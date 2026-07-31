@@ -1,0 +1,19 @@
+provenance: elf_sha256=120911cc9be9a0c1984ce3e8fe9f571899a6ff9d910a53674d1ee0b14b47eb46 bytes=17226816 path=/data/tmp/claude-1000/-data-projects-frankensqlite/f5a994fd-7753-4768-9c20-6883f50192de/scratchpad/e2e-gate-target/release-perf/param-tax-controls profile=DIAGNOSTIC-ONLY
+config: clusters=24 samples_per_arm_per_cluster=8 products=10000 categories=500
+== control1_pure_option_gate (SELECT 40 + 2) ==
+arm=query_row samples=192 median_us=4.29 min_us=4.16 max_us=9.43
+arm=query_row_with_params_empty samples=192 median_us=4.78 min_us=4.63 max_us=20.18
+delta_us=0.49 ratio_b_over_a=1.113
+== control2_literal_fast_lane_gate (COUNT EXISTS probe) ==
+arm=query_row samples=192 median_us=0.59 min_us=0.58 max_us=0.71
+arm=query_row_with_params_empty samples=192 median_us=1.17 min_us=1.13 max_us=1.55
+delta_us=0.58 ratio_b_over_a=1.980
+== aa_null (control-2 shape, query_row both arms) ==
+arm=query_row samples=192 median_us=0.59 min_us=0.59 max_us=0.79
+arm=query_row_again samples=192 median_us=0.59 min_us=0.58 max_us=9.64
+delta_us=0.00 ratio_b_over_a=1.000
+== control3_fast_path_presence (literal vs placeholder, same query) ==
+arm=literal_bound_fast_path samples=192 median_us=0.64 min_us=0.59 max_us=0.98
+arm=placeholder_bound_no_fast_path samples=192 median_us=12.90 min_us=9.17 max_us=30.17
+delta_us=12.26 ratio_placeholder_over_literal=20.123
+interpretation: control1 = Option-gate cost; control2 = params plumbing on a fast-pathed statement; control3 = fast-path presence (literal) vs absence (placeholder) on the same query. If control3's delta dominates (and controls 1-2 plus the A/A spread are ~zero), the ~50-60us gap is the missing prepared_query_fast_path on placeholder statements, not parameter passing (bd-5zeai).

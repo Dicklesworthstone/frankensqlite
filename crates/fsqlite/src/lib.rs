@@ -23,6 +23,11 @@ pub use fsqlite_error::FrankenError;
 pub use fsqlite_types::SqliteValue;
 pub use fsqlite_vfs;
 pub use fsqlite_vfs::FileIdentity;
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub use fsqlite_vfs::{
+    DatabaseNamespaceGenerationTransition, NamespaceGenerationTransitionOutcome,
+    begin_database_namespace_generation_transition,
+};
 
 #[cfg(feature = "session")]
 /// Manual session/changeset API facade re-exported from `fsqlite-ext-session`.
@@ -197,6 +202,101 @@ mod tests {
                 rows.iter().map(row_values).collect::<Vec<_>>(),
                 vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]]
             );
+        });
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn namespace_generation_transition_reopens_quarantined_replacement() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let database_path = dir.path().join("recover.db");
+            let quarantine_path = dir.path().join("recover.db.quarantined");
+            let replacement_stage = dir.path().join("recover.db.replacement");
+            let database_path_string = database_path.to_string_lossy().into_owned();
+
+            {
+                let generation_a =
+                    rusqlite::Connection::open(&database_path).expect("create generation A");
+                generation_a
+                    .execute_batch(
+                        "PRAGMA journal_mode = DELETE;
+                         CREATE TABLE generation(value INTEGER NOT NULL);
+                         INSERT INTO generation VALUES (1);",
+                    )
+                    .expect("seed generation A");
+            }
+            let generation_a = Connection::open_existing(database_path_string.clone())
+                .await
+                .expect("open generation A through the public facade");
+            let old_identity = generation_a
+                .file_identity()
+                .await
+                .expect("query generation A identity")
+                .expect("native database identity");
+            let rows = generation_a
+                .query("SELECT value FROM generation;")
+                .await
+                .expect("query generation A");
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+            drop(generation_a);
+
+            {
+                let generation_b =
+                    rusqlite::Connection::open(&replacement_stage).expect("create generation B");
+                generation_b
+                    .execute_batch(
+                        "PRAGMA journal_mode = DELETE;
+                         CREATE TABLE generation(value INTEGER NOT NULL);
+                         INSERT INTO generation VALUES (2);",
+                    )
+                    .expect("seed generation B");
+            }
+            let replacement_file = std::fs::File::open(&replacement_stage)
+                .expect("retain generation B identity handle");
+            let replacement_identity = FileIdentity::from_file(&replacement_file)
+                .expect("query generation B identity")
+                .expect("native database identity");
+            assert_ne!(old_identity, replacement_identity);
+
+            let mut transition =
+                super::begin_database_namespace_generation_transition(&database_path, old_identity)
+                    .expect("guard generation A before pathname mutation");
+            std::fs::rename(&database_path, &quarantine_path)
+                .expect("quarantine fully quiescent generation A under guard");
+            std::fs::rename(&replacement_stage, &database_path)
+                .expect("install generation B at the stable pathname");
+
+            assert_eq!(
+                transition
+                    .publish_replacement(replacement_identity)
+                    .expect("publish generation B"),
+                super::NamespaceGenerationTransitionOutcome::Published
+            );
+            assert_eq!(
+                transition.finish().expect("finish generation B transition"),
+                replacement_identity
+            );
+            let generation_b = Connection::open_existing_with_expected_identity(
+                database_path_string,
+                replacement_identity,
+            )
+            .await
+            .expect("reopen generation B through the public facade");
+            let rows = generation_b
+                .query("SELECT value FROM generation;")
+                .await
+                .expect("query generation B");
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(2)]);
+            drop(generation_b);
+
+            super::begin_database_namespace_generation_transition(
+                &database_path,
+                replacement_identity,
+            )
+            .expect("reacquire exact published generation")
+            .finish()
+            .expect("finish no-op exact reacquisition");
         });
     }
 
@@ -515,6 +615,10 @@ mod tests {
             .await
             .expect_err("a peer must not join the replacement while the old generation is live");
         assert!(matches!(join_error, FrankenError::CannotOpen { .. }));
+        assert!(matches!(
+            super::begin_database_namespace_generation_transition(&database_path, live_identity),
+            Err(FrankenError::Busy)
+        ));
         assert_eq!(
             std::fs::read(&database_path).expect("read replacement after rejected join"),
             replacement_staged_bytes,
@@ -522,6 +626,24 @@ mod tests {
         );
 
         drop(live);
+        std::fs::rename(&database_path, &replacement_stage)
+            .expect("restage replacement before acquiring transition guard");
+        std::fs::rename(&displaced_path, &database_path)
+            .expect("restore live generation before acquiring transition guard");
+        let mut transition =
+            super::begin_database_namespace_generation_transition(&database_path, live_identity)
+                .expect("guard the quiescent old generation");
+        std::fs::rename(&database_path, &displaced_path)
+            .expect("quarantine old generation under guard");
+        std::fs::rename(&replacement_stage, &database_path)
+            .expect("activate replacement under guard");
+        assert_eq!(
+            transition
+                .publish_replacement(replacement_identity)
+                .expect("publish the quiescent replacement generation"),
+            super::NamespaceGenerationTransitionOutcome::Published
+        );
+        transition.finish().expect("finish replacement transition");
         let replacement = Connection::open_existing(database_path_string)
             .await
             .expect("replacement becomes a new generation after the old lease drops");

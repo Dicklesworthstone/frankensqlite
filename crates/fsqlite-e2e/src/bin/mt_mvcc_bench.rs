@@ -6,7 +6,7 @@
 //! the MVCC page-lock table, commit coordinator, and SSI validator are
 //! exercised under real contention. The comprehensive benchmark now uses the
 //! same one-connection-per-thread shape for its full-matrix concurrent rows;
-//! this binary adds 16-thread coverage, separate-table mode, startup
+//! this binary adds 16- through 128-thread coverage, separate-table mode, startup
 //! diagnostics, and pass-over-pass history gates.
 //!
 //! For each thread count we measure:
@@ -36,7 +36,7 @@
 //! ## CLI
 //!
 //! ```text
-//! mt-mvcc-bench [--rows-per-thread=1000] [--threads=1,2,4,8,16] [--iters=21]
+//! mt-mvcc-bench [--rows-per-thread=1000] [--threads=1,2,4,8,16,32,64,128] [--iters=21]
 //! [--json-output=PATH] [--summary-md=PATH]
 //! [--separate-tables]
 //! ```
@@ -46,12 +46,13 @@
 //! * `BEGIN CONCURRENT` requires `PRAGMA fsqlite.concurrent_mode=ON;` to be
 //!   set on each per-thread connection (see
 //!   `crates/fsqlite-harness/tests/bd_3plop_4_lock_contention_storms.rs`).
-//!   If that PRAGMA fails on a given build, we fall back to plain `BEGIN`
-//!   and print a warning (honest measurement over a fake win).
+//!   The benchmark fails closed unless both the default-on API guard and the
+//!   effective PRAGMA readback prove concurrent mode stayed enabled. It never
+//!   falls back to plain `BEGIN`.
 //! * We retry transient errors (`FrankenError::is_transient()`) by rolling back
 //!   and reopening the whole transaction, up to `MAX_RETRIES`; hard row-level
-//!   failures are counted in `failed_rows` and included in the report so you
-//!   can tell when the numbers are bogus.
+//!   failures remain separate from offered, attempted, retried, and
+//!   database-proven committed work so a failed arm cannot inflate throughput.
 //! * Each paired round creates fresh tempfiles so no database state carries
 //!   across runs. Every F/C claim is preceded by a same-invocation interleaved
 //!   C/C A/A null. The verdict uses a bootstrap CI for the per-round median
@@ -65,7 +66,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{
@@ -81,8 +82,9 @@ use sha2::{Digest, Sha256};
 // ─── Defaults ─────────────────────────────────────────────────────────────
 
 const DEFAULT_ROWS_PER_THREAD: usize = 1_000;
-const DEFAULT_THREADS: &[usize] = &[1, 2, 4, 8, 16];
+const DEFAULT_THREADS: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128];
 const DEFAULT_ITERS: usize = 21;
+const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 const CONTRACT_BOOTSTRAP_REPS: usize = 10_000;
 const DEFAULT_HISTORY_JSON: &str = ".bench-history/mt-mvcc-bench.latest.json";
 const DEFAULT_SEPARATE_TABLES_HISTORY_JSON: &str =
@@ -91,12 +93,97 @@ const ROWID_BASE_STRIDE: i64 = 1_000_000;
 const MAX_RETRIES: usize = 512;
 const RETRY_SLEEP_MS: u64 = 1;
 const MAX_RETRY_SLEEP_MS: u64 = 25;
+// These identities are part of the history-comparison contract. Any semantic
+// change to either retry algorithm must update the matching identity and
+// advance the report schema before the resulting measurements can compare
+// with prior artifacts.
+const CSQLITE_RETRY_ALGORITHM: &str = "csqlite.per-operation.fixed-1ms.busy-or-locked.max-512.v1";
+const FSQLITE_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.whole-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-timeout.v1";
+const FSQLITE_RETRYABLE_ERRORS: &str = "Busy|BusyRecovery|BusySnapshot|DatabaseLocked|\
+    WriteConflict|SerializationFailure|PageBufferCapacityExhausted";
+/// Base wall-clock retry budget for one whole-transaction attempt loop.
+/// Scaled up with offered work by [`fsqlite_retry_timeout`] — the fixed 5s
+/// was exceeded by queueing alone at 64 writers x 1000-row txns (bd-caa6u).
 const FSQLITE_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pessimistic whole-run contention floor used to scale the retry budget.
+/// The first full-matrix run showed 10k wps was still optimistic at peak
+/// contention: the 64-writer arm (11s budget) starved 58 txns past the
+/// envelope while the 128-writer arm (17.8s) passed with zero failures.
+/// 5k wps gives 64 writers ~17.8s and 128 writers ~30.6s.
+const RETRY_BUDGET_FLOOR_WPS: u64 = 5_000;
+
+/// Wall-clock retry budget for one transaction attempt loop, scaled with the
+/// total offered work so a txn that legitimately waits behind a 64/128-writer
+/// convoy tail is not misreported as exhausted (bd-caa6u).
+fn fsqlite_retry_timeout(threads: usize, rows_per_thread: usize) -> Duration {
+    let scaled_secs =
+        (threads as u64).saturating_mul(rows_per_thread as u64) / RETRY_BUDGET_FLOOR_WPS;
+    FSQLITE_RETRY_TIMEOUT + Duration::from_secs(scaled_secs)
+}
+
+fn retry_timeout_millis(timeout: Duration) -> Result<u64, String> {
+    u64::try_from(timeout.as_millis())
+        .map_err(|_| format!("FrankenSQLite retry timeout {timeout:?} exceeds reportable range"))
+}
+
+fn retry_policy_receipt(
+    fsqlite_timeout: Duration,
+    fsqlite_timeout_overridden: bool,
+) -> Result<RetryPolicyReceipt, String> {
+    Ok(RetryPolicyReceipt {
+        csqlite_busy_timeout_ms: 5_000,
+        csqlite_max_operation_retries: MAX_RETRIES,
+        csqlite_retry_sleep_ms: RETRY_SLEEP_MS,
+        csqlite_retry_unit: "individual INSERT or COMMIT operation".to_owned(),
+        csqlite_retry_algorithm: CSQLITE_RETRY_ALGORITHM.to_owned(),
+        fsqlite_transaction_timeout_ms: retry_timeout_millis(fsqlite_timeout)?,
+        fsqlite_max_transaction_retries: MAX_RETRIES,
+        fsqlite_retry_sleep_base_ms: RETRY_SLEEP_MS,
+        fsqlite_retry_sleep_cap_ms: MAX_RETRY_SLEEP_MS + 4,
+        fsqlite_retry_unit: "whole BEGIN CONCURRENT transaction attempt".to_owned(),
+        fsqlite_retry_backoff_algorithm: FSQLITE_RETRY_BACKOFF_ALGORITHM.to_owned(),
+        fsqlite_retryable_errors: FSQLITE_RETRYABLE_ERRORS.to_owned(),
+        fsqlite_timeout_overridden,
+    })
+}
+
+fn fsqlite_error_is_retryable(error: &fsqlite::FrankenError) -> bool {
+    matches!(
+        error,
+        fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::DatabaseLocked { .. }
+            | fsqlite::FrankenError::WriteConflict { .. }
+            | fsqlite::FrankenError::SerializationFailure { .. }
+            | fsqlite::FrankenError::PageBufferCapacityExhausted { .. }
+    )
+}
+
+fn csqlite_error_is_retryable(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 const SHARED_INSERT_SQL: &str = "INSERT INTO bench (id, payload) VALUES (?1, ?2)";
 const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
 const PASS_OVER_PASS_MAX_RATIO_DROP_PCT: f64 = 5.0;
-const REPORT_SCHEMA_V4: &str = "fsqlite-e2e.mt_mvcc_bench_report.v4";
+const REPORT_SCHEMA_V6: &str = "fsqlite-e2e.mt_mvcc_bench_report.v6";
+const SETTINGS_INTERPRETATION: &str = "Both engines proved the listed effective PRAGMA values; \
+    equal names and readbacks do not establish cross-engine semantic equivalence.";
+const ACCOUNTING_INTERPRETATION: &str = "offered and committed writes share one row unit; \
+    attempted_writes counts physical INSERT calls; retried_operations records the existing \
+    engine-specific retry unit and is provenance only, not a cross-engine comparison metric.";
+const TIMING_INTERPRETATION: &str = "workload_elapsed_ns begins only after every worker has \
+    opened and proved its effective settings, and ends at the last worker's transaction terminal \
+    point before connection teardown; worker_startup_elapsed_ns is reported separately.";
+const NON_CITABLE_REASON: &str = "v6 adds fail-closed settings, committed-work, integrity, timing, \
+    retry-policy, and configuration receipts, but bd-uh1fv still requires external watchdog, \
+    sanitized environment, matched retry/deadline semantics, complete build/toolchain provenance, \
+    counterbalanced topology receipts, immutable manifest, and independent verification.";
 
 fn bytes_to_lower_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -147,6 +234,9 @@ struct Options {
     history_json: PathBuf,
     apples_to_apples: bool,
     separate_tables: bool,
+    /// Fixed per-transaction retry budget override in seconds; when unset,
+    /// the budget scales with threads x rows (bd-caa6u).
+    retry_timeout_secs: Option<u64>,
 }
 
 impl Default for Options {
@@ -160,6 +250,7 @@ impl Default for Options {
             history_json: PathBuf::from(DEFAULT_HISTORY_JSON),
             apples_to_apples: false,
             separate_tables: false,
+            retry_timeout_secs: None,
         }
     }
 }
@@ -168,12 +259,14 @@ fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
          [--json-output=PATH] [--summary-md=PATH] [--history-json=PATH] [--apples-to-apples] \\\n\
-         [--separate-tables]\n\
+         [--separate-tables] [--retry-timeout-secs=N]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
-         --threads=1,2,4,8,16 --iters={DEFAULT_ITERS}\n\
+         --threads=1,2,4,8,16,32,64,128 --iters={DEFAULT_ITERS}\n\
          note: --apples-to-apples is a compatibility flag; this benchmark already\n\
          uses the prepared-statement/file-backed/shared-db path on both engines.\n\
+         note: writer counts above MAX_CONCURRENT_WRITERS are reported and skipped;\n\
+         counts above host available_parallelism are measured only as non-comparable diagnostics.\n\
          note: --rows-per-thread=0 reduces the run to shared-file worker open + synchronized start,\n\
          which is the minimal repro for the 13+ thread startup-open failure."
     );
@@ -225,6 +318,11 @@ fn parse_args() -> Options {
                     print_usage_error(format!("invalid --rows-per-thread: {val}"))
                 });
             }
+            "--retry-timeout-secs" => {
+                opts.retry_timeout_secs = Some(val.parse().unwrap_or_else(|_| {
+                    print_usage_error(format!("invalid --retry-timeout-secs: {val}"))
+                }));
+            }
             "--threads" => {
                 opts.threads = val
                     .split(',')
@@ -267,31 +365,98 @@ fn parse_args() -> Options {
 
 // ─── Reported per-config result ───────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EffectiveSettings {
+    page_size_bytes: i64,
+    journal_mode: String,
+    synchronous: String,
+    cache_size: i64,
+    busy_timeout_ms: i64,
+    wal_autocheckpoint_pages: i64,
+    concurrent_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkAccounting {
+    /// Logical writes the caller offered to this arm.
+    offered_writes: usize,
+    /// Physical INSERT calls, including work later rolled back and retried.
+    attempted_writes: usize,
+    /// Rows proven committed by the post-run database oracle.
+    succeeded_writes: usize,
+    /// Additional attempts actually performed after a transient failure.
+    retried_operations: usize,
+    /// Offered writes not present in the committed database.
+    failed_writes: usize,
+    /// Failure count independently reported by the worker loops.
+    worker_reported_failed_writes: usize,
+    exact: bool,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CommittedStateOracle {
+    expected_rows: usize,
+    observed_rows: usize,
+    expected_id_sum: i64,
+    observed_id_sum: i64,
+    expected_payload_sha256: String,
+    observed_payload_sha256: String,
+    integrity_check: Vec<String>,
+    valid: bool,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SampleEvidence {
+    #[serde(default)]
+    worker_startup_elapsed_ns: u128,
+    #[serde(alias = "elapsed_ns")]
+    workload_elapsed_ns: u128,
+    settings: EffectiveSettings,
+    accounting: WorkAccounting,
+    committed_state: CommittedStateOracle,
+}
+
+#[derive(Debug, Clone)]
 struct RunResult {
-    /// Wall-clock duration across threads (max of per-thread times), best of
-    /// `iters` iterations.
-    best_elapsed: Duration,
-    /// Total rows written (across all threads) in the best iteration.
-    total_rows: usize,
-    /// Total rows that hit a hard failure after `MAX_RETRIES`.
-    failed_rows: usize,
+    /// Worker spawn/open/configuration time, excluded from throughput.
+    worker_startup_elapsed: Duration,
+    /// Synchronized writer work through the last transaction terminal point.
+    workload_elapsed: Duration,
+    settings: EffectiveSettings,
+    accounting: WorkAccounting,
+    committed_state: CommittedStateOracle,
 }
 
 impl RunResult {
     fn writes_per_sec(&self) -> f64 {
-        let secs = self.best_elapsed.as_secs_f64();
+        let secs = self.workload_elapsed.as_secs_f64();
         if secs <= 0.0 {
             0.0
         } else {
             #[allow(clippy::cast_precision_loss)]
-            let n = self.total_rows as f64;
+            let n = self.accounting.succeeded_writes as f64;
             n / secs
         }
     }
 
     fn elapsed_ms(&self) -> f64 {
-        self.best_elapsed.as_secs_f64() * 1_000.0
+        self.workload_elapsed.as_secs_f64() * 1_000.0
+    }
+
+    fn correctness_valid(&self) -> bool {
+        self.accounting.exact && self.accounting.failed_writes == 0 && self.committed_state.valid
+    }
+
+    fn sample_evidence(&self) -> SampleEvidence {
+        SampleEvidence {
+            worker_startup_elapsed_ns: self.worker_startup_elapsed.as_nanos(),
+            workload_elapsed_ns: self.workload_elapsed.as_nanos(),
+            settings: self.settings.clone(),
+            accounting: self.accounting.clone(),
+            committed_state: self.committed_state.clone(),
+        }
     }
 }
 
@@ -302,11 +467,61 @@ struct RunStats {
 
 impl RunStats {
     fn new(samples: Vec<RunResult>) -> Self {
+        if let Some(first) = samples.first() {
+            assert!(
+                samples
+                    .iter()
+                    .all(|sample| sample.settings == first.settings),
+                "all samples in one arm must have identical effective settings"
+            );
+        }
         Self { samples }
     }
 
     fn total_failed_rows(&self) -> usize {
-        self.samples.iter().map(|sample| sample.failed_rows).sum()
+        self.samples
+            .iter()
+            .map(|sample| sample.accounting.failed_writes)
+            .sum()
+    }
+
+    fn total_offered_writes(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.accounting.offered_writes)
+            .sum()
+    }
+
+    fn total_attempted_writes(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.accounting.attempted_writes)
+            .sum()
+    }
+
+    fn total_succeeded_writes(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.accounting.succeeded_writes)
+            .sum()
+    }
+
+    fn total_retried_operations(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.accounting.retried_operations)
+            .sum()
+    }
+
+    fn all_correctness_valid(&self) -> bool {
+        self.samples.iter().all(RunResult::correctness_valid)
+    }
+
+    fn sample_evidence(&self) -> Vec<SampleEvidence> {
+        self.samples
+            .iter()
+            .map(RunResult::sample_evidence)
+            .collect()
     }
 
     fn p50_writes_per_sec(&self) -> f64 {
@@ -369,9 +584,57 @@ struct MedianCiContractReport {
     null_radius: f64,
     min_decidable_gain: f64,
     max_decidable_regression: f64,
-    claim_margin: f64,
+    claim_margin: Option<f64>,
     cv_gate: String,
     verdict: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RetryPolicyReceipt {
+    csqlite_busy_timeout_ms: u64,
+    csqlite_max_operation_retries: usize,
+    csqlite_retry_sleep_ms: u64,
+    csqlite_retry_unit: String,
+    #[serde(default)]
+    csqlite_retry_algorithm: String,
+    fsqlite_transaction_timeout_ms: u64,
+    fsqlite_max_transaction_retries: usize,
+    fsqlite_retry_sleep_base_ms: u64,
+    fsqlite_retry_sleep_cap_ms: u64,
+    fsqlite_retry_unit: String,
+    #[serde(default)]
+    fsqlite_retry_backoff_algorithm: String,
+    #[serde(default)]
+    fsqlite_retryable_errors: String,
+    fsqlite_timeout_overridden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfigurationReceipt {
+    writers: usize,
+    available_parallelism: Option<usize>,
+    max_supported_writers: usize,
+    #[serde(default)]
+    wal_autocheckpoint_pages: Option<i64>,
+    #[serde(default)]
+    wal_autocheckpoint_overridden: Option<bool>,
+    #[serde(default)]
+    offered_writes_per_sample: Option<usize>,
+    #[serde(default)]
+    retry_policy: Option<RetryPolicyReceipt>,
+    status: String,
+    comparison_eligible: bool,
+    measured: bool,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ThreadTruthReport {
+    configuration: ConfigurationReceipt,
+    null_c_a_samples: Vec<SampleEvidence>,
+    null_c_b_samples: Vec<SampleEvidence>,
+    sqlite_samples: Vec<SampleEvidence>,
+    fsqlite_samples: Vec<SampleEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -395,14 +658,22 @@ struct ThreadComparisonReport {
     sqlite_failed_rows: usize,
     #[serde(default)]
     median_ci_contract: Option<MedianCiContractReport>,
+    #[serde(default)]
+    truth: Option<ThreadTruthReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct MtMvccBenchReport {
     schema_version: &'static str,
+    citable: bool,
+    non_citable_reason: &'static str,
+    settings_interpretation: &'static str,
+    accounting_interpretation: &'static str,
+    timing_interpretation: &'static str,
     workload_shape: &'static str,
     rows_per_thread: usize,
     iterations: usize,
+    configuration_receipts: Vec<ConfigurationReceipt>,
     thread_results: Vec<ThreadComparisonReport>,
     pass_over_pass_gate: PassOverPassGateReport,
 }
@@ -414,6 +685,7 @@ struct PassOverPassGateReport {
     threshold_ratio_drop_pct: f64,
     status: &'static str,
     previous_report_found: bool,
+    comparable_pair_count: usize,
     regressions: Vec<RatioRegression>,
 }
 
@@ -425,10 +697,17 @@ struct RatioRegression {
     ratio_drop_pct: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoricalMtMvccBenchReport {
+    schema_version: Option<String>,
+    settings_interpretation: Option<String>,
+    accounting_interpretation: Option<String>,
+    timing_interpretation: Option<String>,
     workload_shape: Option<String>,
     rows_per_thread: Option<usize>,
+    iterations: Option<usize>,
+    configuration_receipts: Option<Vec<ConfigurationReceipt>>,
+    #[serde(default)]
     thread_results: Vec<ThreadComparisonReport>,
 }
 
@@ -436,13 +715,15 @@ struct HistoricalMtMvccBenchReport {
 struct FsqliteRetryBudget {
     attempts: usize,
     started: Instant,
+    timeout: Duration,
 }
 
 impl FsqliteRetryBudget {
-    fn new() -> Self {
+    fn new(timeout: Duration) -> Self {
         Self {
             attempts: 0,
             started: Instant::now(),
+            timeout,
         }
     }
 
@@ -451,7 +732,7 @@ impl FsqliteRetryBudget {
     }
 
     fn next_wait(&mut self, tid: usize) -> Option<Duration> {
-        if self.attempts >= MAX_RETRIES || self.started.elapsed() >= FSQLITE_RETRY_TIMEOUT {
+        if self.attempts >= MAX_RETRIES || self.started.elapsed() >= self.timeout {
             return None;
         }
         self.attempts += 1;
@@ -468,6 +749,15 @@ impl FsqliteRetryBudget {
 struct StartupFailure {
     tid: usize,
     error: String,
+}
+
+#[derive(Debug)]
+struct WorkerWork {
+    settings: EffectiveSettings,
+    attempted_writes: usize,
+    retried_operations: usize,
+    reported_failed_writes: usize,
+    workload_finished: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +777,130 @@ struct StartupOutcome {
 struct StartupGateState {
     release: bool,
     abort: bool,
+}
+
+#[derive(Debug)]
+struct WorkerAggregate {
+    attempted_writes: usize,
+    retried_operations: usize,
+    reported_failed_writes: usize,
+    workload_finished: Instant,
+}
+
+fn collect_startup_outcomes(
+    engine: &str,
+    threads: usize,
+    startup_rx: &mpsc::Receiver<StartupOutcome>,
+) -> Result<Vec<StartupFailure>, String> {
+    let mut failures = Vec::new();
+    for _ in 0..threads {
+        let outcome = startup_rx
+            .recv_timeout(STARTUP_COORDINATION_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "{engine} startup coordination timed out after {:?}: {error}",
+                    STARTUP_COORDINATION_TIMEOUT
+                )
+            })?;
+        if outcome.kind == StartupResultKind::Failed {
+            failures.push(StartupFailure {
+                tid: outcome.tid,
+                error: outcome
+                    .error
+                    .unwrap_or_else(|| "unknown startup failure".to_owned()),
+            });
+        }
+    }
+    Ok(failures)
+}
+
+fn publish_startup_decision(
+    startup_gate: &Arc<(Mutex<StartupGateState>, Condvar)>,
+    release: bool,
+) -> Instant {
+    let (gate_lock, gate_cv) = &**startup_gate;
+    let mut gate_state = gate_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let published_at = Instant::now();
+    gate_state.release = release;
+    gate_state.abort = !release;
+    gate_cv.notify_all();
+    published_at
+}
+
+fn join_worker_handles(
+    engine: &str,
+    handles: Vec<thread::JoinHandle<Result<WorkerWork, String>>>,
+    expected_settings: &EffectiveSettings,
+) -> Result<WorkerAggregate, String> {
+    let mut attempted_writes = 0usize;
+    let mut retried_operations = 0usize;
+    let mut reported_failed_writes = 0usize;
+    let mut workload_finished = None::<Instant>;
+    let mut errors = Vec::new();
+
+    for (tid, handle) in handles.into_iter().enumerate() {
+        let work = match handle.join() {
+            Ok(Ok(work)) => work,
+            Ok(Err(error)) => {
+                errors.push(format!("{engine} worker t{tid} failed: {error}"));
+                continue;
+            }
+            Err(_) => {
+                errors.push(format!("{engine} worker t{tid} panicked"));
+                continue;
+            }
+        };
+        if work.settings != *expected_settings {
+            errors.push(format!(
+                "{engine} worker {tid} settings differ from schema connection: \
+                 init={expected_settings:?}, worker={:?}",
+                work.settings
+            ));
+        }
+        match attempted_writes.checked_add(work.attempted_writes) {
+            Some(total) => attempted_writes = total,
+            None => errors.push(format!("{engine} aggregate write-attempt overflow")),
+        }
+        match retried_operations.checked_add(work.retried_operations) {
+            Some(total) => retried_operations = total,
+            None => errors.push(format!("{engine} aggregate retry overflow")),
+        }
+        match reported_failed_writes.checked_add(work.reported_failed_writes) {
+            Some(total) => reported_failed_writes = total,
+            None => errors.push(format!("{engine} aggregate failure overflow")),
+        }
+        workload_finished = Some(workload_finished.map_or(work.workload_finished, |current| {
+            current.max(work.workload_finished)
+        }));
+    }
+
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    let workload_finished = workload_finished
+        .ok_or_else(|| format!("{engine} produced no worker completion timestamp"))?;
+    Ok(WorkerAggregate {
+        attempted_writes,
+        retried_operations,
+        reported_failed_writes,
+        workload_finished,
+    })
+}
+
+fn cleanup_workers_after_startup_failure(
+    engine: &str,
+    startup_gate: &Arc<(Mutex<StartupGateState>, Condvar)>,
+    handles: Vec<thread::JoinHandle<Result<WorkerWork, String>>>,
+    expected_settings: &EffectiveSettings,
+    primary_error: String,
+) -> String {
+    publish_startup_decision(startup_gate, false);
+    match join_worker_handles(engine, handles, expected_settings) {
+        Ok(_) => primary_error,
+        Err(cleanup_error) => format!("{primary_error}; worker cleanup: {cleanup_error}"),
+    }
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -568,11 +982,15 @@ fn paired_run_stats(arm_a: Vec<RunResult>, arm_b: Vec<RunResult>) -> PairedRunSt
         .zip(&arm_b)
         .map(|(baseline, candidate)| {
             assert_eq!(
-                baseline.total_rows, candidate.total_rows,
-                "paired arms must execute equal total work"
+                baseline.accounting.offered_writes, candidate.accounting.offered_writes,
+                "paired arms must receive equal offered work"
             );
-            baseline.best_elapsed.as_secs_f64()
-                / candidate.best_elapsed.as_secs_f64().max(f64::EPSILON)
+            let baseline_wps = baseline.writes_per_sec();
+            if baseline_wps <= 0.0 {
+                0.0
+            } else {
+                candidate.writes_per_sec() / baseline_wps
+            }
         })
         .collect::<Vec<_>>();
 
@@ -583,7 +1001,11 @@ fn paired_run_stats(arm_a: Vec<RunResult>, arm_b: Vec<RunResult>) -> PairedRunSt
     }
 }
 
-fn median_ci_contract(null: &PairedRunStats, claim: &PairedRunStats) -> MedianCiContractReport {
+fn median_ci_contract(
+    null: &PairedRunStats,
+    claim: &PairedRunStats,
+    configuration: &ConfigurationReceipt,
+) -> MedianCiContractReport {
     let null_radius = (null.ratio.ci95.0 - 1.0)
         .abs()
         .max((null.ratio.ci95.1 - 1.0).abs());
@@ -592,16 +1014,34 @@ fn median_ci_contract(null: &PairedRunStats, claim: &PairedRunStats) -> MedianCi
     let max_decidable_regression = 1.0 - decisive_effect;
     let claim_effect = (claim.ratio.median - 1.0).abs();
     let claim_margin = if null_radius == 0.0 {
-        f64::INFINITY
+        None
     } else {
-        claim_effect / null_radius
+        Some(claim_effect / null_radius)
     };
     let failed_rows = null.arm_a.total_failed_rows()
         + null.arm_b.total_failed_rows()
         + claim.arm_a.total_failed_rows()
         + claim.arm_b.total_failed_rows();
-    let verdict = if failed_rows != 0 {
+    let offered_writes = null.arm_a.total_offered_writes()
+        + null.arm_b.total_offered_writes()
+        + claim.arm_a.total_offered_writes()
+        + claim.arm_b.total_offered_writes();
+    let verdict = if offered_writes == 0 {
+        "INVALID_ZERO_COMMITTED_WORK"
+    } else if failed_rows != 0 {
         "INVALID_FAILED_ROWS"
+    } else if !null.arm_a.all_correctness_valid()
+        || !null.arm_b.all_correctness_valid()
+        || !claim.arm_a.all_correctness_valid()
+        || !claim.arm_b.all_correctness_valid()
+    {
+        "INVALID_CORRECTNESS_ORACLE"
+    } else if !configuration.comparison_eligible {
+        match configuration.status.as_str() {
+            "oversubscribed" => "INVALID_OVERSUBSCRIBED",
+            "capacity_unknown" => "INVALID_CAPACITY_UNKNOWN",
+            _ => "INVALID_CONFIGURATION",
+        }
     } else if claim.ratio.ci95.0 > min_decidable_gain {
         "FSQLITE_FASTER"
     } else if claim.ratio.ci95.1 < max_decidable_regression {
@@ -634,6 +1074,7 @@ fn build_thread_report(
     threads: usize,
     null: &PairedRunStats,
     claim: &PairedRunStats,
+    configuration: &ConfigurationReceipt,
 ) -> ThreadComparisonReport {
     let sqlite = &claim.arm_a;
     let fsqlite = &claim.arm_b;
@@ -666,7 +1107,14 @@ fn build_thread_report(
         time_ratio,
         fsqlite_failed_rows: fsqlite.total_failed_rows(),
         sqlite_failed_rows: sqlite.total_failed_rows(),
-        median_ci_contract: Some(median_ci_contract(null, claim)),
+        median_ci_contract: Some(median_ci_contract(null, claim, configuration)),
+        truth: Some(ThreadTruthReport {
+            configuration: configuration.clone(),
+            null_c_a_samples: null.arm_a.sample_evidence(),
+            null_c_b_samples: null.arm_b.sample_evidence(),
+            sqlite_samples: sqlite.sample_evidence(),
+            fsqlite_samples: fsqlite.sample_evidence(),
+        }),
     }
 }
 
@@ -681,6 +1129,23 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# mt-mvcc-bench Summary\n");
+    let _ = writeln!(out, "- Citable: `{}`", report.citable);
+    let _ = writeln!(out, "- Non-citable reason: {}", report.non_citable_reason);
+    let _ = writeln!(
+        out,
+        "- Settings interpretation: {}",
+        report.settings_interpretation
+    );
+    let _ = writeln!(
+        out,
+        "- Accounting interpretation: {}",
+        report.accounting_interpretation
+    );
+    let _ = writeln!(
+        out,
+        "- Timing interpretation: {}",
+        report.timing_interpretation
+    );
     let _ = writeln!(out, "- Workload shape: `{}`", report.workload_shape);
     let _ = writeln!(out, "- Rows per thread: `{}`", report.rows_per_thread);
     let _ = writeln!(out, "- Iterations: `{}`", report.iterations);
@@ -688,8 +1153,11 @@ fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
     let gate = &report.pass_over_pass_gate;
     let _ = writeln!(
         out,
-        "- Pass-over-pass gate: `{}` (threshold `{:.2}%`, history `{}`)",
-        gate.status, gate.threshold_ratio_drop_pct, gate.history_json_path
+        "- Pass-over-pass gate: `{}` (comparable pairs `{}`, threshold `{:.2}%`, history `{}`)",
+        gate.status,
+        gate.comparable_pair_count,
+        gate.threshold_ratio_drop_pct,
+        gate.history_json_path
     );
     if !gate.regressions.is_empty() {
         let _ = writeln!(out, "- Regressions:");
@@ -707,11 +1175,11 @@ fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| Threads | fsqlite p50 wps | sqlite p50 wps | F/C median | F/C median CI95 | C/C A/A CI95 | Verdict | fsqlite failed | sqlite failed |"
+        "| Threads | Configuration | fsqlite p50 wps | sqlite p50 wps | F/C median | F/C median CI95 | C/C A/A CI95 | Verdict | fsqlite committed/offered | sqlite committed/offered | fsqlite failed | sqlite failed |"
     );
     let _ = writeln!(
         out,
-        "|---------|-----------------:|---------------:|-----------:|----------------:|-------------:|:--------|---------------:|--------------:|"
+        "|---------|:--------------|-----------------:|---------------:|-----------:|----------------:|-------------:|:--------|----------------------------:|--------------------------:|---------------:|--------------:|"
     );
     for row in &report.thread_results {
         let (claim_ci, null_ci, verdict) = row.median_ci_contract.as_ref().map_or_else(
@@ -736,19 +1204,76 @@ fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
                 )
             },
         );
+        let (
+            configuration_status,
+            fsqlite_committed,
+            fsqlite_offered,
+            sqlite_committed,
+            sqlite_offered,
+        ) = row.truth.as_ref().map_or_else(
+            || ("unavailable", 0, 0, 0, 0),
+            |truth| {
+                (
+                    truth.configuration.status.as_str(),
+                    truth
+                        .fsqlite_samples
+                        .iter()
+                        .map(|sample| sample.accounting.succeeded_writes)
+                        .sum::<usize>(),
+                    truth
+                        .fsqlite_samples
+                        .iter()
+                        .map(|sample| sample.accounting.offered_writes)
+                        .sum::<usize>(),
+                    truth
+                        .sqlite_samples
+                        .iter()
+                        .map(|sample| sample.accounting.succeeded_writes)
+                        .sum::<usize>(),
+                    truth
+                        .sqlite_samples
+                        .iter()
+                        .map(|sample| sample.accounting.offered_writes)
+                        .sum::<usize>(),
+                )
+            },
+        );
         let _ = writeln!(
             out,
-            "| {} | {:.0} | {:.0} | {:.3}x | {} | {} | {} | {} | {} |",
+            "| {} | {} | {:.0} | {:.0} | {:.3}x | {} | {} | {} | {}/{} | {}/{} | {} | {} |",
             row.threads,
+            configuration_status,
             row.fsqlite_wps_p50,
             row.sqlite_wps_p50,
             row.throughput_ratio,
             claim_ci,
             null_ci,
             verdict,
+            fsqlite_committed,
+            fsqlite_offered,
+            sqlite_committed,
+            sqlite_offered,
             row.fsqlite_failed_rows,
             row.sqlite_failed_rows
         );
+    }
+    if report
+        .configuration_receipts
+        .iter()
+        .any(|receipt| !receipt.measured)
+    {
+        let _ = writeln!(out, "\n## Unmeasured configurations\n");
+        for receipt in report
+            .configuration_receipts
+            .iter()
+            .filter(|receipt| !receipt.measured)
+        {
+            let _ = writeln!(
+                out,
+                "- {} writers: `{}` — {}",
+                receipt.writers, receipt.status, receipt.reason
+            );
+        }
     }
     out
 }
@@ -777,50 +1302,382 @@ fn load_previous_report(path: &Path) -> Result<Option<HistoricalMtMvccBenchRepor
         .map_err(|error| format!("parse history report {}: {error}", path.display()))
 }
 
-fn build_pass_over_pass_gate(
-    history_json: &Path,
-    previous: Option<&HistoricalMtMvccBenchReport>,
-    current_rows: &[ThreadComparisonReport],
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveSettingsFingerprint {
+    sqlite: EffectiveSettings,
+    fsqlite: EffectiveSettings,
+    wal_autocheckpoint_pages: i64,
+    wal_autocheckpoint_overridden: bool,
+    offered_writes_per_sample: usize,
+    retry_policy: RetryPolicyReceipt,
+}
+
+#[derive(Debug, Clone)]
+struct ComparableHistoryRow {
+    throughput_ratio: f64,
+    settings: EffectiveSettingsFingerprint,
+}
+
+fn sample_evidence_is_valid(sample: &SampleEvidence) -> bool {
+    let accounting = &sample.accounting;
+    let committed = &sample.committed_state;
+    sample.worker_startup_elapsed_ns > 0
+        && sample.workload_elapsed_ns > 0
+        && accounting.offered_writes > 0
+        && accounting.exact
+        && accounting.diagnostics.is_empty()
+        && accounting.attempted_writes >= accounting.succeeded_writes
+        && accounting.succeeded_writes == accounting.offered_writes
+        && accounting.failed_writes == 0
+        && accounting.worker_reported_failed_writes == 0
+        && committed.valid
+        && committed.diagnostics.is_empty()
+        && committed.expected_rows == accounting.succeeded_writes
+        && committed.observed_rows == accounting.succeeded_writes
+        && committed.expected_id_sum == committed.observed_id_sum
+        && committed.expected_payload_sha256 == committed.observed_payload_sha256
+        && committed.integrity_check.len() == 1
+        && committed
+            .integrity_check
+            .first()
+            .is_some_and(|result| result == "ok")
+}
+
+fn uniform_effective_settings(
+    samples: &[SampleEvidence],
+    expected_offered_writes: usize,
+) -> Option<EffectiveSettings> {
+    let first = samples.first()?.settings.clone();
+    samples
+        .iter()
+        .all(|sample| {
+            sample_evidence_is_valid(sample)
+                && sample.accounting.offered_writes == expected_offered_writes
+                && sample.settings == first
+        })
+        .then_some(first)
+}
+
+fn valid_truth_settings(
+    row: &ThreadComparisonReport,
+    rows_per_thread: usize,
+) -> Option<EffectiveSettingsFingerprint> {
+    let truth = row.truth.as_ref()?;
+    let configuration = &truth.configuration;
+    let rounds = truth.null_c_a_samples.len();
+    if rounds == 0
+        || truth.null_c_b_samples.len() != rounds
+        || truth.sqlite_samples.len() != rounds
+        || truth.fsqlite_samples.len() != rounds
+        || configuration.writers != row.threads
+        || !configuration.measured
+        || !configuration.comparison_eligible
+        || configuration.status != "supported"
+        || configuration.wal_autocheckpoint_overridden != Some(false)
+    {
+        return None;
+    }
+    let expected_offered_writes = row.threads.checked_mul(rows_per_thread)?;
+    let offered_writes_per_sample = configuration.offered_writes_per_sample?;
+    if offered_writes_per_sample == 0 || offered_writes_per_sample != expected_offered_writes {
+        return None;
+    }
+    let retry_policy = configuration.retry_policy.clone()?;
+    let expected_retry_policy =
+        retry_policy_receipt(fsqlite_retry_timeout(row.threads, rows_per_thread), false).ok()?;
+    if retry_policy != expected_retry_policy {
+        return None;
+    }
+    let wal_autocheckpoint_pages = configuration.wal_autocheckpoint_pages?;
+    if wal_autocheckpoint_pages < 0 {
+        return None;
+    }
+
+    let null_c_a = uniform_effective_settings(&truth.null_c_a_samples, offered_writes_per_sample)?;
+    let null_c_b = uniform_effective_settings(&truth.null_c_b_samples, offered_writes_per_sample)?;
+    let sqlite = uniform_effective_settings(&truth.sqlite_samples, offered_writes_per_sample)?;
+    let fsqlite = uniform_effective_settings(&truth.fsqlite_samples, offered_writes_per_sample)?;
+    let expected_sqlite =
+        expected_effective_settings("sqlite_wal_single_writer", wal_autocheckpoint_pages);
+    let expected_fsqlite = expected_effective_settings("fsqlite_mvcc_on", wal_autocheckpoint_pages);
+    if null_c_a != expected_sqlite
+        || null_c_b != expected_sqlite
+        || sqlite != expected_sqlite
+        || fsqlite != expected_fsqlite
+    {
+        return None;
+    }
+
+    Some(EffectiveSettingsFingerprint {
+        sqlite,
+        fsqlite,
+        wal_autocheckpoint_pages,
+        wal_autocheckpoint_overridden: false,
+        offered_writes_per_sample,
+        retry_policy,
+    })
+}
+
+fn run_result_from_sample_evidence(sample: &SampleEvidence) -> Option<RunResult> {
+    if !sample_evidence_is_valid(sample) {
+        return None;
+    }
+    let startup_seconds = u64::try_from(sample.worker_startup_elapsed_ns / 1_000_000_000).ok()?;
+    let startup_nanoseconds =
+        u32::try_from(sample.worker_startup_elapsed_ns % 1_000_000_000).ok()?;
+    let workload_seconds = u64::try_from(sample.workload_elapsed_ns / 1_000_000_000).ok()?;
+    let workload_nanoseconds = u32::try_from(sample.workload_elapsed_ns % 1_000_000_000).ok()?;
+    Some(RunResult {
+        worker_startup_elapsed: Duration::new(startup_seconds, startup_nanoseconds),
+        workload_elapsed: Duration::new(workload_seconds, workload_nanoseconds),
+        settings: sample.settings.clone(),
+        accounting: sample.accounting.clone(),
+        committed_state: sample.committed_state.clone(),
+    })
+}
+
+fn paired_stats_from_sample_evidence(
+    arm_a: &[SampleEvidence],
+    arm_b: &[SampleEvidence],
+) -> Option<PairedRunStats> {
+    if arm_a.is_empty() || arm_a.len() != arm_b.len() {
+        return None;
+    }
+    let arm_a_settings = &arm_a.first()?.settings;
+    let arm_b_settings = &arm_b.first()?.settings;
+    if !arm_a
+        .iter()
+        .all(|sample| &sample.settings == arm_a_settings)
+        || !arm_b
+            .iter()
+            .all(|sample| &sample.settings == arm_b_settings)
+    {
+        return None;
+    }
+    let offered_work_matches = arm_a.iter().zip(arm_b).all(|(baseline, candidate)| {
+        baseline.accounting.offered_writes == candidate.accounting.offered_writes
+    });
+    if !offered_work_matches {
+        return None;
+    }
+    let arm_a = arm_a
+        .iter()
+        .map(run_result_from_sample_evidence)
+        .collect::<Option<Vec<_>>>()?;
+    let arm_b = arm_b
+        .iter()
+        .map(run_result_from_sample_evidence)
+        .collect::<Option<Vec<_>>>()?;
+    Some(paired_run_stats(arm_a, arm_b))
+}
+
+fn valid_median_ci_contract(row: &ThreadComparisonReport) -> Option<&MedianCiContractReport> {
+    let truth = row.truth.as_ref()?;
+    let contract = row.median_ci_contract.as_ref()?;
+    let null = paired_stats_from_sample_evidence(&truth.null_c_a_samples, &truth.null_c_b_samples)?;
+    let claim = paired_stats_from_sample_evidence(&truth.sqlite_samples, &truth.fsqlite_samples)?;
+    let expected = median_ci_contract(&null, &claim, &truth.configuration);
+    (expected.eq(contract)
+        && row.throughput_ratio.to_bits() == expected.claim_ratio_median.to_bits()
+        && row.fsqlite_failed_rows == 0
+        && row.sqlite_failed_rows == 0)
+        .then_some(contract)
+}
+
+fn comparable_history_row(
+    row: &ThreadComparisonReport,
+    rows_per_thread: usize,
+) -> Option<ComparableHistoryRow> {
+    let settings = valid_truth_settings(row, rows_per_thread)?;
+    let contract = valid_median_ci_contract(row)?;
+    Some(ComparableHistoryRow {
+        throughput_ratio: contract.claim_ratio_median,
+        settings,
+    })
+}
+
+fn comparable_rows_by_thread(
+    rows: &[ThreadComparisonReport],
+    rows_per_thread: usize,
+) -> BTreeMap<usize, Vec<ComparableHistoryRow>> {
+    let mut grouped = BTreeMap::<usize, Vec<ComparableHistoryRow>>::new();
+    for row in rows {
+        if let Some(comparable) = comparable_history_row(row, rows_per_thread) {
+            grouped.entry(row.threads).or_default().push(comparable);
+        }
+    }
+    grouped
+}
+
+fn history_evidence_is_invalid(
+    wal_autocheckpoint_overridden: bool,
+    retry_timeout_overridden: bool,
+    rows_per_thread: usize,
+    iterations: usize,
+    rows: &[ThreadComparisonReport],
+    configuration_receipts: &[ConfigurationReceipt],
+) -> bool {
+    if wal_autocheckpoint_overridden
+        || retry_timeout_overridden
+        || iterations == 0
+        || rows.is_empty()
+        || rows.len() != configuration_receipts.len()
+        || configuration_receipts
+            .iter()
+            .enumerate()
+            .any(|(index, receipt)| {
+                configuration_receipts[..index]
+                    .iter()
+                    .any(|prior| prior.writers == receipt.writers)
+            })
+        || configuration_receipts.iter().any(|receipt| {
+            !receipt.comparison_eligible
+                || receipt.wal_autocheckpoint_pages.is_none()
+                || receipt.wal_autocheckpoint_overridden != Some(false)
+                || receipt.offered_writes_per_sample.is_none()
+                || receipt
+                    .retry_policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.fsqlite_timeout_overridden)
+        })
+        || rows.iter().any(|row| {
+            row.truth.as_ref().is_none_or(|truth| {
+                truth.null_c_a_samples.len() != iterations
+                    || truth.null_c_b_samples.len() != iterations
+                    || truth.sqlite_samples.len() != iterations
+                    || truth.fsqlite_samples.len() != iterations
+            })
+        })
+        || rows
+            .iter()
+            .zip(configuration_receipts)
+            .any(|(row, receipt)| {
+                row.threads != receipt.writers
+                    || receipt.offered_writes_per_sample != row.threads.checked_mul(rows_per_thread)
+                    || row
+                        .truth
+                        .as_ref()
+                        .is_none_or(|truth| truth.configuration != *receipt)
+            })
+    {
+        return true;
+    }
+    let comparable = comparable_rows_by_thread(rows, rows_per_thread);
+    comparable.len() != rows.len() || comparable.values().any(|candidates| candidates.len() != 1)
+}
+
+fn historical_report_matches_contract(
+    previous: &HistoricalMtMvccBenchReport,
     current_workload_shape: &str,
     current_rows_per_thread: usize,
-) -> PassOverPassGateReport {
-    let previous = previous.filter(|previous| {
-        previous
+    current_iterations: usize,
+) -> bool {
+    let Some(configuration_receipts) = previous.configuration_receipts.as_deref() else {
+        return false;
+    };
+    previous.schema_version.as_deref() == Some(REPORT_SCHEMA_V6)
+        && previous.settings_interpretation.as_deref() == Some(SETTINGS_INTERPRETATION)
+        && previous.accounting_interpretation.as_deref() == Some(ACCOUNTING_INTERPRETATION)
+        && previous.timing_interpretation.as_deref() == Some(TIMING_INTERPRETATION)
+        && previous
             .workload_shape
             .as_deref()
             .is_some_and(|shape| shape == current_workload_shape)
-            && previous.rows_per_thread == Some(current_rows_per_thread)
+        && previous.rows_per_thread == Some(current_rows_per_thread)
+        && previous.iterations == Some(current_iterations)
+        && !history_evidence_is_invalid(
+            false,
+            false,
+            current_rows_per_thread,
+            current_iterations,
+            &previous.thread_results,
+            configuration_receipts,
+        )
+}
+
+struct PassOverPassGateInput<'a> {
+    history_json: &'a Path,
+    previous: Option<&'a HistoricalMtMvccBenchReport>,
+    current_rows: &'a [ThreadComparisonReport],
+    current_configuration_receipts: &'a [ConfigurationReceipt],
+    current_workload_shape: &'a str,
+    current_rows_per_thread: usize,
+    current_iterations: usize,
+    current_wal_autocheckpoint_overridden: bool,
+    current_retry_timeout_overridden: bool,
+}
+
+fn build_pass_over_pass_gate(input: PassOverPassGateInput<'_>) -> PassOverPassGateReport {
+    let PassOverPassGateInput {
+        history_json,
+        previous,
+        current_rows,
+        current_configuration_receipts,
+        current_workload_shape,
+        current_rows_per_thread,
+        current_iterations,
+        current_wal_autocheckpoint_overridden,
+        current_retry_timeout_overridden,
+    } = input;
+    let previous = previous.filter(|previous| {
+        historical_report_matches_contract(
+            previous,
+            current_workload_shape,
+            current_rows_per_thread,
+            current_iterations,
+        )
     });
-    let regressions = previous
-        .map(|previous| {
-            let previous_by_threads: BTreeMap<usize, f64> = previous
-                .thread_results
-                .iter()
-                .map(|row| (row.threads, row.throughput_ratio))
-                .collect();
-            current_rows
-                .iter()
-                .filter_map(|row| {
-                    let previous_ratio = *previous_by_threads.get(&row.threads)?;
-                    if previous_ratio <= 0.0 || row.throughput_ratio >= previous_ratio {
-                        return None;
-                    }
-                    let ratio_drop_pct =
-                        ((previous_ratio - row.throughput_ratio) / previous_ratio) * 100.0;
-                    (ratio_drop_pct > PASS_OVER_PASS_MAX_RATIO_DROP_PCT).then_some(
-                        RatioRegression {
-                            threads: row.threads,
-                            previous_ratio,
-                            current_ratio: row.throughput_ratio,
-                            ratio_drop_pct,
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let current_evidence_valid = !history_evidence_is_invalid(
+        current_wal_autocheckpoint_overridden,
+        current_retry_timeout_overridden,
+        current_rows_per_thread,
+        current_iterations,
+        current_rows,
+        current_configuration_receipts,
+    );
+    let mut comparable_pair_count = 0usize;
+    let mut regressions = Vec::new();
+    if let Some(previous) = previous {
+        let previous_by_threads =
+            comparable_rows_by_thread(&previous.thread_results, current_rows_per_thread);
+        let current_by_threads = if current_evidence_valid {
+            comparable_rows_by_thread(current_rows, current_rows_per_thread)
+        } else {
+            BTreeMap::new()
+        };
+        for (threads, current_candidates) in &current_by_threads {
+            let Some(previous_candidates) = previous_by_threads.get(threads) else {
+                continue;
+            };
+            if previous_candidates.len() != 1 || current_candidates.len() != 1 {
+                continue;
+            }
+            let previous_row = &previous_candidates[0];
+            let current_row = &current_candidates[0];
+            if previous_row.settings != current_row.settings {
+                continue;
+            }
+            comparable_pair_count += 1;
+            if current_row.throughput_ratio >= previous_row.throughput_ratio {
+                continue;
+            }
+            let ratio_drop_pct = ((previous_row.throughput_ratio - current_row.throughput_ratio)
+                / previous_row.throughput_ratio)
+                * 100.0;
+            if ratio_drop_pct > PASS_OVER_PASS_MAX_RATIO_DROP_PCT {
+                regressions.push(RatioRegression {
+                    threads: *threads,
+                    previous_ratio: previous_row.throughput_ratio,
+                    current_ratio: current_row.throughput_ratio,
+                    ratio_drop_pct,
+                });
+            }
+        }
+    }
     let status = if previous.is_none() {
         "no_prior_report"
+    } else if comparable_pair_count == 0 {
+        "no_comparable_rows"
     } else if regressions.is_empty() {
         "passed"
     } else {
@@ -832,6 +1689,7 @@ fn build_pass_over_pass_gate(
         threshold_ratio_drop_pct: PASS_OVER_PASS_MAX_RATIO_DROP_PCT,
         status,
         previous_report_found: previous.is_some(),
+        comparable_pair_count,
         regressions,
     }
 }
@@ -851,6 +1709,131 @@ fn workload_shape(separate_tables: bool) -> &'static str {
     } else {
         "shared_table"
     }
+}
+
+fn configuration_receipt(
+    writers: usize,
+    rows_per_thread: usize,
+    available_parallelism: Option<usize>,
+    wal_autocheckpoint_pages: i64,
+    wal_autocheckpoint_overridden: bool,
+    retry_policy: RetryPolicyReceipt,
+) -> ConfigurationReceipt {
+    let max_supported_writers = fsqlite_mvcc::MAX_CONCURRENT_WRITERS;
+    let offered_writes_per_sample = writers.checked_mul(rows_per_thread);
+    let (status, comparison_eligible, measured, reason) = if offered_writes_per_sample.is_none() {
+        (
+            "unsupported".to_owned(),
+            false,
+            false,
+            format!(
+                "{writers} writers x {rows_per_thread} rows overflows offered-work accounting; \
+                     arm skipped"
+            ),
+        )
+    } else if writers == 0 {
+        (
+            "unsupported".to_owned(),
+            false,
+            false,
+            "zero writers cannot produce a multi-writer measurement; arm skipped".to_owned(),
+        )
+    } else if writers > max_supported_writers {
+        (
+            "unsupported".to_owned(),
+            false,
+            false,
+            format!(
+                "requested {writers} writers exceeds FrankenSQLite's explicit \
+                     MAX_CONCURRENT_WRITERS={max_supported_writers}; arm skipped"
+            ),
+        )
+    } else if let Some(available_parallelism) = available_parallelism {
+        if writers > available_parallelism {
+            (
+                "oversubscribed".to_owned(),
+                false,
+                true,
+                format!(
+                    "{writers} writers exceeds host \
+                         available_parallelism={available_parallelism}; raw diagnostic samples \
+                         are not eligible for a performance verdict"
+                ),
+            )
+        } else {
+            (
+                "supported".to_owned(),
+                true,
+                true,
+                format!(
+                    "{writers} writers is within host \
+                         available_parallelism={available_parallelism} and \
+                         MAX_CONCURRENT_WRITERS={max_supported_writers}"
+                ),
+            )
+        }
+    } else {
+        (
+            "capacity_unknown".to_owned(),
+            false,
+            true,
+            "host available_parallelism could not be determined; raw diagnostic \
+                 samples are not eligible for a performance verdict"
+                .to_owned(),
+        )
+    };
+    let mut receipt = ConfigurationReceipt {
+        writers,
+        available_parallelism,
+        max_supported_writers,
+        wal_autocheckpoint_pages: Some(wal_autocheckpoint_pages),
+        wal_autocheckpoint_overridden: Some(wal_autocheckpoint_overridden),
+        offered_writes_per_sample,
+        retry_policy: Some(retry_policy),
+        status,
+        comparison_eligible,
+        measured,
+        reason,
+    };
+    if wal_autocheckpoint_overridden {
+        receipt.comparison_eligible = false;
+        if receipt.status == "supported" {
+            "diagnostic_override".clone_into(&mut receipt.status);
+        }
+        receipt.reason.push_str(&format!(
+            "; explicit wal_autocheckpoint={wal_autocheckpoint_pages} override is diagnostic-only \
+             and cannot update or compare against default-cadence history"
+        ));
+    }
+    if receipt
+        .retry_policy
+        .as_ref()
+        .is_some_and(|policy| policy.fsqlite_timeout_overridden)
+    {
+        receipt.comparison_eligible = false;
+        if receipt.status == "supported" {
+            "diagnostic_override".clone_into(&mut receipt.status);
+        }
+        receipt.reason.push_str(
+            "; explicit FrankenSQLite-only retry-timeout override is diagnostic-only and cannot \
+             update or compare against default-policy history",
+        );
+    }
+    receipt
+}
+
+fn validate_workload_bounds(rows_per_thread: usize, separate_tables: bool) -> Result<(), String> {
+    i64::try_from(rows_per_thread)
+        .map_err(|_| format!("rows_per_thread={rows_per_thread} exceeds the i64 row-id domain"))?;
+    let shared_row_id_stride = usize::try_from(ROWID_BASE_STRIDE)
+        .map_err(|_| "ROWID_BASE_STRIDE does not fit usize".to_owned())?;
+    if !separate_tables && rows_per_thread > shared_row_id_stride {
+        return Err(format!(
+            "rows_per_thread={rows_per_thread} exceeds the shared-table disjoint row-id stride \
+             {ROWID_BASE_STRIDE}; use --separate-tables or at most {ROWID_BASE_STRIDE} rows"
+        ));
+    }
+    Ok(())
 }
 
 fn worker_table_count(threads: usize, separate_tables: bool) -> usize {
@@ -890,70 +1873,228 @@ fn worker_insert_sql(tid: usize, separate_tables: bool) -> String {
     }
 }
 
-/// Read an effective PRAGMA back and require it to be one of `expected`.
-///
-/// `PRAGMA <name>=<value>` returning `Ok` proves only that the statement executed,
-/// not that the setting took effect — PRAGMAs can be silently clamped, ignored, or
-/// applied to a different scope than intended. The published paired ratios are only
-/// meaningful if both arms actually ran at the same durability, so this asserts the
-/// post-state rather than trusting the write.
-fn verify_effective_fsqlite_pragma(
-    conn: &fsqlite::Connection,
-    name: &str,
-    expected: &[&str],
-) -> Result<(), String> {
-    let sql = format!("PRAGMA {name};");
-    let rows = fsqlite_e2e::block_on(conn.query(&sql))
-        .map_err(|error| format!("fsqlite `{sql}` failed: {error}"))?;
-    let row = rows
-        .first()
-        .ok_or_else(|| format!("fsqlite `{sql}` returned no row"))?;
-    let value = row
-        .get(0)
-        .ok_or_else(|| format!("fsqlite `{sql}` returned no first column"))?;
-    let actual = match value {
+fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
+    match value {
         fsqlite::SqliteValue::Null => "null".to_owned(),
         fsqlite::SqliteValue::Integer(value) => value.to_string(),
         fsqlite::SqliteValue::Float(value) => value.to_string(),
         fsqlite::SqliteValue::Text(value) => value.as_ref().to_ascii_lowercase(),
         fsqlite::SqliteValue::Blob(value) => format!("blob:{}", value.len()),
-    };
-    if expected.iter().any(|candidate| *candidate == actual) {
-        return Ok(());
     }
-    Err(format!(
-        "fsqlite effective `{name}` is `{actual}`, expected one of {expected:?}; \
-         publishing a paired ratio from mismatched settings is exactly the bd-x5gzk failure"
-    ))
 }
 
-fn prepare_fsqlite_schema(path: &str, threads: usize, separate_tables: bool) -> Result<(), String> {
+fn query_fsqlite_scalar(conn: &fsqlite::Connection, sql: &str) -> Result<String, String> {
+    let rows = fsqlite_e2e::block_on(conn.query(sql))
+        .map_err(|error| format!("FrankenSQLite `{sql}` failed: {error}"))?;
+    if rows.len() != 1 {
+        return Err(format!(
+            "FrankenSQLite `{sql}` returned {} rows, expected exactly one",
+            rows.len()
+        ));
+    }
+    rows[0]
+        .get(0)
+        .map(normalize_fsqlite_value)
+        .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no first column"))
+}
+
+fn query_rusqlite_scalar(conn: &rusqlite::Connection, sql: &str) -> Result<String, String> {
+    conn.query_row(sql, [], |row| {
+        let value = row.get_ref(0)?;
+        Ok(match value {
+            rusqlite::types::ValueRef::Null => "null".to_owned(),
+            rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+            rusqlite::types::ValueRef::Real(value) => value.to_string(),
+            rusqlite::types::ValueRef::Text(value) => {
+                String::from_utf8_lossy(value).to_ascii_lowercase()
+            }
+            rusqlite::types::ValueRef::Blob(value) => format!("blob:{}", value.len()),
+        })
+    })
+    .map_err(|error| format!("C SQLite `{sql}` failed: {error}"))
+}
+
+fn normalized_synchronous(value: &str) -> Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "off" => Ok("off".to_owned()),
+        "1" | "normal" => Ok("normal".to_owned()),
+        "2" | "full" => Ok("full".to_owned()),
+        "3" | "extra" => Ok("extra".to_owned()),
+        _ => Err(format!("unrecognized PRAGMA synchronous value `{value}`")),
+    }
+}
+
+fn parse_effective_settings<F>(
+    mut query: F,
+    concurrent_mode: &str,
+) -> Result<EffectiveSettings, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    let page_size = query("PRAGMA page_size;")?;
+    let journal_mode = query("PRAGMA journal_mode;")?;
+    let synchronous = query("PRAGMA synchronous;")?;
+    let cache_size = query("PRAGMA cache_size;")?;
+    let busy_timeout = query("PRAGMA busy_timeout;")?;
+    let wal_autocheckpoint = query("PRAGMA wal_autocheckpoint;")?;
+    Ok(EffectiveSettings {
+        page_size_bytes: page_size
+            .parse()
+            .map_err(|error| format!("invalid PRAGMA page_size `{page_size}`: {error}"))?,
+        journal_mode: journal_mode.to_ascii_lowercase(),
+        synchronous: normalized_synchronous(&synchronous)?,
+        cache_size: cache_size
+            .parse()
+            .map_err(|error| format!("invalid PRAGMA cache_size `{cache_size}`: {error}"))?,
+        busy_timeout_ms: busy_timeout
+            .parse()
+            .map_err(|error| format!("invalid PRAGMA busy_timeout `{busy_timeout}`: {error}"))?,
+        wal_autocheckpoint_pages: wal_autocheckpoint.parse().map_err(|error| {
+            format!("invalid PRAGMA wal_autocheckpoint `{wal_autocheckpoint}`: {error}")
+        })?,
+        concurrent_mode: concurrent_mode.to_owned(),
+    })
+}
+
+fn expected_effective_settings(
+    concurrent_mode: &str,
+    wal_autocheckpoint_pages: i64,
+) -> EffectiveSettings {
+    EffectiveSettings {
+        page_size_bytes: 4_096,
+        journal_mode: "wal".to_owned(),
+        synchronous: "normal".to_owned(),
+        cache_size: -64_000,
+        busy_timeout_ms: 5_000,
+        wal_autocheckpoint_pages,
+        concurrent_mode: concurrent_mode.to_owned(),
+    }
+}
+
+fn verify_effective_settings(
+    engine: &str,
+    observed: EffectiveSettings,
+    concurrent_mode: &str,
+    wal_autocheckpoint_pages: i64,
+) -> Result<EffectiveSettings, String> {
+    let expected = expected_effective_settings(concurrent_mode, wal_autocheckpoint_pages);
+    if observed != expected {
+        return Err(format!(
+            "{engine} effective settings mismatch: expected {expected:?}, observed {observed:?}"
+        ));
+    }
+    Ok(observed)
+}
+
+/// Resolve the checkpoint-cadence setting once and pass the exact value to
+/// every connection in both arms. Invalid or non-Unicode overrides fail closed.
+fn bench_wal_autocheckpoint_pages() -> Result<(i64, bool), String> {
+    match std::env::var("FSQLITE_BENCH_WAL_AUTOCHECKPOINT") {
+        Ok(raw) => {
+            let pages = raw.parse::<i64>().map_err(|error| {
+                format!(
+                    "invalid FSQLITE_BENCH_WAL_AUTOCHECKPOINT={raw:?}; expected a non-negative integer: {error}"
+                )
+            })?;
+            if pages < 0 {
+                return Err(format!(
+                    "invalid FSQLITE_BENCH_WAL_AUTOCHECKPOINT={raw:?}; expected a non-negative integer"
+                ));
+            }
+            Ok((pages, true))
+        }
+        Err(std::env::VarError::NotPresent) => Ok((DEFAULT_WAL_AUTOCHECKPOINT_PAGES, false)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("FSQLITE_BENCH_WAL_AUTOCHECKPOINT is not valid Unicode".to_owned())
+        }
+    }
+}
+
+fn configure_fsqlite_connection(
+    conn: &fsqlite::Connection,
+    wal_autocheckpoint_pages: i64,
+) -> Result<EffectiveSettings, String> {
+    if !conn.is_concurrent_mode_default() {
+        return Err(
+            "FrankenSQLite concurrent-writer mode was not default-on before benchmark setup"
+                .to_owned(),
+        );
+    }
+    for pragma in [
+        "PRAGMA page_size=4096;".to_owned(),
+        "PRAGMA journal_mode=WAL;".to_owned(),
+        "PRAGMA synchronous=NORMAL;".to_owned(),
+        "PRAGMA cache_size=-64000;".to_owned(),
+        "PRAGMA busy_timeout=5000;".to_owned(),
+        format!("PRAGMA wal_autocheckpoint={wal_autocheckpoint_pages};"),
+        "PRAGMA fsqlite.concurrent_mode=ON;".to_owned(),
+    ] {
+        fsqlite_e2e::block_on(conn.execute(&pragma))
+            .map_err(|error| format!("FrankenSQLite `{pragma}` failed: {error}"))?;
+    }
+    let concurrent_mode = query_fsqlite_scalar(conn, "PRAGMA fsqlite.concurrent_mode;")?;
+    if !matches!(concurrent_mode.as_str(), "1" | "true" | "on") {
+        return Err(format!(
+            "FrankenSQLite concurrent-mode readback was `{concurrent_mode}`, expected enabled"
+        ));
+    }
+    if !conn.is_concurrent_mode_default() {
+        return Err(
+            "FrankenSQLite concurrent-writer mode became disabled during benchmark setup"
+                .to_owned(),
+        );
+    }
+    let observed =
+        parse_effective_settings(|sql| query_fsqlite_scalar(conn, sql), "fsqlite_mvcc_on")?;
+    verify_effective_settings(
+        "FrankenSQLite",
+        observed,
+        "fsqlite_mvcc_on",
+        wal_autocheckpoint_pages,
+    )
+}
+
+fn configure_rusqlite_connection(
+    conn: &rusqlite::Connection,
+    wal_autocheckpoint_pages: i64,
+) -> Result<EffectiveSettings, String> {
+    conn.execute_batch(&format!(
+        "PRAGMA page_size=4096;\
+         PRAGMA journal_mode=WAL;\
+         PRAGMA synchronous=NORMAL;\
+         PRAGMA cache_size=-64000;\
+         PRAGMA busy_timeout=5000;\
+         PRAGMA wal_autocheckpoint={wal_autocheckpoint_pages};"
+    ))
+    .map_err(|error| format!("C SQLite performance PRAGMAs failed: {error}"))?;
+    let observed = parse_effective_settings(
+        |sql| query_rusqlite_scalar(conn, sql),
+        "sqlite_wal_single_writer",
+    )?;
+    verify_effective_settings(
+        "C SQLite",
+        observed,
+        "sqlite_wal_single_writer",
+        wal_autocheckpoint_pages,
+    )
+}
+
+fn prepare_fsqlite_schema(
+    path: &str,
+    threads: usize,
+    separate_tables: bool,
+    wal_autocheckpoint_pages: i64,
+) -> Result<EffectiveSettings, String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (init): {error}"))?;
-    for pragma in [
-        "PRAGMA page_size=4096;",
-        "PRAGMA journal_mode=WAL;",
-        "PRAGMA synchronous=NORMAL;",
-        "PRAGMA cache_size=-64000;",
-    ] {
-        // The C arm applies its four schema PRAGMAs through
-        // `execute_batch(..).expect(..)` in `run_sqlite`, so it aborts when they do
-        // not take. Discarding the result here left the two arms of a *paired*
-        // benchmark on different error-handling discipline — the same shape that let
-        // bd-x5gzk's C-FULL vs F-NORMAL asymmetry run undetected for the life of a
-        // published section.
-        fsqlite_e2e::block_on(conn.execute(pragma))
-            .map_err(|error| format!("fsqlite schema pragma `{pragma}`: {error}"))?;
-    }
-    verify_effective_fsqlite_pragma(&conn, "journal_mode", &["wal"])?;
-    verify_effective_fsqlite_pragma(&conn, "synchronous", &["normal", "1"])?;
+    let settings = configure_fsqlite_connection(&conn, wal_autocheckpoint_pages)?;
     for tid in 0..worker_table_count(threads, separate_tables) {
         let table_name = worker_table_name(tid, separate_tables);
         let create_sql = create_table_sql(&table_name);
         fsqlite_e2e::block_on(conn.execute(&create_sql))
             .map_err(|error| format!("create table {table_name}: {error}"))?;
     }
-    Ok(())
+    Ok(settings)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -975,80 +2116,346 @@ fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
     (values[upper] - values[lower]).mul_add(fraction, values[lower])
 }
 
+#[derive(Debug)]
+struct DatabaseState {
+    rows: usize,
+    id_sum: i64,
+    payload_sha256: String,
+}
+
+fn hash_committed_row(
+    hasher: &mut Sha256,
+    table_index: usize,
+    id: i64,
+    payload: &str,
+) -> Result<(), String> {
+    let table_index =
+        u64::try_from(table_index).map_err(|_| "table index exceeds u64".to_owned())?;
+    let payload_len =
+        u64::try_from(payload.len()).map_err(|_| "payload length exceeds u64".to_owned())?;
+    hasher.update(table_index.to_le_bytes());
+    hasher.update(id.to_le_bytes());
+    hasher.update(payload_len.to_le_bytes());
+    hasher.update(payload.as_bytes());
+    Ok(())
+}
+
+fn expected_database_state(
+    threads: usize,
+    rows_per_thread: usize,
+    separate_tables: bool,
+) -> Result<DatabaseState, String> {
+    let expected_rows = threads
+        .checked_mul(rows_per_thread)
+        .ok_or_else(|| "expected row count overflow".to_owned())?;
+    let mut observed_rows = 0usize;
+    let mut id_sum = 0i64;
+    let mut hasher = Sha256::new();
+    for tid in 0..threads {
+        let tid_i64 = i64::try_from(tid).map_err(|_| format!("writer index {tid} exceeds i64"))?;
+        let base = if separate_tables {
+            0
+        } else {
+            tid_i64
+                .checked_mul(ROWID_BASE_STRIDE)
+                .ok_or_else(|| format!("writer {tid} row-id base overflow"))?
+        };
+        let table_index = if separate_tables { tid } else { 0 };
+        for row_index in 0..rows_per_thread {
+            let row_index_i64 = i64::try_from(row_index)
+                .map_err(|_| format!("row index {row_index} exceeds i64"))?;
+            let id = base
+                .checked_add(row_index_i64)
+                .ok_or_else(|| format!("writer {tid} row id overflow"))?;
+            let payload = format!("tid{tid}_i{row_index_i64}");
+            observed_rows = observed_rows
+                .checked_add(1)
+                .ok_or_else(|| "expected row count overflow".to_owned())?;
+            id_sum = id_sum
+                .checked_add(id)
+                .ok_or_else(|| "expected id sum overflow".to_owned())?;
+            hash_committed_row(&mut hasher, table_index, id, &payload)?;
+        }
+    }
+    if observed_rows != expected_rows {
+        return Err(format!(
+            "expected-state row enumeration mismatch: product={expected_rows}, enumerated={observed_rows}"
+        ));
+    }
+    Ok(DatabaseState {
+        rows: observed_rows,
+        id_sum,
+        payload_sha256: bytes_to_lower_hex(&hasher.finalize()),
+    })
+}
+
+fn build_committed_state_oracle(
+    expected: DatabaseState,
+    observed: DatabaseState,
+    integrity_check: Vec<String>,
+) -> CommittedStateOracle {
+    let mut diagnostics = Vec::new();
+    if observed.rows != expected.rows {
+        diagnostics.push(format!(
+            "committed row count mismatch: expected {}, observed {}",
+            expected.rows, observed.rows
+        ));
+    }
+    if observed.id_sum != expected.id_sum {
+        diagnostics.push(format!(
+            "committed id sum mismatch: expected {}, observed {}",
+            expected.id_sum, observed.id_sum
+        ));
+    }
+    if observed.payload_sha256 != expected.payload_sha256 {
+        diagnostics.push(format!(
+            "committed payload hash mismatch: expected {}, observed {}",
+            expected.payload_sha256, observed.payload_sha256
+        ));
+    }
+    if integrity_check != ["ok"] {
+        diagnostics.push(format!(
+            "PRAGMA integrity_check returned diagnostics: {integrity_check:?}"
+        ));
+    }
+    CommittedStateOracle {
+        expected_rows: expected.rows,
+        observed_rows: observed.rows,
+        expected_id_sum: expected.id_sum,
+        observed_id_sum: observed.id_sum,
+        expected_payload_sha256: expected.payload_sha256,
+        observed_payload_sha256: observed.payload_sha256,
+        integrity_check,
+        valid: diagnostics.is_empty(),
+        diagnostics,
+    }
+}
+
+fn query_fsqlite_committed_state(
+    path: &str,
+    threads: usize,
+    separate_tables: bool,
+) -> Result<(DatabaseState, Vec<String>), String> {
+    let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
+        .map_err(|error| format!("FrankenSQLite post-run verifier open failed: {error}"))?;
+    let mut rows_total = 0usize;
+    let mut id_sum = 0i64;
+    let mut hasher = Sha256::new();
+    for table_index in 0..worker_table_count(threads, separate_tables) {
+        let table_name = worker_table_name(table_index, separate_tables);
+        let sql = format!("SELECT id, payload FROM {table_name} ORDER BY id");
+        let rows = fsqlite_e2e::block_on(conn.query(&sql))
+            .map_err(|error| format!("FrankenSQLite post-run `{sql}` failed: {error}"))?;
+        for row in rows {
+            let id = row
+                .get(0)
+                .and_then(fsqlite::SqliteValue::as_integer)
+                .ok_or_else(|| {
+                    format!("FrankenSQLite post-run `{sql}` returned a non-integer id")
+                })?;
+            let payload = match row.get(1) {
+                Some(fsqlite::SqliteValue::Text(payload)) => payload.as_ref(),
+                _ => {
+                    return Err(format!(
+                        "FrankenSQLite post-run `{sql}` returned a non-text payload"
+                    ));
+                }
+            };
+            rows_total = rows_total
+                .checked_add(1)
+                .ok_or_else(|| "FrankenSQLite post-run row count overflow".to_owned())?;
+            id_sum = id_sum
+                .checked_add(id)
+                .ok_or_else(|| "FrankenSQLite post-run id sum overflow".to_owned())?;
+            hash_committed_row(&mut hasher, table_index, id, payload)?;
+        }
+    }
+    let integrity_rows = fsqlite_e2e::block_on(conn.query("PRAGMA integrity_check;"))
+        .map_err(|error| format!("FrankenSQLite `PRAGMA integrity_check` failed: {error}"))?;
+    let integrity_check = integrity_rows
+        .iter()
+        .map(|row| {
+            row.get(0).map(normalize_fsqlite_value).ok_or_else(|| {
+                "FrankenSQLite `PRAGMA integrity_check` row omitted column 0".to_owned()
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        DatabaseState {
+            rows: rows_total,
+            id_sum,
+            payload_sha256: bytes_to_lower_hex(&hasher.finalize()),
+        },
+        integrity_check,
+    ))
+}
+
+fn query_rusqlite_committed_state(
+    path: &str,
+    threads: usize,
+    separate_tables: bool,
+) -> Result<(DatabaseState, Vec<String>), String> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|error| format!("C SQLite post-run verifier open failed: {error}"))?;
+    let mut rows_total = 0usize;
+    let mut id_sum = 0i64;
+    let mut hasher = Sha256::new();
+    for table_index in 0..worker_table_count(threads, separate_tables) {
+        let table_name = worker_table_name(table_index, separate_tables);
+        let sql = format!("SELECT id, payload FROM {table_name} ORDER BY id");
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| format!("C SQLite post-run prepare `{sql}` failed: {error}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|error| format!("C SQLite post-run query `{sql}` failed: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("C SQLite post-run row `{sql}` failed: {error}"))?
+        {
+            let id = row
+                .get::<_, i64>(0)
+                .map_err(|error| format!("C SQLite post-run id decode failed: {error}"))?;
+            let payload = row
+                .get::<_, String>(1)
+                .map_err(|error| format!("C SQLite post-run payload decode failed: {error}"))?;
+            rows_total = rows_total
+                .checked_add(1)
+                .ok_or_else(|| "C SQLite post-run row count overflow".to_owned())?;
+            id_sum = id_sum
+                .checked_add(id)
+                .ok_or_else(|| "C SQLite post-run id sum overflow".to_owned())?;
+            hash_committed_row(&mut hasher, table_index, id, &payload)?;
+        }
+    }
+    let mut stmt = conn
+        .prepare("PRAGMA integrity_check;")
+        .map_err(|error| format!("C SQLite integrity_check prepare failed: {error}"))?;
+    let integrity_check: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("C SQLite integrity_check query failed: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("C SQLite integrity_check row failed: {error}"))?
+        .into_iter()
+        .map(|message| message.to_ascii_lowercase())
+        .collect();
+    Ok((
+        DatabaseState {
+            rows: rows_total,
+            id_sum,
+            payload_sha256: bytes_to_lower_hex(&hasher.finalize()),
+        },
+        integrity_check,
+    ))
+}
+
+fn build_work_accounting(
+    offered_writes: usize,
+    attempted_writes: usize,
+    retried_operations: usize,
+    worker_reported_failed_writes: usize,
+    committed_writes: usize,
+) -> WorkAccounting {
+    let mut diagnostics = Vec::new();
+    let failed_writes = if committed_writes <= offered_writes {
+        offered_writes - committed_writes
+    } else {
+        diagnostics.push(format!(
+            "committed rows {committed_writes} exceed offered writes {offered_writes}"
+        ));
+        0
+    };
+    if attempted_writes < committed_writes {
+        diagnostics.push(format!(
+            "physical write attempts {attempted_writes} are fewer than committed writes {committed_writes}"
+        ));
+    }
+    if worker_reported_failed_writes != failed_writes {
+        diagnostics.push(format!(
+            "worker failure accounting mismatch: workers reported {worker_reported_failed_writes}, committed-state delta proves {failed_writes}"
+        ));
+    }
+    if committed_writes
+        .checked_add(failed_writes)
+        .is_none_or(|accounted| accounted != offered_writes)
+    {
+        diagnostics.push(format!(
+            "offered-work accounting mismatch: offered {offered_writes}, committed {committed_writes}, failed {failed_writes}"
+        ));
+    }
+    WorkAccounting {
+        offered_writes,
+        attempted_writes,
+        succeeded_writes: committed_writes,
+        retried_operations,
+        failed_writes,
+        worker_reported_failed_writes,
+        exact: diagnostics.is_empty(),
+        diagnostics,
+    }
+}
+
 // ─── FrankenSQLite workload ──────────────────────────────────────────────
 
-fn open_fsqlite_worker(path: &str) -> Result<(fsqlite::Connection, bool), String> {
+fn open_fsqlite_worker(
+    path: &str,
+    wal_autocheckpoint_pages: i64,
+) -> Result<(fsqlite::Connection, EffectiveSettings), String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (worker): {error}"))?;
-    // `synchronous` is PER-CONNECTION: `prepare_fsqlite_schema`'s NORMAL does not
-    // carry to worker connections, so state it here. FrankenSQLite's default is
-    // already NORMAL (`WalCommitSyncPolicy::Deferred`) and the rusqlite worker
-    // sets NORMAL explicitly, so this is a no-op today — it pins the matched
-    // durability the published concurrent-writer numbers depend on, rather than
-    // leaving it to agree with C SQLite by coincidence of defaults. The same
-    // omission on the C side of `comprehensive_bench::bench_concurrent_writers`
-    // silently compared C-FULL against F-NORMAL for the life of that section
-    // (bd-x5gzk); see docs/bench-methodology-concurrent-writers.md.
-    fsqlite_e2e::block_on(conn.execute("PRAGMA synchronous=NORMAL;"))
-        .map_err(|error| format!("fsqlite worker `PRAGMA synchronous=NORMAL`: {error}"))?;
-    // Prove the pin took. The comment above says this line exists so matched
-    // durability is stated rather than left "to agree with C SQLite by coincidence
-    // of defaults" — discarding the result reinstated exactly that coincidence,
-    // because a failed pin was indistinguishable from a successful one.
-    verify_effective_fsqlite_pragma(&conn, "synchronous", &["normal", "1"])?;
-    let concurrent_ok =
-        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).is_ok();
-    fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"))
-        .map_err(|error| format!("fsqlite worker `PRAGMA busy_timeout=5000`: {error}"))?;
-    Ok((conn, concurrent_ok))
+    let settings = configure_fsqlite_connection(&conn, wal_autocheckpoint_pages)?;
+    Ok((conn, settings))
 }
 
 fn run_fsqlite(
     threads: usize,
     rows_per_thread: usize,
     separate_tables: bool,
+    retry_timeout: Duration,
+    wal_autocheckpoint_pages: i64,
 ) -> Result<RunResult, String> {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("FrankenSQLite tempfile creation failed: {error}"))?;
     let path = tmp
         .path()
         .to_str()
-        .expect("tempfile path is utf-8")
+        .ok_or_else(|| "FrankenSQLite tempfile path is not UTF-8".to_owned())?
         .to_owned();
 
-    prepare_fsqlite_schema(&path, threads, separate_tables)?;
+    let init_settings =
+        prepare_fsqlite_schema(&path, threads, separate_tables, wal_autocheckpoint_pages)?;
 
     let path = Arc::new(path);
-    let barrier = Arc::new(Barrier::new(threads));
     let startup_gate = Arc::new((Mutex::new(StartupGateState::default()), Condvar::new()));
     let (startup_tx, startup_rx) = mpsc::channel::<StartupOutcome>();
     let mut handles = Vec::with_capacity(threads);
 
-    let t0 = Instant::now();
+    let worker_startup_started = Instant::now();
     for tid in 0..threads {
         let path = Arc::clone(&path);
-        let barrier = Arc::clone(&barrier);
         let startup_gate = Arc::clone(&startup_gate);
         let startup_tx = startup_tx.clone();
-        let handle = thread::spawn(move || -> Result<(Duration, usize), String> {
+        let handle = thread::spawn(move || -> Result<WorkerWork, String> {
             // Each thread owns its own Connection (Connection: !Send + !Sync).
-            let (conn, concurrent_ok) = match open_fsqlite_worker(path.as_str()) {
-                Ok(worker) => {
-                    let _ = startup_tx.send(StartupOutcome {
-                        tid,
-                        kind: StartupResultKind::Ready,
-                        error: None,
-                    });
-                    worker
-                }
-                Err(error) => {
-                    let _ = startup_tx.send(StartupOutcome {
-                        tid,
-                        kind: StartupResultKind::Failed,
-                        error: Some(error.clone()),
-                    });
-                    return Err(error);
-                }
-            };
+            let (conn, settings) =
+                match open_fsqlite_worker(path.as_str(), wal_autocheckpoint_pages) {
+                    Ok(worker) => {
+                        let _ = startup_tx.send(StartupOutcome {
+                            tid,
+                            kind: StartupResultKind::Ready,
+                            error: None,
+                        });
+                        worker
+                    }
+                    Err(error) => {
+                        let _ = startup_tx.send(StartupOutcome {
+                            tid,
+                            kind: StartupResultKind::Failed,
+                            error: Some(error.clone()),
+                        });
+                        return Err(error);
+                    }
+                };
 
             let (gate_lock, gate_cv) = &*startup_gate;
             let mut gate_state = gate_lock
@@ -1065,9 +2472,6 @@ fn run_fsqlite(
                 ));
             }
             drop(gate_state);
-
-            barrier.wait();
-            let start = Instant::now();
 
             #[allow(clippy::cast_possible_wrap)]
             let base = if separate_tables {
@@ -1103,17 +2507,14 @@ fn run_fsqlite(
                 Insert(i64),
                 Commit,
             }
-            let begin_sql = if concurrent_ok {
-                "BEGIN CONCURRENT"
-            } else {
-                "BEGIN"
-            };
-            let mut retry_budget = FsqliteRetryBudget::new();
-            let mut failed = 0usize;
-            loop {
+            let mut retry_budget = FsqliteRetryBudget::new(retry_timeout);
+            let mut attempted_writes = 0usize;
+            let mut retried_operations = 0usize;
+            let final_failed = loop {
+                let mut attempt_failed = 0usize;
                 let outcome = fsqlite_e2e::block_on(async {
-                    if let Err(e) = conn.execute(begin_sql).await {
-                        if e.is_transient() {
+                    if let Err(e) = conn.execute("BEGIN CONCURRENT").await {
+                        if fsqlite_error_is_retryable(&e) {
                             return Ok(Some((TxnRetry::Begin, e.to_string())));
                         }
                         return Err(format!(
@@ -1138,22 +2539,28 @@ fn run_fsqlite(
                             fsqlite::SqliteValue::Integer(id),
                             fsqlite::SqliteValue::Text(payload.into()),
                         ];
+                        attempted_writes = attempted_writes.checked_add(1).ok_or_else(|| {
+                            format!("[fsqlite t{tid}] write-attempt counter overflow")
+                        })?;
                         match stmt.execute_with_params(&params).await {
                             Ok(_) => {}
-                            Err(e) if e.is_transient() => {
+                            Err(e) if fsqlite_error_is_retryable(&e) => {
                                 let _ = conn.execute("ROLLBACK").await;
                                 return Ok(Some((TxnRetry::Insert(id), e.to_string())));
                             }
                             Err(e) => {
                                 eprintln!("[fsqlite t{tid}] INSERT {id} failed: {e}");
-                                failed += 1;
+                                attempt_failed =
+                                    attempt_failed.checked_add(1).ok_or_else(|| {
+                                        format!("[fsqlite t{tid}] failed-write counter overflow")
+                                    })?;
                             }
                         }
                     }
 
                     match conn.execute("COMMIT").await {
                         Ok(_) => Ok(None),
-                        Err(e) if e.is_transient() => {
+                        Err(e) if fsqlite_error_is_retryable(&e) => {
                             let _ = conn.execute("ROLLBACK").await;
                             Ok(Some((TxnRetry::Commit, e.to_string())))
                         }
@@ -1165,133 +2572,191 @@ fn run_fsqlite(
                 })?;
 
                 match outcome {
-                    None => break,
+                    None => {
+                        break attempt_failed;
+                    }
                     Some((what, error)) => {
                         if let Some(wait) = retry_budget.next_wait(tid) {
+                            retried_operations =
+                                retried_operations.checked_add(1).ok_or_else(|| {
+                                    format!("[fsqlite t{tid}] retry counter overflow")
+                                })?;
                             thread::sleep(wait);
                         } else {
-                            return Err(match what {
-                                TxnRetry::Begin => format!(
-                                    "[fsqlite t{tid}] BEGIN failed after {} retries: {error}",
-                                    retry_budget.attempts()
-                                ),
-                                TxnRetry::Insert(id) => format!(
-                                    "[fsqlite t{tid}] INSERT {id} exhausted retry budget after {} retries: {error}",
-                                    retry_budget.attempts()
-                                ),
-                                TxnRetry::Commit => format!(
-                                    "[fsqlite t{tid}] COMMIT exhausted retry budget after {} retries: {error}",
-                                    retry_budget.attempts()
-                                ),
-                            });
+                            // Budget exhaustion is a MEASUREMENT-ENVELOPE
+                            // event, not an engine correctness failure
+                            // (bd-caa6u): mirror the C arm — count the whole
+                            // transaction's rows as failed (which flags the
+                            // result row via fsqlite_failed) and keep the
+                            // run alive instead of killing every thread's
+                            // data. The stderr line keeps the distinction
+                            // auditable.
+                            let stage = match what {
+                                TxnRetry::Begin => "BEGIN".to_owned(),
+                                TxnRetry::Insert(id) => format!("INSERT {id}"),
+                                TxnRetry::Commit => "COMMIT".to_owned(),
+                            };
+                            eprintln!(
+                                "[fsqlite t{tid}] {stage} exhausted retry budget \
+                                 ({:?} wall clock, {} attempts): {error} — counting \
+                                 {rows_per_thread} rows failed and continuing",
+                                retry_budget.timeout,
+                                retry_budget.attempts()
+                            );
+                            let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
+                            break rows_per_thread;
                         }
                     }
                 }
-            }
+            };
 
-            Ok((start.elapsed(), failed))
+            Ok(WorkerWork {
+                settings,
+                attempted_writes,
+                retried_operations,
+                reported_failed_writes: final_failed,
+                workload_finished: Instant::now(),
+            })
         });
         handles.push(handle);
     }
     drop(startup_tx);
 
-    let mut startup_failures = Vec::new();
-    for _ in 0..threads {
-        let outcome = startup_rx
-            .recv_timeout(STARTUP_COORDINATION_TIMEOUT)
-            .map_err(|error| {
-                format!(
-                    "fsqlite startup coordination timed out after {:?}: {error}",
-                    STARTUP_COORDINATION_TIMEOUT
-                )
-            })?;
-        if outcome.kind == StartupResultKind::Failed {
-            startup_failures.push(StartupFailure {
-                tid: outcome.tid,
-                error: outcome
-                    .error
-                    .unwrap_or_else(|| "unknown startup failure".to_owned()),
-            });
+    let startup_failures = match collect_startup_outcomes("FrankenSQLite", threads, &startup_rx) {
+        Ok(failures) => failures,
+        Err(error) => {
+            return Err(cleanup_workers_after_startup_failure(
+                "FrankenSQLite",
+                &startup_gate,
+                handles,
+                &init_settings,
+                error,
+            ));
         }
-    }
-
-    {
-        let (gate_lock, gate_cv) = &*startup_gate;
-        let mut gate_state = gate_lock
-            .lock()
-            .map_err(|_| "fsqlite startup gate poisoned".to_owned())?;
-        gate_state.release = startup_failures.is_empty();
-        gate_state.abort = !startup_failures.is_empty();
-        gate_cv.notify_all();
-    }
-
+    };
     if !startup_failures.is_empty() {
-        for handle in handles {
-            let _ = handle.join();
-        }
-        return Err(format_startup_failures("fsqlite", &startup_failures));
+        let error = format_startup_failures("FrankenSQLite", &startup_failures);
+        return Err(cleanup_workers_after_startup_failure(
+            "FrankenSQLite",
+            &startup_gate,
+            handles,
+            &init_settings,
+            error,
+        ));
     }
 
-    let mut total_failed = 0usize;
-    for (tid, h) in handles.into_iter().enumerate() {
-        let (_d, failed) = h
-            .join()
-            .map_err(|_| format!("fsqlite worker t{tid} panicked"))??;
-        total_failed += failed;
-    }
-    let elapsed = t0.elapsed();
+    let worker_startup_elapsed = worker_startup_started.elapsed();
+    let workload_started = publish_startup_decision(&startup_gate, true);
+    let work = join_worker_handles("FrankenSQLite", handles, &init_settings)?;
+    let workload_elapsed = work
+        .workload_finished
+        .checked_duration_since(workload_started)
+        .ok_or_else(|| "FrankenSQLite worker completion preceded workload start".to_owned())?;
+    let expected = expected_database_state(threads, rows_per_thread, separate_tables)?;
+    let (observed, integrity_check) =
+        query_fsqlite_committed_state(path.as_str(), threads, separate_tables)?;
+    let committed_state = build_committed_state_oracle(expected, observed, integrity_check);
+    let offered_writes = threads
+        .checked_mul(rows_per_thread)
+        .ok_or_else(|| "FrankenSQLite offered-write count overflow".to_owned())?;
+    let accounting = build_work_accounting(
+        offered_writes,
+        work.attempted_writes,
+        work.retried_operations,
+        work.reported_failed_writes,
+        committed_state.observed_rows,
+    );
 
     Ok(RunResult {
-        best_elapsed: elapsed,
-        total_rows: threads * rows_per_thread,
-        failed_rows: total_failed,
+        worker_startup_elapsed,
+        workload_elapsed,
+        settings: init_settings,
+        accounting,
+        committed_state,
     })
 }
 
 // ─── C SQLite (rusqlite) workload ────────────────────────────────────────
 
-fn run_rusqlite(threads: usize, rows_per_thread: usize, separate_tables: bool) -> RunResult {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+fn run_rusqlite(
+    threads: usize,
+    rows_per_thread: usize,
+    separate_tables: bool,
+    wal_autocheckpoint_pages: i64,
+) -> Result<RunResult, String> {
+    let tmp = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("C SQLite tempfile creation failed: {error}"))?;
     let path = tmp
         .path()
         .to_str()
-        .expect("tempfile path is utf-8")
+        .ok_or_else(|| "C SQLite tempfile path is not UTF-8".to_owned())?
         .to_owned();
 
-    {
-        let conn = rusqlite::Connection::open(&path).expect("rusqlite open (init)");
-        let mut schema_sql = "PRAGMA page_size=4096;\
-             PRAGMA journal_mode=WAL;\
-             PRAGMA synchronous=NORMAL;\
-             PRAGMA cache_size=-64000;"
-            .to_owned();
-        schema_sql.push_str(&create_tables_sql(threads, separate_tables));
-        conn.execute_batch(&schema_sql).expect("init schema");
-    }
+    let init_settings = {
+        let conn = rusqlite::Connection::open(&path)
+            .map_err(|error| format!("C SQLite init open failed: {error}"))?;
+        let settings = configure_rusqlite_connection(&conn, wal_autocheckpoint_pages)?;
+        conn.execute_batch(&create_tables_sql(threads, separate_tables))
+            .map_err(|error| format!("C SQLite init schema failed: {error}"))?;
+        settings
+    };
 
     let path = Arc::new(path);
-    let barrier = Arc::new(Barrier::new(threads));
+    let startup_gate = Arc::new((Mutex::new(StartupGateState::default()), Condvar::new()));
+    let (startup_tx, startup_rx) = mpsc::channel::<StartupOutcome>();
     let mut handles = Vec::with_capacity(threads);
 
-    let t0 = Instant::now();
+    let worker_startup_started = Instant::now();
     for tid in 0..threads {
         let path = Arc::clone(&path);
-        let barrier = Arc::clone(&barrier);
-        let handle = thread::spawn(move || -> usize {
+        let startup_gate = Arc::clone(&startup_gate);
+        let startup_tx = startup_tx.clone();
+        let handle = thread::spawn(move || -> Result<WorkerWork, String> {
             use rusqlite::OpenFlags;
             let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-            let conn = rusqlite::Connection::open_with_flags(path.as_str(), flags)
-                .expect("rusqlite open (worker)");
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL;\
-                 PRAGMA synchronous=NORMAL;\
-                 PRAGMA busy_timeout=5000;",
-            )
-            .expect("worker pragmas");
+            let setup = (|| {
+                let conn = rusqlite::Connection::open_with_flags(path.as_str(), flags)
+                    .map_err(|error| format!("C SQLite worker {tid} open failed: {error}"))?;
+                let settings = configure_rusqlite_connection(&conn, wal_autocheckpoint_pages)
+                    .map_err(|error| format!("C SQLite worker {tid} setup failed: {error}"))?;
+                Ok::<_, String>((conn, settings))
+            })();
+            let (conn, settings) = match setup {
+                Ok(worker) => {
+                    let _ = startup_tx.send(StartupOutcome {
+                        tid,
+                        kind: StartupResultKind::Ready,
+                        error: None,
+                    });
+                    worker
+                }
+                Err(error) => {
+                    let _ = startup_tx.send(StartupOutcome {
+                        tid,
+                        kind: StartupResultKind::Failed,
+                        error: Some(error.clone()),
+                    });
+                    return Err(error);
+                }
+            };
 
-            barrier.wait();
+            let (gate_lock, gate_cv) = &*startup_gate;
+            let mut gate_state = gate_lock
+                .lock()
+                .map_err(|_| "C SQLite startup gate poisoned".to_owned())?;
+            while !gate_state.release && !gate_state.abort {
+                gate_state = gate_cv
+                    .wait(gate_state)
+                    .map_err(|_| "C SQLite startup gate poisoned while waiting".to_owned())?;
+            }
+            if gate_state.abort {
+                return Err(format!(
+                    "C SQLite t{tid} startup aborted after peer open failure"
+                ));
+            }
+            drop(gate_state);
 
             #[allow(clippy::cast_possible_wrap)]
             let base = if separate_tables {
@@ -1300,35 +2765,41 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize, separate_tables: bool) -
                 tid as i64 * ROWID_BASE_STRIDE
             };
             let mut failed = 0usize;
+            let mut attempted_writes = 0usize;
+            let mut retried_operations = 0usize;
             let insert_sql = worker_insert_sql(tid, separate_tables);
 
-            conn.execute_batch("BEGIN").expect("BEGIN");
+            conn.execute_batch("BEGIN")
+                .map_err(|error| format!("[sqlite t{tid}] BEGIN failed: {error}"))?;
             {
-                let mut stmt = conn.prepare(&insert_sql).expect("prepare");
+                let mut stmt = conn
+                    .prepare(&insert_sql)
+                    .map_err(|error| format!("[sqlite t{tid}] prepare failed: {error}"))?;
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..rows_per_thread as i64 {
                     let id = base + i;
                     let payload = format!("tid{tid}_i{i}");
                     let mut retry = 0usize;
                     loop {
+                        attempted_writes = attempted_writes.checked_add(1).ok_or_else(|| {
+                            format!("[sqlite t{tid}] write-attempt counter overflow")
+                        })?;
                         match stmt.execute(rusqlite::params![id, &payload]) {
                             Ok(_) => break,
                             Err(e) => {
-                                if retry < MAX_RETRIES
-                                    && matches!(
-                                        e.sqlite_error_code(),
-                                        Some(
-                                            rusqlite::ErrorCode::DatabaseBusy
-                                                | rusqlite::ErrorCode::DatabaseLocked
-                                        )
-                                    )
-                                {
+                                if retry < MAX_RETRIES && csqlite_error_is_retryable(&e) {
                                     retry += 1;
+                                    retried_operations =
+                                        retried_operations.checked_add(1).ok_or_else(|| {
+                                            format!("[sqlite t{tid}] retry counter overflow")
+                                        })?;
                                     thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
                                     continue;
                                 }
                                 eprintln!("[sqlite t{tid}] INSERT {id} failed: {e}");
-                                failed += 1;
+                                failed = failed.checked_add(1).ok_or_else(|| {
+                                    format!("[sqlite t{tid}] failed-write counter overflow")
+                                })?;
                                 break;
                             }
                         }
@@ -1341,44 +2812,86 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize, separate_tables: bool) -
                 match conn.execute_batch("COMMIT") {
                     Ok(()) => break,
                     Err(e) => {
-                        if retry < MAX_RETRIES
-                            && matches!(
-                                e.sqlite_error_code(),
-                                Some(
-                                    rusqlite::ErrorCode::DatabaseBusy
-                                        | rusqlite::ErrorCode::DatabaseLocked
-                                )
-                            )
-                        {
+                        if retry < MAX_RETRIES && csqlite_error_is_retryable(&e) {
                             retry += 1;
+                            retried_operations = retried_operations
+                                .checked_add(1)
+                                .ok_or_else(|| format!("[sqlite t{tid}] retry counter overflow"))?;
                             thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
                             continue;
                         }
                         eprintln!("[sqlite t{tid}] COMMIT failed: {e}");
                         let _ = conn.execute_batch("ROLLBACK");
-                        failed += rows_per_thread;
+                        failed = rows_per_thread;
                         break;
                     }
                 }
             }
 
-            failed
+            Ok(WorkerWork {
+                settings,
+                attempted_writes,
+                retried_operations,
+                reported_failed_writes: failed,
+                workload_finished: Instant::now(),
+            })
         });
         handles.push(handle);
     }
+    drop(startup_tx);
 
-    let mut total_failed = 0usize;
-    for h in handles {
-        let failed = h.join().expect("thread join");
-        total_failed += failed;
+    let startup_failures = match collect_startup_outcomes("C SQLite", threads, &startup_rx) {
+        Ok(failures) => failures,
+        Err(error) => {
+            return Err(cleanup_workers_after_startup_failure(
+                "C SQLite",
+                &startup_gate,
+                handles,
+                &init_settings,
+                error,
+            ));
+        }
+    };
+    if !startup_failures.is_empty() {
+        let error = format_startup_failures("C SQLite", &startup_failures);
+        return Err(cleanup_workers_after_startup_failure(
+            "C SQLite",
+            &startup_gate,
+            handles,
+            &init_settings,
+            error,
+        ));
     }
-    let elapsed = t0.elapsed();
 
-    RunResult {
-        best_elapsed: elapsed,
-        total_rows: threads * rows_per_thread,
-        failed_rows: total_failed,
-    }
+    let worker_startup_elapsed = worker_startup_started.elapsed();
+    let workload_started = publish_startup_decision(&startup_gate, true);
+    let work = join_worker_handles("C SQLite", handles, &init_settings)?;
+    let workload_elapsed = work
+        .workload_finished
+        .checked_duration_since(workload_started)
+        .ok_or_else(|| "C SQLite worker completion preceded workload start".to_owned())?;
+    let expected = expected_database_state(threads, rows_per_thread, separate_tables)?;
+    let (observed, integrity_check) =
+        query_rusqlite_committed_state(path.as_str(), threads, separate_tables)?;
+    let committed_state = build_committed_state_oracle(expected, observed, integrity_check);
+    let offered_writes = threads
+        .checked_mul(rows_per_thread)
+        .ok_or_else(|| "C SQLite offered-write count overflow".to_owned())?;
+    let accounting = build_work_accounting(
+        offered_writes,
+        work.attempted_writes,
+        work.retried_operations,
+        work.reported_failed_writes,
+        committed_state.observed_rows,
+    );
+
+    Ok(RunResult {
+        worker_startup_elapsed,
+        workload_elapsed,
+        settings: init_settings,
+        accounting,
+        committed_state,
+    })
 }
 
 // ─── Driver ───────────────────────────────────────────────────────────────
@@ -1453,40 +2966,137 @@ fn main() {
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn run() -> Result<(), String> {
     let opts = parse_args();
+    validate_workload_bounds(opts.rows_per_thread, opts.separate_tables)?;
+    let (wal_autocheckpoint_pages, wal_autocheckpoint_overridden) =
+        bench_wal_autocheckpoint_pages()?;
+    let available_parallelism = std::thread::available_parallelism()
+        .ok()
+        .map(|value| value.get());
 
     eprintln!(
-        "mt-mvcc-bench: rows_per_thread={} threads={:?} paired_rounds={} bootstrap_reps={} synchronous=NORMAL apples_to_apples={} separate_tables={}",
+        "mt-mvcc-bench: rows_per_thread={} threads={:?} paired_rounds={} bootstrap_reps={} synchronous=NORMAL wal_autocheckpoint={} available_parallelism={available_parallelism:?} apples_to_apples={} separate_tables={}",
         opts.rows_per_thread,
         opts.threads,
         opts.iters,
         CONTRACT_BOOTSTRAP_REPS,
+        wal_autocheckpoint_pages,
         opts.apples_to_apples,
         opts.separate_tables,
     );
+    eprintln!("mt-mvcc-bench: NON-CITABLE: {NON_CITABLE_REASON}");
+    eprintln!("mt-mvcc-bench: settings contract: {SETTINGS_INTERPRETATION}");
+    eprintln!("mt-mvcc-bench: accounting contract: {ACCOUNTING_INTERPRETATION}");
+    eprintln!("mt-mvcc-bench: timing contract: {TIMING_INTERPRETATION}");
+    if wal_autocheckpoint_overridden {
+        eprintln!(
+            "mt-mvcc-bench: DIAGNOSTIC OVERRIDE wal_autocheckpoint={wal_autocheckpoint_pages} applied to BOTH \
+             engines — results are NOT comparable with published default-cadence numbers"
+        );
+    }
 
     println!(
-        "threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed"
+        "threads | configuration | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed"
     );
     let mut thread_results = Vec::new();
+    let mut configuration_receipts = Vec::with_capacity(opts.threads.len());
     for &n in &opts.threads {
-        if n == 0 {
+        let retry_timeout = opts.retry_timeout_secs.map_or_else(
+            || fsqlite_retry_timeout(n, opts.rows_per_thread),
+            Duration::from_secs,
+        );
+        let retry_policy = retry_policy_receipt(retry_timeout, opts.retry_timeout_secs.is_some())?;
+        let configuration = configuration_receipt(
+            n,
+            opts.rows_per_thread,
+            available_parallelism,
+            wal_autocheckpoint_pages,
+            wal_autocheckpoint_overridden,
+            retry_policy,
+        );
+        println!(
+            "case={} threads={n} configuration_status={} comparison_eligible={} measured={} available_parallelism={:?} max_supported_writers={} offered_writes_per_sample={:?} wal_autocheckpoint_pages={:?} wal_autocheckpoint_overridden={:?} retry_policy={:?} reason={:?}",
+            workload_shape(opts.separate_tables),
+            configuration.status,
+            configuration.comparison_eligible,
+            configuration.measured,
+            configuration.available_parallelism,
+            configuration.max_supported_writers,
+            configuration.offered_writes_per_sample,
+            configuration.wal_autocheckpoint_pages,
+            configuration.wal_autocheckpoint_overridden,
+            configuration.retry_policy,
+            configuration.reason,
+        );
+        configuration_receipts.push(configuration.clone());
+        if !configuration.measured {
             continue;
         }
         let (null, claim) = collect_contract(
             opts.iters,
-            || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
-            || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
-            || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
-            || run_fsqlite(n, opts.rows_per_thread, opts.separate_tables),
+            || {
+                run_rusqlite(
+                    n,
+                    opts.rows_per_thread,
+                    opts.separate_tables,
+                    wal_autocheckpoint_pages,
+                )
+            },
+            || {
+                run_rusqlite(
+                    n,
+                    opts.rows_per_thread,
+                    opts.separate_tables,
+                    wal_autocheckpoint_pages,
+                )
+            },
+            || {
+                run_rusqlite(
+                    n,
+                    opts.rows_per_thread,
+                    opts.separate_tables,
+                    wal_autocheckpoint_pages,
+                )
+            },
+            || {
+                // Registry commit-lock decomposition (bd-i0tn6 evidence):
+                // reset before / snapshot after each F invocation so every
+                // paired round prints its own hold/wait line, tagged with
+                // the thread count. The bench writers run in-process, so
+                // the process-global counters are exactly this run's.
+                fsqlite_mvcc::reset_registry_commit_lock_metrics();
+                let result = run_fsqlite(
+                    n,
+                    opts.rows_per_thread,
+                    opts.separate_tables,
+                    retry_timeout,
+                    wal_autocheckpoint_pages,
+                );
+                let m = fsqlite_mvcc::registry_commit_lock_metrics();
+                if m.holds_total > 0 {
+                    eprintln!(
+                        "registry_lock threads={n} holds={} wait_ns_total={} wait_ns_max={} \
+                         hold_ns_total={} hold_ns_max={} mean_hold_us={:.1} mean_wait_us={:.1}",
+                        m.holds_total,
+                        m.wait_ns_total,
+                        m.wait_ns_max,
+                        m.hold_ns_total,
+                        m.hold_ns_max,
+                        m.hold_ns_total as f64 / m.holds_total as f64 / 1_000.0,
+                        m.wait_ns_total as f64 / m.holds_total as f64 / 1_000.0,
+                    );
+                }
+                result
+            },
         )?;
-        let report = build_thread_report(n, &null, &claim);
+        let report = build_thread_report(n, &null, &claim, &configuration);
         let contract = report
             .median_ci_contract
             .as_ref()
             .expect("current report always carries median-CI evidence");
 
         println!(
-            "{n:>7} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {fs_wps_p95:>15.0} | {fs_wps_p99:>15.0} | {sqlite_wps_p95:>14.0} | {sqlite_wps_p99:>14.0} | {fs_ms_p50:>14.2} | {fs_ms_p95:>14.2} | {fs_ms_p99:>14.2} | {sqlite_ms_p50:>13.2} | {sqlite_ms_p95:>13.2} | {sqlite_ms_p99:>13.2} | {time_ratio:>10.2}x | {fs_failed:>14} | {sqlite_failed:>13}",
+            "{n:>7} | {configuration_status:>13} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {fs_wps_p95:>15.0} | {fs_wps_p99:>15.0} | {sqlite_wps_p95:>14.0} | {sqlite_wps_p99:>14.0} | {fs_ms_p50:>14.2} | {fs_ms_p95:>14.2} | {fs_ms_p99:>14.2} | {sqlite_ms_p50:>13.2} | {sqlite_ms_p95:>13.2} | {sqlite_ms_p99:>13.2} | {time_ratio:>10.2}x | {fs_failed:>14} | {sqlite_failed:>13}",
+            configuration_status = configuration.status,
             fs_wps = report.fsqlite_wps_p50,
             cs_wps = report.sqlite_wps_p50,
             throughput_ratio = report.throughput_ratio,
@@ -1505,16 +3115,26 @@ fn run() -> Result<(), String> {
             sqlite_failed = report.sqlite_failed_rows
         );
         println!(
-            "case={} threads={n} synchronous=NORMAL null_c_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} cv_gate=never",
+            "case={} threads={n} synchronous=NORMAL null_c_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} cv_gate=never null_a_offered={} null_a_attempted={} null_a_committed={} null_a_retried={} null_a_failed={} null_b_offered={} null_b_attempted={} null_b_committed={} null_b_retried={} null_b_failed={}",
             workload_shape(opts.separate_tables),
             contract.null_ratio_median,
             contract.null_ratio_ci95_low,
             contract.null_ratio_ci95_high,
             contract.null_ratio_cv_pct,
             contract.null_ratio_mad,
+            null.arm_a.total_offered_writes(),
+            null.arm_a.total_attempted_writes(),
+            null.arm_a.total_succeeded_writes(),
+            null.arm_a.total_retried_operations(),
+            null.arm_a.total_failed_rows(),
+            null.arm_b.total_offered_writes(),
+            null.arm_b.total_attempted_writes(),
+            null.arm_b.total_succeeded_writes(),
+            null.arm_b.total_retried_operations(),
+            null.arm_b.total_failed_rows(),
         );
         println!(
-            "case={} threads={n} synchronous=NORMAL claim_f_over_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} fsqlite_p50_wps={:.3} sqlite_p50_wps={:.3} fsqlite_failed={} sqlite_failed={}",
+            "case={} threads={n} synchronous=NORMAL claim_f_over_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} fsqlite_p50_wps={:.3} sqlite_p50_wps={:.3} fsqlite_offered={} fsqlite_attempted={} fsqlite_committed={} fsqlite_retried={} fsqlite_failed={} sqlite_offered={} sqlite_attempted={} sqlite_committed={} sqlite_retried={} sqlite_failed={}",
             workload_shape(opts.separate_tables),
             contract.claim_ratio_median,
             contract.claim_ratio_ci95_low,
@@ -1523,16 +3143,43 @@ fn run() -> Result<(), String> {
             contract.claim_ratio_mad,
             report.fsqlite_wps_p50,
             report.sqlite_wps_p50,
-            report.fsqlite_failed_rows,
-            report.sqlite_failed_rows,
+            claim.arm_b.total_offered_writes(),
+            claim.arm_b.total_attempted_writes(),
+            claim.arm_b.total_succeeded_writes(),
+            claim.arm_b.total_retried_operations(),
+            claim.arm_b.total_failed_rows(),
+            claim.arm_a.total_offered_writes(),
+            claim.arm_a.total_attempted_writes(),
+            claim.arm_a.total_succeeded_writes(),
+            claim.arm_a.total_retried_operations(),
+            claim.arm_a.total_failed_rows(),
+        );
+        let c_settings = &claim
+            .arm_a
+            .samples
+            .first()
+            .expect("paired claim has at least one C sample")
+            .settings;
+        let f_settings = &claim
+            .arm_b
+            .samples
+            .first()
+            .expect("paired claim has at least one FrankenSQLite sample")
+            .settings;
+        println!(
+            "case={} threads={n} effective_settings_readback c={c_settings:?} f={f_settings:?} note=equal_named_values_do_not_claim_cross_engine_semantic_equivalence",
+            workload_shape(opts.separate_tables),
         );
         println!(
-            "case={} threads={n} median_ci_gate={} rule=claim_ci95_beyond_2x_null_radius cv_gate={} null_radius={:.6} claim_margin={:.3} min_decidable_gain={:.6} max_decidable_regression={:.6}",
+            "case={} threads={n} configuration_status={} median_ci_gate={} rule=claim_ci95_beyond_2x_null_radius cv_gate={} null_radius={:.6} claim_margin={} min_decidable_gain={:.6} max_decidable_regression={:.6}",
             workload_shape(opts.separate_tables),
+            configuration.status,
             contract.verdict,
             contract.cv_gate,
             contract.null_radius,
-            contract.claim_margin,
+            contract
+                .claim_margin
+                .map_or_else(|| "unbounded".to_owned(), |margin| format!("{margin:.3}"),),
             contract.min_decidable_gain,
             contract.max_decidable_regression,
         );
@@ -1541,19 +3188,35 @@ fn run() -> Result<(), String> {
 
     let previous_report = load_previous_report(&opts.history_json)?;
     let workload_shape = workload_shape(opts.separate_tables);
-    let pass_over_pass_gate = build_pass_over_pass_gate(
-        &opts.history_json,
-        previous_report.as_ref(),
-        &thread_results,
-        workload_shape,
-        opts.rows_per_thread,
+    let pass_over_pass_gate = build_pass_over_pass_gate(PassOverPassGateInput {
+        history_json: &opts.history_json,
+        previous: previous_report.as_ref(),
+        current_rows: &thread_results,
+        current_configuration_receipts: &configuration_receipts,
+        current_workload_shape: workload_shape,
+        current_rows_per_thread: opts.rows_per_thread,
+        current_iterations: opts.iters,
+        current_wal_autocheckpoint_overridden: wal_autocheckpoint_overridden,
+        current_retry_timeout_overridden: opts.retry_timeout_secs.is_some(),
+    });
+    eprintln!(
+        "mt-mvcc-bench: pass-over-pass status={} comparable_pairs={} previous_report_found={}",
+        pass_over_pass_gate.status,
+        pass_over_pass_gate.comparable_pair_count,
+        pass_over_pass_gate.previous_report_found,
     );
 
     let full_report = MtMvccBenchReport {
-        schema_version: REPORT_SCHEMA_V4,
+        schema_version: REPORT_SCHEMA_V6,
+        citable: false,
+        non_citable_reason: NON_CITABLE_REASON,
+        settings_interpretation: SETTINGS_INTERPRETATION,
+        accounting_interpretation: ACCOUNTING_INTERPRETATION,
+        timing_interpretation: TIMING_INTERPRETATION,
         workload_shape,
         rows_per_thread: opts.rows_per_thread,
         iterations: opts.iters,
+        configuration_receipts,
         thread_results,
         pass_over_pass_gate,
     };
@@ -1566,12 +3229,15 @@ fn run() -> Result<(), String> {
         write_markdown_summary(path, &full_report)?;
         eprintln!("mt-mvcc-bench: wrote markdown summary {}", path.display());
     }
-    let invalid_failed_rows = full_report.thread_results.iter().any(|row| {
-        row.median_ci_contract
-            .as_ref()
-            .is_some_and(|contract| contract.verdict == "INVALID_FAILED_ROWS")
-    });
-    if !invalid_failed_rows {
+    let invalid_evidence = history_evidence_is_invalid(
+        wal_autocheckpoint_overridden,
+        opts.retry_timeout_secs.is_some(),
+        opts.rows_per_thread,
+        opts.iters,
+        &full_report.thread_results,
+        &full_report.configuration_receipts,
+    );
+    if !invalid_evidence {
         write_json_report(&opts.history_json, &full_report)?;
         eprintln!(
             "mt-mvcc-bench: updated pass-over-pass history {}",
@@ -1596,9 +3262,11 @@ fn run() -> Result<(), String> {
                 .join(", ")
         );
     }
-    if invalid_failed_rows {
+    if invalid_evidence {
         return Err(
-            "median-CI evidence invalid because at least one arm reported failed rows".to_owned(),
+            "benchmark evidence is non-comparable or invalid; inspect configuration receipts, \
+             committed-state oracles, and work accounting"
+                .to_owned(),
         );
     }
 
@@ -1610,11 +3278,194 @@ mod tests {
     use super::*;
 
     fn sample_result(elapsed_ms: u64, total_rows: usize, failed_rows: usize) -> RunResult {
+        let committed_rows = total_rows - failed_rows;
         RunResult {
-            best_elapsed: Duration::from_millis(elapsed_ms),
-            total_rows,
-            failed_rows,
+            worker_startup_elapsed: Duration::from_millis(1),
+            workload_elapsed: Duration::from_millis(elapsed_ms),
+            settings: expected_effective_settings("test_engine", DEFAULT_WAL_AUTOCHECKPOINT_PAGES),
+            accounting: WorkAccounting {
+                offered_writes: total_rows,
+                attempted_writes: total_rows,
+                succeeded_writes: committed_rows,
+                retried_operations: 0,
+                failed_writes: failed_rows,
+                worker_reported_failed_writes: failed_rows,
+                exact: true,
+                diagnostics: Vec::new(),
+            },
+            committed_state: CommittedStateOracle {
+                expected_rows: total_rows,
+                observed_rows: committed_rows,
+                expected_id_sum: 0,
+                observed_id_sum: 0,
+                expected_payload_sha256: "expected".to_owned(),
+                observed_payload_sha256: if failed_rows == 0 {
+                    "expected".to_owned()
+                } else {
+                    "incomplete".to_owned()
+                },
+                integrity_check: vec!["ok".to_owned()],
+                valid: failed_rows == 0,
+                diagnostics: Vec::new(),
+            },
         }
+    }
+
+    fn default_retry_policy(writers: usize, rows_per_thread: usize) -> RetryPolicyReceipt {
+        retry_policy_receipt(fsqlite_retry_timeout(writers, rows_per_thread), false)
+            .expect("test retry policy must fit")
+    }
+
+    fn supported_configuration(writers: usize) -> ConfigurationReceipt {
+        configuration_receipt(
+            writers,
+            DEFAULT_ROWS_PER_THREAD,
+            Some(writers),
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            false,
+            default_retry_policy(writers, DEFAULT_ROWS_PER_THREAD),
+        )
+    }
+
+    fn engine_sample_result(
+        elapsed_ms: u64,
+        total_rows: usize,
+        concurrent_mode: &str,
+        wal_autocheckpoint_pages: i64,
+    ) -> RunResult {
+        let mut sample = sample_result(elapsed_ms, total_rows, 0);
+        sample.settings = expected_effective_settings(concurrent_mode, wal_autocheckpoint_pages);
+        sample
+    }
+
+    fn valid_history_row(
+        threads: usize,
+        sqlite_elapsed_ms: u64,
+        fsqlite_elapsed_ms: u64,
+        wal_autocheckpoint_pages: i64,
+    ) -> ThreadComparisonReport {
+        valid_history_row_with_iterations(
+            threads,
+            sqlite_elapsed_ms,
+            fsqlite_elapsed_ms,
+            wal_autocheckpoint_pages,
+            1,
+        )
+    }
+
+    fn valid_history_row_with_iterations(
+        threads: usize,
+        sqlite_elapsed_ms: u64,
+        fsqlite_elapsed_ms: u64,
+        wal_autocheckpoint_pages: i64,
+        iterations: usize,
+    ) -> ThreadComparisonReport {
+        let offered_writes = threads
+            .checked_mul(DEFAULT_ROWS_PER_THREAD)
+            .expect("test offered work must fit");
+        let sqlite = engine_sample_result(
+            sqlite_elapsed_ms,
+            offered_writes,
+            "sqlite_wal_single_writer",
+            wal_autocheckpoint_pages,
+        );
+        let fsqlite = engine_sample_result(
+            fsqlite_elapsed_ms,
+            offered_writes,
+            "fsqlite_mvcc_on",
+            wal_autocheckpoint_pages,
+        );
+        let null = paired_run_stats(
+            vec![sqlite.clone(); iterations],
+            vec![sqlite.clone(); iterations],
+        );
+        let claim = paired_run_stats(vec![sqlite; iterations], vec![fsqlite; iterations]);
+        let configuration = configuration_receipt(
+            threads,
+            DEFAULT_ROWS_PER_THREAD,
+            Some(threads),
+            wal_autocheckpoint_pages,
+            false,
+            default_retry_policy(threads, DEFAULT_ROWS_PER_THREAD),
+        );
+        build_thread_report(threads, &null, &claim, &configuration)
+    }
+
+    fn history_with_rows(
+        rows_per_thread: usize,
+        thread_results: Vec<ThreadComparisonReport>,
+    ) -> HistoricalMtMvccBenchReport {
+        history_with_rows_and_iterations(rows_per_thread, 1, thread_results)
+    }
+
+    fn history_with_rows_and_iterations(
+        rows_per_thread: usize,
+        iterations: usize,
+        thread_results: Vec<ThreadComparisonReport>,
+    ) -> HistoricalMtMvccBenchReport {
+        let configuration_receipts = thread_results
+            .iter()
+            .filter_map(|row| row.truth.as_ref().map(|truth| truth.configuration.clone()))
+            .collect();
+        HistoricalMtMvccBenchReport {
+            schema_version: Some(REPORT_SCHEMA_V6.to_owned()),
+            settings_interpretation: Some(SETTINGS_INTERPRETATION.to_owned()),
+            accounting_interpretation: Some(ACCOUNTING_INTERPRETATION.to_owned()),
+            timing_interpretation: Some(TIMING_INTERPRETATION.to_owned()),
+            workload_shape: Some("shared_table".to_owned()),
+            rows_per_thread: Some(rows_per_thread),
+            iterations: Some(iterations),
+            configuration_receipts: Some(configuration_receipts),
+            thread_results,
+        }
+    }
+
+    fn configuration_receipts_from_rows(
+        rows: &[ThreadComparisonReport],
+    ) -> Vec<ConfigurationReceipt> {
+        rows.iter()
+            .filter_map(|row| row.truth.as_ref().map(|truth| truth.configuration.clone()))
+            .collect()
+    }
+
+    fn gate_from_serialized_history(
+        history: serde_json::Value,
+        current_rows: &[ThreadComparisonReport],
+        current_iterations: usize,
+    ) -> PassOverPassGateReport {
+        let previous = serde_json::from_value::<HistoricalMtMvccBenchReport>(history)
+            .expect("test historical report must deserialize");
+        let current_configuration_receipts = configuration_receipts_from_rows(current_rows);
+        build_pass_over_pass_gate(PassOverPassGateInput {
+            history_json: Path::new(DEFAULT_HISTORY_JSON),
+            previous: Some(&previous),
+            current_rows,
+            current_configuration_receipts: &current_configuration_receipts,
+            current_workload_shape: "shared_table",
+            current_rows_per_thread: DEFAULT_ROWS_PER_THREAD,
+            current_iterations,
+            current_wal_autocheckpoint_overridden: false,
+            current_retry_timeout_overridden: false,
+        })
+    }
+
+    fn gate_with_rows(
+        previous_rows: Vec<ThreadComparisonReport>,
+        current_rows: Vec<ThreadComparisonReport>,
+    ) -> PassOverPassGateReport {
+        let previous = history_with_rows(1_000, previous_rows);
+        let current_configuration_receipts = configuration_receipts_from_rows(&current_rows);
+        build_pass_over_pass_gate(PassOverPassGateInput {
+            history_json: Path::new(DEFAULT_HISTORY_JSON),
+            previous: Some(&previous),
+            current_rows: &current_rows,
+            current_configuration_receipts: &current_configuration_receipts,
+            current_workload_shape: "shared_table",
+            current_rows_per_thread: 1_000,
+            current_iterations: 1,
+            current_wal_autocheckpoint_overridden: false,
+            current_retry_timeout_overridden: false,
+        })
     }
 
     #[test]
@@ -1628,12 +3479,12 @@ mod tests {
             vec![sample_result(200, 1000, 3)],
         );
 
-        let report = build_thread_report(4, &null, &claim);
+        let report = build_thread_report(4, &null, &claim, &supported_configuration(4));
 
         assert_eq!(report.threads, 4);
-        assert!((report.fsqlite_wps_p50 - 5000.0).abs() < 0.01);
-        assert!((report.sqlite_wps_p50 - 10_000.0).abs() < 0.01);
-        assert!((report.throughput_ratio - 0.5).abs() < 0.0001);
+        assert!((report.fsqlite_wps_p50 - 4985.0).abs() < 0.01);
+        assert!((report.sqlite_wps_p50 - 9990.0).abs() < 0.01);
+        assert!((report.throughput_ratio - (4985.0 / 9990.0)).abs() < 0.0001);
         assert!((report.time_ratio - 2.0).abs() < 0.0001);
         assert_eq!(report.fsqlite_failed_rows, 3);
         assert_eq!(report.sqlite_failed_rows, 1);
@@ -1642,10 +3493,16 @@ mod tests {
     #[test]
     fn markdown_summary_renders_thread_rows() {
         let report = MtMvccBenchReport {
-            schema_version: REPORT_SCHEMA_V4,
+            schema_version: REPORT_SCHEMA_V6,
+            citable: false,
+            non_citable_reason: NON_CITABLE_REASON,
+            settings_interpretation: SETTINGS_INTERPRETATION,
+            accounting_interpretation: ACCOUNTING_INTERPRETATION,
+            timing_interpretation: TIMING_INTERPRETATION,
             workload_shape: "shared_table",
             rows_per_thread: 250,
             iterations: 1,
+            configuration_receipts: vec![supported_configuration(8)],
             thread_results: vec![ThreadComparisonReport {
                 threads: 8,
                 fsqlite_wps_p50: 6090.0,
@@ -1665,6 +3522,7 @@ mod tests {
                 fsqlite_failed_rows: 0,
                 sqlite_failed_rows: 0,
                 median_ci_contract: None,
+                truth: None,
             }],
             pass_over_pass_gate: PassOverPassGateReport {
                 schema_version: PASS_OVER_PASS_SCHEMA_V1,
@@ -1672,6 +3530,7 @@ mod tests {
                 threshold_ratio_drop_pct: PASS_OVER_PASS_MAX_RATIO_DROP_PCT,
                 status: "passed",
                 previous_report_found: true,
+                comparable_pair_count: 1,
                 regressions: Vec::new(),
             },
         };
@@ -1680,8 +3539,9 @@ mod tests {
 
         assert!(rendered.contains("# mt-mvcc-bench Summary"));
         assert!(rendered.contains("- Workload shape: `shared_table`"));
-        assert!(rendered.contains("| 8 | 6090 | 55406 | 0.110x | unavailable |"));
+        assert!(rendered.contains("| 8 | unavailable | 6090 | 55406 | 0.110x | unavailable |"));
         assert!(rendered.contains("Pass-over-pass gate"));
+        assert!(rendered.contains("comparable pairs `1`"));
     }
 
     #[test]
@@ -1734,137 +3594,720 @@ mod tests {
     }
 
     #[test]
-    fn pass_over_pass_gate_flags_ratio_drop_over_five_percent() {
-        let previous = HistoricalMtMvccBenchReport {
-            workload_shape: Some("shared_table".to_owned()),
-            rows_per_thread: Some(1000),
-            thread_results: vec![ThreadComparisonReport {
-                threads: 8,
-                fsqlite_wps_p50: 0.0,
-                fsqlite_wps_p95: 0.0,
-                fsqlite_wps_p99: 0.0,
-                sqlite_wps_p50: 0.0,
-                sqlite_wps_p95: 0.0,
-                sqlite_wps_p99: 0.0,
-                throughput_ratio: 0.50,
-                fsqlite_ms_p50: 0.0,
-                fsqlite_ms_p95: 0.0,
-                fsqlite_ms_p99: 0.0,
-                sqlite_ms_p50: 0.0,
-                sqlite_ms_p95: 0.0,
-                sqlite_ms_p99: 0.0,
-                time_ratio: 0.0,
-                fsqlite_failed_rows: 0,
-                sqlite_failed_rows: 0,
-                median_ci_contract: None,
-            }],
-        };
-        let current = vec![ThreadComparisonReport {
-            threads: 8,
-            fsqlite_wps_p50: 0.0,
-            fsqlite_wps_p95: 0.0,
-            fsqlite_wps_p99: 0.0,
-            sqlite_wps_p50: 0.0,
-            sqlite_wps_p95: 0.0,
-            sqlite_wps_p99: 0.0,
-            throughput_ratio: 0.46,
-            fsqlite_ms_p50: 0.0,
-            fsqlite_ms_p95: 0.0,
-            fsqlite_ms_p99: 0.0,
-            sqlite_ms_p50: 0.0,
-            sqlite_ms_p95: 0.0,
-            sqlite_ms_p99: 0.0,
-            time_ratio: 0.0,
-            fsqlite_failed_rows: 0,
-            sqlite_failed_rows: 0,
-            median_ci_contract: None,
-        }];
+    fn default_showcase_matrix_keeps_existing_tiers_and_adds_high_writer_tiers() {
+        assert_eq!(DEFAULT_THREADS, &[1, 2, 4, 8, 16, 32, 64, 128]);
+    }
 
-        let gate = build_pass_over_pass_gate(
-            Path::new(DEFAULT_HISTORY_JSON),
-            Some(&previous),
-            &current,
-            "shared_table",
-            1000,
+    #[test]
+    fn configuration_receipts_distinguish_supported_oversubscribed_and_unsupported() {
+        let zero = configuration_receipt(
+            0,
+            DEFAULT_ROWS_PER_THREAD,
+            Some(64),
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            false,
+            default_retry_policy(0, DEFAULT_ROWS_PER_THREAD),
+        );
+        assert_eq!(zero.status, "unsupported");
+        assert!(!zero.comparison_eligible);
+        assert!(!zero.measured);
+
+        let supported = configuration_receipt(
+            32,
+            DEFAULT_ROWS_PER_THREAD,
+            Some(64),
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            false,
+            default_retry_policy(32, DEFAULT_ROWS_PER_THREAD),
+        );
+        assert_eq!(supported.status, "supported");
+        assert!(supported.comparison_eligible);
+        assert!(supported.measured);
+        assert_eq!(
+            supported.wal_autocheckpoint_pages,
+            Some(DEFAULT_WAL_AUTOCHECKPOINT_PAGES)
+        );
+        assert_eq!(supported.wal_autocheckpoint_overridden, Some(false));
+        assert_eq!(
+            supported.offered_writes_per_sample,
+            Some(32 * DEFAULT_ROWS_PER_THREAD)
+        );
+        assert_eq!(
+            supported
+                .retry_policy
+                .as_ref()
+                .expect("retry policy must be reported"),
+            &default_retry_policy(32, DEFAULT_ROWS_PER_THREAD)
+        );
+        let policy = supported
+            .retry_policy
+            .as_ref()
+            .expect("retry policy must be reported");
+        assert_eq!(policy.csqlite_retry_algorithm, CSQLITE_RETRY_ALGORITHM);
+        assert_eq!(
+            policy.fsqlite_retry_backoff_algorithm,
+            FSQLITE_RETRY_BACKOFF_ALGORITHM
+        );
+        assert_eq!(policy.fsqlite_retryable_errors, FSQLITE_RETRYABLE_ERRORS);
+
+        let oversubscribed = configuration_receipt(
+            64,
+            DEFAULT_ROWS_PER_THREAD,
+            Some(32),
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            false,
+            default_retry_policy(64, DEFAULT_ROWS_PER_THREAD),
+        );
+        assert_eq!(oversubscribed.status, "oversubscribed");
+        assert!(!oversubscribed.comparison_eligible);
+        assert!(oversubscribed.measured);
+
+        let unsupported = configuration_receipt(
+            fsqlite_mvcc::MAX_CONCURRENT_WRITERS + 1,
+            DEFAULT_ROWS_PER_THREAD,
+            Some(256),
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            false,
+            default_retry_policy(
+                fsqlite_mvcc::MAX_CONCURRENT_WRITERS + 1,
+                DEFAULT_ROWS_PER_THREAD,
+            ),
+        );
+        assert_eq!(unsupported.status, "unsupported");
+        assert!(!unsupported.comparison_eligible);
+        assert!(!unsupported.measured);
+
+        let diagnostic_override = configuration_receipt(
+            32,
+            DEFAULT_ROWS_PER_THREAD,
+            Some(64),
+            0,
+            true,
+            default_retry_policy(32, DEFAULT_ROWS_PER_THREAD),
+        );
+        assert_eq!(diagnostic_override.status, "diagnostic_override");
+        assert!(!diagnostic_override.comparison_eligible);
+        assert!(diagnostic_override.measured);
+        assert_eq!(diagnostic_override.wal_autocheckpoint_pages, Some(0));
+        assert_eq!(
+            diagnostic_override.wal_autocheckpoint_overridden,
+            Some(true)
+        );
+        assert!(diagnostic_override.reason.contains("cannot update"));
+
+        let retry_override = configuration_receipt(
+            32,
+            DEFAULT_ROWS_PER_THREAD,
+            Some(64),
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            false,
+            retry_policy_receipt(Duration::from_secs(60), true)
+                .expect("test retry override must fit"),
+        );
+        assert_eq!(retry_override.status, "diagnostic_override");
+        assert!(!retry_override.comparison_eligible);
+        assert!(
+            retry_override
+                .reason
+                .contains("FrankenSQLite-only retry-timeout override")
+        );
+    }
+
+    #[test]
+    fn shared_table_workload_bounds_preserve_disjoint_row_ids() {
+        let stride = usize::try_from(ROWID_BASE_STRIDE).unwrap();
+
+        validate_workload_bounds(stride, false).unwrap();
+        assert!(validate_workload_bounds(stride + 1, false).is_err());
+        validate_workload_bounds(stride + 1, true).unwrap();
+    }
+
+    #[test]
+    fn work_accounting_uses_database_commits_as_successes() {
+        let accounting = build_work_accounting(100, 125, 2, 3, 97);
+
+        assert_eq!(accounting.offered_writes, 100);
+        assert_eq!(accounting.attempted_writes, 125);
+        assert_eq!(accounting.succeeded_writes, 97);
+        assert_eq!(accounting.retried_operations, 2);
+        assert_eq!(accounting.failed_writes, 3);
+        assert!(accounting.exact);
+    }
+
+    #[test]
+    fn throughput_uses_only_workload_time_not_worker_startup() {
+        let mut result = sample_result(10, 1_000, 0);
+        result.worker_startup_elapsed = Duration::from_secs(10);
+
+        assert!((result.writes_per_sec() - 100_000.0).abs() < f64::EPSILON);
+        let evidence = result.sample_evidence();
+        assert_eq!(
+            evidence.worker_startup_elapsed_ns,
+            Duration::from_secs(10).as_nanos()
+        );
+        assert_eq!(
+            evidence.workload_elapsed_ns,
+            Duration::from_millis(10).as_nanos()
+        );
+    }
+
+    #[test]
+    fn startup_abort_wakes_workers_that_have_not_yet_parked() {
+        let gate = Arc::new((Mutex::new(StartupGateState::default()), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let handle = thread::spawn(move || {
+            let (lock, condvar) = &*worker_gate;
+            let mut state = lock.lock().expect("test gate lock");
+            while !state.release && !state.abort {
+                state = condvar.wait(state).expect("test gate wait");
+            }
+            state.abort
+        });
+
+        publish_startup_decision(&gate, false);
+        assert!(
+            handle.join().expect("test worker must join"),
+            "abort publication must be sticky even when it wins before the worker waits"
+        );
+    }
+
+    #[test]
+    fn worker_join_aggregates_every_terminal_error_before_returning() {
+        let settings = expected_effective_settings("test_engine", DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let success_counter = Arc::clone(&completed);
+        let final_error_counter = Arc::clone(&completed);
+        let success_settings = settings.clone();
+        let handles = vec![
+            thread::spawn(|| Err("first".to_owned())),
+            thread::spawn(move || {
+                success_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(WorkerWork {
+                    settings: success_settings,
+                    attempted_writes: 1,
+                    retried_operations: 0,
+                    reported_failed_writes: 0,
+                    workload_finished: Instant::now(),
+                })
+            }),
+            thread::spawn(move || {
+                final_error_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("last".to_owned())
+            }),
+        ];
+
+        let error = join_worker_handles("test", handles, &settings)
+            .expect_err("terminal worker errors must fail the aggregate");
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(error.contains("worker t0 failed: first"));
+        assert!(error.contains("worker t2 failed: last"));
+    }
+
+    #[test]
+    fn pass_over_pass_gate_flags_ratio_drop_over_five_percent() {
+        let gate = gate_with_rows(
+            vec![valid_history_row(
+                8,
+                100,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
+            vec![valid_history_row(
+                8,
+                90,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
         );
 
         assert_eq!(gate.status, "failed");
+        assert_eq!(gate.comparable_pair_count, 1);
         assert_eq!(gate.regressions.len(), 1);
         assert_eq!(gate.regressions[0].threads, 8);
-        assert!((gate.regressions[0].ratio_drop_pct - 8.0).abs() < 1.0e-6);
+        assert!((gate.regressions[0].ratio_drop_pct - 10.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn pass_over_pass_gate_passes_only_with_a_valid_comparable_pair() {
+        let gate = gate_with_rows(
+            vec![valid_history_row(
+                8,
+                100,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
+            vec![valid_history_row(
+                8,
+                110,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
+        );
+
+        assert_eq!(gate.status, "passed");
+        assert_eq!(gate.comparable_pair_count, 1);
+        assert!(gate.regressions.is_empty());
     }
 
     #[test]
     fn pass_over_pass_gate_skips_without_prior_report() {
-        let gate = build_pass_over_pass_gate(
-            Path::new(DEFAULT_HISTORY_JSON),
-            None,
-            &[],
-            "shared_table",
-            1000,
-        );
+        let gate = build_pass_over_pass_gate(PassOverPassGateInput {
+            history_json: Path::new(DEFAULT_HISTORY_JSON),
+            previous: None,
+            current_rows: &[],
+            current_configuration_receipts: &[],
+            current_workload_shape: "shared_table",
+            current_rows_per_thread: 1000,
+            current_iterations: 1,
+            current_wal_autocheckpoint_overridden: false,
+            current_retry_timeout_overridden: false,
+        });
 
         assert_eq!(gate.status, "no_prior_report");
+        assert_eq!(gate.comparable_pair_count, 0);
         assert!(gate.regressions.is_empty());
     }
 
     #[test]
     fn pass_over_pass_gate_skips_incompatible_history_shape() {
-        let previous = HistoricalMtMvccBenchReport {
-            workload_shape: Some("shared_table".to_owned()),
-            rows_per_thread: Some(100),
-            thread_results: vec![ThreadComparisonReport {
-                threads: 16,
-                fsqlite_wps_p50: 0.0,
-                fsqlite_wps_p95: 0.0,
-                fsqlite_wps_p99: 0.0,
-                sqlite_wps_p50: 0.0,
-                sqlite_wps_p95: 0.0,
-                sqlite_wps_p99: 0.0,
-                throughput_ratio: 30.0,
-                fsqlite_ms_p50: 0.0,
-                fsqlite_ms_p95: 0.0,
-                fsqlite_ms_p99: 0.0,
-                sqlite_ms_p50: 0.0,
-                sqlite_ms_p95: 0.0,
-                sqlite_ms_p99: 0.0,
-                time_ratio: 0.0,
-                fsqlite_failed_rows: 0,
-                sqlite_failed_rows: 0,
-                median_ci_contract: None,
-            }],
-        };
-        let current = vec![ThreadComparisonReport {
-            threads: 16,
-            fsqlite_wps_p50: 0.0,
-            fsqlite_wps_p95: 0.0,
-            fsqlite_wps_p99: 0.0,
-            sqlite_wps_p50: 0.0,
-            sqlite_wps_p95: 0.0,
-            sqlite_wps_p99: 0.0,
-            throughput_ratio: 20.0,
-            fsqlite_ms_p50: 0.0,
-            fsqlite_ms_p95: 0.0,
-            fsqlite_ms_p99: 0.0,
-            sqlite_ms_p50: 0.0,
-            sqlite_ms_p95: 0.0,
-            sqlite_ms_p99: 0.0,
-            time_ratio: 0.0,
-            fsqlite_failed_rows: 0,
-            sqlite_failed_rows: 0,
-            median_ci_contract: None,
-        }];
-
-        let gate = build_pass_over_pass_gate(
-            Path::new(DEFAULT_HISTORY_JSON),
-            Some(&previous),
-            &current,
-            "shared_table",
-            1000,
+        let previous = history_with_rows(
+            100,
+            vec![valid_history_row(
+                16,
+                100,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
         );
+        let current = vec![valid_history_row(
+            16,
+            90,
+            200,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+        )];
+        let current_configuration_receipts = vec![
+            current[0]
+                .truth
+                .as_ref()
+                .expect("test current row truth")
+                .configuration
+                .clone(),
+        ];
+
+        let gate = build_pass_over_pass_gate(PassOverPassGateInput {
+            history_json: Path::new(DEFAULT_HISTORY_JSON),
+            previous: Some(&previous),
+            current_rows: &current,
+            current_configuration_receipts: &current_configuration_receipts,
+            current_workload_shape: "shared_table",
+            current_rows_per_thread: 1000,
+            current_iterations: 1,
+            current_wal_autocheckpoint_overridden: false,
+            current_retry_timeout_overridden: false,
+        });
 
         assert_eq!(gate.status, "no_prior_report");
+        assert_eq!(gate.comparable_pair_count, 0);
         assert!(gate.regressions.is_empty());
+    }
+
+    #[test]
+    fn loaded_history_requires_exact_top_level_v6_contract() {
+        let previous_row = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let current_rows = vec![valid_history_row(
+            8,
+            100,
+            200,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+        )];
+        let base = serde_json::to_value(history_with_rows(
+            DEFAULT_ROWS_PER_THREAD,
+            vec![previous_row],
+        ))
+        .expect("test history must serialize");
+
+        let valid_gate = gate_from_serialized_history(base.clone(), &current_rows, 1);
+        assert_eq!(valid_gate.status, "passed");
+
+        for field in [
+            "settings_interpretation",
+            "accounting_interpretation",
+            "timing_interpretation",
+        ] {
+            let mut mutated = base.clone();
+            mutated[field] = serde_json::json!("mutated contract");
+            let gate = gate_from_serialized_history(mutated, &current_rows, 1);
+            assert_eq!(gate.status, "no_prior_report", "field {field}");
+        }
+
+        for field in [
+            "iterations",
+            "configuration_receipts",
+            "settings_interpretation",
+            "accounting_interpretation",
+            "timing_interpretation",
+        ] {
+            let mut missing = base.clone();
+            missing
+                .as_object_mut()
+                .expect("test history must be an object")
+                .remove(field);
+            let gate = gate_from_serialized_history(missing, &current_rows, 1);
+            assert_eq!(gate.status, "no_prior_report", "missing field {field}");
+        }
+
+        let mut wrong_iterations = base.clone();
+        wrong_iterations["iterations"] = serde_json::json!(2);
+        assert_eq!(
+            gate_from_serialized_history(wrong_iterations, &current_rows, 1).status,
+            "no_prior_report"
+        );
+
+        let mut wrong_receipt = base;
+        wrong_receipt["configuration_receipts"][0]["writers"] = serde_json::json!(4);
+        assert_eq!(
+            gate_from_serialized_history(wrong_receipt, &current_rows, 1).status,
+            "no_prior_report"
+        );
+    }
+
+    #[test]
+    fn loaded_history_requires_exact_iteration_cardinality_and_retry_identity() {
+        let current_rows = vec![valid_history_row_with_iterations(
+            8,
+            100,
+            200,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            2,
+        )];
+        let one_sample_history = history_with_rows_and_iterations(
+            DEFAULT_ROWS_PER_THREAD,
+            2,
+            vec![valid_history_row(
+                8,
+                100,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
+        );
+        let one_sample_json =
+            serde_json::to_value(one_sample_history).expect("test history must serialize");
+        assert_eq!(
+            gate_from_serialized_history(one_sample_json, &current_rows, 2).status,
+            "no_prior_report"
+        );
+
+        let two_sample_history = history_with_rows_and_iterations(
+            DEFAULT_ROWS_PER_THREAD,
+            2,
+            vec![valid_history_row_with_iterations(
+                8,
+                100,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+                2,
+            )],
+        );
+        let base = serde_json::to_value(two_sample_history).expect("test history must serialize");
+        assert_eq!(
+            gate_from_serialized_history(base.clone(), &current_rows, 2).status,
+            "passed"
+        );
+
+        for field in [
+            "csqlite_retry_algorithm",
+            "fsqlite_retry_backoff_algorithm",
+            "fsqlite_retryable_errors",
+        ] {
+            let mut missing = base.clone();
+            missing["configuration_receipts"][0]["retry_policy"]
+                .as_object_mut()
+                .expect("test retry policy must be an object")
+                .remove(field);
+            let gate = gate_from_serialized_history(missing, &current_rows, 2);
+            assert_eq!(gate.status, "no_prior_report", "missing field {field}");
+        }
+    }
+
+    #[test]
+    fn pass_over_pass_gate_rejects_inconsistent_current_top_level_receipt() {
+        let previous = history_with_rows(
+            DEFAULT_ROWS_PER_THREAD,
+            vec![valid_history_row(
+                8,
+                100,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
+        );
+        let current_rows = vec![valid_history_row(
+            8,
+            90,
+            200,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+        )];
+        let mut current_receipts = configuration_receipts_from_rows(&current_rows);
+        current_receipts[0].offered_writes_per_sample = Some(1);
+
+        let gate = build_pass_over_pass_gate(PassOverPassGateInput {
+            history_json: Path::new(DEFAULT_HISTORY_JSON),
+            previous: Some(&previous),
+            current_rows: &current_rows,
+            current_configuration_receipts: &current_receipts,
+            current_workload_shape: "shared_table",
+            current_rows_per_thread: DEFAULT_ROWS_PER_THREAD,
+            current_iterations: 1,
+            current_wal_autocheckpoint_overridden: false,
+            current_retry_timeout_overridden: false,
+        });
+
+        assert!(gate.previous_report_found);
+        assert_eq!(gate.status, "no_comparable_rows");
+        assert_eq!(gate.comparable_pair_count, 0);
+    }
+
+    #[test]
+    fn pass_over_pass_gate_rejects_missing_or_invalid_evidence_on_either_side() {
+        let valid_previous = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let valid_current = valid_history_row(8, 90, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+
+        let mut previous_missing_truth = valid_previous.clone();
+        previous_missing_truth.truth = None;
+        let mut current_missing_truth = valid_current.clone();
+        current_missing_truth.truth = None;
+        let mut previous_missing_contract = valid_previous.clone();
+        previous_missing_contract.median_ci_contract = None;
+        let mut current_invalid_contract = valid_current.clone();
+        current_invalid_contract
+            .median_ci_contract
+            .as_mut()
+            .unwrap()
+            .verdict = "INVALID_FAILED_ROWS".to_owned();
+        let mut previous_invalid_truth = valid_previous.clone();
+        previous_invalid_truth
+            .truth
+            .as_mut()
+            .unwrap()
+            .sqlite_samples[0]
+            .committed_state
+            .valid = false;
+        let mut current_invalid_truth = valid_current.clone();
+        current_invalid_truth
+            .truth
+            .as_mut()
+            .unwrap()
+            .fsqlite_samples[0]
+            .accounting
+            .exact = false;
+
+        for gate in [
+            gate_with_rows(vec![previous_missing_truth], vec![valid_current.clone()]),
+            gate_with_rows(vec![previous_missing_contract], vec![valid_current.clone()]),
+            gate_with_rows(vec![previous_invalid_truth], vec![valid_current.clone()]),
+        ] {
+            assert_eq!(gate.status, "no_prior_report");
+            assert_eq!(gate.comparable_pair_count, 0);
+            assert!(gate.regressions.is_empty());
+        }
+
+        for gate in [
+            gate_with_rows(vec![valid_previous.clone()], vec![current_missing_truth]),
+            gate_with_rows(vec![valid_previous.clone()], vec![current_invalid_contract]),
+            gate_with_rows(vec![valid_previous.clone()], vec![current_invalid_truth]),
+        ] {
+            assert_eq!(gate.status, "no_comparable_rows");
+            assert_eq!(gate.comparable_pair_count, 0);
+            assert!(gate.regressions.is_empty());
+        }
+    }
+
+    #[test]
+    fn pass_over_pass_gate_rejects_unsupported_and_nonoverlapping_rows() {
+        let valid_previous = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let valid_current = valid_history_row(8, 90, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let mut unsupported_previous = valid_previous.clone();
+        let unsupported_configuration =
+            &mut unsupported_previous.truth.as_mut().unwrap().configuration;
+        unsupported_configuration.status = "unsupported".to_owned();
+        unsupported_configuration.comparison_eligible = false;
+        unsupported_configuration.measured = false;
+        let mut unsupported_current = valid_current.clone();
+        let unsupported_configuration =
+            &mut unsupported_current.truth.as_mut().unwrap().configuration;
+        unsupported_configuration.status = "unsupported".to_owned();
+        unsupported_configuration.comparison_eligible = false;
+        unsupported_configuration.measured = false;
+
+        let unsupported_gate =
+            gate_with_rows(vec![unsupported_previous], vec![valid_current.clone()]);
+        assert_eq!(unsupported_gate.status, "no_prior_report");
+        assert_eq!(unsupported_gate.comparable_pair_count, 0);
+        let unsupported_current_gate =
+            gate_with_rows(vec![valid_previous.clone()], vec![unsupported_current]);
+        assert_eq!(unsupported_current_gate.status, "no_comparable_rows");
+        assert_eq!(unsupported_current_gate.comparable_pair_count, 0);
+
+        let nonoverlap_gate = gate_with_rows(
+            vec![valid_previous],
+            vec![valid_history_row(
+                16,
+                90,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
+        );
+        assert_eq!(nonoverlap_gate.status, "no_comparable_rows");
+        assert_eq!(nonoverlap_gate.comparable_pair_count, 0);
+    }
+
+    #[test]
+    fn pass_over_pass_gate_rejects_duplicate_eligible_threads_on_either_side() {
+        let valid_previous = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let valid_current = valid_history_row(8, 90, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+
+        let duplicate_previous_gate = gate_with_rows(
+            vec![valid_previous.clone(), valid_previous.clone()],
+            vec![valid_current.clone()],
+        );
+        assert_eq!(duplicate_previous_gate.status, "no_prior_report");
+        assert_eq!(duplicate_previous_gate.comparable_pair_count, 0);
+
+        let duplicate_current_gate = gate_with_rows(
+            vec![valid_previous],
+            vec![valid_current.clone(), valid_current],
+        );
+        assert_eq!(duplicate_current_gate.status, "no_comparable_rows");
+        assert_eq!(duplicate_current_gate.comparable_pair_count, 0);
+    }
+
+    #[test]
+    fn pass_over_pass_gate_requires_exact_effective_settings_fingerprint() {
+        let gate = gate_with_rows(
+            vec![valid_history_row(
+                8,
+                100,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
+            vec![valid_history_row(8, 90, 200, 0)],
+        );
+
+        assert_eq!(gate.status, "no_comparable_rows");
+        assert_eq!(gate.comparable_pair_count, 0);
+        assert!(gate.regressions.is_empty());
+    }
+
+    #[test]
+    fn pass_over_pass_gate_requires_exact_retry_policy_fingerprint() {
+        let mut previous = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        previous
+            .truth
+            .as_mut()
+            .expect("test truth")
+            .configuration
+            .retry_policy
+            .as_mut()
+            .expect("test retry policy")
+            .fsqlite_transaction_timeout_ms += 1;
+        let current = valid_history_row(8, 90, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+
+        let gate = gate_with_rows(vec![previous], vec![current]);
+
+        assert_eq!(gate.status, "no_prior_report");
+        assert_eq!(gate.comparable_pair_count, 0);
+    }
+
+    #[test]
+    fn pass_over_pass_gate_proves_offered_work_from_writers_times_rows() {
+        let mut previous = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let truth = previous.truth.as_mut().expect("test truth");
+        let malformed_offered = 7_777;
+        truth.configuration.offered_writes_per_sample = Some(malformed_offered);
+        for sample in truth
+            .null_c_a_samples
+            .iter_mut()
+            .chain(&mut truth.null_c_b_samples)
+            .chain(&mut truth.sqlite_samples)
+            .chain(&mut truth.fsqlite_samples)
+        {
+            sample.accounting.offered_writes = malformed_offered;
+            sample.accounting.attempted_writes = malformed_offered;
+            sample.accounting.succeeded_writes = malformed_offered;
+            sample.committed_state.expected_rows = malformed_offered;
+            sample.committed_state.observed_rows = malformed_offered;
+        }
+        let current = valid_history_row(8, 90, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+
+        let gate = gate_with_rows(vec![previous], vec![current]);
+
+        assert_eq!(gate.status, "no_prior_report");
+        assert_eq!(gate.comparable_pair_count, 0);
+    }
+
+    #[test]
+    fn pass_over_pass_gate_rejects_missing_or_overridden_cadence_provenance() {
+        let valid_current = valid_history_row(8, 90, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let mut missing_cadence = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let missing_configuration = &mut missing_cadence.truth.as_mut().unwrap().configuration;
+        missing_configuration.wal_autocheckpoint_pages = None;
+        missing_configuration.wal_autocheckpoint_overridden = None;
+
+        let missing_gate = gate_with_rows(vec![missing_cadence], vec![valid_current.clone()]);
+        assert_eq!(missing_gate.status, "no_prior_report");
+        assert_eq!(missing_gate.comparable_pair_count, 0);
+
+        let mut overridden = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let overridden_configuration = &mut overridden.truth.as_mut().unwrap().configuration;
+        overridden_configuration.wal_autocheckpoint_overridden = Some(true);
+        overridden_configuration.status = "diagnostic_override".to_owned();
+        overridden_configuration.comparison_eligible = false;
+
+        let override_gate = gate_with_rows(vec![overridden], vec![valid_current]);
+        assert_eq!(override_gate.status, "no_prior_report");
+        assert_eq!(override_gate.comparable_pair_count, 0);
+    }
+
+    #[test]
+    fn history_write_rejects_override_independent_of_eligibility_flag() {
+        let row = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let mut receipt = row.truth.as_ref().unwrap().configuration.clone();
+
+        assert!(!history_evidence_is_invalid(
+            false,
+            false,
+            DEFAULT_ROWS_PER_THREAD,
+            1,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&receipt),
+        ));
+        assert!(receipt.comparison_eligible);
+        assert!(history_evidence_is_invalid(
+            true,
+            false,
+            DEFAULT_ROWS_PER_THREAD,
+            1,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&receipt),
+        ));
+        assert!(history_evidence_is_invalid(
+            false,
+            true,
+            DEFAULT_ROWS_PER_THREAD,
+            1,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&receipt),
+        ));
+
+        receipt.wal_autocheckpoint_overridden = Some(true);
+        receipt.comparison_eligible = true;
+        assert!(history_evidence_is_invalid(
+            false,
+            false,
+            DEFAULT_ROWS_PER_THREAD,
+            1,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&receipt),
+        ));
     }
 
     #[test]
@@ -1886,7 +4329,7 @@ mod tests {
                 .collect(),
         );
 
-        let contract = median_ci_contract(&null, &claim);
+        let contract = median_ci_contract(&null, &claim, &supported_configuration(8));
 
         assert!(contract.claim_ratio_cv_pct > 5.0);
         assert_eq!(contract.cv_gate, "never");
@@ -1896,22 +4339,55 @@ mod tests {
 
     #[test]
     fn retry_budget_allows_busy_timeout_scaled_retries() {
-        let mut budget = FsqliteRetryBudget::new();
+        let mut budget = FsqliteRetryBudget::new(fsqlite_retry_timeout(8, 1000));
         let mut waits = Vec::new();
         for _ in 0..MAX_RETRIES {
             waits.push(
                 budget
-                    .next_wait(8)
+                    .next_wait(0)
                     .expect("budget should allow configured retry count"),
             );
         }
 
         assert_eq!(budget.attempts(), MAX_RETRIES);
-        assert!(budget.next_wait(8).is_none());
+        assert!(budget.next_wait(0).is_none());
         assert!(
             waits
                 .iter()
                 .all(|wait| wait.as_millis() <= u128::from(MAX_RETRY_SLEEP_MS + 4))
         );
+        assert_eq!(waits[0], Duration::from_millis(4));
+        assert_eq!(waits[7], Duration::from_millis(6));
+        assert_eq!(waits[39], Duration::from_millis(25));
+    }
+
+    #[test]
+    fn fsqlite_retry_classifier_is_pinned_to_the_receipted_error_set() {
+        let retryable = [
+            fsqlite::FrankenError::Busy,
+            fsqlite::FrankenError::BusyRecovery,
+            fsqlite::FrankenError::BusySnapshot {
+                conflicting_pages: "1".to_owned(),
+            },
+            fsqlite::FrankenError::DatabaseLocked {
+                path: PathBuf::from("test.db"),
+            },
+            fsqlite::FrankenError::WriteConflict { page: 1, holder: 2 },
+            fsqlite::FrankenError::SerializationFailure { page: 1 },
+            fsqlite::FrankenError::PageBufferCapacityExhausted {
+                operation: "test",
+                page_size: 4096,
+                max_buffers: 1,
+                total_buffers: 1,
+                available_buffers: 0,
+                cached_clean: 0,
+                cached_dirty: 1,
+                successful_evictions: 0,
+            },
+        ];
+        assert!(retryable.iter().all(fsqlite_error_is_retryable));
+        assert!(!fsqlite_error_is_retryable(
+            &fsqlite::FrankenError::DatabaseFull
+        ));
     }
 }

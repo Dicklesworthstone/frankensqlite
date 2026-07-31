@@ -1,0 +1,21 @@
+bench_elf_sha256=f29cd3944fa6f4549fc91f45f75257730fed22b727f946b7496313d35e4f36a9 (19319408 bytes) /data/tmp/cargo-target/release-perf/mt-mvcc-bench
+bench_source_sha256 /data/projects/frankensqlite/crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs:edb46dcaadd38bd3d4afa7b8b85bf0fce6c95ce789bc03e7bb76feeb539180df:72705
+mt-mvcc-bench: rows_per_thread=1000 threads=[8, 32, 64, 128] paired_rounds=7 bootstrap_reps=10000 synchronous=NORMAL apples_to_apples=false separate_tables=true
+threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed
+      8 |      202112 |      57176 |             3.55x |          220240 |          223501 |          64996 |          67593 |          39.58 |          46.92 |          47.67 |        139.92 |        141.98 |        142.10 |       0.28x |              0 |             0
+case=separate_tables threads=8 synchronous=NORMAL null_c_c ratio_median=0.998062 ci95=[0.990030,1.004757] cv_pct=1.457 mad=0.006695 cv_gate=never
+case=separate_tables threads=8 synchronous=NORMAL claim_f_over_c ratio_median=3.553390 ci95=[2.958481,3.678866] cv_pct=13.433 mad=0.221990 fsqlite_p50_wps=202111.658 sqlite_p50_wps=57176.139 fsqlite_failed=0 sqlite_failed=0
+case=separate_tables threads=8 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.009970 claim_margin=256.099 min_decidable_gain=1.019941 max_decidable_regression=0.980059
+     32 |      147269 |      12979 |            12.37x |          190690 |          191684 |          14922 |          15390 |         217.29 |         223.31 |         223.84 |       2465.44 |       2736.47 |       2785.72 |       0.09x |              0 |             0
+case=separate_tables threads=32 synchronous=NORMAL null_c_c ratio_median=1.008612 ci95=[0.960924,1.044017] cv_pct=4.688 mad=0.035405 cv_gate=never
+case=separate_tables threads=32 synchronous=NORMAL claim_f_over_c ratio_median=12.367635 ci95=[11.346346,14.158254] cv_pct=14.293 mad=1.021289 fsqlite_p50_wps=147269.128 sqlite_p50_wps=12979.432 fsqlite_failed=0 sqlite_failed=0
+case=separate_tables threads=32 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.044017 claim_margin=258.256 min_decidable_gain=1.088034 max_decidable_regression=0.911966
+     64 |       71458 |      12513 |             5.71x |           79667 |           79960 |          12582 |          12585 |         895.64 |         963.79 |         965.87 |       5114.62 |       5158.79 |       5159.99 |       0.18x |              0 |             0
+case=separate_tables threads=64 synchronous=NORMAL null_c_c ratio_median=0.998835 ci95=[0.996966,1.002815] cv_pct=0.348 mad=0.001869 cv_gate=never
+case=separate_tables threads=64 synchronous=NORMAL claim_f_over_c ratio_median=5.710589 ci95=[5.382972,6.354438] cv_pct=7.822 mad=0.443903 fsqlite_p50_wps=71457.516 sqlite_p50_wps=12513.161 fsqlite_failed=0 sqlite_failed=0
+case=separate_tables threads=64 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.003034 claim_margin=1552.688 min_decidable_gain=1.010000 max_decidable_regression=0.990000
+    128 |      106203 |      18692 |             5.57x |          126107 |          130252 |          20291 |          20435 |        1205.24 |        1525.75 |        1611.98 |       6847.82 |      10640.64 |      10780.88 |       0.18x |              0 |             0
+case=separate_tables threads=128 synchronous=NORMAL null_c_c ratio_median=1.148307 ci95=[0.757151,1.254833] cv_pct=26.454 mad=0.106526 cv_gate=never
+case=separate_tables threads=128 synchronous=NORMAL claim_f_over_c ratio_median=5.567407 ci95=[5.344499,9.634601] cv_pct=35.344 mad=1.377900 fsqlite_p50_wps=106202.878 sqlite_p50_wps=18692.068 fsqlite_failed=0 sqlite_failed=0
+case=separate_tables threads=128 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.254833 claim_margin=17.923 min_decidable_gain=1.509666 max_decidable_regression=0.490334
+mt-mvcc-bench: updated pass-over-pass history .bench-history/mt-mvcc-bench.separate-tables.latest.json

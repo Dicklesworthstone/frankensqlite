@@ -15,7 +15,6 @@
     allow(dead_code, unused_imports)
 )]
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::collections::{HashMap, HashSet};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::hash::BuildHasher;
@@ -25,7 +24,7 @@ use std::path::Path;
 use fsqlite_ast::{
     ColumnConstraintKind, CreateTableBody, CreateTableStatement, DefaultValue, Expr,
     GeneratedStorage, IndexedColumn, Literal, SortDirection, Statement, TableConstraintKind,
-    UnaryOp,
+    TriggerTiming, UnaryOp,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_btree::BtreeCursorOps;
@@ -44,11 +43,15 @@ use fsqlite_types::record::{
 };
 use fsqlite_types::value::SqliteValue;
 
+use crate::connection::{
+    ImplicitAutoindexSlot, column_def_is_exact_integer, implicit_autoindex_layout,
+};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
     CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
+    bind_explicit_index,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -105,12 +108,809 @@ fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> 
     {
         return None;
     }
-    let ordinal = suffix.parse::<usize>().ok()?;
-    (ordinal.to_string() == suffix).then_some(ordinal)
+    suffix.parse::<usize>().ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundImplicitAutoindexStorage {
+    /// The logical WITHOUT ROWID primary-key index is stored in the table
+    /// B-tree itself and therefore has no separate sqlite_master row.
+    TableRoot,
+    /// A physical implicit index backed by its own B-tree root.
+    IndexRoot(i32),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BoundImplicitAutoindexSlot {
+    ordinal: usize,
+    slot: ImplicitAutoindexSlot,
+    storage: BoundImplicitAutoindexStorage,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BoundTableAutoindexes {
+    slots: Vec<BoundImplicitAutoindexSlot>,
+}
+
+impl BoundTableAutoindexes {
+    pub(crate) fn implicit_slots(&self) -> impl Iterator<Item = &ImplicitAutoindexSlot> {
+        self.slots.iter().map(|bound| &bound.slot)
+    }
+
+    pub(crate) fn physical_index_schemas(&self, table_name: &str) -> Vec<IndexSchema> {
+        self.slots
+            .iter()
+            .filter_map(|bound| match bound.storage {
+                BoundImplicitAutoindexStorage::TableRoot => None,
+                BoundImplicitAutoindexStorage::IndexRoot(root_page) => Some(
+                    bound
+                        .slot
+                        .clone()
+                        .into_index_schema(table_name, bound.ordinal, root_page),
+                ),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BoundImplicitAutoindexCatalog {
+    by_table: HashMap<String, BoundTableAutoindexes>,
+    canonical_virtual_table_rows: HashSet<usize>,
+}
+
+impl BoundImplicitAutoindexCatalog {
+    pub(crate) fn table(&self, table_name: &str) -> Option<&BoundTableAutoindexes> {
+        self.by_table.get(&table_name.to_ascii_lowercase())
+    }
+
+    pub(crate) fn is_canonical_virtual_table_row(&self, row_index: usize) -> bool {
+        self.canonical_virtual_table_rows.contains(&row_index)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedSqliteMasterEntry<'a> {
+    entry_type: &'a str,
+    name: &'a str,
+    table_name: &'a str,
+    root_page: i64,
+    sql: Option<&'a str>,
+}
+
+#[derive(Debug)]
+struct PendingTableAutoindexes {
+    table_name: String,
+    slots: Vec<ImplicitAutoindexSlot>,
+    physical_roots: Vec<Option<i32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteMasterSchemaNameKind {
+    Table,
+    VirtualTable,
+    View,
+    Index,
+}
+
+impl SqliteMasterSchemaNameKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::VirtualTable => "virtual table",
+            Self::View => "view",
+            Self::Index => "index",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SqliteMasterSchemaNameOwner {
+    name: String,
+    kind: SqliteMasterSchemaNameKind,
+}
+
+#[derive(Debug)]
+struct VirtualTableCatalogVariant {
+    row_index: usize,
+    name: String,
+    root_page: i64,
+    module: String,
+    args: Vec<String>,
+}
+
+fn sqlite_master_corrupt(detail: impl Into<String>) -> FrankenError {
+    FrankenError::DatabaseCorrupt {
+        detail: detail.into(),
+    }
+}
+
+fn qualified_catalog_name_targets_main(schema: Option<&str>) -> bool {
+    schema.is_none_or(|schema| schema.eq_ignore_ascii_case("main"))
+}
+
+fn claim_sqlite_master_schema_name(
+    name: &str,
+    kind: SqliteMasterSchemaNameKind,
+    schema_names: &mut HashMap<String, SqliteMasterSchemaNameOwner>,
+) -> Result<()> {
+    let key = name.to_ascii_lowercase();
+    if let Some(existing) = schema_names.get(&key) {
+        return Err(sqlite_master_corrupt(format!(
+            "sqlite_master schema name `{name}` is shared by {} `{}` and {} `{name}`",
+            existing.kind.label(),
+            existing.name,
+            kind.label()
+        )));
+    }
+    schema_names.insert(
+        key,
+        SqliteMasterSchemaNameOwner {
+            name: name.to_owned(),
+            kind,
+        },
+    );
+    Ok(())
+}
+
+fn normalize_virtual_table_option_token(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if matches!((first, last), (b'\'', b'\'') | (b'"', b'"') | (b'`', b'`')) {
+            let body = &trimmed[1..trimmed.len() - 1];
+            let quote = char::from(first);
+            return body
+                .replace(&format!("{quote}{quote}"), &quote.to_string())
+                .to_ascii_lowercase();
+        }
+        if first == b'[' && last == b']' {
+            return trimmed[1..trimmed.len() - 1].to_ascii_lowercase();
+        }
+    }
+    trimmed.to_ascii_lowercase()
+}
+
+fn fts5_content_variant(args: &[String]) -> Option<(Option<String>, Vec<&str>)> {
+    let mut content = None;
+    let mut non_content = Vec::with_capacity(args.len());
+    for arg in args {
+        let is_content_option = arg
+            .split_once('=')
+            .is_some_and(|(key, _)| normalize_virtual_table_option_token(key) == "content");
+        if is_content_option {
+            let (_, value) = arg
+                .split_once('=')
+                .expect("content option was identified by an equals sign");
+            if content
+                .replace(normalize_virtual_table_option_token(value))
+                .is_some()
+            {
+                return None;
+            }
+        } else {
+            non_content.push(arg.trim());
+        }
+    }
+    Some((content, non_content))
+}
+
+fn supported_virtual_table_duplicate(
+    existing: &VirtualTableCatalogVariant,
+    root_page: i64,
+    module: &str,
+    args: &[String],
+) -> bool {
+    // Two positive roots are rejected by the caller. An otherwise identical
+    // positive/root-zero pair is the legacy materialized-vtab migration shape;
+    // two root-zero rows are accepted only for FTS5's repair path.
+    if existing.module.eq_ignore_ascii_case(module) && existing.args == args {
+        return existing.root_page > 0 || root_page > 0 || module.eq_ignore_ascii_case("fts5");
+    }
+    if existing.root_page != 0
+        || root_page != 0
+        || !existing.module.eq_ignore_ascii_case("fts5")
+        || !module.eq_ignore_ascii_case("fts5")
+    {
+        return false;
+    }
+    // A historical FTS5 repair can leave the authoritative contentless row
+    // beside a stale default-content declaration. The non-content arguments
+    // must still be identical, and no third catalog row is accepted.
+    let Some((existing_content, existing_non_content)) = fts5_content_variant(&existing.args)
+    else {
+        return false;
+    };
+    let Some((candidate_content, candidate_non_content)) = fts5_content_variant(args) else {
+        return false;
+    };
+    existing_non_content == candidate_non_content
+        && matches!(
+            (existing_content.as_deref(), candidate_content.as_deref()),
+            (None, Some("")) | (Some(""), None)
+        )
+}
+
+fn canonical_virtual_table_variant(
+    variants: &[VirtualTableCatalogVariant],
+) -> &VirtualTableCatalogVariant {
+    variants
+        .iter()
+        .find(|variant| variant.root_page > 0)
+        .or_else(|| {
+            variants.iter().find(|variant| {
+                variant.module.eq_ignore_ascii_case("fts5")
+                    && fts5_content_variant(&variant.args)
+                        .is_some_and(|(content, _)| content.as_deref() == Some(""))
+            })
+        })
+        .unwrap_or_else(|| {
+            variants
+                .first()
+                .expect("validated virtual-table variant set is non-empty")
+        })
+}
+
+fn claim_sqlite_master_virtual_table(
+    row_index: usize,
+    name: &str,
+    root_page: i64,
+    module: &str,
+    args: &[String],
+    schema_names: &mut HashMap<String, SqliteMasterSchemaNameOwner>,
+    variants: &mut HashMap<String, Vec<VirtualTableCatalogVariant>>,
+) -> Result<()> {
+    let key = name.to_ascii_lowercase();
+    if let Some(existing_variants) = variants.get_mut(&key) {
+        let Some(existing) = existing_variants.first() else {
+            unreachable!("virtual-table variant map entries are never empty");
+        };
+        if existing_variants.len() != 1
+            || (existing.root_page > 0 && root_page > 0)
+            || !supported_virtual_table_duplicate(existing, root_page, module, args)
+        {
+            return Err(sqlite_master_corrupt(format!(
+                "sqlite_master contains conflicting virtual-table entries for `{}` and `{name}`",
+                existing.name
+            )));
+        }
+        existing_variants.push(VirtualTableCatalogVariant {
+            row_index,
+            name: name.to_owned(),
+            root_page,
+            module: module.to_owned(),
+            args: args.to_vec(),
+        });
+        return Ok(());
+    }
+
+    claim_sqlite_master_schema_name(name, SqliteMasterSchemaNameKind::VirtualTable, schema_names)?;
+    variants.insert(
+        key,
+        vec![VirtualTableCatalogVariant {
+            row_index,
+            name: name.to_owned(),
+            root_page,
+            module: module.to_owned(),
+            args: args.to_vec(),
+        }],
+    );
+    Ok(())
+}
+
+fn decode_sqlite_master_entry(
+    entry: &[SqliteValue],
+    row_index: usize,
+) -> Result<DecodedSqliteMasterEntry<'_>> {
+    if entry.len() != 5 {
+        return Err(sqlite_master_corrupt(format!(
+            "sqlite_master row {} has {} columns instead of 5",
+            row_index + 1,
+            entry.len()
+        )));
+    }
+    let text_column = |column_index: usize, column_name: &str| match &entry[column_index] {
+        SqliteValue::Text(value) => Ok(value.as_ref()),
+        value => Err(sqlite_master_corrupt(format!(
+            "sqlite_master row {} column `{column_name}` must be TEXT, found {value:?}",
+            row_index + 1
+        ))),
+    };
+    let entry_type = text_column(0, "type")?;
+    let name = text_column(1, "name")?;
+    let table_name = text_column(2, "tbl_name")?;
+    let root_page = match &entry[3] {
+        SqliteValue::Integer(value) => *value,
+        value => {
+            return Err(sqlite_master_corrupt(format!(
+                "sqlite_master row {} column `rootpage` must be INTEGER, found {value:?}",
+                row_index + 1
+            )));
+        }
+    };
+    let sql = match &entry[4] {
+        SqliteValue::Text(value) => Some(value.as_ref()),
+        SqliteValue::Null => None,
+        value => {
+            return Err(sqlite_master_corrupt(format!(
+                "sqlite_master row {} column `sql` must be TEXT or NULL, found {value:?}",
+                row_index + 1
+            )));
+        }
+    };
+    Ok(DecodedSqliteMasterEntry {
+        entry_type,
+        name,
+        table_name,
+        root_page,
+        sql,
+    })
+}
+
+fn claim_sqlite_master_root(
+    entry_kind: &str,
+    entry_name: &str,
+    root_page: i64,
+    max_root_page: u32,
+    header: &DatabaseHeader,
+    free_pages: &HashSet<PageNumber>,
+    root_owners: &mut HashMap<i32, String>,
+) -> Result<i32> {
+    let root_page_u32 = validate_sqlite_master_root_page(entry_name, root_page)?;
+    let root_page_i32 = i32::try_from(root_page_u32).map_err(|_| {
+        sqlite_master_corrupt(format!(
+            "sqlite_master {entry_kind} `{entry_name}` has unsupported rootpage {root_page}"
+        ))
+    })?;
+    if root_page_i32 >= i32::MAX - 1 {
+        return Err(sqlite_master_corrupt(format!(
+            "sqlite_master {entry_kind} `{entry_name}` has terminal rootpage {root_page}, which leaves no safe MemDatabase allocation sentinel"
+        )));
+    }
+    if root_page_u32 > max_root_page {
+        return Err(sqlite_master_corrupt(format!(
+            "sqlite_master {entry_kind} `{entry_name}` has rootpage {root_page}, which exceeds the visible database page count {max_root_page}"
+        )));
+    }
+    if root_page_u32 == fsqlite_pager::lock_byte_page(header.page_size) {
+        return Err(sqlite_master_corrupt(format!(
+            "sqlite_master {entry_kind} `{entry_name}` uses reserved lock-byte rootpage {root_page}"
+        )));
+    }
+    let root_page_number =
+        PageNumber::new(root_page_u32).expect("validated positive rootpage must be nonzero");
+    if header.largest_root_page != 0
+        && fsqlite_btree::freelist::is_ptrmap_page(
+            root_page_number,
+            header.page_size.usable(header.reserved_per_page),
+            header.page_size.get(),
+        )
+    {
+        return Err(sqlite_master_corrupt(format!(
+            "sqlite_master {entry_kind} `{entry_name}` uses auto-vacuum pointer-map rootpage {root_page}"
+        )));
+    }
+    if free_pages.contains(&root_page_number) {
+        return Err(sqlite_master_corrupt(format!(
+            "sqlite_master {entry_kind} `{entry_name}` uses free rootpage {root_page}"
+        )));
+    }
+    let owner = format!("{entry_kind} `{entry_name}`");
+    if let Some(existing_owner) = root_owners.insert(root_page_i32, owner.clone()) {
+        return Err(sqlite_master_corrupt(format!(
+            "sqlite_master rootpage {root_page_i32} is shared by {existing_owner} and {owner}"
+        )));
+    }
+    Ok(root_page_i32)
+}
+
+/// Validate and bind every implicit autoindex row in a sqlite_master snapshot.
+///
+/// This is deliberately a global, failure-atomic prepass. Both schema reload
+/// paths must prove the complete expected implicit-index set and root ownership
+/// before either mutates `MemDatabase`, because `create_table_at` replaces an
+/// existing root on collision.
+pub(crate) fn bind_implicit_autoindex_catalog(
+    master_entries: &[Vec<SqliteValue>],
+    max_root_page: u32,
+    header: &DatabaseHeader,
+    free_pages: &HashSet<PageNumber>,
+) -> Result<BoundImplicitAutoindexCatalog> {
+    if max_root_page == 0 {
+        return Err(sqlite_master_corrupt(
+            "sqlite_master cannot be bound without a visible database page",
+        ));
+    }
+    let decoded = master_entries
+        .iter()
+        .enumerate()
+        .map(|(row_index, entry)| decode_sqlite_master_entry(entry, row_index))
+        .collect::<Result<Vec<_>>>()?;
+    let mut root_owners = HashMap::new();
+    root_owners.insert(1, "sqlite_master".to_owned());
+    let mut pending_by_table = HashMap::<String, PendingTableAutoindexes>::new();
+    let mut schema_names = HashMap::<String, SqliteMasterSchemaNameOwner>::new();
+    let mut trigger_names = HashMap::<String, String>::new();
+    let mut virtual_table_variants = HashMap::<String, Vec<VirtualTableCatalogVariant>>::new();
+    let mut logical_autoindex_names = HashMap::<String, String>::new();
+    let mut pending_trigger_parents = Vec::<(String, String, bool)>::new();
+
+    // Claim every table root before any index root, independent of catalog row
+    // order, so an index can never replace a table placeholder during reload.
+    for (row_index, entry) in decoded.iter().enumerate() {
+        if entry.entry_type.eq_ignore_ascii_case("view") {
+            if entry.root_page != 0 || entry.sql.is_none() {
+                return Err(sqlite_master_corrupt(format!(
+                    "sqlite_master view `{}` must have rootpage 0 and non-NULL sql",
+                    entry.name
+                )));
+            }
+            if !entry.name.eq_ignore_ascii_case(entry.table_name) {
+                return Err(sqlite_master_corrupt(format!(
+                    "sqlite_master view `{}` has mismatched tbl_name `{}`",
+                    entry.name, entry.table_name
+                )));
+            }
+            let create_sql = entry.sql.expect("view sql was validated above");
+            let Some(Statement::CreateView(create)) = parse_single_statement(create_sql) else {
+                return Err(sqlite_master_corrupt(format!(
+                    "could not parse CREATE VIEW SQL for `{}`",
+                    entry.name
+                )));
+            };
+            if create.temporary
+                || !qualified_catalog_name_targets_main(create.name.schema.as_deref())
+                || !create.name.name.eq_ignore_ascii_case(entry.name)
+            {
+                return Err(sqlite_master_corrupt(format!(
+                    "CREATE VIEW SQL for `{}` declares a temporary, non-main, or differently named view `{}`",
+                    entry.name, create.name.name
+                )));
+            }
+            claim_sqlite_master_schema_name(
+                entry.name,
+                SqliteMasterSchemaNameKind::View,
+                &mut schema_names,
+            )?;
+            continue;
+        }
+        if entry.entry_type.eq_ignore_ascii_case("trigger") {
+            if entry.root_page != 0 || entry.sql.is_none() {
+                return Err(sqlite_master_corrupt(format!(
+                    "sqlite_master trigger `{}` must have rootpage 0 and non-NULL sql",
+                    entry.name
+                )));
+            }
+            let create_sql = entry.sql.expect("trigger sql was validated above");
+            let Some(Statement::CreateTrigger(create)) = parse_single_statement(create_sql) else {
+                return Err(sqlite_master_corrupt(format!(
+                    "could not parse CREATE TRIGGER SQL for `{}`",
+                    entry.name
+                )));
+            };
+            if create.temporary
+                || !qualified_catalog_name_targets_main(create.name.schema.as_deref())
+                || !create.name.name.eq_ignore_ascii_case(entry.name)
+                || !create.table.eq_ignore_ascii_case(entry.table_name)
+            {
+                return Err(sqlite_master_corrupt(format!(
+                    "CREATE TRIGGER SQL for `{}` does not match its main-catalog name or target `{}`",
+                    entry.name, entry.table_name
+                )));
+            }
+            let trigger_key = entry.name.to_ascii_lowercase();
+            if let Some(existing) = trigger_names.insert(trigger_key, entry.name.to_owned()) {
+                return Err(sqlite_master_corrupt(format!(
+                    "sqlite_master contains duplicate trigger entries for `{existing}` and `{}`",
+                    entry.name
+                )));
+            }
+            pending_trigger_parents.push((
+                entry.name.to_owned(),
+                entry.table_name.to_owned(),
+                matches!(create.timing, TriggerTiming::InsteadOf),
+            ));
+            continue;
+        }
+        if entry.entry_type.eq_ignore_ascii_case("index") {
+            continue;
+        }
+        if !entry.entry_type.eq_ignore_ascii_case("table") {
+            return Err(sqlite_master_corrupt(format!(
+                "sqlite_master entry `{}` has unsupported type `{}`",
+                entry.name, entry.entry_type
+            )));
+        }
+        let Some(create_sql) = entry.sql else {
+            return Err(sqlite_master_corrupt(format!(
+                "sqlite_master table `{}` has NULL sql",
+                entry.name
+            )));
+        };
+        if !entry.name.eq_ignore_ascii_case(entry.table_name) {
+            return Err(sqlite_master_corrupt(format!(
+                "sqlite_master table `{}` has mismatched tbl_name `{}`",
+                entry.name, entry.table_name
+            )));
+        }
+
+        if is_virtual_table_sql(create_sql) {
+            if entry.root_page < 0 {
+                return Err(sqlite_master_corrupt(format!(
+                    "sqlite_master virtual table `{}` has invalid rootpage {}",
+                    entry.name, entry.root_page
+                )));
+            }
+            let Some(Statement::CreateVirtualTable(create)) = parse_single_statement(create_sql)
+            else {
+                return Err(sqlite_master_corrupt(format!(
+                    "could not parse CREATE VIRTUAL TABLE SQL for `{}`",
+                    entry.name
+                )));
+            };
+            if !create.name.name.eq_ignore_ascii_case(entry.name) {
+                return Err(sqlite_master_corrupt(format!(
+                    "CREATE VIRTUAL TABLE SQL for `{}` declares `{}`",
+                    entry.name, create.name.name
+                )));
+            }
+            if !qualified_catalog_name_targets_main(create.name.schema.as_deref()) {
+                return Err(sqlite_master_corrupt(format!(
+                    "CREATE VIRTUAL TABLE SQL for `{}` targets a non-main schema",
+                    entry.name
+                )));
+            }
+            if entry.root_page > 0 {
+                claim_sqlite_master_root(
+                    "virtual table",
+                    entry.name,
+                    entry.root_page,
+                    max_root_page,
+                    header,
+                    free_pages,
+                    &mut root_owners,
+                )?;
+            }
+            claim_sqlite_master_virtual_table(
+                row_index,
+                entry.name,
+                entry.root_page,
+                &create.module,
+                &create.args,
+                &mut schema_names,
+                &mut virtual_table_variants,
+            )?;
+            continue;
+        }
+
+        claim_sqlite_master_root(
+            "table",
+            entry.name,
+            entry.root_page,
+            max_root_page,
+            header,
+            free_pages,
+            &mut root_owners,
+        )?;
+        let Some(Statement::CreateTable(create)) = parse_single_statement(create_sql) else {
+            return Err(sqlite_master_corrupt(format!(
+                "could not parse CREATE TABLE SQL for `{}`",
+                entry.name
+            )));
+        };
+        if create.temporary
+            || !qualified_catalog_name_targets_main(create.name.schema.as_deref())
+            || !create.name.name.eq_ignore_ascii_case(entry.name)
+            || !create.name.name.eq_ignore_ascii_case(entry.table_name)
+        {
+            return Err(sqlite_master_corrupt(format!(
+                "CREATE TABLE SQL for `{}` declares a temporary, non-main, or differently named table `{}`",
+                entry.name, create.name.name
+            )));
+        }
+        let slots = match &create.body {
+            CreateTableBody::Columns {
+                columns,
+                constraints,
+            } => implicit_autoindex_layout(columns, constraints, create.without_rowid).map_err(
+                |error| {
+                    sqlite_master_corrupt(format!(
+                        "invalid implicit autoindex layout for table `{}`: {error}",
+                        entry.name
+                    ))
+                },
+            )?,
+            CreateTableBody::AsSelect(_) => {
+                return Err(sqlite_master_corrupt(format!(
+                    "sqlite_master table `{}` stores CREATE TABLE AS SELECT instead of a normalized column definition",
+                    entry.name
+                )));
+            }
+        };
+        let slot_count = slots.len();
+        for ordinal in 1..=slot_count {
+            let logical_name = format!("sqlite_autoindex_{}_{ordinal}", entry.name);
+            logical_autoindex_names.insert(logical_name.to_ascii_lowercase(), logical_name);
+        }
+        let key = entry.name.to_ascii_lowercase();
+        let pending = PendingTableAutoindexes {
+            table_name: entry.name.to_owned(),
+            slots,
+            physical_roots: vec![None; slot_count],
+        };
+        if let Some(existing) = pending_by_table.insert(key, pending) {
+            return Err(sqlite_master_corrupt(format!(
+                "sqlite_master contains duplicate table entries for `{}` and `{}`",
+                existing.table_name, entry.name
+            )));
+        }
+        claim_sqlite_master_schema_name(
+            entry.name,
+            SqliteMasterSchemaNameKind::Table,
+            &mut schema_names,
+        )?;
+    }
+
+    for (trigger_name, table_name, requires_view) in pending_trigger_parents {
+        let target = schema_names.get(&table_name.to_ascii_lowercase());
+        let target_is_view =
+            target.is_some_and(|owner| owner.kind == SqliteMasterSchemaNameKind::View);
+        let target_is_table = target.is_some_and(|owner| {
+            matches!(
+                owner.kind,
+                SqliteMasterSchemaNameKind::Table | SqliteMasterSchemaNameKind::VirtualTable
+            )
+        });
+        if (!requires_view && !target_is_table) || (requires_view && !target_is_view) {
+            let expected_kind = if requires_view { "view" } else { "table" };
+            return Err(sqlite_master_corrupt(format!(
+                "trigger `{trigger_name}` refers to missing or incompatible {expected_kind} `{table_name}`"
+            )));
+        }
+    }
+
+    let mut index_names = HashMap::<String, String>::new();
+    for entry in &decoded {
+        if !entry.entry_type.eq_ignore_ascii_case("index") {
+            continue;
+        }
+        let index_key = entry.name.to_ascii_lowercase();
+        let logical_autoindex_name = logical_autoindex_names.get(&index_key);
+        if let Some(existing_name) = index_names.insert(index_key, entry.name.to_owned()) {
+            return Err(sqlite_master_corrupt(format!(
+                "sqlite_master contains duplicate index entries for `{existing_name}` and `{}`",
+                entry.name
+            )));
+        }
+        claim_sqlite_master_schema_name(
+            entry.name,
+            SqliteMasterSchemaNameKind::Index,
+            &mut schema_names,
+        )?;
+        let root_page = claim_sqlite_master_root(
+            "index",
+            entry.name,
+            entry.root_page,
+            max_root_page,
+            header,
+            free_pages,
+            &mut root_owners,
+        )?;
+        let table_key = entry.table_name.to_ascii_lowercase();
+        if !pending_by_table.contains_key(&table_key) {
+            return Err(sqlite_master_corrupt(format!(
+                "index `{}` refers to missing ordinary table `{}`",
+                entry.name, entry.table_name
+            )));
+        }
+        // A stored CREATE INDEX statement is authoritative even when its name
+        // resembles SQLite's reserved autoindex naming convention, unless a
+        // real declaration slot (including a hidden WITHOUT ROWID PK slot)
+        // already owns that logical name.
+        if let Some(create_sql) = entry.sql {
+            if let Some(logical_name) = logical_autoindex_name {
+                return Err(sqlite_master_corrupt(format!(
+                    "explicit index `{}` collides with logical implicit index `{logical_name}`",
+                    entry.name
+                )));
+            }
+            let Some(Statement::CreateIndex(create)) = parse_single_statement(create_sql) else {
+                return Err(sqlite_master_corrupt(format!(
+                    "could not parse CREATE INDEX SQL for `{}`",
+                    entry.name
+                )));
+            };
+            if !create.name.name.eq_ignore_ascii_case(entry.name)
+                || !create.table.eq_ignore_ascii_case(entry.table_name)
+                || !qualified_catalog_name_targets_main(create.name.schema.as_deref())
+            {
+                return Err(sqlite_master_corrupt(format!(
+                    "CREATE INDEX SQL for `{}` declares index `{}` on table `{}` instead of `{}`",
+                    entry.name, create.name.name, create.table, entry.table_name
+                )));
+            }
+            continue;
+        }
+
+        let Some(table) = pending_by_table.get_mut(&table_key) else {
+            unreachable!("ordinary index parent was validated above");
+        };
+        let Some(ordinal) = parse_autoindex_ordinal(entry.name, entry.table_name) else {
+            return Err(sqlite_master_corrupt(format!(
+                "implicit index `{}` does not have a canonical autoindex name for table `{}`",
+                entry.name, entry.table_name
+            )));
+        };
+        let Some(slot_index) = ordinal.checked_sub(1) else {
+            return Err(sqlite_master_corrupt(format!(
+                "implicit index `{}` has invalid ordinal {ordinal}",
+                entry.name
+            )));
+        };
+        let Some(slot) = table.slots.get(slot_index) else {
+            return Err(sqlite_master_corrupt(format!(
+                "implicit index `{}` selects nonexistent declaration slot {ordinal} on table `{}`",
+                entry.name, table.table_name
+            )));
+        };
+        if slot.is_hidden_without_rowid_primary_key() {
+            return Err(sqlite_master_corrupt(format!(
+                "implicit index `{}` illegally materializes hidden WITHOUT ROWID primary-key slot {ordinal}",
+                entry.name
+            )));
+        }
+        let root = table
+            .physical_roots
+            .get_mut(slot_index)
+            .expect("validated implicit autoindex slot must have a root binding");
+        if root.replace(root_page).is_some() {
+            return Err(sqlite_master_corrupt(format!(
+                "implicit autoindex slot {ordinal} on table `{}` is bound more than once",
+                table.table_name
+            )));
+        }
+    }
+
+    let mut by_table = HashMap::with_capacity(pending_by_table.len());
+    for (table_key, pending) in pending_by_table {
+        let mut bound_slots = Vec::with_capacity(pending.slots.len());
+        for (slot_index, slot) in pending.slots.into_iter().enumerate() {
+            let ordinal = slot_index + 1;
+            let storage = if slot.is_hidden_without_rowid_primary_key() {
+                BoundImplicitAutoindexStorage::TableRoot
+            } else {
+                let root_page = pending.physical_roots[slot_index].ok_or_else(|| {
+                    sqlite_master_corrupt(format!(
+                        "sqlite_master is missing implicit autoindex slot {ordinal} for table `{}`",
+                        pending.table_name
+                    ))
+                })?;
+                BoundImplicitAutoindexStorage::IndexRoot(root_page)
+            };
+            bound_slots.push(BoundImplicitAutoindexSlot {
+                ordinal,
+                slot,
+                storage,
+            });
+        }
+        by_table.insert(table_key, BoundTableAutoindexes { slots: bound_slots });
+    }
+
+    let canonical_virtual_table_rows = virtual_table_variants
+        .values()
+        .map(|variants| canonical_virtual_table_variant(variants).row_index)
+        .collect();
+
+    Ok(BoundImplicitAutoindexCatalog {
+        by_table,
+        canonical_virtual_table_rows,
+    })
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-fn load_sqlite_cursor_sizes_from_page1(page1_bytes: &[u8]) -> Result<(u32, u32)> {
+fn load_sqlite_header_from_page1(page1_bytes: &[u8]) -> Result<DatabaseHeader> {
     let header_bytes: &[u8; DATABASE_HEADER_SIZE] = page1_bytes
         .get(..DATABASE_HEADER_SIZE)
         .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -123,15 +923,9 @@ fn load_sqlite_cursor_sizes_from_page1(page1_bytes: &[u8]) -> Result<(u32, u32)>
         .map_err(|_| FrankenError::DatabaseCorrupt {
             detail: "database header is not a fixed-size 100-byte prefix".to_owned(),
         })?;
-    let header = DatabaseHeader::from_bytes(header_bytes).map_err(|error| {
-        FrankenError::DatabaseCorrupt {
-            detail: format!("invalid database header: {error}"),
-        }
-    })?;
-    Ok((
-        header.page_size.usable(header.reserved_per_page),
-        header.page_size.get(),
-    ))
+    DatabaseHeader::from_bytes(header_bytes).map_err(|error| FrankenError::DatabaseCorrupt {
+        detail: format!("invalid database header: {error}"),
+    })
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -641,8 +1435,11 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let vfs = PlatformVfs::new();
     let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE).await?;
     let mut txn = pager.begin(cx, TransactionMode::ReadOnly).await?;
+    let max_root_page = txn.snapshot_db_size();
     let page1 = txn.get_page(cx, PageNumber::ONE).await?;
-    let (usable_size, page_size) = load_sqlite_cursor_sizes_from_page1(page1.as_ref())?;
+    let header = load_sqlite_header_from_page1(page1.as_ref())?;
+    let usable_size = header.page_size.usable(header.reserved_per_page);
+    let page_size = header.page_size.get();
 
     // Read sqlite_master entries from page 1.
     let master_entries = {
@@ -679,6 +1476,10 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         }
         entries
     };
+
+    let free_pages = txn.live_freelist_pages().into_iter().collect();
+    let bound_implicit_autoindexes =
+        bind_implicit_autoindex_catalog(&master_entries, max_root_page, &header, &free_pages)?;
 
     // Parse each sqlite_master row.
     // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
@@ -725,7 +1526,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             SqliteValue::Text(s) => s,
             _ => continue,
         };
-        if &**entry_type != "table" {
+        if !entry_type.eq_ignore_ascii_case("table") {
             continue; // Skip indexes, views, triggers for now.
         }
 
@@ -746,7 +1547,8 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         // declarations have no materialized root page to load, so skip them.
         // Positive-rootpage virtual tables are real B-trees and must remain
         // visible on reopen just like ordinary tables.
-        if root_page_num == 0 && is_virtual_table_sql(&create_sql) {
+        let is_virtual_table = is_virtual_table_sql(&create_sql);
+        if root_page_num == 0 && is_virtual_table {
             let _shadowed_by_materialized =
                 materialized_virtual_tables.contains(&name.to_ascii_lowercase());
             continue;
@@ -755,7 +1557,17 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
         // Parse the CREATE TABLE to extract column info and schema decorations.
         let columns = parse_columns_from_sqlite_master_sql(&create_sql);
-        let indexes = extract_unique_constraint_indexes_from_sql(&create_sql, &name);
+        let bound_table_autoindexes = if is_virtual_table {
+            None
+        } else {
+            Some(bound_implicit_autoindexes.table(&name).ok_or_else(|| {
+                sqlite_master_corrupt(format!(
+                    "validated ordinary table `{name}` has no bound autoindex layout"
+                ))
+            })?)
+        };
+        let indexes = bound_table_autoindexes
+            .map_or_else(Vec::new, |bound| bound.physical_index_schemas(&name));
         let primary_key_constraints = extract_primary_key_constraints_from_sql(&create_sql);
         let foreign_keys = extract_foreign_keys_from_sql(&create_sql, &columns);
         let check_constraints = extract_check_constraints_with_owners_from_sql(&create_sql);
@@ -767,6 +1579,9 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         let real_root_page =
             i32::try_from(root_page_u32).expect("validated root page must fit MemDatabase");
         db.create_table_at(real_root_page, num_columns);
+        for index in &indexes {
+            db.create_table_at(index.root_page, 0);
+        }
 
         let table_name_for_err = name.to_string();
         schema.push(TableSchema {
@@ -799,45 +1614,33 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
         if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
-            let mut unique_groups = Vec::<(Vec<usize>, Vec<Option<String>>)>::new();
-            for (column_index, column) in current_table_schema.columns.iter().enumerate() {
-                if column.unique && !column.is_ipk {
-                    unique_groups.push((vec![column_index], vec![column.collation.clone()]));
-                }
-            }
-            for index in &indexes {
-                if !index.is_unique || index.columns.is_empty() {
-                    continue;
-                }
-                let (group, collations): (Vec<_>, Vec<_>) = index
-                    .columns
+            for slot in bound_table_autoindexes
+                .into_iter()
+                .flat_map(BoundTableAutoindexes::implicit_slots)
+            {
+                let Some(column_indices) = slot
+                    .columns()
                     .iter()
-                    .enumerate()
-                    .filter_map(|(term_idx, column_name)| {
+                    .map(|column_name| {
                         current_table_schema
                             .columns
                             .iter()
                             .position(|column| column.name.eq_ignore_ascii_case(column_name))
-                            .map(|column_index| {
-                                (
-                                    column_index,
-                                    index.key_collations.get(term_idx).cloned().flatten(),
-                                )
-                            })
                     })
-                    .unzip();
-                if group.is_empty()
-                    || group
-                        .iter()
-                        .all(|&column_index| current_table_schema.columns[column_index].is_ipk)
-                    || unique_groups.iter().any(|(existing, _)| existing == &group)
-                {
-                    continue;
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "canonical autoindex layout for `{table_name_for_err}` references a missing column"
+                        ),
+                    });
+                };
+                if !column_indices.is_empty() {
+                    mem_table.add_unique_column_group_with_collations(
+                        column_indices,
+                        slot.key_collations().to_vec(),
+                    );
                 }
-                unique_groups.push((group, collations));
-            }
-            for (group, collations) in unique_groups {
-                mem_table.add_unique_column_group_with_collations(group, collations);
             }
             if cursor.first(cx).await? {
                 if without_rowid {
@@ -909,7 +1712,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             SqliteValue::Text(s) => s,
             _ => continue,
         };
-        if &**entry_type != "index" {
+        if !entry_type.eq_ignore_ascii_case("index") {
             continue;
         }
         let index_name = match &entry[1] {
@@ -937,24 +1740,43 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 ),
             })?;
 
-        // Find the parent table in the schema.
-        let Some(table) = schema
-            .iter_mut()
-            .find(|t| t.name.eq_ignore_ascii_case(&tbl_name))
+        // Find the parent table in the schema and bind the authoritative SQL
+        // against it before mutating either schema or MemDatabase state.
+        let Some(table_position) = schema
+            .iter()
+            .position(|table| table.name.eq_ignore_ascii_case(&tbl_name))
         else {
-            continue;
+            return Err(sqlite_master_corrupt(format!(
+                "validated index `{index_name}` lost parent table `{tbl_name}` during load"
+            )));
         };
 
-        // Parse the CREATE INDEX SQL to extract column names, collations,
-        // sort directions, and WHERE clause.
-        if let Some(idx_schema) =
-            self::parse_create_index_sql_to_schema(&index_name, root_page_i32, &create_sql)
+        let Some(Statement::CreateIndex(create_stmt)) = parse_single_statement(&create_sql)
+        else {
+            return Err(sqlite_master_corrupt(format!(
+                "validated CREATE INDEX SQL for `{index_name}` could not be parsed during load"
+            )));
+        };
+        let table = &schema[table_position];
+        if table
+            .indexes
+            .iter()
+            .any(|index| index.name.eq_ignore_ascii_case(&index_name))
         {
-            // Only add if not already present (avoid duplicates with autoindexes).
-            if !table.indexes.iter().any(|i| i.name == index_name) {
-                table.indexes.push(idx_schema);
-            }
+            return Err(sqlite_master_corrupt(format!(
+                "validated explicit index `{index_name}` duplicates an existing index on table `{tbl_name}` during load"
+            )));
         }
+        let bound_index = bind_explicit_index(&create_stmt, &index_name, &tbl_name, table)
+            .map_err(|error| {
+                sqlite_master_corrupt(format!(
+                    "invalid explicit index `{index_name}` on table `{tbl_name}` during load: {error}"
+                ))
+            })?;
+        schema[table_position]
+            .indexes
+            .push(bound_index.into_index_schema(root_page_i32));
+        db.create_table_at(root_page_i32, 0);
     }
 
     // Read schema_cookie and change_counter from the database header (page 1).
@@ -1438,130 +2260,46 @@ pub(crate) fn extract_primary_key_constraints_from_sql(sql: &str) -> Vec<Vec<Str
     primary_keys
 }
 
-fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Vec<IndexSchema> {
+#[cfg(test)]
+fn extract_unique_constraint_indexes_from_sql(
+    sql: &str,
+    table_name: &str,
+) -> Result<Vec<IndexSchema>> {
+    let slots = extract_implicit_autoindex_slots_from_sql(sql, table_name)?;
+    Ok(slots
+        .into_iter()
+        .enumerate()
+        .filter(|(_, slot)| !slot.is_hidden_without_rowid_primary_key())
+        .map(|(slot_index, slot)| slot.into_index_schema(table_name, slot_index + 1, 0))
+        .collect())
+}
+
+#[cfg(test)]
+fn extract_implicit_autoindex_slots_from_sql(
+    sql: &str,
+    table_name: &str,
+) -> Result<Vec<ImplicitAutoindexSlot>> {
     let Some(Statement::CreateTable(create)) = parse_single_statement(sql) else {
-        return Vec::new();
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("could not parse CREATE TABLE SQL for `{table_name}`"),
+        });
     };
+    if !create.name.name.eq_ignore_ascii_case(table_name) {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "CREATE TABLE SQL for `{table_name}` declares `{}`",
+                create.name.name
+            ),
+        });
+    }
     let CreateTableBody::Columns {
         columns,
         constraints,
     } = &create.body
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-
-    let mut indexes = Vec::new();
-    let mut autoindex_ordinal = 1_usize;
-
-    for column in columns {
-        let has_unique_constraint = column.constraints.iter().any(|constraint| {
-            matches!(
-                constraint.kind,
-                ColumnConstraintKind::Unique { .. } | ColumnConstraintKind::PrimaryKey { .. }
-            )
-        });
-        let is_ipk = column.type_name.as_ref().is_some_and(|type_name| {
-            type_name.name.eq_ignore_ascii_case("INTEGER")
-                && column.constraints.iter().any(|constraint| {
-                    matches!(
-                        constraint.kind,
-                        ColumnConstraintKind::PrimaryKey {
-                            direction: None | Some(SortDirection::Asc),
-                            ..
-                        }
-                    )
-                })
-        });
-        if has_unique_constraint && !is_ipk {
-            indexes.push(IndexSchema {
-                name: format!("sqlite_autoindex_{table_name}_{autoindex_ordinal}"),
-                root_page: 0,
-                columns: vec![column.name.clone()],
-                key_expressions: Vec::new(),
-                key_sort_directions: vec![SortDirection::Asc],
-                where_clause: None,
-                is_unique: true,
-                key_collations: vec![column.constraints.iter().find_map(|constraint| {
-                    if let ColumnConstraintKind::Collate(name) = &constraint.kind {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                })],
-                conflict_action: column
-                    .constraints
-                    .iter()
-                    .find_map(|constraint| match &constraint.kind {
-                        ColumnConstraintKind::Unique { conflict }
-                        | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                        _ => None,
-                    }),
-            });
-            autoindex_ordinal += 1;
-        }
-    }
-
-    for constraint in constraints {
-        let (indexed_columns, is_primary_key) = match &constraint.kind {
-            TableConstraintKind::Unique {
-                columns: indexed_columns,
-                ..
-            } => (indexed_columns, false),
-            TableConstraintKind::PrimaryKey {
-                columns: indexed_columns,
-                ..
-            } => (indexed_columns, true),
-            _ => continue,
-        };
-        if is_primary_key
-            && table_primary_key_is_rowid_alias(columns, indexed_columns, create.without_rowid)
-        {
-            continue;
-        }
-        let Some(normalized_terms) = indexed_columns
-            .iter()
-            .map(|indexed_column| {
-                Some((
-                    indexed_column_name(indexed_column)?.to_owned(),
-                    indexed_column_collation(indexed_column),
-                ))
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
-        };
-        let columns = normalized_terms
-            .iter()
-            .map(|(column_name, _)| column_name.clone())
-            .collect::<Vec<_>>();
-        if columns.is_empty() {
-            continue;
-        }
-        indexes.push(IndexSchema {
-            name: format!("sqlite_autoindex_{table_name}_{autoindex_ordinal}"),
-            root_page: 0,
-            columns,
-            key_expressions: Vec::new(),
-            key_sort_directions: indexed_columns
-                .iter()
-                .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
-                .collect(),
-            where_clause: None,
-            is_unique: true,
-            key_collations: normalized_terms
-                .into_iter()
-                .map(|(_, collation)| collation)
-                .collect(),
-            conflict_action: match &constraint.kind {
-                TableConstraintKind::Unique { conflict, .. }
-                | TableConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                _ => None,
-            },
-        });
-        autoindex_ordinal += 1;
-    }
-
-    indexes
+    implicit_autoindex_layout(columns, constraints, create.without_rowid)
 }
 
 pub(crate) fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
@@ -2329,6 +3067,9 @@ fn indexed_column_name(indexed_column: &IndexedColumn) -> Option<&str> {
     fn extract(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(&col_ref.column),
+            // SQLite accepts a legacy single-quoted identifier in indexed
+            // terms and resolves it as the constrained column name.
+            Expr::Literal(Literal::String(name), _) => Some(name),
             Expr::Collate { expr, .. } => extract(expr),
             _ => None,
         }
@@ -2340,9 +3081,10 @@ fn indexed_column_name(indexed_column: &IndexedColumn) -> Option<&str> {
 fn indexed_column_collation(indexed_column: &IndexedColumn) -> Option<String> {
     fn extract(expr: &Expr) -> Option<&str> {
         match expr {
-            Expr::Collate {
-                expr, collation, ..
-            } => extract(expr).or(Some(collation.as_str())),
+            // The outermost COLLATE is the final postfix clause and therefore
+            // determines the effective collation when malformed-but-accepted
+            // DDL repeats the clause.
+            Expr::Collate { collation, .. } => Some(collation.as_str()),
             _ => None,
         }
     }
@@ -2690,24 +3432,6 @@ fn loaded_row_values_satisfy_notnull(columns: &[ColumnInfo], values: &[SqliteVal
         })
 }
 
-fn table_primary_key_is_rowid_alias(
-    columns: &[fsqlite_ast::ColumnDef],
-    indexed_columns: &[IndexedColumn],
-    without_rowid: bool,
-) -> bool {
-    if without_rowid || indexed_columns.len() != 1 {
-        return false;
-    }
-    let Some(column_name) = indexed_column_name(&indexed_columns[0]) else {
-        return false;
-    };
-    columns
-        .iter()
-        .find(|column| column.name.eq_ignore_ascii_case(column_name))
-        .and_then(|column| column.type_name.as_ref())
-        .is_some_and(|type_name| type_name.name.eq_ignore_ascii_case("INTEGER"))
-}
-
 fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
     let Statement::CreateTable(create) = parse_single_statement(sql)? else {
         return None;
@@ -2722,14 +3446,14 @@ pub(crate) fn columns_from_create_table_statement(
         return None;
     };
 
-    let mut table_pk_rowid_col_idx = None;
+    let mut table_pk_rowid = None;
 
     if let CreateTableBody::Columns { constraints, .. } = &create.body {
         for constraint in constraints {
             match &constraint.kind {
                 TableConstraintKind::PrimaryKey {
                     columns: pk_columns,
-                    ..
+                    conflict,
                 } if pk_columns.len() == 1 => {
                     let Some(column_name) = indexed_column_name(&pk_columns[0]) else {
                         continue;
@@ -2741,12 +3465,9 @@ pub(crate) fn columns_from_create_table_statement(
                         continue;
                     };
 
-                    let is_integer = columns[index]
-                        .type_name
-                        .as_ref()
-                        .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+                    let is_integer = column_def_is_exact_integer(&columns[index]);
                     if is_integer && !create.without_rowid {
-                        table_pk_rowid_col_idx = Some(index);
+                        table_pk_rowid = Some((index, *conflict));
                     }
                 }
                 _ => {}
@@ -2758,10 +3479,7 @@ pub(crate) fn columns_from_create_table_statement(
         .iter()
         .enumerate()
         .find_map(|(index, col)| {
-            let is_integer = col
-                .type_name
-                .as_ref()
-                .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+            let is_integer = column_def_is_exact_integer(col);
             let pk = col.constraints.iter().find_map(|constraint| {
                 if let ColumnConstraintKind::PrimaryKey { direction, .. } = &constraint.kind {
                     if *direction != Some(SortDirection::Desc) {
@@ -2779,7 +3497,7 @@ pub(crate) fn columns_from_create_table_statement(
                 None
             }
         })
-        .or(table_pk_rowid_col_idx);
+        .or_else(|| table_pk_rowid.map(|(index, _)| index));
 
     Some(
         columns
@@ -2831,7 +3549,7 @@ pub(crate) fn columns_from_create_table_statement(
                         _ => None,
                     })
                     .unwrap_or((None, None));
-                let collation = col.constraints.iter().find_map(|constraint| {
+                let collation = col.constraints.iter().rev().find_map(|constraint| {
                     if let ColumnConstraintKind::Collate(name) = &constraint.kind {
                         Some(name.clone())
                     } else {
@@ -2847,6 +3565,11 @@ pub(crate) fn columns_from_create_table_statement(
                         .find_map(|constraint| match &constraint.kind {
                             ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
                             _ => None,
+                        })
+                        .or_else(|| {
+                            table_pk_rowid.and_then(|(pk_index, conflict)| {
+                                (pk_index == index).then_some(conflict).flatten()
+                            })
                         })
                 } else {
                     col.constraints
@@ -4182,6 +4905,20 @@ PRAGMA integrity_check;
     }
 
     #[test]
+    fn test_parse_columns_from_create_sql_legacy_quoted_integer_primary_key_is_ipk() {
+        let sql = "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY('id'))";
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert!(cols[0].is_ipk);
+        assert_eq!(cols[1].name, "body");
+        assert_eq!(
+            extract_primary_key_constraints_from_sql(sql),
+            vec![vec!["id".to_owned()]]
+        );
+    }
+
+    #[test]
     fn test_parse_columns_distinguishes_column_and_table_unique_ownership() {
         let column_owned = parse_columns_from_create_sql(
             "CREATE TABLE column_owned (id INTEGER UNIQUE, body TEXT)",
@@ -4195,7 +4932,8 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE table_owned (id INTEGER, body TEXT, UNIQUE(id))",
             "table_owned",
-        );
+        )
+        .unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].columns, vec!["id"]);
     }
@@ -4855,7 +5593,8 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE child (tenant TEXT, slug TEXT, UNIQUE(tenant, slug))",
             "child",
-        );
+        )
+        .unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].columns, vec!["tenant", "slug"]);
         assert!(indexes[0].is_unique);
@@ -4866,8 +5605,50 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY(id COLLATE NOCASE DESC))",
             "metrics",
-        );
+        )
+        .unwrap();
         assert!(indexes.is_empty(), "{indexes:?}");
+    }
+
+    #[test]
+    fn test_extract_implicit_autoindexes_preserves_without_rowid_slots_and_exact_integer_rules() {
+        let indexes = extract_unique_constraint_indexes_from_sql(
+            "CREATE TABLE wr(
+                pk TEXT PRIMARY KEY,
+                u TEXT COLLATE NOCASE COLLATE RTRIM UNIQUE
+             ) WITHOUT ROWID",
+            "wr",
+        )
+        .unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "sqlite_autoindex_wr_2");
+        assert_eq!(indexes[0].columns, ["u"]);
+        assert_eq!(indexes[0].key_collations, [Some("RTRIM".to_owned())]);
+
+        let typed = extract_unique_constraint_indexes_from_sql(
+            "CREATE TABLE typed(id INTEGER(8) PRIMARY KEY, u TEXT UNIQUE)",
+            "typed",
+        )
+        .unwrap();
+        assert_eq!(
+            typed
+                .iter()
+                .map(|index| index.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sqlite_autoindex_typed_1", "sqlite_autoindex_typed_2"]
+        );
+    }
+
+    #[test]
+    fn test_autoindex_followup_explicit_index_uses_final_repeated_collation() {
+        let Some(Statement::CreateIndex(create)) =
+            parse_single_statement("CREATE INDEX idx_t_a ON t(a COLLATE NOCASE COLLATE RTRIM)")
+        else {
+            panic!("expected CREATE INDEX");
+        };
+        let index = create_index_statement_to_index_schema("idx_t_a", 7, &create);
+        assert_eq!(index.columns, ["a"]);
+        assert_eq!(index.key_collations, [Some("RTRIM".to_owned())]);
     }
 
     #[test]
@@ -5171,6 +5952,940 @@ PRAGMA integrity_check;
         }
         let overflowing = format!("sqlite_autoindex_link_table_{}0", usize::MAX);
         assert_eq!(parse_autoindex_ordinal(&overflowing, "link_table"), None);
+    }
+
+    fn implicit_autoindex_catalog_row(
+        entry_type: &str,
+        name: &str,
+        table_name: &str,
+        root_page: i64,
+        sql: Option<&str>,
+    ) -> Vec<SqliteValue> {
+        vec![
+            SqliteValue::Text(entry_type.into()),
+            SqliteValue::Text(name.into()),
+            SqliteValue::Text(table_name.into()),
+            SqliteValue::Integer(root_page),
+            sql.map_or(SqliteValue::Null, |value| SqliteValue::Text(value.into())),
+        ]
+    }
+
+    fn assert_implicit_autoindex_catalog_corrupt(
+        case_name: &str,
+        entries: &[Vec<SqliteValue>],
+        detail_needle: &str,
+    ) {
+        assert_implicit_autoindex_catalog_corrupt_with_page_bound(
+            case_name,
+            entries,
+            i32::MAX.unsigned_abs(),
+            detail_needle,
+        );
+    }
+
+    fn assert_implicit_autoindex_catalog_corrupt_with_page_bound(
+        case_name: &str,
+        entries: &[Vec<SqliteValue>],
+        max_root_page: u32,
+        detail_needle: &str,
+    ) {
+        let header = DatabaseHeader::default();
+        assert_implicit_autoindex_catalog_corrupt_with_root_context(
+            case_name,
+            entries,
+            max_root_page,
+            &header,
+            &HashSet::new(),
+            detail_needle,
+        );
+    }
+
+    fn assert_implicit_autoindex_catalog_corrupt_with_root_context(
+        case_name: &str,
+        entries: &[Vec<SqliteValue>],
+        max_root_page: u32,
+        header: &DatabaseHeader,
+        free_pages: &HashSet<PageNumber>,
+        detail_needle: &str,
+    ) {
+        let error = bind_implicit_autoindex_catalog(entries, max_root_page, header, free_pages)
+            .unwrap_err();
+        let FrankenError::DatabaseCorrupt { detail } = error else {
+            panic!("{case_name}: expected DatabaseCorrupt, found {error:?}");
+        };
+        assert!(
+            detail.contains(detail_needle),
+            "{case_name}: expected `{detail_needle}` in corruption detail, found `{detail}`"
+        );
+    }
+
+    #[test]
+    fn virtual_table_catalog_canonical_row_is_order_independent() {
+        let cases = [
+            (
+                "contentless before stale default",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body, content='')"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                ],
+                0,
+            ),
+            (
+                "contentless after stale default",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body, content='')"),
+                    ),
+                ],
+                1,
+            ),
+            (
+                "equivalent root-zero rows",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "VT",
+                        "VT",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                ],
+                0,
+            ),
+            (
+                "positive row before migration row",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        2,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                ],
+                0,
+            ),
+            (
+                "positive row after migration row",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        2,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                ],
+                1,
+            ),
+        ];
+
+        for (case_name, entries, expected_row) in cases {
+            let catalog = bind_implicit_autoindex_catalog(
+                &entries,
+                2,
+                &DatabaseHeader::default(),
+                &HashSet::new(),
+            )
+            .unwrap_or_else(|error| panic!("{case_name}: unexpected bind failure: {error}"));
+            for row_index in 0..entries.len() {
+                assert_eq!(
+                    catalog.is_canonical_virtual_table_row(row_index),
+                    row_index == expected_row,
+                    "{case_name}: wrong canonical status for row {row_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_autoindex_catalog_binds_complete_layout_and_real_roots() {
+        let entries = vec![
+            implicit_autoindex_catalog_row(
+                "table",
+                "t",
+                "t",
+                2,
+                Some("CREATE TABLE t(a TEXT UNIQUE, b TEXT UNIQUE)"),
+            ),
+            // Deliberately reverse the physical rows: declaration ordinals,
+            // not sqlite_master scan order, determine the canonical result.
+            implicit_autoindex_catalog_row("index", "sqlite_autoindex_t_2", "t", 4, None),
+            implicit_autoindex_catalog_row("index", "sqlite_autoindex_t_1", "t", 3, None),
+            implicit_autoindex_catalog_row(
+                "table",
+                "wr",
+                "wr",
+                5,
+                Some("CREATE TABLE wr(pk TEXT PRIMARY KEY, u TEXT UNIQUE) WITHOUT ROWID"),
+            ),
+            implicit_autoindex_catalog_row("index", "sqlite_autoindex_wr_2", "wr", 6, None),
+            implicit_autoindex_catalog_row(
+                "table",
+                "plain",
+                "plain",
+                7,
+                Some("CREATE TABLE plain(x TEXT)"),
+            ),
+            implicit_autoindex_catalog_row(
+                "index",
+                "sqlite_autoindex_plain_1",
+                "plain",
+                8,
+                Some("CREATE INDEX sqlite_autoindex_plain_1 ON plain(x)"),
+            ),
+        ];
+
+        let catalog = bind_implicit_autoindex_catalog(
+            &entries,
+            8,
+            &DatabaseHeader::default(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let ordinary = catalog.table("T").unwrap();
+        let physical = ordinary.physical_index_schemas("t");
+        assert_eq!(
+            physical
+                .iter()
+                .map(|index| (index.name.as_str(), index.root_page))
+                .collect::<Vec<_>>(),
+            vec![("sqlite_autoindex_t_1", 3), ("sqlite_autoindex_t_2", 4)]
+        );
+
+        let without_rowid = catalog.table("wr").unwrap();
+        assert_eq!(
+            without_rowid
+                .slots
+                .iter()
+                .map(|bound| bound.storage)
+                .collect::<Vec<_>>(),
+            vec![
+                BoundImplicitAutoindexStorage::TableRoot,
+                BoundImplicitAutoindexStorage::IndexRoot(6)
+            ]
+        );
+        let wr_physical = without_rowid.physical_index_schemas("wr");
+        assert_eq!(wr_physical.len(), 1);
+        assert_eq!(wr_physical[0].name, "sqlite_autoindex_wr_2");
+        assert_eq!(wr_physical[0].root_page, 6);
+
+        let plain = catalog.table("plain").unwrap();
+        assert_eq!(plain.implicit_slots().count(), 0);
+        assert!(plain.physical_index_schemas("plain").is_empty());
+    }
+
+    #[test]
+    fn implicit_autoindex_catalog_accepts_valid_views_triggers_and_supported_fts5_repair() {
+        let entries = vec![
+            implicit_autoindex_catalog_row(
+                "TaBlE",
+                "plain",
+                "plain",
+                2,
+                Some("CREATE TABLE main.plain(x TEXT)"),
+            ),
+            implicit_autoindex_catalog_row(
+                "ViEw",
+                "v",
+                "v",
+                0,
+                Some("CREATE VIEW main.v AS SELECT x FROM plain"),
+            ),
+            implicit_autoindex_catalog_row(
+                "TrIgGeR",
+                "plain",
+                "plain",
+                0,
+                Some("CREATE TRIGGER main.plain AFTER INSERT ON plain BEGIN SELECT 1; END"),
+            ),
+            implicit_autoindex_catalog_row(
+                "trigger",
+                "v",
+                "v",
+                0,
+                Some("CREATE TRIGGER main.v INSTEAD OF INSERT ON v BEGIN SELECT 1; END"),
+            ),
+            implicit_autoindex_catalog_row(
+                "table",
+                "docs",
+                "docs",
+                0,
+                Some("CREATE VIRTUAL TABLE main.docs USING fts5(title, body, content='')"),
+            ),
+            implicit_autoindex_catalog_row(
+                "TABLE",
+                "DOCS",
+                "DOCS",
+                0,
+                Some("CREATE VIRTUAL TABLE docs USING fts5(title, body)"),
+            ),
+            implicit_autoindex_catalog_row(
+                "table",
+                "legacy_docs",
+                "legacy_docs",
+                3,
+                Some("CREATE VIRTUAL TABLE legacy_docs USING fts5(title, body)"),
+            ),
+            implicit_autoindex_catalog_row(
+                "table",
+                "LEGACY_DOCS",
+                "LEGACY_DOCS",
+                0,
+                Some("CREATE VIRTUAL TABLE legacy_docs USING fts5(title, body)"),
+            ),
+        ];
+
+        let catalog = bind_implicit_autoindex_catalog(
+            &entries,
+            3,
+            &DatabaseHeader::default(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(catalog.table("PLAIN").is_some());
+        assert!(catalog.table("docs").is_none());
+    }
+
+    #[test]
+    fn implicit_autoindex_catalog_rejects_invalid_row_shapes_and_storage_classes() {
+        let mut short_row =
+            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
+        short_row.pop();
+        let mut non_text_type =
+            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
+        non_text_type[0] = SqliteValue::Integer(1);
+        let mut non_text_name =
+            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
+        non_text_name[1] = SqliteValue::Null;
+        let mut non_text_table_name =
+            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
+        non_text_table_name[2] = SqliteValue::Blob(vec![1].into());
+        let mut invalid_sql_storage =
+            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
+        invalid_sql_storage[4] = SqliteValue::Integer(1);
+
+        for (case_name, entries, detail_needle) in [
+            ("short row", vec![short_row], "columns instead of 5"),
+            (
+                "non-text type",
+                vec![non_text_type],
+                "column `type` must be TEXT",
+            ),
+            (
+                "non-text name",
+                vec![non_text_name],
+                "column `name` must be TEXT",
+            ),
+            (
+                "non-text table name",
+                vec![non_text_table_name],
+                "column `tbl_name` must be TEXT",
+            ),
+            (
+                "invalid sql storage",
+                vec![invalid_sql_storage],
+                "column `sql` must be TEXT or NULL",
+            ),
+            (
+                "table NULL sql",
+                vec![implicit_autoindex_catalog_row("table", "t", "t", 2, None)],
+                "has NULL sql",
+            ),
+        ] {
+            assert_implicit_autoindex_catalog_corrupt(case_name, &entries, detail_needle);
+        }
+
+        assert_implicit_autoindex_catalog_corrupt_with_page_bound(
+            "zero visible bound",
+            &[],
+            0,
+            "without a visible database page",
+        );
+    }
+
+    #[test]
+    fn implicit_autoindex_catalog_rejects_incomplete_ambiguous_or_unsafe_catalogs() {
+        let unique_table = || {
+            implicit_autoindex_catalog_row(
+                "table",
+                "t",
+                "t",
+                2,
+                Some("CREATE TABLE t(a TEXT UNIQUE)"),
+            )
+        };
+        let unique_index = |name: &str, root_page: i64| {
+            implicit_autoindex_catalog_row("index", name, "t", root_page, None)
+        };
+
+        let mut non_integer_root = unique_table();
+        non_integer_root[3] = SqliteValue::Text("two".into());
+        let cases = vec![
+            (
+                "missing expected row",
+                vec![unique_table()],
+                "missing implicit autoindex",
+            ),
+            (
+                "unexpected ordinal",
+                vec![unique_table(), unique_index("sqlite_autoindex_t_2", 3)],
+                "nonexistent declaration slot 2",
+            ),
+            (
+                "duplicate row",
+                vec![
+                    unique_table(),
+                    unique_index("sqlite_autoindex_t_1", 3),
+                    unique_index("SQLITE_AUTOINDEX_T_1", 4),
+                ],
+                "duplicate index entries",
+            ),
+            (
+                "hidden WITHOUT ROWID PK row",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "wr",
+                        "wr",
+                        2,
+                        Some("CREATE TABLE wr(pk TEXT PRIMARY KEY) WITHOUT ROWID"),
+                    ),
+                    implicit_autoindex_catalog_row("index", "sqlite_autoindex_wr_1", "wr", 3, None),
+                ],
+                "illegally materializes hidden",
+            ),
+            (
+                "missing implicit parent",
+                vec![implicit_autoindex_catalog_row(
+                    "index",
+                    "sqlite_autoindex_absent_1",
+                    "absent",
+                    3,
+                    None,
+                )],
+                "missing ordinary table",
+            ),
+            (
+                "missing explicit parent",
+                vec![implicit_autoindex_catalog_row(
+                    "index",
+                    "idx_absent",
+                    "absent",
+                    3,
+                    Some("CREATE INDEX idx_absent ON absent(a)"),
+                )],
+                "missing ordinary table",
+            ),
+            (
+                "table name mismatch",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "other",
+                    2,
+                    Some("CREATE TABLE t(a)"),
+                )],
+                "mismatched tbl_name",
+            ),
+            (
+                "CREATE TABLE name mismatch",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    2,
+                    Some("CREATE TABLE other(a)"),
+                )],
+                "declares `other`",
+            ),
+            (
+                "layout conflict mapping",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    2,
+                    Some(
+                        "CREATE TABLE t(a TEXT UNIQUE ON CONFLICT IGNORE, UNIQUE(a) ON CONFLICT REPLACE)",
+                    ),
+                )],
+                "invalid implicit autoindex layout",
+            ),
+            (
+                "non-integer root",
+                vec![non_integer_root],
+                "must be INTEGER",
+            ),
+            (
+                "zero root",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    0,
+                    Some("CREATE TABLE t(a)"),
+                )],
+                "invalid rootpage 0",
+            ),
+            (
+                "negative root",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    -2,
+                    Some("CREATE TABLE t(a)"),
+                )],
+                "invalid rootpage -2",
+            ),
+            (
+                "above i32 root",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    i64::from(i32::MAX) + 1,
+                    Some("CREATE TABLE t(a)"),
+                )],
+                "exceeds supported range",
+            ),
+            (
+                "penultimate i32 root",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    i64::from(i32::MAX - 1),
+                    Some("CREATE TABLE t(a)"),
+                )],
+                "no safe MemDatabase allocation sentinel",
+            ),
+            (
+                "terminal i32 root",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    i64::from(i32::MAX),
+                    Some("CREATE TABLE t(a)"),
+                )],
+                "no safe MemDatabase allocation sentinel",
+            ),
+            (
+                "page one collision",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    1,
+                    Some("CREATE TABLE t(a)"),
+                )],
+                "shared by sqlite_master",
+            ),
+            (
+                "table index root collision",
+                vec![unique_table(), unique_index("sqlite_autoindex_t_1", 2)],
+                "rootpage 2 is shared",
+            ),
+            (
+                "two index root collision",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "t",
+                        "t",
+                        2,
+                        Some("CREATE TABLE t(a UNIQUE, b UNIQUE)"),
+                    ),
+                    unique_index("sqlite_autoindex_t_1", 3),
+                    unique_index("sqlite_autoindex_t_2", 3),
+                ],
+                "rootpage 3 is shared",
+            ),
+            (
+                "explicit index identity mismatch",
+                vec![
+                    implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)")),
+                    implicit_autoindex_catalog_row(
+                        "index",
+                        "idx_t",
+                        "t",
+                        3,
+                        Some("CREATE INDEX idx_other ON t(a)"),
+                    ),
+                ],
+                "declares index `idx_other`",
+            ),
+            (
+                "virtual table identity mismatch",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "vt",
+                    "vt",
+                    0,
+                    Some("CREATE VIRTUAL TABLE other USING fts5(body)"),
+                )],
+                "declares `other`",
+            ),
+            (
+                "unsupported schema type",
+                vec![implicit_autoindex_catalog_row(
+                    "bogus",
+                    "x",
+                    "x",
+                    0,
+                    Some("bogus"),
+                )],
+                "unsupported type",
+            ),
+            (
+                "view owns a root",
+                vec![implicit_autoindex_catalog_row(
+                    "view",
+                    "v",
+                    "v",
+                    2,
+                    Some("CREATE VIEW v AS SELECT 1"),
+                )],
+                "must have rootpage 0",
+            ),
+        ];
+
+        for (case_name, entries, detail_needle) in cases {
+            assert_implicit_autoindex_catalog_corrupt(case_name, &entries, detail_needle);
+        }
+
+        assert_implicit_autoindex_catalog_corrupt_with_page_bound(
+            "root past visible database",
+            &[
+                implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    2,
+                    Some("CREATE TABLE t(a TEXT UNIQUE)"),
+                ),
+                implicit_autoindex_catalog_row("index", "sqlite_autoindex_t_1", "t", 4, None),
+            ],
+            3,
+            "exceeds the visible database page count 3",
+        );
+    }
+
+    #[test]
+    fn implicit_autoindex_catalog_rejects_schema_identity_and_namespace_corruption() {
+        let ordinary_table =
+            || implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a TEXT)"));
+        let cases = vec![
+            (
+                "ordinary CREATE parse failure",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    2,
+                    Some("CREATE TABLE t("),
+                )],
+                "could not parse CREATE TABLE",
+            ),
+            (
+                "stored CTAS",
+                vec![implicit_autoindex_catalog_row(
+                    "table",
+                    "t",
+                    "t",
+                    2,
+                    Some("CREATE TABLE t AS SELECT 1 AS a"),
+                )],
+                "CREATE TABLE AS SELECT",
+            ),
+            (
+                "duplicate ordinary table",
+                vec![
+                    ordinary_table(),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "T",
+                        "T",
+                        3,
+                        Some("CREATE TABLE T(a TEXT)"),
+                    ),
+                ],
+                "duplicate table entries",
+            ),
+            (
+                "table view namespace collision",
+                vec![
+                    ordinary_table(),
+                    implicit_autoindex_catalog_row(
+                        "view",
+                        "T",
+                        "T",
+                        0,
+                        Some("CREATE VIEW T AS SELECT 1"),
+                    ),
+                ],
+                "schema name `T` is shared",
+            ),
+            (
+                "view NULL sql",
+                vec![implicit_autoindex_catalog_row("view", "v", "v", 0, None)],
+                "non-NULL sql",
+            ),
+            (
+                "view name mismatch",
+                vec![implicit_autoindex_catalog_row(
+                    "view",
+                    "v",
+                    "v",
+                    0,
+                    Some("CREATE VIEW other AS SELECT 1"),
+                )],
+                "differently named view",
+            ),
+            (
+                "temporary view",
+                vec![implicit_autoindex_catalog_row(
+                    "view",
+                    "v",
+                    "v",
+                    0,
+                    Some("CREATE TEMP VIEW v AS SELECT 1"),
+                )],
+                "temporary, non-main, or differently named view",
+            ),
+            (
+                "missing trigger target",
+                vec![implicit_autoindex_catalog_row(
+                    "trigger",
+                    "tr",
+                    "missing",
+                    0,
+                    Some("CREATE TRIGGER tr AFTER INSERT ON missing BEGIN SELECT 1; END"),
+                )],
+                "missing or incompatible table `missing`",
+            ),
+            (
+                "INSTEAD OF trigger on table",
+                vec![
+                    ordinary_table(),
+                    implicit_autoindex_catalog_row(
+                        "trigger",
+                        "tr",
+                        "t",
+                        0,
+                        Some("CREATE TRIGGER tr INSTEAD OF INSERT ON t BEGIN SELECT 1; END"),
+                    ),
+                ],
+                "missing or incompatible view `t`",
+            ),
+            (
+                "AFTER trigger on view",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "view",
+                        "v",
+                        "v",
+                        0,
+                        Some("CREATE VIEW v AS SELECT 1"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "trigger",
+                        "tr",
+                        "v",
+                        0,
+                        Some("CREATE TRIGGER tr AFTER INSERT ON v BEGIN SELECT 1; END"),
+                    ),
+                ],
+                "missing or incompatible table `v`",
+            ),
+            (
+                "explicit index parse failure",
+                vec![
+                    ordinary_table(),
+                    implicit_autoindex_catalog_row(
+                        "index",
+                        "idx_t",
+                        "t",
+                        3,
+                        Some("CREATE INDEX idx_t ON"),
+                    ),
+                ],
+                "could not parse CREATE INDEX",
+            ),
+            (
+                "explicit index table mismatch",
+                vec![
+                    ordinary_table(),
+                    implicit_autoindex_catalog_row(
+                        "index",
+                        "idx_t",
+                        "t",
+                        3,
+                        Some("CREATE INDEX idx_t ON other(a)"),
+                    ),
+                ],
+                "on table `other` instead of `t`",
+            ),
+            (
+                "hidden logical autoindex name claimed explicitly",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "wr",
+                        "wr",
+                        2,
+                        Some("CREATE TABLE wr(pk TEXT PRIMARY KEY, u TEXT) WITHOUT ROWID"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "index",
+                        "sqlite_autoindex_wr_1",
+                        "wr",
+                        3,
+                        Some("CREATE INDEX sqlite_autoindex_wr_1 ON wr(u)"),
+                    ),
+                ],
+                "collides with logical implicit index",
+            ),
+            (
+                "conflicting rootpage-zero virtual tables",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "VT",
+                        "VT",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING rtree(id, min_x, max_x)"),
+                    ),
+                ],
+                "conflicting virtual-table entries",
+            ),
+            (
+                "third duplicate virtual table",
+                vec![
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "VT",
+                        "VT",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                    implicit_autoindex_catalog_row(
+                        "table",
+                        "vt",
+                        "vt",
+                        0,
+                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                    ),
+                ],
+                "conflicting virtual-table entries",
+            ),
+        ];
+
+        for (case_name, entries, detail_needle) in cases {
+            assert_implicit_autoindex_catalog_corrupt(case_name, &entries, detail_needle);
+        }
+    }
+
+    #[test]
+    fn implicit_autoindex_catalog_rejects_reserved_or_free_root_pages() {
+        let table_at = |root_page| {
+            vec![implicit_autoindex_catalog_row(
+                "table",
+                "t",
+                "t",
+                root_page,
+                Some("CREATE TABLE t(a)"),
+            )]
+        };
+
+        let lock_byte_page = fsqlite_pager::lock_byte_page(PageSize::DEFAULT);
+        assert_implicit_autoindex_catalog_corrupt_with_page_bound(
+            "lock-byte root",
+            &table_at(i64::from(lock_byte_page)),
+            lock_byte_page,
+            "reserved lock-byte rootpage",
+        );
+
+        let mut auto_vacuum_header = DatabaseHeader::default();
+        auto_vacuum_header.largest_root_page = 3;
+        assert_implicit_autoindex_catalog_corrupt_with_root_context(
+            "auto-vacuum pointer-map root",
+            &table_at(2),
+            3,
+            &auto_vacuum_header,
+            &HashSet::new(),
+            "pointer-map rootpage 2",
+        );
+
+        let free_page = PageNumber::new(2).unwrap();
+        assert_implicit_autoindex_catalog_corrupt_with_root_context(
+            "freelist root",
+            &table_at(2),
+            2,
+            &DatabaseHeader::default(),
+            &HashSet::from([free_page]),
+            "uses free rootpage 2",
+        );
     }
 
     #[test]

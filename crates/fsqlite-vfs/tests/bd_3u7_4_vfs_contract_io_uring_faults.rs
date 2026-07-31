@@ -12,7 +12,7 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_vfs::IoUringVfs;
 #[cfg(all(feature = "native", unix))]
 use fsqlite_vfs::UnixVfs;
-use fsqlite_vfs::{MemoryVfs, Vfs, VfsFile, VfsWriteCompletion};
+use fsqlite_vfs::{FileIdentity, MemoryVfs, SyncKind, Vfs, VfsFile, VfsWriteCompletion};
 #[cfg(all(feature = "native", unix))]
 use tempfile::tempdir;
 
@@ -244,6 +244,7 @@ struct InjectedFaultState {
     next_read: Option<InjectedReadFault>,
     next_write: Option<InjectedWriteFault>,
     next_sync: Option<InjectedSyncFault>,
+    last_sync_call: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -286,6 +287,13 @@ impl<V: Vfs> TestFaultVfs<V> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .next_sync = Some(InjectedSyncFault::Io);
+    }
+
+    fn last_sync_call(&self) -> Option<&'static str> {
+        self.faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_sync_call
     }
 }
 
@@ -350,6 +358,10 @@ impl<V: Vfs> Vfs for TestFaultVfs<V> {
 impl<F: VfsFile> VfsFile for TestFaultFile<F> {
     fn close(&mut self, cx: &Cx) -> Result<()> {
         self.inner.close(cx)
+    }
+
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.file_identity()
     }
 
     async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
@@ -426,15 +438,32 @@ impl<F: VfsFile> VfsFile for TestFaultFile<F> {
     }
 
     fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
-        let maybe_fault = self
-            .faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_sync
-            .take();
+        let maybe_fault = {
+            let mut faults = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            faults.last_sync_call = Some("sync");
+            faults.next_sync.take()
+        };
         match maybe_fault {
             Some(InjectedSyncFault::Io) => Err(injected_io_error("fault injection: sync failure")),
             None => self.inner.sync(cx, flags),
+        }
+    }
+
+    fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        let maybe_fault = {
+            let mut faults = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            faults.last_sync_call = Some("durable_sync");
+            faults.next_sync.take()
+        };
+        match maybe_fault {
+            Some(InjectedSyncFault::Io) => Err(injected_io_error("fault injection: sync failure")),
+            None => self.inner.durable_sync(cx, kind),
         }
     }
 
@@ -448,6 +477,22 @@ impl<F: VfsFile> VfsFile for TestFaultFile<F> {
 
     fn unlock(&mut self, cx: &Cx, level: fsqlite_types::LockLevel) -> Result<()> {
         self.inner.unlock(cx, level)
+    }
+
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_shared_snapshot(cx)
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_shared_snapshot_attempt(cx)
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        self.inner.lock_external_maintenance(cx, wal_mode)
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_maintenance_attempt(cx)
     }
 
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
@@ -495,6 +540,10 @@ fn fault_injection_wrapper_surfaces_read_write_sync_and_partial_write_errors() -
         let cx = Cx::new();
         let vfs = TestFaultVfs::new(MemoryVfs::new());
         let (mut file, _) = open_main_rw_file(&vfs, &cx, Path::new("bd_3u7_4_faults.db"))?;
+        assert!(
+            file.file_identity()?.is_some(),
+            "the wrapper must preserve the open file's stable identity"
+        );
 
         file.write(&cx, b"abcdefgh", 0).await?;
 
@@ -537,6 +586,18 @@ fn fault_injection_wrapper_surfaces_read_write_sync_and_partial_write_errors() -
             .sync(&cx, SyncFlags::FULL)
             .expect_err("faulted sync should fail");
         assert!(matches!(sync_err, FrankenError::Io(_)));
+
+        vfs.inject_sync_io();
+        let durable_sync_err = file
+            .durable_sync(&cx, SyncKind::FullDurable)
+            .expect_err("faulted durable sync should fail");
+        assert!(matches!(durable_sync_err, FrankenError::Io(_)));
+        assert_eq!(
+            vfs.last_sync_call(),
+            Some("durable_sync"),
+            "durable intent must not collapse through the ordinary sync method"
+        );
+        file.durable_sync(&cx, SyncKind::FullDurable)?;
 
         file.close(&cx)?;
         Ok(())

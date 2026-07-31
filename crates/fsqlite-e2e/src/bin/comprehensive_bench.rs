@@ -57,8 +57,8 @@ const ROW_COUNTS_QUICK: &[usize] = &[100, 1_000, 10_000];
 const CONCURRENT_THREAD_COUNTS: &[usize] = &[2, 4, 8];
 const CONCURRENT_ROWS_PER_THREAD: usize = 1_000;
 const CONCURRENT_RANGE_SIZE: i64 = 1_000_000;
-const JSON_REPORT_SCHEMA_V6: &str = "fsqlite-e2e.comprehensive-bench-report.v6";
-const BENCHMARK_PROVENANCE_SCHEMA_V3: &str = "fsqlite-e2e.benchmark-provenance.v3";
+const JSON_REPORT_SCHEMA_V7: &str = "fsqlite-e2e.comprehensive-bench-report.v7";
+const BENCHMARK_PROVENANCE_SCHEMA_V4: &str = "fsqlite-e2e.benchmark-provenance.v4";
 const CI_REGRESSION_GATE_SCHEMA_V2: &str = "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2";
 const CI_REGRESSION_GATE_BEAD_ID: &str = "bd-m4tju";
 const CI_REGRESSION_BASELINE_BEAD_ID: &str = "bd-0winn";
@@ -71,6 +71,15 @@ const CI_CATEGORY_GEOMEAN_MAX_REGRESSION_PCT: f64 = 0.10;
 const CI_P90_MAX_REGRESSION_PCT: f64 = 0.15;
 const CONCURRENT_WRITERS_SECTION_TITLE: &str =
     "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
+const CONCURRENT_WRITERS_FULL_SECTION_TITLE: &str =
+    "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC [synchronous=FULL diagnostic]";
+const CONCURRENT_SINGLE_BASELINE_SECTION_TITLE: &str =
+    "Concurrent Writers — C SQLite Single-Thread Baseline";
+const CONCURRENT_SINGLE_BASELINE_FULL_SECTION_TITLE: &str =
+    "Concurrent Writers — C SQLite Single-Thread Baseline [synchronous=FULL diagnostic]";
+const SCALAR_SUBQUERY_SQL: &str = "SELECT p.name, \
+    (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name \
+    FROM products p ORDER BY p.id LIMIT 100";
 const DEFAULT_BENCH_PAGE_SIZE_BYTES: u32 = 4096;
 #[cfg(feature = "bridge-experiment")]
 const BRIDGE_REPORT_SCHEMA_V3: &str = "fsqlite-e2e.bridge-experiment.v3";
@@ -208,6 +217,21 @@ struct Measurement {
     row_count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct MeasureConfig {
+    warmup_iters: usize,
+    min_iters: usize,
+    max_iters: usize,
+    target_duration: Duration,
+}
+
+const DEFAULT_MEASURE_CONFIG: MeasureConfig = MeasureConfig {
+    warmup_iters: WARMUP_ITERS,
+    min_iters: MIN_ITERS,
+    max_iters: MAX_ITERS,
+    target_duration: TARGET_DURATION,
+};
+
 #[allow(dead_code)]
 impl Measurement {
     fn mean(&self) -> Duration {
@@ -317,6 +341,139 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
         durations,
         row_count,
     }
+}
+
+fn adaptive_parameter(iteration: usize, maximum: i64) -> i64 {
+    assert!(
+        maximum > 0,
+        "adaptive benchmark parameter maximum must be positive"
+    );
+    #[allow(clippy::cast_possible_wrap)]
+    let iteration = iteration as i64;
+    1 + iteration % maximum
+}
+
+fn measure_paired_parameterized_with_config<C, F>(
+    csqlite_label: &str,
+    fsqlite_label: &str,
+    row_count: usize,
+    parameter_maximum: i64,
+    config: MeasureConfig,
+    mut csqlite: C,
+    mut fsqlite: F,
+) -> (Measurement, Measurement)
+where
+    C: FnMut(i64),
+    F: FnMut(i64),
+{
+    assert!(config.min_iters > 0, "paired measurement needs a sample");
+    assert!(
+        config.min_iters <= config.max_iters,
+        "paired minimum iterations must not exceed the maximum"
+    );
+    assert!(
+        config.max_iters % 2 == 0,
+        "paired maximum iterations must complete AB/BA order blocks"
+    );
+
+    for iteration in 0..config.warmup_iters {
+        eprint!(
+            "\r    [{csqlite_label} / {fsqlite_label}] warmup {}/{}...",
+            iteration + 1,
+            config.warmup_iters
+        );
+        let parameter = adaptive_parameter(iteration, parameter_maximum);
+        if iteration % 2 == 0 {
+            csqlite(parameter);
+            fsqlite(parameter);
+        } else {
+            fsqlite(parameter);
+            csqlite(parameter);
+        }
+    }
+
+    let mut csqlite_durations = Vec::new();
+    let mut fsqlite_durations = Vec::new();
+    let mut csqlite_total = Duration::ZERO;
+    let mut fsqlite_total = Duration::ZERO;
+    for measured_iteration in 0..config.max_iters {
+        eprint!(
+            "\r    [{csqlite_label} / {fsqlite_label}] iter {}/{} \
+             (C: {:.1}s, F: {:.1}s)    ",
+            measured_iteration + 1,
+            config.max_iters,
+            csqlite_total.as_secs_f64(),
+            fsqlite_total.as_secs_f64()
+        );
+        let iteration = config.warmup_iters + measured_iteration;
+        let parameter = adaptive_parameter(iteration, parameter_maximum);
+        let run_csqlite = |csqlite: &mut C| {
+            let start = Instant::now();
+            csqlite(parameter);
+            start.elapsed()
+        };
+        let run_fsqlite = |fsqlite: &mut F| {
+            let start = Instant::now();
+            fsqlite(parameter);
+            start.elapsed()
+        };
+        let (csqlite_elapsed, fsqlite_elapsed) = if iteration % 2 == 0 {
+            (run_csqlite(&mut csqlite), run_fsqlite(&mut fsqlite))
+        } else {
+            let fsqlite_elapsed = run_fsqlite(&mut fsqlite);
+            let csqlite_elapsed = run_csqlite(&mut csqlite);
+            (csqlite_elapsed, fsqlite_elapsed)
+        };
+        csqlite_durations.push(csqlite_elapsed);
+        fsqlite_durations.push(fsqlite_elapsed);
+        csqlite_total += csqlite_elapsed;
+        fsqlite_total += fsqlite_elapsed;
+
+        if csqlite_durations.len() >= config.min_iters
+            && csqlite_durations.len() % 2 == 0
+            && csqlite_total >= config.target_duration
+            && fsqlite_total >= config.target_duration
+        {
+            break;
+        }
+    }
+    eprint!("\r{:80}\r", "");
+
+    (
+        Measurement {
+            label: csqlite_label.to_owned(),
+            durations: csqlite_durations,
+            row_count,
+        },
+        Measurement {
+            label: fsqlite_label.to_owned(),
+            durations: fsqlite_durations,
+            row_count,
+        },
+    )
+}
+
+fn measure_paired_parameterized<C, F>(
+    csqlite_label: &str,
+    fsqlite_label: &str,
+    row_count: usize,
+    parameter_maximum: i64,
+    csqlite: C,
+    fsqlite: F,
+) -> (Measurement, Measurement)
+where
+    C: FnMut(i64),
+    F: FnMut(i64),
+{
+    measure_paired_parameterized_with_config(
+        csqlite_label,
+        fsqlite_label,
+        row_count,
+        parameter_maximum,
+        DEFAULT_MEASURE_CONFIG,
+        csqlite,
+        fsqlite,
+    )
 }
 
 fn measure_with_teardown<F, T>(
@@ -575,19 +732,22 @@ fn bench_env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Matched durability for both engines in the concurrent-writer section.
+/// Matched `synchronous` settings for both engines in the concurrent-writer section.
 ///
 /// NORMAL is the explicit default. FULL is available as a separate, labelled
 /// experiment. Silently allowing C SQLite to inherit FULL while FrankenSQLite
-/// receives NORMAL makes the comparison non-citable (bd-x5gzk).
+/// receives NORMAL makes even the settings comparison invalid (bd-x5gzk).
+/// Equal PRAGMA text/readback does not by itself prove equivalent crash,
+/// ordering, fsync, or checkpoint semantics, so reports must describe these as
+/// matched settings rather than matched durability.
 ///
 /// Why this exists at all: `synchronous` is a PER-CONNECTION pragma, so the
 /// setup connection's NORMAL never reaches the writer connections. A C SQLite
 /// writer that never sets it inherits the compiled default
 /// SQLITE_DEFAULT_SYNCHRONOUS=2 (FULL) and pays a real WAL fsync per commit,
 /// while FrankenSQLite's NORMAL maps to WalCommitSyncPolicy::Deferred and pays
-/// none. FULL is also the durability-serious comparison, and was used to probe
-/// whether group-commit coalescing engages under a per-commit fsync: it does
+/// none. The FULL-settings comparison was also used to probe whether
+/// group-commit coalescing engages under a per-commit fsync: it does
 /// not for this workload shape, because each writer issues exactly one commit
 /// so commits never co-occur in the consolidator's FILLING window (bd-6hgad).
 fn concurrent_sync_mode() -> &'static str {
@@ -597,6 +757,56 @@ fn concurrent_sync_mode() -> &'static str {
         Ok(value) => panic!("FSQLITE_BENCH_CONCURRENT_SYNC must be NORMAL or FULL, got `{value}`"),
         Err(std::env::VarError::NotPresent) => "NORMAL",
         Err(error) => panic!("could not read FSQLITE_BENCH_CONCURRENT_SYNC: {error}"),
+    }
+}
+
+fn concurrent_writers_section_title(sync_mode: &str) -> &'static str {
+    match sync_mode {
+        "NORMAL" => CONCURRENT_WRITERS_SECTION_TITLE,
+        "FULL" => CONCURRENT_WRITERS_FULL_SECTION_TITLE,
+        other => panic!("unsupported concurrent synchronous mode `{other}`"),
+    }
+}
+
+fn concurrent_single_baseline_section_title(sync_mode: &str) -> &'static str {
+    match sync_mode {
+        "NORMAL" => CONCURRENT_SINGLE_BASELINE_SECTION_TITLE,
+        "FULL" => CONCURRENT_SINGLE_BASELINE_FULL_SECTION_TITLE,
+        other => panic!("unsupported concurrent synchronous mode `{other}`"),
+    }
+}
+
+fn concurrent_measurement_label(engine: &str, writers: usize, sync_mode: &str) -> String {
+    match sync_mode {
+        "NORMAL" => format!("{engine}_concurrent_{writers}t"),
+        "FULL" => format!("{engine}_concurrent_full_{writers}t"),
+        other => panic!("unsupported concurrent synchronous mode `{other}`"),
+    }
+}
+
+fn concurrent_scenario_label(writers: usize, sync_mode: &str) -> String {
+    let base = format!("{writers} writers x {CONCURRENT_ROWS_PER_THREAD} rows");
+    match sync_mode {
+        "NORMAL" => base,
+        "FULL" => format!("{base} [synchronous=FULL diagnostic]"),
+        other => panic!("unsupported concurrent synchronous mode `{other}`"),
+    }
+}
+
+fn concurrent_single_measurement_label(writers: usize, sync_mode: &str) -> String {
+    match sync_mode {
+        "NORMAL" => format!("cs_single_{writers}t_equiv"),
+        "FULL" => format!("cs_single_full_{writers}t_equiv"),
+        other => panic!("unsupported concurrent synchronous mode `{other}`"),
+    }
+}
+
+fn concurrent_single_scenario_label(total_rows: usize, sync_mode: &str) -> String {
+    let base = format!("C SQLite 1 thread / {total_rows} rows (baseline)");
+    match sync_mode {
+        "NORMAL" => base,
+        "FULL" => format!("{base} [synchronous=FULL diagnostic]"),
+        other => panic!("unsupported concurrent synchronous mode `{other}`"),
     }
 }
 
@@ -818,9 +1028,171 @@ fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
     }
 }
 
+/// Exact, type-tagged value used by cross-engine correctness oracles.
+///
+/// Benchmark display/readback normalization is intentionally more permissive
+/// for case-insensitive PRAGMA names. Query-result certification must not be:
+/// lowercasing text or reducing blobs to their lengths can accept wrong
+/// results. REAL values use their IEEE-754 bit pattern so multiset ordering is
+/// total and no string-formatting differences enter the comparison.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ExactOracleValue {
+    Null,
+    Integer(i64),
+    RealBits(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+fn exact_csqlite_oracle_value(value: rusqlite::types::ValueRef<'_>) -> ExactOracleValue {
+    match value {
+        rusqlite::types::ValueRef::Null => ExactOracleValue::Null,
+        rusqlite::types::ValueRef::Integer(value) => ExactOracleValue::Integer(value),
+        rusqlite::types::ValueRef::Real(value) => ExactOracleValue::RealBits(value.to_bits()),
+        rusqlite::types::ValueRef::Text(value) => ExactOracleValue::Text(value.to_vec()),
+        rusqlite::types::ValueRef::Blob(value) => ExactOracleValue::Blob(value.to_vec()),
+    }
+}
+
+fn exact_fsqlite_oracle_value(value: &fsqlite::SqliteValue) -> ExactOracleValue {
+    match value {
+        fsqlite::SqliteValue::Null => ExactOracleValue::Null,
+        fsqlite::SqliteValue::Integer(value) => ExactOracleValue::Integer(*value),
+        fsqlite::SqliteValue::Float(value) => ExactOracleValue::RealBits(value.to_bits()),
+        fsqlite::SqliteValue::Text(value) => {
+            ExactOracleValue::Text(value.as_ref().as_bytes().to_vec())
+        }
+        fsqlite::SqliteValue::Blob(value) => ExactOracleValue::Blob(value.to_vec()),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResultSetOraclePolicy {
+    Exact,
+    ApproximateReal {
+        absolute_tolerance: f64,
+        relative_tolerance: f64,
+    },
+}
+
+const ORDER_INDEPENDENT_REAL_ORACLE_POLICY: ResultSetOraclePolicy =
+    ResultSetOraclePolicy::ApproximateReal {
+        absolute_tolerance: 1.0e-12,
+        relative_tolerance: 1.0e-12,
+    };
+
+fn compare_oracle_values_for_sort(
+    left: &ExactOracleValue,
+    right: &ExactOracleValue,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (ExactOracleValue::RealBits(left), ExactOracleValue::RealBits(right)) => {
+            f64::from_bits(*left).total_cmp(&f64::from_bits(*right))
+        }
+        _ => left.cmp(right),
+    }
+}
+
+fn compare_oracle_rows_for_sort(
+    left: &[ExactOracleValue],
+    right: &[ExactOracleValue],
+) -> std::cmp::Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| compare_oracle_values_for_sort(left, right))
+        .find(|ordering| !ordering.is_eq())
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
+fn oracle_values_match(
+    left: &ExactOracleValue,
+    right: &ExactOracleValue,
+    policy: ResultSetOraclePolicy,
+) -> bool {
+    match (left, right, policy) {
+        (
+            ExactOracleValue::RealBits(left),
+            ExactOracleValue::RealBits(right),
+            ResultSetOraclePolicy::ApproximateReal {
+                absolute_tolerance,
+                relative_tolerance,
+            },
+        ) => {
+            if left == right {
+                return true;
+            }
+            let left = f64::from_bits(*left);
+            let right = f64::from_bits(*right);
+            if !left.is_finite() || !right.is_finite() {
+                return false;
+            }
+            let allowed = absolute_tolerance.max(relative_tolerance * left.abs().max(right.abs()));
+            (left - right).abs() <= allowed
+        }
+        _ => left == right,
+    }
+}
+
+fn oracle_rows_match(
+    left: &[ExactOracleValue],
+    right: &[ExactOracleValue],
+    policy: ResultSetOraclePolicy,
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| oracle_values_match(left, right, policy))
+}
+
+fn collect_csqlite_oracle_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    context: &str,
+) -> Vec<Vec<ExactOracleValue>> {
+    let mut stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|error| panic!("{context}: C SQLite prepare failed: {error}"));
+    let column_count = stmt.column_count();
+    stmt.query_map([], |row| {
+        let mut values = Vec::with_capacity(column_count);
+        for index in 0..column_count {
+            values.push(exact_csqlite_oracle_value(row.get_ref(index)?));
+        }
+        Ok(values)
+    })
+    .unwrap_or_else(|error| panic!("{context}: C SQLite query failed: {error}"))
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap_or_else(|error| panic!("{context}: C SQLite row decode failed: {error}"))
+}
+
+fn collect_fsqlite_oracle_rows(
+    conn: &fsqlite::Connection,
+    sql: &str,
+    context: &str,
+) -> Vec<Vec<ExactOracleValue>> {
+    fsqlite_e2e::block_on(conn.query(sql))
+        .unwrap_or_else(|error| panic!("{context}: FrankenSQLite query failed: {error}"))
+        .iter()
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(exact_fsqlite_oracle_value)
+                .collect()
+        })
+        .collect()
+}
+
+fn ordered_oracle_rows_match(
+    left: &[Vec<ExactOracleValue>],
+    right: &[Vec<ExactOracleValue>],
+) -> bool {
+    left == right
+}
+
 /// One-time cross-engine result-set oracle for multi-row benchmark queries
 /// (bd-czzlp): both engines run `sql` once, outside the timed loops, and the
-/// normalized results must match as multisets. Ordering is not compared
+/// exact type-tagged results must match as multisets. Ordering is not compared
 /// because these shapes carry no ORDER BY.
 fn assert_result_set_oracle(
     cs_conn: &rusqlite::Connection,
@@ -828,26 +1200,30 @@ fn assert_result_set_oracle(
     sql: &str,
     context: &str,
 ) {
-    let mut stmt = cs_conn
-        .prepare(sql)
-        .unwrap_or_else(|e| panic!("{context}: C SQLite prepare failed: {e}"));
-    let col_count = stmt.column_count();
-    let mut cs_rows: Vec<Vec<String>> = stmt
-        .query_map([], |row| {
-            let mut values = Vec::with_capacity(col_count);
-            for idx in 0..col_count {
-                values.push(normalize_csqlite_value(row.get_ref(idx)?));
-            }
-            Ok(values)
-        })
-        .unwrap_or_else(|e| panic!("{context}: C SQLite query failed: {e}"))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|e| panic!("{context}: C SQLite row decode failed: {e}"));
-    let mut fs_rows: Vec<Vec<String>> = fsqlite_e2e::block_on(fs_conn.query(sql))
-        .unwrap_or_else(|e| panic!("{context}: FrankenSQLite query failed: {e}"))
-        .iter()
-        .map(|row| row.values().iter().map(normalize_fsqlite_value).collect())
-        .collect();
+    assert_result_set_oracle_with_policy(
+        cs_conn,
+        fs_conn,
+        sql,
+        context,
+        ResultSetOraclePolicy::Exact,
+    );
+}
+
+/// Query-result oracle with an explicit REAL comparison contract.
+///
+/// This is reserved for queries whose valid execution plans can aggregate or
+/// visit floating-point inputs in different orders. Storage classes, integers,
+/// text, and blobs remain exact. REALs use the stated absolute/relative bound;
+/// the tolerance is deliberately not the default for other result oracles.
+fn assert_result_set_oracle_with_policy(
+    cs_conn: &rusqlite::Connection,
+    fs_conn: &fsqlite::Connection,
+    sql: &str,
+    context: &str,
+    policy: ResultSetOraclePolicy,
+) {
+    let mut cs_rows = collect_csqlite_oracle_rows(cs_conn, sql, context);
+    let mut fs_rows = collect_fsqlite_oracle_rows(fs_conn, sql, context);
     assert_eq!(
         cs_rows.len(),
         fs_rows.len(),
@@ -855,9 +1231,91 @@ fn assert_result_set_oracle(
         cs_rows.len(),
         fs_rows.len()
     );
-    cs_rows.sort_unstable();
-    fs_rows.sort_unstable();
-    assert_eq!(cs_rows, fs_rows, "{context}: result-set mismatch");
+    match policy {
+        ResultSetOraclePolicy::Exact => {
+            cs_rows.sort_unstable();
+            fs_rows.sort_unstable();
+        }
+        ResultSetOraclePolicy::ApproximateReal { .. } => {
+            cs_rows.sort_unstable_by(|left, right| compare_oracle_rows_for_sort(left, right));
+            fs_rows.sort_unstable_by(|left, right| compare_oracle_rows_for_sort(left, right));
+        }
+    }
+    assert!(
+        cs_rows
+            .iter()
+            .zip(&fs_rows)
+            .all(|(left, right)| oracle_rows_match(left, right, policy)),
+        "{context}: result-set mismatch under {policy:?}; C={cs_rows:?}, F={fs_rows:?}"
+    );
+}
+
+/// Ordered twin for queries whose ORDER BY is part of the benchmark contract.
+fn assert_ordered_result_set_oracle(
+    cs_conn: &rusqlite::Connection,
+    fs_conn: &fsqlite::Connection,
+    sql: &str,
+    context: &str,
+) {
+    let cs_rows = collect_csqlite_oracle_rows(cs_conn, sql, context);
+    let fs_rows = collect_fsqlite_oracle_rows(fs_conn, sql, context);
+    assert_eq!(
+        cs_rows.len(),
+        fs_rows.len(),
+        "{context}: row-count mismatch (C={}, F={})",
+        cs_rows.len(),
+        fs_rows.len()
+    );
+    assert!(
+        ordered_oracle_rows_match(&cs_rows, &fs_rows),
+        "{context}: ordered result mismatch; C={cs_rows:?}, F={fs_rows:?}"
+    );
+}
+
+fn adaptive_parameter_schedule(maximum: i64) -> Vec<i64> {
+    let mut schedule = (0..WARMUP_ITERS + MAX_ITERS)
+        .map(|iteration| adaptive_parameter(iteration, maximum))
+        .collect::<Vec<_>>();
+    schedule.sort_unstable();
+    schedule.dedup();
+    schedule
+}
+
+/// Check every parameter value that an adaptive measurement can execute.
+///
+/// The paired measurement gives both engines the same value on every warmup
+/// and timed iteration. Checking a single convenient parameter still would not
+/// certify the varying workload, so this covers every value reachable through
+/// the maximum iteration count.
+fn assert_integer_parameter_schedule_oracle(
+    cs_conn: &rusqlite::Connection,
+    fs_conn: &fsqlite::Connection,
+    sql: &str,
+    maximum: i64,
+    context: &str,
+) {
+    let mut cs_stmt = cs_conn
+        .prepare(sql)
+        .unwrap_or_else(|error| panic!("{context}: C SQLite prepare failed: {error}"));
+    let fs_stmt = fs_prepare(fs_conn, sql);
+    for parameter in adaptive_parameter_schedule(maximum) {
+        let expected: i64 = cs_stmt
+            .query_row(rusqlite::params![parameter], |row| row.get(0))
+            .unwrap_or_else(|error| {
+                panic!("{context}: C SQLite query failed for parameter {parameter}: {error}")
+            });
+        let actual = fsqlite_e2e::block_on(
+            fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(parameter)]),
+        )
+        .unwrap_or_else(|error| {
+            panic!("{context}: FrankenSQLite query failed for parameter {parameter}: {error}")
+        });
+        assert_eq!(
+            fsqlite_integer(&actual, 0, context),
+            expected,
+            "{context}: FrankenSQLite and C SQLite disagree for parameter {parameter}"
+        );
+    }
 }
 
 fn normalize_effective_pragma_value(pragma: &str, value: String) -> Result<String, String> {
@@ -904,7 +1362,7 @@ fn query_effective_fsqlite_pragmas(
     Ok(values)
 }
 
-fn record_durability_profile(
+fn record_storage_settings_profile(
     profiles: &mut BTreeMap<String, BTreeMap<String, String>>,
     errors: &mut Vec<String>,
     name: &str,
@@ -918,14 +1376,14 @@ fn record_durability_profile(
     }
 }
 
-fn capture_durability_identity() -> JsonDurabilityIdentity {
+fn capture_storage_settings_identity() -> JsonStorageSettingsIdentity {
     let mut effective_profiles = BTreeMap::new();
     let mut validation_errors = Vec::new();
 
     let csqlite_memory = rusqlite::Connection::open_in_memory()
-        .expect("durability certification must open C SQLite memory database");
+        .expect("settings receipt must open C SQLite memory database");
     apply_pragmas_csqlite(&csqlite_memory);
-    record_durability_profile(
+    record_storage_settings_profile(
         &mut effective_profiles,
         &mut validation_errors,
         "memory.csqlite",
@@ -935,7 +1393,7 @@ fn capture_durability_identity() -> JsonDurabilityIdentity {
     let fsqlite_memory = open_fsqlite_memory_connection_for_benchmark();
     apply_pragmas_fsqlite(&fsqlite_memory);
     let memory_concurrent_mode_default = fsqlite_memory.is_concurrent_mode_default();
-    record_durability_profile(
+    record_storage_settings_profile(
         &mut effective_profiles,
         &mut validation_errors,
         "memory.fsqlite",
@@ -943,12 +1401,12 @@ fn capture_durability_identity() -> JsonDurabilityIdentity {
     );
 
     let directory =
-        tempfile::tempdir().expect("durability certification must create a temporary directory");
+        tempfile::tempdir().expect("settings receipt must create a temporary directory");
     let csqlite_path = directory.path().join("csqlite.db");
     let csqlite_file = rusqlite::Connection::open(&csqlite_path)
-        .expect("durability certification must open C SQLite file database");
+        .expect("settings receipt must open C SQLite file database");
     apply_pragmas_csqlite(&csqlite_file);
-    record_durability_profile(
+    record_storage_settings_profile(
         &mut effective_profiles,
         &mut validation_errors,
         "file.csqlite",
@@ -963,10 +1421,10 @@ fn capture_durability_identity() -> JsonDurabilityIdentity {
         fsqlite_path,
         benchmark_page_size_bytes(),
     ))
-    .expect("durability certification must open FrankenSQLite file database");
+    .expect("settings receipt must open FrankenSQLite file database");
     apply_pragmas_fsqlite(&fsqlite_file);
     let file_concurrent_mode_default = fsqlite_file.is_concurrent_mode_default();
-    record_durability_profile(
+    record_storage_settings_profile(
         &mut effective_profiles,
         &mut validation_errors,
         "file.fsqlite",
@@ -992,9 +1450,9 @@ fn capture_durability_identity() -> JsonDurabilityIdentity {
         ));
     }
 
-    let verified = effective_profiles.len() == 4;
-    let matched = verified && validation_errors.is_empty();
-    JsonDurabilityIdentity {
+    let readbacks_verified = effective_profiles.len() == 4;
+    let effective_values_matched = readbacks_verified && validation_errors.is_empty();
+    JsonStorageSettingsIdentity {
         page_size_bytes: benchmark_page_size_bytes(),
         default_synchronous: "NORMAL".to_owned(),
         concurrent_synchronous_modes: vec![concurrent_sync_mode().to_owned()],
@@ -1015,10 +1473,59 @@ fn capture_durability_identity() -> JsonDurabilityIdentity {
         )
         .collect(),
         concurrent_mode_default,
-        verified,
-        matched,
+        readbacks_verified,
+        effective_values_matched,
         validation_errors,
         effective_profiles,
+    }
+}
+
+fn capture_reference_engine_identity() -> JsonReferenceEngineIdentity {
+    let mut capture_errors = Vec::new();
+    let connection = rusqlite::Connection::open_in_memory()
+        .expect("reference-engine receipt must open C SQLite memory database");
+    let sqlite_source_id = connection
+        .query_row("SELECT sqlite_source_id()", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| {
+            capture_errors.push(format!("sqlite_source_id() query failed: {error}"));
+        })
+        .ok();
+    let mut compile_options = match connection.prepare("PRAGMA compile_options") {
+        Ok(mut statement) => match statement.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|error| {
+                capture_errors.push(format!(
+                    "PRAGMA compile_options row decoding failed: {error}"
+                ));
+                Vec::new()
+            }),
+            Err(error) => {
+                capture_errors.push(format!("PRAGMA compile_options query failed: {error}"));
+                Vec::new()
+            }
+        },
+        Err(error) => {
+            capture_errors.push(format!("PRAGMA compile_options prepare failed: {error}"));
+            Vec::new()
+        }
+    };
+    compile_options.sort_unstable();
+    compile_options.dedup();
+    if compile_options.is_empty() {
+        capture_errors.push("PRAGMA compile_options returned no rows".to_owned());
+    }
+
+    JsonReferenceEngineIdentity {
+        sqlite_version: rusqlite::version().to_owned(),
+        sqlite_version_number: rusqlite::version_number(),
+        sqlite_source_id,
+        compile_options,
+        capture_errors,
+        bundled_amalgamation_sha256: None,
+        native_compiler_path: None,
+        native_compiler_version: None,
+        native_compiler_sha256: None,
     }
 }
 
@@ -1441,17 +1948,30 @@ struct JsonTracingIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct JsonDurabilityIdentity {
+struct JsonStorageSettingsIdentity {
     page_size_bytes: u32,
     default_synchronous: String,
     concurrent_synchronous_modes: Vec<String>,
     csqlite_pragmas: Vec<String>,
     fsqlite_pragmas: Vec<String>,
     concurrent_mode_default: bool,
-    verified: bool,
-    matched: bool,
+    readbacks_verified: bool,
+    effective_values_matched: bool,
     validation_errors: Vec<String>,
     effective_profiles: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonReferenceEngineIdentity {
+    sqlite_version: String,
+    sqlite_version_number: i32,
+    sqlite_source_id: Option<String>,
+    compile_options: Vec<String>,
+    capture_errors: Vec<String>,
+    bundled_amalgamation_sha256: Option<String>,
+    native_compiler_path: Option<String>,
+    native_compiler_version: Option<String>,
+    native_compiler_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1500,7 +2020,8 @@ struct JsonBenchmarkProvenance {
     cpu_affinity: Option<String>,
     runtime_bridge: String,
     tracing: JsonTracingIdentity,
-    durability: JsonDurabilityIdentity,
+    storage_settings: JsonStorageSettingsIdentity,
+    reference_engine: JsonReferenceEngineIdentity,
     execution_routing: JsonExecutionRouting,
 }
 
@@ -1818,6 +2339,7 @@ struct JsonRunConfig {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct JsonMeasurement {
+    samples_ns: Vec<u64>,
     median_ms: f64,
     mean_ms: f64,
     min_ms: f64,
@@ -2210,17 +2732,28 @@ fn build_ci_regression_gate(
     provenance: &JsonBenchmarkProvenance,
 ) -> JsonCiRegressionGateDraft {
     let (max_mt_p95_ratio, max_mt_p95_scenario_id) = max_multithread_p95_ratio(report);
+    let normal_concurrent_settings =
+        provenance.storage_settings.concurrent_synchronous_modes == ["NORMAL".to_owned()];
+    let mut ineligibility_reasons = provenance.validation_errors.clone();
+    if !normal_concurrent_settings {
+        ineligibility_reasons.push(
+            "CI regression baselines cover only the explicitly labelled \
+             synchronous=NORMAL concurrent-writer matrix; FULL is a separate diagnostic"
+                .to_owned(),
+        );
+    }
+    let eligible = provenance.citable && normal_concurrent_settings;
     JsonCiRegressionGateDraft {
         schema_version: CI_REGRESSION_GATE_SCHEMA_V2.to_owned(),
         bead_id: CI_REGRESSION_GATE_BEAD_ID.to_owned(),
         depends_on_bead_id: CI_REGRESSION_BASELINE_BEAD_ID.to_owned(),
-        status: if provenance.citable {
+        status: if eligible {
             "eligible_compatible_baseline_required".to_owned()
         } else {
             "ineligible".to_owned()
         },
-        eligible: provenance.citable,
-        ineligibility_reasons: provenance.validation_errors.clone(),
+        eligible,
+        ineligibility_reasons,
         evaluation_result: "not_evaluated".to_owned(),
         thresholds: JsonCiRegressionThresholdsDraft {
             avg_ratio_baseline: CI_REGRESSION_BASELINE_AVG_RATIO,
@@ -2273,6 +2806,11 @@ fn duration_ms(duration: Duration) -> f64 {
 impl JsonMeasurement {
     fn from_measurement(measurement: &Measurement) -> Self {
         Self {
+            samples_ns: measurement
+                .durations
+                .iter()
+                .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+                .collect(),
             median_ms: duration_ms(measurement.median()),
             mean_ms: duration_ms(measurement.mean()),
             min_ms: duration_ms(measurement.min()),
@@ -2983,7 +3521,7 @@ fn measurement_design_validation_errors(runtime_bridge: &str) -> Vec<String> {
         "scenario_scoped_thread_local_block_on" | "per_operation_thread_local_block_on" => vec![
             "generic comprehensive measurements are diagnostic-only: engines run in unpaired C-first/FrankenSQLite-second adaptive blocks, scored rows lack complete work oracles, and host/topology state is not release-gated"
                 .to_owned(),
-            "generic C-reference measurements do not receipt-bind sqlite_source_id(), compile_options, the SQLite amalgamation/library hash, or the resolved native C compiler path/version/hash"
+            "generic C-reference measurements receipt sqlite_source_id() and compile_options but do not yet bind the bundled SQLite amalgamation hash or resolved native C compiler path/version/hash"
                 .to_owned(),
         ],
         "three_arm_per_operation_inside_existing_runtime_worker_sync_facade" => vec![
@@ -3145,7 +3683,8 @@ impl JsonBenchmarkProvenance {
                 tracing::Level::DEBUG
             ),
         };
-        let durability = capture_durability_identity();
+        let storage_settings = capture_storage_settings_identity();
+        let reference_engine = capture_reference_engine_identity();
         let execution_routing = probe_execution_routing();
 
         let mut validation_errors = validate_build_identity(&build);
@@ -3197,18 +3736,34 @@ impl JsonBenchmarkProvenance {
                     .to_owned(),
             );
         }
-        if !durability.verified || !durability.matched {
+        if !storage_settings.readbacks_verified || !storage_settings.effective_values_matched {
             validation_errors.extend(
-                durability
+                storage_settings
                     .validation_errors
                     .iter()
-                    .map(|error| format!("durability certification: {error}")),
+                    .map(|error| format!("storage-settings receipt: {error}")),
             );
-            if durability.validation_errors.is_empty() {
+            if storage_settings.validation_errors.is_empty() {
                 validation_errors.push(
-                    "effective durability settings were not fully verified and matched".to_owned(),
+                    "effective storage settings were not fully read back and matched".to_owned(),
                 );
             }
+        }
+        validation_errors.extend(
+            reference_engine
+                .capture_errors
+                .iter()
+                .map(|error| format!("C SQLite reference receipt: {error}")),
+        );
+        if reference_engine.bundled_amalgamation_sha256.is_none()
+            || reference_engine.native_compiler_path.is_none()
+            || reference_engine.native_compiler_version.is_none()
+            || reference_engine.native_compiler_sha256.is_none()
+        {
+            validation_errors.push(
+                "C SQLite reference receipt does not yet bind the bundled amalgamation and resolved native compiler path/version/SHA-256"
+                    .to_owned(),
+            );
         }
         validation_errors.extend(
             execution_routing
@@ -3219,7 +3774,7 @@ impl JsonBenchmarkProvenance {
         let citable = validation_errors.is_empty();
 
         Self {
-            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V3.to_owned(),
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V4.to_owned(),
             citable,
             status: if citable {
                 "verified_citable".to_owned()
@@ -3247,7 +3802,8 @@ impl JsonBenchmarkProvenance {
             cpu_affinity: cpu_affinity(),
             runtime_bridge: runtime_bridge.to_owned(),
             tracing,
-            durability,
+            storage_settings,
+            reference_engine,
             execution_routing,
         }
     }
@@ -3576,7 +4132,7 @@ fn build_json_report(
         .collect();
 
     JsonBenchmarkReport {
-        schema_version: JSON_REPORT_SCHEMA_V6.to_owned(),
+        schema_version: JSON_REPORT_SCHEMA_V7.to_owned(),
         generated_at_utc: chrono_stamp(),
         total_elapsed_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
         config,
@@ -3592,7 +4148,7 @@ fn build_json_report(
 fn benchmark_json_schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v6.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v7.json",
         "title": "FrankenSQLite comprehensive benchmark JSON report",
         "type": "object",
         "additionalProperties": false,
@@ -3609,7 +4165,7 @@ fn benchmark_json_schema() -> serde_json::Value {
         ],
         "properties": {
             "schema_version": {
-                "const": JSON_REPORT_SCHEMA_V6
+                "const": JSON_REPORT_SCHEMA_V7
             },
             "generated_at_utc": {
                 "type": "string"
@@ -3697,11 +4253,12 @@ fn benchmark_json_schema() -> serde_json::Value {
                     "cpu_affinity",
                     "runtime_bridge",
                     "tracing",
-                    "durability",
+                    "storage_settings",
+                    "reference_engine",
                     "execution_routing"
                 ],
                 "properties": {
-                    "schema_version": {"const": BENCHMARK_PROVENANCE_SCHEMA_V3},
+                    "schema_version": {"const": BENCHMARK_PROVENANCE_SCHEMA_V4},
                     "citable": {"const": false},
                     "status": {
                         "enum": [
@@ -3836,14 +4393,15 @@ fn benchmark_json_schema() -> serde_json::Value {
                             "fallback_decision_debug_enabled": {"type": "boolean"}
                         }
                     },
-                    "durability": {
+                    "storage_settings": {
                         "type": "object",
                         "additionalProperties": false,
                         "required": [
                             "page_size_bytes", "default_synchronous",
                             "concurrent_synchronous_modes", "csqlite_pragmas",
-                            "fsqlite_pragmas", "concurrent_mode_default", "verified",
-                            "matched", "validation_errors", "effective_profiles"
+                            "fsqlite_pragmas", "concurrent_mode_default",
+                            "readbacks_verified", "effective_values_matched",
+                            "validation_errors", "effective_profiles"
                         ],
                         "properties": {
                             "page_size_bytes": {"type": "integer", "minimum": 512},
@@ -3861,8 +4419,8 @@ fn benchmark_json_schema() -> serde_json::Value {
                                 "items": {"type": "string"}
                             },
                             "concurrent_mode_default": {"type": "boolean"},
-                            "verified": {"type": "boolean"},
-                            "matched": {"type": "boolean"},
+                            "readbacks_verified": {"type": "boolean"},
+                            "effective_values_matched": {"type": "boolean"},
                             "validation_errors": {
                                 "type": "array",
                                 "items": {"type": "string"}
@@ -3873,6 +4431,40 @@ fn benchmark_json_schema() -> serde_json::Value {
                                     "type": "object",
                                     "additionalProperties": {"type": "string"}
                                 }
+                            }
+                        }
+                    },
+                    "reference_engine": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "sqlite_version", "sqlite_version_number",
+                            "sqlite_source_id", "compile_options",
+                            "capture_errors", "bundled_amalgamation_sha256",
+                            "native_compiler_path", "native_compiler_version",
+                            "native_compiler_sha256"
+                        ],
+                        "properties": {
+                            "sqlite_version": {"type": "string", "minLength": 1},
+                            "sqlite_version_number": {"type": "integer", "minimum": 1},
+                            "sqlite_source_id": {"type": ["string", "null"]},
+                            "compile_options": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1}
+                            },
+                            "capture_errors": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1}
+                            },
+                            "bundled_amalgamation_sha256": {
+                                "type": ["string", "null"],
+                                "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "native_compiler_path": {"type": ["string", "null"]},
+                            "native_compiler_version": {"type": ["string", "null"]},
+                            "native_compiler_sha256": {
+                                "type": ["string", "null"],
+                                "pattern": "^[0-9a-f]{64}$"
                             }
                         }
                     },
@@ -4039,11 +4631,11 @@ fn benchmark_json_schema() -> serde_json::Value {
                                         "fallback_decision_debug_enabled": {"const": false}
                                     }
                                 },
-                                "durability": {
+                                "storage_settings": {
                                     "properties": {
                                         "concurrent_mode_default": {"const": true},
-                                        "verified": {"const": true},
-                                        "matched": {"const": true},
+                                        "readbacks_verified": {"const": true},
+                                        "effective_values_matched": {"const": true},
                                         "validation_errors": {"maxItems": 0},
                                         "effective_profiles": {
                                             "required": [
@@ -4051,6 +4643,32 @@ fn benchmark_json_schema() -> serde_json::Value {
                                                 "file.csqlite", "file.fsqlite"
                                             ],
                                             "minProperties": 4
+                                        }
+                                    }
+                                },
+                                "reference_engine": {
+                                    "properties": {
+                                        "sqlite_source_id": {
+                                            "type": "string",
+                                            "minLength": 1
+                                        },
+                                        "compile_options": {"minItems": 1},
+                                        "capture_errors": {"maxItems": 0},
+                                        "bundled_amalgamation_sha256": {
+                                            "type": "string",
+                                            "pattern": "^[0-9a-f]{64}$"
+                                        },
+                                        "native_compiler_path": {
+                                            "type": "string",
+                                            "minLength": 1
+                                        },
+                                        "native_compiler_version": {
+                                            "type": "string",
+                                            "minLength": 1
+                                        },
+                                        "native_compiler_sha256": {
+                                            "type": "string",
+                                            "pattern": "^[0-9a-f]{64}$"
                                         }
                                     }
                                 },
@@ -4328,8 +4946,13 @@ fn benchmark_json_schema() -> serde_json::Value {
             "measurement": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["median_ms", "mean_ms", "min_ms", "p95_ms", "p99_ms", "stddev_ms", "cv_pct", "rows_per_sec", "us_per_row", "iterations"],
+                "required": ["samples_ns", "median_ms", "mean_ms", "min_ms", "p95_ms", "p99_ms", "stddev_ms", "cv_pct", "rows_per_sec", "us_per_row", "iterations"],
                 "properties": {
+                    "samples_ns": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "integer", "minimum": 0}
+                    },
                     "median_ms": {"type": "number", "minimum": 0},
                     "mean_ms": {"type": "number", "minimum": 0},
                     "min_ms": {"type": "number", "minimum": 0},
@@ -8142,14 +8765,18 @@ fn run_fsqlite_concurrent_sample(
 // ─── Section 4: Concurrent writers ─────────────────────────────────────
 
 fn bench_concurrent_writers(report: &mut BenchReport) {
+    let sync_mode = concurrent_sync_mode();
     let section = report.add_section(
-        CONCURRENT_WRITERS_SECTION_TITLE,
+        concurrent_writers_section_title(sync_mode),
         &format!(
             "Each writer inserts {} rows into non-overlapping key ranges on the same \
              file-backed WAL database. Both engines spawn N OS threads each owning its \
-             own connection, and both writer connections run at `synchronous=NORMAL` so \
-             the two engines are compared at matched durability (set \
-             `FSQLITE_BENCH_CONCURRENT_SYNC=full` to match them at FULL instead). \
+             own connection, and both writer connections run at `synchronous={sync_mode}` so \
+             both engines receive the same synchronous setting and prove its \
+             effective readback. NORMAL is the regression-baseline matrix; \
+             `FSQLITE_BENCH_CONCURRENT_SYNC=full` selects an explicitly labelled, \
+             gate-ineligible FULL-settings diagnostic. This is a settings \
+             match, not proof of equivalent crash/fsync/checkpoint semantics. \
              C SQLite uses WAL + busy_timeout, FrankenSQLite uses the \
              MVCC page-lock table via `PRAGMA fsqlite.concurrent_mode=ON` + \
              `BEGIN CONCURRENT`. Every scored worker connection proves its effective \
@@ -8169,7 +8796,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
         eprint!("  Benchmarking {n_threads} concurrent writers ({total_rows} total rows)... ");
 
         let (cs, csqlite_readiness) = measure_concurrent(
-            &format!("cs_concurrent_{n_threads}t"),
+            &concurrent_measurement_label("cs", n_threads, sync_mode),
             total_rows,
             |phase, sample_index| run_csqlite_concurrent_sample(n_threads, phase, sample_index),
         );
@@ -8185,7 +8812,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             None
         };
         let (fs, fsqlite_readiness) = measure_concurrent(
-            &format!("fs_concurrent_{n_threads}t"),
+            &concurrent_measurement_label("fs", n_threads, sync_mode),
             total_rows,
             |phase, sample_index| run_fsqlite_concurrent_sample(n_threads, phase, sample_index),
         );
@@ -8240,7 +8867,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             format_duration(fs.median())
         );
         section.add_row_with_concurrent_details(
-            &format!("{n_threads} writers x {CONCURRENT_ROWS_PER_THREAD} rows"),
+            &concurrent_scenario_label(n_threads, sync_mode),
             Some(cs),
             Some(fs),
             fsqlite_concurrent_profile,
@@ -8253,43 +8880,51 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
 
     // Also benchmark C SQLite single-threaded for the same total work (baseline).
     let section = report.add_section(
-        "Concurrent Writers — C SQLite Single-Thread Baseline",
-        "Same total row count as concurrent tests, but single-threaded file-backed C SQLite.",
+        concurrent_single_baseline_section_title(sync_mode),
+        &format!(
+            "Same total row count as concurrent tests, but single-threaded file-backed \
+             C SQLite at synchronous={sync_mode}. FULL runs are separately labelled and \
+             excluded from the NORMAL regression gate."
+        ),
     );
 
     for &n_threads in CONCURRENT_THREAD_COUNTS {
         let total_rows = n_threads * CONCURRENT_ROWS_PER_THREAD;
         eprint!("  Benchmarking C SQLite single-thread baseline ({total_rows} rows)... ");
 
-        let cs_single = measure(&format!("cs_single_{n_threads}t_equiv"), total_rows, || {
-            let tmp = tempfile::NamedTempFile::new().unwrap();
-            let path = tmp.path().to_str().unwrap().to_owned();
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(&format!(
-                "PRAGMA page_size = {};\
+        let cs_single = measure(
+            &concurrent_single_measurement_label(n_threads, sync_mode),
+            total_rows,
+            || {
+                let tmp = tempfile::NamedTempFile::new().unwrap();
+                let path = tmp.path().to_str().unwrap().to_owned();
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch(&format!(
+                    "PRAGMA page_size = {};\
                  PRAGMA journal_mode = WAL;\
                  PRAGMA synchronous = {};\
                  PRAGMA cache_size = -64000;\
                  CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
-                benchmark_page_size_bytes(),
-                concurrent_sync_mode()
-            ))
-            .unwrap();
-
-            conn.execute_batch("BEGIN").unwrap();
-            let mut stmt = conn
-                .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
+                    benchmark_page_size_bytes(),
+                    concurrent_sync_mode()
+                ))
                 .unwrap();
-            #[allow(clippy::cast_possible_wrap)]
-            for i in 0..total_rows as i64 {
-                stmt.execute(rusqlite::params![i]).unwrap();
-            }
-            conn.execute_batch("COMMIT").unwrap();
-        });
+
+                conn.execute_batch("BEGIN").unwrap();
+                let mut stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
+                    .unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 0..total_rows as i64 {
+                    stmt.execute(rusqlite::params![i]).unwrap();
+                }
+                conn.execute_batch("COMMIT").unwrap();
+            },
+        );
 
         eprintln!("C_single={}", format_duration(cs_single.median()));
         section.add_row(
-            &format!("C SQLite 1 thread / {total_rows} rows (baseline)"),
+            &concurrent_single_scenario_label(total_rows, sync_mode),
             Some(cs_single),
             None,
         );
@@ -8300,7 +8935,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sample_measurement(label: &str, row_count: usize, durations_ms: &[u64]) -> Measurement {
@@ -8344,7 +8979,7 @@ mod tests {
 
     fn sample_provenance() -> JsonBenchmarkProvenance {
         JsonBenchmarkProvenance {
-            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V3.to_owned(),
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V4.to_owned(),
             citable: false,
             status: "unverified".to_owned(),
             validation_errors: vec![
@@ -8413,15 +9048,15 @@ mod tests {
                 statement_reuse_info_enabled: false,
                 fallback_decision_debug_enabled: false,
             },
-            durability: JsonDurabilityIdentity {
+            storage_settings: JsonStorageSettingsIdentity {
                 page_size_bytes: 4096,
                 default_synchronous: "NORMAL".to_owned(),
                 concurrent_synchronous_modes: vec!["NORMAL".to_owned()],
                 csqlite_pragmas: vec!["PRAGMA synchronous = NORMAL;".to_owned()],
                 fsqlite_pragmas: vec!["PRAGMA synchronous = NORMAL;".to_owned()],
                 concurrent_mode_default: true,
-                verified: true,
-                matched: true,
+                readbacks_verified: true,
+                effective_values_matched: true,
                 validation_errors: Vec::new(),
                 effective_profiles: BTreeMap::from([
                     (
@@ -8441,6 +9076,20 @@ mod tests {
                         BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
                     ),
                 ]),
+            },
+            reference_engine: JsonReferenceEngineIdentity {
+                sqlite_version: "3.50.4".to_owned(),
+                sqlite_version_number: 3_050_004,
+                sqlite_source_id: Some(
+                    "2025-07-30 19:33:53 4d8adfb30e03f9cf27f800a2c1ba3c48fb4ca1b08b0f5ed59a4d5ec3c9d7e75f"
+                        .to_owned(),
+                ),
+                compile_options: vec!["THREADSAFE=1".to_owned()],
+                capture_errors: Vec::new(),
+                bundled_amalgamation_sha256: None,
+                native_compiler_path: None,
+                native_compiler_version: None,
+                native_compiler_sha256: None,
             },
             execution_routing: JsonExecutionRouting {
                 probe_scope: "untimed test probe".to_owned(),
@@ -8503,8 +9152,200 @@ mod tests {
         );
         assert!(
             normalize_effective_pragma_value("synchronous", "unknown".to_owned()).is_err(),
-            "unknown durability values must fail closed"
+            "unknown synchronous values must fail closed"
         );
+    }
+
+    #[test]
+    fn exact_result_oracle_preserves_storage_class_text_case_and_blob_bytes() {
+        let c_text = exact_csqlite_oracle_value(rusqlite::types::ValueRef::Text(b"Case"));
+        let f_text = exact_fsqlite_oracle_value(&fsqlite::SqliteValue::from("Case"));
+        assert_eq!(c_text, f_text);
+        assert_ne!(
+            f_text,
+            exact_fsqlite_oracle_value(&fsqlite::SqliteValue::from("case")),
+            "query-result certification must not fold text case"
+        );
+
+        let c_blob =
+            exact_csqlite_oracle_value(rusqlite::types::ValueRef::Blob(&[0x00, 0x01, 0xff]));
+        let f_blob =
+            exact_fsqlite_oracle_value(&fsqlite::SqliteValue::from(vec![0x00, 0x01, 0xff]));
+        assert_eq!(c_blob, f_blob);
+        assert_ne!(
+            f_blob,
+            exact_fsqlite_oracle_value(&fsqlite::SqliteValue::from(vec![0x00, 0x02, 0xff])),
+            "equal-length blobs with different bytes must not compare equal"
+        );
+
+        assert_ne!(
+            exact_fsqlite_oracle_value(&fsqlite::SqliteValue::Integer(1)),
+            exact_fsqlite_oracle_value(&fsqlite::SqliteValue::Float(1.0)),
+            "INTEGER and REAL are distinct SQLite storage classes"
+        );
+    }
+
+    #[test]
+    fn floating_result_oracle_uses_only_the_explicit_query_policy() {
+        let exact = vec![
+            ExactOracleValue::Text(b"group".to_vec()),
+            ExactOracleValue::RealBits(100.0_f64.to_bits()),
+        ];
+        let roundoff = vec![
+            ExactOracleValue::Text(b"group".to_vec()),
+            ExactOracleValue::RealBits((100.0_f64 + 5.0e-11).to_bits()),
+        ];
+        let wrong = vec![
+            ExactOracleValue::Text(b"group".to_vec()),
+            ExactOracleValue::RealBits(100.01_f64.to_bits()),
+        ];
+
+        assert!(
+            !oracle_rows_match(&exact, &roundoff, ResultSetOraclePolicy::Exact),
+            "the default oracle must preserve bit-exact REAL comparison"
+        );
+        assert!(oracle_rows_match(
+            &exact,
+            &roundoff,
+            ORDER_INDEPENDENT_REAL_ORACLE_POLICY
+        ));
+        assert!(
+            !oracle_rows_match(&exact, &wrong, ORDER_INDEPENDENT_REAL_ORACLE_POLICY),
+            "the aggregate tolerance must still reject material numeric errors"
+        );
+    }
+
+    #[test]
+    fn adaptive_parameter_oracle_covers_warmups_and_every_possible_timed_value() {
+        assert_eq!(
+            adaptive_parameter_schedule(5),
+            vec![1, 2, 3, 4, 5],
+            "a short cyclic schedule must cover every parameter"
+        );
+        assert_eq!(
+            adaptive_parameter_schedule(100),
+            (1..=WARMUP_ITERS + MAX_ITERS)
+                .map(|value| i64::try_from(value).expect("small benchmark iteration count"))
+                .collect::<Vec<_>>(),
+            "a long schedule must include warmup and maximum timed iteration values"
+        );
+    }
+
+    #[test]
+    fn paired_parameter_measurement_equalizes_schedule_count_and_order_bias() {
+        let events = RefCell::new(Vec::new());
+        let config = MeasureConfig {
+            warmup_iters: 2,
+            min_iters: 3,
+            max_iters: 6,
+            target_duration: Duration::ZERO,
+        };
+        let (csqlite, fsqlite) = measure_paired_parameterized_with_config(
+            "c",
+            "f",
+            1,
+            10,
+            config,
+            |parameter| events.borrow_mut().push(("c", parameter)),
+            |parameter| events.borrow_mut().push(("f", parameter)),
+        );
+
+        assert_eq!(csqlite.iter_count(), 4);
+        assert_eq!(fsqlite.iter_count(), 4);
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                ("c", 1),
+                ("f", 1),
+                ("f", 2),
+                ("c", 2),
+                ("c", 3),
+                ("f", 3),
+                ("f", 4),
+                ("c", 4),
+                ("c", 5),
+                ("f", 5),
+                ("f", 6),
+                ("c", 6),
+            ],
+            "each iteration must share one parameter and measured samples must complete AB/BA blocks"
+        );
+    }
+
+    #[test]
+    fn concurrent_full_mode_has_distinct_artifact_labels_and_no_normal_gate_identity() {
+        assert_eq!(
+            concurrent_writers_section_title("NORMAL"),
+            CONCURRENT_WRITERS_SECTION_TITLE
+        );
+        assert_eq!(
+            concurrent_scenario_label(8, "NORMAL"),
+            "8 writers x 1000 rows"
+        );
+        assert_eq!(
+            concurrent_measurement_label("fs", 8, "NORMAL"),
+            "fs_concurrent_8t"
+        );
+        assert_ne!(
+            concurrent_writers_section_title("FULL"),
+            CONCURRENT_WRITERS_SECTION_TITLE
+        );
+        assert!(concurrent_scenario_label(8, "FULL").contains("synchronous=FULL diagnostic"));
+        assert_eq!(
+            concurrent_measurement_label("fs", 8, "FULL"),
+            "fs_concurrent_full_8t"
+        );
+
+        let report = sample_report();
+        let summary = compute_report_summary(&report);
+        let mut provenance = sample_provenance();
+        provenance.citable = true;
+        provenance.validation_errors.clear();
+        provenance.storage_settings.concurrent_synchronous_modes = vec!["FULL".to_owned()];
+        let gate = build_ci_regression_gate(&report, &summary, &provenance);
+        assert!(!gate.eligible);
+        assert!(
+            gate.ineligibility_reasons
+                .iter()
+                .any(|reason| reason.contains("FULL is a separate diagnostic"))
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_limit_has_a_deterministic_row_order() {
+        assert!(SCALAR_SUBQUERY_SQL.contains("ORDER BY p.id LIMIT 100"));
+        let ordered = vec![
+            vec![ExactOracleValue::Integer(1)],
+            vec![ExactOracleValue::Integer(2)],
+        ];
+        let swapped = vec![
+            vec![ExactOracleValue::Integer(2)],
+            vec![ExactOracleValue::Integer(1)],
+        ];
+        assert!(ordered_oracle_rows_match(&ordered, &ordered));
+        assert!(
+            !ordered_oracle_rows_match(&ordered, &swapped),
+            "the ORDER BY oracle must reject the same rows in the wrong order"
+        );
+    }
+
+    #[test]
+    fn reference_engine_receipt_captures_runtime_source_and_compile_options() {
+        let identity = capture_reference_engine_identity();
+        assert!(!identity.sqlite_version.is_empty());
+        assert!(identity.sqlite_version_number > 0);
+        assert!(
+            identity
+                .sqlite_source_id
+                .as_deref()
+                .is_some_and(|source_id| !source_id.is_empty())
+        );
+        assert!(!identity.compile_options.is_empty());
+        assert!(identity.capture_errors.is_empty());
+        assert!(identity.bundled_amalgamation_sha256.is_none());
+        assert!(identity.native_compiler_path.is_none());
+        assert!(identity.native_compiler_version.is_none());
+        assert!(identity.native_compiler_sha256.is_none());
     }
 
     #[test]
@@ -8844,7 +9685,7 @@ mod tests {
             sample_provenance(),
         );
 
-        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V6);
+        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V7);
         assert_eq!(json.environment.git_head_unix_ts, Some(1_700_000_000));
         assert_eq!(json.environment.git_dirty, Some(false));
         assert_eq!(
@@ -8891,6 +9732,15 @@ mod tests {
             "insert-throughput__100-rows-small-record",
         );
         assert_eq!(json.sections[0].rows[0].category, "write_bulk");
+        assert_eq!(
+            json.sections[0].rows[0]
+                .csqlite
+                .as_ref()
+                .expect("sample report has C SQLite measurements")
+                .samples_ns,
+            vec![1_000_000, 1_000_000, 2_000_000],
+            "raw samples must remain available for independent recomputation"
+        );
         assert!(
             json.summary
                 .average_ratio
@@ -8906,12 +9756,12 @@ mod tests {
         let schema = benchmark_json_schema();
         assert!(
             jsonschema::draft202012::meta::is_valid(&schema),
-            "the published V5 schema must itself be valid Draft 2020-12 JSON Schema"
+            "the published V7 schema must itself be valid Draft 2020-12 JSON Schema"
         );
         let instance = serde_json::to_value(&json).expect("report should serialize");
         assert!(
             jsonschema::draft202012::is_valid(&schema, &instance),
-            "a complete V5 report must validate against its published schema"
+            "a complete V7 report must validate against its published schema"
         );
 
         let mut contradictory_citable = instance.clone();
@@ -8921,11 +9771,11 @@ mod tests {
         contradictory_citable["provenance"]["validation_errors"] = serde_json::json!([]);
         assert!(
             !jsonschema::draft202012::is_valid(&schema, &contradictory_citable),
-            "the generic V5 report cannot claim citable provenance"
+            "the generic V7 report cannot claim citable provenance"
         );
 
         let mut disabled_concurrency = instance.clone();
-        disabled_concurrency["provenance"]["durability"]["concurrent_mode_default"] =
+        disabled_concurrency["provenance"]["storage_settings"]["concurrent_mode_default"] =
             serde_json::Value::Bool(false);
         assert!(
             jsonschema::draft202012::is_valid(&schema, &disabled_concurrency),
@@ -8946,14 +9796,14 @@ mod tests {
         );
         assert!(
             !jsonschema::draft202012::is_valid(&schema, &wrong_design),
-            "the generic V5 schema must not accept a bridge-experiment provenance shape"
+            "the generic V7 schema must not accept a bridge-experiment provenance shape"
         );
 
         let mut diagnostic = instance.clone();
         diagnostic["provenance"]["citable"] = serde_json::Value::Bool(false);
         diagnostic["provenance"]["status"] = serde_json::Value::String("unverified".to_owned());
         diagnostic["provenance"]["validation_errors"] = serde_json::json!(["diagnostic fixture"]);
-        diagnostic["provenance"]["durability"]["concurrent_mode_default"] =
+        diagnostic["provenance"]["storage_settings"]["concurrent_mode_default"] =
             serde_json::Value::Bool(false);
         assert!(
             jsonschema::draft202012::is_valid(&schema, &diagnostic),
@@ -9091,7 +9941,7 @@ mod tests {
 
         let written = std::fs::read_to_string(report_path).expect("JSON report should be written");
         assert!(
-            written.contains(JSON_REPORT_SCHEMA_V6),
+            written.contains(JSON_REPORT_SCHEMA_V7),
             "written JSON should include the benchmark schema version"
         );
     }
@@ -9157,7 +10007,7 @@ mod tests {
             .expect("HTML report should be written");
         let html = std::fs::read_to_string(html_path).expect("HTML report should be readable");
         assert!(html.contains("benchmark-provenance"));
-        assert!(html.contains(BENCHMARK_PROVENANCE_SCHEMA_V3));
+        assert!(html.contains(BENCHMARK_PROVENANCE_SCHEMA_V4));
         assert!(html.contains("NON-CITABLE DIAGNOSTIC"));
         assert!(html.contains("generic comprehensive measurements are diagnostic-only"));
     }
@@ -9242,7 +10092,7 @@ mod tests {
 
         assert_eq!(
             schema["properties"]["schema_version"]["const"],
-            JSON_REPORT_SCHEMA_V6
+            JSON_REPORT_SCHEMA_V7
         );
         assert_eq!(
             schema["properties"]["ci_regression_gate"]["properties"]["bead_id"]["const"],
@@ -9276,6 +10126,15 @@ mod tests {
             schema["$defs"]["fsqlite_concurrent_profile"]["properties"]["counters"]["additionalProperties"]
                 ["type"],
             "integer"
+        );
+        assert_eq!(
+            schema["$defs"]["measurement"]["properties"]["samples_ns"]["items"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            schema["properties"]["provenance"]["properties"]["reference_engine"]["properties"]["compile_options"]
+                ["type"],
+            "array"
         );
         assert_eq!(schema["$defs"]["scenario_category"]["enum"][5], "mixed");
         assert_eq!(
@@ -11467,16 +12326,22 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
 
         // INNER JOIN.
         eprint!("    INNER JOIN... ");
+        let inner_join_sql =
+            "SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id";
+        assert_result_set_oracle_with_policy(
+            &cs_conn,
+            &fs_conn,
+            inner_join_sql,
+            "INNER JOIN benchmark oracle",
+            ORDER_INDEPENDENT_REAL_ORACLE_POLICY,
+        );
         let cs = {
-            let mut stmt = cs_conn.prepare("SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id").unwrap();
+            let mut stmt = cs_conn.prepare(inner_join_sql).unwrap();
             measure(&format!("cs_inner_join_{count}"), count, || {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id",
-        );
+        let fs_stmt = fs_prepare(&fs_conn, inner_join_sql);
         let fs = measure(&format!("fs_inner_join_{count}"), count, || {
             std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
@@ -11489,16 +12354,22 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
 
         // LEFT JOIN.
         eprint!("    LEFT JOIN... ");
+        let left_join_sql =
+            "SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id";
+        assert_result_set_oracle_with_policy(
+            &cs_conn,
+            &fs_conn,
+            left_join_sql,
+            "LEFT JOIN benchmark oracle",
+            ORDER_INDEPENDENT_REAL_ORACLE_POLICY,
+        );
         let cs = {
-            let mut stmt = cs_conn.prepare("SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id").unwrap();
+            let mut stmt = cs_conn.prepare(left_join_sql).unwrap();
             measure(&format!("cs_left_join_{count}"), count, || {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id",
-        );
+        let fs_stmt = fs_prepare(&fs_conn, left_join_sql);
         let fs = measure(&format!("fs_left_join_{count}"), count, || {
             std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
@@ -11511,16 +12382,21 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
 
         // JOIN + GROUP BY aggregate.
         eprint!("    JOIN + GROUP BY aggregate... ");
+        let join_aggregate_sql = "SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name";
+        assert_result_set_oracle_with_policy(
+            &cs_conn,
+            &fs_conn,
+            join_aggregate_sql,
+            "JOIN + GROUP BY benchmark oracle",
+            ORDER_INDEPENDENT_REAL_ORACLE_POLICY,
+        );
         let cs = {
-            let mut stmt = cs_conn.prepare("SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name").unwrap();
+            let mut stmt = cs_conn.prepare(join_aggregate_sql).unwrap();
             measure(&format!("cs_join_agg_{count}"), customer_count, || {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name",
-        );
+        let fs_stmt = fs_prepare(&fs_conn, join_aggregate_sql);
         let fs = measure(&format!("fs_join_agg_{count}"), customer_count, || {
             std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
@@ -11538,20 +12414,23 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
         // JOIN + GROUP BY + HAVING.
         eprint!("    JOIN + GROUP BY + HAVING... ");
         let threshold = count as f64 * 0.05; // Customers with > 5% of orders.
+        let join_having_sql = format!(
+            "SELECT c.name, COUNT(*) cnt FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name HAVING cnt > {threshold}"
+        );
+        assert_result_set_oracle(
+            &cs_conn,
+            &fs_conn,
+            &join_having_sql,
+            "JOIN + GROUP BY + HAVING benchmark oracle",
+        );
         let cs = {
-            let sql = format!(
-                "SELECT c.name, COUNT(*) cnt FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name HAVING cnt > {threshold}"
-            );
-            let mut stmt = cs_conn.prepare(&sql).unwrap();
+            let mut stmt = cs_conn.prepare(&join_having_sql).unwrap();
             measure(&format!("cs_join_having_{count}"), customer_count, || {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs = {
-            let sql = format!(
-                "SELECT c.name, COUNT(*) cnt FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name HAVING cnt > {threshold}"
-            );
-            let stmt = fs_prepare(&fs_conn, &sql);
+            let stmt = fs_prepare(&fs_conn, &join_having_sql);
             measure(&format!("fs_join_having_{count}"), customer_count, || {
                 std::hint::black_box(fsqlite_e2e::block_on(stmt.query()).unwrap());
             })
@@ -11653,8 +12532,13 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
 
         // Scalar subquery in SELECT.
         eprint!("    Scalar subquery in SELECT... ");
-        let scalar_sub_sql = "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100";
-        assert_result_set_oracle(&cs_conn, &fs_conn, scalar_sub_sql, "scalar-subquery oracle");
+        let scalar_sub_sql = SCALAR_SUBQUERY_SQL;
+        assert_ordered_result_set_oracle(
+            &cs_conn,
+            &fs_conn,
+            scalar_sub_sql,
+            "scalar-subquery oracle",
+        );
         let cs = {
             let mut stmt = cs_conn.prepare(scalar_sub_sql).unwrap();
             measure(&format!("cs_scalar_sub_{count}"), 100, || {
@@ -11685,47 +12569,34 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
              WHERE c.id = p.category_id AND c.id <= ?1)";
         #[allow(clippy::cast_possible_wrap)]
         let cat_count_i64 = cat_count as i64;
-        let oracle_threshold = cat_count_i64.min(5);
-        let expected_exists: i64 = cs_conn
-            .query_row(exists_sql, rusqlite::params![oracle_threshold], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let exists_probe = fs_prepare(&fs_conn, exists_sql);
-        let actual_exists = fsqlite_e2e::block_on(
-            exists_probe.query_row_with_params(&[fsqlite::SqliteValue::Integer(oracle_threshold)]),
-        )
-        .unwrap();
-        assert_eq!(
-            fsqlite_integer(&actual_exists, 0, "EXISTS oracle"),
-            expected_exists,
-            "FrankenSQLite and C SQLite disagree on EXISTS benchmark oracle"
+        assert_integer_parameter_schedule_oracle(
+            &cs_conn,
+            &fs_conn,
+            exists_sql,
+            cat_count_i64,
+            "EXISTS benchmark oracle",
         );
-        let cs = {
-            let mut stmt = cs_conn.prepare(exists_sql).unwrap();
-            let mut iteration = 0_i64;
-            measure(&format!("cs_exists_{count}"), 1, || {
-                let threshold = 1 + iteration % cat_count_i64;
-                iteration += 1;
-                let value: i64 = stmt
+        let mut cs_stmt = cs_conn.prepare(exists_sql).unwrap();
+        let fs_stmt = fs_prepare(&fs_conn, exists_sql);
+        let (cs, fs) = measure_paired_parameterized(
+            &format!("cs_exists_{count}"),
+            &format!("fs_exists_{count}"),
+            1,
+            cat_count_i64,
+            |threshold| {
+                let value: i64 = cs_stmt
                     .query_row(rusqlite::params![threshold], |row| row.get(0))
                     .unwrap();
                 std::hint::black_box(value);
-            })
-        };
-        let fs = {
-            let stmt = fs_prepare(&fs_conn, exists_sql);
-            let mut iteration = 0_i64;
-            measure(&format!("fs_exists_{count}"), 1, || {
-                let threshold = 1 + iteration % cat_count_i64;
-                iteration += 1;
+            },
+            |threshold| {
                 let row = fsqlite_e2e::block_on(
-                    stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
+                    fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
                 )
                 .unwrap();
                 std::hint::black_box(fsqlite_integer(&row, 0, "EXISTS measurement"));
-            })
-        };
+            },
+        );
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
@@ -11744,44 +12615,34 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         let in_sql = "SELECT COUNT(*) FROM products \
             WHERE category_id IN \
             (SELECT id FROM categories WHERE id <= ?1)";
-        let expected_in: i64 = cs_conn
-            .query_row(in_sql, rusqlite::params![oracle_threshold], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let in_probe = fs_prepare(&fs_conn, in_sql);
-        let actual_in = fsqlite_e2e::block_on(
-            in_probe.query_row_with_params(&[fsqlite::SqliteValue::Integer(oracle_threshold)]),
-        )
-        .unwrap();
-        assert_eq!(
-            fsqlite_integer(&actual_in, 0, "IN-subquery oracle"),
-            expected_in,
-            "FrankenSQLite and C SQLite disagree on IN-subquery benchmark oracle"
+        assert_integer_parameter_schedule_oracle(
+            &cs_conn,
+            &fs_conn,
+            in_sql,
+            cat_count_i64,
+            "IN-subquery benchmark oracle",
         );
-        let cs = {
-            let mut stmt = cs_conn.prepare(in_sql).unwrap();
-            let mut iteration = 0_i64;
-            measure(&format!("cs_in_sub_{count}"), 1, || {
-                let threshold = 1 + iteration % cat_count_i64;
-                iteration += 1;
-                let value: i64 = stmt
+        let mut cs_stmt = cs_conn.prepare(in_sql).unwrap();
+        let fs_stmt = fs_prepare(&fs_conn, in_sql);
+        let (cs, fs) = measure_paired_parameterized(
+            &format!("cs_in_sub_{count}"),
+            &format!("fs_in_sub_{count}"),
+            1,
+            cat_count_i64,
+            |threshold| {
+                let value: i64 = cs_stmt
                     .query_row(rusqlite::params![threshold], |row| row.get(0))
                     .unwrap();
                 std::hint::black_box(value);
-            })
-        };
-        let fs_stmt = fs_prepare(&fs_conn, in_sql);
-        let mut fs_iteration = 0_i64;
-        let fs = measure(&format!("fs_in_sub_{count}"), 1, || {
-            let threshold = 1 + fs_iteration % cat_count_i64;
-            fs_iteration += 1;
-            let row = fsqlite_e2e::block_on(
-                fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
-            )
-            .unwrap();
-            std::hint::black_box(fsqlite_integer(&row, 0, "IN-subquery measurement"));
-        });
+            },
+            |threshold| {
+                let row = fsqlite_e2e::block_on(
+                    fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
+                )
+                .unwrap();
+                std::hint::black_box(fsqlite_integer(&row, 0, "IN-subquery measurement"));
+            },
+        );
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
@@ -11797,7 +12658,13 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         eprint!("    CTE (non-recursive)... ");
         let cte_join_sql = "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
              SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id";
-        assert_result_set_oracle(&cs_conn, &fs_conn, cte_join_sql, "CTE+JOIN oracle");
+        assert_result_set_oracle_with_policy(
+            &cs_conn,
+            &fs_conn,
+            cte_join_sql,
+            "CTE+JOIN oracle",
+            ORDER_INDEPENDENT_REAL_ORACLE_POLICY,
+        );
         let cs = {
             let mut stmt = cs_conn.prepare(cte_join_sql).unwrap();
             measure(&format!("cs_cte_{count}"), count, || {
@@ -12587,7 +13454,10 @@ fn bridge_validate_host_stability(
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_result<T>(result: Result<T, fsqlite::FrankenError>, context: &str) -> Result<T, String> {
+fn bridge_result<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    context: &str,
+) -> Result<T, String> {
     result.map_err(|error| format!("{context}: {error}"))
 }
 
@@ -13223,9 +14093,9 @@ fn bridge_sample_insert_single_runtime(
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_worker_command<T>(
+fn bridge_worker_command<T, E: std::fmt::Display>(
     command_count: &mut usize,
-    result: Result<T, fsqlite::FrankenError>,
+    result: Result<T, E>,
     context: &str,
 ) -> Result<T, String> {
     *command_count += 1;

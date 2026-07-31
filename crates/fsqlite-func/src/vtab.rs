@@ -42,7 +42,7 @@ pub enum ConstraintOp {
 }
 
 /// A single constraint from the WHERE clause that the planner is considering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexConstraint {
     /// Column index (0-based; `-1` for rowid).
     pub column: i32,
@@ -53,7 +53,7 @@ pub struct IndexConstraint {
 }
 
 /// A single ORDER BY term from the query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOrderBy {
     /// Column index (0-based).
     pub column: i32,
@@ -65,10 +65,14 @@ pub struct IndexOrderBy {
 #[derive(Debug, Clone, Default)]
 pub struct IndexConstraintUsage {
     /// 1-based index into the `args` array passed to `filter`.
-    /// 0 means this constraint is not consumed by the vtab.
+    /// Non-positive values mean this constraint supplies no argument. All
+    /// positive values returned by one `best_index` call must be unique and
+    /// form a contiguous sequence starting at 1.
     pub argv_index: i32,
     /// If `true`, the vtab guarantees this constraint is satisfied and
-    /// the core need not double-check it.
+    /// the core need not double-check it. This is only effective when
+    /// `argv_index` is positive; constraints that supply no filter argument
+    /// remain subject to core evaluation.
     pub omit: bool,
 }
 
@@ -80,11 +84,15 @@ pub struct IndexConstraintUsage {
 /// `estimated_cost`, and `estimated_rows`.
 #[derive(Debug, Clone)]
 pub struct IndexInfo {
-    /// WHERE clause constraints the planner is considering.
+    /// WHERE clause constraints the planner is considering. This is read-only
+    /// input: implementations must not mutate, reorder, or resize it.
     pub constraints: Vec<IndexConstraint>,
-    /// ORDER BY terms from the query.
+    /// ORDER BY terms from the query. This is read-only input and must not be
+    /// mutated, reordered, or resized.
     pub order_by: Vec<IndexOrderBy>,
-    /// How each constraint maps to filter arguments (vtab fills this).
+    /// How each constraint maps to filter arguments (vtab fills this). The
+    /// vector length is fixed by the core and must remain equal to
+    /// `constraints.len()`.
     pub constraint_usage: Vec<IndexConstraintUsage>,
     /// Integer identifier for the chosen index strategy.
     pub idx_num: i32,
@@ -461,6 +469,10 @@ pub trait VirtualTable: Send + Sync {
 
     /// Called for `CREATE VIRTUAL TABLE`.
     ///
+    /// `args` follows SQLite's canonical module ABI: module name, database
+    /// name, virtual-table name, then the arguments from the `USING` clause.
+    /// Implementations must not also accept a module-only compatibility shape.
+    ///
     /// May create backing storage. Default delegates to `connect`
     /// (suitable for eponymous virtual tables).
     fn create(cx: &Cx, args: &[&str]) -> Result<Self>
@@ -470,12 +482,17 @@ pub trait VirtualTable: Send + Sync {
         Self::connect(cx, args)
     }
 
-    /// Called for subsequent opens of an existing virtual table.
+    /// Called for subsequent opens of an existing virtual table. `args` uses
+    /// the same canonical SQLite module ABI as [`create`](Self::create).
     fn connect(cx: &Cx, args: &[&str]) -> Result<Self>
     where
         Self: Sized;
 
     /// Inform the query planner about available indexes and their costs.
+    /// Implementations may mutate output fields, but `constraints` and
+    /// `order_by` are immutable inputs and the length of `constraint_usage`
+    /// must be preserved. Positive argument slots must be unique and contiguous
+    /// from 1 through the number of supplied filter arguments.
     fn best_index(&self, info: &mut IndexInfo) -> Result<()>;
 
     /// Open a new scan cursor.
@@ -599,14 +616,19 @@ pub trait VirtualTableCursor: Send {
 #[allow(clippy::missing_errors_doc)]
 pub trait VtabModuleFactory: Send + Sync {
     /// Create a new virtual table instance for `CREATE VIRTUAL TABLE`.
+    ///
+    /// `args` is exactly `[module, database, table, module_args...]`, matching
+    /// SQLite's xCreate/xConnect contract.
     fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>>;
 
-    /// Connect to an existing virtual table (subsequent opens).
+    /// Connect to an existing virtual table (subsequent opens), using the same
+    /// canonical argv shape as [`create`](Self::create).
     fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
         self.create(cx, args)
     }
 
-    /// Column names and affinities for the virtual table schema.
+    /// Column names and affinities for the virtual table schema. `args` uses
+    /// the same canonical argv shape as [`create`](Self::create).
     fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
         Vec::new()
     }
@@ -623,9 +645,22 @@ pub trait VtabModuleFactory: Send + Sync {
     }
 }
 
+mod erased_instance_sealed {
+    use super::VirtualTable;
+
+    pub trait Sealed {}
+
+    impl<T: VirtualTable + 'static> Sealed for T where T::Cursor: 'static {}
+}
+
 /// A type-erased virtual table instance.
+///
+/// This implementation detail is sealed so extension authors implement the
+/// safe [`VirtualTable`] surface instead. In particular, this guarantees the
+/// `as_any` accessors remain mechanical downcasts rather than user callbacks.
 #[allow(clippy::missing_errors_doc)]
-pub trait ErasedVtabInstance: Send + Sync {
+#[allow(private_bounds)]
+pub trait ErasedVtabInstance: Send + Sync + erased_instance_sealed::Sealed {
     /// Return this instance as `Any` for downcasting to concrete extension types.
     fn as_any(&self) -> &dyn Any;
     /// Return this instance as mutable `Any` for downcasting to concrete extension types.
@@ -648,6 +683,8 @@ pub trait ErasedVtabInstance: Send + Sync {
     fn release(&mut self, cx: &Cx, n: i32) -> Result<()>;
     /// Roll back to savepoint at level `n`.
     fn rollback_to(&mut self, cx: &Cx, n: i32) -> Result<()>;
+    /// Disconnect this live instance without destroying its backing storage.
+    fn disconnect(&mut self, cx: &Cx) -> Result<()>;
     /// Destroy the virtual table.
     fn destroy(&mut self, cx: &Cx) -> Result<()>;
     /// Rename the virtual table.
@@ -742,6 +779,9 @@ where
     }
     fn rollback_to(&mut self, cx: &Cx, n: i32) -> Result<()> {
         VirtualTable::rollback_to(self, cx, n)
+    }
+    fn disconnect(&mut self, cx: &Cx) -> Result<()> {
+        VirtualTable::disconnect(self, cx)
     }
     fn destroy(&mut self, cx: &Cx) -> Result<()> {
         VirtualTable::destroy(self, cx)

@@ -4,48 +4,103 @@
 //! using `ProgramBuilder`. Handles SELECT, INSERT,
 //! UPDATE, and DELETE with correct opcode patterns matching C SQLite behavior.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::sync::Arc;
 
 use crate::{Label, ProgramBuilder};
 use fsqlite_ast::{
-    AssignmentTarget, BinaryOp, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr,
-    FromClause, FunctionArgs, InSet, InsertSource, InsertStatement, JsonArrow, LimitClause,
-    Literal, NullsOrder, OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore,
-    SelectStatement, SortDirection, Span, TableOrSubquery, TimeTravelClause, TimeTravelTarget,
-    UpdateStatement, UpsertAction, UpsertClause, UpsertTarget,
+    AssignmentTarget, BinaryOp, ColumnRef, ConflictAction, CreateIndexStatement, DeleteStatement,
+    Distinctness, Expr, FromClause, FunctionArgs, InSet, IndexedColumn, InsertSource,
+    InsertStatement, JsonArrow, LimitClause, Literal, NullsOrder, OrderingTerm, QualifiedTableRef,
+    ResultColumn, SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery,
+    TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction, UpsertClause, UpsertTarget,
 };
+use fsqlite_error::ErrorCode;
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
-use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
+use fsqlite_types::opcode::{
+    IndexCursorMeta, Opcode, P4, SORTER_COMPARE_TOP_N_PREFLIGHT, SORTER_OPEN_TOP_N_REGISTER,
+};
 use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind};
 use fsqlite_types::value::classify_sql_like_fast_path;
 use fsqlite_types::{SmallText, SqliteValue, StrictColumnType, TypeAffinity};
 
 // ---------------------------------------------------------------------------
-// Thread-local extra aggregate function names for UDF support (bd-2wt.3)
+// Thread-local custom aggregate keys for UDF support (bd-2wt.3)
 // ---------------------------------------------------------------------------
 // Custom aggregate UDFs registered via Connection::register_aggregate_function
 // need to be recognized by the codegen so they emit AggStep/AggFinal opcodes
-// instead of PureFunc. A thread-local avoids threading the names through
+// instead of PureFunc. Arity is part of the key: a custom max/1 must not turn
+// scalar max(x,y) into an aggregate, while a custom max/2 must replace that
+// scalar-shaped built-in call. A thread-local avoids threading the keys through
 // dozens of internal codegen helpers. Connection is !Send/!Sync so all codegen
 // runs on a single thread.
 
 thread_local! {
-    static EXTRA_AGG_NAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static CUSTOM_AGG_KEYS: RefCell<Vec<(String, i32)>> = const { RefCell::new(Vec::new()) };
+    static USE_BUILTIN_LIKE_GLOB_SEMANTICS: Cell<bool> = const { Cell::new(true) };
+    static USE_BUILTIN_SCALAR_FUNCTION_SEMANTICS: Cell<bool> = const { Cell::new(true) };
 }
 
-/// Set extra aggregate function names for the current codegen invocation.
+struct ConnectionFunctionContextGuard {
+    previous_custom_aggregate_keys: Vec<(String, i32)>,
+    previous_builtin_like_glob_semantics: bool,
+    previous_builtin_scalar_function_semantics: bool,
+}
+
+impl Drop for ConnectionFunctionContextGuard {
+    fn drop(&mut self) {
+        let previous_custom_aggregate_keys =
+            std::mem::take(&mut self.previous_custom_aggregate_keys);
+        CUSTOM_AGG_KEYS.with(|keys| {
+            *keys.borrow_mut() = previous_custom_aggregate_keys;
+        });
+        USE_BUILTIN_LIKE_GLOB_SEMANTICS.with(|enabled| {
+            enabled.set(self.previous_builtin_like_glob_semantics);
+        });
+        USE_BUILTIN_SCALAR_FUNCTION_SEMANTICS.with(|enabled| {
+            enabled.set(self.previous_builtin_scalar_function_semantics);
+        });
+    }
+}
+
+/// Run one codegen invocation with the connection's function-overriding state.
 ///
-/// Called by Connection before codegen to make custom aggregates visible.
-/// Names should be lowercase.
-pub fn set_extra_aggregate_names(names: Vec<String>) {
-    EXTRA_AGG_NAMES.with(|n| *n.borrow_mut() = names);
+/// Custom aggregate names must be lowercase and use `-1` for variadic arity.
+/// `use_builtin_like_glob_semantics` must be false when the connection has
+/// replaced an operator-compatible `like()` or `glob()` function: direct LIKE
+/// opcodes and LIKE/GLOB prefix-to-range rewrites would otherwise bypass the
+/// replacement. `use_builtin_scalar_function_semantics` must be false after
+/// any scalar registration because function-bearing partial-index predicates
+/// can no longer be assumed to match the semantics under which the index was
+/// populated. The previous thread-local state is restored even if `codegen`
+/// unwinds.
+pub fn with_connection_function_context<R>(
+    custom_aggregate_keys: Vec<(String, i32)>,
+    use_builtin_like_glob_semantics: bool,
+    use_builtin_scalar_function_semantics: bool,
+    codegen: impl FnOnce() -> R,
+) -> R {
+    let previous_custom_aggregate_keys = CUSTOM_AGG_KEYS
+        .with(|keys| std::mem::replace(&mut *keys.borrow_mut(), custom_aggregate_keys));
+    let previous_builtin_like_glob_semantics = USE_BUILTIN_LIKE_GLOB_SEMANTICS
+        .with(|enabled| enabled.replace(use_builtin_like_glob_semantics));
+    let previous_builtin_scalar_function_semantics = USE_BUILTIN_SCALAR_FUNCTION_SEMANTICS
+        .with(|enabled| enabled.replace(use_builtin_scalar_function_semantics));
+    let _guard = ConnectionFunctionContextGuard {
+        previous_custom_aggregate_keys,
+        previous_builtin_like_glob_semantics,
+        previous_builtin_scalar_function_semantics,
+    };
+    codegen()
 }
 
-/// Clear extra aggregate function names after codegen completes.
-pub fn clear_extra_aggregate_names() {
-    EXTRA_AGG_NAMES.with(|n| n.borrow_mut().clear());
+fn use_builtin_like_glob_semantics() -> bool {
+    USE_BUILTIN_LIKE_GLOB_SEMANTICS.with(Cell::get)
+}
+
+fn use_builtin_scalar_function_semantics() -> bool {
+    USE_BUILTIN_SCALAR_FUNCTION_SEMANTICS.with(Cell::get)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +313,48 @@ impl IndexSchema {
             self.columns.join(", ")
         } else {
             self.key_expressions.join(", ")
+        }
+    }
+}
+
+/// A validated explicit-index definition before a physical root page exists.
+///
+/// This is the common binding result for live `CREATE INDEX` and persisted
+/// `sqlite_master` reloads.  Root allocation deliberately remains a caller
+/// responsibility so malformed catalog SQL and invalid live DDL fail before
+/// they can mutate storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundExplicitIndex {
+    /// Index name exactly as declared by the bound statement.
+    pub name: String,
+    /// Plain indexed column names, or empty for an expression index.
+    pub columns: Vec<String>,
+    /// Executable SQL for every key term when any term is an expression.
+    pub key_expressions: Vec<String>,
+    /// Effective sort direction for every key term.
+    pub key_sort_directions: Vec<SortDirection>,
+    /// Optional validated partial-index predicate SQL.
+    pub where_clause: Option<String>,
+    /// Whether the index enforces uniqueness.
+    pub is_unique: bool,
+    /// Effective collation for every key term.
+    pub key_collations: Vec<Option<String>>,
+}
+
+impl BoundExplicitIndex {
+    /// Attach an already-allocated root page to this validated definition.
+    #[must_use]
+    pub fn into_index_schema(self, root_page: i32) -> IndexSchema {
+        IndexSchema {
+            name: self.name,
+            root_page,
+            columns: self.columns,
+            key_expressions: self.key_expressions,
+            key_sort_directions: self.key_sort_directions,
+            where_clause: self.where_clause,
+            is_unique: self.is_unique,
+            key_collations: self.key_collations,
+            conflict_action: None,
         }
     }
 }
@@ -515,6 +612,281 @@ impl TableSchema {
 
     fn resolves_to_hidden_rowid(&self, name: &str) -> bool {
         !self.without_rowid && self.column_index(name).is_none() && is_hidden_rowid_alias_name(name)
+    }
+}
+
+/// Validate and bind an explicit `CREATE INDEX` without allocating storage.
+///
+/// `expected_index_name` and `expected_table_name` let catalog reload callers
+/// bind the SQL text to the surrounding `sqlite_master` row.  Live DDL callers
+/// pass the names from `stmt` itself.  Identifier comparisons are
+/// case-insensitive, while the returned metadata preserves the spelling from
+/// the declaration.
+///
+/// This pass validates expression shape, every table column reference, and
+/// collation placement.  It intentionally does not decide whether a collation
+/// name is registered: that is connection-local state and must be checked by
+/// the caller before allocating the root page.
+pub fn bind_explicit_index(
+    stmt: &CreateIndexStatement,
+    expected_index_name: &str,
+    expected_table_name: &str,
+    table: &TableSchema,
+) -> Result<BoundExplicitIndex, CodegenError> {
+    if stmt.name.name.is_empty() || expected_index_name.is_empty() {
+        return Err(CodegenError::Unsupported(
+            "malformed CREATE INDEX identity: empty index name".to_owned(),
+        ));
+    }
+    if !stmt.name.name.eq_ignore_ascii_case(expected_index_name) {
+        return Err(CodegenError::Unsupported(format!(
+            "CREATE INDEX identity mismatch: statement names `{}`, expected `{expected_index_name}`",
+            stmt.name.name
+        )));
+    }
+    if stmt.table.is_empty() || expected_table_name.is_empty() {
+        return Err(CodegenError::Unsupported(
+            "malformed CREATE INDEX identity: empty table name".to_owned(),
+        ));
+    }
+    if !stmt.table.eq_ignore_ascii_case(expected_table_name) {
+        return Err(CodegenError::Unsupported(format!(
+            "CREATE INDEX table identity mismatch: statement targets `{}`, expected `{expected_table_name}`",
+            stmt.table
+        )));
+    }
+    if !table.name.eq_ignore_ascii_case(expected_table_name) {
+        return Err(CodegenError::TableNotFound(expected_table_name.to_owned()));
+    }
+    if stmt.columns.is_empty() {
+        return Err(CodegenError::Unsupported(format!(
+            "malformed CREATE INDEX `{}`: at least one key term is required",
+            stmt.name.name
+        )));
+    }
+
+    let mut simple_columns = Vec::with_capacity(stmt.columns.len());
+    let mut key_sort_directions = Vec::with_capacity(stmt.columns.len());
+    let mut key_collations = Vec::with_capacity(stmt.columns.len());
+
+    for (term_index, indexed) in stmt.columns.iter().enumerate() {
+        let context = format!("key term {}", term_index + 1);
+        validate_explicit_index_term(indexed, table, &context)?;
+
+        let simple_column = explicit_index_simple_column_name(&indexed.expr);
+        if let Some(column_name) = simple_column {
+            if table.column_index(column_name).is_none() {
+                return Err(CodegenError::ColumnNotFound {
+                    table: table.name.clone(),
+                    column: column_name.to_owned(),
+                });
+            }
+            simple_columns.push(column_name.to_owned());
+        }
+
+        let declared_collation = simple_column
+            .and_then(|column_name| table.column_index(column_name))
+            .and_then(|column_index| table.columns[column_index].collation.as_deref())
+            .or_else(|| column_collation(&indexed.expr, table, None));
+        let effective_collation = indexed
+            .collation
+            .as_deref()
+            .or_else(|| extract_collation(&indexed.expr))
+            .or(declared_collation);
+        validate_explicit_index_collation(effective_collation, &context)?;
+        key_collations.push(effective_collation.map(str::to_owned));
+        key_sort_directions.push(indexed.direction.unwrap_or(SortDirection::Asc));
+    }
+
+    if let Some(predicate) = stmt.where_clause.as_ref() {
+        validate_explicit_index_expr_shape(predicate, "partial-index predicate")?;
+        validate_single_table_expr_columns(predicate, table, None)?;
+    }
+
+    let all_terms_are_simple = simple_columns.len() == stmt.columns.len();
+    let (columns, key_expressions) = if all_terms_are_simple {
+        (simple_columns, Vec::new())
+    } else {
+        (
+            Vec::new(),
+            stmt.columns
+                .iter()
+                .map(|indexed| indexed.expr.to_string())
+                .collect(),
+        )
+    };
+
+    Ok(BoundExplicitIndex {
+        name: stmt.name.name.clone(),
+        columns,
+        key_expressions,
+        key_sort_directions,
+        where_clause: stmt.where_clause.as_ref().map(ToString::to_string),
+        is_unique: stmt.unique,
+        key_collations,
+    })
+}
+
+fn explicit_index_simple_column_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(col_ref.column.as_ref()),
+        // SQLite's indexed-column grammar resolves this legacy spelling as a
+        // column identifier rather than a constant string expression.
+        Expr::Literal(Literal::String(name), _) => Some(name),
+        Expr::Collate { expr, .. } => explicit_index_simple_column_name(expr),
+        _ => None,
+    }
+}
+
+fn validate_explicit_index_term(
+    indexed: &IndexedColumn,
+    table: &TableSchema,
+    context: &str,
+) -> Result<(), CodegenError> {
+    validate_explicit_index_collation(indexed.collation.as_deref(), context)?;
+    validate_explicit_index_expr_shape(&indexed.expr, context)?;
+    validate_single_table_expr_columns(&indexed.expr, table, None)
+}
+
+fn validate_explicit_index_collation(
+    collation: Option<&str>,
+    context: &str,
+) -> Result<(), CodegenError> {
+    if collation.is_some_and(str::is_empty) {
+        return Err(CodegenError::Unsupported(format!(
+            "malformed CREATE INDEX {context}: empty collation name"
+        )));
+    }
+    Ok(())
+}
+
+fn malformed_explicit_index_expr(context: &str, detail: &str) -> CodegenError {
+    CodegenError::Unsupported(format!("malformed CREATE INDEX {context}: {detail}"))
+}
+
+fn validate_explicit_index_expr_shape(expr: &Expr, context: &str) -> Result<(), CodegenError> {
+    match expr {
+        Expr::Literal(..) | Expr::Column(..) => Ok(()),
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            validate_explicit_index_expr_shape(left, context)?;
+            validate_explicit_index_expr_shape(right, context)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            validate_explicit_index_expr_shape(expr, context)
+        }
+        Expr::Collate {
+            expr, collation, ..
+        } => {
+            validate_explicit_index_collation(Some(collation), context)?;
+            validate_explicit_index_expr_shape(expr, context)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_explicit_index_expr_shape(expr, context)?;
+            validate_explicit_index_expr_shape(low, context)?;
+            validate_explicit_index_expr_shape(high, context)
+        }
+        Expr::In { expr, set, .. } => {
+            validate_explicit_index_expr_shape(expr, context)?;
+            let InSet::List(values) = set else {
+                return Err(malformed_explicit_index_expr(
+                    context,
+                    "subqueries and table-valued IN operands are not allowed",
+                ));
+            };
+            for value in values {
+                validate_explicit_index_expr_shape(value, context)?;
+            }
+            Ok(())
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_explicit_index_expr_shape(expr, context)?;
+            validate_explicit_index_expr_shape(pattern, context)?;
+            if let Some(escape) = escape {
+                validate_explicit_index_expr_shape(escape, context)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if whens.is_empty() {
+                return Err(malformed_explicit_index_expr(
+                    context,
+                    "CASE expression has no WHEN terms",
+                ));
+            }
+            if let Some(operand) = operand {
+                validate_explicit_index_expr_shape(operand, context)?;
+            }
+            for (when_expr, then_expr) in whens {
+                validate_explicit_index_expr_shape(when_expr, context)?;
+                validate_explicit_index_expr_shape(then_expr, context)?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_explicit_index_expr_shape(else_expr, context)?;
+            }
+            Ok(())
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if name.is_empty()
+                || *distinct
+                || !order_by.is_empty()
+                || filter.is_some()
+                || over.is_some()
+                || matches!(args, FunctionArgs::Star)
+            {
+                return Err(malformed_explicit_index_expr(
+                    context,
+                    "aggregate or window function term is not allowed",
+                ));
+            }
+            let FunctionArgs::List(values) = args else {
+                unreachable!("star arguments were rejected above");
+            };
+            for value in values {
+                validate_explicit_index_expr_shape(value, context)?;
+            }
+            Ok(())
+        }
+        Expr::Exists { .. } | Expr::Subquery(..) => Err(malformed_explicit_index_expr(
+            context,
+            "subqueries are not allowed",
+        )),
+        Expr::Raise { .. } => Err(malformed_explicit_index_expr(
+            context,
+            "RAISE expressions are not allowed",
+        )),
+        Expr::RowValue(..) => Err(malformed_explicit_index_expr(
+            context,
+            "row-value key terms are not allowed",
+        )),
+        Expr::Placeholder(..) => Err(malformed_explicit_index_expr(
+            context,
+            "bind parameters are not allowed",
+        )),
     }
 }
 
@@ -1071,7 +1443,8 @@ fn emit_upsert_expr(
             not,
             ..
         } => {
-            if matches!(like_op, fsqlite_ast::LikeOp::Like)
+            if use_builtin_like_glob_semantics()
+                && matches!(like_op, fsqlite_ast::LikeOp::Like)
                 && escape.is_none()
                 && let Expr::Literal(Literal::String(pattern_text), _) = pattern.as_ref()
                 && let Some((kind, literal)) = classify_sql_like_fast_path(pattern_text, None)
@@ -1549,13 +1922,21 @@ fn count_anon_placeholders(expr: &Expr) -> u32 {
                 + else_expr.as_deref().map_or(0, count_anon_placeholders)
         }
         Expr::FunctionCall {
-            args, filter, over, ..
+            args,
+            order_by,
+            filter,
+            over,
+            ..
         } => {
             let args_count = match args {
                 FunctionArgs::List(exprs) => exprs.iter().map(count_anon_placeholders).sum(),
                 FunctionArgs::Star => 0,
             };
             args_count
+                + order_by
+                    .iter()
+                    .map(|term| count_anon_placeholders(&term.expr))
+                    .sum::<u32>()
                 + filter.as_deref().map_or(0, count_anon_placeholders)
                 + over
                     .as_ref()
@@ -1682,6 +2063,219 @@ fn count_anon_placeholders_in_frame_bound(bound: &fsqlite_ast::FrameBound) -> u3
         fsqlite_ast::FrameBound::UnboundedPreceding
         | fsqlite_ast::FrameBound::CurrentRow
         | fsqlite_ast::FrameBound::UnboundedFollowing => 0,
+    }
+}
+
+/// Whether an expression contains a placeholder that has not been canonicalized
+/// to an explicit `?NNN` slot.
+///
+/// Connection-level compilation canonicalizes anonymous and named parameters
+/// before calling VDBE codegen. Direct codegen callers can still supply raw ASTs,
+/// though, and the builder's emission-order counter cannot preserve SQL textual
+/// ordering (or named-parameter reuse) when one optimization emits LIMIT before
+/// WHERE. Such callers must stay on an emission path that does not duplicate or
+/// reorder the expression.
+fn expr_contains_non_numbered_placeholder(expr: &Expr) -> bool {
+    match expr {
+        Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _) => false,
+        Expr::Placeholder(_, _) => true,
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => false,
+        Expr::Subquery(select, _)
+        | Expr::Exists {
+            subquery: select, ..
+        } => select_contains_non_numbered_placeholder(select),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_non_numbered_placeholder(left)
+                || expr_contains_non_numbered_placeholder(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => expr_contains_non_numbered_placeholder(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_non_numbered_placeholder(expr)
+                || expr_contains_non_numbered_placeholder(low)
+                || expr_contains_non_numbered_placeholder(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_non_numbered_placeholder(expr)
+                || match set {
+                    InSet::List(items) => items.iter().any(expr_contains_non_numbered_placeholder),
+                    InSet::Subquery(select) => select_contains_non_numbered_placeholder(select),
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_non_numbered_placeholder(expr)
+                || expr_contains_non_numbered_placeholder(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(expr_contains_non_numbered_placeholder)
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_non_numbered_placeholder(when_expr)
+                        || expr_contains_non_numbered_placeholder(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            matches!(
+                args,
+                FunctionArgs::List(items)
+                    if items.iter().any(expr_contains_non_numbered_placeholder)
+            ) || order_by
+                .iter()
+                .any(|term| expr_contains_non_numbered_placeholder(&term.expr))
+                || filter
+                    .as_deref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+                || over
+                    .as_ref()
+                    .is_some_and(window_spec_contains_non_numbered_placeholder)
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_contains_non_numbered_placeholder(expr)
+                || expr_contains_non_numbered_placeholder(path)
+        }
+        Expr::RowValue(items, _) => items.iter().any(expr_contains_non_numbered_placeholder),
+    }
+}
+
+fn select_contains_non_numbered_placeholder(select: &SelectStatement) -> bool {
+    select.with.as_ref().is_some_and(|with_clause| {
+        with_clause
+            .ctes
+            .iter()
+            .any(|cte| select_contains_non_numbered_placeholder(&cte.query))
+    }) || select_core_contains_non_numbered_placeholder(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| select_core_contains_non_numbered_placeholder(core))
+        || select
+            .order_by
+            .iter()
+            .any(|term| expr_contains_non_numbered_placeholder(&term.expr))
+        || select.limit.as_ref().is_some_and(|clause| {
+            expr_contains_non_numbered_placeholder(&clause.limit)
+                || clause
+                    .offset
+                    .as_ref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+        })
+}
+
+fn select_core_contains_non_numbered_placeholder(core: &SelectCore) -> bool {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            columns.iter().any(|column| {
+                matches!(
+                    column,
+                    ResultColumn::Expr { expr, .. }
+                        if expr_contains_non_numbered_placeholder(expr)
+                )
+            }) || from
+                .as_ref()
+                .is_some_and(from_clause_contains_non_numbered_placeholder)
+                || where_clause
+                    .as_deref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+                || group_by.iter().any(expr_contains_non_numbered_placeholder)
+                || having
+                    .as_deref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+                || windows
+                    .iter()
+                    .any(|window| window_spec_contains_non_numbered_placeholder(&window.spec))
+        }
+        SelectCore::Values(rows) => rows
+            .iter()
+            .flatten()
+            .any(expr_contains_non_numbered_placeholder),
+    }
+}
+
+fn from_clause_contains_non_numbered_placeholder(from: &FromClause) -> bool {
+    table_or_subquery_contains_non_numbered_placeholder(&from.source)
+        || from.joins.iter().any(|join| {
+            table_or_subquery_contains_non_numbered_placeholder(&join.table)
+                || matches!(
+                    &join.constraint,
+                    Some(fsqlite_ast::JoinConstraint::On(expr))
+                        if expr_contains_non_numbered_placeholder(expr)
+                )
+        })
+}
+
+fn table_or_subquery_contains_non_numbered_placeholder(source: &TableOrSubquery) -> bool {
+    match source {
+        TableOrSubquery::Table { .. } => false,
+        TableOrSubquery::Subquery { query, .. } => select_contains_non_numbered_placeholder(query),
+        TableOrSubquery::TableFunction { args, .. } => {
+            args.iter().any(expr_contains_non_numbered_placeholder)
+        }
+        TableOrSubquery::ParenJoin(from) => from_clause_contains_non_numbered_placeholder(from),
+    }
+}
+
+fn window_spec_contains_non_numbered_placeholder(spec: &fsqlite_ast::WindowSpec) -> bool {
+    spec.partition_by
+        .iter()
+        .any(expr_contains_non_numbered_placeholder)
+        || spec
+            .order_by
+            .iter()
+            .any(|term| expr_contains_non_numbered_placeholder(&term.expr))
+        || spec.frame.as_ref().is_some_and(|frame| {
+            frame_bound_contains_non_numbered_placeholder(&frame.start)
+                || frame
+                    .end
+                    .as_ref()
+                    .is_some_and(frame_bound_contains_non_numbered_placeholder)
+        })
+}
+
+fn frame_bound_contains_non_numbered_placeholder(bound: &fsqlite_ast::FrameBound) -> bool {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            expr_contains_non_numbered_placeholder(expr)
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => false,
     }
 }
 
@@ -1878,6 +2472,7 @@ pub fn codegen_select(
                     where_clause.as_deref(),
                     table,
                     table_alias,
+                    None,
                 )
                 .is_some()
                 || extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
@@ -2002,7 +2597,7 @@ pub fn codegen_select(
             })
     };
 
-    // bd-nonagg-eq-residual: `SELECT <non-covering cols> FROM t WHERE <int/text-indexed col> = <lit>
+    // bd-nonagg-eq-residual: `SELECT <cols> FROM t WHERE <int/text-indexed col> = <lit>
     // AND <residual on a non-indexed col>` (e.g. `SELECT * ... WHERE a = 5 AND c = 7`). The planner
     // emits an IndexEquality directive for the `col=lit` conjunct which bypasses on the residual it
     // cannot enforce (or emits none), reaching the heuristic chain below — where `index_eq_target`'s bare-`Eq`
@@ -2012,27 +2607,44 @@ pub fn codegen_select(
     // filtering the FULL WHERE per row (`codegen_select_index_equality_scan` with `residual_filter =
     // true`, so its fast path narrows to the exact matches). Dispatched as a heuristic fallback (AFTER
     // rowid/range/index_eq, before the full scan) so strictly-better rowid/range paths still win. Single
-    // eq column only. NON-covering output only: the emitter opens the table (needs_table_lookup is
-    // output-driven) so the residual can read any column — a covering output (SELECT id: the rowid is in
-    // the index entry; SELECT a: the indexed column) would skip the table and correctly declines to the
-    // full scan (lifting that needs the covering-decision fix, see the negative-results ledger). The
-    // `col=lit` rows come back in rowid order — the full scan's order within that block — so byte-identical.
+    // eq column only. The residual-aware emitter always opens the table even when the projection itself
+    // is index-covering, because the residual may read any table column. The `col=lit` rows come back in
+    // rowid order — the full scan's order within that block — so byte-identical.
     let eq_residual: Option<(&IndexSchema, &Expr)> = if is_aggregate
         || from_index_hint.is_some()
+        || time_travel.is_some()
         || !stmt.order_by.is_empty()
         || distinct != Distinctness::All
         || !group_by.is_empty()
         || having.is_some()
+        || has_window_columns(columns)
         || table.without_rowid
-    {
+        // The connection canonicalizes every bind parameter to `?NNN`, which
+        // keeps the residual and LIMIT/OFFSET slots stable even though this
+        // emitter generates LIMIT first and WHERE later. A direct/raw AST can
+        // still contain anonymous or named parameters; decline only this
+        // reorder-and-reapply optimization rather than assigning colliding
+        // slots or breaking named-parameter reuse.
+        || where_clause
+            .as_deref()
+            .is_some_and(expr_contains_non_numbered_placeholder)
+        || stmt.limit.as_ref().is_some_and(|clause| {
+            expr_contains_non_numbered_placeholder(&clause.limit)
+                || clause
+                    .offset
+                    .as_ref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+        }) {
         None
     } else {
-        aggregate_index_prefix_literal_residual_target(where_clause.as_deref(), table, table_alias)
-            .filter(|(_idx, prefix)| prefix.len() == 1)
-            .filter(|(idx, _prefix)| {
-                resolve_covering_output_sources(columns, table, table_alias, idx).is_none()
-            })
-            .map(|(idx, prefix)| (idx, prefix[0]))
+        aggregate_index_prefix_literal_residual_target(
+            where_clause.as_deref(),
+            table,
+            table_alias,
+            Some(1),
+        )
+        .filter(|(_idx, prefix)| prefix.len() == 1)
+        .map(|(idx, prefix)| (idx, prefix[0]))
     };
 
     // bd-2dgf5: non-aggregate `SELECT ... FROM t WHERE <int col> IN (<int literals>)` seeks
@@ -2675,6 +3287,8 @@ pub fn codegen_select(
                                     match extract_expression_index_equality_expr(
                                         where_clause.as_deref(),
                                         idx_schema,
+                                        table,
+                                        table_alias,
                                     ) {
                                         Some(actual_target_expr)
                                             if actual_target_expr == directive_target_expr =>
@@ -2774,6 +3388,8 @@ pub fn codegen_select(
                                     match extract_expression_index_range_target(
                                         where_clause.as_deref(),
                                         idx_schema,
+                                        table,
+                                        table_alias,
                                     ) {
                                         Some(actual_range_target)
                                             if &actual_range_target == directive_range_target =>
@@ -3020,6 +3636,15 @@ pub fn codegen_select(
         )
     } else if has_aggregate_columns(columns) {
         // --- Aggregate query (single-group, no GROUP BY) ---
+        let limit_anon_placeholder_base = stmt.limit.as_ref().map(|limit_clause| {
+            let limit_placeholder_count = count_anon_placeholders(&limit_clause.limit)
+                + limit_clause
+                    .offset
+                    .as_ref()
+                    .map_or(0, count_anon_placeholders);
+            b.current_anon_placeholder()
+                + count_anon_placeholders_in_select(stmt).saturating_sub(limit_placeholder_count)
+        });
         codegen_select_aggregate(
             b,
             cursor,
@@ -3029,6 +3654,8 @@ pub fn codegen_select(
             columns,
             where_clause.as_deref(),
             having.as_deref(),
+            stmt.limit.as_ref(),
+            limit_anon_placeholder_base,
             out_regs,
             out_col_count,
             done_label,
@@ -3208,22 +3835,7 @@ fn codegen_select_rowid_lookup(
     // The residual re-applies the whole WHERE, so it must re-number from this base (else the `id = ?`
     // conjunct would double-consume). Unused when `residual_filter` is false.
     let where_placeholder_base = b.current_anon_placeholder();
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     let rowid_reg = b.alloc_reg();
     emit_expr(b, target_expr, rowid_reg, None);
@@ -3317,18 +3929,6 @@ fn codegen_select_index_equality_scan(
     let full_scan_fallback = b.emit_label();
     let duplicate_run_done = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
     // WITHOUT ROWID index entries carry a PK suffix instead of a trailing
     // rowid (bd-rjaff): covering resolution is rowid-table shaped, so route
     // WITHOUT ROWID through the table-lookup path below.
@@ -3337,7 +3937,7 @@ fn codegen_select_index_equality_scan(
     } else {
         None
     };
-    let covering_output = if wr_pk_indices.is_some() {
+    let covering_output = if wr_pk_indices.is_some() || residual_filter {
         None
     } else {
         resolve_covering_output_sources(columns, table, table_alias, idx_schema)
@@ -3369,12 +3969,17 @@ fn codegen_select_index_equality_scan(
         full_scan_fallback
     };
 
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, fast_path_done_label);
-    }
+    let (limit_reg, offset_reg) =
+        emit_limit_offset_registers(b, limit_clause, fast_path_done_label);
 
-    let probe_key_regs = b.alloc_regs((idx_schema.key_term_count() + 1) as i32);
-    let min_rowid_reg = probe_key_regs + idx_schema.key_term_count() as i32;
+    // A composite index must be positioned with a true one-field prefix
+    // record. Padding unconstrained trailing terms with NULL is not a block
+    // floor when any such term is DESC: SeekGE would start in the trailing-NULL
+    // region and silently skip preceding non-NULL entries. Single-key indexes
+    // retain the exact `(key, rowid-floor)` record needed for rowid-order walks.
+    let composite_prefix_probe = idx_schema.key_term_count() > 1;
+    let probe_field_count = if composite_prefix_probe { 1 } else { 2 };
+    let probe_key_regs = b.alloc_regs(probe_field_count);
     emit_expr(b, target_expr, probe_key_regs, None);
     b.emit_jump_to_label(
         Opcode::IsNull,
@@ -3384,35 +3989,29 @@ fn codegen_select_index_equality_scan(
         P4::None,
         0,
     );
-    for offset in 1..idx_schema.key_term_count() {
-        b.emit_op(
-            Opcode::Null,
-            0,
-            probe_key_regs + offset as i32,
-            0,
-            P4::None,
-            0,
-        );
-    }
 
     let saw_index_match_reg = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
 
-    // Ascending seeks to `(val, i64::MIN)` (lowest rowid of the value) then walks up; descending seeks to
-    // `(val, i64::MAX)` (highest rowid) then walks down with `Prev`.
-    b.emit_op(
-        Opcode::Int64,
-        0,
-        min_rowid_reg,
-        0,
-        P4::Int64(if descending { i64::MAX } else { i64::MIN }),
-        0,
-    );
+    if !composite_prefix_probe {
+        let rowid_floor_reg = probe_key_regs + 1;
+        // Ascending seeks to `(val, i64::MIN)` (lowest rowid of the value)
+        // then walks up; descending seeks to `(val, i64::MAX)` (highest
+        // rowid) then walks down with `Prev`.
+        b.emit_op(
+            Opcode::Int64,
+            0,
+            rowid_floor_reg,
+            0,
+            P4::Int64(if descending { i64::MAX } else { i64::MIN }),
+            0,
+        );
+    }
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         probe_key_regs,
-        (idx_schema.key_term_count() + 1) as i32,
+        probe_field_count,
         probe_record_reg,
         P4::None,
         0,
@@ -3474,7 +4073,7 @@ fn codegen_select_index_equality_scan(
 
     let idx_skip_label = b.emit_label();
     b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
-    if let Some(pk_indices) = wr_pk_indices.as_ref() {
+    let covering_rowid_reg = if let Some(pk_indices) = wr_pk_indices.as_ref() {
         // WITHOUT ROWID: read the PK suffix stored after the index key terms
         // and position the table b-tree on it (prefix probe; fall-through
         // leaves the cursor on the matching row).
@@ -3486,10 +4085,7 @@ fn codegen_select_index_equality_scan(
             pk_indices,
             idx_skip_label,
         );
-        if let Some(off_r) = offset_reg {
-            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, idx_skip_label, P4::None, 0);
-        }
-        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+        None
     } else {
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
@@ -3503,15 +4099,8 @@ fn codegen_select_index_equality_scan(
                 0,
             );
         }
-        if let Some(off_r) = offset_reg {
-            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, idx_skip_label, P4::None, 0);
-        }
-        if let Some(covering_output) = covering_output.as_ref() {
-            emit_covering_output_reads(b, idx_cursor, rowid_reg, covering_output, out_regs);
-        } else {
-            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
-        }
-    }
+        Some(rowid_reg)
+    };
     // bd-nonagg-eq-residual: apply the full WHERE as a per-row residual filter on the fast seek path
     // when the caller has a residual beyond the eq prefix. The seek already pins `col = lit` (so that
     // conjunct is redundant here) and the row is positioned (table cursor for the non-covering caller
@@ -3529,6 +4118,21 @@ fn codegen_select_index_equality_scan(
             schema,
             idx_skip_label,
         );
+    }
+    // OFFSET applies to rows that satisfy WHERE, and projection expressions must
+    // not run for filtered-out candidates. Keep both after the residual filter.
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, idx_skip_label, P4::None, 0);
+    }
+    if let Some(covering_output) = covering_output.as_ref() {
+        let rowid_reg = covering_rowid_reg.ok_or_else(|| {
+            CodegenError::Unsupported(
+                "covering output requires a rowid-table index cursor".to_owned(),
+            )
+        })?;
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, covering_output, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     if let Some(lim_r) = limit_reg {
@@ -4059,23 +4663,7 @@ fn codegen_select_full_scan(
     descending: bool,
 ) -> Result<(), CodegenError> {
     // Allocate LIMIT/OFFSET counter registers (if present).
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-
-    // LIMIT 0 guard: skip entire scan if limit is zero.
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     b.emit_op(
         Opcode::OpenRead,
@@ -4253,22 +4841,7 @@ fn codegen_select_rowid_range_scan(
     // Captured before any placeholder-emitting op so the re-applied WHERE re-numbers a residual `?` from
     // this base. Unused when `residual_filter` is false.
     let where_placeholder_base = b.current_anon_placeholder();
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     let lower_reg = rowid_range.lower.map(|bound| {
         let reg = b.alloc_reg();
@@ -4452,22 +5025,7 @@ fn codegen_select_index_range_scan(
     index_range: PlannerIndexRangeTarget,
 ) -> Result<(), CodegenError> {
     let idx_cursor = cursor + 1;
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     // bd-u6tbr / bd-xiojw follow-up: coerce a runtime-typed bound (a placeholder) to the indexed
     // column's affinity so the seek positions identically to the full-scan filter, which applies
@@ -4703,21 +5261,7 @@ fn codegen_select_index_range_scan_desc(
     range: &ColumnRangeTarget<'_>,
 ) -> Result<(), CodegenError> {
     let idx_cursor = cursor + 1;
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     let bound_affinity = idx_schema
         .columns
@@ -4912,21 +5456,7 @@ fn codegen_select_composite_index_prefix_range_scan(
     let key_terms = idx_schema.key_term_count();
     let range_pos = prefix_len;
 
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     // Coercing affinity ('C'/'D'/'E'/'B') of each key column, or None (untyped -> no coercion).
     let key_affinities: Vec<Option<char>> = (0..key_terms)
@@ -5180,21 +5710,7 @@ fn codegen_select_composite_index_prefix_range_scan_desc(
     let key_terms = idx_schema.key_term_count();
     let range_pos = prefix_len;
 
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     // Coercing affinity ('C'/'D'/'E'/'B') of each key column, or None (untyped -> no coercion).
     let key_affinities: Vec<Option<char>> = (0..key_terms)
@@ -5575,7 +6091,9 @@ fn is_simple_count_star(columns: &[ResultColumn]) -> bool {
                     ..
                 },
             ..
-        }] if name.eq_ignore_ascii_case("count") && order_by.is_empty()
+        }] if name.eq_ignore_ascii_case("count")
+            && order_by.is_empty()
+            && builtin_aggregate_semantics_available(name, 0)
     )
 }
 
@@ -5627,7 +6145,8 @@ fn simple_group_by_rowid_bucket_sum_plan(
     table_alias: Option<&str>,
     group_by: &[Expr],
 ) -> Option<GroupByRowidBucketSumPlan> {
-    if columns.len() != 2 || group_by.len() != 1 {
+    if columns.len() != 2 || group_by.len() != 1 || !builtin_aggregate_semantics_available("sum", 1)
+    {
         return None;
     }
 
@@ -5689,7 +6208,10 @@ fn simple_count_star_plus_sum_plan(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> Option<CountStarPlusSumPlan> {
-    if columns.len() != 2 {
+    if columns.len() != 2
+        || !builtin_aggregate_semantics_available("count", 0)
+        || !builtin_aggregate_semantics_available("sum", 1)
+    {
         return None;
     }
 
@@ -7059,23 +7581,7 @@ fn codegen_select_index_ordered_scan(
         && equality_prefix_exprs.len() >= index_plan.equality_prefix_len;
 
     // Allocate LIMIT/OFFSET counter registers (if present).
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-
-    // LIMIT 0 guard: skip entire scan if limit is zero.
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     if needs_table_lookup {
         b.emit_op(
@@ -7275,32 +7781,32 @@ fn codegen_select_distinct_scan(
 
     // Open sorter with all output columns as sort keys (ascending).
     let sort_order: String = "+".repeat(num_data_cols);
-    // Build per-column collation info for DISTINCT comparison.
-    let sort_collations: Vec<String> = columns
-        .iter()
-        .map(|col| {
-            if let ResultColumn::Expr { expr, .. } = col {
-                // Explicit COLLATE on the expression takes priority.
-                if let Some(coll) = extract_collation(expr) {
-                    return coll.to_owned();
-                }
-                // Inherit column-level collation from table schema.
-                if let Expr::Column(cr, _) = expr {
-                    if let Some(idx) = table.column_index(&cr.column) {
-                        if let Some(coll) =
-                            table.columns.get(idx).and_then(|c| c.collation.as_deref())
-                        {
-                            return coll.to_owned();
-                        }
-                    }
-                }
-            }
-            String::new()
+    // Build one collation entry per flattened output slot. A syntactic `*`
+    // contributes every table column, so iterating result-column AST nodes
+    // would shift or drop declared collations on the expanded tuple.
+    let sort_collations: Vec<String> = (0..num_data_cols)
+        .map(|slot| {
+            result_output_slot_collation(slot, columns, table, table_alias).unwrap_or_default()
         })
         .collect();
     let has_collation = sort_collations.iter().any(|c| !c.is_empty());
     let p4_str = if has_collation {
-        format!("{sort_order}|{}", sort_collations.join(","))
+        // Keep the serialized metadata explicitly positional whenever any
+        // slot needs a named collation. Spelling out BINARY defaults makes it
+        // unambiguous that a later NOCASE/RTRIM entry belongs to that later
+        // flattened output slot.
+        let positional_collations = sort_collations
+            .iter()
+            .map(|collation| {
+                if collation.is_empty() {
+                    "BINARY"
+                } else {
+                    collation.as_str()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{sort_order}|{positional_collations}")
     } else {
         sort_order
     };
@@ -7379,23 +7885,7 @@ fn codegen_select_distinct_scan(
     // === Pass 2: Iterate sorted rows, skipping duplicates ===
 
     // Allocate LIMIT/OFFSET counters.
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-
-    // LIMIT 0 guard: skip entire output pass if limit is zero.
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     // DISTINCT state (record compare against previous output row).
     let cur_rec = b.alloc_reg();
@@ -7538,35 +8028,24 @@ fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
     }
 }
 
-/// Maximum `LIMIT + OFFSET` for which the bounded top-N sorter is applied when an OFFSET is present.
-/// The sorter is a sorted `Vec` (O(N) insert), so a very large top-N retention (deep pagination on a
-/// large table) would regress vs a full sort; beyond this we fall back to the full sort (unchanged).
-/// Typical pagination stays well under it. bd-5310l.
-const MAX_TOP_N_BOUND_WITH_OFFSET: usize = 1024;
-
-/// Tightest bounded top-N sorter retention for `LIMIT <l> [OFFSET <o>]`.
+/// Whether LIMIT/OFFSET cannot suppress a single aggregate output row.
 ///
-/// The sorter need only keep the `l + o` best rows because pass 2 skips `o` then emits `l` — the
-/// retained set is byte-identical to a full sort followed by the same LIMIT/OFFSET. A bare
-/// `LIMIT <l>` returns exactly `l` (unchanged, uncapped). When an OFFSET is present, both must be
-/// constant non-negative integer literals and `l + o <= MAX_TOP_N_BOUND_WITH_OFFSET`; otherwise
-/// `None` (full sort). bd-5310l.
-fn constant_positive_top_n_bound(limit_clause: &LimitClause) -> Option<usize> {
-    let limit = match &limit_clause.limit {
-        Expr::Literal(Literal::Integer(limit), _) if *limit > 0 => usize::try_from(*limit).ok()?,
-        _ => return None,
+/// This lets single-seek aggregate fast paths retain their existing complexity
+/// for common `LIMIT 1` probes. Dynamic or coercible expressions take the
+/// general limit-aware path because their value is known only at execution.
+fn single_group_aggregate_limit_is_output_neutral(limit_clause: Option<&LimitClause>) -> bool {
+    let Some(clause) = limit_clause else {
+        return true;
     };
-    let Some(offset_expr) = limit_clause.offset.as_ref() else {
-        return Some(limit);
+    let Expr::Literal(Literal::Integer(limit), _) = &clause.limit else {
+        return false;
     };
-    let offset = match offset_expr {
-        Expr::Literal(Literal::Integer(offset), _) if *offset >= 0 => {
-            usize::try_from(*offset).ok()?
-        }
-        _ => return None,
-    };
-    let bound = limit.checked_add(offset)?;
-    (bound <= MAX_TOP_N_BOUND_WITH_OFFSET).then_some(bound)
+    if *limit == 0 {
+        return false;
+    }
+    clause.offset.as_ref().is_none_or(
+        |offset| matches!(offset, Expr::Literal(Literal::Integer(value), _) if *value <= 0),
+    )
 }
 
 /// Emit a guard that jumps to `done_label` when the LIMIT register is zero.
@@ -7581,6 +8060,81 @@ fn emit_limit_zero_guard(b: &mut ProgramBuilder, limit_reg: i32, done_label: cra
     b.emit_jump_to_label(Opcode::IfNot, limit_reg, 1, done_label, P4::None, 0);
 }
 
+/// Emit LIMIT/OFFSET registers with SQLite's evaluation and coercion order.
+///
+/// LIMIT is evaluated and losslessly coerced to an integer first. A zero LIMIT
+/// jumps directly to `done_label`, so OFFSET is not evaluated at all. Only a
+/// nonzero LIMIT reaches OFFSET evaluation and its own integer coercion.
+fn emit_limit_offset_registers(
+    b: &mut ProgramBuilder,
+    limit_clause: Option<&LimitClause>,
+    done_label: crate::Label,
+) -> (Option<i32>, Option<i32>) {
+    let Some(clause) = limit_clause else {
+        return (None, None);
+    };
+
+    let limit_reg = b.alloc_reg();
+    emit_limit_expr(b, &clause.limit, limit_reg);
+    if !matches!(&clause.limit, Expr::Literal(Literal::Integer(_), _)) {
+        b.emit_op(Opcode::MustBeInt, limit_reg, 0, 0, P4::None, 0);
+    }
+    emit_limit_zero_guard(b, limit_reg, done_label);
+
+    let offset_reg = clause.offset.as_ref().map(|offset| {
+        let register = b.alloc_reg();
+        emit_limit_expr(b, offset, register);
+        if !matches!(offset, Expr::Literal(Literal::Integer(_), _)) {
+            b.emit_op(Opcode::MustBeInt, register, 0, 0, P4::None, 0);
+        }
+        register
+    });
+
+    (Some(limit_reg), offset_reg)
+}
+
+/// Compute the runtime row-retention bound for a top-N sorter.
+///
+/// Pass 2 emits at most `LIMIT` rows after skipping `OFFSET`, so pass 1 must
+/// retain `LIMIT + max(OFFSET, 0)` rows. `OffsetLimit` preserves negative
+/// LIMIT as the no-limit sentinel and saturates positive overflow. The
+/// returned register must be read by `SorterOpen` with
+/// `SORTER_OPEN_TOP_N_REGISTER`.
+fn emit_top_n_bound_register(
+    b: &mut ProgramBuilder,
+    limit_reg: Option<i32>,
+    offset_reg: Option<i32>,
+) -> Option<i32> {
+    let limit_reg = limit_reg?;
+    let Some(offset_reg) = offset_reg else {
+        return Some(limit_reg);
+    };
+
+    // SQLite treats a negative OFFSET as zero. Clamp the shared pass-2 counter
+    // before computing the retention bound so both phases observe the same
+    // normalized value.
+    let zero_reg = b.alloc_temp();
+    b.emit_op(Opcode::Integer, 0, zero_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::MemMax, zero_reg, offset_reg, 0, P4::None, 0);
+    b.free_temp(zero_reg);
+
+    let bound_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::OffsetLimit,
+        limit_reg,
+        offset_reg,
+        bound_reg,
+        P4::None,
+        0,
+    );
+    Some(bound_reg)
+}
+
+fn limit_clause_can_enable_top_n(limit_clause: Option<&LimitClause>) -> bool {
+    limit_clause
+        .is_some_and(|clause| order_by_integer_ordinal(&clause.limit).is_none_or(|limit| limit > 0))
+}
+
 // ---------------------------------------------------------------------------
 // ORDER BY codegen (two-pass sorter)
 // ---------------------------------------------------------------------------
@@ -7592,7 +8146,12 @@ fn emit_limit_zero_guard(b: &mut ProgramBuilder, limit_reg: i32, done_label: cra
 /// 2. After sorting, iterate sorted rows and emit `ResultRow`.
 ///
 /// LIMIT/OFFSET are applied in pass 2 (on sorted output).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn codegen_select_ordered_scan(
     b: &mut ProgramBuilder,
     cursor: i32,
@@ -7609,8 +8168,45 @@ fn codegen_select_ordered_scan(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
-    let top_n_limit = if distinct == Distinctness::All {
-        limit_clause.and_then(constant_positive_top_n_bound)
+    // Connection-level compilation canonicalizes anonymous and named bind
+    // parameters to explicit `?NNN` slots before VDBE codegen. Direct callers
+    // can still provide a raw AST, though, and this path intentionally emits
+    // LIMIT/OFFSET before the earlier textual SELECT/WHERE/ORDER expressions.
+    // Sequential emission-order numbering would therefore reverse slots or
+    // break named-parameter reuse. Decline the reordered path unless every
+    // placeholder already carries its canonical numeric slot.
+    let projection_has_non_numbered_placeholder = columns.iter().any(|column| {
+        matches!(
+            column,
+            ResultColumn::Expr { expr, .. } if expr_contains_non_numbered_placeholder(expr)
+        )
+    });
+    let order_has_non_numbered_placeholder = order_by
+        .iter()
+        .any(|term| expr_contains_non_numbered_placeholder(&term.expr));
+    let limit_has_non_numbered_placeholder = limit_clause.is_some_and(|clause| {
+        expr_contains_non_numbered_placeholder(&clause.limit)
+            || clause
+                .offset
+                .as_ref()
+                .is_some_and(expr_contains_non_numbered_placeholder)
+    });
+    if projection_has_non_numbered_placeholder
+        || where_clause.is_some_and(expr_contains_non_numbered_placeholder)
+        || order_has_non_numbered_placeholder
+        || limit_has_non_numbered_placeholder
+    {
+        return Err(CodegenError::Unsupported(
+            "ordered SELECT codegen requires canonical numbered bind parameters".to_owned(),
+        ));
+    }
+
+    // LIMIT (then OFFSET) is evaluated before the source scan. Besides
+    // matching SQLite's observable error/function order, this supplies the
+    // runtime retention bound used by the bounded sorter.
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+    let top_n_bound_reg = if limit_clause_can_enable_top_n(limit_clause) {
+        emit_top_n_bound_register(b, limit_reg, offset_reg)
     } else {
         None
     };
@@ -7620,10 +8216,13 @@ fn codegen_select_ordered_scan(
         .iter()
         .map(|term| resolve_sort_key(&term.expr, table, table_alias, columns))
         .collect();
+    let order_output_slots: Vec<Option<usize>> = order_by
+        .iter()
+        .map(|term| resolve_order_by_output_slot(&term.expr, columns, table, table_alias))
+        .collect();
 
     let num_sort_keys = sort_keys.len();
     let num_data_cols = result_column_count_usize(columns, table);
-    let total_sorter_cols = num_sort_keys + num_data_cols;
 
     // Sorter cursor is separate from the table cursor.
     let sorter_cursor = cursor + 1;
@@ -7652,20 +8251,60 @@ fn codegen_select_ordered_scan(
     let sort_collations: Vec<String> = sort_keys
         .iter()
         .zip(order_by.iter())
-        .map(|(sk, term)| {
+        .enumerate()
+        .map(|(index, (sk, term))| {
             // Explicit COLLATE on the ORDER BY term takes priority.
-            if let fsqlite_ast::Expr::Collate { collation, .. } = &term.expr {
-                return collation.clone();
+            if let Some(collation) = extract_collation(&term.expr) {
+                return collation.to_owned();
+            }
+            if let Some(output_slot) = order_output_slots[index]
+                && let Some(collation) =
+                    result_output_slot_collation(output_slot, columns, table, table_alias)
+            {
+                return collation;
             }
             // Otherwise, inherit the column's declared collation.
-            if let SortKeySource::Column(idx) = sk {
-                if let Some(coll) = table.columns.get(*idx).and_then(|c| c.collation.as_deref()) {
-                    return coll.to_owned();
+            match sk {
+                SortKeySource::Column(idx) => {
+                    if let Some(collation) =
+                        table.columns.get(*idx).and_then(|c| c.collation.as_deref())
+                    {
+                        return collation.to_owned();
+                    }
                 }
+                SortKeySource::Expression(expr) => {
+                    if let Some(collation) = extract_collation(expr)
+                        .or_else(|| column_collation(expr, table, table_alias))
+                    {
+                        return collation.to_owned();
+                    }
+                }
+                SortKeySource::Rowid => {}
             }
             String::new()
         })
         .collect();
+    let distinct_projection_mode = ordered_distinct_projection_mode(
+        distinct,
+        order_by,
+        &order_output_slots,
+        &sort_collations,
+        columns,
+        table,
+        table_alias,
+    );
+    let stored_data_cols = match distinct_projection_mode {
+        OrderedDistinctProjectionMode::StoredOutput => num_data_cols,
+        OrderedDistinctProjectionMode::ReprojectRepresentative if table.without_rowid => {
+            table.columns.len()
+        }
+        OrderedDistinctProjectionMode::ReprojectRepresentative => 1,
+    };
+    let total_sorter_cols = num_sort_keys + stored_data_cols;
+    let keep_source_cursor_open = distinct_projection_mode
+        == OrderedDistinctProjectionMode::ReprojectRepresentative
+        && !table.without_rowid;
+
     let has_collation = sort_collations.iter().any(|c| !c.is_empty());
     let p4_str = if has_collation {
         format!("{sort_order}|{}", sort_collations.join(","))
@@ -7677,12 +8316,37 @@ fn codegen_select_ordered_scan(
         Opcode::SorterOpen,
         sorter_cursor,
         num_sort_keys as i32,
-        top_n_limit
-            .and_then(|limit| i32::try_from(limit).ok())
-            .unwrap_or(0),
+        top_n_bound_reg.unwrap_or(0),
         P4::Str(p4_str),
-        0,
+        top_n_bound_reg.map_or(0, |_| SORTER_OPEN_TOP_N_REGISTER),
     );
+
+    // DISTINCT is defined over the flattened output tuple, not the ORDER BY
+    // key prefix. Open a separate membership index before pass 1 so duplicate
+    // outputs can skip independent ORDER BY expression evaluation as well as
+    // sorter insertion. Spell out BINARY for default-collation slots because
+    // the OpenAutoindex P4 parser intentionally ignores empty list entries.
+    let distinct_cursor = if distinct == Distinctness::Distinct {
+        let distinct_cursor = sorter_cursor + 1;
+        let collations = (0..num_data_cols)
+            .map(|slot| {
+                result_output_slot_collation(slot, columns, table, table_alias)
+                    .unwrap_or_else(|| "BINARY".to_owned())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        b.emit_op(
+            Opcode::OpenAutoindex,
+            distinct_cursor,
+            out_col_count,
+            0,
+            P4::Str(collations),
+            0,
+        );
+        Some(distinct_cursor)
+    } else {
+        None
+    };
 
     // Open table for reading.
     b.emit_op(
@@ -7716,6 +8380,13 @@ fn codegen_select_ordered_scan(
     // Read sort-key columns + data columns into consecutive registers.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let sorter_base = b.alloc_regs(total_sorter_cols as i32);
+    let stored_data_base = sorter_base + num_sort_keys as i32;
+    let output_base =
+        if distinct_projection_mode == OrderedDistinctProjectionMode::ReprojectRepresentative {
+            b.alloc_regs(out_col_count)
+        } else {
+            stored_data_base
+        };
     {
         let scan = ScanCtx {
             cursor,
@@ -7725,33 +8396,121 @@ fn codegen_select_ordered_scan(
             register_base: None,
             secondaries: &[],
         };
-        for (reg, key) in (sorter_base..).zip(sort_keys.iter()) {
-            match key {
-                SortKeySource::Column(col_idx) => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
+        let mut output_emitted = vec![false; num_data_cols];
+
+        // In the ordinary (non-merged) SQLite DISTINCT+ORDER BY shape, result
+        // expressions are evaluated and deduplicated before independent ORDER
+        // expressions. Besides being the correct tuple key, this ordering means
+        // a duplicate output cannot invoke a volatile or failing sort-only
+        // expression. Exact ORDER aliases/ordinals below reuse these registers.
+        if let Some(distinct_cursor) = distinct_cursor {
+            emit_column_reads_selected(
+                b,
+                cursor,
+                columns,
+                table,
+                table_alias,
+                schema,
+                output_base,
+                |_| true,
+            )?;
+            output_emitted.fill(true);
+
+            let distinct_record = b.alloc_temp();
+            b.emit_op(
+                Opcode::MakeRecord,
+                output_base,
+                out_col_count,
+                distinct_record,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::Found,
+                distinct_cursor,
+                distinct_record,
+                skip_label,
+                P4::None,
+                0,
+            );
+            b.emit_op(
+                Opcode::IdxInsert,
+                distinct_cursor,
+                distinct_record,
+                0,
+                P4::None,
+                0,
+            );
+            b.free_temp(distinct_record);
+        }
+
+        for (index, (reg, key)) in (sorter_base..).zip(sort_keys.iter()).enumerate() {
+            if let Some(output_slot) = order_output_slots[index] {
+                if !output_emitted[output_slot] {
+                    emit_column_reads_selected(
+                        b,
+                        cursor,
+                        columns,
+                        table,
+                        table_alias,
+                        schema,
+                        output_base,
+                        |slot| slot == output_slot,
+                    )?;
+                    output_emitted[output_slot] = true;
                 }
-                SortKeySource::Rowid => {
-                    b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
-                }
-                SortKeySource::Expression(expr) => {
-                    emit_expr(b, expr, reg, Some(&scan));
-                }
+                b.emit_op(
+                    Opcode::Copy,
+                    output_base + output_slot as i32,
+                    reg,
+                    0,
+                    P4::None,
+                    0,
+                );
+            } else {
+                emit_resolved_column(b, key, cursor, reg, &scan);
             }
         }
 
-        // Evaluate result columns (including expressions) and store the final
-        // output values in the sorter record.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        emit_column_reads(
+        if top_n_bound_reg.is_some() {
+            let key_record = b.alloc_temp();
+            b.emit_op(
+                Opcode::MakeRecord,
+                sorter_base,
+                num_sort_keys as i32,
+                key_record,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::SorterCompare,
+                sorter_cursor,
+                key_record,
+                skip_label,
+                P4::None,
+                SORTER_COMPARE_TOP_N_PREFLIGHT,
+            );
+            b.free_temp(key_record);
+        }
+
+        // For non-DISTINCT top-N, evaluate only outputs not already shared with
+        // an exact ORDER BY key. This occurs after admission, so rejected rows
+        // cannot invoke volatile or failing payload expressions. DISTINCT
+        // output was already evaluated above, before its membership probe.
+        emit_column_reads_selected(
             b,
             cursor,
             columns,
             table,
             table_alias,
             schema,
-            sorter_base + num_sort_keys as i32,
+            output_base,
+            |slot| !output_emitted[slot],
         )?;
+
+        if distinct_projection_mode == OrderedDistinctProjectionMode::ReprojectRepresentative {
+            emit_ordered_distinct_source_state(b, cursor, table, stored_data_base);
+        }
     }
 
     // MakeRecord from all sorter columns, then SorterInsert.
@@ -7782,40 +8541,15 @@ fn codegen_select_ordered_scan(
     let scan_body = (scan_start + 1) as i32;
     b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
 
-    // End of pass 1: close table cursor.
+    // End of pass 1. A merged ordered-DISTINCT query on a rowid table keeps
+    // this read cursor open so pass 2 can seek and re-evaluate the selected
+    // expressions for each retained representative.
     b.resolve_label(scan_done);
-    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
-
-    // === Pass 2: Iterate sorted rows ===
-
-    // Allocate LIMIT/OFFSET counters (before the sort loop).
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-
-    // LIMIT 0 guard: skip entire output pass if limit is zero.
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
+    if !keep_source_cursor_open {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     }
 
-    // DISTINCT state (used only when DISTINCT is requested).
-    let distinct_state = if distinct == Distinctness::Distinct {
-        let cur_rec = b.alloc_reg();
-        let prev_rec = b.alloc_reg();
-        b.emit_op(Opcode::Null, 0, prev_rec, 0, P4::None, 0);
-        Some((cur_rec, prev_rec, b.emit_label()))
-    } else {
-        None
-    };
+    // === Pass 2: Iterate the already-deduplicated sorted rows ===
 
     // SorterSort: sort and position at first row; jump to done if empty.
     b.emit_jump_to_label(
@@ -7827,8 +8561,15 @@ fn codegen_select_ordered_scan(
         0,
     );
 
-    // Save the address of the sort loop body (SorterData target for SorterNext).
+    // Save the address of the sort loop body (SorterNext returns here).
     let sort_loop_body = b.current_addr();
+
+    // OFFSET applies after duplicate elimination and before materializing the
+    // retained sorter payload or restoring/reprojecting its source row.
+    let output_skip = b.emit_label();
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
+    }
 
     // SorterData: decode current sorted row into a register.
     let sorted_reg = b.alloc_reg();
@@ -7841,58 +8582,76 @@ fn codegen_select_ordered_scan(
         0,
     );
 
-    // Extract data columns from the sorted record.
-    // The sorter record has sort-key columns first, then data columns.
-    // We use Column on the sorter cursor to read individual fields.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for i in 0..num_data_cols {
-        let src_col = (num_sort_keys + i) as i32;
-        b.emit_op(
-            Opcode::Column,
-            sorter_cursor,
-            src_col,
-            out_regs + i as i32,
-            P4::None,
-            0,
-        );
-    }
-
-    // DISTINCT: skip rows whose output columns match the previous row.
-    // Pack output into a record, compare with previous record using
-    // SorterCompare for collation-aware dedup; if equal, skip.
-    if let Some((cur_rec, prev_rec, skip)) = distinct_state {
-        // Pack current output columns into a record.
-        b.emit_op(
-            Opcode::MakeRecord,
-            out_regs,
-            out_col_count,
-            cur_rec,
-            P4::None,
-            0,
-        );
-
-        // SorterCompare: jumps to not_dup when keys differ (not a duplicate).
-        let not_dup = b.emit_label();
-        b.emit_jump_to_label(
-            Opcode::SorterCompare,
-            sorter_cursor,
-            prev_rec,
-            not_dup,
-            P4::None,
-            0,
-        );
-        // Fall through = keys equal = duplicate, skip.
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
-        b.resolve_label(not_dup);
-
-        // Update previous record to current.
-        b.emit_op(Opcode::Copy, cur_rec, prev_rec, 0, P4::None, 0);
-    }
-
-    // OFFSET applies after duplicate elimination.
-    let output_skip = b.emit_label();
-    if let Some(off_r) = offset_reg {
-        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
+    match distinct_projection_mode {
+        OrderedDistinctProjectionMode::StoredOutput => {
+            // The sorter record has sort-key columns first, followed by the
+            // already-projected result tuple.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            for i in 0..num_data_cols {
+                let src_col = (num_sort_keys + i) as i32;
+                b.emit_op(
+                    Opcode::Column,
+                    sorter_cursor,
+                    src_col,
+                    out_regs + i as i32,
+                    P4::None,
+                    0,
+                );
+            }
+        }
+        OrderedDistinctProjectionMode::ReprojectRepresentative if table.without_rowid => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let source_base = b.alloc_regs(table.columns.len() as i32);
+            for column_index in 0..table.columns.len() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                b.emit_op(
+                    Opcode::Column,
+                    sorter_cursor,
+                    (num_sort_keys + column_index) as i32,
+                    source_base + column_index as i32,
+                    P4::None,
+                    0,
+                );
+            }
+            emit_projection_from_register_row(
+                b,
+                columns,
+                table,
+                table_alias,
+                schema,
+                source_base,
+                out_regs,
+            )?;
+        }
+        OrderedDistinctProjectionMode::ReprojectRepresentative => {
+            let representative_rowid = b.alloc_reg();
+            b.emit_op(
+                Opcode::Column,
+                sorter_cursor,
+                num_sort_keys as i32,
+                representative_rowid,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                representative_rowid,
+                output_skip,
+                P4::None,
+                0,
+            );
+            emit_column_reads_selected(
+                b,
+                cursor,
+                columns,
+                table,
+                table_alias,
+                schema,
+                out_regs,
+                |_| true,
+            )?;
+        }
     }
 
     // ResultRow.
@@ -7901,11 +8660,6 @@ fn codegen_select_ordered_scan(
     // LIMIT: decrement limit counter; jump to done when zero.
     if let Some(lim_r) = limit_reg {
         b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
-    }
-
-    // Resolve DISTINCT skip label (if active).
-    if let Some((_, _, skip)) = distinct_state {
-        b.resolve_label(skip);
     }
 
     // Output skip label (for OFFSET-skipped rows).
@@ -7924,6 +8678,12 @@ fn codegen_select_ordered_scan(
 
     // Done: Close sorter + Halt.
     b.resolve_label(done_label);
+    if keep_source_cursor_open {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    if let Some(distinct_cursor) = distinct_cursor {
+        b.emit_op(Opcode::Close, distinct_cursor, 0, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
@@ -7953,11 +8713,15 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
     "percentile_disc",
 ];
 
-/// Check whether a function name is a known aggregate (built-in or custom UDF).
+/// Check whether a function name is a known built-in aggregate.
+///
+/// Custom aggregates are resolved separately by exact/variadic arity in
+/// [`is_aggregate_function_call`]. Folding them into this name-only predicate
+/// would make registering `custom/1` incorrectly classify `custom/2` as an
+/// aggregate call.
 fn is_aggregate_function(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    AGGREGATE_FUNCTIONS.iter().any(|&n| n == lower)
-        || EXTRA_AGG_NAMES.with(|extra| extra.borrow().contains(&lower))
+    AGGREGATE_FUNCTIONS.contains(&lower.as_str())
 }
 
 /// Check whether any result column contains an aggregate function call.
@@ -8064,8 +8828,14 @@ fn where_is_plain_scan_safe(expr: &Expr) -> bool {
 fn expr_has_window(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { over: Some(_), .. } => true,
-        Expr::FunctionCall { args, filter, .. } => {
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
             matches!(args, fsqlite_ast::FunctionArgs::List(items) if items.iter().any(expr_has_window))
+                || order_by.iter().any(|term| expr_has_window(&term.expr))
                 || filter.as_deref().is_some_and(expr_has_window)
         }
         Expr::BinaryOp { left, right, .. } => expr_has_window(left) || expr_has_window(right),
@@ -8116,8 +8886,17 @@ fn expr_has_window(expr: &Expr) -> bool {
 }
 
 /// Check whether an expression contains an aggregate function call.
-/// NOTE: `max(x,y,...)` and `min(x,y,...)` with 2+ args are scalar, not aggregate.
+///
+/// Built-in `max(x,y,...)` and `min(x,y,...)` calls with 2+ arguments are
+/// scalar unless a custom aggregate registration replaces that exact arity.
 fn is_aggregate_function_call(name: &str, args: &FunctionArgs) -> bool {
+    let arity = match args {
+        FunctionArgs::Star => 0,
+        FunctionArgs::List(items) => i32::try_from(items.len()).unwrap_or(i32::MAX),
+    };
+    if custom_aggregate_overrides_builtin(name, arity) {
+        return true;
+    }
     if !is_aggregate_function(name) {
         return false;
     }
@@ -8125,6 +8904,36 @@ fn is_aggregate_function_call(name: &str, args: &FunctionArgs) -> bool {
     let lower = name.to_ascii_lowercase();
     !((lower == "max" || lower == "min")
         && matches!(args, fsqlite_ast::FunctionArgs::List(items) if items.len() >= 2))
+}
+
+fn custom_aggregate_overrides_builtin(name: &str, arity: i32) -> bool {
+    let builtin_has_exact_arity = (name.eq_ignore_ascii_case("count") && matches!(arity, 0 | 1))
+        || (name.eq_ignore_ascii_case("string_agg") && arity == 2)
+        || (arity == 1
+            && ["avg", "max", "median", "min", "sum", "total"]
+                .iter()
+                .any(|builtin| name.eq_ignore_ascii_case(builtin)))
+        || (arity == 2
+            && ["percentile", "percentile_cont", "percentile_disc"]
+                .iter()
+                .any(|builtin| name.eq_ignore_ascii_case(builtin)));
+    CUSTOM_AGG_KEYS.with(|keys| {
+        keys.borrow().iter().any(|(custom_name, custom_arity)| {
+            custom_name.eq_ignore_ascii_case(name)
+                && (*custom_arity == arity || (*custom_arity == -1 && !builtin_has_exact_arity))
+        })
+    })
+}
+
+/// Whether an algebraic shortcut may rely on the named built-in aggregate's
+/// exact semantics at this arity.
+///
+/// Generic aggregate lowering already routes an exact custom registration
+/// through `AggStep`/`AggFinal`. Shortcuts such as `Count`, COUNT+SUM fusion,
+/// and one-row MIN/MAX leaf seeks bypass part of that protocol and are valid
+/// only when the connection has not replaced the corresponding built-in.
+fn builtin_aggregate_semantics_available(name: &str, arity: i32) -> bool {
+    !custom_aggregate_overrides_builtin(name, arity)
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
@@ -8183,14 +8992,45 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
             false
         }
         Expr::FunctionCall {
-            args: FunctionArgs::List(args),
+            args,
+            order_by,
+            filter,
+            over,
             ..
-        } => args.iter().any(is_aggregate_expr),
+        } => {
+            matches!(args, FunctionArgs::List(args) if args.iter().any(is_aggregate_expr))
+                || order_by.iter().any(|term| is_aggregate_expr(&term.expr))
+                || filter.as_deref().is_some_and(is_aggregate_expr)
+                || over.as_ref().is_some_and(window_spec_has_aggregate)
+        }
         Expr::RowValue(items, _) => items.iter().any(is_aggregate_expr),
         Expr::JsonAccess {
             expr: inner, path, ..
         } => is_aggregate_expr(inner) || is_aggregate_expr(path),
         _ => false,
+    }
+}
+
+fn window_spec_has_aggregate(spec: &fsqlite_ast::WindowSpec) -> bool {
+    spec.partition_by.iter().any(is_aggregate_expr)
+        || spec
+            .order_by
+            .iter()
+            .any(|term| is_aggregate_expr(&term.expr))
+        || spec.frame.as_ref().is_some_and(|frame| {
+            frame_bound_has_aggregate(&frame.start)
+                || frame.end.as_ref().is_some_and(frame_bound_has_aggregate)
+        })
+}
+
+fn frame_bound_has_aggregate(bound: &fsqlite_ast::FrameBound) -> bool {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            is_aggregate_expr(expr)
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => false,
     }
 }
 
@@ -8292,6 +9132,12 @@ fn grouped_inner_join_count_sum_plan<'a>(
     schema: &'a [TableSchema],
 ) -> Result<Option<GroupedInnerJoinCountSumPlan<'a>>, CodegenError> {
     use fsqlite_ast::{FunctionArgs, JoinConstraint, JoinKind, TableOrSubquery};
+
+    if !builtin_aggregate_semantics_available("count", 0)
+        || !builtin_aggregate_semantics_available("sum", 1)
+    {
+        return Ok(None);
+    }
 
     let SelectCore::Select {
         columns,
@@ -10760,6 +11606,9 @@ fn minmax_rowid_seek_plan(agg_columns: &[AggColumn]) -> Option<RowidSeekEnd> {
     {
         return None;
     }
+    if !builtin_aggregate_semantics_available(&agg.name, 1) {
+        return None;
+    }
     match agg.name.as_str() {
         "MIN" => Some(RowidSeekEnd::First),
         "MAX" => Some(RowidSeekEnd::Last),
@@ -10840,6 +11689,7 @@ fn count_distinct_index_walk_plan(
     };
     if columns.len() != 1
         || !agg.name.eq_ignore_ascii_case("count")
+        || !builtin_aggregate_semantics_available(&agg.name, 1)
         || !agg.distinct
         || agg.filter.is_some()
         || agg.wrapper_expr.is_some()
@@ -10949,6 +11799,9 @@ fn minmax_index_seek_plan(
     {
         return None;
     }
+    if !builtin_aggregate_semantics_available(&agg.name, 1) {
+        return None;
+    }
     let is_max = match agg.name.as_str() {
         "MIN" => false,
         "MAX" => true,
@@ -10999,6 +11852,9 @@ fn minmax_pair_seek_plan(agg_columns: &[AggColumn], table: &TableSchema) -> Opti
             || !agg.extra_args.is_empty()
             || agg.num_args != 1
         {
+            return None;
+        }
+        if !builtin_aggregate_semantics_available(&agg.name, 1) {
             return None;
         }
     }
@@ -11112,6 +11968,9 @@ fn minmax_range_seek_plan(
     {
         return None;
     }
+    if !builtin_aggregate_semantics_available(&agg.name, 1) {
+        return None;
+    }
     let is_max = match agg.name.as_str() {
         "MIN" => false,
         "MAX" => true,
@@ -11173,6 +12032,9 @@ fn minmax_rowid_range_seek_plan(
         || agg.num_args != 1
         || table.without_rowid
     {
+        return None;
+    }
+    if !builtin_aggregate_semantics_available(&agg.name, 1) {
         return None;
     }
     let is_max = match agg.name.as_str() {
@@ -11271,6 +12133,9 @@ fn minmax_prefix_seek_plan<'e>(
         || !agg.extra_args.is_empty()
         || agg.num_args != 1
     {
+        return None;
+    }
+    if !builtin_aggregate_semantics_available(&agg.name, 1) {
         return None;
     }
     if table.without_rowid {
@@ -11953,21 +12818,7 @@ fn codegen_select_skip_scan(
     b.emit_jump_to_label(Opcode::IsNull, const_reg, 0, done_label, P4::None, 0);
 
     // LIMIT/OFFSET streaming (only reached when a matching ORDER BY makes the top-N deterministic).
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off, r);
-            r
-        })
-    });
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table = covering.is_none();
@@ -12221,21 +13072,7 @@ fn codegen_select_skip_scan_range(
     });
 
     // LIMIT/OFFSET streaming (only reached when a matching ORDER BY makes the top-N deterministic).
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off, r);
-            r
-        })
-    });
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table = covering.is_none();
@@ -12437,21 +13274,7 @@ fn codegen_select_skip_scan_is_null(
 ) -> Result<(), CodegenError> {
     let idx_cursor = cursor + 1;
     // LIMIT/OFFSET streaming (only reached when a matching ORDER BY makes the top-N deterministic).
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off, r);
-            r
-        })
-    });
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table = covering.is_none();
@@ -13307,6 +14130,12 @@ fn emit_aggregate_accumulate_body(
         // Bare (non-aggregate) column: evaluate expression on each row
         // and store in the accumulator register.  No AggStep needed.
         if let Some(ref bare) = agg.bare_expr {
+            // Row-independent scalars belong to the aggregate output row, not
+            // an input row. Defer them until finalization so they are evaluated
+            // exactly once and still have a value for an empty input group.
+            if !expr_references_scan(bare, table, table_alias) {
+                continue;
+            }
             let scan_ctx = ScanCtx {
                 cursor,
                 table,
@@ -13629,6 +14458,11 @@ fn aggregate_index_range_seek_target<'t, 'e>(
             .column_index(col_name)
             .and_then(|ci| table.columns.get(ci))
             .map(|c| c.affinity);
+        let column_uses_binary_collation = table
+            .column_index(col_name)
+            .and_then(|ci| table.columns.get(ci))
+            .and_then(|column| column.collation.as_deref())
+            .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
         let Some(range) = extract_named_column_range(where_expr, table, table_alias, col_name)
         else {
             continue;
@@ -13651,9 +14485,10 @@ fn aggregate_index_range_seek_target<'t, 'e>(
                     && range.upper.as_ref().is_none_or(|b| bound_is(b, false))
             }
             Some('B')
-                if index
-                    .key_term_collation(0)
-                    .is_none_or(|c| c.eq_ignore_ascii_case("BINARY")) =>
+                if column_uses_binary_collation
+                    && index
+                        .key_term_collation(0)
+                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY")) =>
             {
                 range.lower.as_ref().is_none_or(|b| bound_is(b, true))
                     && range.upper.as_ref().is_none_or(|b| bound_is(b, true))
@@ -13667,18 +14502,25 @@ fn aggregate_index_range_seek_target<'t, 'e>(
     None
 }
 
-/// The index and equality prefix a `COUNT(*)/SUM(...) WHERE a = <int> AND <residual>` aggregate can
-/// seek: pin the leading key column(s) with an integer-literal equality, walk that block, and apply
-/// the FULL WHERE as a residual filter per row. Gated tight so it is byte-exact and safe: (1) the
-/// prefix is INTEGER-affinity + integer literal, so the seek matches exactly with no affinity
-/// fallback; (2) the literal probe consumes no placeholders, so bound parameters in the residual keep
-/// the same numbering as the scan path; (3) there is at least one residual conjunct beyond the prefix
-/// (otherwise the exact eq-seek already handles it). The residual filter enforces the whole predicate,
-/// so a dropped-predicate class of bug cannot occur.
+/// The index and equality prefix a
+/// `COUNT(*)/SUM(...) WHERE a = <literal> AND <residual>` aggregate can seek:
+/// pin the leading key column(s) with an integer- or text-literal equality,
+/// walk that block, and apply the FULL WHERE as a residual filter per row.
+/// Gated tight so it is byte-exact and safe: (1) each literal's storage class
+/// exactly matches its indexed column's affinity and text probes use BINARY
+/// collation, so the seek cannot miss a scan match; (2) the literal probe
+/// consumes no placeholders, so bound parameters in the residual keep the
+/// same numbering as the scan path; (3) there is at least one residual
+/// conjunct beyond the prefix (otherwise the exact eq-seek already handles
+/// it). `required_key_term_count` lets callers that depend on rowid ordering
+/// reject composite indexes while aggregate callers retain prefix support.
+/// The residual filter enforces the whole predicate, so a dropped-predicate
+/// class of bug cannot occur.
 fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    required_key_term_count: Option<usize>,
 ) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
     let where_expr = where_clause?;
     // A bound parameter is allowed only in the RESIDUAL: the prefix is required to be an integer/text
@@ -13690,7 +14532,17 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
     let mut conjuncts = Vec::new();
     collect_conjunctive_terms(where_expr, &mut conjuncts);
     for index in &table.indexes {
-        if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+        if index.key_term_descending(0)
+            || index.columns.is_empty()
+            || index.columns.len() != index.key_term_count()
+            || required_key_term_count.is_some_and(|required| index.key_term_count() != required)
+            || !index_partial_predicate_is_covered_by_query_conjuncts(
+                index,
+                &conjuncts,
+                table,
+                table_alias,
+            )
+        {
             continue;
         }
         let prefix = extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
@@ -13702,19 +14554,25 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
         // the whole WHERE and narrows to exact). An integer literal vs an INTEGER column, or a text
         // literal vs a TEXT column indexed BINARY, both seek without an affinity/collation miss.
         let exact = prefix.iter().enumerate().all(|(i, e)| {
-            let affinity = index
+            let column = index
                 .columns
                 .get(i)
                 .and_then(|name| table.column_index(name))
-                .and_then(|ci| table.columns.get(ci))
-                .map(|c| c.affinity);
+                .and_then(|ci| table.columns.get(ci));
             match e {
-                Expr::Literal(Literal::Integer(_), _) => affinity == Some('D'),
+                Expr::Literal(Literal::Integer(_), _) => {
+                    column.is_some_and(|column| column.affinity == 'D')
+                }
                 Expr::Literal(Literal::String(_), _) => {
-                    affinity == Some('B')
-                        && index
-                            .key_term_collation(i)
-                            .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                    column.is_some_and(|column| {
+                        column.affinity == 'B'
+                            && column
+                                .collation
+                                .as_deref()
+                                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                    }) && index
+                        .key_term_collation(i)
+                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
                 }
                 _ => false,
             }
@@ -13725,6 +14583,203 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
         return Some((index, prefix));
     }
     None
+}
+
+fn expr_contains_function_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { .. } => true,
+        Expr::Subquery(select, _)
+        | Expr::Exists {
+            subquery: select, ..
+        } => select_contains_function_call(select),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_function_call(left) || expr_contains_function_call(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => expr_contains_function_call(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_function_call(expr)
+                || expr_contains_function_call(low)
+                || expr_contains_function_call(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_function_call(expr)
+                || match set {
+                    InSet::List(items) => items.iter().any(expr_contains_function_call),
+                    InSet::Subquery(select) => select_contains_function_call(select),
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_function_call(expr)
+                || expr_contains_function_call(pattern)
+                || escape.as_deref().is_some_and(expr_contains_function_call)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_contains_function_call)
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_function_call(when_expr) || expr_contains_function_call(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_function_call)
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_contains_function_call(expr) || expr_contains_function_call(path)
+        }
+        Expr::RowValue(items, _) => items.iter().any(expr_contains_function_call),
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+            false
+        }
+    }
+}
+
+fn select_contains_function_call(select: &SelectStatement) -> bool {
+    select.with.as_ref().is_some_and(|with_clause| {
+        with_clause
+            .ctes
+            .iter()
+            .any(|cte| select_contains_function_call(&cte.query))
+    }) || select_core_contains_function_call(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| select_core_contains_function_call(core))
+        || select
+            .order_by
+            .iter()
+            .any(|term| expr_contains_function_call(&term.expr))
+        || select.limit.as_ref().is_some_and(|clause| {
+            expr_contains_function_call(&clause.limit)
+                || clause
+                    .offset
+                    .as_ref()
+                    .is_some_and(expr_contains_function_call)
+        })
+}
+
+fn select_core_contains_function_call(core: &SelectCore) -> bool {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            columns.iter().any(|column| {
+                matches!(
+                    column,
+                    ResultColumn::Expr { expr, .. } if expr_contains_function_call(expr)
+                )
+            }) || from.as_ref().is_some_and(from_contains_function_call)
+                || where_clause
+                    .as_deref()
+                    .is_some_and(expr_contains_function_call)
+                || group_by.iter().any(expr_contains_function_call)
+                || having.as_deref().is_some_and(expr_contains_function_call)
+                || windows
+                    .iter()
+                    .any(|window| window_spec_contains_function_call(&window.spec))
+        }
+        SelectCore::Values(rows) => rows.iter().flatten().any(expr_contains_function_call),
+    }
+}
+
+fn from_contains_function_call(from: &FromClause) -> bool {
+    table_or_subquery_contains_function_call(&from.source)
+        || from.joins.iter().any(|join| {
+            table_or_subquery_contains_function_call(&join.table)
+                || matches!(
+                    &join.constraint,
+                    Some(fsqlite_ast::JoinConstraint::On(expr))
+                        if expr_contains_function_call(expr)
+                )
+        })
+}
+
+fn table_or_subquery_contains_function_call(source: &TableOrSubquery) -> bool {
+    match source {
+        TableOrSubquery::Table { .. } => false,
+        TableOrSubquery::Subquery { query, .. } => select_contains_function_call(query),
+        TableOrSubquery::TableFunction { .. } => true,
+        TableOrSubquery::ParenJoin(from) => from_contains_function_call(from),
+    }
+}
+
+fn window_spec_contains_function_call(spec: &fsqlite_ast::WindowSpec) -> bool {
+    spec.partition_by.iter().any(expr_contains_function_call)
+        || spec
+            .order_by
+            .iter()
+            .any(|term| expr_contains_function_call(&term.expr))
+        || spec.frame.as_ref().is_some_and(|frame| {
+            frame_bound_contains_function_call(&frame.start)
+                || frame
+                    .end
+                    .as_ref()
+                    .is_some_and(frame_bound_contains_function_call)
+        })
+}
+
+fn frame_bound_contains_function_call(bound: &fsqlite_ast::FrameBound) -> bool {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            expr_contains_function_call(expr)
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => false,
+    }
+}
+
+/// A partial index is a safe source only when every row that can satisfy the
+/// query is present in it. This low-level helper has no affinity proof lattice,
+/// so require each partial-predicate conjunct to appear structurally in the
+/// query after normalizing only the current table name or alias. An unparseable
+/// predicate or foreign qualifier fails closed. A connection with any scalar
+/// replacement also declines a function-bearing predicate: structural equality
+/// cannot prove that the index's population-time function semantics still match
+/// the current registry.
+fn index_partial_predicate_is_covered_by_query_conjuncts(
+    index: &IndexSchema,
+    query_conjuncts: &[&Expr],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let Some(predicate_sql) = index.where_clause.as_deref() else {
+        return true;
+    };
+    let Ok(predicate) = parse_sql_expr(predicate_sql) else {
+        return false;
+    };
+    if !use_builtin_scalar_function_semantics() && expr_contains_function_call(&predicate) {
+        return false;
+    }
+    let mut predicate_conjuncts = Vec::new();
+    collect_conjunctive_terms(&predicate, &mut predicate_conjuncts);
+    predicate_conjuncts.iter().all(|predicate_conjunct| {
+        query_conjuncts.iter().any(|query_conjunct| {
+            expressions_match_table_locally(query_conjunct, predicate_conjunct, table, table_alias)
+        })
+    })
 }
 
 /// Emit one value's index seek + duplicate-run accumulate for the aggregate IN-list path.
@@ -13860,6 +14915,8 @@ fn codegen_select_aggregate(
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     having: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
+    limit_anon_placeholder_base: Option<u32>,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -13870,9 +14927,11 @@ fn codegen_select_aggregate(
     // `SELECT SUM(qty) AS total_qty ... HAVING total_qty > 100`).
     let rewritten_having = having.map(|h| rewrite_having_select_aliases(h, columns, table));
     let having = rewritten_having.as_ref();
+    let limit_is_output_neutral = single_group_aggregate_limit_is_output_neutral(limit_clause);
 
     if where_clause.is_none()
         && having.is_none()
+        && limit_is_output_neutral
         && let Some(plan) = simple_count_star_plus_sum_plan(columns, table, table_alias)
     {
         return codegen_select_count_star_plus_sum(
@@ -13892,6 +14951,7 @@ fn codegen_select_aggregate(
     // feeds AggStep changes (the single extremum row instead of every row).
     if where_clause.is_none()
         && having.is_none()
+        && limit_is_output_neutral
         && let Some(seek) = minmax_rowid_seek_plan(&agg_columns)
     {
         return codegen_select_minmax_rowid_seek(
@@ -13919,6 +14979,7 @@ fn codegen_select_aggregate(
     if allow_index_seek
         && minmax_no_effective_where
         && having.is_none()
+        && limit_is_output_neutral
         && let Some(seek) = minmax_index_seek_plan(&agg_columns, table)
     {
         return codegen_select_minmax_index_seek(
@@ -13940,6 +15001,7 @@ fn codegen_select_aggregate(
     if allow_index_seek
         && where_clause.is_none()
         && having.is_none()
+        && limit_is_output_neutral
         && let Some(walk) = count_distinct_index_walk_plan(&agg_columns, columns, table)
     {
         codegen_select_count_distinct_index_walk(
@@ -13959,6 +15021,7 @@ fn codegen_select_aggregate(
     if allow_index_seek
         && minmax_no_effective_where
         && having.is_none()
+        && limit_is_output_neutral
         && let Some(seek) = minmax_pair_seek_plan(&agg_columns, table)
     {
         return codegen_select_minmax_pair_seek(
@@ -13978,6 +15041,7 @@ fn codegen_select_aggregate(
     // group (~800x on a large group). Byte-identical; gated on `allow_index_seek`. bd-minmax-prefix-seek.
     if allow_index_seek
         && having.is_none()
+        && limit_is_output_neutral
         && let Some(seek) = minmax_prefix_seek_plan(&agg_columns, table, table_alias, where_clause)
     {
         return codegen_select_minmax_prefix_seek(
@@ -13996,6 +15060,7 @@ fn codegen_select_aggregate(
     // INTEGER-indexed column seeks the bound (one seek) instead of scanning. bd-minmax-range-seek.
     if allow_index_seek
         && having.is_none()
+        && limit_is_output_neutral
         && let Some(seek) = minmax_range_seek_plan(&agg_columns, table, table_alias, where_clause)
     {
         return codegen_select_minmax_range_seek(
@@ -14014,6 +15079,7 @@ fn codegen_select_aggregate(
     // b-tree (one seek) instead of scanning the range. bd-minmax-rowid-range-seek.
     if allow_index_seek
         && having.is_none()
+        && limit_is_output_neutral
         && let Some((seek_op, bound)) =
             minmax_rowid_range_seek_plan(&agg_columns, table, table_alias, where_clause)
     {
@@ -14043,6 +15109,19 @@ fn codegen_select_aggregate(
             &mut having_output_cols,
         );
     }
+
+    // A single-group aggregate produces at most one row, but LIMIT/OFFSET still
+    // govern that row. In particular, LIMIT 0 and OFFSET >= 1 must suppress the
+    // empty-group result just as they suppress a non-empty aggregate result.
+    let aggregate_anon_placeholder_base = b.current_anon_placeholder();
+    if let Some(limit_base) = limit_anon_placeholder_base {
+        // LIMIT appears after the SELECT core, compounds, and ORDER BY in SQL
+        // text even though its guard is emitted before the scan. Give anonymous
+        // placeholders their textual indices, then restore the body counter.
+        b.set_next_anon_placeholder(limit_base);
+    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+    b.set_next_anon_placeholder(aggregate_anon_placeholder_base);
 
     // Allocate one accumulator register per aggregate (SELECT + HAVING-only).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -14198,10 +15277,10 @@ fn codegen_select_aggregate(
         None
     };
 
-    // Seek the equality-prefix block and apply the full (placeholder-free) WHERE as a residual filter
-    // per row — for `WHERE a = <int> AND <residual>` where the residual is not a range the composite
-    // path handles. INTEGER-exact prefix (no affinity fallback) and a placeholder-free WHERE keep it
-    // byte-exact and safe.
+    // Seek the equality-prefix block and apply the full WHERE as a residual filter
+    // per row — for `WHERE a = <literal> AND <residual>` where the residual is not a range the composite
+    // path handles. The literal prefix needs no bind slot, so the residual filter is emitted once from
+    // the original WHERE bind base and its Variable opcodes are reused on every row.
     let index_prefix_residual_seek = if allow_index_seek
         && having.is_none()
         && index_eq_seek.is_none()
@@ -14212,7 +15291,7 @@ fn codegen_select_aggregate(
         && composite_prefix_range_seek.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
-        aggregate_index_prefix_literal_residual_target(where_clause, table, table_alias)
+        aggregate_index_prefix_literal_residual_target(where_clause, table, table_alias, None)
     } else {
         None
     };
@@ -15024,28 +16103,30 @@ fn codegen_select_aggregate(
         b.emit_op(Opcode::Next, idx_cursor, loop_body, 0, P4::None, 0);
         skip_scan = true;
     } else if let Some((idx_schema, prefix_exprs)) = index_prefix_residual_seek {
-        // bd-agg-leading-eq-residual: seek the integer-exact equality-prefix block, then apply the full
-        // (placeholder-free) WHERE per row so the residual predicate is enforced (no dropped-predicate
-        // bug), and accumulate. Always non-covering — the residual filter reads table columns.
+        // bd-agg-leading-eq-residual: seek the storage-class-exact equality-prefix block, then apply
+        // the full WHERE per row so the residual predicate is enforced (no dropped-predicate bug),
+        // and accumulate. Always non-covering — the residual filter reads table columns.
         let idx_cursor = 1_i32;
         let duplicate_run_done = b.emit_label();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let prefix_len = prefix_exprs.len() as i32;
 
-        let probe_key_regs = b.alloc_regs(prefix_len + 1);
-        let min_rowid_reg = probe_key_regs + prefix_len;
+        let probe_key_regs = b.alloc_regs(prefix_len);
         for (i, expr) in prefix_exprs.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let reg = probe_key_regs + i as i32;
             emit_expr(b, expr, reg, None);
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
         }
-        b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+        // A true partial record is the floor of the entire prefix block. A
+        // synthetic `i64::MIN` next term would sort after NULL on an ASC
+        // trailing key (and at the wrong end of a DESC key), silently dropping
+        // matching entries.
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             probe_key_regs,
-            prefix_len + 1,
+            prefix_len,
             probe_record_reg,
             P4::None,
             0,
@@ -15107,8 +16188,8 @@ fn codegen_select_aggregate(
             P4::None,
             0,
         );
-        // Apply the whole WHERE (placeholder-free) — the prefix equalities are redundant with the seek
-        // but harmless; the residual conjuncts are the point.
+        // Apply the whole WHERE — the prefix equalities are redundant with the
+        // seek but harmless; the residual conjuncts are the point.
         if let Some(where_expr) = where_clause {
             emit_where_filter(
                 b,
@@ -15294,8 +16375,14 @@ fn codegen_select_aggregate(
         if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
             continue;
         }
-        // Skip bare columns — they already hold the final row's value.
-        if agg.bare_expr.is_some() {
+        // Row-dependent bare expressions already hold the final scanned row's
+        // value. Evaluate row-independent scalars here exactly once so empty
+        // input still produces their ordinary value.
+        if let Some(bare) = agg.bare_expr.as_deref() {
+            if !expr_references_scan(bare, table, table_alias) {
+                let accum_reg = accum_base + i as i32;
+                emit_expr(b, bare, accum_reg, None);
+            }
             continue;
         }
         let accum_reg = accum_base + i as i32;
@@ -15365,12 +16452,12 @@ fn codegen_select_aggregate(
     // HAVING filter: skip ResultRow if HAVING predicate is false/NULL.
     // For single-group aggregate (no GROUP BY), each output column maps
     // directly to its aggregate accumulator at accum_base + i.
-    let having_skip_label = if let Some(having_expr) = having {
+    let output_skip_label = b.emit_label();
+    if let Some(having_expr) = having {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let output_cols: Vec<GroupByOutputCol> = (0..agg_columns.len())
             .map(|i| GroupByOutputCol::Aggregate { agg_index: i })
             .collect();
-        let skip = b.emit_label();
         emit_having_filter(
             b,
             having_expr,
@@ -15379,20 +16466,24 @@ fn codegen_select_aggregate(
             &[],
             table,
             accum_base,
-            skip,
+            output_skip_label,
         );
-        Some(skip)
-    } else {
-        None
-    };
+    }
+
+    // OFFSET applies after HAVING. A single-group aggregate can emit only one
+    // row, so any positive offset consumes that row.
+    if let Some(offset_reg) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, offset_reg, 1, output_skip_label, P4::None, 0);
+    }
 
     // ResultRow (reached when HAVING passes or when there is no HAVING).
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
-
-    // Resolve HAVING skip label after ResultRow so failed HAVING jumps past it.
-    if let Some(skip) = having_skip_label {
-        b.resolve_label(skip);
+    if let Some(limit_reg) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, limit_reg, 0, done_label, P4::None, 0);
     }
+
+    // Failed HAVING and consumed OFFSET both jump past ResultRow.
+    b.resolve_label(output_skip_label);
 
     // Done: Close + Halt.
     b.resolve_label(done_label);
@@ -17095,24 +18186,7 @@ fn codegen_select_group_by_aggregate(
         collect_having_aggregates(having_expr, table, &mut agg_columns, &mut output_cols);
     }
 
-    // LIMIT/OFFSET registers.
-    let limit_reg = limit_clause.map(|lc| {
-        let r = b.alloc_reg();
-        emit_limit_expr(b, &lc.limit, r);
-        r
-    });
-    let offset_reg = limit_clause.and_then(|lc| {
-        lc.offset.as_ref().map(|off_expr| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, off_expr, r);
-            r
-        })
-    });
-
-    // LIMIT 0 guard: skip entire GROUP BY scan if limit is zero.
-    if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
-    }
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     let num_group_keys = group_by_keys.len();
     let num_aggs = agg_columns.len();
@@ -23925,13 +24999,46 @@ fn emit_column_reads(
     schema: &[TableSchema],
     base_reg: i32,
 ) -> Result<(), CodegenError> {
+    emit_column_reads_selected(
+        b,
+        cursor,
+        columns,
+        table,
+        table_alias,
+        schema,
+        base_reg,
+        |_| true,
+    )
+}
+
+/// Emit selected flattened result columns into their normal output slots.
+///
+/// `SELECT *` and table-star columns each occupy one flattened slot per table
+/// column. This lets ordered codegen evaluate an exact ORDER BY output
+/// expression once at its key position, then emit only the remaining output
+/// slots after top-N admission.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_column_reads_selected(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    base_reg: i32,
+    mut should_emit: impl FnMut(usize) -> bool,
+) -> Result<(), CodegenError> {
     let mut reg = base_reg;
+    let mut output_slot = 0usize;
     for col in columns {
         match col {
             ResultColumn::Star => {
                 for i in 0..table.columns.len() {
-                    emit_table_column_read(b, cursor, table, table_alias, Some(schema), i, reg);
+                    if should_emit(output_slot) {
+                        emit_table_column_read(b, cursor, table, table_alias, Some(schema), i, reg);
+                    }
                     reg += 1;
+                    output_slot += 1;
                 }
             }
             ResultColumn::TableStar(qualifier) => {
@@ -23939,51 +25046,197 @@ fn emit_column_reads(
                     return Err(CodegenError::TableNotFound(qualifier.to_string()));
                 }
                 for i in 0..table.columns.len() {
-                    emit_table_column_read(b, cursor, table, table_alias, Some(schema), i, reg);
+                    if should_emit(output_slot) {
+                        emit_table_column_read(b, cursor, table, table_alias, Some(schema), i, reg);
+                    }
                     reg += 1;
+                    output_slot += 1;
                 }
             }
             ResultColumn::Expr { expr, .. } => {
-                if let Expr::Column(col_ref, _) = expr {
-                    if let Some(qualifier) = &col_ref.table {
-                        if !matches_table_or_alias(qualifier, table, table_alias) {
-                            return Err(qualified_column_not_found(qualifier, &col_ref.column));
+                if should_emit(output_slot) {
+                    if let Expr::Column(col_ref, _) = expr {
+                        if let Some(qualifier) = &col_ref.table {
+                            if !matches_table_or_alias(qualifier, table, table_alias) {
+                                return Err(qualified_column_not_found(qualifier, &col_ref.column));
+                            }
                         }
-                    }
-                    if let Some(col_idx) = table.column_index(&col_ref.column) {
-                        emit_table_column_read(
-                            b,
+                        if let Some(col_idx) = table.column_index(&col_ref.column) {
+                            emit_table_column_read(
+                                b,
+                                cursor,
+                                table,
+                                table_alias,
+                                Some(schema),
+                                col_idx,
+                                reg,
+                            );
+                        } else if table.resolves_to_hidden_rowid(&col_ref.column) {
+                            b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                        } else if let Some(qualifier) = &col_ref.table {
+                            return Err(qualified_column_not_found(qualifier, &col_ref.column));
+                        } else {
+                            return Err(CodegenError::ColumnNotFound {
+                                table: table.name.clone(),
+                                column: col_ref.column.to_string(),
+                            });
+                        }
+                    } else {
+                        // Evaluate non-column expressions (literals, arithmetic, CASE, CAST, etc.)
+                        // against the current scan row.
+                        let scan = ScanCtx {
                             cursor,
                             table,
                             table_alias,
-                            Some(schema),
-                            col_idx,
-                            reg,
-                        );
-                    } else if table.resolves_to_hidden_rowid(&col_ref.column) {
-                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
-                    } else if let Some(qualifier) = &col_ref.table {
-                        return Err(qualified_column_not_found(qualifier, &col_ref.column));
-                    } else {
-                        return Err(CodegenError::ColumnNotFound {
-                            table: table.name.clone(),
-                            column: col_ref.column.to_string(),
-                        });
+                            schema: Some(schema),
+                            register_base: None,
+                            secondaries: &[],
+                        };
+                        emit_expr(b, expr, reg, Some(&scan));
                     }
-                } else {
-                    // Evaluate non-column expressions (literals, arithmetic, CASE, CAST, etc.)
-                    // against the current scan row.
-                    let scan = ScanCtx {
-                        cursor,
-                        table,
-                        table_alias,
-                        schema: Some(schema),
-                        register_base: None,
-                        secondaries: &[],
-                    };
-                    emit_expr(b, expr, reg, Some(&scan));
                 }
                 reg += 1;
+                output_slot += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retain the representative source row needed by ordered DISTINCT's
+/// second-stage projection.
+///
+/// Rowid tables need only their stable rowid because pass 2 keeps the source
+/// cursor open and seeks the representative again. WITHOUT ROWID tables have
+/// no such locator, so retain their complete physical row image. VIRTUAL
+/// generated columns deliberately keep a NULL placeholder: register-backed
+/// projection recomputes them from the retained base columns, preserving the
+/// second-stage function and error behavior.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_ordered_distinct_source_state(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    state_base: i32,
+) {
+    if !table.without_rowid {
+        b.emit_op(Opcode::Rowid, cursor, state_base, 0, P4::None, 0);
+        return;
+    }
+
+    for (column_index, column) in table.columns.iter().enumerate() {
+        let target = state_base + column_index as i32;
+        if virtual_generated_column_expr(column).is_some() {
+            b.emit_op(Opcode::Null, 0, target, 0, P4::None, 0);
+        } else {
+            b.emit_op(
+                Opcode::Column,
+                cursor,
+                column_index as i32,
+                target,
+                P4::None,
+                0,
+            );
+        }
+    }
+}
+
+/// Read one logical table column from a retained register row.
+///
+/// Physical and STORED-generated columns are copied directly. VIRTUAL
+/// generated columns are recomputed against the same retained row image and
+/// receive their declared affinity, just as a live table-cursor read does.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_table_column_read_from_register_row(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: Option<&[TableSchema]>,
+    source_base: i32,
+    column_index: usize,
+    target: i32,
+) {
+    let column = &table.columns[column_index];
+    if let Some(generated_expr) = virtual_generated_column_expr(column) {
+        let scan = ScanCtx {
+            cursor: 0,
+            table,
+            table_alias,
+            schema,
+            register_base: Some(source_base),
+            secondaries: &[],
+        };
+        emit_expr(b, &generated_expr, target, Some(&scan));
+        emit_single_column_affinity(b, target, column.affinity);
+    } else {
+        b.emit_op(
+            Opcode::Copy,
+            source_base + column_index as i32,
+            target,
+            0,
+            P4::None,
+            0,
+        );
+    }
+}
+
+/// Re-evaluate a flattened SELECT projection against a retained WITHOUT ROWID
+/// source row.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_projection_from_register_row(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    source_base: i32,
+    output_base: i32,
+) -> Result<(), CodegenError> {
+    let scan = ScanCtx {
+        cursor: 0,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: Some(source_base),
+        secondaries: &[],
+    };
+    let mut target = output_base;
+    for column in columns {
+        match column {
+            ResultColumn::Star => {
+                for column_index in 0..table.columns.len() {
+                    emit_table_column_read_from_register_row(
+                        b,
+                        table,
+                        table_alias,
+                        Some(schema),
+                        source_base,
+                        column_index,
+                        target,
+                    );
+                    target += 1;
+                }
+            }
+            ResultColumn::TableStar(qualifier) => {
+                if !matches_table_or_alias(&qualifier.name, table, table_alias) {
+                    return Err(CodegenError::TableNotFound(qualifier.to_string()));
+                }
+                for column_index in 0..table.columns.len() {
+                    emit_table_column_read_from_register_row(
+                        b,
+                        table,
+                        table_alias,
+                        Some(schema),
+                        source_base,
+                        column_index,
+                        target,
+                    );
+                    target += 1;
+                }
+            }
+            ResultColumn::Expr { expr, .. } => {
+                emit_expr(b, expr, target, Some(&scan));
+                target += 1;
             }
         }
     }
@@ -24721,8 +25974,8 @@ fn resolve_order_by_output_expr<'a>(
     expr: &'a Expr,
     columns: &'a [ResultColumn],
 ) -> Option<&'a Expr> {
-    if let Expr::Literal(Literal::Integer(n), _) = expr {
-        let idx = usize::try_from(*n).ok()?;
+    if let Some(ordinal) = order_by_integer_ordinal(expr) {
+        let idx = usize::try_from(ordinal).ok()?;
         if idx == 0 || idx > columns.len() {
             return None;
         }
@@ -24732,6 +25985,14 @@ fn resolve_order_by_output_expr<'a>(
             } => Some(output_expr),
             ResultColumn::Star | ResultColumn::TableStar(_) => None,
         };
+    }
+
+    // COLLATE changes ordering semantics but not output-alias name
+    // resolution. Preserve the wrapper for sorter collation metadata at the
+    // caller while resolving its inner expression against the SELECT list.
+    let mut expr = expr;
+    while let Expr::Collate { expr: inner, .. } = expr {
+        expr = inner.as_ref();
     }
 
     let Expr::Column(col_ref, _) = expr else {
@@ -24762,6 +26023,229 @@ fn resolve_order_by_output_expr<'a>(
             _ => Some(output_expr),
         }
     })
+}
+
+/// Resolve an exact ORDER BY output reference to its flattened result slot.
+///
+/// Unlike `resolve_order_by_output_expr`, ordinals count columns expanded from
+/// `*`, because sorter records store the flattened result shape. Alias and
+/// structural-expression matches follow the same COLLATE distinction as
+/// `resolve_single_output_order_expr`: COLLATE may wrap an alias/ordinal, but a
+/// separately written collated expression remains a separate evaluation.
+fn resolve_order_by_output_slot(
+    order_expr: &Expr,
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<usize> {
+    if let Some(ordinal) = order_by_integer_ordinal(order_expr) {
+        let one_based = usize::try_from(ordinal).ok()?;
+        let slot = one_based.checked_sub(1)?;
+        return (slot < result_column_count_usize(columns, table)).then_some(slot);
+    }
+
+    let mut alias_expr = order_expr;
+    while let Expr::Collate { expr: inner, .. } = alias_expr {
+        alias_expr = inner.as_ref();
+    }
+    if let Expr::Column(column, _) = alias_expr
+        && column.table.is_none()
+    {
+        let mut slot = 0usize;
+        for result_column in columns {
+            match result_column {
+                ResultColumn::Star | ResultColumn::TableStar(_) => {
+                    slot += table.columns.len();
+                }
+                ResultColumn::Expr {
+                    expr: output_expr,
+                    alias: Some(alias),
+                } if alias.eq_ignore_ascii_case(&column.column) => {
+                    let is_same_named_source_column = matches!(
+                        output_expr,
+                        Expr::Column(output_column, _)
+                            if output_column.table.is_none()
+                                && output_column
+                                    .column
+                                    .eq_ignore_ascii_case(&column.column)
+                    );
+                    if !is_same_named_source_column {
+                        return Some(slot);
+                    }
+                    slot += 1;
+                }
+                ResultColumn::Expr { .. } => slot += 1,
+            }
+        }
+    }
+
+    let mut slot = 0usize;
+    for result_column in columns {
+        match result_column {
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                slot += table.columns.len();
+            }
+            ResultColumn::Expr {
+                expr: output_expr, ..
+            } => {
+                if expressions_match_table_locally(order_expr, output_expr, table, table_alias) {
+                    return Some(slot);
+                }
+                slot += 1;
+            }
+        }
+    }
+    None
+}
+
+fn result_output_slot_collation(
+    output_slot: usize,
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<String> {
+    let mut slot = 0usize;
+    for result_column in columns {
+        match result_column {
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                let relative = output_slot.checked_sub(slot)?;
+                if relative < table.columns.len() {
+                    return table.columns[relative].collation.clone();
+                }
+                slot += table.columns.len();
+            }
+            ResultColumn::Expr { expr, .. } => {
+                if slot == output_slot {
+                    return extract_collation(expr)
+                        .or_else(|| column_collation(expr, table, table_alias))
+                        .map(ToOwned::to_owned);
+                }
+                slot += 1;
+            }
+        }
+    }
+    None
+}
+
+/// How an ordered DISTINCT query produces its final result row.
+///
+/// SQLite has two observably different plans. A general ordered DISTINCT
+/// query retains the first projected output for each DISTINCT key and emits
+/// that stored value after sorting. When the ascending ORDER BY is exactly the
+/// flattened DISTINCT output tuple, SQLite instead uses the tuple as a grouping
+/// key and evaluates the selected expressions again for the representative
+/// source row. The latter distinction matters for volatile or failing
+/// expressions, so the classifier below intentionally requires every merge
+/// precondition rather than guessing from a partial ORDER BY match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderedDistinctProjectionMode {
+    StoredOutput,
+    ReprojectRepresentative,
+}
+
+fn ordered_distinct_projection_mode(
+    distinct: Distinctness,
+    order_by: &[OrderingTerm],
+    order_output_slots: &[Option<usize>],
+    sort_collations: &[String],
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> OrderedDistinctProjectionMode {
+    let output_count = result_column_count_usize(columns, table);
+    if distinct != Distinctness::Distinct
+        || order_by.len() != output_count
+        || order_output_slots.len() != output_count
+        || sort_collations.len() != output_count
+    {
+        return OrderedDistinctProjectionMode::StoredOutput;
+    }
+
+    for (slot, term) in order_by.iter().enumerate() {
+        if order_output_slots[slot] != Some(slot)
+            || term.direction == Some(SortDirection::Desc)
+            || term.nulls == Some(NullsOrder::Last)
+            // An explicit COLLATE in the ORDER expression forces SQLite's
+            // separate DISTINCT-membership/order plan, even when it names the
+            // same collation as the output expression.
+            || extract_collation(&term.expr).is_some()
+        {
+            return OrderedDistinctProjectionMode::StoredOutput;
+        }
+
+        let output_collation = result_output_slot_collation(slot, columns, table, table_alias);
+        let order_collation =
+            (!sort_collations[slot].is_empty()).then_some(sort_collations[slot].as_str());
+        if !collation_names_equivalent(output_collation.as_deref(), order_collation) {
+            return OrderedDistinctProjectionMode::StoredOutput;
+        }
+    }
+
+    OrderedDistinctProjectionMode::ReprojectRepresentative
+}
+
+/// Resolve an ORDER BY integer ordinal, including SQLite's signed-literal
+/// forms (`+1` is ordinal 1 and `-1` is an out-of-range ordinal).
+///
+/// COLLATE wrappers do not turn an ordinal into a constant expression. The
+/// checked negation keeps the pathological `-i64::MIN` AST fail-closed.
+fn order_by_integer_ordinal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Integer(value), _) => Some(*value),
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Plus,
+            expr,
+            ..
+        }
+        | Expr::Collate { expr, .. } => order_by_integer_ordinal(expr),
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate,
+            expr,
+            ..
+        } => order_by_integer_ordinal(expr)?.checked_neg(),
+        _ => None,
+    }
+}
+
+fn order_by_refers_to_single_star_output(expr: &Expr, columns: &[ResultColumn]) -> bool {
+    if !matches!(columns, [ResultColumn::Star | ResultColumn::TableStar(_)]) {
+        return false;
+    }
+    order_by_integer_ordinal(expr) == Some(1)
+}
+
+/// Return the sole projected expression when an ORDER BY term names it
+/// directly (alias/ordinal) or is structurally the same expression.
+///
+/// SQLite evaluates a volatile expression only once per source row for these
+/// exact non-DISTINCT ORDER BY references. COLLATE may wrap an alias/ordinal
+/// without preventing name resolution, but otherwise remains part of the
+/// structural expression. Local column qualifiers, identifier case, hidden
+/// rowid synonyms, and an INTEGER PRIMARY KEY alias are schema-normalized
+/// before the structural comparison.
+fn resolve_single_output_order_expr<'a>(
+    order_expr: &'a Expr,
+    columns: &'a [ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<&'a Expr> {
+    if let Some(output_expr) = resolve_order_by_output_expr(order_expr, columns) {
+        return Some(output_expr);
+    }
+    let [
+        ResultColumn::Expr {
+            expr: output_expr, ..
+        },
+    ] = columns
+    else {
+        return None;
+    };
+    // Do not strip COLLATE for structural matching. `ORDER BY alias COLLATE`
+    // was already resolved above and reuses the output, but a separately
+    // written `ORDER BY volatile_expr() COLLATE ...` is a distinct expression
+    // that SQLite evaluates again.
+    expressions_match_table_locally(order_expr, output_expr, table, table_alias)
+        .then_some(output_expr)
 }
 
 /// Resolve a column reference expression to either a column index or rowid.
@@ -24966,7 +26450,9 @@ fn validate_single_table_result_columns(
         match column {
             ResultColumn::Star => {}
             ResultColumn::TableStar(qualifier) => {
-                if !matches_table_or_alias(&qualifier.name, table, table_alias) {
+                if qualifier.schema.is_some()
+                    || !matches_table_or_alias(&qualifier.name, table, table_alias)
+                {
                     return Err(CodegenError::TableNotFound(qualifier.to_string()));
                 }
             }
@@ -24984,7 +26470,19 @@ fn validate_single_table_order_by_terms(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> Result<(), CodegenError> {
-    for term in order_by {
+    let output_count = result_column_count_usize(columns, table);
+    for (term_index, term) in order_by.iter().enumerate() {
+        if let Some(ordinal) = order_by_integer_ordinal(&term.expr) {
+            let in_range = usize::try_from(ordinal)
+                .ok()
+                .is_some_and(|one_based| (1..=output_count).contains(&one_based));
+            if !in_range {
+                return Err(CodegenError::Unsupported(format!(
+                    "ORDER BY term {} out of range - should be between 1 and {output_count}",
+                    term_index + 1
+                )));
+            }
+        }
         let expr = resolve_order_by_output_expr(&term.expr, columns).unwrap_or(&term.expr);
         validate_single_table_expr_columns(expr, table, table_alias)?;
     }
@@ -25112,17 +26610,20 @@ fn index_column_position(index: &IndexSchema, column_name: &str) -> Option<usize
 }
 
 fn collect_conjunctive_terms<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
-    if let Expr::BinaryOp {
-        left,
-        op: fsqlite_ast::BinaryOp::And,
-        right,
-        ..
-    } = expr
-    {
-        collect_conjunctive_terms(left, out);
-        collect_conjunctive_terms(right, out);
-    } else {
-        out.push(expr);
+    let mut pending = vec![expr];
+    while let Some(term) = pending.pop() {
+        if let Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } = term
+        {
+            pending.push(right);
+            pending.push(left);
+        } else {
+            out.push(term);
+        }
     }
 }
 
@@ -25134,6 +26635,126 @@ fn expr_matches_index_column(
 ) -> bool {
     column_name(expr, table, table_alias)
         .is_some_and(|column_name| column_name.eq_ignore_ascii_case(expected_column))
+}
+
+fn expressions_match_table_locally(
+    query: &Expr,
+    stored: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let mut normalized_query = query.clone();
+    let mut normalized_stored = stored.clone();
+    normalize_table_local_expression(&mut normalized_query, table, table_alias)
+        && normalize_table_local_expression(&mut normalized_stored, table, table_alias)
+        && normalized_query == normalized_stored
+}
+
+/// Canonicalize table-local columns before structural expression matching.
+///
+/// Schema expressions normally contain bare columns, while SELECT expressions
+/// can use either the table name or its visible alias. Strip only those local
+/// qualifiers and resolve every column to a stable column-index identity.
+/// Hidden rowid synonyms and an INTEGER PRIMARY KEY alias share one identity.
+/// Foreign qualifiers, unknown columns, and nested scopes fail closed.
+fn normalize_table_local_expression(
+    expr: &mut Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let normalize = |expr: &mut Expr| normalize_table_local_expression(expr, table, table_alias);
+    match expr {
+        Expr::Literal(..) | Expr::Placeholder(..) => true,
+        Expr::Column(column, _) => {
+            if column.table.as_deref().is_some_and(|qualifier| {
+                !qualifier.eq_ignore_ascii_case(&table.name)
+                    && !table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+            }) {
+                return false;
+            }
+            column.table = None;
+            if let Some(index) = table.column_index(&column.column) {
+                column.column = if table.columns[index].is_ipk {
+                    "__fsqlite_local_rowid".into()
+                } else {
+                    format!("__fsqlite_local_column_{index}").into()
+                };
+                true
+            } else if table.resolves_to_hidden_rowid(&column.column) {
+                column.column = "__fsqlite_local_rowid".into();
+                true
+            } else {
+                false
+            }
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => normalize(left) && normalize(right),
+        Expr::UnaryOp { expr, .. } | Expr::Collate { expr, .. } | Expr::IsNull { expr, .. } => {
+            normalize(expr)
+        }
+        Expr::Cast {
+            expr, type_name, ..
+        } => {
+            type_name.name.make_ascii_lowercase();
+            if let Some(arg) = &mut type_name.arg1 {
+                arg.make_ascii_lowercase();
+            }
+            if let Some(arg) = &mut type_name.arg2 {
+                arg.make_ascii_lowercase();
+            }
+            normalize(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => normalize(expr) && normalize(low) && normalize(high),
+        Expr::In { expr, set, .. } => {
+            normalize(expr)
+                && match set {
+                    InSet::List(items) => items.iter_mut().all(normalize),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => normalize(expr) && normalize(pattern) && escape.as_deref_mut().is_none_or(normalize),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref_mut().is_none_or(normalize)
+                && whens
+                    .iter_mut()
+                    .all(|(when, then)| normalize(when) && normalize(then))
+                && else_expr.as_deref_mut().is_none_or(normalize)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let args_local = match args {
+                FunctionArgs::Star => false,
+                FunctionArgs::List(args) => args.iter_mut().all(normalize),
+            };
+            args_local
+                && order_by.iter_mut().all(|term| normalize(&mut term.expr))
+                && filter.as_deref_mut().is_none_or(normalize)
+                && over.is_none()
+        }
+        Expr::RowValue(items, _) => items.iter_mut().all(normalize),
+        Expr::Exists { .. } | Expr::Subquery(..) | Expr::Raise { .. } => false,
+    }
 }
 
 fn extract_index_column_equality_expr<'a>(
@@ -25961,49 +27582,81 @@ fn extract_column_eq_target<'a>(
     None
 }
 
-#[allow(dead_code)]
 fn extract_expression_index_equality_expr<'a>(
     where_clause: Option<&'a Expr>,
     index: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
 ) -> Option<&'a Expr> {
-    let expr = where_clause?;
+    let root = where_clause?;
     let key_expr = parse_sql_expr(index.key_term_sql(0)?).ok()?;
-    let Expr::BinaryOp {
-        left,
-        op: fsqlite_ast::BinaryOp::Eq,
-        right,
-        ..
-    } = expr
-    else {
-        return None;
-    };
-
-    if **left == key_expr && is_simple_constant(right) {
-        return Some(right);
+    let mut pending = vec![root];
+    let mut residuals = Vec::new();
+    let mut target = None;
+    while let Some(expr) = pending.pop() {
+        let Expr::BinaryOp {
+            left, op, right, ..
+        } = expr
+        else {
+            residuals.push(expr);
+            continue;
+        };
+        if *op == fsqlite_ast::BinaryOp::And {
+            pending.push(right);
+            pending.push(left);
+            continue;
+        }
+        if *op != fsqlite_ast::BinaryOp::Eq {
+            residuals.push(expr);
+            continue;
+        }
+        let candidate = if expressions_match_table_locally(left, &key_expr, table, table_alias)
+            && is_simple_constant(right)
+        {
+            Some(right.as_ref())
+        } else if expressions_match_table_locally(right, &key_expr, table, table_alias)
+            && is_simple_constant(left)
+        {
+            Some(left.as_ref())
+        } else {
+            None
+        };
+        if let Some(candidate) = candidate {
+            if target.replace(candidate).is_some() {
+                return None;
+            }
+        } else {
+            residuals.push(expr);
+        }
     }
-    if **right == key_expr && is_simple_constant(left) {
-        return Some(left);
-    }
-    None
+    target.filter(|_| expression_index_residuals_match(&residuals, index, table, table_alias))
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum PlannerIndexRangeSlot {
     Lower,
     Upper,
 }
 
-#[allow(dead_code)]
 fn extract_expression_index_range_target(
     where_clause: Option<&Expr>,
     index: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
 ) -> Option<PlannerIndexRangeTarget> {
     let expr = where_clause?;
     let key_expr = parse_sql_expr(index.key_term_sql(0)?).ok()?;
     let mut target = PlannerIndexRangeTarget::default();
-    if collect_expression_index_range_bounds(expr, &key_expr, &mut target)
-        && (target.lower.is_some() || target.upper.is_some())
+    let mut residuals = Vec::new();
+    if collect_expression_index_range_bounds(
+        expr,
+        &key_expr,
+        table,
+        table_alias,
+        &mut target,
+        &mut residuals,
+    ) && (target.lower.is_some() || target.upper.is_some())
+        && expression_index_residuals_match(&residuals, index, table, table_alias)
     {
         Some(target)
     } else {
@@ -26011,66 +27664,118 @@ fn extract_expression_index_range_target(
     }
 }
 
-#[allow(dead_code)]
-fn collect_expression_index_range_bounds(
-    expr: &Expr,
+fn collect_expression_index_range_bounds<'a>(
+    root: &'a Expr,
     key_expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
     target: &mut PlannerIndexRangeTarget,
+    residuals: &mut Vec<&'a Expr>,
 ) -> bool {
-    match expr {
-        Expr::BinaryOp {
+    let mut found_bound = false;
+    let mut pending = vec![root];
+    while let Some(expr) = pending.pop() {
+        if let Expr::BinaryOp {
             left,
             op: fsqlite_ast::BinaryOp::And,
             right,
             ..
-        } => {
-            collect_expression_index_range_bounds(left, key_expr, target)
-                && collect_expression_index_range_bounds(right, key_expr, target)
+        } = expr
+        {
+            pending.push(right);
+            pending.push(left);
+            continue;
         }
-        Expr::BinaryOp {
+
+        if let Expr::BinaryOp {
             left, op, right, ..
-        } => extract_expression_index_range_bound(left, *op, right, key_expr)
-            .is_some_and(|(slot, bound)| assign_expression_index_range_bound(target, slot, bound)),
-        Expr::Between {
+        } = expr
+            && let Some((slot, bound)) =
+                extract_expression_index_range_bound(left, *op, right, key_expr, table, table_alias)
+        {
+            if !assign_expression_index_range_bound(target, slot, bound) {
+                return false;
+            }
+            found_bound = true;
+            continue;
+        }
+
+        if let Expr::Between {
             expr: operand,
             low,
             high,
             not: false,
             ..
-        } if **operand == *key_expr
+        } = expr
+            && expressions_match_table_locally(operand, key_expr, table, table_alias)
             && is_index_range_constant(low)
-            && is_index_range_constant(high) =>
+            && is_index_range_constant(high)
         {
-            assign_expression_index_range_bound(
+            if !assign_expression_index_range_bound(
                 target,
                 PlannerIndexRangeSlot::Lower,
                 PlannerIndexRangeBound {
                     expr: low.as_ref().clone(),
                     inclusive: true,
                 },
-            ) && assign_expression_index_range_bound(
+            ) || !assign_expression_index_range_bound(
                 target,
                 PlannerIndexRangeSlot::Upper,
                 PlannerIndexRangeBound {
                     expr: high.as_ref().clone(),
                     inclusive: true,
                 },
-            )
+            ) {
+                return false;
+            }
+            found_bound = true;
+            continue;
         }
-        _ => false,
+
+        residuals.push(expr);
     }
+    found_bound
 }
 
-#[allow(dead_code)]
+fn expression_index_residuals_match(
+    residuals: &[&Expr],
+    index: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let Some(predicate_sql) = index.where_clause.as_deref() else {
+        return residuals.is_empty();
+    };
+    let Ok(predicate) = parse_sql_expr(predicate_sql) else {
+        return false;
+    };
+    let mut predicate_terms = Vec::new();
+    collect_conjunctive_terms(&predicate, &mut predicate_terms);
+
+    predicate_terms.iter().all(|predicate_term| {
+        residuals.iter().any(|residual| {
+            expressions_match_table_locally(residual, predicate_term, table, table_alias)
+        })
+    }) && residuals.iter().all(|residual| {
+        predicate_terms.iter().any(|predicate_term| {
+            expressions_match_table_locally(residual, predicate_term, table, table_alias)
+        })
+    })
+}
+
 fn extract_expression_index_range_bound(
     left: &Expr,
     op: fsqlite_ast::BinaryOp,
     right: &Expr,
     key_expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
 ) -> Option<(PlannerIndexRangeSlot, PlannerIndexRangeBound)> {
     use fsqlite_ast::BinaryOp::{Ge, Gt, Le, Lt};
 
-    if left == key_expr && is_index_range_constant(right) {
+    if expressions_match_table_locally(left, key_expr, table, table_alias)
+        && is_index_range_constant(right)
+    {
         return match op {
             Ge => Some((
                 PlannerIndexRangeSlot::Lower,
@@ -26104,7 +27809,9 @@ fn extract_expression_index_range_bound(
         };
     }
 
-    if right == key_expr && is_index_range_constant(left) {
+    if expressions_match_table_locally(right, key_expr, table, table_alias)
+        && is_index_range_constant(left)
+    {
         return match op {
             Le => Some((
                 PlannerIndexRangeSlot::Lower,
@@ -26141,7 +27848,6 @@ fn extract_expression_index_range_bound(
     None
 }
 
-#[allow(dead_code)]
 fn assign_expression_index_range_bound(
     target: &mut PlannerIndexRangeTarget,
     slot: PlannerIndexRangeSlot,
@@ -26824,10 +28530,17 @@ fn extract_like_glob_prefix_range<'a>(
 ) -> Option<(String, ColumnRangeBound<'a>, ColumnRangeBound<'a>)> {
     let column_name = column_name(operand, table, table_alias)?;
     let prefix = match op {
-        fsqlite_ast::LikeOp::Glob => extract_pure_glob_prefix(pattern),
-        fsqlite_ast::LikeOp::Like => extract_pure_like_prefix(pattern, escape)
-            .filter(|prefix| is_case_stable_like_prefix(prefix)),
-        fsqlite_ast::LikeOp::Match | fsqlite_ast::LikeOp::Regexp => None,
+        fsqlite_ast::LikeOp::Glob if use_builtin_like_glob_semantics() => {
+            extract_pure_glob_prefix(pattern)
+        }
+        fsqlite_ast::LikeOp::Like if use_builtin_like_glob_semantics() => {
+            extract_pure_like_prefix(pattern, escape)
+                .filter(|prefix| is_case_stable_like_prefix(prefix))
+        }
+        fsqlite_ast::LikeOp::Glob
+        | fsqlite_ast::LikeOp::Like
+        | fsqlite_ast::LikeOp::Match
+        | fsqlite_ast::LikeOp::Regexp => None,
     }?;
     let upper_bound = prefix_upper_bound(&prefix)?;
     Some((
@@ -27230,6 +28943,141 @@ struct InProbeSource<'a> {
     value: InProbeValue<'a>,
 }
 
+#[derive(Clone, Copy)]
+struct ScalarInOperandMetadata {
+    affinity: u8,
+}
+
+/// Recognize a scalar-subquery IN operand that native codegen can evaluate
+/// once, after materializing the uncorrelated RHS.
+///
+/// Keep this deliberately narrower than the general scalar-subquery emitter:
+/// one plain SELECT, one output value, no ordering/cardinality modifiers, and
+/// no reference outside the scalar SELECT's own optional single-table scope.
+/// Function calls are excluded because codegen cannot distinguish a custom
+/// aggregate from a scalar override here.
+fn scalar_in_operand_metadata(
+    operand: &Expr,
+    schema: &[TableSchema],
+) -> Option<ScalarInOperandMetadata> {
+    let Expr::Subquery(select, _) = operand else {
+        return None;
+    };
+    if select.with.is_some()
+        || !select.body.compounds.is_empty()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+    {
+        return None;
+    }
+    let SelectCore::Select {
+        columns,
+        from,
+        where_clause,
+        group_by,
+        having,
+        windows,
+        ..
+    } = &select.body.select
+    else {
+        return None;
+    };
+    if !group_by.is_empty()
+        || having.is_some()
+        || !windows.is_empty()
+        || has_aggregate_columns(columns)
+        || has_window_columns(columns)
+        || columns.iter().any(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr { expr, .. }
+                    if in_probe_expr_requires_semantic_fallback(expr)
+                        || expr_contains_function_call(expr)
+            )
+        })
+        || where_clause.as_deref().is_some_and(|expr| {
+            in_probe_expr_requires_semantic_fallback(expr)
+                || expr_contains_function_call(expr)
+                || is_aggregate_expr(expr)
+                || expr_has_window(expr)
+        })
+    {
+        return None;
+    }
+
+    let Some(from_clause) = from.as_ref() else {
+        if where_clause.is_some() {
+            return None;
+        }
+        let [ResultColumn::Expr { expr, .. }] = columns.as_slice() else {
+            return None;
+        };
+        let has_column = validate_expr_columns_with(expr, &|column| {
+            Err(CodegenError::ColumnNotFound {
+                table: String::new(),
+                column: column.column.to_string(),
+            })
+        })
+        .is_err();
+        return (!has_column).then_some(ScalarInOperandMetadata {
+            affinity: expr_affinity(expr, None),
+        });
+    };
+
+    if !from_clause.joins.is_empty() {
+        return None;
+    }
+    let (qualified_table_name, table_alias) = match &from_clause.source {
+        TableOrSubquery::Table {
+            name,
+            alias,
+            index_hint: None,
+            time_travel: None,
+        } => (name, alias.as_deref()),
+        _ => return None,
+    };
+    if qualified_table_name.schema.is_some() {
+        return None;
+    }
+    let table = find_table(schema, &qualified_table_name.name).ok()?;
+    if validate_single_table_result_columns(columns, table, table_alias).is_err()
+        || where_clause.as_deref().is_some_and(|expr| {
+            validate_single_table_expr_columns(expr, table, table_alias).is_err()
+        })
+    {
+        return None;
+    }
+
+    let scalar_scan = ScanCtx {
+        cursor: 0,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
+    let affinity = match columns.as_slice() {
+        [ResultColumn::Expr { expr, .. }] => {
+            let resolved = resolve_column_ref(expr, table, table_alias);
+            resolved_expr_affinity(expr, resolved.as_ref(), &scalar_scan)
+        }
+        [ResultColumn::Star | ResultColumn::TableStar(_)] if table.columns.len() == 1 => {
+            table.columns.first().map_or(b'A', |column| {
+                if column.is_ipk {
+                    b'D'
+                } else {
+                    column
+                        .type_name
+                        .as_deref()
+                        .map_or(b'A', column_type_to_affinity)
+                }
+            })
+        }
+        _ => return None,
+    };
+    Some(ScalarInOperandMetadata { affinity })
+}
+
 fn emit_in_probe_value(
     b: &mut ProgramBuilder,
     source_cursor: i32,
@@ -27240,12 +29088,93 @@ fn emit_in_probe_value(
     match probe_source.value {
         InProbeValue::Expr(expr) => emit_expr(b, expr, reg, Some(probe_scan)),
         InProbeValue::FirstColumn => {
-            b.emit_op(Opcode::Column, source_cursor, 0, reg, P4::None, 0);
+            // A one-column `SELECT *` still needs the centralized table-read
+            // semantics: an INTEGER PRIMARY KEY is stored as the rowid rather
+            // than in record column 0, and a VIRTUAL generated column must be
+            // computed instead of reading its NULL storage placeholder.
+            if let Some(source_base) = probe_scan.register_base {
+                emit_table_column_read_from_register_row(
+                    b,
+                    probe_source.table,
+                    probe_source.table_alias,
+                    probe_scan.schema,
+                    source_base,
+                    0,
+                    reg,
+                );
+            } else {
+                emit_table_column_read(
+                    b,
+                    source_cursor,
+                    probe_source.table,
+                    probe_source.table_alias,
+                    probe_scan.schema,
+                    0,
+                    reg,
+                );
+            }
         }
         InProbeValue::Rowid => {
             b.emit_op(Opcode::Rowid, source_cursor, reg, 0, P4::None, 0);
         }
     }
+}
+
+fn in_probe_value_explicit_collation(probe_source: &InProbeSource<'_>) -> Option<String> {
+    match probe_source.value {
+        InProbeValue::Expr(expr) => extract_collation(expr).map(str::to_owned),
+        InProbeValue::FirstColumn | InProbeValue::Rowid => None,
+    }
+}
+
+fn in_probe_value_effective_collation(
+    probe_source: &InProbeSource<'_>,
+    probe_scan: &ScanCtx<'_>,
+) -> Option<String> {
+    match probe_source.value {
+        InProbeValue::Rowid => None,
+        InProbeValue::FirstColumn => probe_source
+            .table
+            .columns
+            .first()
+            .and_then(|column| column.collation.clone()),
+        InProbeValue::Expr(expr) => {
+            effective_collation_ctx(expr, Some(probe_scan)).map(str::to_owned)
+        }
+    }
+}
+
+fn in_probe_value_affinity(probe_source: &InProbeSource<'_>, probe_scan: &ScanCtx<'_>) -> u8 {
+    match probe_source.value {
+        InProbeValue::Rowid => b'D',
+        InProbeValue::FirstColumn => probe_source.table.columns.first().map_or(b'A', |column| {
+            if column.is_ipk {
+                b'D'
+            } else {
+                column
+                    .type_name
+                    .as_deref()
+                    .map_or(b'A', column_type_to_affinity)
+            }
+        }),
+        InProbeValue::Expr(expr) => expr_affinity(expr, Some(probe_scan)),
+    }
+}
+
+/// Resolve the collation for `lhs IN (SELECT rhs ...)` with SQLite's
+/// comparison precedence: explicit COLLATE on either side (left wins a tie),
+/// then a declared column collation (again left before right).
+fn in_probe_comparison_collation(
+    operand: &Expr,
+    operand_ctx: &ScanCtx<'_>,
+    probe_source: &InProbeSource<'_>,
+    probe_scan: &ScanCtx<'_>,
+) -> Option<String> {
+    extract_collation(operand)
+        .map(str::to_owned)
+        .or_else(|| in_probe_value_explicit_collation(probe_source))
+        .or_else(|| effective_collation_ctx(operand, Some(operand_ctx)).map(str::to_owned))
+        .or_else(|| in_probe_value_effective_collation(probe_source, probe_scan))
 }
 
 fn probe_source_value_is_unique(probe_source: &InProbeSource<'_>) -> bool {
@@ -27299,6 +29228,107 @@ fn can_use_direct_count_indexed_in_subquery_probe_source(
         && count_exists_semijoin_merge_is_safe(table, idx_schema, probe_source)
 }
 
+/// Whether generic expression lowering would silently lose semantics needed by
+/// an IN-subquery probe.
+///
+/// `emit_expr` does not lower row values or RAISE, and its scalar-function arm
+/// deliberately ignores aggregate-only FILTER / in-call ORDER BY modifiers.
+/// Nested SELECT scopes are also outside these single-table probe helpers.
+/// Decline all of those shapes so connection-level semantic evaluation can
+/// either execute them correctly or report SQLite's preparation error.
+fn in_probe_expr_requires_semantic_fallback(expr: &Expr) -> bool {
+    match expr {
+        Expr::RowValue(..) | Expr::Raise { .. } | Expr::Exists { .. } | Expr::Subquery(..) => true,
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            in_probe_expr_requires_semantic_fallback(left)
+                || in_probe_expr_requires_semantic_fallback(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => in_probe_expr_requires_semantic_fallback(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            in_probe_expr_requires_semantic_fallback(expr)
+                || in_probe_expr_requires_semantic_fallback(low)
+                || in_probe_expr_requires_semantic_fallback(high)
+        }
+        Expr::In { expr, set, .. } => {
+            in_probe_expr_requires_semantic_fallback(expr)
+                || match set {
+                    InSet::List(values) => {
+                        values.iter().any(in_probe_expr_requires_semantic_fallback)
+                    }
+                    InSet::Table(_) | InSet::Subquery(_) => true,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            in_probe_expr_requires_semantic_fallback(expr)
+                || in_probe_expr_requires_semantic_fallback(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(in_probe_expr_requires_semantic_fallback)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(in_probe_expr_requires_semantic_fallback)
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    in_probe_expr_requires_semantic_fallback(when_expr)
+                        || in_probe_expr_requires_semantic_fallback(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(in_probe_expr_requires_semantic_fallback)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            !order_by.is_empty()
+                || filter.is_some()
+                || over.is_some()
+                || matches!(
+                    args,
+                    FunctionArgs::List(values)
+                        if values
+                            .iter()
+                            .any(in_probe_expr_requires_semantic_fallback)
+                )
+        }
+        Expr::Literal(..) | Expr::Column(..) | Expr::Placeholder(..) => false,
+    }
+}
+
+fn in_probe_result_columns_require_semantic_fallback(columns: &[ResultColumn]) -> bool {
+    columns.iter().any(|column| {
+        matches!(
+            column,
+            ResultColumn::Expr { expr, .. }
+                if in_probe_expr_requires_semantic_fallback(expr)
+        )
+    })
+}
+
 fn resolve_in_probe_source<'a>(
     set: &'a fsqlite_ast::InSet,
     schema: &'a [TableSchema],
@@ -27306,8 +29336,11 @@ fn resolve_in_probe_source<'a>(
     match set {
         fsqlite_ast::InSet::List(_) => None,
         fsqlite_ast::InSet::Table(name) => {
+            if name.schema.is_some() {
+                return None;
+            }
             let table = find_table(schema, &name.name).ok()?;
-            if table.columns.is_empty() {
+            if table.columns.len() != 1 {
                 return None;
             }
             Some(InProbeSource {
@@ -27339,7 +29372,16 @@ fn resolve_in_probe_source<'a>(
                 return None;
             };
 
-            if !group_by.is_empty() || having.is_some() || !windows.is_empty() {
+            if has_aggregate_columns(columns)
+                || has_window_columns(columns)
+                || !group_by.is_empty()
+                || having.is_some()
+                || !windows.is_empty()
+                || in_probe_result_columns_require_semantic_fallback(columns)
+                || where_clause
+                    .as_deref()
+                    .is_some_and(in_probe_expr_requires_semantic_fallback)
+            {
                 return None;
             }
 
@@ -27348,13 +29390,26 @@ fn resolve_in_probe_source<'a>(
                 return None;
             }
 
-            let (table_name, table_alias) = match &from_clause.source {
-                fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => {
-                    (&name.name, alias.as_deref())
-                }
+            let (qualified_table_name, table_alias) = match &from_clause.source {
+                fsqlite_ast::TableOrSubquery::Table {
+                    name,
+                    alias,
+                    index_hint: None,
+                    time_travel: None,
+                } => (name, alias.as_deref()),
                 _ => return None,
             };
-            let table = find_table(schema, table_name).ok()?;
+            if qualified_table_name.schema.is_some() {
+                return None;
+            }
+            let table = find_table(schema, &qualified_table_name.name).ok()?;
+            if validate_single_table_result_columns(columns, table, table_alias).is_err()
+                || where_clause.as_deref().is_some_and(|expr| {
+                    validate_single_table_expr_columns(expr, table, table_alias).is_err()
+                })
+            {
+                return None;
+            }
 
             let value = match columns.as_slice() {
                 [fsqlite_ast::ResultColumn::Expr { expr, .. }] => {
@@ -27365,7 +29420,7 @@ fn resolve_in_probe_source<'a>(
                     }
                 }
                 [fsqlite_ast::ResultColumn::Star | fsqlite_ast::ResultColumn::TableStar(_)] => {
-                    if table.columns.is_empty() {
+                    if table.columns.len() != 1 {
                         return None;
                     }
                     InProbeValue::FirstColumn
@@ -27386,7 +29441,8 @@ fn resolve_in_probe_source<'a>(
 /// Attempt to emit bytecode for a complex IN subquery with ORDER BY and/or LIMIT.
 ///
 /// Returns `true` if the subquery was handled, `false` if it cannot be handled
-/// (caller should fall back to emitting Null or other behavior).
+/// and must be routed through connection-level semantic evaluation. Direct
+/// callers fail closed at the caller rather than synthesizing a SQL value.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -27403,6 +29459,10 @@ fn try_emit_complex_in_subquery(
     let Some(schema) = scan_ctx.schema else {
         return false;
     };
+    let scalar_operand = scalar_in_operand_metadata(operand, schema);
+    if in_probe_expr_requires_semantic_fallback(operand) && scalar_operand.is_none() {
+        return false;
+    }
 
     // Reject WITH and compound queries.
     if subquery.with.is_some() || !subquery.body.compounds.is_empty() {
@@ -27410,6 +29470,7 @@ fn try_emit_complex_in_subquery(
     }
 
     let fsqlite_ast::SelectCore::Select {
+        distinct,
         columns,
         from,
         where_clause,
@@ -27422,8 +29483,48 @@ fn try_emit_complex_in_subquery(
         return false;
     };
 
-    // Reject GROUP BY, HAVING, windows.
-    if !group_by.is_empty() || having.is_some() || !windows.is_empty() {
+    // Per-row IN probing cannot reproduce aggregate or window-query
+    // cardinality. Decline those shapes, including implicit aggregate/window
+    // queries without an explicit GROUP BY or named WINDOW clause.
+    let where_has_aggregate_or_window = where_clause
+        .as_deref()
+        .is_some_and(|expr| is_aggregate_expr(expr) || expr_has_window(expr));
+    let order_has_aggregate_or_window = subquery
+        .order_by
+        .iter()
+        .any(|term| is_aggregate_expr(&term.expr) || expr_has_window(&term.expr));
+    let limit_has_aggregate_or_window = subquery.limit.as_ref().is_some_and(|clause| {
+        is_aggregate_expr(&clause.limit)
+            || expr_has_window(&clause.limit)
+            || clause
+                .offset
+                .as_ref()
+                .is_some_and(|expr| is_aggregate_expr(expr) || expr_has_window(expr))
+    });
+    if has_aggregate_columns(columns)
+        || has_window_columns(columns)
+        || where_has_aggregate_or_window
+        || order_has_aggregate_or_window
+        || limit_has_aggregate_or_window
+        || !group_by.is_empty()
+        || having.is_some()
+        || !windows.is_empty()
+        || in_probe_result_columns_require_semantic_fallback(columns)
+        || where_clause
+            .as_deref()
+            .is_some_and(in_probe_expr_requires_semantic_fallback)
+        || subquery
+            .order_by
+            .iter()
+            .any(|term| in_probe_expr_requires_semantic_fallback(&term.expr))
+        || subquery.limit.as_ref().is_some_and(|clause| {
+            in_probe_expr_requires_semantic_fallback(&clause.limit)
+                || clause
+                    .offset
+                    .as_ref()
+                    .is_some_and(in_probe_expr_requires_semantic_fallback)
+        })
+    {
         return false;
     }
 
@@ -27436,106 +29537,347 @@ fn try_emit_complex_in_subquery(
         return false;
     }
 
-    let (table_name, table_alias) = match &from_clause.source {
-        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+    let (qualified_table_name, table_alias) = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table {
+            name,
+            alias,
+            index_hint: None,
+            time_travel: None,
+        } => (name, alias.as_deref()),
         _ => return false,
     };
+    if qualified_table_name.schema.is_some() {
+        return false;
+    }
 
-    let Ok(table) = find_table(schema, table_name) else {
+    let Ok(table) = find_table(schema, &qualified_table_name.name) else {
         return false;
     };
 
-    // Determine the value expression to compare.
-    let value_expr: Option<&Expr> = match columns.as_slice() {
-        [fsqlite_ast::ResultColumn::Expr { expr, .. }] => Some(expr),
+    // WHERE references and aliases nested inside ORDER expressions fall back
+    // to a SELECT alias only when no real source column has that name. Exact
+    // ORDER aliases/ordinals have output-column precedence and are resolved
+    // separately below. Reuse the general rewrite for the former cases so
+    // unknown names never degrade into emitted NULL values.
+    let where_clause_rewritten = where_clause
+        .as_deref()
+        .map(|expr| rewrite_having_select_aliases(expr, columns, table));
+    let where_clause = where_clause_rewritten.as_ref();
+    let order_by_exprs: Vec<Expr> = subquery
+        .order_by
+        .iter()
+        .map(|term| rewrite_having_select_aliases(&term.expr, columns, table))
+        .collect();
+    if validate_single_table_result_columns(columns, table, table_alias).is_err()
+        || where_clause.is_some_and(|expr| {
+            validate_single_table_expr_columns(expr, table, table_alias).is_err()
+        })
+        || order_by_exprs
+            .iter()
+            .any(|expr| validate_single_table_expr_columns(expr, table, table_alias).is_err())
+    {
+        return false;
+    }
+    // This helper accepts exactly one output column. Integer ORDER BY terms
+    // are ordinals, so anything other than 1 is an out-of-range error rather
+    // than a constant sort expression.
+    if subquery
+        .order_by
+        .iter()
+        .any(|term| order_by_integer_ordinal(&term.expr).is_some_and(|ordinal| ordinal != 1))
+    {
+        return false;
+    }
+    if subquery.limit.as_ref().is_some_and(|clause| {
+        let has_unsupported_reference = |expr: &Expr| {
+            expr_contains_nested_subquery(expr)
+                || validate_expr_columns_with(expr, &|column| {
+                    Err(CodegenError::ColumnNotFound {
+                        table: table.name.clone(),
+                        column: column.column.to_string(),
+                    })
+                })
+                .is_err()
+        };
+        has_unsupported_reference(&clause.limit)
+            || clause
+                .offset
+                .as_ref()
+                .is_some_and(has_unsupported_reference)
+    }) {
+        return false;
+    }
+
+    // Determine the value expression to compare. `SELECT *` is a legal
+    // single-column IN source only when the source table itself has one column.
+    let value = match columns.as_slice() {
+        [fsqlite_ast::ResultColumn::Expr { expr, .. }] => {
+            if is_rowid_expr(expr, Some(table), table_alias) {
+                InProbeValue::Rowid
+            } else {
+                InProbeValue::Expr(expr)
+            }
+        }
         [fsqlite_ast::ResultColumn::Star | fsqlite_ast::ResultColumn::TableStar(_)] => {
-            if table.columns.is_empty() {
+            if table.columns.len() != 1 {
                 return false;
             }
-            None // Use first column
+            InProbeValue::FirstColumn
         }
         _ => return false,
     };
+    let has_order_by = !subquery.order_by.is_empty();
+    let is_distinct = *distinct == Distinctness::Distinct;
 
-    // --- Begin bytecode emission ---
+    // The selected RHS is retained for the lifetime of the statement, so each
+    // complex IN expression needs its own stable cursor range.
+    let cursor_base = 16_384 + (b.current_addr() as i32 * 4);
+    let subq_cursor = cursor_base;
+    let sorter_cursor = cursor_base + 1;
+    let distinct_cursor = cursor_base + 2;
+    let membership_cursor = cursor_base + 3;
+    let subq_scan = ScanCtx {
+        cursor: subq_cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
+    let probe_source = InProbeSource {
+        table,
+        table_alias,
+        where_clause,
+        value,
+    };
 
-    // Use cursors well above the main scan cursor to avoid collisions.
-    let subq_cursor = scan_ctx.cursor + 128;
-    let sorter_cursor = scan_ctx.cursor + 129;
+    // Connection-level compilation canonicalizes all parameters to explicit
+    // slots. Raw codegen callers cannot safely use emission-order numbering
+    // here because LIMIT is intentionally evaluated before WHERE/ORDER BY.
+    if expr_contains_non_numbered_placeholder(operand)
+        || select_contains_non_numbered_placeholder(subquery)
+    {
+        return false;
+    }
 
-    // Evaluate the operand (value we're checking for membership).
-    let r_operand = b.alloc_temp();
-    emit_expr(b, operand, r_operand, Some(scan_ctx));
+    // This implementation materializes an uncorrelated RHS once per statement.
+    // Decline correlated references instead of accidentally resolving them
+    // against the RHS table cursor.
+    let sort_keys: Vec<SortKeySource> = order_by_exprs
+        .iter()
+        .zip(subquery.order_by.iter())
+        .map(|(resolved_expr, term)| {
+            if order_by_refers_to_single_star_output(&term.expr, columns) {
+                SortKeySource::Column(0)
+            } else if let Some(output_expr) =
+                resolve_single_output_order_expr(&term.expr, columns, table, table_alias)
+            {
+                // Exact output aliases/ordinals win over a same-named source
+                // column in ORDER BY. Resolve the projected expression without
+                // re-applying SELECT-list alias lookup.
+                resolve_sort_key(output_expr, table, table_alias, &[])
+            } else {
+                resolve_sort_key(resolved_expr, table, table_alias, columns)
+            }
+        })
+        .collect();
+    let order_by_references_outer = sort_keys.iter().any(|key| {
+        matches!(
+            key,
+            SortKeySource::Expression(expr)
+                if probe_expr_references_outer_scan(expr, &probe_source, scan_ctx)
+        )
+    });
+    let limit_references_outer = subquery.limit.as_ref().is_some_and(|clause| {
+        probe_expr_references_outer_scan(&clause.limit, &probe_source, scan_ctx)
+            || clause.offset.as_ref().is_some_and(|offset| {
+                probe_expr_references_outer_scan(offset, &probe_source, scan_ctx)
+            })
+    });
+    if in_probe_source_references_outer_scan(&probe_source, scan_ctx)
+        || order_by_references_outer
+        || limit_references_outer
+    {
+        return false;
+    }
 
-    // Labels for control flow.
-    let no_match_label = b.emit_label();
+    let order_output_slots: Vec<Option<usize>> = subquery
+        .order_by
+        .iter()
+        .map(|term| resolve_order_by_output_slot(&term.expr, columns, table, table_alias))
+        .collect();
+    let sort_order: String = subquery
+        .order_by
+        .iter()
+        .map(|term| {
+            let is_desc = term.direction == Some(SortDirection::Desc);
+            let nulls_last = match term.nulls {
+                Some(NullsOrder::Last) => true,
+                Some(NullsOrder::First) => false,
+                None => is_desc,
+            };
+            match (is_desc, nulls_last) {
+                (false, false) => '+',
+                (false, true) => '>',
+                (true, true) => '-',
+                (true, false) => '<',
+            }
+        })
+        .collect();
+    let sort_collations: Vec<String> = sort_keys
+        .iter()
+        .zip(subquery.order_by.iter())
+        .enumerate()
+        .map(|(index, (key, term))| {
+            if let Some(collation) = extract_collation(&term.expr) {
+                return collation.to_owned();
+            }
+            if let Some(output_slot) = order_output_slots[index]
+                && let Some(collation) =
+                    result_output_slot_collation(output_slot, columns, table, table_alias)
+            {
+                return collation;
+            }
+            match key {
+                SortKeySource::Column(index) => table
+                    .columns
+                    .get(*index)
+                    .and_then(|column| column.collation.as_deref())
+                    .unwrap_or_default()
+                    .to_owned(),
+                SortKeySource::Expression(expr) => effective_collation_ctx(expr, Some(&subq_scan))
+                    .unwrap_or_default()
+                    .to_owned(),
+                SortKeySource::Rowid => String::new(),
+            }
+        })
+        .collect();
+    let distinct_projection_mode = ordered_distinct_projection_mode(
+        *distinct,
+        &subquery.order_by,
+        &order_output_slots,
+        &sort_collations,
+        columns,
+        table,
+        table_alias,
+    );
+    let keep_subq_cursor_open = has_order_by
+        && distinct_projection_mode == OrderedDistinctProjectionMode::ReprojectRepresentative
+        && !table.without_rowid;
+
+    let probe_aff = in_probe_value_affinity(&probe_source, &subq_scan);
+    let operand_affinity = scalar_operand.map_or_else(
+        || expr_affinity(operand, Some(scan_ctx)),
+        |metadata| metadata.affinity,
+    );
+    let comparison_affinity = combine_comparison_affinity(operand_affinity, probe_aff);
+    let comparison_affinity_string = u8::try_from(comparison_affinity)
+        .ok()
+        .filter(|&code| code != 0)
+        .map(|code| (code as char).to_string());
+    let probe_collation = in_probe_value_effective_collation(&probe_source, &subq_scan);
+    let comparison_collation =
+        in_probe_comparison_collation(operand, scan_ctx, &probe_source, &subq_scan);
+
+    // Reserve the operand register now, but evaluate it only after the
+    // uncorrelated RHS has been materialized (SQLite's observable order for
+    // volatile functions and errors).
+    let r_operand = if scalar_operand.is_some() {
+        // The Once-guarded scalar result must survive later result-expression
+        // code and subsequent outer rows, so it cannot use the temp pool.
+        b.alloc_reg()
+    } else {
+        b.alloc_temp()
+    };
+
     let matched_label = b.emit_label();
     let null_result_label = b.emit_label();
     let done_label = b.emit_label();
 
-    // If the operand is NULL, the result is NULL per SQL semantics.
-    b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_result_label, P4::None, 0);
+    // Materialize the final RHS membership set exactly once. Besides avoiding
+    // an O(outer rows × RHS rows) rebuild, this prevents an uncorrelated RHS
+    // from being reevaluated separately for every outer row.
+    let r_rhs_nonempty = b.alloc_reg();
+    let r_rhs_saw_null = b.alloc_reg();
+    let build_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::Once, 0, 0, build_done, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, r_rhs_nonempty, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, r_rhs_saw_null, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenAutoindex,
+        membership_cursor,
+        1,
+        0,
+        comparison_collation
+            .as_ref()
+            .map_or(P4::None, |collation| P4::Collation(collation.clone())),
+        0,
+    );
 
-    // Check if we have ORDER BY and/or LIMIT.
-    let has_order_by = !subquery.order_by.is_empty();
-    let has_limit = subquery.limit.is_some();
+    // SQLite validates LIMIT before OFFSET and skips OFFSET evaluation for
+    // LIMIT 0. It also performs this validation before opening the RHS table,
+    // while applying both counters after WHERE/DISTINCT and after ORDER BY.
+    // Keep this inside the Once-guarded build so a reused complex IN expression
+    // does not reevaluate a dynamic LIMIT for every outer row.
+    let selected_done = b.emit_label();
+    let (limit_reg, offset_reg) =
+        emit_limit_offset_registers(b, subquery.limit.as_ref(), selected_done);
+    let top_n_bound_reg = if has_order_by && limit_clause_can_enable_top_n(subquery.limit.as_ref())
+    {
+        emit_top_n_bound_register(b, limit_reg, offset_reg)
+    } else {
+        None
+    };
 
-    if has_order_by || has_limit {
-        // Materialize subquery results into a sorter, then probe.
-
-        // Build sort order string.
-        let sort_order: String = subquery
-            .order_by
+    if has_order_by {
+        // Build the same sort metadata as a top-level ordered SELECT.
+        let sorter_p4 = if sort_collations
             .iter()
-            .map(|term| {
-                if term.direction == Some(SortDirection::Desc) {
-                    '-'
-                } else {
-                    '+'
-                }
-            })
-            .collect();
-
-        // Number of sort key columns. If no ORDER BY, still need 1 column for the value.
-        let num_sort_keys = if has_order_by {
-            subquery.order_by.len()
+            .any(|collation| !collation.is_empty())
+        {
+            format!("{sort_order}|{}", sort_collations.join(","))
         } else {
-            0
+            sort_order
         };
-        // Sorter holds: sort keys + value column.
-        let num_sorter_cols = num_sort_keys + 1;
+        let num_sort_keys = sort_keys.len();
 
-        // Open sorter.
         b.emit_op(
             Opcode::SorterOpen,
             sorter_cursor,
-            num_sort_keys.max(1) as i32,
-            0,
-            P4::Str(if sort_order.is_empty() {
-                "+".to_owned()
-            } else {
-                sort_order
-            }),
-            0,
+            num_sort_keys as i32,
+            top_n_bound_reg.unwrap_or(0),
+            P4::Str(sorter_p4),
+            top_n_bound_reg.map_or(0, |_| SORTER_OPEN_TOP_N_REGISTER),
         );
+    }
 
-        // Open subquery table for reading.
+    if is_distinct {
         b.emit_op(
-            Opcode::OpenRead,
-            subq_cursor,
-            table.root_page,
+            Opcode::OpenAutoindex,
+            distinct_cursor,
+            1,
             0,
-            P4::Table(table.name.clone()),
+            probe_collation.map_or(P4::None, |collation| P4::Collation(collation.to_owned())),
             0,
         );
+    }
 
-        // === Pass 1: Scan subquery rows into sorter ===
+    b.emit_op(
+        Opcode::OpenRead,
+        subq_cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    if has_order_by {
+        // === Pass 1: scan, DISTINCT-filter, and materialize into the sorter. ===
         let scan_start = b.current_addr();
         let scan_done = b.emit_label();
         b.emit_jump_to_label(Opcode::Rewind, subq_cursor, 0, scan_done, P4::None, 0);
 
-        // WHERE filter.
-        let skip_row = b.emit_label();
+        let next_source_row = b.emit_label();
         if let Some(where_expr) = where_clause.as_deref() {
             emit_where_filter(
                 b,
@@ -27544,62 +29886,118 @@ fn try_emit_complex_in_subquery(
                 table,
                 table_alias,
                 schema,
-                skip_row,
+                next_source_row,
             );
         }
 
-        // Allocate registers for sorter record.
-        let sorter_base = b.alloc_regs(num_sorter_cols as i32);
-        let subq_scan = ScanCtx {
-            cursor: subq_cursor,
-            table,
-            table_alias,
-            schema: Some(schema),
-            register_base: None,
-            secondaries: &[],
+        let num_sort_keys = sort_keys.len();
+        let stored_data_cols = if distinct_projection_mode
+            == OrderedDistinctProjectionMode::ReprojectRepresentative
+            && table.without_rowid
+        {
+            table.columns.len()
+        } else {
+            1
         };
+        let num_sorter_cols = num_sort_keys + stored_data_cols;
+        let sorter_base = b.alloc_regs(num_sorter_cols as i32);
+        let stored_data_base = sorter_base + num_sort_keys as i32;
+        let value_reg =
+            if distinct_projection_mode == OrderedDistinctProjectionMode::ReprojectRepresentative {
+                b.alloc_reg()
+            } else {
+                stored_data_base
+            };
 
-        // Emit sort key columns.
-        for (i, term) in subquery.order_by.iter().enumerate() {
-            let key_source = resolve_sort_key(&term.expr, table, table_alias, columns);
-            match key_source {
-                SortKeySource::Column(col_idx) => {
-                    b.emit_op(
-                        Opcode::Column,
-                        subq_cursor,
-                        col_idx as i32,
-                        sorter_base + i as i32,
-                        P4::None,
-                        0,
-                    );
+        // DISTINCT is defined on the result value, so evaluate and deduplicate
+        // it before any ORDER BY-only expressions. A non-DISTINCT top-N query,
+        // by contrast, evaluates independent sort keys before the projected
+        // value; this preserves the selected value when both are volatile.
+        if is_distinct {
+            emit_in_probe_value(b, subq_cursor, &probe_source, value_reg, &subq_scan);
+            let distinct_record = b.alloc_temp();
+            b.emit_op(
+                Opcode::MakeRecord,
+                value_reg,
+                1,
+                distinct_record,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::Found,
+                distinct_cursor,
+                distinct_record,
+                next_source_row,
+                P4::None,
+                0,
+            );
+            b.emit_op(
+                Opcode::IdxInsert,
+                distinct_cursor,
+                distinct_record,
+                0,
+                P4::None,
+                0,
+            );
+            b.free_temp(distinct_record);
+        }
+
+        let mut value_emitted = is_distinct;
+        for (index, (register, key)) in (sorter_base..).zip(sort_keys.iter()).enumerate() {
+            let order_uses_output_value = resolve_single_output_order_expr(
+                &subquery.order_by[index].expr,
+                columns,
+                table,
+                table_alias,
+            )
+            .is_some()
+                || order_by_refers_to_single_star_output(&subquery.order_by[index].expr, columns);
+            if order_uses_output_value {
+                if !value_emitted {
+                    // Exact output aliases, ordinals, and structurally equal
+                    // expressions share the projected value in a
+                    // non-DISTINCT ordered SELECT. Evaluate it lazily at this
+                    // key's position so earlier independent keys retain
+                    // SQLite's observable evaluation order.
+                    emit_in_probe_value(b, subq_cursor, &probe_source, value_reg, &subq_scan);
+                    value_emitted = true;
                 }
-                SortKeySource::Rowid => {
-                    b.emit_op(
-                        Opcode::Rowid,
-                        subq_cursor,
-                        sorter_base + i as i32,
-                        0,
-                        P4::None,
-                        0,
-                    );
-                }
-                SortKeySource::Expression(expr) => {
-                    emit_expr(b, &expr, sorter_base + i as i32, Some(&subq_scan));
-                }
+                b.emit_op(Opcode::Copy, value_reg, register, 0, P4::None, 0);
+            } else {
+                emit_resolved_column(b, key, subq_cursor, register, &subq_scan);
             }
         }
 
-        // Emit value column (last column in sorter record).
-        let value_reg = sorter_base + num_sort_keys as i32;
-        match value_expr {
-            Some(expr) => emit_expr(b, expr, value_reg, Some(&subq_scan)),
-            None => {
-                // First column.
-                b.emit_op(Opcode::Column, subq_cursor, 0, value_reg, P4::None, 0);
-            }
+        if top_n_bound_reg.is_some() {
+            let key_record = b.alloc_temp();
+            b.emit_op(
+                Opcode::MakeRecord,
+                sorter_base,
+                num_sort_keys as i32,
+                key_record,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::SorterCompare,
+                sorter_cursor,
+                key_record,
+                next_source_row,
+                P4::None,
+                SORTER_COMPARE_TOP_N_PREFLIGHT,
+            );
+            b.free_temp(key_record);
         }
 
-        // MakeRecord + SorterInsert.
+        if !value_emitted {
+            emit_in_probe_value(b, subq_cursor, &probe_source, value_reg, &subq_scan);
+        }
+
+        if distinct_projection_mode == OrderedDistinctProjectionMode::ReprojectRepresentative {
+            emit_ordered_distinct_source_state(b, subq_cursor, table, stored_data_base);
+        }
+
         let record_reg = b.alloc_temp();
         b.emit_op(
             Opcode::MakeRecord,
@@ -27619,40 +30017,30 @@ fn try_emit_complex_in_subquery(
         );
         b.free_temp(record_reg);
 
-        // Skip label (for WHERE-filtered rows).
-        b.resolve_label(skip_row);
-
-        // Next row.
+        b.resolve_label(next_source_row);
         let scan_body = (scan_start + 1) as i32;
         b.emit_op(Opcode::Next, subq_cursor, scan_body, 0, P4::None, 0);
-
-        // End of pass 1.
         b.resolve_label(scan_done);
-        b.emit_op(Opcode::Close, subq_cursor, 0, 0, P4::None, 0);
+        if !keep_subq_cursor_open {
+            b.emit_op(Opcode::Close, subq_cursor, 0, 0, P4::None, 0);
+        }
 
-        // === Pass 2: Sort and probe ===
-
-        // Initialize LIMIT counter if needed.
-        let limit_reg = subquery.limit.as_ref().map(|lc| {
-            let r = b.alloc_reg();
-            emit_limit_expr(b, &lc.limit, r);
-            r
-        });
-
-        // SorterSort: sort and position at first row; jump to no_match if empty.
+        // === Pass 2: apply OFFSET/LIMIT to sorted, distinct RHS values. ===
         b.emit_jump_to_label(
             Opcode::SorterSort,
             sorter_cursor,
             0,
-            no_match_label,
+            selected_done,
             P4::None,
             0,
         );
 
-        // Probe loop.
         let probe_loop = b.current_addr();
+        let next_sorted_row = b.emit_label();
+        if let Some(offset) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, offset, 1, next_sorted_row, P4::None, 0);
+        }
 
-        // SorterData to extract current row.
         let sorted_reg = b.alloc_temp();
         b.emit_op(
             Opcode::SorterData,
@@ -27662,33 +30050,107 @@ fn try_emit_complex_in_subquery(
             P4::None,
             0,
         );
-
-        // Extract the value column (last column).
         let r_probe = b.alloc_temp();
+        match distinct_projection_mode {
+            OrderedDistinctProjectionMode::StoredOutput => {
+                b.emit_op(
+                    Opcode::Column,
+                    sorter_cursor,
+                    num_sort_keys as i32,
+                    r_probe,
+                    P4::None,
+                    0,
+                );
+            }
+            OrderedDistinctProjectionMode::ReprojectRepresentative if table.without_rowid => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let source_base = b.alloc_regs(table.columns.len() as i32);
+                for column_index in 0..table.columns.len() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    b.emit_op(
+                        Opcode::Column,
+                        sorter_cursor,
+                        (num_sort_keys + column_index) as i32,
+                        source_base + column_index as i32,
+                        P4::None,
+                        0,
+                    );
+                }
+                let replay_scan = ScanCtx {
+                    cursor: 0,
+                    table,
+                    table_alias,
+                    schema: Some(schema),
+                    register_base: Some(source_base),
+                    secondaries: &[],
+                };
+                emit_in_probe_value(b, 0, &probe_source, r_probe, &replay_scan);
+            }
+            OrderedDistinctProjectionMode::ReprojectRepresentative => {
+                let representative_rowid = b.alloc_temp();
+                b.emit_op(
+                    Opcode::Column,
+                    sorter_cursor,
+                    num_sort_keys as i32,
+                    representative_rowid,
+                    P4::None,
+                    0,
+                );
+                b.emit_jump_to_label(
+                    Opcode::SeekRowid,
+                    subq_cursor,
+                    representative_rowid,
+                    next_sorted_row,
+                    P4::None,
+                    0,
+                );
+                b.free_temp(representative_rowid);
+                emit_in_probe_value(b, subq_cursor, &probe_source, r_probe, &subq_scan);
+            }
+        }
+
+        b.emit_op(Opcode::Integer, 1, r_rhs_nonempty, 0, P4::None, 0);
+        if let Some(ref affinity) = comparison_affinity_string {
+            b.emit_op(
+                Opcode::Affinity,
+                r_probe,
+                1,
+                0,
+                P4::Affinity(affinity.clone()),
+                0,
+            );
+        }
+        let saw_null = b.emit_label();
+        let value_materialized = b.emit_label();
+        b.emit_jump_to_label(Opcode::IsNull, r_probe, 0, saw_null, P4::None, 0);
+        let membership_record = b.alloc_temp();
         b.emit_op(
-            Opcode::Column,
-            sorter_cursor,
-            num_sort_keys as i32,
+            Opcode::MakeRecord,
             r_probe,
+            1,
+            membership_record,
             P4::None,
             0,
         );
+        b.emit_op(
+            Opcode::IdxInsert,
+            membership_cursor,
+            membership_record,
+            0,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, value_materialized, P4::None, 0);
+        b.resolve_label(saw_null);
+        b.emit_op(Opcode::Integer, 1, r_rhs_saw_null, 0, P4::None, 0);
+        b.resolve_label(value_materialized);
+        b.free_temp(membership_record);
 
-        // Compare with operand.
-        b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
-
-        b.free_temp(r_probe);
-        b.free_temp(sorted_reg);
-
-        // LIMIT: decrement counter and stop when zero.
-        let continue_label = b.emit_label();
         if let Some(lim_r) = limit_reg {
-            // DecrJumpZero: if limit counter reaches zero, jump to no_match.
-            b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, no_match_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, selected_done, P4::None, 0);
         }
-        b.resolve_label(continue_label);
 
-        // SorterNext.
+        b.resolve_label(next_sorted_row);
         b.emit_op(
             Opcode::SorterNext,
             sorter_cursor,
@@ -27697,23 +30159,15 @@ fn try_emit_complex_in_subquery(
             P4::None,
             0,
         );
+        b.free_temp(r_probe);
+        b.free_temp(sorted_reg);
     } else {
-        // No ORDER BY, no LIMIT: simple scan probe (should have been handled
-        // by resolve_in_probe_source, but handle here as fallback).
-        b.emit_op(
-            Opcode::OpenRead,
-            subq_cursor,
-            table.root_page,
-            0,
-            P4::Table(table.name.clone()),
-            0,
-        );
-
+        // A LIMIT-only subquery must preserve the source scan order. Applying a
+        // value-keyed sorter here would silently reorder rows before LIMIT.
         let loop_start = b.current_addr();
-        b.emit_jump_to_label(Opcode::Rewind, subq_cursor, 0, no_match_label, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Rewind, subq_cursor, 0, selected_done, P4::None, 0);
 
-        // WHERE filter.
-        let skip_label = b.emit_label();
+        let next_source_row = b.emit_label();
         if let Some(where_expr) = where_clause.as_deref() {
             emit_where_filter(
                 b,
@@ -27722,39 +30176,174 @@ fn try_emit_complex_in_subquery(
                 table,
                 table_alias,
                 schema,
-                skip_label,
+                next_source_row,
             );
         }
 
-        let subq_scan = ScanCtx {
-            cursor: subq_cursor,
-            table,
-            table_alias,
-            schema: Some(schema),
-            register_base: None,
-            secondaries: &[],
-        };
+        // Without DISTINCT, OFFSET discards source rows before their SELECT
+        // expression is evaluated. This avoids invoking volatile/erroring
+        // projections for skipped rows. DISTINCT must still evaluate and
+        // deduplicate the value before applying OFFSET.
+        if !is_distinct && let Some(offset) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, offset, 1, next_source_row, P4::None, 0);
+        }
 
         let r_probe = b.alloc_temp();
-        match value_expr {
-            Some(expr) => emit_expr(b, expr, r_probe, Some(&subq_scan)),
-            None => {
-                b.emit_op(Opcode::Column, subq_cursor, 0, r_probe, P4::None, 0);
+        emit_in_probe_value(b, subq_cursor, &probe_source, r_probe, &subq_scan);
+        if is_distinct {
+            let distinct_record = b.alloc_temp();
+            b.emit_op(Opcode::MakeRecord, r_probe, 1, distinct_record, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Found,
+                distinct_cursor,
+                distinct_record,
+                next_source_row,
+                P4::None,
+                0,
+            );
+            b.emit_op(
+                Opcode::IdxInsert,
+                distinct_cursor,
+                distinct_record,
+                0,
+                P4::None,
+                0,
+            );
+            b.free_temp(distinct_record);
+            if let Some(offset) = offset_reg {
+                b.emit_jump_to_label(Opcode::IfPos, offset, 1, next_source_row, P4::None, 0);
             }
         }
-        b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
 
-        b.resolve_label(skip_label);
+        b.emit_op(Opcode::Integer, 1, r_rhs_nonempty, 0, P4::None, 0);
+        if let Some(ref affinity) = comparison_affinity_string {
+            b.emit_op(
+                Opcode::Affinity,
+                r_probe,
+                1,
+                0,
+                P4::Affinity(affinity.clone()),
+                0,
+            );
+        }
+        let saw_null = b.emit_label();
+        let value_materialized = b.emit_label();
+        b.emit_jump_to_label(Opcode::IsNull, r_probe, 0, saw_null, P4::None, 0);
+        let membership_record = b.alloc_temp();
+        b.emit_op(
+            Opcode::MakeRecord,
+            r_probe,
+            1,
+            membership_record,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::IdxInsert,
+            membership_cursor,
+            membership_record,
+            0,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, value_materialized, P4::None, 0);
+        b.resolve_label(saw_null);
+        b.emit_op(Opcode::Integer, 1, r_rhs_saw_null, 0, P4::None, 0);
+        b.resolve_label(value_materialized);
+        b.free_temp(membership_record);
+
+        if let Some(lim_r) = limit_reg {
+            b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, selected_done, P4::None, 0);
+        }
+
+        b.resolve_label(next_source_row);
         let loop_body = (loop_start + 1) as i32;
         b.emit_op(Opcode::Next, subq_cursor, loop_body, 0, P4::None, 0);
 
         b.free_temp(r_probe);
     }
 
-    // Fall through to no_match (common to both paths).
+    b.resolve_label(selected_done);
+    if has_order_by {
+        b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    }
+    if is_distinct {
+        b.emit_op(Opcode::Close, distinct_cursor, 0, 0, P4::None, 0);
+    }
+    if !has_order_by || keep_subq_cursor_open {
+        b.emit_op(Opcode::Close, subq_cursor, 0, 0, P4::None, 0);
+    }
+    b.resolve_label(build_done);
+
+    if scalar_operand.is_some() {
+        let scalar_done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Once, 0, 0, scalar_done, P4::None, 0);
+        emit_expr(b, operand, r_operand, Some(scan_ctx));
+        b.resolve_label(scalar_done);
+    } else {
+        emit_expr(b, operand, r_operand, Some(scan_ctx));
+    }
+
+    // Probe the once-built, non-NULL membership index for this outer row.
+    // Keep the explicit empty-set branch separate: NULL IN (empty) is false,
+    // while NULL IN (any non-empty set) is unknown.
+    let operand_null_label = b.emit_label();
+    let no_match_label = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::IsNull,
+        r_operand,
+        0,
+        operand_null_label,
+        P4::None,
+        0,
+    );
+    if let Some(ref affinity) = comparison_affinity_string {
+        b.emit_op(
+            Opcode::Affinity,
+            r_operand,
+            1,
+            0,
+            P4::Affinity(affinity.clone()),
+            0,
+        );
+    }
+    let operand_record = b.alloc_temp();
+    b.emit_op(
+        Opcode::MakeRecord,
+        r_operand,
+        1,
+        operand_record,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(
+        Opcode::Found,
+        membership_cursor,
+        operand_record,
+        matched_label,
+        P4::None,
+        0,
+    );
+    b.free_temp(operand_record);
+    b.emit_jump_to_label(
+        Opcode::If,
+        r_rhs_saw_null,
+        0,
+        null_result_label,
+        P4::None,
+        0,
+    );
     b.emit_jump_to_label(Opcode::Goto, 0, 0, no_match_label, P4::None, 0);
 
-    // --- Result emission (shared by both paths) ---
+    b.resolve_label(operand_null_label);
+    b.emit_jump_to_label(
+        Opcode::If,
+        r_rhs_nonempty,
+        0,
+        null_result_label,
+        P4::None,
+        0,
+    );
 
     b.resolve_label(no_match_label);
     b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
@@ -27768,14 +30357,9 @@ fn try_emit_complex_in_subquery(
     b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
 
     b.resolve_label(done_label);
-    // Close cursors.
-    if has_order_by || has_limit {
-        b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
-    } else {
-        b.emit_op(Opcode::Close, subq_cursor, 0, 0, P4::None, 0);
+    if scalar_operand.is_none() {
+        b.free_temp(r_operand);
     }
-
-    b.free_temp(r_operand);
 
     true
 }
@@ -27790,11 +30374,11 @@ fn emit_in_probe_expr(
     ctx: Option<&ScanCtx<'_>>,
 ) {
     let Some(scan_ctx) = ctx else {
-        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        emit_in_probe_codegen_failure(b, "missing scan context");
         return;
     };
     let Some(schema) = scan_ctx.schema else {
-        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        emit_in_probe_codegen_failure(b, "missing schema");
         return;
     };
     let Some(probe_source) = resolve_in_probe_source(set, schema) else {
@@ -27804,9 +30388,19 @@ fn emit_in_probe_expr(
                 return;
             }
         }
-        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        emit_in_probe_codegen_failure(b, "unsupported probe source");
         return;
     };
+
+    if in_probe_expr_requires_semantic_fallback(operand) {
+        emit_in_probe_codegen_failure(b, "unsupported probe operand");
+        return;
+    }
+
+    if in_probe_source_references_outer_scan(&probe_source, scan_ctx) {
+        emit_in_probe_codegen_failure(b, "correlated probe source requires outer substitution");
+        return;
+    }
 
     if can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx) {
         emit_once_materialized_in_probe_source(
@@ -27832,9 +30426,6 @@ fn emit_in_probe_expr(
     let no_match_label = b.emit_label();
     let matched_label = b.emit_label();
     let done_label = b.emit_label();
-
-    // Three-valued NULL semantics: if operand is NULL, result is NULL.
-    b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
 
     b.emit_op(
         Opcode::OpenRead,
@@ -27876,29 +30467,25 @@ fn emit_in_probe_expr(
     emit_in_probe_value(b, probe_cursor, &probe_source, r_probe, &probe_scan);
     // Apply the comparison affinity between the outer operand and the subquery
     // probe column, mirroring `=`/value-list IN coercion (bd-56aj2 IN-subquery).
-    let probe_aff = match probe_source.value {
-        InProbeValue::Rowid => b'D',
-        InProbeValue::FirstColumn => probe_source
-            .table
-            .columns
-            .first()
-            .and_then(|c| c.type_name.as_deref())
-            .map_or(b'A', column_type_to_affinity),
-        InProbeValue::Expr(e) => expr_affinity(e, Some(&probe_scan)),
-    };
+    let probe_aff = in_probe_value_affinity(&probe_source, &probe_scan);
     let probe_aff_p5 =
         combine_comparison_affinity(expr_affinity(operand, Some(scan_ctx)), probe_aff);
+    let comparison_collation =
+        in_probe_comparison_collation(operand, scan_ctx, &probe_source, &probe_scan)
+            .map_or(P4::None, P4::Collation);
     b.emit_jump_to_label(
         Opcode::Eq,
         r_probe,
         r_operand,
         matched_label,
-        P4::None,
+        comparison_collation,
         probe_aff_p5,
     );
-    // If probe value was NULL, flag it (Eq never matches NULLs).
+    // A NULL on either side makes a no-match unknown, but only after at least
+    // one qualifying RHS row exists. An empty RHS remains a definite miss.
     let after_flag = b.emit_label();
     let set_flag = b.emit_label();
+    b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, set_flag, P4::None, 0);
     b.emit_jump_to_label(Opcode::IsNull, r_probe, 0, set_flag, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, after_flag, P4::None, 0);
     b.resolve_label(set_flag);
@@ -27930,6 +30517,20 @@ fn emit_in_probe_expr(
     b.free_temp(r_saw_null);
     b.free_temp(r_probe);
     b.free_temp(r_operand);
+}
+
+/// Fail closed when routing and expression lowering disagree about an `IN`
+/// probe. Returning SQL `NULL` here would silently turn an internal codegen
+/// defect into a query result.
+fn emit_in_probe_codegen_failure(b: &mut ProgramBuilder, reason: &str) {
+    b.emit_op(
+        Opcode::Halt,
+        ErrorCode::Internal as i32,
+        0,
+        0,
+        P4::Str(format!("IN probe codegen invariant failed: {reason}")),
+        0,
+    );
 }
 
 /// Handles literals, bind parameters, binary/unary operators, CASE, CAST,
@@ -28058,7 +30659,8 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             not,
             ..
         } => {
-            if matches!(like_op, fsqlite_ast::LikeOp::Like)
+            if use_builtin_like_glob_semantics()
+                && matches!(like_op, fsqlite_ast::LikeOp::Like)
                 && escape.is_none()
                 && let Expr::Literal(Literal::String(pattern_text), _) = pattern.as_ref()
                 && let Some((kind, literal)) = classify_sql_like_fast_path(pattern_text, None)
@@ -28405,7 +31007,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
 }
 
 fn current_time_literal_text(literal: &Literal) -> Option<String> {
-    use std::time::SystemTime;
+    use fsqlite_types::sync_primitives::SystemTime;
 
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -28595,22 +31197,41 @@ fn probe_expr_references_outer_scan(
             expr: inner, set, ..
         } => {
             probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
-                || matches!(
-                    set,
-                    fsqlite_ast::InSet::List(items)
-                        if items
-                            .iter()
-                            .any(|item| probe_expr_references_outer_scan(item, probe_source, scan_ctx))
-                )
+                || match set {
+                    fsqlite_ast::InSet::List(items) => items
+                        .iter()
+                        .any(|item| probe_expr_references_outer_scan(item, probe_source, scan_ctx)),
+                    // Recursively resolving a nested SELECT would require a
+                    // separate scope stack. Fail closed instead of overlooking
+                    // a correlation hidden inside that SELECT.
+                    fsqlite_ast::InSet::Subquery(_) => true,
+                    // A table-name shorthand contains no expression that can
+                    // reference the outer scan.
+                    fsqlite_ast::InSet::Table(_) => false,
+                }
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
             matches!(
                 args,
                 FunctionArgs::List(items)
                     if items
                         .iter()
                         .any(|item| probe_expr_references_outer_scan(item, probe_source, scan_ctx))
-            )
+            ) || order_by
+                .iter()
+                .any(|term| probe_expr_references_outer_scan(&term.expr, probe_source, scan_ctx))
+                || filter.as_deref().is_some_and(|expr| {
+                    probe_expr_references_outer_scan(expr, probe_source, scan_ctx)
+                })
+                || over.as_ref().is_some_and(|spec| {
+                    probe_window_spec_references_outer_scan(spec, probe_source, scan_ctx)
+                })
         }
         Expr::Case {
             operand,
@@ -28639,8 +31260,53 @@ fn probe_expr_references_outer_scan(
                     probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
                 })
         }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
+                || probe_expr_references_outer_scan(path, probe_source, scan_ctx)
+        }
+        Expr::RowValue(items, _) => items
+            .iter()
+            .any(|item| probe_expr_references_outer_scan(item, probe_source, scan_ctx)),
+        // As above, nested SELECT scoping is deliberately unsupported here.
         Expr::Exists { .. } | Expr::Subquery(_, _) => true,
-        _ => false,
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+    }
+}
+
+fn probe_window_spec_references_outer_scan(
+    spec: &fsqlite_ast::WindowSpec,
+    probe_source: &InProbeSource<'_>,
+    scan_ctx: &ScanCtx<'_>,
+) -> bool {
+    spec.partition_by
+        .iter()
+        .any(|expr| probe_expr_references_outer_scan(expr, probe_source, scan_ctx))
+        || spec
+            .order_by
+            .iter()
+            .any(|term| probe_expr_references_outer_scan(&term.expr, probe_source, scan_ctx))
+        || spec.frame.as_ref().is_some_and(|frame| {
+            probe_frame_bound_references_outer_scan(&frame.start, probe_source, scan_ctx)
+                || frame.end.as_ref().is_some_and(|bound| {
+                    probe_frame_bound_references_outer_scan(bound, probe_source, scan_ctx)
+                })
+        })
+}
+
+fn probe_frame_bound_references_outer_scan(
+    bound: &fsqlite_ast::FrameBound,
+    probe_source: &InProbeSource<'_>,
+    scan_ctx: &ScanCtx<'_>,
+) -> bool {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            probe_expr_references_outer_scan(expr, probe_source, scan_ctx)
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => false,
     }
 }
 
@@ -28881,21 +31547,30 @@ fn emit_once_materialized_in_probe_source(
     schema: &[TableSchema],
 ) {
     let r_operand = b.alloc_temp();
-    emit_expr(b, operand, r_operand, Some(scan_ctx));
 
     let null_label = b.emit_label();
     let found_label = b.emit_label();
     let done_label = b.emit_label();
-    b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
 
     let source_cursor = 8192 + b.current_addr() as i32;
     let autoindex_cursor = 12288 + b.current_addr() as i32;
     let r_saw_null = b.alloc_reg();
+    let r_rhs_nonempty = b.alloc_reg();
+    let probe_scan = ScanCtx {
+        cursor: source_cursor,
+        table: probe_source.table,
+        table_alias: probe_source.table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
     let build_done = b.emit_label();
     b.emit_jump_to_label(Opcode::Once, 0, 0, build_done, P4::None, 0);
     b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
-    let autoindex_collation = effective_collation_ctx(operand, Some(scan_ctx))
-        .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+    b.emit_op(Opcode::Integer, 0, r_rhs_nonempty, 0, P4::None, 0);
+    let autoindex_collation =
+        in_probe_comparison_collation(operand, scan_ctx, probe_source, &probe_scan)
+            .map_or(P4::None, P4::Collation);
     b.emit_op(
         Opcode::OpenAutoindex,
         autoindex_cursor,
@@ -28937,27 +31612,10 @@ fn emit_once_materialized_in_probe_source(
         );
     }
 
-    let probe_scan = ScanCtx {
-        cursor: source_cursor,
-        table: probe_source.table,
-        table_alias: probe_source.table_alias,
-        schema: Some(schema),
-        register_base: None,
-        secondaries: &[],
-    };
     // Apply the comparison affinity between the outer operand and the subquery
     // probe column to both the materialized values and the probe key, mirroring
     // the per-row IN-subquery path (bd-56aj2 IN-subquery).
-    let probe_aff = match probe_source.value {
-        InProbeValue::Rowid => b'D',
-        InProbeValue::FirstColumn => probe_source
-            .table
-            .columns
-            .first()
-            .and_then(|c| c.type_name.as_deref())
-            .map_or(b'A', column_type_to_affinity),
-        InProbeValue::Expr(e) => expr_affinity(e, Some(&probe_scan)),
-    };
+    let probe_aff = in_probe_value_affinity(probe_source, &probe_scan);
     let in_aff_str: Option<String> = u8::try_from(combine_comparison_affinity(
         expr_affinity(operand, Some(scan_ctx)),
         probe_aff,
@@ -28967,6 +31625,7 @@ fn emit_once_materialized_in_probe_source(
     .map(|code| (code as char).to_string());
     let r_value = b.alloc_temp();
     let r_key = b.alloc_temp();
+    b.emit_op(Opcode::Integer, 1, r_rhs_nonempty, 0, P4::None, 0);
     emit_in_probe_value(b, source_cursor, probe_source, r_value, &probe_scan);
     if let Some(ref aff) = in_aff_str {
         b.emit_op(
@@ -28999,6 +31658,8 @@ fn emit_once_materialized_in_probe_source(
     b.free_temp(r_value);
     b.resolve_label(build_done);
 
+    emit_expr(b, operand, r_operand, Some(scan_ctx));
+
     let r_probe_key = b.alloc_temp();
     if let Some(ref aff) = in_aff_str {
         b.emit_op(
@@ -29022,6 +31683,20 @@ fn emit_once_materialized_in_probe_source(
     b.free_temp(r_probe_key);
 
     b.emit_jump_to_label(Opcode::If, r_saw_null, 0, null_label, P4::None, 0);
+    let definite_miss = b.emit_label();
+    let check_null_operand = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::IsNull,
+        r_operand,
+        0,
+        check_null_operand,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, definite_miss, P4::None, 0);
+    b.resolve_label(check_null_operand);
+    b.emit_jump_to_label(Opcode::If, r_rhs_nonempty, 0, null_label, P4::None, 0);
+    b.resolve_label(definite_miss);
     b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
@@ -29324,6 +31999,36 @@ fn emit_exists_subquery(
     b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
 }
 
+/// Emit the first scalar result expression against an already-positioned
+/// single-table subquery cursor.
+fn emit_scalar_subquery_result_value(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    reg: i32,
+    sub_ctx: &ScanCtx<'_>,
+    outer_ctx: &ScanCtx<'_>,
+) {
+    match columns.first() {
+        Some(ResultColumn::Expr { expr, .. }) => {
+            emit_expr_with_fallback(b, expr, reg, sub_ctx, Some(outer_ctx));
+        }
+        Some(ResultColumn::Star | ResultColumn::TableStar(_))
+            if sub_ctx.table.columns.len() == 1 =>
+        {
+            emit_table_column_read(
+                b,
+                sub_ctx.cursor,
+                sub_ctx.table,
+                sub_ctx.table_alias,
+                sub_ctx.schema,
+                0,
+                reg,
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Emit bytecode for a scalar subquery expression `(SELECT expr FROM ...)`.
 ///
 /// Evaluates the subquery and places the first result value into `reg`.
@@ -29454,9 +32159,7 @@ fn emit_scalar_subquery(
                 b.free_temp(residual_reg);
             }
 
-            if let Some(ResultColumn::Expr { expr, .. }) = columns.first() {
-                emit_expr_with_fallback(b, expr, reg, &sub_ctx, Some(outer_ctx));
-            }
+            emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
 
             b.resolve_label(done_label);
             return;
@@ -29478,9 +32181,7 @@ fn emit_scalar_subquery(
         }
 
         // Evaluate the first result column expression.
-        if let Some(ResultColumn::Expr { expr, .. }) = columns.first() {
-            emit_expr_with_fallback(b, expr, reg, &sub_ctx, Some(outer_ctx));
-        }
+        emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
 
         // Got our value — jump to done (only need one row).
         b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
@@ -29833,7 +32534,8 @@ fn emit_expr_with_fallback(
             op: like_op,
             ..
         } => {
-            if matches!(like_op, fsqlite_ast::LikeOp::Like)
+            if use_builtin_like_glob_semantics()
+                && matches!(like_op, fsqlite_ast::LikeOp::Like)
                 && escape.is_none()
                 && let Expr::Literal(Literal::String(pattern_text), _) = pattern.as_ref()
                 && let Some((kind, literal)) = classify_sql_like_fast_path(pattern_text, None)
@@ -30160,12 +32862,66 @@ fn emit_binary_op(
     b.free_temp(tmp);
 }
 
-/// Extract collation name from a `COLLATE` wrapper, if present.
+/// Extract the leftmost explicit COLLATE from an expression operand.
+///
+/// SQLite treats a COLLATE operator anywhere inside a comparison operand as
+/// explicit for that operand; it is not limited to a wrapper at the root.
+/// Nested SELECT scopes and window-control clauses are deliberately excluded:
+/// their collations do not become collations of the containing scalar value.
 fn extract_collation(expr: &Expr) -> Option<&str> {
-    if let Expr::Collate { collation, .. } = expr {
-        Some(collation.as_str())
-    } else {
-        None
+    match expr {
+        Expr::Collate { collation, .. } => Some(collation.as_str()),
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => extract_collation(left).or_else(|| extract_collation(right)),
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            extract_collation(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => extract_collation(expr)
+            .or_else(|| extract_collation(low))
+            .or_else(|| extract_collation(high)),
+        Expr::In { expr, set, .. } => extract_collation(expr).or_else(|| match set {
+            InSet::List(values) => values.iter().find_map(extract_collation),
+            InSet::Table(_) | InSet::Subquery(_) => None,
+        }),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => extract_collation(expr)
+            .or_else(|| extract_collation(pattern))
+            .or_else(|| escape.as_deref().and_then(extract_collation)),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => operand
+            .as_deref()
+            .and_then(extract_collation)
+            .or_else(|| {
+                whens.iter().find_map(|(when_expr, then_expr)| {
+                    extract_collation(when_expr).or_else(|| extract_collation(then_expr))
+                })
+            })
+            .or_else(|| else_expr.as_deref().and_then(extract_collation)),
+        Expr::FunctionCall { args, .. } => match args {
+            FunctionArgs::Star => None,
+            FunctionArgs::List(values) => values.iter().find_map(extract_collation),
+        },
+        Expr::RowValue(values, _) => values.iter().find_map(extract_collation),
+        Expr::Literal(..)
+        | Expr::Column(..)
+        | Expr::Exists { .. }
+        | Expr::Subquery(..)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(..) => None,
     }
 }
 
@@ -30176,11 +32932,7 @@ fn join_effective_collation<'a>(
     if let Some(collation) = extract_collation(expr) {
         return Some(collation);
     }
-    let inner = if let Expr::Collate { expr: inner, .. } = expr {
-        inner.as_ref()
-    } else {
-        expr
-    };
+    let inner = declared_collation_source_expr(expr);
     let Expr::Column(col_ref, _) = inner else {
         return None;
     };
@@ -30267,12 +33019,7 @@ fn column_collation<'a>(
     table: &'a TableSchema,
     table_alias: Option<&str>,
 ) -> Option<&'a str> {
-    // Unwrap COLLATE to reach the underlying column ref
-    let inner = if let Expr::Collate { expr: inner, .. } = expr {
-        inner.as_ref()
-    } else {
-        expr
-    };
+    let inner = declared_collation_source_expr(expr);
     if let Expr::Column(col_ref, _) = inner {
         if let Some(qualifier) = &col_ref.table {
             if !matches_table_or_alias(qualifier, table, table_alias) {
@@ -30284,6 +33031,25 @@ fn column_collation<'a>(
         }
     }
     None
+}
+
+/// Reach a column whose declared collation is inherited by this expression.
+///
+/// SQLite preserves a column's collation through COLLATE (when the explicit
+/// wrapper itself is being inspected separately), CAST, and unary plus. Other
+/// unary operators produce a new expression with no declared column
+/// collation.
+fn declared_collation_source_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Collate { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Plus,
+            expr,
+            ..
+        } => declared_collation_source_expr(expr),
+        _ => expr,
+    }
 }
 
 /// Get effective collation via `ScanCtx`: explicit COLLATE first, then column-level.
@@ -30748,6 +33514,155 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    fn create_index_sql(sql: &str) -> CreateIndexStatement {
+        let Some((statement, tail)) =
+            parse_first_statement_with_tail(sql).expect("test CREATE INDEX SQL should parse")
+        else {
+            unreachable!("expected parsed CREATE INDEX statement");
+        };
+        assert_eq!(
+            tail,
+            sql.len(),
+            "parser should consume the whole SQL string"
+        );
+        match statement {
+            Statement::CreateIndex(stmt) => stmt,
+            other => unreachable!("expected CREATE INDEX statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_explicit_index_binds_rootless_simple_index_metadata() {
+        let mut schema = test_schema();
+        schema[0].columns[0].collation = Some("NOCASE".to_owned());
+        let stmt = create_index_sql("CREATE UNIQUE INDEX MiXeD ON T(a DESC)");
+
+        let bound =
+            bind_explicit_index(&stmt, "mixed", "t", &schema[0]).expect("simple index should bind");
+
+        assert_eq!(bound.name, "MiXeD");
+        assert_eq!(bound.columns, ["a"]);
+        assert!(bound.key_expressions.is_empty());
+        assert_eq!(bound.key_sort_directions, [SortDirection::Desc]);
+        assert_eq!(bound.key_collations, [Some("NOCASE".to_owned())]);
+        assert!(bound.where_clause.is_none());
+        assert!(bound.is_unique);
+
+        let index = bound.into_index_schema(41);
+        assert_eq!(index.root_page, 41);
+        assert_eq!(index.name, "MiXeD");
+        assert_eq!(index.conflict_action, None);
+    }
+
+    #[test]
+    fn bind_explicit_index_binds_expression_terms_and_preserves_custom_collation() {
+        let schema = test_schema();
+        let stmt = create_index_sql(
+            "CREATE INDEX idx_expr ON t(lower(a) COLLATE custom_sort DESC, b + 1 ASC)",
+        );
+
+        let bound = bind_explicit_index(&stmt, "idx_expr", "t", &schema[0])
+            .expect("expression index should bind before registry validation");
+
+        assert!(bound.columns.is_empty());
+        assert_eq!(bound.key_expressions.len(), 2);
+        assert_eq!(bound.key_expressions[0], "lower(a) COLLATE custom_sort");
+        assert_eq!(bound.key_expressions[1], "b + 1");
+        assert_eq!(
+            bound.key_sort_directions,
+            [SortDirection::Desc, SortDirection::Asc]
+        );
+        assert_eq!(bound.key_collations, [Some("custom_sort".to_owned()), None]);
+    }
+
+    #[test]
+    fn bind_explicit_index_binds_partial_predicate() {
+        let schema = test_schema();
+        let stmt = create_index_sql("CREATE INDEX idx_partial ON t(a) WHERE b > 0");
+
+        let bound = bind_explicit_index(&stmt, "idx_partial", "t", &schema[0])
+            .expect("partial index should bind");
+
+        assert_eq!(bound.columns, ["a"]);
+        assert_eq!(bound.where_clause.as_deref(), Some("b > 0"));
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_catalog_identity_and_unknown_table() {
+        let schema = test_schema();
+        let stmt = create_index_sql("CREATE INDEX declared_name ON t(a)");
+        let error = bind_explicit_index(&stmt, "catalog_name", "t", &schema[0])
+            .expect_err("catalog index-name mismatch must fail");
+        assert!(
+            matches!(error, CodegenError::Unsupported(message) if message.contains("identity mismatch"))
+        );
+
+        let stmt = create_index_sql("CREATE INDEX idx_other ON other(a)");
+        let error = bind_explicit_index(&stmt, "idx_other", "other", &schema[0])
+            .expect_err("supplied schema must match the target table");
+        assert_eq!(error, CodegenError::TableNotFound("other".to_owned()));
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_unknown_simple_and_expression_columns() {
+        let schema = test_schema();
+        for sql in [
+            "CREATE INDEX idx_missing ON t(missing)",
+            "CREATE INDEX idx_missing ON t(lower(missing))",
+            "CREATE INDEX idx_missing ON t(lower(other.a))",
+        ] {
+            let stmt = create_index_sql(sql);
+            let error = bind_explicit_index(&stmt, "idx_missing", "t", &schema[0])
+                .expect_err("unknown indexed column must fail");
+            assert!(matches!(error, CodegenError::ColumnNotFound { .. }));
+        }
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_unknown_partial_predicate_column() {
+        let schema = test_schema();
+        let stmt = create_index_sql("CREATE INDEX idx_partial_missing ON t(a) WHERE missing > 0");
+
+        let error = bind_explicit_index(&stmt, "idx_partial_missing", "t", &schema[0])
+            .expect_err("unknown partial-index predicate column must fail");
+
+        assert_eq!(
+            error,
+            CodegenError::ColumnNotFound {
+                table: "t".to_owned(),
+                column: "missing".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_malformed_terms_and_collation_shape() {
+        let schema = test_schema();
+        let mut empty = create_index_sql("CREATE INDEX idx_empty ON t(a)");
+        empty.columns.clear();
+        let error = bind_explicit_index(&empty, "idx_empty", "t", &schema[0])
+            .expect_err("empty key-term list must fail");
+        assert!(
+            matches!(error, CodegenError::Unsupported(message) if message.contains("at least one key term"))
+        );
+
+        let mut placeholder_term = create_index_sql("CREATE INDEX idx_param ON t(a)");
+        placeholder_term.columns[0].expr = placeholder(1);
+        let error = bind_explicit_index(&placeholder_term, "idx_param", "t", &schema[0])
+            .expect_err("bind parameter key term must fail");
+        assert!(
+            matches!(error, CodegenError::Unsupported(message) if message.contains("bind parameters"))
+        );
+
+        let mut empty_collation = create_index_sql("CREATE INDEX idx_coll ON t(a)");
+        empty_collation.columns[0].collation = Some(String::new());
+        let error = bind_explicit_index(&empty_collation, "idx_coll", "t", &schema[0])
+            .expect_err("empty collation name must fail");
+        assert!(
+            matches!(error, CodegenError::Unsupported(message) if message.contains("empty collation"))
+        );
     }
 
     fn test_schema_with_index() -> Vec<TableSchema> {
@@ -31568,6 +34483,16 @@ mod tests {
         assert_eq!(frame.exclude, Some(fsqlite_ast::FrameExclude::Group));
     }
 
+    #[test]
+    fn test_function_placeholder_count_includes_in_call_order_by_and_filter() {
+        let expr = expr_sql("group_concat(a ORDER BY ?) FILTER (WHERE b = ?)");
+        assert_eq!(
+            count_anon_placeholders(&expr),
+            2,
+            "function modifiers participate in lexical bind-slot accounting"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -31653,6 +34578,20 @@ mod tests {
             order_by: vec![],
             limit: None,
         }
+    }
+
+    fn simple_select_as(
+        cols: &[&str],
+        table: &str,
+        alias: &str,
+        where_clause: Option<Box<Expr>>,
+    ) -> SelectStatement {
+        let mut stmt = simple_select(cols, table, where_clause);
+        let SelectCore::Select { from, .. } = &mut stmt.body.select else {
+            unreachable!("simple_select always constructs a SELECT core");
+        };
+        *from = Some(from_table_as(table, alias));
+        stmt
     }
 
     fn star_select(table: &str) -> SelectStatement {
@@ -31881,6 +34820,188 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &CodegenContext::default())
             .expect("bd-2dgf5 fixture SELECT should compile");
         b.finish().expect("program should finish").ops().to_vec()
+    }
+
+    #[test]
+    fn single_group_aggregate_limit_preserves_textual_placeholder_indices() {
+        let ops = bd_2dgf5_program("SELECT COUNT(*) FROM t WHERE id > ? LIMIT ?");
+        let variable_indices: Vec<i32> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect();
+        assert_eq!(
+            variable_indices,
+            vec![2, 1],
+            "LIMIT is emitted before the scan, but its anonymous parameter must retain \
+             its second-in-SQL index"
+        );
+
+        let limit_variable = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Variable && op.p1 == 2)
+            .expect("LIMIT parameter must be emitted");
+        assert_eq!(
+            ops.get(limit_variable + 1).map(|op| op.opcode),
+            Some(Opcode::MustBeInt),
+            "dynamic LIMIT must be validated as a losslessly coercible integer"
+        );
+
+        let ops = bd_2dgf5_program("SELECT COUNT(*) FROM t LIMIT ? OFFSET ?");
+        let variable_indices: Vec<i32> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect();
+        assert_eq!(variable_indices, vec![1, 2]);
+        for variable in ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == Opcode::Variable)
+            .map(|(index, _)| index)
+        {
+            assert_eq!(
+                ops.get(variable + 1).map(|op| op.opcode),
+                Some(Opcode::MustBeInt),
+                "dynamic LIMIT and OFFSET must both receive integer validation"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_aggregate_limit_validates_and_preserves_numbered_slots() {
+        let ops = bd_2dgf5_program(
+            "SELECT k, COUNT(*) FROM t WHERE v = ?1 GROUP BY k LIMIT ?2 OFFSET ?3",
+        );
+        let variables: Vec<i32> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect();
+        assert_eq!(
+            variables,
+            vec![2, 3, 1],
+            "GROUP BY codegen emits LIMIT/OFFSET before the scan, but numbered \
+             parameters must keep their SQL-text slots"
+        );
+
+        let limit_variable = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Variable && op.p1 == 2)
+            .expect("GROUP BY LIMIT parameter must be emitted");
+        assert_eq!(
+            ops.get(limit_variable + 1).map(|op| op.opcode),
+            Some(Opcode::MustBeInt),
+            "GROUP BY LIMIT must be losslessly coerced to integer"
+        );
+        let zero_guard = ops
+            .iter()
+            .enumerate()
+            .skip(limit_variable + 1)
+            .find(|(_, op)| op.opcode == Opcode::IfNot)
+            .map(|(index, _)| index)
+            .expect("GROUP BY LIMIT zero guard must be emitted");
+        let offset_variable = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Variable && op.p1 == 3)
+            .expect("GROUP BY OFFSET parameter must be emitted");
+        assert!(
+            zero_guard < offset_variable,
+            "GROUP BY LIMIT zero must short-circuit before OFFSET evaluation"
+        );
+        assert_eq!(
+            ops.get(offset_variable + 1).map(|op| op.opcode),
+            Some(Opcode::MustBeInt),
+            "GROUP BY OFFSET must be losslessly coerced to integer"
+        );
+
+        let integer_literal_ops =
+            bd_2dgf5_program("SELECT k, COUNT(*) FROM t GROUP BY k LIMIT 2 OFFSET 1");
+        assert!(
+            !integer_literal_ops
+                .iter()
+                .any(|op| op.opcode == Opcode::MustBeInt),
+            "exact integer LIMIT/OFFSET literals must avoid redundant coercion opcodes"
+        );
+
+        let text_literal_ops =
+            bd_2dgf5_program("SELECT k, COUNT(*) FROM t GROUP BY k LIMIT '2' OFFSET '1'");
+        assert_eq!(
+            text_literal_ops
+                .iter()
+                .filter(|op| op.opcode == Opcode::MustBeInt)
+                .count(),
+            2,
+            "coercible text LIMIT/OFFSET literals must each be validated at runtime"
+        );
+    }
+
+    #[test]
+    fn nonaggregate_eq_residual_limit_validates_and_preserves_numbered_slots() {
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE k = 2 AND v = ?1 LIMIT ?2 OFFSET ?3");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_k")),
+            "canonicalized/numbered residual + LIMIT/OFFSET must retain the equality seek"
+        );
+
+        let variables: Vec<i32> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect();
+        assert_eq!(
+            variables,
+            vec![2, 3, 1, 1],
+            "LIMIT and OFFSET emit first, but must retain their second/third textual slots; \
+             the residual is emitted once per mutually-exclusive seek/fallback path at slot 1"
+        );
+
+        let limit_variable = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Variable && op.p1 == 2)
+            .expect("LIMIT parameter must be emitted");
+        assert_eq!(
+            ops.get(limit_variable + 1).map(|op| op.opcode),
+            Some(Opcode::MustBeInt),
+            "dynamic equality-scan LIMIT must be losslessly coerced to integer"
+        );
+        let zero_guard = ops
+            .iter()
+            .enumerate()
+            .skip(limit_variable + 1)
+            .find(|(_, op)| op.opcode == Opcode::IfNot)
+            .map(|(index, _)| index)
+            .expect("LIMIT zero guard must be emitted");
+        let offset_variable = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Variable && op.p1 == 3)
+            .expect("OFFSET parameter must be emitted");
+        assert!(
+            zero_guard < offset_variable,
+            "LIMIT zero must short-circuit before OFFSET is evaluated"
+        );
+        assert_eq!(
+            ops.get(offset_variable + 1).map(|op| op.opcode),
+            Some(Opcode::MustBeInt),
+            "dynamic equality-scan OFFSET must be losslessly coerced to integer"
+        );
+    }
+
+    #[test]
+    fn nonaggregate_eq_residual_raw_non_numbered_slots_decline_seek() {
+        for sql in [
+            "SELECT id FROM t WHERE k = 2 AND v = ? LIMIT ? OFFSET ?",
+            "SELECT id FROM t WHERE k = 2 AND v = :residual LIMIT :lim OFFSET :off",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_k")),
+                "raw anonymous/named AST must decline the residual optimization until \
+                 connection-level canonicalization assigns stable slots: `{sql}`"
+            );
+        }
     }
 
     /// Index of the first instruction of the scan fallback.
@@ -34308,6 +37429,31 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_select_distinct_star_preserves_flattened_collations() {
+        let mut schema = test_schema();
+        schema[0].columns[1].collation = Some("NOCASE".to_owned());
+
+        for sql in ["SELECT DISTINCT * FROM t", "SELECT DISTINCT t.* FROM t"] {
+            let stmt = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+            let prog = b.finish().unwrap();
+
+            let sorter_open = prog
+                .ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::SorterOpen)
+                .expect("unordered DISTINCT should open a tuple sorter");
+            assert_eq!(sorter_open.p2, 2, "{sql}");
+            assert_eq!(
+                sorter_open.p4,
+                P4::Str("++|BINARY,NOCASE".to_owned()),
+                "{sql}: expanded output slots must retain positional column collations"
+            );
+        }
+    }
+
+    #[test]
     fn test_codegen_select_distinct_full_scan_offset_after_dedup() {
         let stmt = SelectStatement {
             with: None,
@@ -34385,29 +37531,34 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // ORDER BY + DISTINCT: uses ordered scan with dedup.
-        // Should include SorterOpen, Rewind scan, SorterInsert, SorterSort,
-        // then SorterData + Column reads + MakeRecord + SorterCompare + Goto
-        // + Copy + ResultRow.
+        // ORDER BY + DISTINCT uses a sorter for ordering and a separate
+        // output-tuple membership index for deduplication.
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Init,
                 Opcode::SorterOpen,
+                Opcode::OpenAutoindex,
                 Opcode::OpenRead,
                 Opcode::Rewind,
+                Opcode::MakeRecord,
+                Opcode::Found,
+                Opcode::IdxInsert,
                 Opcode::SorterInsert,
                 Opcode::Next,
                 Opcode::SorterSort,
                 Opcode::SorterData,
-                Opcode::MakeRecord,
-                Opcode::SorterCompare,
-                Opcode::Goto,
-                Opcode::Copy,
                 Opcode::ResultRow,
                 Opcode::SorterNext,
             ]
         ));
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::SorterCompare),
+            "ordered DISTINCT must not compare an output tuple against the ORDER BY key prefix"
+        );
     }
 
     #[test]
@@ -34442,23 +37593,123 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        let cmp_pos = prog
+        let found_pos = prog
             .ops()
             .iter()
-            .position(|op| op.opcode == Opcode::SorterCompare)
-            .expect("missing DISTINCT SorterCompare opcode");
+            .position(|op| op.opcode == Opcode::Found)
+            .expect("missing DISTINCT membership probe");
         let ifpos_pos = prog
             .ops()
             .iter()
             .position(|op| op.opcode == Opcode::IfPos)
             .expect("missing OFFSET IfPos opcode");
         assert!(
-            cmp_pos < ifpos_pos,
+            found_pos < ifpos_pos,
             "DISTINCT dedup must run before OFFSET filtering"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Null),
-            "expected DISTINCT previous-record register initialization"
+            prog.ops().iter().any(|op| op.opcode == Opcode::IdxInsert),
+            "a novel output tuple must be added to the DISTINCT membership index"
+        );
+        let distinct_insert_pos = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::IdxInsert)
+            .expect("missing DISTINCT membership insert");
+        let top_n_preflight_pos = prog
+            .ops()
+            .iter()
+            .position(|op| {
+                op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
+            })
+            .expect("bounded ordered DISTINCT should preflight sorter admission");
+        assert!(
+            found_pos < distinct_insert_pos && distinct_insert_pos < top_n_preflight_pos,
+            "DISTINCT membership must precede bounded-sorter admission so rejected first \
+             representatives still suppress later duplicates"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| {
+                op.opcode == Opcode::SorterCompare && op.p5 != SORTER_COMPARE_TOP_N_PREFLIGHT
+            }),
+            "ordered DISTINCT must not use the old output-record-versus-sort-key comparison"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ordered_distinct_membership_preserves_output_collation_slots() {
+        let mut schema = test_schema();
+        schema[0].columns[1].collation = Some("NOCASE".to_owned());
+        let stmt = select_sql("SELECT DISTINCT a, b FROM t ORDER BY b");
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+
+        let membership_open = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenAutoindex)
+            .expect("ordered DISTINCT should open an output membership index");
+        assert_eq!(membership_open.p2, 2);
+        assert_eq!(
+            membership_open.p4,
+            P4::Str("BINARY,NOCASE".to_owned()),
+            "default-collation slots must remain explicit so later named collations keep their positions"
+        );
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::Found && op.p1 == membership_open.p1 && op.p3 > 0
+            }),
+            "the flattened output record must probe the membership index"
+        );
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::IdxInsert && op.p1 == membership_open.p1 && op.p2 > 0
+            }),
+            "novel flattened output records must enter the membership index"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ordered_distinct_dedups_before_independent_order_expression() {
+        let schema = test_schema();
+        let stmt = select_sql("SELECT DISTINCT out(b) AS x FROM t ORDER BY key(a), x DESC");
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let output_pos = ops
+            .iter()
+            .position(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "OUT")
+            })
+            .expect("DISTINCT output should evaluate out()");
+        let found_pos = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Found)
+            .expect("DISTINCT output should be membership-tested");
+        let independent_order_pos = ops
+            .iter()
+            .position(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "KEY")
+            })
+            .expect("independent ORDER BY expression should evaluate key()");
+        assert!(
+            output_pos < found_pos && found_pos < independent_order_pos,
+            "duplicate output rows must skip evaluation of independent ORDER BY expressions"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| {
+                    op.opcode == Opcode::PureFunc
+                        && matches!(&op.p4, P4::FuncName(name) if name == "OUT")
+                })
+                .count(),
+            1,
+            "the exact ORDER alias should reuse the already-deduplicated output value"
         );
     }
 
@@ -35260,6 +38511,89 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_composite_expression_equality_uses_true_prefix_probe() {
+        let stmt = simple_select(&["name"], "t", Some(lower_name_eq_param(1)));
+        let mut schema = test_schema_with_expression_index();
+        schema[0].indexes[0].key_expressions.push("a".to_owned());
+        schema[0].indexes[0].key_sort_directions = vec![SortDirection::Asc, SortDirection::Desc];
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-composite-expression-equality".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: Some("idx_t_lower_name".to_owned()),
+                index_key_label: Some("lower(name)".to_owned()),
+                index_key_is_expression: true,
+                index_equality_target: Some(placeholder(1)),
+                index_range_target: None,
+                covering: false,
+                access_kind: PlannerSelectAccessKind::IndexEquality,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+        let seek_idx = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SeekGE)
+            .expect("composite expression equality should seek its index");
+        let probe = ops[..seek_idx]
+            .iter()
+            .rev()
+            .find(|op| op.opcode == Opcode::MakeRecord)
+            .expect("index seek must build a probe record");
+
+        assert_eq!(
+            probe.p2, 1,
+            "unconstrained DESC trailing terms must not be padded with NULL"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_honors_partial_expression_index_equality_directive() {
+        let stmt = simple_select_as(
+            &["name"],
+            "t",
+            "x",
+            Some(Box::new(expr_sql("lower(x.Name) = ?1 AND x.A = 1"))),
+        );
+        let mut schema = test_schema_with_expression_index();
+        schema[0].indexes[0].key_expressions[0] = "LOWER(NAME)".to_owned();
+        schema[0].indexes[0].where_clause = Some("A = 1".to_owned());
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-partial-expression-equality".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: Some("idx_t_lower_name".to_owned()),
+                index_key_label: Some("LOWER(NAME)".to_owned()),
+                index_key_is_expression: true,
+                index_equality_target: Some(placeholder(1)),
+                index_range_target: None,
+                covering: false,
+                access_kind: PlannerSelectAccessKind::IndexEquality,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_lower_name")
+            }),
+            "a residual guaranteed by the partial index must not make the VDBE reject the directive"
+        );
+        assert!(prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE));
+    }
+
+    #[test]
     fn test_codegen_select_honors_expression_planner_index_range_directive() {
         let stmt = simple_select(&["name"], "t", Some(lower_name_range_params(1, 2)));
         let schema = test_schema_with_expression_index();
@@ -35304,6 +38638,58 @@ mod tests {
             ops.iter().any(|op| op.opcode == Opcode::SeekGE),
             "expression range directive should lower to an index range probe"
         );
+    }
+
+    #[test]
+    fn test_codegen_select_honors_partial_expression_index_range_directive() {
+        let stmt = simple_select_as(
+            &["name"],
+            "t",
+            "x",
+            Some(Box::new(expr_sql(
+                "lower(x.Name) >= ?1 AND lower(x.name) < ?2 AND x.A = 1",
+            ))),
+        );
+        let mut schema = test_schema_with_expression_index();
+        schema[0].indexes[0].key_expressions[0] = "LOWER(NAME)".to_owned();
+        schema[0].indexes[0].where_clause = Some("A = 1".to_owned());
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-partial-expression-range".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: Some("idx_t_lower_name".to_owned()),
+                index_key_label: Some("LOWER(NAME)".to_owned()),
+                index_key_is_expression: true,
+                index_equality_target: None,
+                index_range_target: Some(PlannerIndexRangeTarget {
+                    lower: Some(PlannerIndexRangeBound {
+                        expr: placeholder(1),
+                        inclusive: true,
+                    }),
+                    upper: Some(PlannerIndexRangeBound {
+                        expr: placeholder(2),
+                        inclusive: false,
+                    }),
+                }),
+                covering: false,
+                access_kind: PlannerSelectAccessKind::IndexRange,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_lower_name")
+            }),
+            "partial-index range proof must survive the independent VDBE verifier"
+        );
+        assert!(prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE));
     }
 
     #[test]
@@ -36606,6 +39992,612 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_in_probe_expr_fails_closed_when_probe_lowering_is_unsupported() {
+        let schema = test_schema_with_subquery_source();
+        let scan_ctx = ScanCtx {
+            cursor: 0,
+            table: &schema[0],
+            table_alias: None,
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let unsupported_subquery = select_sql("SELECT b, b FROM s");
+        let set = InSet::Subquery(Box::new(unsupported_subquery));
+        let operand = Expr::Column(ColumnRef::bare("a"), Span::ZERO);
+        let mut b = ProgramBuilder::new();
+        let result_reg = b.alloc_reg();
+
+        emit_in_probe_expr(&mut b, &operand, &set, false, result_reg, Some(&scan_ctx));
+
+        let program = b.finish().expect("error program should be valid VDBE");
+        assert_eq!(
+            program.ops(),
+            &[VdbeOp {
+                opcode: Opcode::Halt,
+                p1: ErrorCode::Internal as i32,
+                p2: 0,
+                p3: 0,
+                p4: P4::Str(
+                    "IN probe codegen invariant failed: unsupported probe source".to_owned()
+                ),
+                p5: 0,
+            }],
+            "an unsupported compiled IN probe must fail explicitly, never yield SQL NULL"
+        );
+    }
+
+    fn in_subquery_program_ops(sql: &str, schema: &[TableSchema]) -> Vec<VdbeOp> {
+        let stmt = select_sql(sql);
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, schema, &CodegenContext::default())
+            .expect("IN-subquery fixture should compile");
+        b.finish()
+            .expect("IN-subquery program should finish")
+            .ops()
+            .to_vec()
+    }
+
+    #[test]
+    fn complex_in_ordered_top_n_emits_independent_key_before_projection() {
+        let schema = test_schema_with_subquery_source();
+        let ops = in_subquery_program_ops(
+            "SELECT a IN (SELECT out() FROM s ORDER BY key() LIMIT 1) FROM t",
+            &schema,
+        );
+        let function_index = |name: &str| {
+            ops.iter()
+                .position(|op| {
+                    op.opcode == Opcode::PureFunc
+                        && matches!(&op.p4, P4::FuncName(actual) if actual == name)
+                })
+                .unwrap_or_else(|| panic!("expected {name} function opcode"))
+        };
+
+        assert!(
+            function_index("KEY") < function_index("OUT"),
+            "a non-DISTINCT bounded sorter must compute an independent ORDER key \
+             before the projected RHS value"
+        );
+        let preflight_index = ops
+            .iter()
+            .position(|op| {
+                op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
+            })
+            .expect("bounded complex-IN sorter should preflight each candidate key");
+        assert!(
+            function_index("KEY") < preflight_index && preflight_index < function_index("OUT"),
+            "a rejected candidate must branch around its projected RHS value"
+        );
+        let sorter_open = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterOpen)
+            .expect("ordered RHS should open a sorter");
+        assert_eq!(
+            sorter_open.p5, SORTER_OPEN_TOP_N_REGISTER,
+            "complex-IN sorter should read its top-N bound from the LIMIT register"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::Integer && op.p1 == 1 && op.p2 == sorter_open.p3
+            }),
+            "constant LIMIT 1 should populate the complex-IN top-N bound register"
+        );
+    }
+
+    #[test]
+    fn complex_in_exact_output_order_reference_reuses_volatile_projection() {
+        let schema = test_schema_with_subquery_source();
+        for sql in [
+            "SELECT a IN (SELECT out() FROM s ORDER BY out() LIMIT 1) FROM t",
+            "SELECT a IN (SELECT out() AS x FROM s ORDER BY x COLLATE BINARY LIMIT 1) FROM t",
+            "SELECT a IN (SELECT out() FROM s ORDER BY +1 LIMIT 1) FROM t",
+            "SELECT a IN (SELECT out(b) FROM s ORDER BY out(s.b) LIMIT 1) FROM t",
+            "SELECT a IN (SELECT out(b) FROM s ORDER BY out(B) LIMIT 1) FROM t",
+            "SELECT a IN (SELECT out(b) FROM s AS x ORDER BY out(x.b) LIMIT 1) FROM t",
+            "SELECT a IN (SELECT out(rowid) FROM s ORDER BY out(_rowid_) LIMIT 1) FROM t",
+            "SELECT a IN (SELECT out(rowid) FROM s ORDER BY out(oid) LIMIT 1) FROM t",
+        ] {
+            let ops = in_subquery_program_ops(sql, &schema);
+            let output_calls = ops
+                .iter()
+                .filter(|op| {
+                    op.opcode == Opcode::PureFunc
+                        && matches!(&op.p4, P4::FuncName(name) if name == "OUT")
+                })
+                .count();
+            assert_eq!(
+                output_calls, 1,
+                "exact output alias/ordinal/expression should share one emitted value: `{sql}`"
+            );
+        }
+
+        let collated_expr_ops = in_subquery_program_ops(
+            "SELECT a IN \
+             (SELECT out() FROM s ORDER BY out() COLLATE BINARY LIMIT 1) FROM t",
+            &schema,
+        );
+        let output_calls = collated_expr_ops
+            .iter()
+            .filter(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "OUT")
+            })
+            .count();
+        assert_eq!(
+            output_calls, 2,
+            "a separately written COLLATE-wrapped output expression is not an alias reference"
+        );
+    }
+
+    #[test]
+    fn complex_in_exact_output_reuses_integer_primary_key_for_rowid_order_reference() {
+        let mut schema = test_schema_with_subquery_source();
+        schema[1].columns = vec![ColumnInfo::basic("id", 'D', true)];
+        let sql = "SELECT a IN (SELECT out(id) FROM s ORDER BY out(rowid) LIMIT 1) FROM t";
+        let ops = in_subquery_program_ops(sql, &schema);
+        let output_calls = ops
+            .iter()
+            .filter(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "OUT")
+            })
+            .count();
+        assert_eq!(
+            output_calls, 1,
+            "an INTEGER PRIMARY KEY alias and rowid name the same projected value"
+        );
+    }
+
+    #[test]
+    fn complex_in_uncorrelated_scalar_lhs_preserves_affinity_and_rhs_first_order() {
+        let mut schema = test_schema_with_subquery_source();
+        schema[1].columns[0].type_name = Some("TEXT".to_owned());
+        let mut integer_column = ColumnInfo::basic("x", 'D', false);
+        integer_column.type_name = Some("INTEGER".to_owned());
+        schema.push(TableSchema {
+            name: "scalar_lhs".to_owned(),
+            root_page: 4,
+            columns: vec![integer_column],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        });
+
+        for sql in [
+            "SELECT (SELECT x FROM scalar_lhs) IN \
+             (SELECT b FROM s ORDER BY rowid LIMIT 1) FROM t",
+            "SELECT (SELECT CAST(1 AS INTEGER)) IN \
+             (SELECT b FROM s ORDER BY rowid LIMIT 1) FROM t",
+        ] {
+            let ops = in_subquery_program_ops(sql, &schema);
+            let rhs_open = ops
+                .iter()
+                .position(|op| {
+                    op.opcode == Opcode::OpenRead
+                        && matches!(&op.p4, P4::Table(name) if name == "s")
+                })
+                .expect("complex RHS should open s");
+            let scalar_open = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::OpenRead && op.p2 == schema[2].root_page);
+            if sql.contains("FROM scalar_lhs") {
+                assert!(
+                    scalar_open.is_some_and(|index| rhs_open < index),
+                    "the RHS must be materialized before opening the scalar-LHS source"
+                );
+            } else {
+                assert!(
+                    scalar_open.is_none(),
+                    "a FROM-less scalar LHS should not open a source cursor"
+                );
+            }
+            assert!(
+                ops.iter()
+                    .filter(|op| {
+                        op.opcode == Opcode::Affinity
+                            && matches!(&op.p4, P4::Affinity(affinity) if affinity == "C")
+                    })
+                    .count()
+                    >= 2,
+                "INTEGER scalar-result affinity must numerically coerce the TEXT RHS and probe"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::Halt && op.p1 != 0),
+                "eligible uncorrelated scalar LHS must remain on native complex-IN codegen"
+            );
+        }
+    }
+
+    #[test]
+    fn complex_in_scalar_lhs_does_not_inherit_inner_result_collation() {
+        let mut schema = test_schema_with_subquery_source();
+        schema[1].columns[0].type_name = Some("TEXT".to_owned());
+        let mut nocase_column = ColumnInfo::basic("x", 'B', false);
+        nocase_column.type_name = Some("TEXT".to_owned());
+        nocase_column.collation = Some("NOCASE".to_owned());
+        schema.push(TableSchema {
+            name: "scalar_lhs".to_owned(),
+            root_page: 4,
+            columns: vec![nocase_column],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        });
+
+        for sql in [
+            "SELECT (SELECT x FROM scalar_lhs) IN \
+             (SELECT b FROM s ORDER BY rowid LIMIT 1) FROM t",
+            "SELECT (SELECT x COLLATE NOCASE FROM scalar_lhs) IN \
+             (SELECT b FROM s ORDER BY rowid LIMIT 1) FROM t",
+        ] {
+            let ops = in_subquery_program_ops(sql, &schema);
+            let membership = ops
+                .iter()
+                .find(|op| op.opcode == Opcode::OpenAutoindex)
+                .expect("complex IN should open its membership index");
+            assert_eq!(
+                membership.p4,
+                P4::None,
+                "a scalar subquery's inner result collation does not cross its SQL boundary: `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn complex_in_rejects_correlated_or_function_bearing_scalar_lhs() {
+        let mut schema = test_schema_with_subquery_source();
+        schema.push(TableSchema {
+            name: "scalar_lhs".to_owned(),
+            root_page: 4,
+            columns: vec![ColumnInfo::basic("x", 'D', false)],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        });
+
+        for sql in [
+            "SELECT (SELECT a) IN \
+             (SELECT b FROM s ORDER BY rowid LIMIT 1) FROM t",
+            "SELECT (SELECT t.a FROM scalar_lhs) IN \
+             (SELECT b FROM s ORDER BY rowid LIMIT 1) FROM t",
+            "SELECT (SELECT out()) IN \
+             (SELECT b FROM s ORDER BY rowid LIMIT 1) FROM t",
+        ] {
+            let ops = in_subquery_program_ops(sql, &schema);
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::SorterOpen),
+                "a scalar LHS with outer scope or function semantics must not enter native complex-IN lowering: `{sql}`"
+            );
+            assert!(
+                ops.iter()
+                    .any(|op| op.opcode == Opcode::Halt && op.p1 == ErrorCode::Internal as i32),
+                "direct codegen must fail closed for an ineligible scalar LHS: `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn complex_in_distinct_function_output_order_reference_reprojects() {
+        let schema = test_schema_with_subquery_source();
+        for sql in [
+            "SELECT a IN \
+             (SELECT DISTINCT out(b) AS x FROM s ORDER BY x LIMIT 1) FROM t",
+            "SELECT a IN \
+             (SELECT DISTINCT out(b) FROM s ORDER BY 1 LIMIT 1) FROM t",
+            "SELECT a IN \
+             (SELECT DISTINCT out(b) FROM s ORDER BY out(s.b) LIMIT 1) FROM t",
+        ] {
+            let ops = in_subquery_program_ops(sql, &schema);
+            let output_calls = ops
+                .iter()
+                .enumerate()
+                .filter_map(|(index, op)| {
+                    (op.opcode == Opcode::PureFunc
+                        && matches!(&op.p4, P4::FuncName(name) if name == "OUT"))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                output_calls.len(),
+                2,
+                "exact alias/ordinal/qualified-structural ordered DISTINCT must emit \
+                 one pass-1 evaluation and one second-stage projection: `{sql}`"
+            );
+
+            let distinct_probe = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::Found)
+                .expect("ordered DISTINCT should probe pass-1 membership");
+            let sorter_data = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::SorterData)
+                .expect("ordered DISTINCT should restore its retained representative");
+            let representative_seek = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::SeekRowid)
+                .expect("rowid-table reprojection should seek the representative source row");
+            let source_cursor = ops
+                .iter()
+                .find(|op| {
+                    op.opcode == Opcode::OpenRead
+                        && matches!(&op.p4, P4::Table(name) if name == "s")
+                })
+                .map(|op| op.p1)
+                .expect("complex-IN should open source table s");
+            let source_close = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::Close && op.p1 == source_cursor)
+                .expect("complex-IN should close source table s");
+            assert!(
+                output_calls[0] < distinct_probe
+                    && sorter_data < representative_seek
+                    && representative_seek < output_calls[1]
+                    && output_calls[1] < source_close,
+                "pass 1 must preserve output-first membership, then pass 2 must restore \
+                 and reproject the retained representative before closing its rowid cursor: `{sql}`"
+            );
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::SorterOpen)
+                    && !ops
+                        .iter()
+                        .any(|op| op.opcode == Opcode::Halt && op.p1 == ErrorCode::Internal as i32),
+                "supported ordered-DISTINCT projection must stay in native complex-IN lowering: `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn table_local_expression_matching_rejects_foreign_qualifiers() {
+        let schema = test_schema_with_subquery_source();
+        let stored = expr_sql("out(b)");
+        let foreign = expr_sql("out(other.b)");
+        assert!(
+            !expressions_match_table_locally(&foreign, &stored, &schema[1], None),
+            "a foreign qualifier must never be stripped into a local expression match"
+        );
+    }
+
+    #[test]
+    fn complex_in_no_order_offset_skips_before_projection() {
+        let schema = test_schema_with_subquery_source();
+        let ops = in_subquery_program_ops(
+            "SELECT a IN (SELECT tick() FROM s LIMIT 1 OFFSET 1) FROM t",
+            &schema,
+        );
+        let offset_skip = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::IfPos)
+            .expect("OFFSET should emit IfPos");
+        let projection = ops
+            .iter()
+            .position(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "TICK")
+            })
+            .expect("projection should emit tick()");
+        assert!(
+            offset_skip < projection,
+            "non-DISTINCT OFFSET rows must be skipped before evaluating the RHS projection"
+        );
+    }
+
+    #[test]
+    fn complex_in_validates_limit_before_opening_source_table() {
+        let schema = test_schema_with_subquery_source();
+        let ops = in_subquery_program_ops(
+            "SELECT a IN (SELECT b FROM s ORDER BY b LIMIT ?1) FROM t",
+            &schema,
+        );
+        let limit_variable = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Variable && op.p1 == 1)
+            .expect("dynamic LIMIT should emit Variable ?1");
+        let limit_coercion = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::MustBeInt)
+            .expect("dynamic LIMIT should emit MustBeInt");
+        let source_open = ops
+            .iter()
+            .position(|op| {
+                op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "s")
+            })
+            .expect("complex RHS should open source table s");
+        assert!(
+            limit_variable < limit_coercion && limit_coercion < source_open,
+            "LIMIT evaluation/coercion must precede RHS table I/O"
+        );
+        let sorter_open = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterOpen)
+            .expect("ordered complex-IN RHS should open a sorter");
+        assert_eq!(
+            sorter_open.p5, SORTER_OPEN_TOP_N_REGISTER,
+            "dynamic complex-IN LIMIT should supply a runtime top-N bound"
+        );
+        assert_eq!(
+            sorter_open.p3, ops[limit_variable].p2,
+            "without OFFSET, SorterOpen should read the coerced LIMIT register directly"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
+            }),
+            "dynamic complex-IN LIMIT should preflight keys before projection"
+        );
+    }
+
+    #[test]
+    fn complex_in_raw_non_numbered_operand_and_limit_fail_closed() {
+        let schema = test_schema_with_subquery_source();
+        for sql in [
+            "SELECT ? IN (SELECT b FROM s ORDER BY b LIMIT ?) FROM t",
+            "SELECT :lhs IN (SELECT b FROM s ORDER BY b LIMIT :lim) FROM t",
+        ] {
+            let ops = in_subquery_program_ops(sql, &schema);
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::SorterOpen),
+                "raw non-numbered parameters must not enter emission-reordered complex IN: `{sql}`"
+            );
+            assert!(
+                ops.iter()
+                    .any(|op| { op.opcode == Opcode::Halt && op.p1 == ErrorCode::Internal as i32 }),
+                "direct raw codegen must fail closed until slots are canonicalized: `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn complex_in_rejects_negative_order_ordinal() {
+        let schema = test_schema_with_subquery_source();
+        let ops = in_subquery_program_ops(
+            "SELECT a IN (SELECT b FROM s ORDER BY -1 LIMIT 1) FROM t",
+            &schema,
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SorterOpen),
+            "negative ORDER ordinal must not degrade into a constant sort key"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Halt && op.p1 == ErrorCode::Internal as i32),
+            "connection routing should intercept the declined out-of-range ordinal"
+        );
+    }
+
+    #[test]
+    fn complex_in_single_star_reads_integer_primary_key_as_rowid() {
+        let mut schema = test_schema_with_subquery_source();
+        schema[1].columns = vec![ColumnInfo::basic("id", 'D', true)];
+        let ops = in_subquery_program_ops(
+            "SELECT a IN (SELECT * FROM s ORDER BY +1 LIMIT 1) FROM t",
+            &schema,
+        );
+        let source_cursor = ops
+            .iter()
+            .find_map(|op| {
+                (op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "s"))
+                    .then_some(op.p1)
+            })
+            .expect("complex RHS should open s");
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rowid && op.p1 == source_cursor),
+            "one-column star over an INTEGER PRIMARY KEY must read the rowid value"
+        );
+
+        let probe_source = InProbeSource {
+            table: &schema[1],
+            table_alias: None,
+            where_clause: None,
+            value: InProbeValue::FirstColumn,
+        };
+        let probe_scan = ScanCtx {
+            cursor: source_cursor,
+            table: &schema[1],
+            table_alias: None,
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        assert_eq!(
+            in_probe_value_affinity(&probe_source, &probe_scan),
+            b'D',
+            "INTEGER PRIMARY KEY star output must retain INTEGER affinity"
+        );
+    }
+
+    #[test]
+    fn complex_in_exact_alias_collision_uses_output_collation() {
+        let mut schema = test_schema_with_subquery_source();
+        schema[1].columns = vec![
+            ColumnInfo {
+                name: "k".to_owned(),
+                affinity: 'B',
+                is_ipk: false,
+                type_name: Some("TEXT".to_owned()),
+                notnull: false,
+                unique: false,
+                default_value: None,
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: Some("BINARY".to_owned()),
+                conflict_action: None,
+            },
+            ColumnInfo {
+                name: "v".to_owned(),
+                affinity: 'B',
+                is_ipk: false,
+                type_name: Some("TEXT".to_owned()),
+                notnull: false,
+                unique: false,
+                default_value: None,
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: Some("NOCASE".to_owned()),
+                conflict_action: None,
+            },
+        ];
+        let ops = in_subquery_program_ops(
+            "SELECT a IN (SELECT v AS k FROM s ORDER BY k LIMIT 1) FROM t",
+            &schema,
+        );
+        let sorter_open = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterOpen)
+            .expect("ordered RHS should open sorter");
+        let P4::Str(sorter_p4) = &sorter_open.p4 else {
+            panic!("unexpected sorter metadata: {:?}", &sorter_open.p4);
+        };
+        assert_eq!(
+            sorter_p4, "+|NOCASE",
+            "bare ORDER alias wins a same-named BINARY source column and inherits output NOCASE"
+        );
+    }
+
+    #[test]
+    fn nested_explicit_and_preserved_declared_collations_are_discovered() {
+        let nested = expr_sql("('a' COLLATE NOCASE) || ''");
+        assert_eq!(extract_collation(&nested), Some("NOCASE"));
+
+        let schema = test_schema_with_nocase_text_column();
+        let scan = ScanCtx {
+            cursor: 0,
+            table: &schema[0],
+            table_alias: None,
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        for sql in ["+name", "CAST(name AS TEXT)"] {
+            let expr = expr_sql(sql);
+            assert_eq!(
+                effective_collation_ctx(&expr, Some(&scan)),
+                Some("NOCASE"),
+                "declared collation should survive `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_in_probe_source_rejects_schema_qualified_table_shorthand() {
+        let set = InSet::Table(QualifiedName::qualified("main", "s"));
+        let schema = test_schema_with_subquery_source();
+        assert!(resolve_in_probe_source(&set, &schema).is_none());
+    }
+
+    #[test]
     fn test_codegen_select_where_in_table_supported_without_rewrite() {
         let where_expr = Expr::In {
             expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
@@ -37590,7 +41582,7 @@ mod tests {
             ]
         ));
 
-        // Integer for LIMIT should appear after scan pass.
+        // LIMIT is evaluated before opening or scanning the source table.
         let integers: Vec<_> = prog
             .ops()
             .iter()
@@ -37607,8 +41599,329 @@ mod tests {
             .find(|op| op.opcode == Opcode::SorterOpen)
             .expect("ORDER BY + LIMIT should open a sorter");
         assert_eq!(
-            sorter_open.p3, 5,
-            "simple ORDER BY + LIMIT should encode top-N pruning limit in SorterOpen.p3"
+            sorter_open.p5, SORTER_OPEN_TOP_N_REGISTER,
+            "simple ORDER BY + LIMIT should read its top-N bound from a register"
+        );
+        assert!(
+            integers
+                .iter()
+                .any(|op| op.p1 == 5 && op.p2 == sorter_open.p3),
+            "SorterOpen.p3 should name the register containing LIMIT 5"
+        );
+        let limit_index = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::Integer && op.p1 == 5)
+            .expect("constant LIMIT should be emitted");
+        let source_open_index = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::OpenRead)
+            .expect("ordered SELECT should open its source");
+        assert!(
+            limit_index < source_open_index,
+            "LIMIT evaluation must precede source-table I/O"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ordered_top_n_preflights_before_independent_projection() {
+        let stmt = select_sql("SELECT out(b) FROM t ORDER BY key(a) LIMIT ?1 OFFSET ?2");
+        let schema = test_schema();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let function_index = |name: &str| {
+            ops.iter()
+                .position(|op| {
+                    op.opcode == Opcode::PureFunc
+                        && matches!(&op.p4, P4::FuncName(actual) if actual == name)
+                })
+                .unwrap_or_else(|| panic!("expected {name} function opcode"))
+        };
+        let preflight_index = ops
+            .iter()
+            .position(|op| {
+                op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
+            })
+            .expect("dynamic top-N should emit candidate preflight");
+        assert!(
+            function_index("KEY") < preflight_index && preflight_index < function_index("OUT"),
+            "candidate admission must occur after the ORDER key and before an independent projection"
+        );
+
+        let sorter_open = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterOpen)
+            .expect("ordered SELECT should open a sorter");
+        assert_eq!(sorter_open.p5, SORTER_OPEN_TOP_N_REGISTER);
+        assert!(
+            ops.iter()
+                .any(|op| { op.opcode == Opcode::OffsetLimit && op.p3 == sorter_open.p3 }),
+            "runtime LIMIT+OFFSET should supply the sorter bound"
+        );
+        let sorter_open_index = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SorterOpen)
+            .expect("ordered SELECT should open a sorter");
+        let second_must_be_int = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == Opcode::MustBeInt)
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("LIMIT and OFFSET should both be coerced");
+        assert!(
+            second_must_be_int < sorter_open_index,
+            "LIMIT/OFFSET coercion must finish before sorter/source setup"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ordered_raw_non_numbered_parameters_fail_closed() {
+        let schema = test_schema();
+        for sql in [
+            "SELECT ? AS x FROM t ORDER BY x LIMIT ?",
+            "SELECT :shared AS x FROM t ORDER BY x LIMIT :shared",
+            "SELECT a FROM t WHERE a = ? ORDER BY a LIMIT ?",
+            "SELECT a FROM t ORDER BY (? + a) LIMIT ?",
+        ] {
+            let stmt = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            let error = codegen_select(&mut b, &stmt, &schema, &CodegenContext::default())
+                .expect_err("emission-reordered raw parameters should fail closed");
+            assert!(
+                matches!(
+                    error,
+                    CodegenError::Unsupported(ref message)
+                        if message.contains("canonical numbered bind parameters")
+                ),
+                "unexpected raw ordered-parameter error for `{sql}`: {error:?}"
+            );
+        }
+
+        let stmt = select_sql("SELECT ?1 AS x FROM t ORDER BY x LIMIT ?2 OFFSET ?3");
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default())
+            .expect("canonical ?NNN slots remain stable despite LIMIT-first emission");
+        let program = b.finish().unwrap();
+        let variable_slots = program
+            .ops()
+            .iter()
+            .filter_map(|op| (op.opcode == Opcode::Variable).then_some(op.p1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            variable_slots,
+            vec![2, 3, 1],
+            "LIMIT/OFFSET may emit before projection, but explicit bind slots must remain textual"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ordered_distinct_top_n_membership_precedes_admission() {
+        let assert_program = |ops: &[VdbeOp], label: &str| {
+            let sorter_open = ops
+                .iter()
+                .find(|op| op.opcode == Opcode::SorterOpen)
+                .unwrap_or_else(|| panic!("[{label}] ordered DISTINCT should open a sorter"));
+            assert_eq!(
+                sorter_open.p5, SORTER_OPEN_TOP_N_REGISTER,
+                "[{label}] ordered DISTINCT should retain only LIMIT+OFFSET representatives"
+            );
+
+            let preflight_index = ops
+                .iter()
+                .position(|op| {
+                    op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
+                })
+                .unwrap_or_else(|| panic!("[{label}] ordered DISTINCT should preflight admission"));
+            let found_index = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::Found)
+                .unwrap_or_else(|| panic!("[{label}] DISTINCT should probe membership"));
+            let distinct_insert_index = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::IdxInsert)
+                .unwrap_or_else(|| panic!("[{label}] DISTINCT should record first membership"));
+            assert!(
+                found_index < distinct_insert_index && distinct_insert_index < preflight_index,
+                "[{label}] every first DISTINCT representative must enter membership before \
+                 bounded-sorter admission; rejected representatives must still suppress later duplicates"
+            );
+
+            let output_calls = ops
+                .iter()
+                .enumerate()
+                .filter_map(|(index, op)| {
+                    (op.opcode == Opcode::PureFunc
+                        && matches!(&op.p4, P4::FuncName(name) if name == "OUT"))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                output_calls.len(),
+                2,
+                "[{label}] exact ascending DISTINCT output should be evaluated in pass 1 \
+                 and reprojected only for an emitted representative"
+            );
+            assert!(
+                output_calls[0] < found_index,
+                "[{label}] pass-1 output must be evaluated before DISTINCT membership"
+            );
+
+            let offset_index = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::IfPos)
+                .unwrap_or_else(|| panic!("[{label}] OFFSET should skip sorted representatives"));
+            let sorter_data_index = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::SorterData)
+                .unwrap_or_else(|| panic!("[{label}] pass 2 should read retained sorter rows"));
+            assert!(
+                offset_index < sorter_data_index && sorter_data_index < output_calls[1],
+                "[{label}] OFFSET must skip representatives before source restore and reprojection"
+            );
+        };
+
+        let schema = test_schema();
+        let stmt = select_sql("SELECT DISTINCT out(b) AS x FROM t ORDER BY x LIMIT 1 OFFSET 1");
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let program = b.finish().unwrap();
+        assert_program(program.ops(), "top-level");
+
+        let complex_ops = in_subquery_program_ops(
+            "SELECT a IN \
+             (SELECT DISTINCT out(b) AS x FROM s ORDER BY x LIMIT 1 OFFSET 1) FROM t",
+            &test_schema_with_subquery_source(),
+        );
+        assert_program(&complex_ops, "complex-in");
+    }
+
+    #[test]
+    fn test_codegen_ordered_exact_output_reference_is_evaluated_once() {
+        let schema = test_schema();
+        for sql in [
+            "SELECT out(b) AS x FROM t ORDER BY x LIMIT 1",
+            "SELECT out(b) AS x FROM t ORDER BY x COLLATE BINARY LIMIT 1",
+            "SELECT out(b) FROM t ORDER BY 1 LIMIT 1",
+            "SELECT out(b) FROM t ORDER BY out(t.b) LIMIT 1",
+        ] {
+            let stmt = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+            let prog = b.finish().unwrap();
+            let output_calls = prog
+                .ops()
+                .iter()
+                .filter(|op| {
+                    op.opcode == Opcode::PureFunc
+                        && matches!(&op.p4, P4::FuncName(name) if name == "OUT")
+                })
+                .count();
+            assert_eq!(
+                output_calls, 1,
+                "an exact output alias/ordinal/expression should share one emitted value: `{sql}`"
+            );
+        }
+
+        let stmt = select_sql("SELECT out(b) FROM t ORDER BY out(b) COLLATE BINARY LIMIT 1");
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let output_calls = prog
+            .ops()
+            .iter()
+            .filter(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "OUT")
+            })
+            .count();
+        assert_eq!(
+            output_calls, 2,
+            "a separately written COLLATE-wrapped expression remains a distinct evaluation"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ordered_star_ordinal_inherits_output_collation() {
+        let mut schema = test_schema();
+        schema[0].columns[0].collation = Some("NOCASE".to_owned());
+        let stmt = select_sql("SELECT * FROM t ORDER BY 1 LIMIT 1");
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let sorter_open = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterOpen)
+            .expect("star ordinal should use an ordered sorter");
+        assert_eq!(
+            sorter_open.p4,
+            P4::Str("+|NOCASE".to_owned()),
+            "ORDER BY 1 should inherit the first expanded star column's collation"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ordered_ordinals_are_range_checked_after_star_expansion() {
+        let schema = test_schema();
+        for sql in [
+            "SELECT a, b FROM t ORDER BY 0",
+            "SELECT a, b FROM t ORDER BY -1",
+            "SELECT a, b FROM t ORDER BY +3",
+            "SELECT a FROM t ORDER BY 2 COLLATE BINARY",
+        ] {
+            let stmt = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            let error = codegen_select(&mut b, &stmt, &schema, &CodegenContext::default())
+                .expect_err("out-of-range ORDER ordinal should fail");
+            assert!(
+                matches!(error, CodegenError::Unsupported(ref message) if message.contains("ORDER BY term")),
+                "unexpected out-of-range ORDER ordinal error for `{sql}`: {error:?}"
+            );
+        }
+
+        let stmt = select_sql("SELECT * FROM t ORDER BY 2");
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default())
+            .expect("ORDER BY 2 should resolve to the second column expanded from star");
+    }
+
+    #[test]
+    fn test_codegen_static_negative_limit_skips_top_n_preflight() {
+        let schema = test_schema();
+        let stmt = select_sql("SELECT out(b) FROM t ORDER BY a LIMIT -1");
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let sorter_open = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterOpen)
+            .expect("ordered SELECT should still use a full sorter");
+        assert_eq!(
+            sorter_open.p5, 0,
+            "a static negative LIMIT means no bound and should not use runtime-bound setup"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| {
+                op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
+            }),
+            "a static negative LIMIT must not pay per-row preflight overhead"
+        );
+
+        let complex_ops = in_subquery_program_ops(
+            "SELECT a IN (SELECT out(b) FROM s ORDER BY b LIMIT -1) FROM t",
+            &test_schema_with_subquery_source(),
+        );
+        assert!(
+            !complex_ops.iter().any(|op| {
+                op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
+            }),
+            "complex IN should also skip preflight for a static negative LIMIT"
         );
     }
 
@@ -37728,6 +42041,160 @@ mod tests {
                 .any(|op| op.opcode == Opcode::LikeConstFast
                     && op.p4 == P4::Str("prefix".to_owned())),
             "prefix LIKE should hoist the trimmed literal into LikeConstFast"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_custom_like_context_disables_builtin_shortcuts() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(Box::new(Expr::Like {
+                expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                pattern: Box::new(Expr::Literal(
+                    Literal::String("123%".to_owned()),
+                    Span::ZERO,
+                )),
+                escape: None,
+                op: fsqlite_ast::LikeOp::Like,
+                not: false,
+                span: Span::ZERO,
+            })),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        with_connection_function_context(Vec::new(), false, true, || {
+            codegen_select(&mut b, &stmt, &schema, &ctx)
+        })
+        .unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::LikeConstFast),
+            "a replaced like() function must not be bypassed by LikeConstFast"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "LIKE")
+            }),
+            "LIKE must dispatch through the function registry after replacement"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "a built-in LIKE prefix range can exclude rows accepted by a replacement"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "the replacement-aware lowering should retain the complete table candidate set"
+        );
+        assert!(
+            use_builtin_like_glob_semantics(),
+            "the connection function context must restore its prior state"
+        );
+    }
+
+    #[test]
+    fn scalar_override_declines_only_function_bearing_partial_index_heuristics() {
+        fn fixture_where(sql: &str) -> Expr {
+            let stmt = select_sql(sql);
+            let SelectCore::Select {
+                where_clause: Some(where_clause),
+                ..
+            } = stmt.body.select
+            else {
+                panic!("partial-index fixture must have a WHERE clause");
+            };
+            *where_clause
+        }
+
+        let mut function_table = bd_2dgf5_table();
+        function_table
+            .indexes
+            .first_mut()
+            .expect("fixture must have an index")
+            .where_clause = Some("abs(v) = 1".to_owned());
+        let function_where = fixture_where("SELECT id FROM t WHERE k = 2 AND abs(v) = 1");
+        let mut function_conjuncts = Vec::new();
+        collect_conjunctive_terms(&function_where, &mut function_conjuncts);
+        assert!(
+            index_partial_predicate_is_covered_by_query_conjuncts(
+                &function_table.indexes[0],
+                &function_conjuncts,
+                &function_table,
+                None,
+            ),
+            "with built-in scalar semantics, the structurally identical function predicate \
+             should prove partial-index coverage"
+        );
+        assert!(
+            aggregate_index_prefix_literal_residual_target(
+                Some(&function_where),
+                &function_table,
+                None,
+                None,
+            )
+            .is_some(),
+            "fixture must exercise the partial-index equality-prefix residual heuristic"
+        );
+
+        let mut plain_table = bd_2dgf5_table();
+        plain_table
+            .indexes
+            .first_mut()
+            .expect("fixture must have an index")
+            .where_clause = Some("v = 'x'".to_owned());
+        let plain_where = fixture_where("SELECT id FROM t WHERE k = 2 AND v = 'x'");
+        let mut plain_conjuncts = Vec::new();
+        collect_conjunctive_terms(&plain_where, &mut plain_conjuncts);
+
+        with_connection_function_context(Vec::new(), true, false, || {
+            assert!(
+                !index_partial_predicate_is_covered_by_query_conjuncts(
+                    &function_table.indexes[0],
+                    &function_conjuncts,
+                    &function_table,
+                    None,
+                ),
+                "any scalar replacement must decline a function-bearing partial-index proof"
+            );
+            assert!(
+                aggregate_index_prefix_literal_residual_target(
+                    Some(&function_where),
+                    &function_table,
+                    None,
+                    None,
+                )
+                .is_none(),
+                "a scalar replacement must keep the function-bearing partial index \
+                 out of the equality-prefix residual heuristic"
+            );
+            assert!(
+                index_partial_predicate_is_covered_by_query_conjuncts(
+                    &plain_table.indexes[0],
+                    &plain_conjuncts,
+                    &plain_table,
+                    None,
+                ),
+                "an unrelated scalar replacement must not disable a function-free partial predicate"
+            );
+            assert!(
+                aggregate_index_prefix_literal_residual_target(
+                    Some(&plain_where),
+                    &plain_table,
+                    None,
+                    None,
+                )
+                .is_some(),
+                "the function-free partial index must remain eligible for the residual heuristic"
+            );
+        });
+        assert!(
+            use_builtin_scalar_function_semantics(),
+            "the connection function context must restore scalar semantics state"
         );
     }
 
@@ -42167,6 +46634,323 @@ mod tests {
         assert!(matches!(&steps[0].p4, P4::FuncName(f) if f == "SUM"));
     }
 
+    #[test]
+    fn test_custom_aggregate_keys_preserve_max_arity_resolution() {
+        let unary = FunctionArgs::List(vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]);
+        let binary = FunctionArgs::List(vec![
+            Expr::Literal(Literal::Integer(1), Span::ZERO),
+            Expr::Literal(Literal::Integer(2), Span::ZERO),
+        ]);
+
+        assert!(is_aggregate_function_call("max", &unary));
+        assert!(
+            !is_aggregate_function_call("max", &binary),
+            "the built-in two-argument max() form is scalar"
+        );
+
+        with_connection_function_context(vec![("max".to_owned(), 1)], true, true, || {
+            assert!(is_aggregate_function_call("max", &unary));
+            assert!(
+                !is_aggregate_function_call("max", &binary),
+                "a custom max/1 must not change max/2"
+            );
+        });
+        with_connection_function_context(vec![("max".to_owned(), -1)], true, true, || {
+            assert!(
+                is_aggregate_function_call("max", &unary),
+                "the exact built-in max/1 outranks the variadic registration but remains aggregate"
+            );
+            assert!(
+                is_aggregate_function_call("max", &binary),
+                "a variadic custom max replaces the scalar-shaped max/2 call"
+            );
+        });
+        with_connection_function_context(vec![("max".to_owned(), 2)], true, true, || {
+            assert!(is_aggregate_function_call("max", &binary));
+        });
+        with_connection_function_context(vec![("custom".to_owned(), 1)], true, true, || {
+            assert!(is_aggregate_function_call("custom", &unary));
+            assert!(
+                !is_aggregate_function_call("custom", &binary),
+                "a fixed-arity custom aggregate must not capture a scalar overload"
+            );
+        });
+        with_connection_function_context(vec![("custom".to_owned(), -1)], true, true, || {
+            assert!(is_aggregate_function_call("custom", &unary));
+            assert!(is_aggregate_function_call("custom", &binary));
+        });
+
+        assert!(
+            !is_aggregate_function_call("max", &binary),
+            "the codegen function context must restore its prior arity map"
+        );
+    }
+
+    #[test]
+    fn custom_builtin_aggregate_overrides_decline_algebraic_codegen_shortcuts() {
+        let compile =
+            |stmt: &SelectStatement, schema: &[TableSchema], custom_keys: Vec<(String, i32)>| {
+                with_connection_function_context(custom_keys, true, true, || {
+                    let mut builder = ProgramBuilder::new();
+                    codegen_select(&mut builder, stmt, schema, &CodegenContext::default())
+                        .expect("custom aggregate fixture should compile");
+                    builder
+                        .finish()
+                        .expect("custom aggregate program should finish")
+                        .ops()
+                        .to_vec()
+                })
+            };
+
+        let count_ops = compile(
+            &agg_count_star("t"),
+            &test_schema(),
+            vec![("count".to_owned(), 0)],
+        );
+        assert!(
+            !count_ops.iter().any(|op| op.opcode == Opcode::Count),
+            "custom count/0 must not use the built-in Count opcode"
+        );
+        assert!(
+            count_ops.iter().any(|op| {
+                op.opcode == Opcode::AggStep
+                    && matches!(&op.p4, P4::FuncName(name) if name == "COUNT")
+            }),
+            "custom count/0 must flow through generic AggStep"
+        );
+
+        let count_sum_ops = compile(
+            &agg_count_star_and_sum("a", "t"),
+            &test_schema(),
+            vec![("sum".to_owned(), 1)],
+        );
+        assert!(
+            !count_sum_ops.iter().any(|op| op.opcode == Opcode::Count),
+            "custom sum/1 must decline COUNT+SUM fusion because the fused path \
+             assumes built-in SUM semantics"
+        );
+        assert_eq!(
+            count_sum_ops
+                .iter()
+                .filter(|op| op.opcode == Opcode::AggStep)
+                .count(),
+            2,
+            "declined COUNT+SUM fusion must step both aggregates generically"
+        );
+
+        let mut scalar_stmt = simple_select(&["a"], "t", None);
+        let SelectCore::Select { columns, .. } = &mut scalar_stmt.body.select else {
+            unreachable!("simple_select returns a SELECT core");
+        };
+        columns.push(ResultColumn::Expr {
+            expr: Expr::Subquery(Box::new(agg_count_star("s")), Span::ZERO),
+            alias: None,
+        });
+        let scalar_ops = compile(
+            &scalar_stmt,
+            &test_schema_with_subquery_source(),
+            vec![("count".to_owned(), 0)],
+        );
+        assert!(
+            !scalar_ops.iter().any(|op| op.opcode == Opcode::Count),
+            "custom count/0 inside a scalar subquery must not use Count"
+        );
+        assert!(
+            scalar_ops.iter().any(|op| {
+                op.opcode == Opcode::AggStep
+                    && matches!(&op.p4, P4::FuncName(name) if name == "COUNT")
+            }),
+            "custom scalar-subquery count/0 must use generic aggregate lowering"
+        );
+    }
+
+    #[test]
+    fn custom_count_sum_overrides_decline_grouped_algebraic_plans() {
+        let table = bd_2dgf5_table();
+        let bucket_stmt = select_sql("SELECT id / 10, SUM(k) FROM t GROUP BY id / 10");
+        let SelectCore::Select {
+            columns, group_by, ..
+        } = &bucket_stmt.body.select
+        else {
+            panic!("bucket fixture must be a SELECT core");
+        };
+        assert!(
+            simple_group_by_rowid_bucket_sum_plan(columns, &table, None, group_by).is_some(),
+            "fixture must exercise the grouped rowid-bucket SUM shortcut"
+        );
+        with_connection_function_context(vec![("sum".to_owned(), 1)], true, true, || {
+            assert!(
+                simple_group_by_rowid_bucket_sum_plan(columns, &table, None, group_by).is_none(),
+                "custom sum/1 must decline grouped rowid-bucket SUM algebra"
+            );
+        });
+
+        let join_stmt = grouped_join_count_sum_index_lookup_stmt();
+        let SelectCore::Select {
+            from: Some(join_from),
+            ..
+        } = &join_stmt.body.select
+        else {
+            panic!("grouped join fixture must have a FROM clause");
+        };
+        let join_schema = test_schema_with_join_lookup();
+        assert!(
+            grouped_inner_join_count_sum_plan(&join_stmt, join_from, &join_schema)
+                .expect("baseline grouped join plan")
+                .is_some(),
+            "fixture must exercise the grouped inner-join COUNT+SUM shortcut"
+        );
+        for custom_key in [("count".to_owned(), 0), ("sum".to_owned(), 1)] {
+            with_connection_function_context(vec![custom_key], true, true, || {
+                assert!(
+                    grouped_inner_join_count_sum_plan(&join_stmt, join_from, &join_schema)
+                        .expect("custom grouped join planning")
+                        .is_none(),
+                    "an exact custom COUNT/0 or SUM/1 must decline grouped join algebra"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn custom_minmax_and_count_distinct_overrides_decline_leaf_plans() {
+        fn aggregate_fixture(sql: &str, table: &TableSchema) -> (SelectStatement, Vec<AggColumn>) {
+            let stmt = select_sql(sql);
+            let SelectCore::Select { columns, .. } = &stmt.body.select else {
+                panic!("aggregate fixture must be a SELECT core");
+            };
+            let aggregates =
+                parse_aggregate_columns(columns, table).expect("aggregate fixture should parse");
+            (stmt, aggregates)
+        }
+
+        fn fixture_where(stmt: &SelectStatement) -> Option<&Expr> {
+            let SelectCore::Select { where_clause, .. } = &stmt.body.select else {
+                return None;
+            };
+            where_clause.as_deref()
+        }
+
+        fn fixture_columns(stmt: &SelectStatement) -> &[ResultColumn] {
+            let SelectCore::Select { columns, .. } = &stmt.body.select else {
+                return &[];
+            };
+            columns
+        }
+
+        let table = bd_2dgf5_table();
+        let (rowid_stmt, rowid_agg) = aggregate_fixture("SELECT MAX(id) FROM t", &table);
+        let (index_stmt, index_agg) = aggregate_fixture("SELECT MAX(k) FROM t", &table);
+        let (_pair_stmt, pair_agg) = aggregate_fixture("SELECT MIN(k), MAX(k) FROM t", &table);
+        let (range_stmt, range_agg) =
+            aggregate_fixture("SELECT MAX(k) FROM t WHERE k < 10", &table);
+        let (rowid_range_stmt, rowid_range_agg) =
+            aggregate_fixture("SELECT MAX(id) FROM t WHERE id < 10", &table);
+        let (distinct_stmt, distinct_agg) =
+            aggregate_fixture("SELECT COUNT(DISTINCT k) FROM t", &table);
+
+        let prefix_schema = test_schema_with_composite_prefix_index();
+        let prefix_table = &prefix_schema[0];
+        let (prefix_stmt, prefix_agg) = aggregate_fixture(
+            "SELECT MAX(idx) FROM messages WHERE conversation_id = 7",
+            prefix_table,
+        );
+
+        assert!(
+            minmax_rowid_seek_plan(&rowid_agg).is_some(),
+            "fixture must exercise the rowid MIN/MAX leaf seek"
+        );
+        assert!(
+            minmax_index_seek_plan(&index_agg, &table).is_some(),
+            "fixture must exercise the secondary-index MIN/MAX leaf seek"
+        );
+        assert!(
+            minmax_pair_seek_plan(&pair_agg, &table).is_some(),
+            "fixture must exercise the paired MIN/MAX leaf seek"
+        );
+        assert!(
+            minmax_range_seek_plan(&range_agg, &table, None, fixture_where(&range_stmt)).is_some(),
+            "fixture must exercise the bounded secondary-index MIN/MAX leaf seek"
+        );
+        assert!(
+            minmax_rowid_range_seek_plan(
+                &rowid_range_agg,
+                &table,
+                None,
+                fixture_where(&rowid_range_stmt),
+            )
+            .is_some(),
+            "fixture must exercise the bounded rowid MIN/MAX leaf seek"
+        );
+        assert!(
+            minmax_prefix_seek_plan(&prefix_agg, prefix_table, None, fixture_where(&prefix_stmt),)
+                .is_some(),
+            "fixture must exercise the composite-prefix MIN/MAX leaf seek"
+        );
+        assert!(
+            count_distinct_index_walk_plan(&distinct_agg, fixture_columns(&distinct_stmt), &table,)
+                .is_some(),
+            "fixture must exercise the COUNT(DISTINCT) index walk"
+        );
+
+        with_connection_function_context(vec![("max".to_owned(), 1)], true, true, || {
+            assert!(
+                minmax_rowid_seek_plan(&rowid_agg).is_none(),
+                "custom max/1 must decline the rowid leaf seek"
+            );
+            assert!(
+                minmax_index_seek_plan(&index_agg, &table).is_none(),
+                "custom max/1 must decline the secondary-index leaf seek"
+            );
+            assert!(
+                minmax_pair_seek_plan(&pair_agg, &table).is_none(),
+                "custom max/1 must decline the MIN/MAX pair seek"
+            );
+            assert!(
+                minmax_range_seek_plan(&range_agg, &table, None, fixture_where(&range_stmt),)
+                    .is_none(),
+                "custom max/1 must decline the bounded secondary-index leaf seek"
+            );
+            assert!(
+                minmax_rowid_range_seek_plan(
+                    &rowid_range_agg,
+                    &table,
+                    None,
+                    fixture_where(&rowid_range_stmt),
+                )
+                .is_none(),
+                "custom max/1 must decline the bounded rowid leaf seek"
+            );
+            assert!(
+                minmax_prefix_seek_plan(
+                    &prefix_agg,
+                    prefix_table,
+                    None,
+                    fixture_where(&prefix_stmt),
+                )
+                .is_none(),
+                "custom max/1 must decline the composite-prefix leaf seek"
+            );
+        });
+
+        with_connection_function_context(vec![("count".to_owned(), 1)], true, true, || {
+            assert!(
+                count_distinct_index_walk_plan(
+                    &distinct_agg,
+                    fixture_columns(&distinct_stmt),
+                    &table,
+                )
+                .is_none(),
+                "custom count/1 must decline COUNT(DISTINCT) index-walk algebra"
+            );
+        });
+
+        // Keep the statements live through all borrowed WHERE checks above and
+        // make the deliberately no-WHERE fixtures explicit.
+        assert!(fixture_where(&rowid_stmt).is_none());
+        assert!(fixture_where(&index_stmt).is_none());
+    }
+
     // === Test 22b: HAVING-only aggregate is accumulated (bd-3ew8w) ===
     #[test]
     fn test_codegen_select_having_only_aggregate_is_accumulated() {
@@ -43968,8 +48752,9 @@ mod tests {
 
     #[test]
     fn test_codegen_delete_where_not_in_subquery_with_order_by_limit() {
-        // DELETE FROM t WHERE a NOT IN (SELECT b FROM s ORDER BY b LIMIT ?1)
-        // Tests the complex IN subquery path with ORDER BY and LIMIT.
+        // DELETE FROM t WHERE
+        //   a NOT IN (SELECT b FROM s ORDER BY b LIMIT ?1 OFFSET ?2)
+        // Tests the complex IN subquery path with dynamic LIMIT/OFFSET.
         let subquery = SelectStatement {
             with: None,
             body: fsqlite_ast::SelectBody {
@@ -44002,7 +48787,10 @@ mod tests {
             }],
             limit: Some(LimitClause {
                 limit: Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(1), Span::ZERO),
-                offset: None,
+                offset: Some(Expr::Placeholder(
+                    fsqlite_ast::PlaceholderType::Numbered(2),
+                    Span::ZERO,
+                )),
             }),
         };
 
@@ -44065,10 +48853,56 @@ mod tests {
             "expected Delete opcode"
         );
 
-        // Should have Variable opcode for the LIMIT parameter.
+        let ops = prog.ops();
+        let variable_slots: Vec<i32> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect();
+        assert_eq!(
+            variable_slots,
+            vec![1, 2],
+            "LIMIT/OFFSET must retain their explicit bind slots"
+        );
+        let limit_variable = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Variable && op.p1 == 1)
+            .expect("LIMIT ?1 should be emitted");
+        let limit_coercion = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::MustBeInt)
+            .expect("dynamic LIMIT should be coerced");
+        let zero_guard = ops
+            .iter()
+            .enumerate()
+            .skip(limit_coercion + 1)
+            .find_map(|(index, op)| (op.opcode == Opcode::IfNot).then_some(index))
+            .expect("LIMIT zero should short-circuit the RHS build");
+        let offset_variable = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Variable && op.p1 == 2)
+            .expect("OFFSET ?2 should be emitted");
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Variable),
-            "expected Variable opcode for LIMIT parameter"
+            limit_variable < limit_coercion
+                && limit_coercion < zero_guard
+                && zero_guard < offset_variable,
+            "LIMIT must be validated and zero-guarded before OFFSET evaluation"
+        );
+        assert_eq!(
+            ops.get(offset_variable + 1).map(|op| op.opcode),
+            Some(Opcode::MustBeInt),
+            "dynamic OFFSET should be losslessly coerced"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::IfPos),
+            "OFFSET should emit a runtime skip counter"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Once)
+                && ops.iter().any(|op| op.opcode == Opcode::OpenAutoindex)
+                && ops.iter().any(|op| op.opcode == Opcode::IdxInsert)
+                && ops.iter().any(|op| op.opcode == Opcode::Found),
+            "complex RHS should build and probe one persistent membership set"
         );
     }
 

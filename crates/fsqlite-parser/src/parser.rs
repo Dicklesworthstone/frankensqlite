@@ -1,6 +1,7 @@
 // bd-2tu6: §10.2 SQL Parser
 //
-// Hand-written recursive descent parser. Expression parsing lives in expr.rs.
+// Hand-written statement and DDL grammar. The iterative expression and SELECT
+// state machine lives in expr.rs.
 
 use std::error::Error;
 use std::fmt;
@@ -8,21 +9,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fsqlite_ast::{
     AlterTableAction, AlterTableStatement, Assignment, AssignmentTarget, AttachStatement,
-    BeginStatement, ColumnConstraint, ColumnConstraintKind, ColumnDef, ColumnRef, CompoundOp,
-    ConflictAction, CreateIndexStatement, CreateTableBody, CreateTableStatement,
-    CreateTriggerStatement, CreateViewStatement, CreateVirtualTableStatement, Cte, CteMaterialized,
-    DefaultValue, Deferrable, DeferrableInitially, DeleteStatement, Distinctness, DropObjectType,
-    DropStatement, Expr, ForeignKeyAction, ForeignKeyActionType, ForeignKeyClause,
-    ForeignKeyTrigger, FrameBound, FrameExclude, FrameSpec, FrameType, FromClause,
-    GeneratedStorage, IndexHint, IndexedColumn, InsertSource, InsertStatement, JoinClause,
-    JoinConstraint, JoinKind, JoinType, LimitClause, Literal, NullsOrder, OrderingTerm,
-    PragmaStatement, PragmaValue, QualifiedName, QualifiedTableRef, ResultColumn,
-    RollbackStatement, SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement,
-    TableConstraint, TableConstraintKind, TableOrSubquery, TimeTravelClause, TimeTravelTarget,
-    TransactionMode, TriggerEvent, TriggerTiming, TypeName, UpdateStatement, UpsertAction,
-    UpsertClause, UpsertTarget, VacuumStatement, WindowDef, WindowSpec, WithClause,
+    BeginStatement, ColumnConstraint, ColumnConstraintKind, ColumnDef, ColumnRef, ConflictAction,
+    CreateIndexStatement, CreateTableBody, CreateTableStatement, CreateTriggerStatement,
+    CreateViewStatement, CreateVirtualTableStatement, DefaultValue, Deferrable,
+    DeferrableInitially, DeleteStatement, DropObjectType, DropStatement, Expr, ForeignKeyAction,
+    ForeignKeyActionType, ForeignKeyClause, ForeignKeyTrigger, GeneratedStorage, IndexHint,
+    IndexedColumn, InsertSource, InsertStatement, JoinKind, JoinType, LimitClause, Literal,
+    NullsOrder, OrderingTerm, PragmaStatement, PragmaValue, QualifiedName, QualifiedTableRef,
+    ResultColumn, RollbackStatement, SelectCore, SelectStatement, SortDirection, Span, Statement,
+    TableConstraint, TableConstraintKind, TimeTravelClause, TimeTravelTarget, TransactionMode,
+    TriggerEvent, TriggerTiming, TypeName, UpdateStatement, UpsertAction, UpsertClause,
+    UpsertTarget, VacuumStatement, WithClause,
+};
+#[cfg(test)]
+use fsqlite_ast::{
+    CompoundOp, CteMaterialized, Distinctness, FrameBound, FrameExclude, FrameSpec, FrameType,
+    FromClause, JoinClause, JoinConstraint, SelectBody, TableOrSubquery, UnaryOp, WindowDef,
+    WindowReference, WindowSpec,
 };
 
+#[cfg(test)]
+use crate::expr::{ParsedFrameBound, validate_frame_end, validate_frame_start};
 use crate::lexer::Lexer;
 use crate::token::{Token, TokenKind};
 
@@ -82,12 +89,26 @@ pub fn reset_parse_metrics() {
     FSQLITE_PARSE_ERRORS_TOTAL.store(0, Ordering::Relaxed);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmlParseContext {
+    TopLevel,
+    TriggerBody,
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    Syntax,
+    ExpressionTooDeep { max: u32 },
+    RecursionLimit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
+    pub kind: ParseErrorKind,
     pub message: String,
     pub span: Span,
     pub line: u32,
@@ -99,6 +120,7 @@ impl ParseError {
     pub(crate) fn at(message: impl Into<String>, token: Option<&Token>) -> Self {
         if let Some(t) = token {
             Self {
+                kind: ParseErrorKind::Syntax,
                 message: message.into(),
                 span: t.span,
                 line: t.line,
@@ -106,12 +128,38 @@ impl ParseError {
             }
         } else {
             Self {
+                kind: ParseErrorKind::Syntax,
                 message: message.into(),
                 span: Span::ZERO,
                 line: 0,
                 col: 0,
             }
         }
+    }
+
+    #[must_use]
+    pub(crate) fn expression_too_deep(max: u32, token: Option<&Token>) -> Self {
+        let mut error = Self::at(
+            format!("Expression tree is too large (maximum depth {max})"),
+            token,
+        );
+        error.kind = ParseErrorKind::ExpressionTooDeep { max };
+        error
+    }
+
+    #[must_use]
+    fn recursion_limit(token: Option<&Token>) -> Self {
+        let mut error = Self::at(
+            format!("parser recursion limit exceeded (maximum depth {MAX_NATIVE_PARSE_DEPTH})"),
+            token,
+        );
+        error.kind = ParseErrorKind::RecursionLimit;
+        error
+    }
+
+    #[must_use]
+    pub const fn is_expression_too_deep(&self) -> bool {
+        matches!(self.kind, ParseErrorKind::ExpressionTooDeep { .. })
     }
 }
 
@@ -188,6 +236,18 @@ impl StatementParseScratch {
 /// builder-configurable if needed.
 pub const MAX_PARSE_DEPTH: u32 = 1000;
 
+/// Native parser-call guard.
+///
+/// This is deliberately distinct from [`MAX_PARSE_DEPTH`]. Statement, SELECT,
+/// and grammar helper frames consume this defensive implementation budget, but
+/// they do not contribute nodes to SQLite's semantic expression-height limit.
+const MAX_NATIVE_PARSE_DEPTH: u32 = 1000;
+
+pub(crate) struct HeightTracked<T> {
+    pub(crate) value: T,
+    pub(crate) height: u32,
+}
+
 pub struct Parser {
     pub(crate) tokens: Vec<Token>,
     pub(crate) pos: usize,
@@ -197,7 +257,32 @@ pub struct Parser {
 
 impl Parser {
     #[must_use]
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(mut tokens: Vec<Token>) -> Self {
+        // The public constructor accepts caller-built token streams. Normalize
+        // every such stream to one physical EOF at the end so an embedded
+        // sentinel cannot silently hide later tokens from parse/tail checks.
+        let terminal_eof = tokens
+            .last()
+            .filter(|token| matches!(token.kind, TokenKind::Eof))
+            .cloned();
+        tokens.retain(|token| !matches!(token.kind, TokenKind::Eof));
+        if let Some(eof) = terminal_eof {
+            tokens.push(eof);
+        } else {
+            let (offset, line, col) = tokens.last().map_or((0, 1, 1), |token| {
+                (
+                    token.span.end,
+                    token.line,
+                    token.col.saturating_add(token.span.len()),
+                )
+            });
+            tokens.push(Token {
+                kind: TokenKind::Eof,
+                span: Span::new(offset, offset),
+                line,
+                col,
+            });
+        }
         Self {
             tokens,
             pos: 0,
@@ -207,10 +292,8 @@ impl Parser {
     }
 
     pub(crate) fn enter_recursion(&mut self) -> Result<(), ParseError> {
-        if self.depth >= MAX_PARSE_DEPTH {
-            return Err(self.err_msg(format!(
-                "expression tree is too deep (maximum depth {MAX_PARSE_DEPTH})"
-            )));
+        if self.depth >= MAX_NATIVE_PARSE_DEPTH {
+            return Err(ParseError::recursion_limit(self.current()));
         }
         self.depth += 1;
         Ok(())
@@ -218,6 +301,20 @@ impl Parser {
 
     pub(crate) fn leave_recursion(&mut self) {
         self.depth = self.depth.saturating_sub(1);
+    }
+
+    pub(crate) fn checked_cached_parent_height(
+        &self,
+        max_child_height: u32,
+    ) -> Result<u32, ParseError> {
+        let height = max_child_height.saturating_add(1);
+        if height > MAX_PARSE_DEPTH {
+            return Err(ParseError::expression_too_deep(
+                MAX_PARSE_DEPTH,
+                self.current(),
+            ));
+        }
+        Ok(height)
     }
 
     pub(crate) fn with_recursion_guard<T>(
@@ -264,7 +361,22 @@ impl Parser {
                         FSQLITE_PARSE_STATEMENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
                     stmts.push(s);
-                    let _ = self.eat(&TokenKind::Semicolon);
+                    if self.at_eof() || self.eat(&TokenKind::Semicolon) {
+                        continue;
+                    }
+
+                    let error = self
+                        .err_msg("unexpected token after end of statement; expected ';' separator");
+                    if collect_parse_metrics {
+                        FSQLITE_PARSE_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::warn!(
+                        target: "fsqlite.parse",
+                        error = %error,
+                        "parse recovery: missing statement separator"
+                    );
+                    self.errors.push(error);
+                    self.synchronize();
                 }
                 Err(e) => {
                     if collect_parse_metrics {
@@ -403,31 +515,63 @@ impl Parser {
         }
     }
 
-    fn recover_trigger_body_after_error(&mut self) {
-        let mut case_depth = 0_usize;
+    fn starts_nested_trigger_definition(&self) -> bool {
+        if !self.check_kw(&TokenKind::KwCreate) {
+            return false;
+        }
+
+        let mut offset = 1_usize;
+        while offset <= 2
+            && matches!(
+                self.peek_nth(offset),
+                TokenKind::KwTemp | TokenKind::KwTemporary | TokenKind::KwUnique
+            )
+        {
+            offset += 1;
+        }
+        self.peek_nth(offset) == &TokenKind::KwTrigger
+    }
+
+    fn recover_trigger_body_after_error(&mut self, statement_start: usize) {
+        // Rewind to the rejected body statement's first token. The enclosing
+        // trigger END is then the first END observed at a statement boundary;
+        // END used as an alias or CASE terminator remains inside its statement.
+        self.pos = statement_start.min(self.tokens.len().saturating_sub(1));
+        let mut at_statement_boundary = true;
+        let mut nested_trigger_header = false;
+        let mut nested_trigger_depth = 0_usize;
 
         loop {
             match self.peek() {
                 TokenKind::Eof => return,
-                TokenKind::KwCase => {
-                    case_depth = case_depth.saturating_add(1);
+                TokenKind::Semicolon => {
                     self.advance();
+                    at_statement_boundary = true;
+                    nested_trigger_header = false;
                 }
-                TokenKind::KwEnd if case_depth > 0 => {
-                    case_depth = case_depth.saturating_sub(1);
+                TokenKind::KwBegin if nested_trigger_header => {
+                    nested_trigger_depth = nested_trigger_depth.saturating_add(1);
                     self.advance();
+                    at_statement_boundary = true;
+                    nested_trigger_header = false;
                 }
-                // Once CASE nesting is balanced, treat END as the trigger-body
-                // terminator even if the malformed statement left parentheses
-                // unbalanced. Recovery should prefer the enclosing trigger
-                // boundary over swallowing subsequent top-level SQL.
-                TokenKind::KwEnd => {
+                TokenKind::KwEnd if at_statement_boundary && nested_trigger_depth > 0 => {
+                    nested_trigger_depth -= 1;
+                    self.advance();
+                    let _ = self.eat(&TokenKind::Semicolon);
+                    at_statement_boundary = true;
+                }
+                TokenKind::KwEnd if at_statement_boundary => {
                     self.advance();
                     let _ = self.eat(&TokenKind::Semicolon);
                     return;
                 }
                 _ => {
+                    if at_statement_boundary {
+                        nested_trigger_header = self.starts_nested_trigger_definition();
+                    }
                     self.advance();
+                    at_statement_boundary = false;
                 }
             }
         }
@@ -447,12 +591,50 @@ impl Parser {
                 self.advance();
                 Ok(s)
             }
-            ref k if is_nonreserved_kw(k) => {
+            ref k if starts_post_dot_identifier(k) => {
                 let s = kw_to_str(k);
                 self.advance();
                 Ok(s)
             }
             _ => Err(self.err_expected("identifier")),
+        }
+    }
+
+    pub(crate) fn parse_table_star_qualifier(&mut self) -> Result<String, ParseError> {
+        match self.peek().clone() {
+            TokenKind::Id(s) | TokenKind::QuotedId(s, _) => {
+                self.advance();
+                Ok(s.to_string())
+            }
+            TokenKind::String(s) => {
+                self.advance();
+                Ok(s)
+            }
+            ref k if starts_table_star_qualifier(k) => {
+                let s = kw_to_str(k);
+                self.advance();
+                Ok(s)
+            }
+            _ => Err(self.err_expected("table-star qualifier")),
+        }
+    }
+
+    pub(crate) fn parse_window_name(&mut self) -> Result<String, ParseError> {
+        match self.peek().clone() {
+            TokenKind::Id(s) | TokenKind::QuotedId(s, _) => {
+                self.advance();
+                Ok(s.to_string())
+            }
+            TokenKind::String(s) => {
+                self.advance();
+                Ok(s)
+            }
+            ref k if starts_bare_window_name(k) => {
+                let s = kw_to_str(k);
+                self.advance();
+                Ok(s)
+            }
+            _ => Err(self.err_expected("window name")),
         }
     }
 
@@ -466,9 +648,44 @@ impl Parser {
         }
     }
 
-    fn parse_qualified_table_ref(&mut self) -> Result<QualifiedTableRef, ParseError> {
-        let name = self.parse_qualified_name()?;
-        let alias = self.try_alias()?;
+    fn parse_dml_target_name(
+        &mut self,
+        context: DmlParseContext,
+    ) -> Result<QualifiedName, ParseError> {
+        let first = self.parse_identifier()?;
+        if self.check(&TokenKind::Dot) {
+            if context == DmlParseContext::TriggerBody {
+                return Err(self
+                    .err_msg("qualified table names are not allowed in trigger body statements"));
+            }
+            self.advance();
+            let second = self.parse_identifier()?;
+            Ok(QualifiedName::qualified(first, second))
+        } else {
+            Ok(QualifiedName::bare(first))
+        }
+    }
+
+    fn parse_qualified_table_ref(
+        &mut self,
+        context: DmlParseContext,
+    ) -> Result<QualifiedTableRef, ParseError> {
+        let name = self.parse_dml_target_name(context)?;
+        if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwAs) {
+            return Err(self.err_msg("table aliases are not allowed in trigger body statements"));
+        }
+        let alias = if context == DmlParseContext::TopLevel {
+            self.try_table_alias()?
+        } else {
+            None
+        };
+        if context == DmlParseContext::TriggerBody
+            && (self.check_kw(&TokenKind::KwIndexed)
+                || (self.check_kw(&TokenKind::KwNot) && self.peek_nth(1) == &TokenKind::KwIndexed))
+        {
+            return Err(self
+                .err_msg("INDEXED BY and NOT INDEXED are not allowed in trigger body statements"));
+        }
         let index_hint = self.parse_index_hint()?;
         let time_travel = self.parse_time_travel_clause()?;
         Ok(QualifiedTableRef {
@@ -479,25 +696,66 @@ impl Parser {
         })
     }
 
-    fn try_alias(&mut self) -> Result<Option<String>, ParseError> {
-        if self.eat_kw(&TokenKind::KwAs) {
-            return Ok(Some(self.parse_identifier()?));
+    fn parse_alias_name(&mut self) -> Result<String, ParseError> {
+        match self.peek().clone() {
+            TokenKind::Id(s) | TokenKind::QuotedId(s, _) => {
+                self.advance();
+                Ok(s.to_string())
+            }
+            TokenKind::String(s) => {
+                self.advance();
+                Ok(s)
+            }
+            ref k if starts_explicit_alias_name(k) => {
+                let s = kw_to_str(k);
+                self.advance();
+                Ok(s)
+            }
+            _ => Err(self.err_expected("alias")),
         }
-        // Peek for an identifier that isn't a keyword starting the next clause.
-        // We also accept non-reserved keywords as implicit aliases.
-        match self.peek() {
-            TokenKind::Id(_) | TokenKind::QuotedId(_, _) => {
-                return Ok(Some(self.parse_identifier()?));
-            }
-            k if is_nonreserved_kw(k) && !is_alias_terminator_kw(k) => {
-                return Ok(Some(self.parse_identifier()?));
-            }
-            _ => {}
+    }
+
+    fn starts_window_clause(&self) -> bool {
+        self.check_kw(&TokenKind::KwWindow)
+            && starts_bare_window_name(self.peek_nth(1))
+            && self.peek_nth(2) == &TokenKind::KwAs
+    }
+
+    fn starts_time_travel_clause(&self) -> bool {
+        self.check_kw(&TokenKind::KwFor)
+            && matches!(
+                self.peek_nth(1),
+                TokenKind::Id(name) if name.eq_ignore_ascii_case("SYSTEM_TIME")
+            )
+    }
+
+    pub(crate) fn try_result_alias(&mut self) -> Result<Option<String>, ParseError> {
+        if self.eat_kw(&TokenKind::KwAs) {
+            return Ok(Some(self.parse_alias_name()?));
+        }
+        if self.starts_window_clause() {
+            return Ok(None);
+        }
+        if starts_result_alias(self.peek()) {
+            return Ok(Some(self.parse_alias_name()?));
         }
         Ok(None)
     }
 
-    fn parse_index_hint(&mut self) -> Result<Option<IndexHint>, ParseError> {
+    pub(crate) fn try_table_alias(&mut self) -> Result<Option<String>, ParseError> {
+        if self.eat_kw(&TokenKind::KwAs) {
+            return Ok(Some(self.parse_alias_name()?));
+        }
+        if self.starts_window_clause() || self.starts_time_travel_clause() {
+            return Ok(None);
+        }
+        if starts_table_alias(self.peek()) {
+            return Ok(Some(self.parse_alias_name()?));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn parse_index_hint(&mut self) -> Result<Option<IndexHint>, ParseError> {
         if self.eat_kw(&TokenKind::KwIndexed) {
             self.expect_kw(&TokenKind::KwBy)?;
             Ok(Some(IndexHint::IndexedBy(self.parse_identifier()?)))
@@ -517,7 +775,9 @@ impl Parser {
     /// time_travel_clause ::= FOR SYSTEM_TIME AS OF COMMITSEQ integer
     ///                      | FOR SYSTEM_TIME AS OF string_literal
     /// ```
-    fn parse_time_travel_clause(&mut self) -> Result<Option<TimeTravelClause>, ParseError> {
+    pub(crate) fn parse_time_travel_clause(
+        &mut self,
+    ) -> Result<Option<TimeTravelClause>, ParseError> {
         if !self.check_kw(&TokenKind::KwFor) {
             return Ok(None);
         }
@@ -585,9 +845,11 @@ impl Parser {
                 Ok(Statement::Select(parser.parse_select_stmt(None)?))
             }
             TokenKind::KwWith => parser.parse_with_leading(),
-            TokenKind::KwInsert | TokenKind::KwReplace => parser.parse_insert_stmt(None),
-            TokenKind::KwUpdate => parser.parse_update_stmt(None),
-            TokenKind::KwDelete => parser.parse_delete_stmt(None),
+            TokenKind::KwInsert | TokenKind::KwReplace => {
+                parser.parse_insert_stmt(None, DmlParseContext::TopLevel)
+            }
+            TokenKind::KwUpdate => parser.parse_update_stmt(None, DmlParseContext::TopLevel),
+            TokenKind::KwDelete => parser.parse_delete_stmt(None, DmlParseContext::TopLevel),
             TokenKind::KwCreate => parser.parse_create(),
             TokenKind::KwDrop => parser.parse_drop(),
             TokenKind::KwAlter => parser.parse_alter(),
@@ -648,49 +910,17 @@ impl Parser {
             TokenKind::KwSelect | TokenKind::KwValues => {
                 Ok(Statement::Select(self.parse_select_stmt(Some(with))?))
             }
-            TokenKind::KwInsert | TokenKind::KwReplace => self.parse_insert_stmt(Some(with)),
-            TokenKind::KwUpdate => self.parse_update_stmt(Some(with)),
-            TokenKind::KwDelete => self.parse_delete_stmt(Some(with)),
+            TokenKind::KwInsert | TokenKind::KwReplace => {
+                self.parse_insert_stmt(Some(with), DmlParseContext::TopLevel)
+            }
+            TokenKind::KwUpdate => self.parse_update_stmt(Some(with), DmlParseContext::TopLevel),
+            TokenKind::KwDelete => self.parse_delete_stmt(Some(with), DmlParseContext::TopLevel),
             _ => Err(self.err_expected("SELECT, INSERT, UPDATE, or DELETE after WITH")),
         }
     }
 
     pub(crate) fn parse_with_clause(&mut self) -> Result<WithClause, ParseError> {
-        self.expect_kw(&TokenKind::KwWith)?;
-        let recursive = self.eat_kw(&TokenKind::KwRecursive);
-        let ctes = self.parse_comma_sep(Self::parse_cte)?;
-        Ok(WithClause { recursive, ctes })
-    }
-
-    fn parse_cte(&mut self) -> Result<Cte, ParseError> {
-        let name = self.parse_identifier()?;
-        let columns = if self.eat(&TokenKind::LeftParen) {
-            let cols = self.parse_comma_sep(Self::parse_identifier)?;
-            self.expect_token(&TokenKind::RightParen)?;
-            cols
-        } else {
-            vec![]
-        };
-        // SQL syntax: name AS [NOT] MATERIALIZED (subquery)
-        self.expect_kw(&TokenKind::KwAs)?;
-        let materialized = if self.check_kw(&TokenKind::KwNot) {
-            self.advance();
-            self.expect_kw(&TokenKind::KwMaterialized)?;
-            Some(CteMaterialized::NotMaterialized)
-        } else if self.eat_kw(&TokenKind::KwMaterialized) {
-            Some(CteMaterialized::Materialized)
-        } else {
-            None
-        };
-        self.expect_token(&TokenKind::LeftParen)?;
-        let query = self.parse_select_stmt(None)?;
-        self.expect_token(&TokenKind::RightParen)?;
-        Ok(Cte {
-            name,
-            columns,
-            materialized,
-            query,
-        })
+        self.parse_with_clause_machine()
     }
 
     // -----------------------------------------------------------------------
@@ -701,47 +931,72 @@ impl Parser {
         &mut self,
         with: Option<WithClause>,
     ) -> Result<SelectStatement, ParseError> {
-        self.with_recursion_guard(|parser| parser.parse_select_stmt_inner(with))
+        self.parse_select_stmt_tracked(with)
+            .map(|tracked| tracked.value)
     }
 
-    fn parse_select_stmt_inner(
+    pub(crate) fn parse_select_stmt_tracked(
         &mut self,
         with: Option<WithClause>,
-    ) -> Result<SelectStatement, ParseError> {
-        let body = self.parse_select_body()?;
+    ) -> Result<HeightTracked<SelectStatement>, ParseError> {
+        self.parse_select_tracked_machine(with)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse_select_stmt_inner_tracked(
+        &mut self,
+        with: Option<WithClause>,
+    ) -> Result<HeightTracked<SelectStatement>, ParseError> {
+        let body = self.parse_select_body_tracked()?;
+        let mut height = body.height;
+        let final_core = body
+            .value
+            .compounds
+            .last()
+            .map_or(&body.value.select, |(_, core)| core);
+        if matches!(final_core, SelectCore::Values(_))
+            && matches!(self.peek(), TokenKind::KwOrder | TokenKind::KwLimit)
+        {
+            return Err(self.err_msg("ORDER BY / LIMIT clause is not allowed after a VALUES term"));
+        }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
             self.expect_kw(&TokenKind::KwBy)?;
-            self.parse_comma_sep(Self::parse_ordering_term)?
+            let parsed = self.parse_comma_sep(Self::parse_ordering_term_tracked)?;
+            let mut terms = Vec::with_capacity(parsed.len());
+            for tracked in parsed {
+                height = height.max(tracked.height);
+                terms.push(tracked.value);
+            }
+            terms
         } else {
             vec![]
         };
-        let limit = self.parse_limit()?;
-        // bd-tp6ia: SQLite's grammar attaches ORDER BY / LIMIT to the final term
-        // of a compound SELECT, but a VALUES term has no such slot — so a
-        // trailing ORDER BY / LIMIT after a compound whose last term is VALUES is
-        // a syntax error (e.g. `SELECT 1 UNION VALUES (2),(3) ORDER BY 1`). A
-        // standalone VALUES (no compound) is unaffected.
-        if !body.compounds.is_empty()
-            && matches!(
-                body.compounds.last().map(|(_, core)| core),
-                Some(SelectCore::Values(_))
-            )
-            && (!order_by.is_empty() || limit.is_some())
+        let limit = self.parse_limit_tracked()?;
+        height = height.max(limit.height);
+        // bd-tp6ia: SQLite's grammar attaches ORDER BY / LIMIT to a SELECT,
+        // but a final VALUES term has no such slot. This rejects both standalone
+        // `VALUES (1) ORDER BY 1` and compounds such as
+        // `SELECT 1 UNION VALUES (2),(3) ORDER BY 1`.
+        if matches!(final_core, SelectCore::Values(_))
+            && (!order_by.is_empty() || limit.value.is_some())
         {
-            return Err(self.err_msg(
-                "ORDER BY / LIMIT clause is not allowed after a VALUES term in a compound SELECT",
-            ));
+            return Err(self.err_msg("ORDER BY / LIMIT clause is not allowed after a VALUES term"));
         }
-        Ok(SelectStatement {
-            with,
-            body,
-            order_by,
-            limit,
+        Ok(HeightTracked {
+            value: SelectStatement {
+                with,
+                body: body.value,
+                order_by,
+                limit: limit.value,
+            },
+            height,
         })
     }
 
-    fn parse_select_body(&mut self) -> Result<SelectBody, ParseError> {
-        let select = self.parse_select_core()?;
+    #[cfg(test)]
+    fn parse_select_body_tracked(&mut self) -> Result<HeightTracked<SelectBody>, ParseError> {
+        let select = self.parse_select_core_tracked()?;
+        let mut height = select.height;
         let mut compounds = Vec::new();
         loop {
             let op = if self.eat_kw(&TokenKind::KwUnion) {
@@ -757,14 +1012,23 @@ impl Parser {
             } else {
                 break;
             };
-            compounds.push((op, self.parse_select_core()?));
+            let core = self.parse_select_core_tracked()?;
+            height = height.max(core.height);
+            compounds.push((op, core.value));
         }
-        Ok(SelectBody { select, compounds })
+        Ok(HeightTracked {
+            value: SelectBody {
+                select: select.value,
+                compounds,
+            },
+            height,
+        })
     }
 
-    fn parse_select_core(&mut self) -> Result<SelectCore, ParseError> {
+    #[cfg(test)]
+    fn parse_select_core_tracked(&mut self) -> Result<HeightTracked<SelectCore>, ParseError> {
         if self.eat_kw(&TokenKind::KwValues) {
-            return self.parse_values_core();
+            return self.parse_values_core_tracked();
         }
         self.expect_kw(&TokenKind::KwSelect)?;
         let distinct = if self.eat_kw(&TokenKind::KwDistinct) {
@@ -773,25 +1037,41 @@ impl Parser {
             let _ = self.eat_kw(&TokenKind::KwAll);
             Distinctness::All
         };
-        let columns = self.parse_comma_sep(Self::parse_result_column)?;
+        let parsed_columns = self.parse_comma_sep(Self::parse_result_column_tracked)?;
+        let mut height = 0;
+        let mut columns = Vec::with_capacity(parsed_columns.len());
+        for tracked in parsed_columns {
+            height = height.max(tracked.height);
+            columns.push(tracked.value);
+        }
         let from = if self.eat_kw(&TokenKind::KwFrom) {
             Some(self.parse_from_clause()?)
         } else {
             None
         };
         let where_clause = if self.eat_kw(&TokenKind::KwWhere) {
-            Some(Box::new(self.parse_expr()?))
+            let parsed = self.parse_expr_tracked()?;
+            height = height.max(parsed.height);
+            Some(Box::new(parsed.expr))
         } else {
             None
         };
         let group_by = if self.eat_kw(&TokenKind::KwGroup) {
             self.expect_kw(&TokenKind::KwBy)?;
-            self.parse_comma_sep(Self::parse_expr)?
+            let parsed = self.parse_comma_sep(Self::parse_expr_tracked)?;
+            let mut expressions = Vec::with_capacity(parsed.len());
+            for tracked in parsed {
+                height = height.max(tracked.height);
+                expressions.push(tracked.expr);
+            }
+            expressions
         } else {
             vec![]
         };
         let having = if self.eat_kw(&TokenKind::KwHaving) {
-            Some(Box::new(self.parse_expr()?))
+            let parsed = self.parse_expr_tracked()?;
+            height = height.max(parsed.height);
+            Some(Box::new(parsed.expr))
         } else {
             None
         };
@@ -800,69 +1080,101 @@ impl Parser {
         } else {
             vec![]
         };
-        Ok(SelectCore::Select {
-            distinct,
-            columns,
-            from,
-            where_clause,
-            group_by,
-            having,
-            windows,
+        Ok(HeightTracked {
+            value: SelectCore::Select {
+                distinct,
+                columns,
+                from,
+                where_clause,
+                group_by,
+                having,
+                windows,
+            },
+            height,
         })
     }
 
     fn parse_values_core(&mut self) -> Result<SelectCore, ParseError> {
+        self.parse_values_core_tracked()
+            .map(|tracked| tracked.value)
+    }
+
+    fn parse_values_core_tracked(&mut self) -> Result<HeightTracked<SelectCore>, ParseError> {
         let mut rows = Vec::new();
+        let mut height = 0;
         loop {
             self.expect_token(&TokenKind::LeftParen)?;
-            let row = self.parse_comma_sep(Self::parse_expr)?;
+            let parsed = self.parse_comma_sep(Self::parse_expr_tracked)?;
+            let mut row = Vec::with_capacity(parsed.len());
+            for tracked in parsed {
+                height = height.max(tracked.height);
+                row.push(tracked.expr);
+            }
             self.expect_token(&TokenKind::RightParen)?;
             rows.push(row);
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
         }
-        Ok(SelectCore::Values(rows))
+        Ok(HeightTracked {
+            value: SelectCore::Values(rows),
+            height,
+        })
+    }
+
+    fn parse_result_column_tracked(&mut self) -> Result<HeightTracked<ResultColumn>, ParseError> {
+        if self.eat(&TokenKind::Star) {
+            return Ok(HeightTracked {
+                value: ResultColumn::Star,
+                height: 0,
+            });
+        }
+        if starts_table_star_qualifier(self.peek()) && self.peek_nth(1) == &TokenKind::Dot {
+            if self.peek_nth(2) == &TokenKind::Star {
+                let table = self.parse_table_star_qualifier()?;
+                self.expect_token(&TokenKind::Dot)?;
+                self.expect_token(&TokenKind::Star)?;
+                return Ok(HeightTracked {
+                    value: ResultColumn::TableStar(QualifiedName::bare(table)),
+                    height: 0,
+                });
+            }
+            if starts_table_star_qualifier(self.peek_nth(2))
+                && self.peek_nth(3) == &TokenKind::Dot
+                && self.peek_nth(4) == &TokenKind::Star
+            {
+                let schema = self.parse_table_star_qualifier()?;
+                self.expect_token(&TokenKind::Dot)?;
+                let table = self.parse_table_star_qualifier()?;
+                self.expect_token(&TokenKind::Dot)?;
+                self.expect_token(&TokenKind::Star)?;
+                return Ok(HeightTracked {
+                    value: ResultColumn::TableStar(QualifiedName::qualified(schema, table)),
+                    height: 0,
+                });
+            }
+        }
+        let parsed = self.parse_expr_tracked()?;
+        let alias = self.try_result_alias()?;
+        Ok(HeightTracked {
+            value: ResultColumn::Expr {
+                expr: parsed.expr,
+                alias,
+            },
+            height: parsed.height,
+        })
     }
 
     fn parse_result_column(&mut self) -> Result<ResultColumn, ParseError> {
-        if self.eat(&TokenKind::Star) {
-            return Ok(ResultColumn::Star);
-        }
-        if matches!(self.peek(), TokenKind::Id(_) | TokenKind::QuotedId(_, _))
-            && self.peek_nth(1) == &TokenKind::Dot
-        {
-            if self.peek_nth(2) == &TokenKind::Star {
-                let table = self.parse_identifier()?;
-                self.expect_token(&TokenKind::Dot)?;
-                self.expect_token(&TokenKind::Star)?;
-                return Ok(ResultColumn::TableStar(QualifiedName::bare(table)));
-            }
-            if matches!(
-                self.peek_nth(2),
-                TokenKind::Id(_) | TokenKind::QuotedId(_, _)
-            ) && self.peek_nth(3) == &TokenKind::Dot
-                && self.peek_nth(4) == &TokenKind::Star
-            {
-                let schema = self.parse_identifier()?;
-                self.expect_token(&TokenKind::Dot)?;
-                let table = self.parse_identifier()?;
-                self.expect_token(&TokenKind::Dot)?;
-                self.expect_token(&TokenKind::Star)?;
-                return Ok(ResultColumn::TableStar(QualifiedName::qualified(
-                    schema, table,
-                )));
-            }
-        }
-        let expr = self.parse_expr()?;
-        let alias = self.try_alias()?;
-        Ok(ResultColumn::Expr { expr, alias })
+        self.parse_result_column_tracked()
+            .map(|tracked| tracked.value)
     }
 
     // -----------------------------------------------------------------------
     // FROM clause & JOINs
     // -----------------------------------------------------------------------
 
+    #[cfg(test)]
     fn parse_from_clause(&mut self) -> Result<FromClause, ParseError> {
         let source = self.parse_table_or_subquery()?;
         let mut joins = Vec::new();
@@ -880,13 +1192,14 @@ impl Parser {
                 });
             } else if self.eat(&TokenKind::Comma) {
                 let table = self.parse_table_or_subquery()?;
+                let constraint = self.parse_join_constraint()?;
                 joins.push(JoinClause {
                     join_type: JoinType {
                         natural: false,
                         kind: JoinKind::Cross,
                     },
                     table,
-                    constraint: None,
+                    constraint,
                 });
             } else {
                 break;
@@ -895,10 +1208,12 @@ impl Parser {
         Ok(FromClause { source, joins })
     }
 
+    #[cfg(test)]
     fn parse_table_or_subquery(&mut self) -> Result<TableOrSubquery, ParseError> {
         self.with_recursion_guard(|parser| parser.parse_table_or_subquery_inner())
     }
 
+    #[cfg(test)]
     fn parse_table_or_subquery_inner(&mut self) -> Result<TableOrSubquery, ParseError> {
         if self.check(&TokenKind::LeftParen) {
             self.advance();
@@ -913,7 +1228,7 @@ impl Parser {
                 };
                 let q = self.parse_select_stmt(with)?;
                 self.expect_token(&TokenKind::RightParen)?;
-                let alias = self.try_alias()?;
+                let alias = self.try_table_alias()?;
                 return Ok(TableOrSubquery::Subquery {
                     query: Box::new(q),
                     alias,
@@ -936,7 +1251,7 @@ impl Parser {
                 self.parse_comma_sep(Self::parse_expr)?
             };
             self.expect_token(&TokenKind::RightParen)?;
-            let alias = self.try_alias()?;
+            let alias = self.try_table_alias()?;
             return Ok(TableOrSubquery::TableFunction {
                 name: name.name,
                 args,
@@ -944,7 +1259,7 @@ impl Parser {
             });
         }
 
-        let alias = self.try_alias()?;
+        let alias = self.try_table_alias()?;
         let index_hint = self.parse_index_hint()?;
         let time_travel = self.parse_time_travel_clause()?;
         Ok(TableOrSubquery::Table {
@@ -955,7 +1270,7 @@ impl Parser {
         })
     }
 
-    fn try_join_type(&mut self) -> Result<Option<JoinType>, ParseError> {
+    pub(crate) fn try_join_type(&mut self) -> Result<Option<JoinType>, ParseError> {
         let natural = self.eat_kw(&TokenKind::KwNatural);
         let kind = if self.eat_kw(&TokenKind::KwJoin) {
             Some(JoinKind::Inner)
@@ -987,6 +1302,7 @@ impl Parser {
         }
     }
 
+    #[cfg(test)]
     fn parse_join_constraint(&mut self) -> Result<Option<JoinConstraint>, ParseError> {
         if self.eat_kw(&TokenKind::KwOn) {
             Ok(Some(JoinConstraint::On(self.parse_expr()?)))
@@ -1005,7 +1321,12 @@ impl Parser {
     // -----------------------------------------------------------------------
 
     pub(crate) fn parse_ordering_term(&mut self) -> Result<OrderingTerm, ParseError> {
-        let expr = self.parse_expr()?;
+        self.parse_ordering_term_tracked()
+            .map(|tracked| tracked.value)
+    }
+
+    fn parse_ordering_term_tracked(&mut self) -> Result<HeightTracked<OrderingTerm>, ParseError> {
+        let parsed = self.parse_expr_tracked()?;
         let direction = if self.eat_kw(&TokenKind::KwAsc) {
             Some(SortDirection::Asc)
         } else if self.eat_kw(&TokenKind::KwDesc) {
@@ -1023,45 +1344,74 @@ impl Parser {
         } else {
             None
         };
-        Ok(OrderingTerm {
-            expr,
-            direction,
-            nulls,
+        Ok(HeightTracked {
+            value: OrderingTerm {
+                expr: parsed.expr,
+                direction,
+                nulls,
+            },
+            height: parsed.height,
         })
     }
 
     pub(crate) fn parse_limit(&mut self) -> Result<Option<LimitClause>, ParseError> {
+        self.parse_limit_tracked().map(|tracked| tracked.value)
+    }
+
+    fn parse_limit_tracked(&mut self) -> Result<HeightTracked<Option<LimitClause>>, ParseError> {
         if !self.eat_kw(&TokenKind::KwLimit) {
-            return Ok(None);
+            return Ok(HeightTracked {
+                value: None,
+                height: 0,
+            });
         }
-        let first = self.parse_expr()?;
+        let first = self.parse_expr_tracked()?;
         if self.eat_kw(&TokenKind::KwOffset) {
-            return Ok(Some(LimitClause {
-                limit: first,
-                offset: Some(self.parse_expr()?),
-            }));
+            let offset = self.parse_expr_tracked()?;
+            let height = self.checked_cached_parent_height(first.height.max(offset.height))?;
+            return Ok(HeightTracked {
+                value: Some(LimitClause {
+                    limit: first.expr,
+                    offset: Some(offset.expr),
+                }),
+                height,
+            });
         }
 
         if self.eat(&TokenKind::Comma) {
             // LIMIT offset, count — SQLite/MySQL compatibility form.
-            let second = self.parse_expr()?;
-            return Ok(Some(LimitClause {
-                limit: second,
-                offset: Some(first),
-            }));
+            let second = self.parse_expr_tracked()?;
+            let height = self.checked_cached_parent_height(first.height.max(second.height))?;
+            return Ok(HeightTracked {
+                value: Some(LimitClause {
+                    limit: second.expr,
+                    offset: Some(first.expr),
+                }),
+                height,
+            });
         }
 
-        Ok(Some(LimitClause {
-            limit: first,
-            offset: None,
-        }))
+        let height = self.checked_cached_parent_height(first.height)?;
+        Ok(HeightTracked {
+            value: Some(LimitClause {
+                limit: first.expr,
+                offset: None,
+            }),
+            height,
+        })
     }
 
     // -----------------------------------------------------------------------
     // RETURNING clause
     // -----------------------------------------------------------------------
 
-    fn parse_returning(&mut self) -> Result<Vec<ResultColumn>, ParseError> {
+    fn parse_returning(
+        &mut self,
+        context: DmlParseContext,
+    ) -> Result<Vec<ResultColumn>, ParseError> {
+        if self.check_kw(&TokenKind::KwReturning) && context == DmlParseContext::TriggerBody {
+            return Err(self.err_msg("RETURNING is not allowed in trigger body statements"));
+        }
         if self.eat_kw(&TokenKind::KwReturning) {
             self.parse_comma_sep(Self::parse_result_column)
         } else {
@@ -1073,7 +1423,11 @@ impl Parser {
     // INSERT
     // -----------------------------------------------------------------------
 
-    fn parse_insert_stmt(&mut self, with: Option<WithClause>) -> Result<Statement, ParseError> {
+    fn parse_insert_stmt(
+        &mut self,
+        with: Option<WithClause>,
+        context: DmlParseContext,
+    ) -> Result<Statement, ParseError> {
         let or_conflict = if self.eat_kw(&TokenKind::KwReplace) {
             Some(ConflictAction::Replace)
         } else {
@@ -1085,7 +1439,10 @@ impl Parser {
             }
         };
         self.eat_kw(&TokenKind::KwInto);
-        let table = self.parse_qualified_name()?;
+        let table = self.parse_dml_target_name(context)?;
+        if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwAs) {
+            return Err(self.err_msg("table aliases are not allowed in trigger body statements"));
+        }
         let alias = if self.eat_kw(&TokenKind::KwAs) {
             Some(self.parse_identifier()?)
         } else {
@@ -1103,7 +1460,11 @@ impl Parser {
         } else {
             vec![]
         };
-        let source = if self.eat_kw(&TokenKind::KwDefault) {
+        let source = if self.check_kw(&TokenKind::KwDefault)
+            && context == DmlParseContext::TriggerBody
+        {
+            return Err(self.err_msg("DEFAULT VALUES is not allowed in trigger body statements"));
+        } else if self.eat_kw(&TokenKind::KwDefault) {
             self.expect_kw(&TokenKind::KwValues)?;
             InsertSource::DefaultValues
         } else if self.eat_kw(&TokenKind::KwValues) {
@@ -1120,7 +1481,7 @@ impl Parser {
             InsertSource::Select(Box::new(self.parse_select_stmt(inner_with)?))
         };
         let upsert = self.parse_upsert_clauses()?;
-        let returning = self.parse_returning()?;
+        let returning = self.parse_returning(context)?;
         Ok(Statement::Insert(InsertStatement {
             with,
             or_conflict,
@@ -1206,18 +1567,22 @@ impl Parser {
     // UPDATE
     // -----------------------------------------------------------------------
 
-    fn parse_update_stmt(&mut self, with: Option<WithClause>) -> Result<Statement, ParseError> {
+    fn parse_update_stmt(
+        &mut self,
+        with: Option<WithClause>,
+        context: DmlParseContext,
+    ) -> Result<Statement, ParseError> {
         self.expect_kw(&TokenKind::KwUpdate)?;
         let or_conflict = if self.eat_kw(&TokenKind::KwOr) {
             Some(self.parse_conflict_action()?)
         } else {
             None
         };
-        let table = self.parse_qualified_table_ref()?;
+        let table = self.parse_qualified_table_ref(context)?;
         self.expect_kw(&TokenKind::KwSet)?;
         let assignments = self.parse_comma_sep(Self::parse_assignment)?;
         let from = if self.eat_kw(&TokenKind::KwFrom) {
-            Some(self.parse_from_clause()?)
+            Some(self.parse_from_clause_machine()?)
         } else {
             None
         };
@@ -1226,13 +1591,19 @@ impl Parser {
         } else {
             None
         };
-        let returning = self.parse_returning()?;
+        let returning = self.parse_returning(context)?;
+        if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwOrder) {
+            return Err(self.err_msg("ORDER BY is not allowed in trigger body UPDATE statements"));
+        }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
             self.expect_kw(&TokenKind::KwBy)?;
             self.parse_comma_sep(Self::parse_ordering_term)?
         } else {
             vec![]
         };
+        if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwLimit) {
+            return Err(self.err_msg("LIMIT is not allowed in trigger body UPDATE statements"));
+        }
         let limit = self.parse_limit()?;
         Ok(Statement::Update(UpdateStatement {
             with,
@@ -1265,22 +1636,32 @@ impl Parser {
     // DELETE
     // -----------------------------------------------------------------------
 
-    fn parse_delete_stmt(&mut self, with: Option<WithClause>) -> Result<Statement, ParseError> {
+    fn parse_delete_stmt(
+        &mut self,
+        with: Option<WithClause>,
+        context: DmlParseContext,
+    ) -> Result<Statement, ParseError> {
         self.expect_kw(&TokenKind::KwDelete)?;
         self.expect_kw(&TokenKind::KwFrom)?;
-        let table = self.parse_qualified_table_ref()?;
+        let table = self.parse_qualified_table_ref(context)?;
         let where_clause = if self.eat_kw(&TokenKind::KwWhere) {
             Some(self.parse_expr()?)
         } else {
             None
         };
-        let returning = self.parse_returning()?;
+        let returning = self.parse_returning(context)?;
+        if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwOrder) {
+            return Err(self.err_msg("ORDER BY is not allowed in trigger body DELETE statements"));
+        }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
             self.expect_kw(&TokenKind::KwBy)?;
             self.parse_comma_sep(Self::parse_ordering_term)?
         } else {
             vec![]
         };
+        if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwLimit) {
+            return Err(self.err_msg("LIMIT is not allowed in trigger body DELETE statements"));
+        }
         let limit = self.parse_limit()?;
         Ok(Statement::Delete(DeleteStatement {
             with,
@@ -1302,18 +1683,33 @@ impl Parser {
         let unique = self.eat_kw(&TokenKind::KwUnique);
 
         if self.eat_kw(&TokenKind::KwTable) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_table(temporary);
         }
         if self.eat_kw(&TokenKind::KwIndex) {
+            if temporary {
+                return Err(self.err_expected("TABLE, VIEW, or TRIGGER after TEMP"));
+            }
             return self.parse_create_index(unique);
         }
         if self.eat_kw(&TokenKind::KwView) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_view(temporary);
         }
         if self.eat_kw(&TokenKind::KwTrigger) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_trigger(temporary);
         }
         if self.eat_kw(&TokenKind::KwVirtual) {
+            if temporary || unique {
+                return Err(self.err_expected("TABLE, INDEX, VIEW, or TRIGGER"));
+            }
             self.expect_kw(&TokenKind::KwTable)?;
             return self.parse_create_virtual_table();
         }
@@ -1782,6 +2178,35 @@ impl Parser {
         }))
     }
 
+    fn parse_trigger_body_statement_inner(&mut self) -> Result<Statement, ParseError> {
+        match self.peek().clone() {
+            TokenKind::KwSelect | TokenKind::KwValues => {
+                Ok(Statement::Select(self.parse_select_stmt(None)?))
+            }
+            TokenKind::KwWith => {
+                let with = self.parse_with_clause()?;
+                if matches!(self.peek(), TokenKind::KwSelect | TokenKind::KwValues) {
+                    Ok(Statement::Select(self.parse_select_stmt(Some(with))?))
+                } else {
+                    Err(self.err_expected("SELECT or VALUES after WITH in a trigger body"))
+                }
+            }
+            TokenKind::KwInsert | TokenKind::KwReplace => {
+                self.parse_insert_stmt(None, DmlParseContext::TriggerBody)
+            }
+            TokenKind::KwUpdate => self.parse_update_stmt(None, DmlParseContext::TriggerBody),
+            TokenKind::KwDelete => self.parse_delete_stmt(None, DmlParseContext::TriggerBody),
+            _ => {
+                Err(self
+                    .err_msg("trigger body statement must be SELECT, INSERT, UPDATE, or DELETE"))
+            }
+        }
+    }
+
+    fn parse_trigger_body_statement(&mut self) -> Result<Statement, ParseError> {
+        self.parse_trigger_body_statement_inner()
+    }
+
     fn parse_create_trigger(&mut self, temporary: bool) -> Result<Statement, ParseError> {
         let if_not_exists = self.parse_if_not_exists();
         let name = self.parse_qualified_name()?;
@@ -1824,19 +2249,32 @@ impl Parser {
         };
         self.expect_kw(&TokenKind::KwBegin)?;
         let mut body = Vec::new();
+        if self.check_kw(&TokenKind::KwEnd) {
+            let error = self.err_msg("trigger body must contain at least one statement");
+            self.recover_trigger_body_after_error(self.pos);
+            return Err(error);
+        }
         loop {
             if self.check_kw(&TokenKind::KwEnd) {
                 break;
             }
-            let stmt = match self.parse_statement_inner() {
+            let statement_start = self.pos;
+            let stmt = match self.parse_trigger_body_statement() {
                 Ok(stmt) => stmt,
                 Err(err) => {
-                    self.recover_trigger_body_after_error();
+                    self.recover_trigger_body_after_error(statement_start);
                     return Err(err);
                 }
             };
             body.push(stmt);
-            let _ = self.eat(&TokenKind::Semicolon);
+            if !self.eat(&TokenKind::Semicolon) {
+                let error = self.err_expected("';' after trigger body statement");
+                // The statement parsed successfully, so the current token is
+                // already a statement boundary. In particular, UPDATE/INSERT/
+                // DELETE leave the enclosing trigger END current here.
+                self.recover_trigger_body_after_error(self.pos);
+                return Err(error);
+            }
         }
         self.expect_kw(&TokenKind::KwEnd)?;
         Ok(Statement::CreateTrigger(CreateTriggerStatement {
@@ -2101,6 +2539,9 @@ impl Parser {
         } else {
             false
         };
+        if self.check_kw(&TokenKind::KwExplain) {
+            return Err(self.err_msg("nested EXPLAIN is not allowed"));
+        }
         let stmt = self.parse_statement_inner()?;
         Ok(Statement::Explain {
             query_plan,
@@ -2112,8 +2553,9 @@ impl Parser {
     // Window definitions (used in SELECT ... WINDOW clause and OVER)
     // -----------------------------------------------------------------------
 
+    #[cfg(test)]
     fn parse_window_def(&mut self) -> Result<WindowDef, ParseError> {
-        let name = self.parse_identifier()?;
+        let name = self.parse_window_name()?;
         self.expect_kw(&TokenKind::KwAs)?;
         self.expect_token(&TokenKind::LeftParen)?;
         let spec = self.parse_window_spec()?;
@@ -2121,22 +2563,12 @@ impl Parser {
         Ok(WindowDef { name, spec })
     }
 
+    #[cfg(test)]
     pub(crate) fn parse_window_spec(&mut self) -> Result<WindowSpec, ParseError> {
         // Optional base window name.
-        let has_base_window = match self.peek() {
-            TokenKind::Id(_) | TokenKind::QuotedId(_, _) => true,
-            k if is_nonreserved_kw(k) => !matches!(
-                k,
-                TokenKind::KwPartition
-                    | TokenKind::KwOrder
-                    | TokenKind::KwRange
-                    | TokenKind::KwRows
-                    | TokenKind::KwGroups
-            ),
-            _ => false,
-        };
+        let has_base_window = starts_window_base_name(self.peek());
         let base_window = if has_base_window {
-            Some(self.parse_identifier()?)
+            Some(self.parse_window_name()?)
         } else {
             None
         };
@@ -2154,13 +2586,14 @@ impl Parser {
         };
         let frame = self.try_frame_spec()?;
         Ok(WindowSpec {
-            base_window,
+            window_ref: base_window.map(WindowReference::Base),
             partition_by,
             order_by,
             frame,
         })
     }
 
+    #[cfg(test)]
     fn try_frame_spec(&mut self) -> Result<Option<FrameSpec>, ParseError> {
         let frame_type = if self.eat_kw(&TokenKind::KwRows) {
             FrameType::Rows
@@ -2172,12 +2605,16 @@ impl Parser {
             return Ok(None);
         };
         let (start, end) = if self.eat_kw(&TokenKind::KwBetween) {
-            let s = self.parse_frame_bound()?;
+            let start = self.parse_frame_bound()?;
+            validate_frame_start(&start, true)?;
             self.expect_kw(&TokenKind::KwAnd)?;
-            let e = self.parse_frame_bound()?;
-            (s, Some(e))
+            let end = self.parse_frame_bound()?;
+            validate_frame_end(&start, &end)?;
+            (start, Some(end))
         } else {
-            (self.parse_frame_bound()?, None)
+            let start = self.parse_frame_bound()?;
+            validate_frame_start(&start, false)?;
+            (start, None)
         };
         let exclude = if self.eat_kw(&TokenKind::KwExclude) {
             if self.check_kw(&TokenKind::KwNo) {
@@ -2206,33 +2643,39 @@ impl Parser {
         };
         Ok(Some(FrameSpec {
             frame_type,
-            start,
-            end,
+            start: start.value,
+            end: end.map(|bound| bound.value),
             exclude,
         }))
     }
 
-    fn parse_frame_bound(&mut self) -> Result<FrameBound, ParseError> {
-        if self.eat_kw(&TokenKind::KwUnbounded) {
+    #[cfg(test)]
+    fn parse_frame_bound(&mut self) -> Result<ParsedFrameBound, ParseError> {
+        let origin = self
+            .current()
+            .cloned()
+            .ok_or_else(|| self.err_expected("window frame bound"))?;
+        let value = if self.eat_kw(&TokenKind::KwUnbounded) {
             if self.eat_kw(&TokenKind::KwPreceding) {
-                Ok(FrameBound::UnboundedPreceding)
+                FrameBound::UnboundedPreceding
             } else {
                 self.expect_kw(&TokenKind::KwFollowing)?;
-                Ok(FrameBound::UnboundedFollowing)
+                FrameBound::UnboundedFollowing
             }
         } else if matches!(self.peek(), TokenKind::Id(s) if s.eq_ignore_ascii_case("CURRENT")) {
             self.advance();
             self.expect_kw(&TokenKind::KwRow)?;
-            Ok(FrameBound::CurrentRow)
+            FrameBound::CurrentRow
         } else {
             let expr = self.parse_expr()?;
             if self.eat_kw(&TokenKind::KwPreceding) {
-                Ok(FrameBound::Preceding(Box::new(expr)))
+                FrameBound::Preceding(Box::new(expr))
             } else {
                 self.expect_kw(&TokenKind::KwFollowing)?;
-                Ok(FrameBound::Following(Box::new(expr)))
+                FrameBound::Following(Box::new(expr))
             }
-        }
+        };
+        Ok(ParsedFrameBound { value, origin })
     }
 }
 
@@ -2330,6 +2773,227 @@ pub fn parse_first_statement_with_tail(
 // Keyword classification helper
 // ---------------------------------------------------------------------------
 
+/// Whether `OVER` can consume the next token as a bare window name.
+///
+/// SQLite's fallback-name grammar is contextual here: it accepts several hard
+/// keywords that the generic identifier parser rejects, while `FILTER`,
+/// `NOTHING`, and `TRANSACTION` remain structural/reserved in this position.
+pub(crate) fn starts_bare_window_name(k: &TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::Id(_) | TokenKind::QuotedId(_, _) | TokenKind::String(_)
+    ) || (is_nonreserved_kw(k) && !matches!(k, TokenKind::KwFilter))
+        || matches!(
+            k,
+            TokenKind::KwAttach
+                | TokenKind::KwBegin
+                | TokenKind::KwBy
+                | TokenKind::KwCast
+                | TokenKind::KwCurrentDate
+                | TokenKind::KwCurrentTime
+                | TokenKind::KwCurrentTimestamp
+                | TokenKind::KwCross
+                | TokenKind::KwDetach
+                | TokenKind::KwExplain
+                | TokenKind::KwFalse
+                | TokenKind::KwFor
+                | TokenKind::KwGlob
+                | TokenKind::KwInner
+                | TokenKind::KwLeft
+                | TokenKind::KwLike
+                | TokenKind::KwNatural
+                | TokenKind::KwOuter
+                | TokenKind::KwRaise
+                | TokenKind::KwRegexp
+                | TokenKind::KwRight
+                | TokenKind::KwRollback
+                | TokenKind::KwTrue
+                | TokenKind::KwWith
+        )
+}
+
+/// Whether a token can begin the optional base name inside `OVER (...)`.
+///
+/// This uses the same contextual fallback set as a bare name, minus the five
+/// structural window-spec delimiters.
+pub(crate) fn starts_window_base_name(k: &TokenKind) -> bool {
+    starts_bare_window_name(k)
+        && !matches!(
+            k,
+            TokenKind::KwPartition
+                | TokenKind::KwOrder
+                | TokenKind::KwRange
+                | TokenKind::KwRows
+                | TokenKind::KwGroups
+        )
+}
+
+pub(crate) fn starts_post_dot_identifier(k: &TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::Id(_) | TokenKind::QuotedId(_, _) | TokenKind::String(_)
+    ) || (k.keyword_str().is_some()
+        && !matches!(
+            k,
+            TokenKind::KwAdd
+                | TokenKind::KwAll
+                | TokenKind::KwAlter
+                | TokenKind::KwAnd
+                | TokenKind::KwAs
+                | TokenKind::KwAutoincrement
+                | TokenKind::KwBetween
+                | TokenKind::KwCase
+                | TokenKind::KwCheck
+                | TokenKind::KwCollate
+                | TokenKind::KwCommit
+                | TokenKind::KwConstraint
+                | TokenKind::KwCreate
+                | TokenKind::KwDefault
+                | TokenKind::KwDeferrable
+                | TokenKind::KwDelete
+                | TokenKind::KwDistinct
+                | TokenKind::KwDrop
+                | TokenKind::KwElse
+                | TokenKind::KwEscape
+                | TokenKind::KwExcept
+                | TokenKind::KwExists
+                | TokenKind::KwForeign
+                | TokenKind::KwFrom
+                | TokenKind::KwGroup
+                | TokenKind::KwHaving
+                | TokenKind::KwIn
+                | TokenKind::KwIndex
+                | TokenKind::KwInsert
+                | TokenKind::KwIntersect
+                | TokenKind::KwInto
+                | TokenKind::KwIs
+                | TokenKind::KwIsnull
+                | TokenKind::KwJoin
+                | TokenKind::KwLimit
+                | TokenKind::KwNot
+                | TokenKind::KwNothing
+                | TokenKind::KwNotnull
+                | TokenKind::KwNull
+                | TokenKind::KwOn
+                | TokenKind::KwOr
+                | TokenKind::KwOrder
+                | TokenKind::KwPrimary
+                | TokenKind::KwReferences
+                | TokenKind::KwReturning
+                | TokenKind::KwSelect
+                | TokenKind::KwSet
+                | TokenKind::KwTable
+                | TokenKind::KwThen
+                | TokenKind::KwTo
+                | TokenKind::KwTransaction
+                | TokenKind::KwUnion
+                | TokenKind::KwUnique
+                | TokenKind::KwUpdate
+                | TokenKind::KwUsing
+                | TokenKind::KwValues
+                | TokenKind::KwWhen
+                | TokenKind::KwWhere
+        ))
+}
+
+pub(crate) fn starts_table_star_qualifier(k: &TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::Id(_)
+            | TokenKind::QuotedId(_, _)
+            | TokenKind::String(_)
+            | TokenKind::KwAbort
+            | TokenKind::KwAction
+            | TokenKind::KwAfter
+            | TokenKind::KwAlways
+            | TokenKind::KwAnalyze
+            | TokenKind::KwAsc
+            | TokenKind::KwAttach
+            | TokenKind::KwBefore
+            | TokenKind::KwBegin
+            | TokenKind::KwBy
+            | TokenKind::KwCascade
+            | TokenKind::KwColumn
+            | TokenKind::KwCommitseq
+            | TokenKind::KwConcurrent
+            | TokenKind::KwConflict
+            | TokenKind::KwCross
+            | TokenKind::KwDatabase
+            | TokenKind::KwDeferred
+            | TokenKind::KwDesc
+            | TokenKind::KwDetach
+            | TokenKind::KwDo
+            | TokenKind::KwEach
+            | TokenKind::KwEnd
+            | TokenKind::KwExclude
+            | TokenKind::KwExclusive
+            | TokenKind::KwExplain
+            | TokenKind::KwFail
+            | TokenKind::KwFalse
+            | TokenKind::KwFilter
+            | TokenKind::KwFirst
+            | TokenKind::KwFollowing
+            | TokenKind::KwFor
+            | TokenKind::KwFull
+            | TokenKind::KwGenerated
+            | TokenKind::KwGlob
+            | TokenKind::KwGroups
+            | TokenKind::KwIf
+            | TokenKind::KwIgnore
+            | TokenKind::KwImmediate
+            | TokenKind::KwIndexed
+            | TokenKind::KwInitially
+            | TokenKind::KwInner
+            | TokenKind::KwInstead
+            | TokenKind::KwKey
+            | TokenKind::KwLast
+            | TokenKind::KwLeft
+            | TokenKind::KwLike
+            | TokenKind::KwMatch
+            | TokenKind::KwMaterialized
+            | TokenKind::KwNatural
+            | TokenKind::KwNo
+            | TokenKind::KwNulls
+            | TokenKind::KwOf
+            | TokenKind::KwOffset
+            | TokenKind::KwOthers
+            | TokenKind::KwOuter
+            | TokenKind::KwOver
+            | TokenKind::KwPartition
+            | TokenKind::KwPlan
+            | TokenKind::KwPragma
+            | TokenKind::KwPreceding
+            | TokenKind::KwQuery
+            | TokenKind::KwRange
+            | TokenKind::KwRecursive
+            | TokenKind::KwRegexp
+            | TokenKind::KwReindex
+            | TokenKind::KwRelease
+            | TokenKind::KwRename
+            | TokenKind::KwReplace
+            | TokenKind::KwRestrict
+            | TokenKind::KwRight
+            | TokenKind::KwRollback
+            | TokenKind::KwRow
+            | TokenKind::KwRows
+            | TokenKind::KwSavepoint
+            | TokenKind::KwStored
+            | TokenKind::KwStrict
+            | TokenKind::KwTemp
+            | TokenKind::KwTemporary
+            | TokenKind::KwTies
+            | TokenKind::KwTrigger
+            | TokenKind::KwTrue
+            | TokenKind::KwUnbounded
+            | TokenKind::KwVacuum
+            | TokenKind::KwView
+            | TokenKind::KwVirtual
+            | TokenKind::KwWindow
+            | TokenKind::KwWith
+            | TokenKind::KwWithout
+    )
+}
+
 pub(crate) fn is_nonreserved_kw(k: &TokenKind) -> bool {
     matches!(
         k,
@@ -2362,7 +3026,6 @@ pub(crate) fn is_nonreserved_kw(k: &TokenKind) -> bool {
             | TokenKind::KwIf
             | TokenKind::KwIgnore
             | TokenKind::KwImmediate
-            | TokenKind::KwIndex
             | TokenKind::KwInitially
             | TokenKind::KwInstead
             | TokenKind::KwKey
@@ -2370,7 +3033,6 @@ pub(crate) fn is_nonreserved_kw(k: &TokenKind) -> bool {
             | TokenKind::KwMatch
             | TokenKind::KwMaterialized
             | TokenKind::KwNo
-            | TokenKind::KwNothing
             | TokenKind::KwNulls
             | TokenKind::KwOf
             | TokenKind::KwOffset
@@ -2388,17 +3050,14 @@ pub(crate) fn is_nonreserved_kw(k: &TokenKind) -> bool {
             | TokenKind::KwRename
             | TokenKind::KwReplace
             | TokenKind::KwRestrict
-            | TokenKind::KwReturning
             | TokenKind::KwRow
             | TokenKind::KwRows
             | TokenKind::KwSavepoint
             | TokenKind::KwStored
             | TokenKind::KwStrict
-            | TokenKind::KwTable
             | TokenKind::KwTemp
             | TokenKind::KwTemporary
             | TokenKind::KwTies
-            | TokenKind::KwTransaction
             | TokenKind::KwTrigger
             | TokenKind::KwUnbounded
             | TokenKind::KwVacuum
@@ -2409,33 +3068,59 @@ pub(crate) fn is_nonreserved_kw(k: &TokenKind) -> bool {
     )
 }
 
-/// Keywords that should never be consumed as implicit aliases because they
-/// begin/continue the next clause in this grammar position.
-fn is_alias_terminator_kw(k: &TokenKind) -> bool {
-    matches!(
-        k,
-        TokenKind::KwCross
-            | TokenKind::KwExcept
-            | TokenKind::KwFull
-            | TokenKind::KwGroup
-            | TokenKind::KwHaving
-            | TokenKind::KwInner
-            | TokenKind::KwIntersect
-            | TokenKind::KwJoin
-            | TokenKind::KwLeft
-            | TokenKind::KwLimit
-            | TokenKind::KwNatural
-            | TokenKind::KwOffset
-            | TokenKind::KwOn
-            | TokenKind::KwOrder
-            | TokenKind::KwOuter
-            | TokenKind::KwReturning
-            | TokenKind::KwRight
-            | TokenKind::KwUnion
-            | TokenKind::KwUsing
-            | TokenKind::KwWhere
-            | TokenKind::KwWindow
-    )
+/// Whether a token can be used as an alias after an explicit `AS`.
+///
+/// SQLite's fallback-name grammar accepts more hard keywords here than the
+/// old generic identifier grammar, while operator-shaped and structural
+/// keywords remain reserved.
+fn starts_explicit_alias_name(k: &TokenKind) -> bool {
+    starts_post_dot_identifier(k)
+}
+
+/// Whether a token can be consumed as an implicit result-column alias.
+///
+/// Pattern-matching tokens remain expression operators in this position.
+/// `WINDOW` is admitted here only after `Parser::starts_window_clause` has
+/// ruled out an actual named-window clause.
+fn starts_result_alias(k: &TokenKind) -> bool {
+    starts_explicit_alias_name(k)
+        && !matches!(
+            k,
+            TokenKind::KwCross
+                | TokenKind::KwFull
+                | TokenKind::KwGlob
+                | TokenKind::KwIndexed
+                | TokenKind::KwInner
+                | TokenKind::KwLeft
+                | TokenKind::KwLike
+                | TokenKind::KwMatch
+                | TokenKind::KwNatural
+                | TokenKind::KwOuter
+                | TokenKind::KwRegexp
+                | TokenKind::KwRight
+        )
+}
+
+/// Whether a token can be consumed as an implicit table/source alias.
+///
+/// Join prefixes, `INDEXED`, and FrankenSQLite's `FOR SYSTEM_TIME` introducer
+/// must remain available to the surrounding FROM grammar. Unlike a result
+/// alias, MATCH-family tokens are unambiguous source aliases here.
+fn starts_table_alias(k: &TokenKind) -> bool {
+    starts_explicit_alias_name(k)
+        && !matches!(
+            k,
+            TokenKind::KwCross
+                | TokenKind::KwFull
+                | TokenKind::KwIndexed
+                | TokenKind::KwInner
+                | TokenKind::KwIsnull
+                | TokenKind::KwLeft
+                | TokenKind::KwNatural
+                | TokenKind::KwNotnull
+                | TokenKind::KwOuter
+                | TokenKind::KwRight
+        )
 }
 
 pub(crate) fn kw_to_str(k: &TokenKind) -> String {
@@ -2470,6 +3155,642 @@ mod tests {
         stmts.into_iter().next().unwrap()
     }
 
+    fn parse_full_select(sql: &str) -> SelectStatement {
+        let Some((statement, tail_offset)) =
+            parse_first_statement_with_tail(sql).expect("full SELECT statement must parse")
+        else {
+            panic!("expected one SELECT statement");
+        };
+        assert_eq!(
+            tail_offset,
+            sql.len(),
+            "public parser must consume the full statement"
+        );
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT AST");
+        };
+        select
+    }
+
+    fn only_join(select: &SelectStatement) -> &JoinClause {
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            panic!("expected SELECT with FROM clause");
+        };
+        let [join] = from.joins.as_slice() else {
+            panic!("expected exactly one join");
+        };
+        assert_eq!(join.join_type.kind, JoinKind::Cross);
+        assert!(!join.join_type.natural);
+        join
+    }
+
+    #[test]
+    fn test_comma_join_accepts_on_constraint_and_consumes_full_statement() {
+        let select = parse_full_select("SELECT * FROM a, b ON a.id = b.id");
+        assert!(matches!(
+            &only_join(&select).constraint,
+            Some(JoinConstraint::On(Expr::BinaryOp {
+                op: fsqlite_ast::BinaryOp::Eq,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_comma_join_accepts_using_constraint_and_consumes_full_statement() {
+        let select = parse_full_select("SELECT * FROM a, b USING(id)");
+        assert!(matches!(
+            &only_join(&select).constraint,
+            Some(JoinConstraint::Using(columns))
+                if columns.len() == 1 && columns[0] == "id"
+        ));
+    }
+
+    #[test]
+    fn test_explicit_cross_join_accepts_on_constraint_and_consumes_full_statement() {
+        let select = parse_full_select("SELECT * FROM a CROSS JOIN b ON a.id = b.id");
+        assert!(matches!(
+            &only_join(&select).constraint,
+            Some(JoinConstraint::On(Expr::BinaryOp {
+                op: fsqlite_ast::BinaryOp::Eq,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_nonreserved_keyword_table_star_uses_wildcard_ast() {
+        let select = parse_full_select("SELECT filter.* FROM t AS filter");
+        let SelectCore::Select { columns, .. } = &select.body.select else {
+            panic!("expected SELECT core");
+        };
+        assert!(matches!(
+            columns.as_slice(),
+            [ResultColumn::TableStar(name)] if name == &QualifiedName::bare("filter")
+        ));
+        assert_eq!(
+            select.to_string(),
+            "SELECT \"filter\".* FROM t AS \"filter\""
+        );
+    }
+
+    #[test]
+    fn test_table_star_qualifier_uses_sqlite_contextual_keyword_matrix() {
+        for name in [
+            "abort",
+            "action",
+            "after",
+            "always",
+            "analyze",
+            "asc",
+            "attach",
+            "before",
+            "begin",
+            "by",
+            "cascade",
+            "column",
+            "commitseq",
+            "concurrent",
+            "conflict",
+            "cross",
+            "database",
+            "deferred",
+            "desc",
+            "detach",
+            "do",
+            "each",
+            "end",
+            "exclude",
+            "exclusive",
+            "explain",
+            "fail",
+            "false",
+            "filter",
+            "first",
+            "following",
+            "for",
+            "full",
+            "generated",
+            "glob",
+            "groups",
+            "if",
+            "ignore",
+            "immediate",
+            "indexed",
+            "initially",
+            "inner",
+            "instead",
+            "key",
+            "last",
+            "left",
+            "like",
+            "match",
+            "materialized",
+            "natural",
+            "no",
+            "nulls",
+            "of",
+            "offset",
+            "others",
+            "outer",
+            "over",
+            "partition",
+            "plan",
+            "pragma",
+            "preceding",
+            "query",
+            "range",
+            "recursive",
+            "regexp",
+            "reindex",
+            "release",
+            "rename",
+            "replace",
+            "restrict",
+            "right",
+            "rollback",
+            "row",
+            "rows",
+            "savepoint",
+            "stored",
+            "strict",
+            "temp",
+            "temporary",
+            "ties",
+            "trigger",
+            "true",
+            "unbounded",
+            "vacuum",
+            "view",
+            "virtual",
+            "window",
+            "with",
+            "without",
+        ] {
+            let sql = format!("SELECT {name}.* FROM t AS \"{name}\"");
+            let select = parse_full_select(&sql);
+            let SelectCore::Select { columns, .. } = &select.body.select else {
+                panic!("expected SELECT core for `{sql}`");
+            };
+            assert!(matches!(
+                columns.as_slice(),
+                [ResultColumn::TableStar(qualifier)] if qualifier == &QualifiedName::bare(name)
+            ));
+        }
+
+        for name in ["nothing", "transaction", "select", "table"] {
+            let sql = format!("SELECT {name}.* FROM t AS \"{name}\"");
+            parse_first_statement_with_tail(&sql)
+                .expect_err("non-fallback table-star keywords must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_qualified_star_is_rejected_outside_result_columns() {
+        for sql in ["SELECT 1 WHERE t.*", "SELECT abs(t.*) FROM t"] {
+            let error = parse_first_statement_with_tail(sql)
+                .expect_err("qualified star must not become an ordinary column expression");
+            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                "*",
+                "the diagnostic for `{sql}` must point at the illegal wildcard"
+            );
+            assert!(
+                error.message.contains("expected column name after '.'"),
+                "unexpected diagnostic for `{sql}`: {error:?}"
+            );
+        }
+
+        let valid = parse_full_select("SELECT t.*, filter.* FROM t AS filter");
+        let SelectCore::Select { columns, .. } = &valid.body.select else {
+            panic!("expected SELECT core");
+        };
+        assert!(matches!(
+            columns.as_slice(),
+            [ResultColumn::TableStar(first), ResultColumn::TableStar(second)]
+                if first == &QualifiedName::bare("t")
+                    && second == &QualifiedName::bare("filter")
+        ));
+    }
+
+    #[test]
+    fn test_single_quoted_qualified_identifiers_follow_identifier_context() {
+        for (sql, expected) in [
+            ("SELECT 't'.x FROM t", "SELECT t.x FROM t"),
+            ("SELECT t.'x' FROM t", "SELECT t.x FROM t"),
+            ("SELECT 't'.'x' FROM t", "SELECT t.x FROM t"),
+            ("SELECT t.'select' FROM t", "SELECT t.\"select\" FROM t"),
+            ("SELECT 't'.* FROM t", "SELECT t.* FROM t"),
+        ] {
+            let select = parse_full_select(sql);
+            assert_eq!(
+                select.to_string(),
+                expected,
+                "round-trip mismatch for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_post_dot_identifier_classification_matches_unquoted_names() {
+        for name in [
+            "key",
+            "window",
+            "filter",
+            "range",
+            "rows",
+            "groups",
+            "match",
+            "replace",
+            "abort",
+            "column",
+            "strict",
+            "true",
+            "false",
+            "current_date",
+            "current_time",
+            "current_timestamp",
+            "like",
+            "glob",
+            "regexp",
+        ] {
+            parse_full_select(&format!("SELECT t.{name} FROM t"));
+        }
+
+        for name in [
+            "add",
+            "all",
+            "alter",
+            "and",
+            "as",
+            "autoincrement",
+            "between",
+            "case",
+            "check",
+            "collate",
+            "commit",
+            "constraint",
+            "create",
+            "default",
+            "deferrable",
+            "delete",
+            "distinct",
+            "drop",
+            "else",
+            "escape",
+            "except",
+            "exists",
+            "foreign",
+            "select",
+            "from",
+            "group",
+            "having",
+            "in",
+            "index",
+            "insert",
+            "intersect",
+            "into",
+            "is",
+            "isnull",
+            "join",
+            "limit",
+            "not",
+            "nothing",
+            "notnull",
+            "null",
+            "on",
+            "or",
+            "order",
+            "primary",
+            "references",
+            "returning",
+            "set",
+            "table",
+            "then",
+            "to",
+            "transaction",
+            "union",
+            "unique",
+            "update",
+            "using",
+            "values",
+            "when",
+            "where",
+        ] {
+            let sql = format!("SELECT t.{name} FROM t");
+            let error = parse_first_statement_with_tail(&sql)
+                .expect_err("hard reserved names after a dot must require quoting");
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                name,
+                "the diagnostic for `{sql}` must point at the rejected name"
+            );
+        }
+
+        for (sql, rejected) in [("SELECT t.1 FROM t", ".1"), ("SELECT t. 1 FROM t", "1")] {
+            let error = parse_first_statement_with_tail(sql)
+                .expect_err("numeric tokens after a dot must not become identifiers");
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                rejected
+            );
+        }
+    }
+
+    #[test]
+    fn test_leading_qualified_keyword_uses_dot_lookahead_only() {
+        for name in [
+            "attach", "begin", "by", "false", "filter", "glob", "inner", "left", "like", "natural",
+            "outer", "regexp", "right", "rollback", "true", "with",
+        ] {
+            let sql = format!("SELECT {name}.x FROM (SELECT 1 AS x) AS \"{name}\"");
+            let select = parse_full_select(&sql);
+            let SelectCore::Select { columns, .. } = &select.body.select else {
+                panic!("expected SELECT core for `{sql}`");
+            };
+            assert!(matches!(
+                columns.as_slice(),
+                [ResultColumn::Expr {
+                    expr: Expr::Column(column, _),
+                    alias: None,
+                }] if column.table.as_deref() == Some(name) && column.column.as_ref() == "x"
+            ));
+        }
+
+        for name in ["cast", "current_date", "nothing", "raise", "transaction"] {
+            let sql = format!("SELECT {name}.x FROM (SELECT 1 AS x) AS \"{name}\"");
+            parse_first_statement_with_tail(&sql)
+                .expect_err("non-fallback leading qualifiers must remain expressions or syntax");
+        }
+    }
+
+    #[test]
+    fn test_result_alias_uses_sqlite_contextual_name_policy() {
+        for (source, expected) in [
+            ("'single quoted'", "single quoted"),
+            ("attach", "attach"),
+            ("cast", "cast"),
+            ("current_date", "current_date"),
+            ("false", "false"),
+            ("raise", "raise"),
+            ("rollback", "rollback"),
+            ("true", "true"),
+            ("with", "with"),
+            ("window", "window"),
+            ("offset", "offset"),
+        ] {
+            let sql = format!("SELECT 1 {source}");
+            let select = parse_full_select(&sql);
+            let SelectCore::Select { columns, .. } = &select.body.select else {
+                panic!("expected SELECT core for `{sql}`");
+            };
+            assert!(matches!(
+                columns.as_slice(),
+                [ResultColumn::Expr {
+                    alias: Some(alias),
+                    ..
+                }] if alias == expected
+            ));
+        }
+
+        for sql in [
+            "SELECT 1 indexed",
+            "SELECT 1 left",
+            "SELECT 1 match",
+            "SELECT 1 nothing",
+            "SELECT 1 transaction",
+            "SELECT 1 AS isnull",
+            "SELECT 1 AS notnull",
+        ] {
+            parse_first_statement_with_tail(sql)
+                .expect_err("operators and non-fallback names must not become result aliases");
+        }
+    }
+
+    #[test]
+    fn test_table_alias_uses_sqlite_contextual_name_policy() {
+        for (source, expected) in [
+            ("'single quoted'", "single quoted"),
+            ("attach", "attach"),
+            ("cast", "cast"),
+            ("current_date", "current_date"),
+            ("false", "false"),
+            ("for", "for"),
+            ("match", "match"),
+            ("raise", "raise"),
+            ("rollback", "rollback"),
+            ("true", "true"),
+            ("with", "with"),
+            ("window", "window"),
+            ("offset", "offset"),
+        ] {
+            let sql = format!("SELECT * FROM (SELECT 1) {source}");
+            let select = parse_full_select(&sql);
+            let SelectCore::Select {
+                from:
+                    Some(FromClause {
+                        source: TableOrSubquery::Subquery { alias, .. },
+                        ..
+                    }),
+                ..
+            } = &select.body.select
+            else {
+                panic!("expected aliased subquery for `{sql}`");
+            };
+            assert_eq!(
+                alias.as_deref(),
+                Some(expected),
+                "alias mismatch for `{sql}`"
+            );
+        }
+
+        for sql in [
+            "SELECT * FROM (SELECT 1) isnull",
+            "SELECT * FROM (SELECT 1) notnull",
+            "SELECT * FROM (SELECT 1) nothing",
+            "SELECT * FROM (SELECT 1) transaction",
+        ] {
+            parse_first_statement_with_tail(sql)
+                .expect_err("non-table-alias tokens must remain rejected");
+        }
+
+        let select = parse_full_select("SELECT * FROM t WINDOW w AS ()");
+        let SelectCore::Select { from, windows, .. } = &select.body.select else {
+            panic!("expected SELECT core");
+        };
+        assert!(matches!(
+            from,
+            Some(FromClause {
+                source: TableOrSubquery::Table { alias: None, .. },
+                ..
+            })
+        ));
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].name, "w");
+
+        let select = parse_full_select("SELECT * FROM t FOR SYSTEM_TIME AS OF COMMITSEQ 1");
+        let SelectCore::Select { from, .. } = &select.body.select else {
+            panic!("expected SELECT core");
+        };
+        assert!(matches!(
+            from,
+            Some(FromClause {
+                source: TableOrSubquery::Table {
+                    alias: None,
+                    time_travel: Some(TimeTravelClause {
+                        target: TimeTravelTarget::CommitSequence(1),
+                    }),
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_indexed_is_explicit_name_but_not_implicit_alias() {
+        for sql in [
+            "SELECT 1 AS indexed",
+            "SELECT * FROM (SELECT 1) AS indexed",
+            "CREATE TABLE t(indexed); SELECT t.indexed FROM t",
+        ] {
+            let mut parser = Parser::from_sql(sql);
+            let (statements, errors) = parser.parse_all();
+            assert!(
+                errors.is_empty(),
+                "unexpected errors for `{sql}`: {errors:?}"
+            );
+            assert!(
+                !statements.is_empty(),
+                "explicit INDEXED name context must produce an AST for `{sql}`"
+            );
+        }
+
+        for sql in ["SELECT 1 indexed", "SELECT * FROM (SELECT 1) indexed"] {
+            parse_first_statement_with_tail(sql)
+                .expect_err("INDEXED must remain unavailable as an implicit alias");
+        }
+    }
+
+    #[test]
+    fn test_nested_explain_is_rejected_at_the_second_explain() {
+        for sql in [
+            "EXPLAIN EXPLAIN SELECT 1",
+            "EXPLAIN QUERY PLAN EXPLAIN SELECT 1",
+        ] {
+            let error = parse_first_statement_with_tail(sql)
+                .expect_err("SQLite does not permit nested EXPLAIN statements");
+            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            assert!(
+                error.message.contains("nested EXPLAIN"),
+                "unexpected diagnostic for `{sql}`: {error:?}"
+            );
+            let second_explain = sql
+                .match_indices("EXPLAIN")
+                .nth(1)
+                .map(|(offset, _)| offset)
+                .expect("test SQL must contain a second EXPLAIN");
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                &sql[second_explain..second_explain + "EXPLAIN".len()],
+                "the nested-EXPLAIN diagnostic must point at the rejected keyword"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_name_slots_use_sqlite_fallback_name_policy() {
+        for sql in [
+            "CREATE TABLE begin(x)",
+            "SELECT * FROM begin",
+            "DROP TABLE main.begin",
+        ] {
+            parse_first_statement_with_tail(sql)
+                .expect("fallback-name keywords must parse in an established name slot");
+        }
+    }
+
+    #[test]
+    fn test_hard_reserved_column_names_require_quoting_in_ddl() {
+        for name in ["index", "nothing", "returning", "table", "transaction"] {
+            let sql = format!("CREATE TABLE t({name} INTEGER)");
+            let error = parse_first_statement_with_tail(&sql)
+                .expect_err("hard reserved column names must require quoting");
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_final_values_rejects_order_by_and_limit() {
+        for (sql, clause) in [
+            ("VALUES (1) ORDER BY 1", "ORDER"),
+            ("VALUES (1) LIMIT 1", "LIMIT"),
+            ("SELECT 1 UNION VALUES (2) ORDER BY 1", "ORDER"),
+            ("SELECT 1 UNION VALUES (2) LIMIT 1", "LIMIT"),
+        ] {
+            let error = parse_first_statement_with_tail(sql)
+                .expect_err("a trailing clause on a final VALUES term must be rejected");
+            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            assert!(
+                error.message.contains("not allowed after a VALUES term"),
+                "unexpected diagnostic for `{sql}`: {error:?}"
+            );
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                clause,
+                "the primary error for `{sql}` must point at the forbidden clause"
+            );
+        }
+
+        let deeply_nested = format!(
+            "VALUES (1) ORDER BY {}1{}",
+            "(".repeat(1_200),
+            ")".repeat(1_200)
+        );
+        let error = parse_first_statement_with_tail(&deeply_nested)
+            .expect_err("the forbidden final-VALUES clause must win over expression depth");
+        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        assert_eq!(
+            &deeply_nested[error.span.start as usize..error.span.end as usize],
+            "ORDER"
+        );
+
+        let final_select = parse_full_select("VALUES (1) UNION SELECT 2 ORDER BY 1 LIMIT 1");
+        assert_eq!(
+            final_select.to_string(),
+            "VALUES (1) UNION SELECT 2 ORDER BY 1 LIMIT 1"
+        );
+        let wrapped = parse_full_select("SELECT * FROM (VALUES (1)) ORDER BY 1 LIMIT 1");
+        assert_eq!(
+            wrapped.to_string(),
+            "SELECT * FROM (VALUES (1)) ORDER BY 1 LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn test_count_star_rejects_aggregate_order_by() {
+        let error = parse_first_statement_with_tail("SELECT count(* ORDER BY x) FROM t")
+            .expect_err("aggregate ORDER BY after count(*) must be rejected");
+        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        assert!(
+            error.message.contains("RightParen"),
+            "unexpected diagnostic: {error:?}"
+        );
+
+        let valid = parse_full_select("SELECT count(*) FILTER (WHERE x > 0) OVER () FROM t");
+        assert_eq!(
+            valid.to_string(),
+            "SELECT count(*) FILTER (WHERE x > 0) OVER () FROM t"
+        );
+    }
+
     #[test]
     fn test_parse_metrics_emitted_when_enabled() {
         let _guard = PARSE_OBSERVABILITY_LOCK
@@ -2489,6 +3810,98 @@ mod tests {
 
         set_parse_metrics_enabled(prev_metrics_enabled);
         reset_parse_metrics();
+    }
+
+    #[test]
+    fn test_public_parser_new_normalizes_empty_and_missing_eof_streams() {
+        let error = Parser::new(Vec::new())
+            .parse_expr()
+            .expect_err("an empty public token stream must return an error, not panic");
+        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        assert_eq!(error.span, Span::ZERO);
+
+        let integer = Token {
+            kind: TokenKind::Integer(1),
+            span: Span::new(0, 1),
+            line: 1,
+            col: 1,
+        };
+        let mut expression_parser = Parser::new(vec![integer]);
+        assert!(matches!(
+            expression_parser
+                .parse_expr()
+                .expect("a token stream without explicit EOF must be normalized"),
+            Expr::Literal(Literal::Integer(1), _)
+        ));
+        assert!(expression_parser.at_eof());
+
+        let mut tokens = Lexer::tokenize("SELECT 1");
+        assert!(matches!(
+            tokens.pop(),
+            Some(Token {
+                kind: TokenKind::Eof,
+                ..
+            })
+        ));
+        let (statements, errors) = Parser::new(tokens).parse_all();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].to_string(), "SELECT 1");
+
+        let mut tokens = Lexer::tokenize("SELECT 1; SELECT 2");
+        tokens.insert(
+            2,
+            Token {
+                kind: TokenKind::Eof,
+                span: Span::new(8, 8),
+                line: 1,
+                col: 9,
+            },
+        );
+        let mut parser = Parser::new(tokens);
+        assert_eq!(
+            parser
+                .tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::Eof)
+                .count(),
+            1
+        );
+        assert!(matches!(
+            parser.tokens.last(),
+            Some(Token {
+                kind: TokenKind::Eof,
+                ..
+            })
+        ));
+        let (statements, errors) = parser.parse_all();
+        assert!(
+            errors.is_empty(),
+            "embedded EOF normalization must not hide later tokens: {errors:?}"
+        );
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[1].to_string(), "SELECT 2");
+
+        let tokens = Lexer::tokenize("SELECT CASE WHEN 1 THEN 'a\nb'");
+        let expected_eof = tokens
+            .last()
+            .cloned()
+            .expect("the lexer must supply a terminal EOF");
+        let mut parser = Parser::new(tokens);
+        let normalized_eof = parser
+            .tokens
+            .last()
+            .expect("the normalized stream must retain a terminal EOF");
+        assert_eq!(normalized_eof, &expected_eof);
+        assert_eq!(normalized_eof.line, 2);
+        let (_, errors) = parser.parse_all();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.span == expected_eof.span && error.line == expected_eof.line),
+            "the missing END diagnostic must retain the lexer's multiline EOF coordinates: \
+             {errors:?}"
+        );
     }
 
     #[test]
@@ -2514,32 +3927,30 @@ mod tests {
 
     #[test]
     fn test_parse_depth_overflow_does_not_poison_following_statement() {
-        let mut parser = Parser::from_sql("SELECT 1; SELECT 42;");
-        parser.depth = MAX_PARSE_DEPTH - 1;
+        const OVER_LIMIT: usize = MAX_PARSE_DEPTH as usize + 1;
+        let expression = std::iter::repeat_n("1", OVER_LIMIT)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let sql = format!("SELECT {expression}; SELECT 42;");
+        let mut parser = Parser::from_sql(&sql);
+        let (statements, errors) = parser.parse_all();
 
-        // First statement overflows in nested parse entry (statement -> select)
-        // and should unwind depth cleanly back to MAX_PARSE_DEPTH - 1.
-        let first = parser.parse_statement();
-        assert!(first.is_err(), "first statement should hit depth guard");
         assert_eq!(
-            parser.depth,
-            MAX_PARSE_DEPTH - 1,
-            "depth must not leak upward on recursion-limit error"
-        );
-
-        // Consume separator and parse the next statement; it should still be
-        // reachable and fail for the same controlled reason (not because depth
-        // was poisoned by the prior attempt).
-        let _ = parser.eat(&TokenKind::Semicolon);
-        let second = parser.parse_statement();
-        assert!(
-            second.is_err(),
-            "second statement should still be parseable"
+            errors.len(),
+            1,
+            "only the height-1001 statement should be rejected: {errors:?}"
         );
         assert_eq!(
-            parser.depth,
-            MAX_PARSE_DEPTH - 1,
-            "depth must remain stable across repeated recursion-limit errors"
+            errors[0].kind,
+            ParseErrorKind::ExpressionTooDeep {
+                max: MAX_PARSE_DEPTH
+            }
+        );
+        assert_eq!(statements.len(), 1, "the valid statement must survive");
+        assert_eq!(statements[0].to_string(), "SELECT 42");
+        assert_eq!(
+            parser.depth, 0,
+            "expression-height recovery must not poison native parser depth"
         );
     }
 
@@ -2557,6 +3968,257 @@ mod tests {
     }
 
     #[test]
+    fn test_trigger_body_accepts_only_sqlite_trigger_commands() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                   SELECT 1; \
+                   VALUES (2); \
+                   INSERT INTO audit VALUES (3); \
+                   REPLACE INTO audit VALUES (4); \
+                   UPDATE audit SET value = 5; \
+                   DELETE FROM audit WHERE value = 6; \
+                   WITH seed(value) AS (VALUES (7)) SELECT value FROM seed; \
+                   SELECT 8 end; \
+                   SELECT * FROM audit end; \
+                   SELECT * FROM (SELECT 9) end; \
+                   UPDATE audit SET value = source.value FROM source \
+                     WHERE audit.id = source.id; \
+                   END";
+        let Statement::CreateTrigger(trigger) = parse_one(sql) else {
+            panic!("expected CREATE TRIGGER");
+        };
+        assert_eq!(trigger.body.len(), 11);
+        assert!(matches!(trigger.body[0], Statement::Select(_)));
+        assert!(matches!(trigger.body[1], Statement::Select(_)));
+        assert!(matches!(trigger.body[2], Statement::Insert(_)));
+        assert!(matches!(trigger.body[3], Statement::Insert(_)));
+        assert!(matches!(trigger.body[4], Statement::Update(_)));
+        assert!(matches!(trigger.body[5], Statement::Delete(_)));
+        assert!(matches!(trigger.body[6], Statement::Select(_)));
+        assert!(matches!(trigger.body[7], Statement::Select(_)));
+        assert!(matches!(trigger.body[8], Statement::Select(_)));
+        assert!(matches!(trigger.body[9], Statement::Select(_)));
+        assert!(matches!(trigger.body[10], Statement::Update(_)));
+    }
+
+    #[test]
+    fn test_trigger_body_rejects_empty_missing_semicolon_and_non_dml_commands() {
+        for (sql, rejected) in [
+            ("CREATE TRIGGER trg AFTER INSERT ON t BEGIN END", "END"),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN CREATE TABLE bad(x); END",
+                "CREATE",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN BEGIN; END",
+                "BEGIN",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN PRAGMA foreign_keys; END",
+                "PRAGMA",
+            ),
+            (
+                "CREATE TRIGGER outer_trg AFTER INSERT ON t BEGIN \
+                 CREATE TRIGGER inner_trg AFTER INSERT ON t BEGIN SELECT 1; END; END",
+                "CREATE",
+            ),
+        ] {
+            let error = parse_first_statement_with_tail(sql)
+                .expect_err("invalid trigger-body grammar must fail closed");
+            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                rejected,
+                "the diagnostic for `{sql}` must identify the rejected token"
+            );
+        }
+
+        let missing_separator = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1 END";
+        let error = parse_first_statement_with_tail(missing_separator)
+            .expect_err("a trigger body statement still requires a semicolon");
+        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        assert!(
+            error
+                .message
+                .contains("expected ';' after trigger body statement"),
+            "unexpected missing-separator diagnostic: {error:?}"
+        );
+        assert_eq!(
+            error.span.start, error.span.end,
+            "like stock SQLite's incomplete-input result, the parser must not reinterpret \
+             the implicit END alias as the trigger terminator"
+        );
+    }
+
+    #[test]
+    fn test_trigger_missing_separator_recovery_preserves_trailing_top_level_sql() {
+        for body_statement in [
+            "INSERT INTO audit VALUES (1)",
+            "UPDATE audit SET value = 1",
+            "DELETE FROM audit",
+        ] {
+            let sql = format!(
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 {body_statement} END; SELECT 42;"
+            );
+            let (statements, errors) = Parser::from_sql(&sql).parse_all();
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "the missing trigger-body separator must be reported: {sql}"
+            );
+            assert_eq!(
+                statements.len(),
+                1,
+                "recovery must preserve the trailing top-level statement: {sql}"
+            );
+            assert_eq!(statements[0].to_string(), "SELECT 42");
+        }
+    }
+
+    #[test]
+    fn test_trigger_body_rejects_stock_forbidden_dml_forms_at_exact_tokens() {
+        for (sql, rejected) in [
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 INSERT INTO main.audit VALUES (1); END",
+                ".",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 UPDATE main.audit SET value = 1; END",
+                ".",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 DELETE FROM main.audit; END",
+                ".",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 INSERT INTO audit AS target VALUES (1); END",
+                "AS",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 UPDATE audit AS target SET value = 1; END",
+                "AS",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 DELETE FROM audit AS target; END",
+                "AS",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 INSERT INTO audit DEFAULT VALUES; END",
+                "DEFAULT",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 UPDATE audit INDEXED BY audit_idx SET value = 1; END",
+                "INDEXED",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 UPDATE audit NOT INDEXED SET value = 1; END",
+                "NOT",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 DELETE FROM audit INDEXED BY audit_idx; END",
+                "INDEXED",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 DELETE FROM audit NOT INDEXED; END",
+                "NOT",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 UPDATE audit SET value = 1 ORDER BY value; END",
+                "ORDER",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 UPDATE audit SET value = 1 LIMIT 1; END",
+                "LIMIT",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 DELETE FROM audit ORDER BY value; END",
+                "ORDER",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 DELETE FROM audit LIMIT 1; END",
+                "LIMIT",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 INSERT INTO audit VALUES (1) RETURNING value; END",
+                "RETURNING",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 UPDATE audit SET value = 1 RETURNING value; END",
+                "RETURNING",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 DELETE FROM audit RETURNING value; END",
+                "RETURNING",
+            ),
+            (
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 WITH seed(value) AS (VALUES (1)) \
+                 INSERT INTO audit SELECT value FROM seed; END",
+                "INSERT",
+            ),
+        ] {
+            let error = parse_first_statement_with_tail(sql)
+                .expect_err("stock-forbidden trigger DML must fail closed");
+            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                rejected,
+                "the diagnostic for `{sql}` must identify the forbidden token"
+            );
+        }
+    }
+
+    #[test]
+    fn test_trigger_dml_restrictions_do_not_leak_to_top_level_statements() {
+        for sql in [
+            "INSERT INTO main.audit DEFAULT VALUES RETURNING rowid",
+            "UPDATE main.audit INDEXED BY audit_idx SET value = 1 \
+             RETURNING value ORDER BY value LIMIT 1",
+            "DELETE FROM main.audit NOT INDEXED RETURNING value ORDER BY value LIMIT 1",
+        ] {
+            parse_first_statement_with_tail(sql)
+                .unwrap_or_else(|error| panic!("top-level DML must remain accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn test_trigger_body_recovery_preserves_following_top_level_statement() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                   CREATE TABLE bad(x); END; SELECT 42;";
+        let (statements, errors) = Parser::from_sql(sql).parse_all();
+        assert_eq!(errors.len(), 1, "expected one trigger-body grammar error");
+        assert_eq!(
+            statements.len(),
+            1,
+            "the malformed trigger must be discarded"
+        );
+        assert_eq!(statements[0].to_string(), "SELECT 42");
+        assert_eq!(
+            &sql[errors[0].span.start as usize..errors[0].span.end as usize],
+            "CREATE"
+        );
+    }
+
+    #[test]
     fn test_parse_first_statement_with_tail_rejects_adjacent_statements_without_separator() {
         let error = parse_first_statement_with_tail("SELECT 1 SELECT 2")
             .expect_err("adjacent statements without a semicolon must be rejected");
@@ -2564,6 +4226,32 @@ mod tests {
         assert!(
             error.message.contains("expected ';' separator"),
             "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_all_reports_and_recovers_from_missing_statement_separator() {
+        let sql = "SELECT 1 SELECT 2";
+        let mut parser = Parser::from_sql(sql);
+        let (statements, errors) = parser.parse_all();
+
+        assert_eq!(
+            statements.len(),
+            2,
+            "both independently valid statements should remain available for diagnostics"
+        );
+        assert_eq!(statements[0].to_string(), "SELECT 1");
+        assert_eq!(statements[1].to_string(), "SELECT 2");
+        assert_eq!(errors.len(), 1, "the missing separator must be reported");
+        assert!(
+            errors[0].message.contains("expected ';' separator"),
+            "unexpected diagnostic: {:?}",
+            errors[0]
+        );
+        assert_eq!(
+            &sql[errors[0].span.start as usize..errors[0].span.end as usize],
+            "SELECT",
+            "the separator diagnostic must point at the second statement"
         );
     }
 
@@ -2582,7 +4270,8 @@ mod tests {
     #[test]
     fn test_error_recovery_does_not_fabricate_top_level_statements_from_trigger_body() {
         let mut parser = Parser::from_sql(
-            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN XYZZY; SELECT 1; END; SELECT 2;",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+             XYZZY; SELECT CASE WHEN 1 THEN 2 END AS end; SELECT 2; END; SELECT 3;",
         );
         let (stmts, errs) = parser.parse_all();
 
@@ -2602,7 +4291,7 @@ mod tests {
                             if matches!(
                                 columns.as_slice(),
                                 [ResultColumn::Expr {
-                                    expr: Expr::Literal(Literal::Integer(2), _),
+                                    expr: Expr::Literal(Literal::Integer(3), _),
                                     alias: None,
                                 }]
                             )
@@ -2610,6 +4299,26 @@ mod tests {
             ),
             "parser must skip the malformed trigger instead of reinterpreting body tokens as top-level SQL: {stmts:?}"
         );
+    }
+
+    #[test]
+    fn test_error_recovery_skips_a_rejected_nested_trigger_before_outer_end() {
+        for nested_prefix in ["CREATE TRIGGER", "CREATE UNIQUE TRIGGER"] {
+            let sql = format!(
+                "CREATE TRIGGER outer_trg AFTER INSERT ON t BEGIN \
+                 {nested_prefix} inner_trg AFTER INSERT ON t BEGIN SELECT 1; END; \
+                 END; SELECT 7;"
+            );
+            let (stmts, errs) = Parser::from_sql(&sql).parse_all();
+
+            assert_eq!(errs.len(), 1, "expected one trigger-body parse error");
+            assert_eq!(
+                stmts.len(),
+                1,
+                "neither nested-trigger tokens nor the outer END may escape as top-level SQL: {sql}"
+            );
+            assert_eq!(stmts[0].to_string(), "SELECT 7");
+        }
     }
 
     #[test]
@@ -2841,7 +4550,10 @@ mod tests {
                                 over: Some(over), ..
                             },
                         ..
-                    } => assert_eq!(over.base_window.as_deref(), Some("win")),
+                    } => assert_eq!(
+                        over.window_ref,
+                        Some(WindowReference::Direct("win".to_owned()))
+                    ),
                     other => unreachable!("expected named window function, got {other:?}"),
                 }
             } else {
@@ -2850,6 +4562,232 @@ mod tests {
         } else {
             unreachable!("expected Select");
         }
+    }
+
+    #[test]
+    fn select_named_window_reference_uses_sqlite_contextual_keyword_matrix() {
+        let assert_reference = |reference: &str, name: &str| {
+            let sql = format!("SELECT sum(1) OVER {reference} WINDOW {name} AS ()");
+            let select = parse_full_select(&sql);
+            let SelectCore::Select {
+                columns, windows, ..
+            } = &select.body.select
+            else {
+                panic!("expected SELECT core for `{sql}`");
+            };
+            assert_eq!(windows.len(), 1, "missing WINDOW definition for `{sql}`");
+            assert_eq!(windows[0].name, name);
+            let [
+                ResultColumn::Expr {
+                    expr:
+                        Expr::FunctionCall {
+                            over: Some(window), ..
+                        },
+                    alias: None,
+                },
+            ] = columns.as_slice()
+            else {
+                panic!("expected one named window call for `{sql}`");
+            };
+            let expected = if reference.starts_with('(') {
+                WindowReference::Base(name.to_owned())
+            } else {
+                WindowReference::Direct(name.to_owned())
+            };
+            assert_eq!(
+                window.window_ref,
+                Some(expected),
+                "wrong OVER form for `{sql}`"
+            );
+        };
+
+        for name in [
+            "attach",
+            "begin",
+            "by",
+            "cast",
+            "current_date",
+            "current_time",
+            "current_timestamp",
+            "cross",
+            "detach",
+            "explain",
+            "false",
+            "for",
+            "glob",
+            "inner",
+            "left",
+            "like",
+            "natural",
+            "outer",
+            "over",
+            "raise",
+            "regexp",
+            "right",
+            "rollback",
+            "key",
+            "true",
+            "window",
+            "with",
+        ] {
+            assert_reference(name, name);
+            assert_reference(&format!("({name})"), name);
+        }
+
+        for name in ["partition", "range", "rows", "groups"] {
+            assert_reference(name, name);
+            let sql = format!("SELECT sum(1) OVER ({name})");
+            parse_first_statement_with_tail(&sql)
+                .expect_err("window-spec delimiters cannot be parenthesized base names");
+        }
+    }
+
+    #[test]
+    fn select_named_window_reference_rejects_non_fallback_keywords() {
+        for name in ["filter", "nothing", "transaction"] {
+            for reference in [name.to_owned(), format!("({name})")] {
+                let sql = format!("SELECT sum(1) OVER {reference}");
+                parse_first_statement_with_tail(&sql)
+                    .expect_err("reserved window-name tokens must not be consumed as names");
+            }
+            let sql = format!("SELECT sum(1) WINDOW {name} AS ()");
+            parse_first_statement_with_tail(&sql)
+                .expect_err("reserved WINDOW definition names must be rejected");
+        }
+    }
+
+    #[test]
+    fn select_named_window_reference_accepts_string_and_parenthesized_names() {
+        for (sql, expected_name) in [
+            ("SELECT sum(1) OVER 'w' WINDOW 'w' AS ()", "w"),
+            ("SELECT sum(1) OVER ('w') WINDOW 'w' AS ()", "w"),
+            ("SELECT sum(1) OVER (window) WINDOW window AS ()", "window"),
+        ] {
+            let select = parse_full_select(sql);
+            let SelectCore::Select {
+                columns, windows, ..
+            } = &select.body.select
+            else {
+                panic!("expected SELECT core for `{sql}`");
+            };
+            assert_eq!(windows.len(), 1, "missing WINDOW definition for `{sql}`");
+            assert_eq!(windows[0].name, expected_name);
+            let [
+                ResultColumn::Expr {
+                    expr:
+                        Expr::FunctionCall {
+                            over: Some(window), ..
+                        },
+                    alias: None,
+                },
+            ] = columns.as_slice()
+            else {
+                panic!("expected one named window call for `{sql}`");
+            };
+            let expected = if sql.contains("OVER (") {
+                WindowReference::Base(expected_name.to_owned())
+            } else {
+                WindowReference::Direct(expected_name.to_owned())
+            };
+            assert_eq!(
+                window.window_ref,
+                Some(expected),
+                "wrong OVER form for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn over_window_prefers_named_window_reference_over_implicit_alias() {
+        let sql = "WITH t(x) AS (VALUES (1), (2)) \
+                   SELECT sum(x) OVER window FROM t WINDOW window AS ()";
+        let select = parse_full_select(sql);
+        let SelectCore::Select {
+            columns, windows, ..
+        } = &select.body.select
+        else {
+            panic!("expected SELECT core");
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].name, "window");
+        assert!(matches!(
+            columns.as_slice(),
+            [ResultColumn::Expr {
+                expr: Expr::FunctionCall {
+                    over: Some(WindowSpec {
+                        window_ref: Some(WindowReference::Direct(base_window)),
+                        ..
+                    }),
+                    ..
+                },
+                alias: None,
+            }] if base_window == "window"
+        ));
+
+        let error = parse_first_statement_with_tail("SELECT sum(1) OVER WINDOW w AS ()")
+            .expect_err("WINDOW after OVER is a window name, not an implicit OVER alias");
+        assert_eq!(error.kind, ParseErrorKind::Syntax);
+    }
+
+    #[test]
+    fn over_implicit_alias_disambiguation_is_preserved_at_real_boundaries() {
+        for sql in ["SELECT sum(1) OVER, 2", "SELECT sum(1) OVER FROM t"] {
+            let select = parse_full_select(sql);
+            let SelectCore::Select { columns, .. } = &select.body.select else {
+                panic!("expected SELECT core for `{sql}`");
+            };
+            assert!(matches!(
+                columns.first(),
+                Some(ResultColumn::Expr {
+                    expr: Expr::FunctionCall { over: None, .. },
+                    alias: Some(alias),
+                }) if alias == "over"
+            ));
+        }
+    }
+
+    #[test]
+    fn overflowing_float_literals_round_trip_as_infinite_numbers() {
+        fn assert_infinite_columns(select: &SelectStatement) {
+            let SelectCore::Select { columns, .. } = &select.body.select else {
+                panic!("expected SELECT core");
+            };
+            let [positive, negative] = columns.as_slice() else {
+                panic!("expected positive and negative infinity columns");
+            };
+            assert!(matches!(
+                positive,
+                ResultColumn::Expr {
+                    expr: Expr::Literal(Literal::Float(value), _),
+                    ..
+                } if value.is_infinite() && value.is_sign_positive()
+            ));
+            let ResultColumn::Expr {
+                expr:
+                    Expr::UnaryOp {
+                        op: UnaryOp::Negate,
+                        expr,
+                        ..
+                    },
+                ..
+            } = negative
+            else {
+                panic!("expected negative infinity to retain unary negation");
+            };
+            assert!(matches!(
+                expr.as_ref(),
+                Expr::Literal(Literal::Float(value), _)
+                    if value.is_infinite() && value.is_sign_positive()
+            ));
+        }
+
+        let parsed = parse_full_select("SELECT 9e999, -9e999");
+        assert_infinite_columns(&parsed);
+        let rendered = parsed.to_string();
+        assert_eq!(rendered, "SELECT 9e999, -9e999");
+        let reparsed = parse_full_select(&rendered);
+        assert_infinite_columns(&reparsed);
+        assert_eq!(reparsed.to_string(), rendered);
     }
 
     #[test]
@@ -3618,6 +5556,55 @@ mod tests {
     }
 
     #[test]
+    fn test_window_frame_rejects_illegal_bound_order_with_exact_span() {
+        for (sql, rejected) in [
+            (
+                "SELECT sum(x) OVER (ROWS UNBOUNDED FOLLOWING) FROM t",
+                "UNBOUNDED",
+            ),
+            ("SELECT sum(x) OVER (ROWS 1 FOLLOWING) FROM t", "1"),
+            (
+                "SELECT sum(x) OVER (ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t",
+                "UNBOUNDED",
+            ),
+            (
+                "SELECT sum(x) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM t",
+                "UNBOUNDED",
+            ),
+            (
+                "SELECT sum(x) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t",
+                "1",
+            ),
+            (
+                "SELECT sum(x) OVER (ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t",
+                "CURRENT",
+            ),
+        ] {
+            let error = parse_first_statement_with_tail(sql)
+                .expect_err("illegal window-frame boundaries must be rejected");
+            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                rejected,
+                "the diagnostic for `{sql}` must point at the illegal boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn test_window_frame_accepts_legal_categorical_order_without_offset_comparison() {
+        for sql in [
+            "SELECT sum(x) OVER (ROWS 1 PRECEDING) FROM t",
+            "SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND 2 PRECEDING) FROM t",
+            "SELECT sum(x) OVER (ROWS BETWEEN 2 FOLLOWING AND UNBOUNDED FOLLOWING) FROM t",
+            "SELECT sum(x) OVER (RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t",
+            "SELECT sum(x) OVER (GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING) FROM t",
+        ] {
+            parse_full_select(sql);
+        }
+    }
+
+    #[test]
     fn test_filter_clause_aggregate() {
         let stmt = parse_one("SELECT count(*) FILTER (WHERE x > 0) FROM t");
         if let Statement::Select(s) = stmt {
@@ -3820,6 +5807,15 @@ mod tests {
     #[test]
     fn test_roundtrip_select_filter_window_combined() {
         assert_roundtrip("SELECT sum(x) FILTER (WHERE x > 0) OVER (ORDER BY y) FROM t");
+    }
+
+    #[test]
+    fn test_serializer_regression_window_base_name_and_extensions_roundtrip() {
+        assert_roundtrip("SELECT sum(x) OVER base FROM t");
+        assert_roundtrip(
+            "SELECT sum(x) OVER (base PARTITION BY p ORDER BY y \
+             ROWS BETWEEN z PRECEDING AND CURRENT ROW) FROM t",
+        );
     }
 
     #[test]
@@ -4933,6 +6929,78 @@ mod tests {
     }
 
     #[test]
+    fn test_update_from_parentheses_are_stack_safe_at_1000_and_1001() {
+        fn drop_update_from_iteratively(statement: Statement) {
+            let Statement::Update(mut update) = statement else {
+                panic!("expected UPDATE statement");
+            };
+            let Some(mut from) = update.from.take() else {
+                panic!("expected UPDATE FROM clause");
+            };
+            drop(update);
+            loop {
+                let FromClause { source, joins } = from;
+                assert!(joins.is_empty());
+                match source {
+                    TableOrSubquery::ParenJoin(inner) => from = *inner,
+                    leaf => {
+                        drop(leaf);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for height in [1000, 1001] {
+            let sql = format!(
+                "UPDATE target SET value = 1 FROM {}source{} WHERE target.id = source.id",
+                "(".repeat(height),
+                ")".repeat(height)
+            );
+            let (rendered, statement) = std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(move || {
+                    let statement = Parser::from_sql(&sql)
+                        .parse_statement()
+                        .expect("deep UPDATE FROM must parse");
+                    let rendered = statement.to_string();
+                    (rendered, statement)
+                })
+                .expect("1 MiB parser thread must spawn")
+                .join()
+                .expect("deep UPDATE FROM parsing and formatting must not overflow");
+            assert!(rendered.starts_with("UPDATE target SET value = 1 FROM "));
+            assert!(rendered.ends_with(" WHERE target.id = source.id"));
+            assert_eq!(rendered.matches('(').count(), height);
+            assert_eq!(rendered.matches(')').count(), height);
+            drop_update_from_iteratively(statement);
+        }
+    }
+
+    #[test]
+    fn test_malformed_deep_update_from_recovers_following_statement() {
+        let sql = format!(
+            "UPDATE target SET value = 1 FROM {}source{}; SELECT 42;",
+            "(".repeat(1001),
+            ")".repeat(1000)
+        );
+        let (statements, errors) = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || Parser::from_sql(&sql).parse_all())
+            .expect("1 MiB parser thread must spawn")
+            .join()
+            .expect("malformed deep UPDATE FROM recovery must not overflow");
+
+        assert_eq!(errors.len(), 1, "expected one unbalanced-FROM error");
+        assert_eq!(
+            statements.len(),
+            1,
+            "the malformed UPDATE must be discarded"
+        );
+        assert_eq!(statements[0].to_string(), "SELECT 42");
+    }
+
+    #[test]
     fn test_update_order_by_limit() {
         let stmt = parse_one("UPDATE t SET a = a + 1 ORDER BY b DESC LIMIT 10");
         if let Statement::Update(u) = stmt {
@@ -5288,6 +7356,112 @@ mod tests {
     }
 
     #[test]
+    fn test_check_constraint_expression_height_fails_closed_at_1001() {
+        const LIMIT: usize = MAX_PARSE_DEPTH as usize;
+        let at_limit = std::iter::repeat_n("1", LIMIT)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let statement = format!("CREATE TABLE t (value INTEGER CHECK({at_limit}))");
+        assert!(
+            matches!(parse_one(&statement), Statement::CreateTable(_)),
+            "height-1000 CHECK must remain attached to its CREATE TABLE"
+        );
+
+        let over_limit = std::iter::repeat_n("1", LIMIT + 1)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let statement = format!("CREATE TABLE t (value INTEGER CHECK({over_limit}))");
+        let mut parser = Parser::from_sql(&statement);
+        let error = parser
+            .parse_statement()
+            .expect_err("height-1001 CHECK must reject the entire schema statement");
+        assert_eq!(
+            error.kind,
+            ParseErrorKind::ExpressionTooDeep {
+                max: MAX_PARSE_DEPTH
+            }
+        );
+        assert_eq!(
+            parser.depth, 0,
+            "expression-height rejection must unwind parser recursion state"
+        );
+    }
+
+    #[test]
+    fn test_expression_height_boundary_is_context_independent_on_one_mib_stack() {
+        const LIMIT: usize = MAX_PARSE_DEPTH as usize;
+        fn right_deep_expression(height: usize) -> String {
+            format!("{}1{}", "1 + (".repeat(height - 1), ")".repeat(height - 1))
+        }
+        fn parse_on_one_mib_stack(sql: String) -> Result<(), ParseError> {
+            std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(move || {
+                    let statement = Parser::from_sql(&sql).parse_statement()?;
+                    // Destruction is part of the constrained-stack contract:
+                    // a successful parse must not merely move a deep AST onto
+                    // the caller's larger stack before dropping it.
+                    drop(statement);
+                    Ok(())
+                })
+                .expect("1 MiB parser thread must spawn")
+                .join()
+                .expect("schema-context parse must not overflow or panic")
+        }
+
+        let at_limit = right_deep_expression(LIMIT);
+        let over_limit = right_deep_expression(LIMIT + 1);
+        let contexts = [
+            (
+                "SELECT",
+                format!("SELECT {at_limit}"),
+                format!("SELECT {over_limit}"),
+            ),
+            (
+                "column CHECK",
+                format!("CREATE TABLE t (value INTEGER CHECK({at_limit}))"),
+                format!("CREATE TABLE t (value INTEGER CHECK({over_limit}))"),
+            ),
+            (
+                "table CHECK",
+                format!("CREATE TABLE t (value INTEGER, CHECK({at_limit}))"),
+                format!("CREATE TABLE t (value INTEGER, CHECK({over_limit}))"),
+            ),
+            (
+                "view",
+                format!("CREATE VIEW v AS SELECT {at_limit}"),
+                format!("CREATE VIEW v AS SELECT {over_limit}"),
+            ),
+            (
+                "trigger",
+                format!(
+                    "CREATE TRIGGER tr BEFORE INSERT ON t WHEN {at_limit} \
+                     BEGIN SELECT 1; END"
+                ),
+                format!(
+                    "CREATE TRIGGER tr BEFORE INSERT ON t WHEN {over_limit} \
+                     BEGIN SELECT 1; END"
+                ),
+            ),
+        ];
+
+        for (context, accepted, rejected) in contexts {
+            parse_on_one_mib_stack(accepted)
+                .unwrap_or_else(|error| panic!("{context} height 1000 rejected: {error}"));
+
+            let error = parse_on_one_mib_stack(rejected)
+                .expect_err("height 1001 must reject every expression-bearing context");
+            assert_eq!(
+                error.kind,
+                ParseErrorKind::ExpressionTooDeep {
+                    max: MAX_PARSE_DEPTH
+                },
+                "wrong error classification for {context}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_column_default_literal() {
         let stmt = parse_one("CREATE TABLE t (status TEXT DEFAULT 'active')");
         if let Statement::CreateTable(ct) = stmt {
@@ -5403,6 +7577,32 @@ mod tests {
         } else {
             unreachable!("expected CreateTable");
         }
+    }
+
+    #[test]
+    fn test_create_rejects_modifiers_for_incompatible_object_kinds() {
+        for sql in [
+            "CREATE UNIQUE TABLE t(value INTEGER)",
+            "CREATE UNIQUE VIEW v AS SELECT 1",
+            "CREATE UNIQUE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "CREATE UNIQUE VIRTUAL TABLE vt USING fts5(content)",
+            "CREATE TEMP INDEX i ON t(value)",
+            "CREATE TEMP VIRTUAL TABLE vt USING fts5(content)",
+        ] {
+            Parser::from_sql(sql)
+                .parse_statement()
+                .expect_err("CREATE modifiers must not be discarded for incompatible objects");
+        }
+    }
+
+    #[test]
+    fn test_invalid_create_modifier_recovers_next_statement() {
+        let (statements, errors) =
+            Parser::from_sql("CREATE UNIQUE TABLE t(value INTEGER); SELECT 42;").parse_all();
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(statements[0], Statement::Select(_)));
     }
 
     #[test]
@@ -8267,6 +10467,36 @@ mod tests {
             warmed_error_capacity,
             "successful parse should preserve error scratch capacity for the next recovery path",
         );
+    }
+
+    #[test]
+    fn test_parse_statements_with_scratch_enforces_top_level_separators() {
+        let mut scratch = StatementParseScratch::default();
+        let sql = "SELECT 1 SELECT 2";
+        let error = parse_statements_with_scratch(sql, &mut scratch)
+            .expect_err("scratch parser must reject adjacent statements");
+        assert!(
+            error.message.contains("expected ';' separator"),
+            "unexpected diagnostic: {error:?}"
+        );
+        assert_eq!(
+            &sql[error.span.start as usize..error.span.end as usize],
+            "SELECT"
+        );
+
+        let statements = parse_statements_with_scratch("SELECT 1; SELECT 2;", &mut scratch)
+            .expect("semicolon-separated statements must remain valid");
+        assert_eq!(statements.len(), 2);
+
+        let trigger_script = "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+                              INSERT INTO t VALUES (1); \
+                              INSERT INTO t VALUES (2); \
+                              END; SELECT 3;";
+        let statements = parse_statements_with_scratch(trigger_script, &mut scratch)
+            .expect("trigger-body terminators must not become top-level separator errors");
+        assert_eq!(statements.len(), 2);
+        assert!(matches!(statements[0], Statement::CreateTrigger(_)));
+        assert!(matches!(statements[1], Statement::Select(_)));
     }
 
     #[test]

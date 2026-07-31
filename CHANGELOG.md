@@ -17,14 +17,14 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.2.0] -- 2026-07-25 (async storage stack, skip-scan acceleration, durable WAL certificates)
+## [0.2.0] -- Unreleased (async storage stack, adaptive skip-scan execution, durable WAL certificates)
 
-Full-workspace lockstep release (`0.1.18 -> 0.2.0`).
+Next full-workspace lockstep release (`0.1.19 -> 0.2.0`).
 
 > **BREAKING.** This release makes the storage stack `async` end to end, which
 > changes public signatures. Under Cargo's 0.x rules the minor version is the
-> compatibility axis, so this ships as `0.2.0` rather than `0.1.19`: a caller
-> pinning `fsqlite = "0.1"` keeps the synchronous 0.1.18 API and is not
+> compatibility axis, so this ships as `0.2.0` rather than `0.1.20`: a caller
+> pinning `fsqlite = "0.1"` keeps the synchronous 0.1.19 API and is not
 > upgraded silently. See **Breaking changes** below for the migration.
 
 ### Breaking changes
@@ -33,14 +33,10 @@ Full-workspace lockstep release (`0.1.18 -> 0.2.0`).
   `open_existing` / `open_with_page_size` / `open_schema_only` / identity and
   reserved variants, along with `execute`, `execute_batch`, `query`,
   `query_row`, and `prepare`, are now `async fn`. Call sites add `.await`.
-  FrankenSQLite still never builds a runtime of its own -- the `Cx` and the
-  executor come from the caller, per the asupersync contract.
-- **`compat::Transaction` is no longer RAII.** Dropping a transaction without
-  finalizing it previously rolled back; it now leaves the transaction open,
-  because `Drop::drop` cannot await and this crate will not build a runtime to
-  bridge that. Callers must explicitly `commit().await` or `rollback().await`.
-  This is the one silent behavior change in the release: code that relied on
-  drop-rollback will now leak an open transaction rather than fail loudly.
+  The caller's executor polls these futures. Core `Connection` operations
+  derive their `Cx` from the connection's `RuntimeContext`; callers that need
+  explicit capability lineage can use `RuntimeContext::new_with_root_cx` in a
+  `ConnectionEnv`.
 - **The sealed storage traits are no longer dyn-compatible.** `MvccPager`,
   `TransactionHandle`, and the neighbouring pager traits return
   `impl Future` (RPITIT) instead of being `async_trait`-boxed, which keeps the
@@ -84,14 +80,13 @@ Full-workspace lockstep release (`0.1.18 -> 0.2.0`).
 
 ### Fixed
 
-- `Connection::open_existing_schema_only` and identity/environment variants
-  provide an existing-only, writable database open that loads schema metadata
-  without hydrating table rows into the compatibility `MemDatabase`. This is
-  the bounded-memory entry point for repairing or incrementally updating very
-  large SQLite-compatible databases.
-
-### Fixed
-
+- `compat::Transaction` preserves rollback-on-drop across the async migration.
+  Because `Drop::drop` cannot await, an unfinalized wrapper records a mandatory
+  cleanup obligation; the next public SQL entry point rolls the transaction
+  back before executing the incoming statement. Explicit
+  `commit().await` / `rollback().await` remains the immediate-finalization
+  path, but abandoned writes cannot leak into a later statement
+  ([`0e45f070`](https://github.com/Dicklesworthstone/frankensqlite/commit/0e45f070dc0b7dcfbb3f7ca8269cc6831bee2803)).
 - **Connection-local TEMP tables and indexes can no longer allocate orphaned
   pages in the main database**
   ([#290](https://github.com/Dicklesworthstone/frankensqlite/issues/290)). TEMP
@@ -156,11 +151,54 @@ Full-workspace lockstep release (`0.1.18 -> 0.2.0`).
   (`1..COUNT`), and its unit test, which still asserted the pre-`cc17ee46`
   value, was corrected.
 
-### Release
+## [0.1.19] -- 2026-07-26 (atomic SQL semantics and migration-scale DDL reopening)
 
-- All publishable `fsqlite` / `fsqlite-*` crates are released in lockstep at
-  `0.2.0`. Native artifacts are built and signed outside GitHub Actions for
-  Linux x86-64 and arm64, macOS x86-64 and arm64, and Windows x86-64.
+Full-workspace lockstep release (`0.1.18 -> 0.1.19`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Correctness
+
+- Multi-row `INSERT ... SELECT`, rowid and `WITHOUT ROWID` updates, nested
+  triggers, `RETURNING`, conflict actions, and foreign-key validation now share
+  statement-scoped rollback and change-counter semantics with C SQLite. The
+  execution path preserves the correct effects for `FAIL`, rolls back the
+  complete statement for `ABORT`/`ROLLBACK`, restores nested-trigger
+  `last_insert_rowid()`, and retains exact transaction/savepoint history.
+- `INSERT OR REPLACE` now records every logical victim, applies inbound
+  foreign-key actions at the correct statement boundary, and handles
+  `WITHOUT ROWID` primary and secondary uniqueness victims without leaking a
+  partial delete or double-counting changes.
+- Trigger `WHEN` expressions honor explicit collations after `OLD`/`NEW`
+  binding, including bound literals under `COLLATE NOCASE`.
+
+### DDL durability and fail-closed parsing
+
+- Flat associative `AND`/`OR` predicates are serialized without recursive
+  parenthesis growth, so repeatedly reopening a migration-heavy database no
+  longer inflates catalog SQL until the parser exhausts a bounded stack.
+- Parser nesting is tracked explicitly and returns a typed recursion-limit
+  error rather than overflowing a 2 MiB worker stack.
+- Catalog hydration now refuses malformed trigger definitions instead of
+  silently dropping them. File-backed reopen tests pin exact catalog SQL and
+  BLAKE3 hashes across four close/open cycles while executing triggers, partial
+  indexes, views, rowid and `WITHOUT ROWID` foreign keys, and integrity checks.
+
+### Verification
+
+- Eleven atomic C-SQLite differential scenarios cover trigger interleavings,
+  composite locators, foreign-key matrices, REPLACE cascades, savepoint/reopen
+  behavior, `OR FAIL` history, and rowid-alias updates.
+- The migration-scale DDL harness covers scalar and `EXISTS` trigger
+  predicates, binary and `NOCASE` partial indexes, four durable reopen cycles,
+  and nine deliberately corrupted catalog variants that must all fail closed.
+
+### CI / Release
+
+- All publishable `fsqlite` / `fsqlite-*` crates were published in lockstep at
+  `0.1.19` by the successful
+  [crates.io publishing workflow](https://github.com/Dicklesworthstone/frankensqlite/actions/runs/30200995163).
+- The `v0.1.19` Git tag exists, but no GitHub Release object or native signed
+  artifact set was published for this version.
 
 ## [0.1.18] -- 2026-07-18 (streaming composite-index count semijoins)
 
@@ -190,9 +228,11 @@ no breaking API changes.
 
 ### CI / Release
 
-- All publishable `fsqlite` / `fsqlite-*` crates are released in lockstep at
-  `0.1.18`, with native signed artifacts for Linux x86-64 and arm64, macOS
-  x86-64 and arm64, and Windows x86-64.
+- All publishable `fsqlite` / `fsqlite-*` crates were published to crates.io
+  in lockstep at `0.1.18`.
+- The annotated `v0.1.18` Git tag exists, but GitHub records no Release
+  workflow run or Release object for that tag, and no native signed artifact
+  set was published for this version.
 
 ## [0.1.17] -- 2026-07-18 (B-tree corruption and join-correctness fixes)
 

@@ -38,10 +38,6 @@ use crate::shm::ShmRegion;
 use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource};
 use crate::unix::{UnixFile, UnixVfs};
 
-#[cfg(feature = "linux-uring-fs")]
-compile_error!(
-    "legacy `linux-uring-fs` backend is disabled; use `linux-asupersync-uring` (homegrown runtime path)"
-);
 #[cfg(not(feature = "linux-asupersync-uring"))]
 compile_error!("fsqlite-vfs on Linux requires `linux-asupersync-uring`");
 
@@ -1020,6 +1016,22 @@ impl VfsFile for IoUringFile {
 
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
         self.inner.unlock(cx, level)
+    }
+
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_shared_snapshot(cx)
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_shared_snapshot_attempt(cx)
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        self.inner.lock_external_maintenance(cx, wal_mode)
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_maintenance_attempt(cx)
     }
 
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
@@ -2201,51 +2213,6 @@ mod tests {
             "abort should not fall back to unix or record fallback metrics"
         );
         Ok(())
-    }
-
-    #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    #[test]
-    fn test_lock_mutex_or_io_handles_poison_without_panicking() {
-        let mutex = Mutex::new(7_u8);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-            std::panic::panic_any("poison mutex");
-        }));
-        let err = lock_mutex_or_io(&mutex).expect_err("lock should fail");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert_eq!(err.to_string(), IO_URING_LOCK_POISONED_MSG);
-    }
-
-    #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    #[test]
-    fn test_poisoned_runtime_falls_back_to_unix_path_and_disables_backend() {
-        let cx = Cx::new();
-        let vfs = IoUringVfs::new();
-        if !vfs.is_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("uring_poison_fallback.db");
-        let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
-            .expect("open should succeed");
-
-        if let Some(ring_mutex) = file.runtime.ring.as_ref() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _guard = ring_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                std::panic::panic_any("poison io_uring runtime lock");
-            }));
-        }
-
-        block_on_test(&cx, file.write(&cx, b"fallback", 0))
-            .expect("write should fall back and succeed");
-        let mut buf = [0_u8; 8];
-        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0))
-            .expect("read should fall back and succeed");
-        assert_eq!(n, 8);
-        assert_eq!(&buf, b"fallback");
-        assert!(vfs.runtime.is_disabled());
-        assert!(!vfs.is_available());
     }
 
     #[cfg(feature = "linux-asupersync-uring")]

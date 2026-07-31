@@ -15,7 +15,27 @@ on:
       - ".github/workflows/fsqlite-wasm-ci.yml"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "crates/fsqlite-wasm/**"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "packages/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.base.json"
+      - "scripts/build_fsqlite_wasm_package.sh"
+      - "LICENSE"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/fsqlite-wasm-ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "packages/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.base.json"
       - "scripts/build_fsqlite_wasm_package.sh"
       - "LICENSE"
   release:
@@ -25,6 +45,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event_name == 'workflow_dispatch' && github.run_id || github.ref
+    }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
 jobs:
   build-test-package:
     runs-on: ubuntu-latest
@@ -32,12 +59,14 @@ jobs:
     env:
       RUST_BACKTRACE: "1"
       CARGO_TERM_COLOR: always
+      FSQLITE_WASM_WORKER_FEATURES: backup,batch-execution,diagnostics,prepared-statements,row-arrays
+      FSQLITE_WASM_WORKER_ACTIVE_FEATURES: backup,batch-execution,diagnostics,prepared-statements,row-arrays,wasm-runtime-minimal
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: nightly
 
@@ -48,7 +77,7 @@ jobs:
           rustup target add wasm32-unknown-unknown
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
@@ -72,23 +101,26 @@ jobs:
           set -euo pipefail
           cargo install twiggy --locked
 
-      - name: Run host tests
+      - name: Run default and all-feature host tests
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p fsqlite-wasm --locked -- --nocapture
+          cargo test -p fsqlite-wasm --locked --all-features -- --nocapture
 
-      - name: Run browser tests
+      - name: Run default and all-feature browser tests
         shell: bash
         run: |
           set -euo pipefail
-          wasm-pack test --headless --chrome crates/fsqlite-wasm
+          wasm-pack test --headless --chrome crates/fsqlite-wasm --locked
+          wasm-pack test --headless --chrome crates/fsqlite-wasm --locked --all-features
 
-      - name: Verify wasm32 build
+      - name: Verify default and all-feature wasm32 builds
         shell: bash
         run: |
           set -euo pipefail
           cargo build -p fsqlite-wasm --locked --target wasm32-unknown-unknown --release
+          cargo build -p fsqlite-wasm --locked --target wasm32-unknown-unknown --release --all-features
 
       - name: Build and pack npm artifact
         shell: bash
@@ -99,7 +131,10 @@ jobs:
           pkg_dir="${artifact_root}/pkg"
 
           mkdir -p "${artifact_root}"
-          FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh "${pkg_dir}"
+          FSQLITE_WASM_FEATURES="${FSQLITE_WASM_WORKER_FEATURES}" \
+            FSQLITE_WASM_EXPECT_ACTIVE_FEATURES="${FSQLITE_WASM_WORKER_ACTIVE_FEATURES}" \
+            FSQLITE_WASM_TWIGGY=required \
+            ./scripts/build_fsqlite_wasm_package.sh "${pkg_dir}"
 
           size_report="${pkg_dir}/size-report.json"
           if [[ ! -f "${size_report}" ]]; then
@@ -107,9 +142,29 @@ jobs:
             exit 1
           fi
 
+          expected_features_json='["backup","batch-execution","diagnostics","prepared-statements","row-arrays","wasm-runtime-minimal"]'
+          jq -e \
+            --argjson expected "${expected_features_json}" \
+            '
+              .cargoFeatures == $expected
+              and .defaultFeaturesEnabled == true
+              and .expectedCargoFeatures == $expected
+              and .featureContractPass == true
+            ' "${size_report}" >/dev/null
+          jq -e \
+            --argjson expected "${expected_features_json}" \
+            '
+              .frankensqlite.cargoPackage == "fsqlite-wasm"
+              and .frankensqlite.cargoFeatures == $expected
+              and .frankensqlite.defaultFeaturesEnabled == true
+              and .frankensqlite.expectedCargoFeatures == $expected
+            ' "${pkg_dir}/package.json" >/dev/null
+
           package_name="$(jq -r '.packageName' "${size_report}")"
           build_target="$(jq -r '.buildTarget' "${size_report}")"
           profile="$(jq -r '.profile' "${size_report}")"
+          cargo_features="$(jq -c '.cargoFeatures' "${size_report}")"
+          feature_contract_pass="$(jq -r '.featureContractPass' "${size_report}")"
           strip_location_detail="$(jq -r '.stripLocationDetail' "${size_report}")"
           wasm_opt_mode="$(jq -r '.wasmOpt.mode' "${size_report}")"
           packed_file="$(jq -r '.packedArchive // ""' "${size_report}")"
@@ -136,6 +191,8 @@ jobs:
             echo "- size_report: \`${size_report}\`"
             echo "- build_target: \`${build_target}\`"
             echo "- profile: \`${profile}\`"
+            echo "- cargo_features: \`${cargo_features}\`"
+            echo "- feature_contract_pass: \`${feature_contract_pass}\`"
             echo "- wasm_opt: \`${wasm_opt_mode}\`"
             echo "- wasm_opt_kept: \`${wasm_opt_kept}\`"
             echo "- strip_location_detail: \`${strip_location_detail}\`"
@@ -155,9 +212,315 @@ jobs:
             done < <(find "${artifact_root}" -maxdepth 2 -type f | sort)
           } > "${artifact_root}/summary.md"
 
+      - name: Install JavaScript test toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --legacy-peer-deps
+
+      - name: Install exact generated core artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pkg_dir="artifacts/fsqlite-wasm/pkg"
+          size_report="${pkg_dir}/size-report.json"
+          packed_file="$(jq -er '.packedArchive' "${size_report}")"
+          packed_path="${pkg_dir}/${packed_file}"
+          installed_core="node_modules/@frankensqlite/core"
+          expected_features_json='["backup","batch-execution","diagnostics","prepared-statements","row-arrays","wasm-runtime-minimal"]'
+
+          if [[ ! -f "${packed_path}" ]]; then
+            echo "Expected generated core archive at ${packed_path}" >&2
+            exit 1
+          fi
+          if [[ -e "${installed_core}" ]]; then
+            echo "Refusing to overwrite an existing core installation at ${installed_core}" >&2
+            exit 1
+          fi
+
+          mkdir -p "${installed_core}"
+          tar -xzf "${packed_path}" --strip-components=1 -C "${installed_core}"
+          jq -e \
+            --argjson expected "${expected_features_json}" \
+            '
+              .name == "@frankensqlite/core"
+              and .frankensqlite.cargoFeatures == $expected
+              and .frankensqlite.defaultFeaturesEnabled == true
+              and .frankensqlite.expectedCargoFeatures == $expected
+            ' "${installed_core}/package.json" >/dev/null
+          sha256sum "${packed_path}" > "artifacts/fsqlite-wasm/core-package.sha256"
+
+      - name: Build and typecheck worker and SDK against generated core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -e packages/worker/tsconfig.package-ci.json ]] \
+            || [[ -e packages/sdk/tsconfig.package-ci.json ]]; then
+            echo "Refusing to overwrite package-resolution TypeScript configs" >&2
+            exit 1
+          fi
+          jq '
+            .compilerOptions.paths = {}
+            | .exclude = ((.exclude // []) + ["src/core-module.d.ts"] | unique)
+          ' \
+            packages/worker/tsconfig.json \
+            > packages/worker/tsconfig.package-ci.json
+          jq '.compilerOptions.paths = {}' \
+            packages/sdk/tsconfig.json \
+            > packages/sdk/tsconfig.package-ci.json
+
+          ./node_modules/.bin/tsc -p packages/worker/tsconfig.build.json
+          ./node_modules/.bin/tsc -p packages/sdk/tsconfig.build.json
+          ./node_modules/.bin/tsc \
+            -p packages/worker/tsconfig.package-ci.json \
+            --noEmit \
+            --traceResolution \
+            > artifacts/fsqlite-wasm/worker-resolution-trace.txt
+          ./node_modules/.bin/tsc \
+            -p packages/sdk/tsconfig.package-ci.json \
+            --noEmit \
+            --traceResolution \
+            > artifacts/fsqlite-wasm/sdk-resolution-trace.txt
+
+          core_declaration="node_modules/@frankensqlite/core/frankensqlite_wasm.d.ts"
+          if ! grep -F "${core_declaration}" \
+            artifacts/fsqlite-wasm/worker-resolution-trace.txt >/dev/null; then
+            echo "Worker did not resolve @frankensqlite/core to ${core_declaration}" >&2
+            exit 1
+          fi
+          if grep -F "packages/worker/src/core-module.d.ts" \
+            artifacts/fsqlite-wasm/worker-resolution-trace.txt >/dev/null; then
+            echo "Worker typecheck resolved the source core-module shim" >&2
+            exit 1
+          fi
+          if ! grep -F "packages/worker/dist/index.d.ts" \
+            artifacts/fsqlite-wasm/sdk-resolution-trace.txt >/dev/null; then
+            echo "SDK did not resolve @frankensqlite/worker to built declarations" >&2
+            exit 1
+          fi
+          if grep -F "packages/worker/src/index.ts" \
+            artifacts/fsqlite-wasm/sdk-resolution-trace.txt >/dev/null; then
+            echo "SDK package typecheck resolved worker source instead of dist" >&2
+            exit 1
+          fi
+
+      - name: Test worker and SDK against generated core installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd packages/worker
+            ../../node_modules/.bin/vitest run --config vitest.config.ts
+          )
+          (
+            cd packages/sdk
+            ../../node_modules/.bin/vitest run --config vitest.config.ts
+          )
+
+      - name: Smoke exact generated core through built worker host
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF'
+          import { readFile } from "node:fs/promises";
+          import * as core from "@frankensqlite/core";
+          import { WorkerConnectionHost } from "./packages/worker/dist/connection.js";
+
+          const assert = (condition, message) => {
+            if (!condition) {
+              throw new Error(message);
+            }
+          };
+          const request = async (host, payload, expectedKind) => {
+            const response = await host.handle(payload);
+            if (response.kind === "error") {
+              throw new Error(
+                `${payload.kind} failed: ${response.error.code}: ${response.error.message}`,
+              );
+            }
+            assert(
+              response.kind === expectedKind,
+              `${payload.kind}: expected ${expectedKind}, got ${response.kind}`,
+            );
+            return response;
+          };
+
+          const wasmBytes = await readFile(
+            "node_modules/@frankensqlite/core/frankensqlite_wasm_bg.wasm",
+          );
+          await core.default(wasmBytes);
+          const directDb = await core.FrankenDB.create("diagnostics-smoke");
+          assert(
+            directDb.path === "diagnostics-smoke",
+            "diagnostics path getter missing or incorrect",
+          );
+          directDb.close();
+          directDb.free();
+
+          const loader = {
+            async load() {
+              return { FrankenDB: core.FrankenDB };
+            },
+          };
+
+          const host = new WorkerConnectionHost(loader);
+          await request(
+            host,
+            {
+              kind: "init",
+              requestId: 1,
+              config: { dbName: "package-smoke", persistence: "memory" },
+            },
+            "ready",
+          );
+          await request(
+            host,
+            {
+              kind: "execute-batch",
+              requestId: 2,
+              sql: "CREATE TABLE smoke(value INTEGER); INSERT INTO smoke VALUES (5);",
+            },
+            "execute-batch-result",
+          );
+          const unpreparedExecution = await request(
+            host,
+            {
+              kind: "execute",
+              requestId: 3,
+              sql: "INSERT INTO smoke VALUES (?1)",
+              params: [7],
+            },
+            "execute-result",
+          );
+          assert(
+            unpreparedExecution.changes === 1,
+            "unprepared executeWithParams did not report one change",
+          );
+          const preparedExecution = await request(
+            host,
+            {
+              kind: "prepare",
+              requestId: 4,
+              sql: "INSERT INTO smoke VALUES (?1)",
+            },
+            "prepare-result",
+          );
+          const preparedExecutionResult = await request(
+            host,
+            {
+              kind: "statement-execute",
+              requestId: 5,
+              statementId: preparedExecution.data.statementId,
+              params: [11],
+            },
+            "execute-result",
+          );
+          assert(
+            preparedExecutionResult.changes === 1,
+            "prepared executeWithParams did not report one change",
+          );
+          await request(
+            host,
+            {
+              kind: "statement-finalize",
+              requestId: 6,
+              statementId: preparedExecution.data.statementId,
+            },
+            "statement-finalize-result",
+          );
+          const prepared = await request(
+            host,
+            {
+              kind: "prepare",
+              requestId: 7,
+              sql: "SELECT value FROM smoke ORDER BY value",
+            },
+            "prepare-result",
+          );
+          assert(prepared.data.columnCount === 1, "prepared metadata feature missing");
+          assert(
+            prepared.data.columnNames[0] === "value",
+            "prepared column-name metadata missing",
+          );
+          const queried = await request(
+            host,
+            {
+              kind: "statement-query",
+              requestId: 8,
+              statementId: prepared.data.statementId,
+            },
+            "query-result",
+          );
+          assert(
+            JSON.stringify(queried.data.rows.map((row) => row.value)) ===
+              JSON.stringify([5, 7, 11]),
+            "labeled query rows mismatch",
+          );
+          assert(
+            JSON.stringify(queried.data.rowArrays.map((row) => row[0])) ===
+              JSON.stringify([5, 7, 11]),
+            "row-arrays feature missing or incorrect",
+          );
+          assert(
+            Number.isInteger(queried.data.changes),
+            "diagnostic QueryResult.changes field missing",
+          );
+          await request(
+            host,
+            {
+              kind: "statement-finalize",
+              requestId: 9,
+              statementId: prepared.data.statementId,
+            },
+            "statement-finalize-result",
+          );
+          const exported = await request(
+            host,
+            { kind: "export", requestId: 10 },
+            "export-result",
+          );
+          assert(exported.data.byteLength > 0, "backup export returned an empty image");
+          await request(host, { kind: "close", requestId: 11 }, "close-result");
+
+          const importedHost = new WorkerConnectionHost(loader);
+          await request(
+            importedHost,
+            {
+              kind: "init",
+              requestId: 12,
+              config: {
+                persistence: "memory",
+                snapshot: exported.data,
+              },
+            },
+            "ready",
+          );
+          const imported = await request(
+            importedHost,
+            {
+              kind: "query",
+              requestId: 13,
+              sql: "SELECT value FROM smoke ORDER BY value",
+            },
+            "query-result",
+          );
+          assert(
+            JSON.stringify(imported.data.rows.map((row) => row.value)) ===
+              JSON.stringify([5, 7, 11]),
+            "backup import lost data",
+          );
+          await request(
+            importedHost,
+            { kind: "close", requestId: 14 },
+            "close-result",
+          );
+          EOF
+
       - name: Upload fsqlite-wasm artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fsqlite-wasm-package
           path: artifacts/fsqlite-wasm/
@@ -173,13 +536,13 @@ jobs:
       id-token: write
     steps:
       - name: Download fsqlite-wasm artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: fsqlite-wasm-package
           path: artifacts/fsqlite-wasm
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
@@ -201,7 +564,34 @@ jobs:
             echo "Expected package metadata at ${pkg_dir}/package.json" >&2
             exit 1
           fi
+          if [[ ! -f "${pkg_dir}/size-report.json" ]]; then
+            echo "Expected package size and feature report at ${pkg_dir}/size-report.json" >&2
+            exit 1
+          fi
 
-          pushd "${pkg_dir}" >/dev/null
-          npm publish --provenance --access public
-          popd >/dev/null
+          expected_features_json='["backup","batch-execution","diagnostics","prepared-statements","row-arrays","wasm-runtime-minimal"]'
+          jq -e \
+            --argjson expected "${expected_features_json}" \
+            '
+              .cargoFeatures == $expected
+              and .defaultFeaturesEnabled == true
+              and .expectedCargoFeatures == $expected
+              and .featureContractPass == true
+              and .gzipBudgetPass == true
+              and .packedBudgetPass == true
+            ' "${pkg_dir}/size-report.json" >/dev/null
+          jq -e \
+            --argjson expected "${expected_features_json}" \
+            '
+              .frankensqlite.cargoFeatures == $expected
+              and .frankensqlite.defaultFeaturesEnabled == true
+              and .frankensqlite.expectedCargoFeatures == $expected
+            ' "${pkg_dir}/package.json" >/dev/null
+
+          packed_file="$(jq -er '.packedArchive' "${pkg_dir}/size-report.json")"
+          packed_path="${pkg_dir}/${packed_file}"
+          if [[ ! -f "${packed_path}" ]]; then
+            echo "Expected the tested package archive at ${packed_path}" >&2
+            exit 1
+          fi
+          npm publish "${packed_path}" --provenance --access public

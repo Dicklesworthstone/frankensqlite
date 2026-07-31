@@ -22,6 +22,13 @@ use crate::compat_persist::persist_to_reserved_sqlite_with_header_and_master_ent
 pub(crate) const ATTACHED_SCHEMA_UNSUPPORTED: &str = "VACUUM on attached schemas";
 pub(crate) const NON_TEXT_FILENAME: &str = "non-text filename";
 
+#[cfg_attr(
+    any(target_arch = "wasm32", not(feature = "native")),
+    expect(
+        dead_code,
+        reason = "non-native VACUUM paths report NotImplemented but connection dispatch still matches every target kind"
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VacuumTargetKind {
     UserOutput,
@@ -249,6 +256,9 @@ pub(crate) fn resolve_vacuum_into_target(
     source_path: &str,
     target_value: &SqliteValue,
 ) -> Result<VacuumTargetReservation> {
+    #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+    let _ = (cx, source_path);
+
     match target_value {
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         SqliteValue::Text(path) if !path.is_empty() => {

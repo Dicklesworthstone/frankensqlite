@@ -8,9 +8,9 @@
 //!
 //! Records form a BLAKE3-chained append-only log for tamper-evident auditing.
 
+use fsqlite_types::sync_primitives::SystemTime;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{AccessPath, AccessPathKind, IndexInfo, QueryPlan, StatsSource, TableStats};
 
@@ -337,7 +337,7 @@ pub fn build_contract(
         id: next_id(),
         query_text: text,
         timestamp_epoch_secs: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         state: PlannerState {

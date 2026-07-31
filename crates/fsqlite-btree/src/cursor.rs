@@ -37,6 +37,7 @@ use fsqlite_types::record::{
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
 };
+use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -1569,7 +1570,7 @@ impl TableLeafDeleteRun {
         usable_size: u32,
     ) -> Result<TableLeafDeleteRunDelete> {
         let cell_idx = if self.profile_delete_leaf_run {
-            let search_start = Some(std::time::Instant::now());
+            let search_start = Some(Instant::now());
             let search_result = self.search_table_leaf(cx, rowid);
             instrumentation::record_delete_leaf_run_search(search_start);
             search_result?
@@ -1582,7 +1583,7 @@ impl TableLeafDeleteRun {
             ));
         };
         let already_deleted = if self.profile_delete_leaf_run {
-            let duplicate_check_start = Some(std::time::Instant::now());
+            let duplicate_check_start = Some(Instant::now());
             let already_deleted = self.deleted_cell_indices.contains(&cell_idx);
             instrumentation::record_delete_leaf_run_duplicate_check(duplicate_check_start);
             already_deleted
@@ -1607,7 +1608,7 @@ impl TableLeafDeleteRun {
             }
         }
         let has_compact_cell_area = if self.profile_delete_leaf_run {
-            let compact_check_start = Some(std::time::Instant::now());
+            let compact_check_start = Some(Instant::now());
             let has_compact_cell_area = self.compact_cell_area;
             instrumentation::record_delete_leaf_run_compact_check(compact_check_start);
             has_compact_cell_area
@@ -1621,7 +1622,7 @@ impl TableLeafDeleteRun {
         }
         let cell_offset = usize::from(self.entry.cell_pointers[usize::from(cell_idx)]);
         let cell = if self.profile_delete_leaf_run {
-            let cell_parse_start = Some(std::time::Instant::now());
+            let cell_parse_start = Some(Instant::now());
             let cell = CellRef::parse(
                 self.entry.page_data.as_bytes(),
                 cell_offset,

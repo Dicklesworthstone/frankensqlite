@@ -27,11 +27,11 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
 use asupersync::runtime::{BlockingTaskHandle, RuntimeHandle};
-use fsqlite_types::{CommitSeq, PageNumber, TxnToken, cx::Cx, limits};
+use fsqlite_types::{CommitSeq, PageNumber, TxnToken, cx::Cx, limits, sync_primitives::Instant};
 
 use crate::group_commit::TransactionFrameBatchContext;
 use crate::per_core_buffer::{
@@ -3510,6 +3510,7 @@ fn flush_pending_batches(
 /// 6. Mark the epoch as durable.
 ///
 /// The loop exits when `running` is cleared or the task `Cx` is cancelled.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn epoch_ticker_loop(
     running: Arc<AtomicBool>,

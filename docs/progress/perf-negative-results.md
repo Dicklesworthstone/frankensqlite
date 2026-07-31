@@ -48,6 +48,174 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - LANDED (be8e066d): bd-5zeai parameterized fast path (12.90us->1.01us, tax ELIMINATED to plumbing floor) + bd-gpi5i sync CTE frontier (1.59ms->1.01ms, residual documented)
+
+- bd-5zeai CLOSED: PreparedProbeRowidBound {None, LiteralExclusive,
+  Parameter} in SimpleCountIndexedRowidProbe; execute-time strict-Integer
+  resolution (Float/Text/Null -> general-path fallback = affinity-safe);
+  resolved-bound cache keys; both params branches of query_row_internal.
+  Receipt `param-fastpath-fix-20260728T2330Z-superserver`: control3
+  placeholder 12.90us -> 1.01us (20.1x -> 1.63x); residual 0.39us == the
+  independently measured params-plumbing floor (control2 0.40us) — the
+  fast-path-absence tax is GONE. rustc's field-type-change sweep found
+  exactly one dispatch site beyond the spec'd list (the deliberate
+  make-missed-sites-unrepresentable strategy worked).
+- bd-gpi5i PARTIAL (P1->P2): sync Direct-frontier lane (conservative node
+  set; async keeps Between/Case/Like/In/Cast/Collate/FunctionCall which are
+  affinity/collation/registry-aware). General COUNT 1.59ms -> 1.01ms
+  (6.4x -> 3.82x vs C; receipt
+  `cte-syncfrontier-fix-20260728T2255Z-superserver`). Residual ~750ns/iter
+  = frontier Vec/Row alloc traffic + final materialization + outer scan.
+  DO NOT retry via a COUNT closed-form specialization — it re-blinds the
+  bench row to the general path (bd-czzlp asymmetry is intentional); the
+  legitimate follow-up is allocation reduction in the general loop.
+- Landing discipline receipts: full lib suite 3432/24 with ALL 24
+  dispositioned via a stash/clean-HEAD rebuild (23 pre-existing in
+  RusticBasin's active correctness lane; 1 = pre-existing exact-counter
+  parallel flake, bd-zeqpr filed). En-route fix: eval_join_expr's
+  UnaryOp::Plus->NULL fallthrough NOT taken by the new sync evaluator
+  (copies the async arms; bd-g54oq still open for the join path itself).
+
+## 2026-07-28 - MEASURED(macOS): M4 Pro inversion decomposed — registry guard 1.4ms holds at 8 WRITERS (Linux-64w territory) drives conflict-backoff collapse; barrier hypothesis eliminated; padding flip suggestive-only, NOT landed
+
+- First real-Apple-silicon receipts (mac-mini-max M4 Pro; artifacts
+  `mseries-cacheline-ab-20260728T1935Z-mmmax`,
+  `macos-inversion-decomp-20260728T2145Z-mmmax`; beads bd-jyeus, bd-64uz9):
+  F is CI-gated SLOWER than C at 2-4 shared-table writers (0.24x/0.30x; 8w
+  0.66-0.85x INCONCLUSIVE), flat ~77-114k wps across 2-8w.
+- ELIMINATED by direct measurement (do not re-propose without new evidence):
+  (a) F_FULLFSYNC/checkpoint barriers — fs_usage counted ZERO F_FULLFSYNC and
+  112 total fsync-family lines over 3 paired rounds; synchronous=NORMAL is
+  correctly plumbed (apply_synchronous_to_pager -> Deferred); (b) blocking-
+  pool saturation — pool ~0.1% of thread-time, I/O leaves tiny.
+- MEASURED mechanism: worker round = ~30% condvar-blocked behind commit
+  serialization + ~28% engine work + ~23% retry-backoff SLEEP; registry
+  telemetry: holds ~9/round x mean 1,420us (max 4.5ms) at 8w. Root cause =
+  bd-i0tn6's guard-across-I/O, amplified on Darwin by spawn_blocking handoff
+  cost inside the guard + unpinned QoS (bd-y3dlq). bd-jyeus = macOS
+  acceptance harness for bd-i0tn6 S3.
+- PADDING (bd-64uz9): premise PROVEN on hardware (64B-spaced atomics
+  1.65-2.1x slower on M4, granule exactly 128B, x86 null control clean) but
+  the product-level flip (CommitSlot + striped counters to 128B) is
+  SUGGESTIVE-ONLY: interleaved A/B/A/B x3 won 3/3 pairs at mean +4.7%, cv
+  42-52%, sign-test p=0.125 -> NOT landed. RETRY: quiesced/QoS-pinned mini,
+  >=10 interleaved pairs, or Instruments HITM. Unpaired mac comparisons are
+  BANNED for receipts (C-arm drifted +33% run-to-run; interleave is a hard
+  requirement).
+- Infra: mac runs resolve their own dep graph (Cargo.lock drift on the mac
+  clone — note in provenance); `FSQLITE_BENCH_WAL_AUTOCHECKPOINT` knob
+  (e9fd9679) available for checkpoint-cadence isolation on other hosts.
+
+## 2026-07-28 - ATTRIBUTED: general recursive-CTE frontier gap (bd-gpi5i) = ~135ns/AST-node boxed-future evaluation (~53%) + ~720ns/iter async loop plumbing (~47%); fix spec'd, perf-tooling attempts all failed (recorded)
+
+- Target row: "Recursive CTE general COUNT (1..1000)" — four release-perf runs
+  on superserver: C=249-257us vs F=1.58-1.64ms (6.1-6.5x slower, CV<2.2%),
+  while the specialized SUM row is simultaneously 25-32x FASTER (closed
+  form). Artifact: `tests/artifacts/perf/cte-frontier-profile-20260728T1810Z-superserver/`.
+- MECHANISM (measured, not inferred): CLI node-count differential — same
+  Direct tier, 6-node vs 16-node arm expressions at depth 1000 → per
+  iteration T = ~720ns + ~135ns×AST-nodes; depth scaling linear (no O(n^2)).
+  135ns/node = the `Pin<Box<dyn Future>>`-per-node signature of
+  `eval_expr_with_subqueries` (connection.rs:56302), which the Direct-plan
+  matcher (:66898) makes pure waste (it admits NO subquery expressions; the
+  async evaluator's own simple-node fallthrough is `eval_join_expr`).
+- FIX: patch-ready hunk spec on bd-gpi5i (sync evaluator for a conservative
+  node set + fully-sync iteration loop when all arms qualify — H4(b) is what
+  removes the 47% fixed share). connection.rs leased → RusticBasin applies at
+  checkpoint. En route: bd-g54oq filed (eval_join_expr UnaryOp::Plus → NULL
+  latent bug); the existing recursive_cte_perf_repro.rs scaling test no
+  longer guards the general frontier (SUM specialization short-circuits it) —
+  COUNT twin required.
+- NEGATIVE RESULTS (perf tooling on a busy shared host; do not repeat):
+  (1) whole-run dwarf record at -F 999 → kernel-throttled to ~1K samples/2min,
+  zero window coverage; (2) trigger + `perf record -p PID` → ESRCH race;
+  (3) trigger + `-C cpus` system-wide → /proc-maps synthesis latency ate the
+  1.9s phase twice (even with --proc-map-timeout=50); (4) `--overwrite` ring
+  dump → unparseable perf.data on perf 6.17.13. RETRY CONDITION: none needed —
+  the CLI repetition differential (400 reps × /usr/bin/time, minimums) was
+  strictly better for phase-scoped attribution; prefer it for engine-internal
+  hot loops. If a flamegraph is ever truly required: dedicated quiet host +
+  record-from-birth + --quick + line-tables build.
+
+## 2026-07-28 - ATTRIBUTED: the high-writer decline decomposed — registry guard held 0.7-7ms per commit (~80% of the decline); leaf-boundary conflicts ~20%; merge ladder found production-dormant
+
+- Three-receipt attribution of why F declines 150k→52k wps from 8→128
+  writers (all diagnostic-host; within-run gates + the SHAPE are the
+  evidence):
+  1. **Separate-tables split** (`septables-split-20260728T1605Z`): with
+     page conflicts impossible, F still declines 202k→71k (8→64w) —
+     ~80% of the decline is registry-side; the shared-leaf class costs
+     the residual ~20% (and separate-table 32w hits **12.37x over C**).
+  2. **Registry hold/wait counters**
+     (`registry-hold-decomposition-20260728T1620Z`, RusticBasin's core
+     shim 57dffe1a + mvcc counters c53aaf93 + bench dump): mean guard
+     hold **713-2,340µs at 64w, 2.4-6.9ms at 128w** (max single hold
+     60ms) — milliseconds of global mutex per commit because pager I/O +
+     validation run inside the guard; waits stay µs-scale at 64w
+     (convoying shows up as txn latency, not lock spin).
+  3. **Page 45 identified** (job-tmp replica + dbstat): a stride-boundary
+     bench LEAF — numerically-disjoint 1M strides are ADJACENT in key
+     order, so one leaf spans every junction, and the rightmost leaf
+     absorbs every above-max writer on a young tree. Leaf-level false
+     sharing from distinct-key inserts — the merge ladder's designed case.
+- **Merge-ladder wiring audit** (bd-p4dcv): the ladder is
+  production-dormant IN FULL — only abort/retry executes; intent log never
+  populated; `write_merge` is an SSI-skip switch whose documented OFF
+  doesn't parse; two latent bugs in the dormant path; README corrected to
+  say so (Current-Implementation-Status convention). Statement-rebase
+  design at the audited begin_concurrent.rs:2826 hook = bd-3d5y3.
+- Fix ladder now numbers-backed and beaded: bd-i0tn6 (write outside the
+  lock — PRIMARY, design review requested from RusticBasin + DustyOrchid),
+  bd-6a8a5 (group commit), bd-15hxt (SSI history windowing), bd-3d5y3
+  (rebase, secondary ~20%). Non-behavioral platform groundwork landed:
+  VendorCachePadded + layout tests (Apple-vendor-scoped, no call-site
+  flips) and FC slot-full telemetry (bb705aad).
+
+## 2026-07-28 - MEASURED: COMPLETE 1-128 writer matrix (f1ab7663) — FSQLITE_FASTER at every gated arm incl. 64w 4.259x and 128w 4.082x, zero failed writes; hot page 45 identified; bd-5zeai controls confirm fast-path-presence 20.1x dominant
+
+- Follow-up to the truncated first attempt (below). With the bd-caa6u
+  envelope scaling (c53aaf93, floor deepened 10k→5k at f1ab7663), the full
+  matrix completed: 1w 2.111x / 8w 2.703x / 16w 6.556x FSQLITE_FASTER; 32w
+  7.333x median (CV-inconclusive); **64w 4.259x and 128w 4.082x
+  FSQLITE_FASTER with zero failed writes** — C pins to its ~12.5k wps
+  single-writer floor from 32w up while F stays 4-7x ahead through the
+  MAX_CONCURRENT_WRITERS cap. Artifact:
+  `tests/artifacts/perf/highwriter-full-20260728T0645Z-superserver/`
+  (diagnostic host; within-run CI gates are the evidence).
+- Extraction targets sharpened: the failed first 64-arm identified **hot
+  page 45 by number** ("snapshot conflict on pages: 45", 3-5 attempts) as
+  one starvation mode alongside busy-retry convoying (69-84 attempts); F's
+  own decline 150k→52k wps under contention is the registry-convoy cost —
+  RegistryCommitLockMetrics (mvcc side landed c53aaf93; core RAII shim
+  handed to RusticBasin) will quantify hold/wait vs writer count.
+- bd-5zeai control battery (same day, c53aaf93): Option gate 0.49µs,
+  params-on-fast-path 0.58µs, A/A 0.00µs, fast-path presence 20.1x
+  (0.64µs literal vs 12.90µs placeholder, same query) — parameter passing
+  is free; the placeholder fast-path gap is the whole mechanism.
+  Implementation awaiting RusticBasin ack. Cross-agent same-day flow:
+  bd-f8iph (silent-Null IN emitter) fixed by RusticBasin at 8f75946d,
+  verified downstream and closed; bd-3ua5h invariants locked at 2ef61094.
+
+## 2026-07-28 - MEASURED: first 1-128 writer scaling attempt — F/C grows 2.1x→7.3x through 32 writers; p95 latency convoying at 32 confirms the registry hypothesis; 64+ unmeasurable until the bench retry envelope scales
+
+- Post-revert tree a29e136d, mt-mvcc-bench ELF 4132d5a7…, shared table,
+  synchronous=NORMAL both arms, 7 paired rounds with same-invocation C/C
+  nulls, host superserver (64 logical CPUs, shared box — diagnostic-only).
+  Artifact: `tests/artifacts/perf/highwriter-baseline-20260728T0510Z-superserver/`.
+- Median-CI-gated: 1w 2.111x FASTER; 8w 2.703x FASTER; 16w 6.556x FASTER;
+  32w 7.333x median but INCONCLUSIVE (CV 70%). C collapses 65k→13k wps
+  under its single-writer lock while F holds 95-150k. Zero failed writes
+  through 32 writers on both engines.
+- ENGINE SIGNAL: F p95 per-txn latency 225ms@16 → 2,273ms@32 (10x for 2x
+  writers) with throughput nearly flat — convoying at a serialization
+  point, consistent with the concurrent_registry mutex held across
+  physical commit (the audit's named suspect). This is the instrumentation
+  target; fanout changes stay rejected until it is profiled.
+- HARNESS ENVELOPE: 64-writer arm aborts via the FIXED 5s wall-clock retry
+  budget (FSQLITE_RETRY_TIMEOUT, mt_mvcc_bench.rs:94) — queueing alone
+  exceeds it at 64×1000-row txns. bd-caa6u files the scaling fix; 64/128
+  rows are unmeasured, not bad.
+
 ## 2026-07-28 - REVERTED same-hour: platform scaling slice (7b2c2c61 → reverted at b5074aa4) — reachability audit invalidated all three claims
 
 - Target: aarch64 128B padding, 64→128 contention-table fanout, macOS

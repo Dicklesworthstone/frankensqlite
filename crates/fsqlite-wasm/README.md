@@ -8,6 +8,11 @@ generated `wasm-bindgen` glue plus the `FrankenDB` API implemented in
 [`src/lib.rs`](./src/lib.rs). Builds that enable the `prepared-statements`
 feature also export `FrankenPreparedStatement`.
 
+The browser artifact includes FrankenSQLite's portable in-memory VFS, pager,
+WAL, MVCC, and B-tree storage path. It excludes native OS backends and
+facilities such as `io_uring`; it does not replace the storage engine with a
+host-only stub.
+
 ## Package Build
 
 Build the primary browser ES module package into `target/fsqlite-wasm-pkg/`:
@@ -35,8 +40,9 @@ The helper script:
 - normalizes the generated `package.json` to the `@frankensqlite/core` package name
 - copies README/license files into the output package
 - validates the generated `.wasm`, `.js`, and `.d.ts` artifacts exist
-- can build a minimum-feature core package with
-  `FSQLITE_WASM_NO_DEFAULT_FEATURES=1`
+- can build with an explicit minimal browser runtime selection using
+  `FSQLITE_WASM_NO_DEFAULT_FEATURES=1
+  FSQLITE_WASM_FEATURES=wasm-runtime-minimal`
 - can opt into SQLite image import/export bindings with
   `FSQLITE_WASM_FEATURES=backup`
 - can opt into multi-statement batch execution with
@@ -70,13 +76,18 @@ The helper script:
 - runs `npm pack` so the result is ready for registry or local install testing
 - enforces a packed tarball size budget of 2 MiB by default (`FSQLITE_WASM_MAX_PACKED_BYTES=0` disables the guard)
 
-The default crate feature set is intentionally empty so the core browser
-package does not carry crash-reporting or diagnostics glue. Minimum-core release
-wasm builds compile tracing at `error` level only and strip caller-location
-detail to keep metadata out of the core download. The default browser package
-leaves FrankenSQLite-specific observability PRAGMAs and browser-facing
-introspection exports out of the core transfer. Enable the `diagnostics` feature
-when a build needs `parseSql()`, `db.path`, `db.explain()`,
+The default crate feature set selects only
+`wasm-runtime-minimal`, the final package's canonical asupersync browser
+runtime profile. It does not enable any optional JavaScript API, crash-reporting,
+or diagnostics glue. A downstream development harness that needs
+asupersync's `wasm-browser-dev` profile must depend directly on asupersync and
+disable `fsqlite-wasm` default features, so exactly one canonical runtime
+profile is selected. Minimum-core release wasm builds compile tracing at
+`error` level only and strip caller-location detail to keep metadata out of the
+core download. The default browser package leaves FrankenSQLite-specific
+observability PRAGMAs and browser-facing introspection exports out of the core
+transfer. Enable the `diagnostics` feature when a build needs `parseSql()`,
+`db.path`, `db.explain()`,
 prepared-statement `explain()`, prepared-statement metadata getters (`stmt.sql`,
 `stmt.columnCount`, `stmt.columnNames()`), `db.memoryStats()`,
 `PRAGMA fsqlite.jit_stats`,
@@ -137,10 +148,58 @@ the package needs `FrankenDB.prepare()` and the exported
 and keeps parameterized one-shot SQL available through `executeWithParams()` and
 `queryWithParams()`.
 
+Every JavaScript API that reaches the async core returns a `Promise`. Callers
+must `await` `FrankenDB.create()`, `open()`, `openWithOptions()`, `import()`,
+`importWithOptions()`, database `execute*()` / `query*()` / `pragma()` /
+`prepare()` / `explain()` / `export()`, and prepared-statement `execute*()` /
+`query*()` / `explain()`. Pure accessors and lifecycle operations such as
+`path`, `close()`, `memoryStats()`, and prepared-statement metadata remain
+synchronous.
+
+One `FrankenDB` handle admits one core operation at a time. Await each operation
+before starting the next one on that handle; overlapping calls fail fast rather
+than concurrently driving one SQLite connection. Use separate `FrankenDB`
+handles when operations must overlap. Calling `close()` prevents new operations
+immediately, while a Promise that was already admitted retains its connection
+and is allowed to settle normally.
+
+Every generated `FrankenDB` and `FrankenPreparedStatement` wrapper owns a
+WebAssembly allocation and exposes both `.free()` and `[Symbol.dispose]()`.
+Call `stmt.free()` when a prepared statement is finalized. For a database,
+finalize/free its statements first, then call `db.close()` and `db.free()`.
+`close()` is idempotent logical shutdown; it is not a substitute for freeing
+the generated wrapper. The worker package performs this order automatically.
+An operation acquires its owned connection/SQL lease before its Promise is
+returned, so calling `close()` or `free()` immediately after starting that
+operation cannot invalidate the admitted work.
+
 The `row-arrays` feature restores positional `result.rowArrays` for consumers
 that need array-indexed rows in addition to the default labeled `result.rows`
 objects. The minimum core package omits `rowArrays` to avoid carrying duplicate
 row materialization glue.
+
+## Worker Compatibility Contract
+
+`@frankensqlite/worker` requires an `@frankensqlite/core` artifact built with
+the default `wasm-runtime-minimal` profile plus these exact five API features:
+
+```text
+backup,batch-execution,diagnostics,prepared-statements,row-arrays
+```
+
+Build that artifact with:
+
+```bash
+FSQLITE_WASM_FEATURES=backup,batch-execution,diagnostics,prepared-statements,row-arrays \
+  ./scripts/build_fsqlite_wasm_package.sh
+```
+
+The core-package CI/publish path is configured to build this worker-compatible
+feature set, record the exact active features in the package metadata and size
+report, and exercise the generated package through the worker and SDK before
+publication. A release remains blocked until that workflow produces a green
+artifact within the configured size budgets; the minimal default crate build
+alone is not a worker-compatible package.
 
 ## Size Budgets
 
@@ -155,7 +214,7 @@ is the browser transfer shape.
 
 | Feature combo | Build command | Gzip budget |
 | --- | --- | --- |
-| Minimum core | `FSQLITE_WASM_NO_DEFAULT_FEATURES=1 FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
+| Explicit minimal runtime | `FSQLITE_WASM_NO_DEFAULT_FEATURES=1 FSQLITE_WASM_FEATURES=wasm-runtime-minimal FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
 | Default core | `FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
 | Batch execution | `FSQLITE_WASM_FEATURES=batch-execution FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | Date parameters | `FSQLITE_WASM_FEATURES=date-params FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
@@ -210,12 +269,15 @@ import init, { FrankenDB } from "@frankensqlite/core";
 
 await init();
 
-const db = new FrankenDB(":memory:");
-db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)");
-db.execute("INSERT INTO users(name) VALUES('Ada')");
+const db = await FrankenDB.create(":memory:");
+await db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)");
+await db.execute("INSERT INTO users(name) VALUES('Ada')");
 
-const result = db.query("SELECT id, name FROM users ORDER BY id");
+const result = await db.query("SELECT id, name FROM users ORDER BY id");
 console.log(result.rows);
+
+db.close();
+db.free();
 ```
 
 ## WASM Memory Management
@@ -228,7 +290,7 @@ FrankenSQLite's own heap usage inside that ceiling. Enable
 `FSQLITE_WASM_FEATURES=backup,memory-options` for the backup import variant:
 
 ```ts
-const db = FrankenDB.openWithOptions(":memory:", {
+const db = await FrankenDB.openWithOptions(":memory:", {
   pageBufferMax: 256,
   memory: {
     initialPages: 4,

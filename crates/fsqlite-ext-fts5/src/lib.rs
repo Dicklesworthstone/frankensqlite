@@ -2112,8 +2112,7 @@ impl Fts5ScoreSnapshot {
         &self,
         queries: &[&str],
     ) -> std::result::Result<Vec<String>, Fts5QueryError> {
-        let tokenizer = create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+        let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
         query_terms_for_query_strings(&self.columns, queries, tokenizer.as_ref(), self.detail)
     }
 
@@ -2126,8 +2125,7 @@ impl Fts5ScoreSnapshot {
         match &self.source {
             Fts5ScoreSource::InMemory(index) => Ok(bm25_score(index, rowid, query_terms, weights)),
             Fts5ScoreSource::Shadow(rows) => {
-                let tokenizer = create_tokenizer(&self.tokenizer_name)
-                    .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+                let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)?
                     .bm25_score(rowid, query_terms, weights)
             }
@@ -3339,6 +3337,89 @@ pub trait Fts5Tokenizer: Send + Sync {
     }
 }
 
+/// Upper bound on a single indexed term in bytes (cass#362).
+///
+/// The segment-leaf codec addresses term starts with u16 offsets, so a term
+/// larger than one leaf can never be represented; before this cap a single
+/// >64 KiB whitespace-delimited token (a minified JS bundle or base64 blob
+/// pasted into a coding-agent transcript — normal data in that domain) made
+/// `Fts5SegmentLeaf::encode` fail the entire INSERT, and every rebuild after
+/// it, unrecoverably. C SQLite FTS5 does not error here either way: it writes
+/// the oversized term with a silently wrapped `szLeaf` header
+/// (`fts5_index.c` `fts5WriteFlushLeaf`'s unchecked u16 cast), leaving the
+/// term unqueryable. Skipping matches that observable outcome — the term is
+/// not findable — while keeping the write path total, and matches the
+/// mainstream-engine convention (Lucene rejects >32 KiB terms outright,
+/// Elasticsearch `ignore_above` drops them). Divergences from C are
+/// documented rather than hidden: one position slot is lost per skipped
+/// token, so phrase and NEAR windows spanning a pathological token shift by
+/// one; a MATCH query that itself contains an overlong term drops it during
+/// query tokenization (C parses the term and finds nothing, returning zero
+/// rows, where our AND/NEAR/phrase behaves as if the term were absent —
+/// strictly broader results); and a `prefix*` query can never reach a
+/// skipped term even when the prefix itself is under the cap.
+pub const FTS5_MAX_TERM_BYTES: usize = 1024;
+
+/// Decorator applied by [`Fts5Table::create_tokenizer_instance`] so every
+/// tokenizer (unicode61/ascii/porter/trigram) and every consumer — the
+/// pending-hash segment writer, the live in-memory index, the incremental
+/// delta index, and MATCH query parsing — sees the same bounded term stream.
+/// Query-time symmetry means a query containing an overlong term drops it
+/// exactly as indexing did.
+struct MaxTokenLenTokenizer {
+    inner: Box<dyn Fts5Tokenizer>,
+    /// First skip per tokenizer instance logs at `warn!`; the rest drop to
+    /// `debug!`. A single minified bundle can hold thousands of overlong
+    /// blobs, and hydration/rebuild re-tokenizes the whole corpus — per-token
+    /// warns would flood logs with an identical, already-actioned message.
+    warned_overlong: std::sync::atomic::AtomicBool,
+}
+
+impl Fts5Tokenizer for MaxTokenLenTokenizer {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        self.inner
+            .visit_tokens(text, &mut |term, start, end, colocated| {
+                if term.len() > FTS5_MAX_TERM_BYTES {
+                    if self
+                        .warned_overlong
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::debug!(
+                            term_bytes = term.len(),
+                            max_term_bytes = FTS5_MAX_TERM_BYTES,
+                            "fts5: skipping overlong term instead of failing the segment write (cass#362)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            term_bytes = term.len(),
+                            max_term_bytes = FTS5_MAX_TERM_BYTES,
+                            "fts5: skipping overlong term instead of failing the segment write (cass#362); further skips log at debug level"
+                        );
+                    }
+                    return;
+                }
+                sink(term, start, end, colocated);
+            });
+    }
+}
+
+/// Shared capped construction for every tokenizer the table, hydration,
+/// query, and scoring paths use (cass#362). The bare [`create_tokenizer`]
+/// factory stays uncapped for spec validation and direct API use; every
+/// indexing and MATCH consumer must come through this guard so the live
+/// index, the persisted segments, and query normalization all see the same
+/// bounded term stream.
+fn create_capped_tokenizer(name: &str) -> Box<dyn Fts5Tokenizer> {
+    Box::new(MaxTokenLenTokenizer {
+        inner: create_tokenizer(name).unwrap_or_else(|| Box::new(Unicode61Tokenizer::new())),
+        warned_overlong: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
 /// Unicode61 tokenizer: splits on non-alphanumeric characters, lowercases.
 #[derive(Debug)]
 pub struct Unicode61Tokenizer {
@@ -3533,6 +3614,13 @@ impl PorterTokenizer {
     }
 }
 
+/// C parity: `fts5_tokenize.c` (`FTS5_PORTER_MAX_TOKEN = 64`) passes tokens
+/// longer than 64 bytes through unstemmed. Mirroring it keeps term identity
+/// aligned with stock FTS5 for long tokens and avoids `porter_stem`'s
+/// per-suffix `String` reallocation storm on pathological inputs (a 91 KiB
+/// minified-JS token would otherwise be "stemmed"; cass#362).
+const FTS5_PORTER_MAX_TOKEN: usize = 64;
+
 impl Fts5Tokenizer for PorterTokenizer {
     fn name(&self) -> &'static str {
         "porter"
@@ -3541,6 +3629,10 @@ impl Fts5Tokenizer for PorterTokenizer {
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         self.inner
             .visit_tokens(text, &mut |term, start, end, colocated| {
+                if term.len() > FTS5_PORTER_MAX_TOKEN {
+                    sink(term, start, end, colocated);
+                    return;
+                }
                 let stemmed = porter_stem(term);
                 sink(stemmed.as_str(), start, end, colocated);
             });
@@ -7499,8 +7591,7 @@ impl Fts5Table {
     }
 
     pub fn create_tokenizer_instance(&self) -> Box<dyn Fts5Tokenizer> {
-        create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()))
+        create_capped_tokenizer(&self.tokenizer_name)
     }
 
     pub fn open_shadow_rows(
@@ -7746,8 +7837,12 @@ impl Fts5Table {
         self.clear_lazy_on_disk();
         self.row_locales.clear();
         self.next_rowid = 1;
-        let tokenizer = create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+        // cass#362: hydration must use the same capped tokenizer as inserts,
+        // or a reopened content table's live in-memory index would carry
+        // overlong terms the persisted segments (and fresh sessions) skip —
+        // and a later contentless-style flush of that index would re-hit the
+        // u16 leaf-offset failure this cap exists to prevent.
+        let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
         for (rowid, columns) in rows {
             self.index_document_with_tokenizer(rowid, &columns, tokenizer.as_ref());
             self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
@@ -8132,8 +8227,13 @@ impl Fts5Table {
         }
     }
 
-    #[must_use]
-    pub fn encode_data_rows(&self) -> Vec<Fts5DataRow> {
+    /// Encode the full `%_data` shadow contents from the in-memory index.
+    ///
+    /// A pending-hash build or segment flush failure is propagated (cass#362):
+    /// the previous `if let Ok(..)` fall-through silently emitted an *empty*
+    /// structure row on failure, so a full re-encode of a populated table
+    /// could "succeed" while discarding the entire inverted index.
+    pub fn encode_data_rows(&self) -> Result<Vec<Fts5DataRow>> {
         let docsize_rows = self.encode_docsize_rows();
         let averages = Fts5AveragesRecord::from_docsize_rows(
             u64::try_from(self.row_count()).unwrap_or(u64::MAX),
@@ -8148,20 +8248,18 @@ impl Fts5Table {
 
         let mut rows = vec![Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode())];
         let pending = if self.config.content_mode == ContentMode::Contentless {
-            self.index.build_pending_hash(&self.prefix_lengths)
+            self.index.build_pending_hash(&self.prefix_lengths)?
         } else {
-            self.build_pending_hash()
+            self.build_pending_hash()?
         };
-        if let Ok(pending) = pending
-            && !pending.is_empty()
-            && let Ok(flush) = pending.flush_to_segment(1, structure.clone())
-        {
+        if !pending.is_empty() {
+            let flush = pending.flush_to_segment(1, structure.clone())?;
             rows.extend(flush.data_rows);
-            return rows;
+            return Ok(rows);
         }
 
         rows.push(Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()));
-        rows
+        Ok(rows)
     }
 
     pub fn decode_data_rows(&self, rows: &[Fts5DataRow]) -> Result<Fts5DataMetadata> {
@@ -8301,15 +8399,14 @@ impl Fts5Table {
         }))
     }
 
-    #[must_use]
-    pub fn encode_shadow_rows(&self) -> Fts5ShadowRows {
-        Fts5ShadowRows {
-            data: self.encode_data_rows(),
+    pub fn encode_shadow_rows(&self) -> Result<Fts5ShadowRows> {
+        Ok(Fts5ShadowRows {
+            data: self.encode_data_rows()?,
             idx: Vec::new(),
             config: self.encode_config_rows(),
             content: self.encode_content_rows(),
             docsize: self.encode_docsize_rows(),
-        }
+        })
     }
 
     pub fn apply_shadow_rows(&mut self, rows: &Fts5ShadowRows) -> Result<Fts5ConfigMetadata> {
@@ -8984,8 +9081,7 @@ impl VirtualTableCursor for Fts5Cursor {
                 let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
                 let queries: Vec<String> = args.iter().map(SqliteValue::to_text).collect();
                 let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-                let tokenizer = create_tokenizer(&self.tokenizer_name)
-                    .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+                let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 self.results = if let Some(rows) = self.shadow_rows.as_ref() {
                     Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)
                         .and_then(|query| query.search_queries_with_weights(&query_refs, &weights))
@@ -10530,7 +10626,7 @@ mod tests {
             &["rust index".to_owned(), "shadow table rows".to_owned()],
         );
 
-        let data = table.encode_data_rows();
+        let data = table.encode_data_rows().unwrap();
         let metadata = table.decode_data_rows(&data).unwrap();
         let snapshot = Fts5DataRowsStructure {
             data_blocks: data.iter().map(|row| (row.id, row.block.clone())).collect(),
@@ -11983,7 +12079,7 @@ mod tests {
         );
         table.insert_document(9, &["sqlite notes".to_owned(), "rust fts".to_owned()]);
 
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         assert_eq!(
             rows.content,
             vec![
@@ -12040,7 +12136,7 @@ mod tests {
         );
         assert_eq!(table.lookup_content_row(3), None);
 
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         let opened = Fts5Table::open_shadow_rows(
             &cx,
             &["fts5", "main", "docs", "body", "content=''"],
@@ -12261,7 +12357,7 @@ mod tests {
         let cx = Cx::new();
         let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
         let rows = Fts5ShadowRows {
-            data: base.encode_data_rows(),
+            data: base.encode_data_rows().unwrap(),
             idx: Vec::new(),
             config: base.encode_config_rows(),
             content: vec![Fts5ContentRow::new(1, vec!["only one column".to_owned()])],
@@ -12296,7 +12392,7 @@ mod tests {
             11,
             &["rust index".to_owned(), "shadow table rows".to_owned()],
         );
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         let snapshot = Fts5ShadowRowsStructure {
             data: rows
                 .data

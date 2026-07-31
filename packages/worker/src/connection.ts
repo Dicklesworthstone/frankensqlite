@@ -22,28 +22,33 @@ import {
 export interface CorePreparedStatementHandle {
   readonly sql: string;
   readonly columnCount: number;
+  free(): void;
   columnNames(): string[];
-  execute(): number;
-  executeWithParams(params: unknown[]): number;
-  query(): QueryResponse["data"];
-  queryWithParams(params: unknown[]): QueryResponse["data"];
+  execute(): Promise<number>;
+  executeWithParams(params: unknown[]): Promise<number>;
+  query(): Promise<QueryResponse["data"]>;
+  queryWithParams(params: unknown[]): Promise<QueryResponse["data"]>;
 }
 
 export interface CoreDatabaseHandle {
   readonly path: string;
+  free(): void;
   close(): void;
-  execute(sql: string): number;
-  executeBatch(sql: string): void;
-  executeWithParams(sql: string, params: unknown[]): number;
-  query(sql: string): QueryResponse["data"];
-  queryWithParams(sql: string, params: unknown[]): QueryResponse["data"];
-  prepare(sql: string): CorePreparedStatementHandle;
-  export(): Uint8Array;
+  execute(sql: string): Promise<number>;
+  executeBatch(sql: string): Promise<void>;
+  executeWithParams(sql: string, params: unknown[]): Promise<number>;
+  query(sql: string): Promise<QueryResponse["data"]>;
+  queryWithParams(
+    sql: string,
+    params: unknown[],
+  ): Promise<QueryResponse["data"]>;
+  prepare(sql: string): Promise<CorePreparedStatementHandle>;
+  export(): Promise<Uint8Array>;
 }
 
 export interface CoreDatabaseConstructor {
-  new (path?: string): CoreDatabaseHandle;
-  import(data: Uint8Array): CoreDatabaseHandle;
+  create(path?: string): Promise<CoreDatabaseHandle>;
+  import(data: Uint8Array): Promise<CoreDatabaseHandle>;
 }
 
 export interface CoreModule {
@@ -59,7 +64,7 @@ export const defaultCoreModuleLoader: CoreModuleLoader = {
     const core = await import("@frankensqlite/core");
     await core.default(wasmUrl);
     return {
-      FrankenDB: core.FrankenDB as unknown as CoreDatabaseConstructor,
+      FrankenDB: core.FrankenDB,
     };
   },
 };
@@ -80,29 +85,29 @@ export class WorkerConnectionHost {
         case "init":
           return await this.#initialize(request.requestId, request.config);
         case "execute":
-          return this.#execute(
+          return await this.#execute(
             request.requestId,
             request.sql,
             request.params ?? [],
           );
         case "execute-batch":
-          return this.#executeBatch(request.requestId, request.sql);
+          return await this.#executeBatch(request.requestId, request.sql);
         case "query":
-          return this.#query(
+          return await this.#query(
             request.requestId,
             request.sql,
             request.params ?? [],
           );
         case "prepare":
-          return this.#prepare(request.requestId, request.sql);
+          return await this.#prepare(request.requestId, request.sql);
         case "statement-execute":
-          return this.#statementExecute(
+          return await this.#statementExecute(
             request.requestId,
             request.statementId,
             request.params ?? [],
           );
         case "statement-query":
-          return this.#statementQuery(
+          return await this.#statementQuery(
             request.requestId,
             request.statementId,
             request.params ?? [],
@@ -110,7 +115,7 @@ export class WorkerConnectionHost {
         case "statement-finalize":
           return this.#statementFinalize(request.requestId, request.statementId);
         case "export":
-          return this.#exportSnapshot(request.requestId);
+          return await this.#exportSnapshot(request.requestId);
         case "close":
           return this.#close(request.requestId);
       }
@@ -133,8 +138,8 @@ export class WorkerConnectionHost {
     const core = await this.#loader.load(config.wasmUrl);
     this.#disposeDatabase();
     this.#db = config.snapshot
-      ? core.FrankenDB.import(config.snapshot)
-      : new core.FrankenDB(resolveDatabasePath(config));
+      ? await core.FrankenDB.import(config.snapshot)
+      : await core.FrankenDB.create(resolveDatabasePath(config));
 
     return {
       kind: "ready",
@@ -146,14 +151,16 @@ export class WorkerConnectionHost {
     };
   }
 
-  #execute(
+  async #execute(
     requestId: number,
     sql: string,
     params: readonly unknown[],
-  ): ExecuteResponse {
+  ): Promise<ExecuteResponse> {
     const db = this.#requireDatabase();
     const changes =
-      params.length === 0 ? db.execute(sql) : db.executeWithParams(sql, [...params]);
+      params.length === 0
+        ? await db.execute(sql)
+        : await db.executeWithParams(sql, [...params]);
     return {
       kind: "execute-result",
       requestId,
@@ -161,22 +168,27 @@ export class WorkerConnectionHost {
     };
   }
 
-  #executeBatch(requestId: number, sql: string): ExecuteBatchResponse {
-    this.#requireDatabase().executeBatch(sql);
+  async #executeBatch(
+    requestId: number,
+    sql: string,
+  ): Promise<ExecuteBatchResponse> {
+    await this.#requireDatabase().executeBatch(sql);
     return {
       kind: "execute-batch-result",
       requestId,
     };
   }
 
-  #query(
+  async #query(
     requestId: number,
     sql: string,
     params: readonly unknown[],
-  ): QueryResponse {
+  ): Promise<QueryResponse> {
     const db = this.#requireDatabase();
     const data =
-      params.length === 0 ? db.query(sql) : db.queryWithParams(sql, [...params]);
+      params.length === 0
+        ? await db.query(sql)
+        : await db.queryWithParams(sql, [...params]);
     return {
       kind: "query-result",
       requestId,
@@ -184,8 +196,8 @@ export class WorkerConnectionHost {
     };
   }
 
-  #prepare(requestId: number, sql: string): PrepareResponse {
-    const stmt = this.#requireDatabase().prepare(sql);
+  async #prepare(requestId: number, sql: string): Promise<PrepareResponse> {
+    const stmt = await this.#requireDatabase().prepare(sql);
     const statementId = String(this.#nextStatementId++);
     this.#statements.set(statementId, stmt);
     return {
@@ -200,14 +212,16 @@ export class WorkerConnectionHost {
     };
   }
 
-  #statementExecute(
+  async #statementExecute(
     requestId: number,
     statementId: string,
     params: readonly unknown[],
-  ): ExecuteResponse {
+  ): Promise<ExecuteResponse> {
     const stmt = this.#requireStatement(statementId);
     const changes =
-      params.length === 0 ? stmt.execute() : stmt.executeWithParams([...params]);
+      params.length === 0
+        ? await stmt.execute()
+        : await stmt.executeWithParams([...params]);
     return {
       kind: "execute-result",
       requestId,
@@ -215,14 +229,16 @@ export class WorkerConnectionHost {
     };
   }
 
-  #statementQuery(
+  async #statementQuery(
     requestId: number,
     statementId: string,
     params: readonly unknown[],
-  ): QueryResponse {
+  ): Promise<QueryResponse> {
     const stmt = this.#requireStatement(statementId);
     const data =
-      params.length === 0 ? stmt.query() : stmt.queryWithParams([...params]);
+      params.length === 0
+        ? await stmt.query()
+        : await stmt.queryWithParams([...params]);
     return {
       kind: "query-result",
       requestId,
@@ -234,19 +250,20 @@ export class WorkerConnectionHost {
     requestId: number,
     statementId: string,
   ): StatementFinalizeResponse {
-    this.#requireStatement(statementId);
+    const stmt = this.#requireStatement(statementId);
     this.#statements.delete(statementId);
+    stmt.free();
     return {
       kind: "statement-finalize-result",
       requestId,
     };
   }
 
-  #exportSnapshot(requestId: number): ExportResponse {
+  async #exportSnapshot(requestId: number): Promise<ExportResponse> {
     return {
       kind: "export-result",
       requestId,
-      data: this.#requireDatabase().export(),
+      data: await this.#requireDatabase().export(),
     };
   }
 
@@ -259,9 +276,34 @@ export class WorkerConnectionHost {
   }
 
   #disposeDatabase(): void {
+    const statements = [...this.#statements.values()];
     this.#statements.clear();
-    this.#db?.close();
+    const db = this.#db;
     this.#db = null;
+
+    let firstError: unknown;
+    for (const stmt of statements) {
+      try {
+        stmt.free();
+      } catch (error: unknown) {
+        firstError ??= error;
+      }
+    }
+    if (db !== null) {
+      try {
+        db.close();
+      } catch (error: unknown) {
+        firstError ??= error;
+      }
+      try {
+        db.free();
+      } catch (error: unknown) {
+        firstError ??= error;
+      }
+    }
+    if (firstError !== undefined) {
+      throw firstError;
+    }
   }
 
   #requireDatabase(): CoreDatabaseHandle {

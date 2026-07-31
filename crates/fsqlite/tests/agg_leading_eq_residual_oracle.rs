@@ -1,11 +1,11 @@
-//! bd-agg-leading-eq-residual: `SELECT COUNT(*)/SUM(...) FROM t WHERE a = <int> AND <residual>` seeks
-//! the integer-exact equality-prefix block on an index and applies the FULL (placeholder-free) WHERE
-//! as a residual filter per row, instead of full-scanning. HARD GATE: byte-identical to C SQLite across
+//! bd-agg-leading-eq-residual: `SELECT COUNT(*)/SUM(...) FROM t WHERE a = <literal> AND <residual>`
+//! seeks a storage-class-exact equality-prefix block on an index and applies the FULL WHERE as a
+//! residual filter per row, instead of full-scanning. HARD GATE: byte-identical to C SQLite across
 //! residual equality/range/OR/multi-term predicates (including a rowid residual), a multi-column
-//! equality prefix, absent keys
+//! equality prefix, NULL trailing composite-index terms, absent keys
 //! (→ COUNT=0 / SUM=NULL), COALESCE, and both aggregates. The residual filter enforces the WHOLE
 //! predicate, so nothing is dropped. Opcode gate: an all-literal WHERE SeekGEs the index; a WHERE with
-//! a bound parameter DECLINES the seek (falls to a scan that binds it).
+//! a bound parameter in the literal prefix declines, while a parameterized residual remains seekable.
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -67,6 +67,7 @@ fn agg_leading_eq_residual_matches_sqlite() {
         let r = rusqlite::Connection::open_in_memory().expect("sqlite");
         for stmt in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER, y INTEGER, s TEXT);",
+            "CREATE INDEX idx_a_x5 ON t(a) WHERE x = 5;",
             "CREATE INDEX idx_ab ON t(a, b);",
             "CREATE INDEX idx_a ON t(a);",
             "CREATE INDEX idx_s ON t(s);", // BINARY collation (default)
@@ -76,7 +77,14 @@ fn agg_leading_eq_residual_matches_sqlite() {
         }
         for i in 1..=3000_i64 {
             let a = i % 12;
-            let b = i % 7;
+            // Exercise the prefix-record floor on idx_ab. A synthetic
+            // `(a, i64::MIN)` probe sorts after these NULL trailing keys and
+            // would silently omit them.
+            let b = if i % 23 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 7).to_string()
+            };
             let x = i % 10;
             let y = i % 3;
             let stmt = format!(
@@ -90,6 +98,7 @@ fn agg_leading_eq_residual_matches_sqlite() {
         for sql in [
             // Leading eq + residual equality on a non-key column, both aggregates.
             "SELECT COUNT(*) FROM t WHERE a = 7 AND x = 5",
+            "SELECT COUNT(*) FROM t AS q WHERE q.a = 7 AND q.x = 5",
             "SELECT SUM(x) FROM t WHERE a = 7 AND x = 5",
             "SELECT SUM(b) FROM t WHERE a = 7 AND x = 5",
             // Residual range / inequality / OR.
@@ -197,5 +206,40 @@ fn agg_leading_eq_residual_matches_sqlite() {
             .await,
             "TEXT range + residual on a BINARY-indexed column must seek the range (SeekGE)"
         );
+    });
+}
+
+#[test]
+fn agg_leading_eq_residual_rejects_binary_index_for_nocase_column() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("frank");
+        let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+        for stmt in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE, x INTEGER);",
+            "CREATE INDEX idx_s_binary ON t(s COLLATE BINARY);",
+            "INSERT INTO t VALUES (1, 'k3', 5);",
+            "INSERT INTO t VALUES (2, 'K3', 5);",
+            "INSERT INTO t VALUES (3, 'k3', 4);",
+            "INSERT INTO t VALUES (4, 'other', 5);",
+        ] {
+            f.execute(stmt).await.unwrap();
+            r.execute_batch(stmt).unwrap();
+        }
+
+        for sql in [
+            "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x = 5",
+            "SELECT SUM(x) FROM t WHERE s = 'k3' AND x = 5",
+        ] {
+            assert_eq!(
+                frank_rows(&f, sql).await,
+                sqlite_rows(&r, sql),
+                "NOCASE-column/BINARY-index aggregate diverged: `{sql}`"
+            );
+            assert!(
+                !has_op(&f, sql, "SeekGE").await,
+                "a BINARY index cannot serve a bare equality whose NOCASE column \
+                 semantics also match differently-cased keys: `{sql}`"
+            );
+        }
     });
 }

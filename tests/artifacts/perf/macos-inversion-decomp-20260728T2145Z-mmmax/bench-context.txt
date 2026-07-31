@@ -1,0 +1,11 @@
+registry_lock threads=8 holds=11 wait_ns_total=1538 wait_ns_max=333 hold_ns_total=10138666 hold_ns_max=1894625 mean_hold_us=921.7 mean_wait_us=0.1
+registry_lock threads=8 holds=9 wait_ns_total=710 wait_ns_max=250 hold_ns_total=5975125 hold_ns_max=982208 mean_hold_us=663.9 mean_wait_us=0.1
+registry_lock threads=8 holds=9 wait_ns_total=1334 wait_ns_max=250 hold_ns_total=7337252 hold_ns_max=1171833 mean_hold_us=815.3 mean_wait_us=0.1
+case=shared_table threads=8 synchronous=NORMAL null_c_c ratio_median=1.016673 ci95=[0.923554,1.812352] cv_pct=39.052 mad=0.093119 cv_gate=never
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.635231 ci95=[0.619621,0.681731] cv_pct=5.005 mad=0.015610 fsqlite_p50_wps=175487.340 sqlite_p50_wps=283217.170 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=8 median_ci_gate=INCONCLUSIVE rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.812352 claim_margin=0.449 min_decidable_gain=2.624704 max_decidable_regression=-0.624704
+---
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.624332 ci95=[0.534711,0.728455] cv_pct=287.405 mad=0.175231 fsqlite_p50_wps=102752.606 sqlite_p50_wps=151315.194 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=8 median_ci_gate=INCONCLUSIVE rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.308894 claim_margin=1.216 min_decidable_gain=1.617788 max_decidable_regression=0.382212
+mt-mvcc-bench: updated pass-over-pass history .bench-history/mt-mvcc-bench.latest.json
+mt-mvcc-bench: historical ratio warning (provenance only; median-CI is the decision gate): 8t 0.72x -> 0.62x (13.55% drop)

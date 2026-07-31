@@ -98,6 +98,47 @@ const FC_HANDOFF_MAX_SPINS: u32 = 2_048;
 const FC_HANDOFF_PARK_EVERY: u32 = 4;
 const FC_HANDOFF_MAX_PARK: Duration = Duration::from_micros(50);
 
+// Slot-full overflow telemetry: how often publishers find every slot taken
+// (requires > MAX_FC_SLOTS concurrent publishers on one shard) and how long
+// they park for it. Additive only; the 64/96/128-writer scaling receipts
+// consume these to prove or rule out publication-list overflow.
+static FC_SLOT_FULL_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FC_SLOT_FULL_PARK_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn record_fc_slot_full_event() {
+    FC_SLOT_FULL_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn record_fc_slot_full_park_ns(ns: u64) {
+    FC_SLOT_FULL_PARK_NS_TOTAL.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot of publication-list overflow telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct FcSlotFullMetrics {
+    /// Full-scan misses: a publisher found every slot occupied.
+    pub slot_full_events: u64,
+    /// Total nanoseconds spent parked waiting for a slot to free.
+    pub park_ns_total: u64,
+}
+
+/// Read the publication-list overflow counters.
+#[must_use]
+pub fn fc_slot_full_metrics() -> FcSlotFullMetrics {
+    FcSlotFullMetrics {
+        slot_full_events: FC_SLOT_FULL_EVENTS.load(std::sync::atomic::Ordering::Relaxed),
+        park_ns_total: FC_SLOT_FULL_PARK_NS_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Reset the publication-list overflow counters (bench/test harnesses).
+pub fn reset_fc_slot_full_metrics() {
+    FC_SLOT_FULL_EVENTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    FC_SLOT_FULL_PARK_NS_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FcHandoffWait {
     attempt: u32,
@@ -510,14 +551,22 @@ impl FcPageLockShard {
                     return idx;
                 }
             }
-            // All slots busy — bounded spin and then a tiny park. This is rare; it would
-            // require > `MAX_FC_SLOTS` concurrent publishers all racing.
+            // All slots busy — bounded spin and then a tiny park. Requires
+            // > `MAX_FC_SLOTS` concurrent publishers all racing; the counters
+            // below make this overflow regime visible at 64/96/128-writer
+            // counts instead of silently degrading (platform-perf telemetry
+            // ask, 2026-07-28).
+            record_fc_slot_full_event();
             wait_attempt = wait_attempt.saturating_add(1);
             let wait = fc_handoff_wait(wait_attempt);
             perform_fc_handoff_spin(wait);
             #[cfg(not(target_arch = "wasm32"))]
             if !wait.park_timeout.is_zero() {
+                let park_started = std::time::Instant::now();
                 std::thread::park_timeout(wait.park_timeout);
+                record_fc_slot_full_park_ns(
+                    u64::try_from(park_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
             }
         }
     }

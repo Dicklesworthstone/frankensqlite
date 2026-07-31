@@ -27,6 +27,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_vfs::SyncKind;
 use fsqlite_vfs::shm::ShmRegion;
 use fsqlite_vfs::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion};
 use tracing::{debug, debug_span};
@@ -570,6 +571,11 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
         self.inner.delete(cx, path, sync_dir)
     }
 
+    fn sync_parent_directory(&self, cx: &Cx, path: &Path) -> Result<()> {
+        self.check_power()?;
+        self.inner.sync_parent_directory(cx, path)
+    }
+
     fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
         self.check_power()?;
         self.inner.access(cx, path, flags)
@@ -713,8 +719,20 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
     }
 
     fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+        #[cfg(test)]
+        self.state.record_sync_api("sync");
         match self.state.check_sync(&self.path) {
             SyncDecision::Allow => self.inner.sync(cx, flags),
+            SyncDecision::PowerCut | SyncDecision::PoweredOff => Err(power_cut_error()),
+            SyncDecision::IoError => Err(io_failure_error("fault injection: sync failure")),
+        }
+    }
+
+    fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        #[cfg(test)]
+        self.state.record_sync_api("durable_sync");
+        match self.state.check_sync(&self.path) {
+            SyncDecision::Allow => self.inner.durable_sync(cx, kind),
             SyncDecision::PowerCut | SyncDecision::PoweredOff => Err(power_cut_error()),
             SyncDecision::IoError => Err(io_failure_error("fault injection: sync failure")),
         }
@@ -730,6 +748,22 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
 
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
         self.inner.unlock(cx, level)
+    }
+
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_shared_snapshot(cx)
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_shared_snapshot_attempt(cx)
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        self.inner.lock_external_maintenance(cx, wal_mode)
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_maintenance_attempt(cx)
     }
 
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
@@ -775,6 +809,8 @@ pub struct FaultState {
     fault_counters: Mutex<BTreeMap<&'static str, u64>>,
     operation_counter: AtomicU64,
     replay_seed: u64,
+    #[cfg(test)]
+    last_sync_api: Mutex<Option<&'static str>>,
 }
 
 impl FaultState {
@@ -795,7 +831,19 @@ impl FaultState {
             fault_counters: Mutex::new(BTreeMap::new()),
             operation_counter: AtomicU64::new(0),
             replay_seed: seed,
+            #[cfg(test)]
+            last_sync_api: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn record_sync_api(&self, api: &'static str) {
+        *self.last_sync_api.lock().expect("lock last sync API") = Some(api);
+    }
+
+    #[cfg(test)]
+    fn last_sync_api(&self) -> Option<&'static str> {
+        *self.last_sync_api.lock().expect("lock last sync API")
     }
 
     /// Register a fault specification.
@@ -1365,6 +1413,8 @@ mod tests {
     #[cfg(windows)]
     use fsqlite_vfs::WindowsVfs;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[cfg(unix)]
     type NativeVfs = UnixVfs;
@@ -1372,6 +1422,49 @@ mod tests {
     type NativeVfs = WindowsVfs;
 
     const TEST_BEAD: &str = "bd-3go.2";
+
+    struct DirectorySyncProbeVfs {
+        inner: MemoryVfs,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl Vfs for DirectorySyncProbeVfs {
+        type File = <MemoryVfs as Vfs>::File;
+
+        fn name(&self) -> &'static str {
+            "directory-sync-probe"
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            self.inner.open(cx, path, flags)
+        }
+
+        fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn sync_parent_directory(&self, _cx: &Cx, _path: &Path) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+
+        fn is_memory(&self) -> bool {
+            true
+        }
+    }
 
     fn test_cx() -> Cx {
         Cx::default()
@@ -1506,6 +1599,60 @@ mod tests {
         assert_eq!(n, data.len());
         assert_eq!(&buf, data);
 
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_fault_vfs_forwards_parent_directory_sync_only_while_powered() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let vfs = FaultInjectingVfs::new(DirectorySyncProbeVfs {
+            inner: MemoryVfs::new(),
+            calls: Arc::clone(&calls),
+        });
+        let cx = test_cx();
+        let path = Path::new("directory-entry.db");
+
+        vfs.sync_parent_directory(&cx, path)
+            .expect("powered wrapper must delegate directory durability");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        vfs.state.powered_off.store(true, Ordering::Release);
+        assert!(
+            vfs.sync_parent_directory(&cx, path).is_err(),
+            "powered-off wrapper must reject directory durability"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "powered-off wrapper must fail before delegating"
+        );
+    }
+
+    #[test]
+    fn test_fault_vfs_applies_sync_faults_to_durable_sync() {
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let cx = test_cx();
+        let path = Path::new("durable.db");
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        assert!(
+            file.file_identity().expect("wrapped identity").is_some(),
+            "the decorator must preserve the inner file identity"
+        );
+        vfs.inject_fault(FaultSpec::io_error("durable.db").build());
+
+        assert!(matches!(
+            file.durable_sync(&cx, SyncKind::FullDurable),
+            Err(FrankenError::Io(_))
+        ));
+        assert_eq!(
+            vfs.state.last_sync_api(),
+            Some("durable_sync"),
+            "durable intent must not collapse through the ordinary sync method"
+        );
+        file.durable_sync(&cx, SyncKind::FullDurable)
+            .expect("one-shot fault must leave later durable syncs delegated");
         file.close(&cx).unwrap();
     }
 

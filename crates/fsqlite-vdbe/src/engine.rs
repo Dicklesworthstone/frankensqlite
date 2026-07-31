@@ -140,9 +140,9 @@ impl<V> CursorSlots<V> {
             .filter_map(|(i, slot)| slot.as_ref().map(|v| (i as i32, v)))
     }
 }
+use fsqlite_types::sync_primitives::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
 
 use fsqlite_btree::cursor::{CursorPositionStamp, FirstIndexKeyIntegerLocalRunSegment};
 use fsqlite_btree::{
@@ -167,7 +167,9 @@ use fsqlite_mvcc::{
 use fsqlite_mvcc::{concurrent_read_page, concurrent_write_page};
 use fsqlite_pager::{TransactionHandle, TransactionKind};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+use fsqlite_types::opcode::{
+    Opcode, P4, SORTER_COMPARE_TOP_N_PREFLIGHT, SORTER_OPEN_TOP_N_REGISTER, VdbeOp,
+};
 use fsqlite_types::record::{
     ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
     parse_record, record_iter_with_precomputed_header_exact_size, serialize_record,
@@ -1156,6 +1158,8 @@ struct SorterRow {
     values: Vec<SqliteValue>,
     /// Raw serialized record for output via `SorterData`.
     blob: Vec<u8>,
+    /// Source-row order, used only to make bounded-heap ties stable.
+    source_sequence: u64,
 }
 
 /// Cursor state for sorter opcodes (`SorterOpen`, `SorterInsert`, ...).
@@ -1189,9 +1193,18 @@ struct SorterCursor {
     /// Sorted runs that have been spilled to disk.
     spill_runs: Vec<SpillRun>,
     /// Keep only the best N rows during insertion when ORDER BY is paired with
-    /// a simple LIMIT. This avoids sorting the full input when the tail can
-    /// never survive to the final output.
+    /// LIMIT. Retained rows form a max-heap whose root is the current worst
+    /// row, so candidate admission and replacement are O(log N).
+    ///
+    /// While the heap is still growing, native spillable builds can safely
+    /// downgrade it after crossing the spill threshold because no input row
+    /// has been discarded yet. Browser builds retain top-N mode because their
+    /// spill path remains in memory. Once the heap is full, rejected rows make
+    /// any downgrade unsound; a later retained replacement with a giant
+    /// payload can therefore still exceed the spill threshold.
     top_n_limit: Option<usize>,
+    /// Monotonic source-row sequence for stable top-N tie handling.
+    next_source_sequence: u64,
     /// Total rows sorted (across all runs + final merge).
     rows_sorted_total: u64,
     /// Total pages spilled to disk.
@@ -1330,31 +1343,103 @@ impl SorterCursor {
             spill_threshold: SORTER_DEFAULT_SPILL_THRESHOLD,
             spill_runs: Vec::new(),
             top_n_limit,
+            next_source_sequence: 0,
             rows_sorted_total: 0,
             spill_pages_total: 0,
         }
     }
 
-    fn insert_sorted_top_n_row(&mut self, row: SorterRow, collation_registry: &CollationRegistry) {
-        let mut low = 0usize;
-        let mut high = self.rows.len();
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let ordering = compare_sorter_rows(
-                &row.values,
-                &self.rows[mid].values,
+    fn compare_top_n_rows(
+        &self,
+        lhs: &SorterRow,
+        rhs: &SorterRow,
+        collation_registry: &CollationRegistry,
+    ) -> Ordering {
+        let key_ordering = compare_sorter_rows(
+            &lhs.values,
+            &rhs.values,
+            self.key_columns,
+            &self.sort_key_orders,
+            &self.collations,
+            collation_registry,
+        );
+        if key_ordering == Ordering::Equal {
+            lhs.source_sequence.cmp(&rhs.source_sequence)
+        } else {
+            key_ordering
+        }
+    }
+
+    fn sift_top_n_heap_up(&mut self, mut index: usize, collation_registry: &CollationRegistry) {
+        while index > 0 {
+            let parent = (index - 1) / 2;
+            if self.compare_top_n_rows(&self.rows[parent], &self.rows[index], collation_registry)
+                != Ordering::Less
+            {
+                break;
+            }
+            self.rows.swap(parent, index);
+            index = parent;
+        }
+    }
+
+    fn sift_top_n_heap_down(&mut self, mut index: usize, collation_registry: &CollationRegistry) {
+        loop {
+            let left = index * 2 + 1;
+            if left >= self.rows.len() {
+                break;
+            }
+            let right = left + 1;
+            let mut worse_child = left;
+            if right < self.rows.len()
+                && self.compare_top_n_rows(&self.rows[left], &self.rows[right], collation_registry)
+                    == Ordering::Less
+            {
+                worse_child = right;
+            }
+            if self.compare_top_n_rows(
+                &self.rows[index],
+                &self.rows[worse_child],
+                collation_registry,
+            ) != Ordering::Less
+            {
+                break;
+            }
+            self.rows.swap(index, worse_child);
+            index = worse_child;
+        }
+    }
+
+    /// Whether a key-only candidate would survive the bounded top-N heap.
+    ///
+    /// Equal-key candidates are rejected once the heap is full because they
+    /// occur later in source order. This is the same tie rule used by
+    /// `insert_row`, and lets codegen skip evaluating payload expressions for
+    /// rows that cannot reach the result.
+    fn would_retain_top_n(
+        &self,
+        candidate_values: &[SqliteValue],
+        collation_registry: &CollationRegistry,
+    ) -> bool {
+        let Some(limit) = self.top_n_limit else {
+            return true;
+        };
+        if limit == 0 {
+            return false;
+        }
+        if self.rows.len() < limit {
+            return true;
+        }
+        self.rows.first().is_some_and(|worst| {
+            compare_sorter_rows(
+                candidate_values,
+                &worst.values,
                 self.key_columns,
                 &self.sort_key_orders,
                 &self.collations,
                 collation_registry,
-            );
-            if ordering == Ordering::Less {
-                high = mid;
-            } else {
-                low = mid + 1;
-            }
-        }
-        self.rows.insert(low, row);
+            ) == Ordering::Less
+        })
     }
 
     /// Estimate the memory footprint of a sorter row.
@@ -1373,49 +1458,64 @@ impl SorterCursor {
 
     /// Insert a row and spill to disk if memory exceeds the threshold.
     fn insert_row(&mut self, values: Vec<SqliteValue>, blob: Vec<u8>) -> Result<()> {
-        if let Some(limit) = self.top_n_limit {
-            if limit == 0 {
-                return Ok(());
-            }
-
-            let new_row_size = Self::estimate_row_size(&values, &blob);
-            let new_row = SorterRow { values, blob };
-            let collation_registry = Arc::clone(&self.collation_registry);
-            let coll_guard = collation_registry.lock().unwrap_or_else(|e| e.into_inner());
-            if self.rows.len() < limit {
-                self.insert_sorted_top_n_row(new_row, &coll_guard);
-                self.memory_used += new_row_size;
-                self.invalidate_output_row_cache();
-                return Ok(());
-            }
-
-            if let Some(worst_row) = self.rows.last() {
-                let ordering = compare_sorter_rows(
-                    &new_row.values,
-                    &worst_row.values,
-                    self.key_columns,
-                    &self.sort_key_orders,
-                    &self.collations,
-                    &coll_guard,
-                );
-                if ordering != Ordering::Less {
-                    return Ok(());
-                }
-                self.insert_sorted_top_n_row(new_row, &coll_guard);
-                let removed_row = self
-                    .rows
-                    .pop()
-                    .expect("top-N sorter should remove one retained row");
-                let removed_size = Self::estimate_row_size(&removed_row.values, &removed_row.blob);
-                self.memory_used = self.memory_used.saturating_sub(removed_size);
-                self.memory_used = self.memory_used.saturating_add(new_row_size);
-                self.invalidate_output_row_cache();
-            }
+        if self.top_n_limit == Some(0) {
             return Ok(());
         }
 
-        self.memory_used += Self::estimate_row_size(&values, &blob);
-        self.rows.push(SorterRow { values, blob });
+        let new_row_size = Self::estimate_row_size(&values, &blob);
+        if let Some(limit) = self.top_n_limit {
+            // Rejection and replacement begin only once the heap reaches
+            // `limit`, and the heap never shrinks afterward. Therefore
+            // `len() < limit` proves that the retained prefix is still complete.
+            #[cfg(not(target_arch = "wasm32"))]
+            let can_downgrade_before_discarding = self.rows.len() < limit
+                && self.memory_used.saturating_add(new_row_size) >= self.spill_threshold;
+            #[cfg(target_arch = "wasm32")]
+            let can_downgrade_before_discarding = false;
+            if can_downgrade_before_discarding {
+                // The heap may have reordered equal-key rows. Restore scan
+                // order before handing the complete input prefix to the stable
+                // ordinary sorter and its spill path.
+                self.rows.sort_by_key(|row| row.source_sequence);
+                self.top_n_limit = None;
+                self.next_source_sequence = 0;
+                self.invalidate_output_row_cache();
+            } else {
+                let new_row = SorterRow {
+                    values,
+                    blob,
+                    source_sequence: self.next_source_sequence,
+                };
+                self.next_source_sequence = self.next_source_sequence.saturating_add(1);
+                let collation_registry = Arc::clone(&self.collation_registry);
+                let coll_guard = collation_registry.lock().unwrap_or_else(|e| e.into_inner());
+                if self.rows.len() < limit {
+                    self.rows.push(new_row);
+                    self.sift_top_n_heap_up(self.rows.len() - 1, &coll_guard);
+                    self.memory_used += new_row_size;
+                    self.invalidate_output_row_cache();
+                    return Ok(());
+                }
+
+                if self.would_retain_top_n(&new_row.values, &coll_guard) {
+                    let removed_row = std::mem::replace(&mut self.rows[0], new_row);
+                    let removed_size =
+                        Self::estimate_row_size(&removed_row.values, &removed_row.blob);
+                    self.memory_used = self.memory_used.saturating_sub(removed_size);
+                    self.memory_used = self.memory_used.saturating_add(new_row_size);
+                    self.sift_top_n_heap_down(0, &coll_guard);
+                    self.invalidate_output_row_cache();
+                }
+                return Ok(());
+            }
+        }
+
+        self.memory_used += new_row_size;
+        self.rows.push(SorterRow {
+            values,
+            blob,
+            source_sequence: 0,
+        });
         self.invalidate_output_row_cache();
 
         if self.memory_used >= self.spill_threshold {
@@ -1536,6 +1636,24 @@ impl SorterCursor {
 
         if self.spill_runs.is_empty() {
             if self.top_n_limit.is_some() {
+                let key_columns = self.key_columns;
+                let orders = self.sort_key_orders.clone();
+                let colls = self.collations.clone();
+                self.rows.sort_by(|lhs, rhs| {
+                    let key_ordering = compare_sorter_rows(
+                        &lhs.values,
+                        &rhs.values,
+                        key_columns,
+                        &orders,
+                        &colls,
+                        &coll_guard,
+                    );
+                    if key_ordering == Ordering::Equal {
+                        lhs.source_sequence.cmp(&rhs.source_sequence)
+                    } else {
+                        key_ordering
+                    }
+                });
                 self.rows_sorted_total += self.rows.len() as u64;
                 return Ok(());
             }
@@ -1652,6 +1770,7 @@ impl SorterCursor {
         self.position = None;
         self.invalidate_output_row_cache();
         self.memory_used = 0;
+        self.next_source_sequence = 0;
         // Clean up temp files.
         for run in &self.spill_runs {
             let _ = std::fs::remove_file(&run.path);
@@ -1742,7 +1861,11 @@ impl RunIterator {
                             .ok_or_else(|| {
                                 FrankenError::internal("sorter run: malformed record")
                             })?;
-                        *current = Some(SorterRow { values, blob: buf });
+                        *current = Some(SorterRow {
+                            values,
+                            blob: buf,
+                            source_sequence: 0,
+                        });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         *current = None;
@@ -5675,7 +5798,6 @@ impl MakeRecordStatementLookaside {
         self.buf.is_empty()
     }
 
-    #[cfg(test)]
     #[must_use]
     fn as_slice(&self) -> &[u8] {
         self.buf.as_slice()
@@ -9143,7 +9265,15 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(&cursor_id);
                     let key_columns = usize::try_from(op.p2.max(1)).unwrap_or(1);
-                    let top_n_limit = usize::try_from(op.p3).ok().filter(|limit| *limit > 0);
+                    let top_n_from_register = (op.p5 & SORTER_OPEN_TOP_N_REGISTER) != 0;
+                    let top_n_bound = if top_n_from_register {
+                        self.get_reg(op.p3).to_integer()
+                    } else {
+                        i64::from(op.p3)
+                    };
+                    let top_n_limit = usize::try_from(top_n_bound)
+                        .ok()
+                        .filter(|limit| top_n_from_register || *limit > 0);
                     // P4::Str format: ORDER_CHARS or ORDER_CHARS|COLL1,COLL2,...
                     // where ORDER_CHARS are '+'/'-' per key column,
                     // and COLL values are collation names (empty = BINARY).
@@ -10966,20 +11096,99 @@ impl VdbeEngine {
                 }
 
                 Opcode::SorterCompare => {
-                    // Compare current sorter key with packed record in register p3.
-                    // Jump to p2 when keys differ.
+                    // In preflight mode, compare a candidate key with the
+                    // bounded sorter's current worst key and jump when the
+                    // candidate cannot survive. Otherwise compare the current
+                    // sorter key with P3 and jump when the keys differ.
                     let cursor_id = op.p1;
+                    let is_top_n_preflight = (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0;
+                    let preflight_sorter_exists =
+                        !is_top_n_preflight || self.sorters.get(&cursor_id).is_some();
+                    let preflight_needs_compare = is_top_n_preflight
+                        && self.sorters.get(&cursor_id).is_some_and(|sorter| {
+                            sorter
+                                .top_n_limit
+                                .is_some_and(|limit| sorter.rows.len() >= limit)
+                        });
+                    let preflight_probe = if is_top_n_preflight {
+                        if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
+                            // Consume MakeRecord's sideband directly, then
+                            // return its allocation to the lookaside pool.
+                            // Materializing an Arc-backed register blob here
+                            // would add an allocation to every source row.
+                            self.make_record_lookaside.disarm();
+                            let probe_buf = self.make_record_lookaside.take_buf();
+                            let decoded = preflight_needs_compare
+                                .then(|| {
+                                    decode_record_bytes_with_metrics(
+                                        &probe_buf,
+                                        self.collect_vdbe_metrics,
+                                    )
+                                })
+                                .transpose();
+                            self.make_record_lookaside.replace_cleared_buf(probe_buf);
+                            decoded?
+                        } else if preflight_needs_compare {
+                            Some(decode_record_with_metrics(
+                                self.get_reg(op.p3),
+                                self.collect_vdbe_metrics,
+                            )?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let ordinary_needs_compare = !is_top_n_preflight
+                        && self.sorters.get(&cursor_id).is_some_and(|sorter| {
+                            sorter
+                                .position
+                                .is_some_and(|position| sorter.rows.get(position).is_some())
+                        });
+                    let ordinary_probe = if ordinary_needs_compare {
+                        if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
+                            // Decode the logical P3 value without consuming
+                            // MakeRecord's sideband. Ordinary SorterCompare is
+                            // a read operation, so a later opcode must still
+                            // observe the packed record in P3.
+                            Some(decode_record_bytes_with_metrics(
+                                self.make_record_lookaside.as_slice(),
+                                self.collect_vdbe_metrics,
+                            )?)
+                        } else {
+                            Some(decode_record_with_metrics(
+                                self.get_reg(op.p3),
+                                self.collect_vdbe_metrics,
+                            )?)
+                        }
+                    } else {
+                        None
+                    };
                     let coll = self.lock_collation();
-                    let differs = if let Some(sorter) = self.sorters.get(&cursor_id) {
+                    let should_jump = if is_top_n_preflight {
+                        if !preflight_sorter_exists {
+                            true
+                        } else if !preflight_needs_compare {
+                            false
+                        } else if let Some(sorter) = self.sorters.get(&cursor_id) {
+                            !sorter.would_retain_top_n(
+                                preflight_probe
+                                    .as_deref()
+                                    .expect("preflight probe should be decoded"),
+                                &coll,
+                            )
+                        } else {
+                            true
+                        }
+                    } else if let Some(sorter) = self.sorters.get(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             if let Some(current) = sorter.rows.get(pos) {
-                                let probe = decode_record_with_metrics(
-                                    self.get_reg(op.p3),
-                                    self.collect_vdbe_metrics,
-                                )?;
+                                let probe = ordinary_probe
+                                    .as_deref()
+                                    .expect("positioned sorter probe should be decoded");
                                 !sorter_keys_equal(
                                     &current.values,
-                                    &probe,
+                                    probe,
                                     sorter.key_columns,
                                     &sorter.collations,
                                     &coll,
@@ -10993,7 +11202,7 @@ impl VdbeEngine {
                     } else {
                         true
                     };
-                    if differs {
+                    if should_jump {
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;
@@ -17776,7 +17985,13 @@ fn decode_record_with_metrics(
     let SqliteValue::Blob(bytes) = val else {
         return Ok(Vec::new());
     };
+    decode_record_bytes_with_metrics(bytes, collect_vdbe_metrics)
+}
 
+fn decode_record_bytes_with_metrics(
+    bytes: &[u8],
+    collect_vdbe_metrics: bool,
+) -> Result<Vec<SqliteValue>> {
     let _profile_stage = enter_vdbe_decode_profile_stage();
     let values = parse_record(bytes)
         .ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))?;
@@ -22589,6 +22804,201 @@ mod tests {
         });
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
+    }
+
+    #[test]
+    fn test_sorter_compare_falls_through_on_equal_make_record_sideband_key() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let diff = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_probe = b.alloc_reg();
+            let r_probe_record = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 10, r_value, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, diff, P4::None, 0);
+
+            b.emit_op(Opcode::Integer, 10, r_probe, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_probe, 1, r_probe_record, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterCompare, 0, r_probe_record, diff, P4::None, 0);
+
+            b.emit_op(Opcode::Copy, r_probe_record, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            b.resolve_label(diff);
+            b.emit_op(Opcode::Integer, 2, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            decode_record(&rows[0][0]).expect("copied probe should remain a valid record"),
+            vec![SqliteValue::Integer(10)]
+        );
+    }
+
+    #[test]
+    fn test_sorter_compare_unpositioned_sorter_jumps_without_decoding_probe() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let unpositioned = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_uninitialized_probe = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SorterCompare,
+                0,
+                r_uninitialized_probe,
+                unpositioned,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            b.resolve_label(unpositioned);
+            b.emit_op(Opcode::Integer, 2, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
+    }
+
+    #[test]
+    fn test_sorter_compare_top_n_preflight_uses_runtime_bound() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+        let materializations_before = vdbe_test_sideband_materialization_count_snapshot();
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let rejected = b.emit_label();
+            let after_rejected_probe = b.emit_label();
+            let unexpectedly_rejected = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_bound = b.alloc_reg();
+            let r_key = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::Integer, 1, r_bound, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::SorterOpen,
+                0,
+                1,
+                r_bound,
+                P4::Str("+".to_owned()),
+                SORTER_OPEN_TOP_N_REGISTER,
+            );
+            b.emit_op(Opcode::Integer, 10, r_key, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+
+            // A later, worse key is rejected before payload evaluation.
+            b.emit_op(Opcode::Integer, 20, r_key, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SorterCompare,
+                0,
+                r_record,
+                rejected,
+                P4::None,
+                SORTER_COMPARE_TOP_N_PREFLIGHT,
+            );
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, after_rejected_probe, P4::None, 0);
+            b.resolve_label(rejected);
+            b.emit_op(Opcode::Integer, 2, r_out, 0, P4::None, 0);
+            b.resolve_label(after_rejected_probe);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+
+            // A better key falls through and is eligible for projection.
+            b.emit_op(Opcode::Integer, 5, r_key, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SorterCompare,
+                0,
+                r_record,
+                unexpectedly_rejected,
+                P4::None,
+                SORTER_COMPARE_TOP_N_PREFLIGHT,
+            );
+            b.emit_op(Opcode::Integer, 3, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            b.resolve_label(unexpectedly_rejected);
+            b.emit_op(Opcode::Integer, 4, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let materializations_after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(2)], vec![SqliteValue::Integer(3)],]
+        );
+        assert_eq!(
+            materializations_after - materializations_before,
+            0,
+            "top-N preflight should consume MakeRecord sideband bytes without allocating an Arc-backed register blob"
+        );
+    }
+
+    #[test]
+    fn test_sorter_open_zero_runtime_bound_retains_no_rows() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let empty = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_bound = b.alloc_reg();
+            let r_key = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::Integer, 0, r_bound, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::SorterOpen,
+                0,
+                1,
+                r_bound,
+                P4::Str("+".to_owned()),
+                SORTER_OPEN_TOP_N_REGISTER,
+            );
+            b.emit_op(Opcode::Integer, 10, r_key, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, empty, P4::None, 0);
+
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            b.resolve_label(empty);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -31930,7 +32340,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sorter_top_n_limit_desc_keeps_rows_sorted_during_insert() {
+    fn test_sorter_top_n_limit_desc_uses_heap_then_final_sort() {
         let mut sorter = SorterCursor::with_collation_registry(
             1,
             vec![SortKeyOrder::Desc],
@@ -31945,12 +32355,13 @@ mod tests {
                 .expect("insert should succeed");
         }
 
-        let retained: Vec<i64> = sorter
+        let mut retained: Vec<i64> = sorter
             .rows
             .iter()
             .map(|r| r.values[0].to_integer())
             .collect();
-        assert_eq!(retained, vec![5, 4, 3]);
+        retained.sort_unstable();
+        assert_eq!(retained, vec![3, 4, 5]);
 
         sorter.sort().expect("sort should succeed");
         let sorted: Vec<i64> = sorter
@@ -31959,6 +32370,182 @@ mod tests {
             .map(|r| r.values[0].to_integer())
             .collect();
         assert_eq!(sorted, vec![5, 4, 3]);
+    }
+
+    #[test]
+    fn test_sorter_top_n_equal_keys_keep_earliest_source_rows() {
+        let mut sorter = SorterCursor::with_collation_registry(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            Some(2),
+        );
+
+        for payload in [10i64, 20, 30] {
+            let values = [SqliteValue::Integer(1), SqliteValue::Integer(payload)];
+            sorter
+                .insert_row(
+                    vec![values[0].clone()],
+                    fsqlite_types::record::serialize_record(&values),
+                )
+                .expect("insert should succeed");
+        }
+
+        sorter.sort().expect("sort should succeed");
+        let payloads: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|row| {
+                fsqlite_types::record::parse_record(&row.blob)
+                    .expect("retained record should decode")[1]
+                    .to_integer()
+            })
+            .collect();
+        assert_eq!(payloads, vec![10, 20]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_sorter_top_n_downgrades_before_discard_to_preserve_stable_spill_input() {
+        let mut sorter = SorterCursor::with_collation_registry(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            Some(10),
+        );
+        sorter.spill_threshold = usize::MAX;
+
+        let make_row = |payload| {
+            let record = [SqliteValue::Integer(7), SqliteValue::Integer(payload)];
+            (
+                vec![record[0].clone()],
+                fsqlite_types::record::serialize_record(&record),
+            )
+        };
+
+        for payload in [10i64, 20] {
+            let (key, blob) = make_row(payload);
+            sorter
+                .insert_row(key, blob)
+                .expect("heap-building insert should succeed");
+        }
+        let heap_payloads: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|row| {
+                fsqlite_types::record::parse_record(&row.blob).expect("heap row should decode")[1]
+                    .to_integer()
+            })
+            .collect();
+        assert_eq!(
+            heap_payloads,
+            vec![20, 10],
+            "setup should prove the bounded heap reordered equal-key rows"
+        );
+
+        let (third_key, third_blob) = make_row(30);
+        let third_size = SorterCursor::estimate_row_size(&third_key, &third_blob);
+        sorter.spill_threshold = sorter.memory_used.saturating_add(third_size);
+        sorter
+            .insert_row(third_key, third_blob)
+            .expect("downgrading insert should spill successfully");
+
+        assert!(
+            sorter.top_n_limit.is_none(),
+            "complete input prefix should downgrade to the spillable sorter"
+        );
+        assert!(
+            !sorter.spill_runs.is_empty(),
+            "downgrading insert should activate the ordinary spill path"
+        );
+
+        let (fourth_key, fourth_blob) = make_row(40);
+        sorter
+            .insert_row(fourth_key, fourth_blob)
+            .expect("post-downgrade insert should succeed");
+        sorter.sort().expect("external merge should succeed");
+
+        let payloads: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|row| {
+                fsqlite_types::record::parse_record(&row.blob).expect("merged row should decode")[1]
+                    .to_integer()
+            })
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![10, 20, 30, 40],
+            "downgrade must preserve every row and stable equal-key source order"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn test_sorter_top_n_stays_bounded_without_native_spill_support() {
+        let mut sorter = SorterCursor::with_collation_registry(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            Some(2),
+        );
+        sorter.spill_threshold = 1;
+
+        for value in [3i64, 2, 1] {
+            sorter
+                .insert_row(vec![SqliteValue::Integer(value)], Vec::new())
+                .expect("bounded insert should succeed");
+        }
+
+        assert_eq!(
+            sorter.top_n_limit,
+            Some(2),
+            "wasm must keep its effective top-N memory bound"
+        );
+        sorter
+            .sort()
+            .expect("bounded in-memory sort should succeed");
+        let values: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|row| row.values[0].to_integer())
+            .collect();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_sorter_top_n_preflight_respects_multikey_null_and_nocase_order() {
+        let registry = Arc::new(Mutex::new(CollationRegistry::new()));
+        let mut sorter = SorterCursor::with_collation_registry(
+            2,
+            vec![SortKeyOrder::AscNullsLast, SortKeyOrder::Desc],
+            vec![None, Some("NOCASE".to_owned())],
+            Arc::clone(&registry),
+            Some(1),
+        );
+        sorter
+            .insert_row(
+                vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())],
+                Vec::new(),
+            )
+            .expect("insert should succeed");
+
+        let collations = registry.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(sorter.would_retain_top_n(
+            &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into()),],
+            &collations,
+        ));
+        assert!(!sorter.would_retain_top_n(
+            &[SqliteValue::Integer(2), SqliteValue::Text("BETA".into()),],
+            &collations,
+        ));
+        assert!(!sorter.would_retain_top_n(
+            &[SqliteValue::Null, SqliteValue::Text("zeta".into())],
+            &collations,
+        ));
     }
 
     // ── bd-2ttd8.1: Pager routing and parity-cert tests ──────────────

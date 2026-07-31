@@ -55,6 +55,96 @@ use crate::ssi_validation::{
 /// unbounded resource consumption.
 pub const MAX_CONCURRENT_WRITERS: usize = 128;
 
+// ---------------------------------------------------------------------------
+// Registry commit-lock metrics (bd-db300.5.6.1 step 1 instrumentation)
+// ---------------------------------------------------------------------------
+//
+// The first 1-32 writer scaling receipt
+// (tests/artifacts/perf/highwriter-baseline-20260728T0510Z-superserver/)
+// showed F p95 per-txn latency inflating 10x from 16 to 32 writers at
+// near-flat throughput — convoying at a serialization point. The audited
+// suspect is the shared `concurrent_registry` mutex held across
+// validate → physical write → publish on the COMMIT path. These counters
+// quantify exactly that: how long committers WAIT to acquire the registry
+// guard, and how long they HOLD it. Additive only; same idiom as
+// `commit_combiner`'s metrics.
+
+static REGISTRY_COMMIT_LOCK_HOLDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_COMMIT_LOCK_WAIT_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_COMMIT_LOCK_WAIT_NS_MAX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_COMMIT_LOCK_HOLD_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_COMMIT_LOCK_HOLD_NS_MAX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn registry_metric_update_max(metric: &std::sync::atomic::AtomicU64, val: u64) {
+    use std::sync::atomic::Ordering;
+    let mut prev = metric.load(Ordering::Relaxed);
+    while val > prev {
+        match metric.compare_exchange_weak(prev, val, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
+/// Snapshot of commit-path registry lock contention counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RegistryCommitLockMetrics {
+    /// Number of commit-path registry guard acquisitions recorded.
+    pub holds_total: u64,
+    /// Total nanoseconds committers spent WAITING to acquire the guard.
+    pub wait_ns_total: u64,
+    /// Worst single wait.
+    pub wait_ns_max: u64,
+    /// Total nanoseconds the guard was HELD across validate/write/publish.
+    pub hold_ns_total: u64,
+    /// Worst single hold.
+    pub hold_ns_max: u64,
+}
+
+/// Read the commit-path registry lock counters.
+#[must_use]
+pub fn registry_commit_lock_metrics() -> RegistryCommitLockMetrics {
+    use std::sync::atomic::Ordering;
+    RegistryCommitLockMetrics {
+        holds_total: REGISTRY_COMMIT_LOCK_HOLDS.load(Ordering::Relaxed),
+        wait_ns_total: REGISTRY_COMMIT_LOCK_WAIT_NS_TOTAL.load(Ordering::Relaxed),
+        wait_ns_max: REGISTRY_COMMIT_LOCK_WAIT_NS_MAX.load(Ordering::Relaxed),
+        hold_ns_total: REGISTRY_COMMIT_LOCK_HOLD_NS_TOTAL.load(Ordering::Relaxed),
+        hold_ns_max: REGISTRY_COMMIT_LOCK_HOLD_NS_MAX.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset the commit-path registry lock counters (bench/test harnesses).
+pub fn reset_registry_commit_lock_metrics() {
+    use std::sync::atomic::Ordering;
+    REGISTRY_COMMIT_LOCK_HOLDS.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_WAIT_NS_MAX.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_HOLD_NS_TOTAL.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_HOLD_NS_MAX.store(0, Ordering::Relaxed);
+}
+
+/// Record one commit-path registry guard acquisition: how long the committer
+/// waited for the lock, then (on drop) how long it held it.
+pub fn record_registry_commit_lock_wait(wait_ns: u64) {
+    use std::sync::atomic::Ordering;
+    REGISTRY_COMMIT_LOCK_HOLDS.fetch_add(1, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_WAIT_NS_TOTAL.fetch_add(wait_ns, Ordering::Relaxed);
+    registry_metric_update_max(&REGISTRY_COMMIT_LOCK_WAIT_NS_MAX, wait_ns);
+}
+
+/// Record the hold duration of one commit-path registry guard.
+pub fn record_registry_commit_lock_hold(hold_ns: u64) {
+    use std::sync::atomic::Ordering;
+    REGISTRY_COMMIT_LOCK_HOLD_NS_TOTAL.fetch_add(hold_ns, Ordering::Relaxed);
+    registry_metric_update_max(&REGISTRY_COMMIT_LOCK_HOLD_NS_MAX, hold_ns);
+}
+
 #[inline]
 fn same_txn_identity(left: TxnToken, right: TxnToken) -> bool {
     left.id.get() == right.id.get() && left.epoch.get() == right.epoch.get()

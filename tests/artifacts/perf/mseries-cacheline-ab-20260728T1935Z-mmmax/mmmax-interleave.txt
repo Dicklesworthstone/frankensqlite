@@ -1,0 +1,13 @@
+=== pair 1 baseline ===
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.728977 ci95=[0.484830,0.865162] cv_pct=51.550 mad=0.250839 fsqlite_p50_wps=108274.299 sqlite_p50_wps=160858.046 fsqlite_failed=0 sqlite_failed=0
+=== pair 1 flip128 ===
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.833750 ci95=[0.492228,0.987712] cv_pct=42.109 mad=0.319763 fsqlite_p50_wps=109736.044 sqlite_p50_wps=152291.028 fsqlite_failed=0 sqlite_failed=0
+=== pair 2 baseline ===
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.846926 ci95=[0.606907,1.007339] cv_pct=52.302 mad=0.288010 fsqlite_p50_wps=105918.820 sqlite_p50_wps=146945.484 fsqlite_failed=0 sqlite_failed=0
+=== pair 2 flip128 ===
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.707554 ci95=[0.565561,0.910815] cv_pct=45.999 mad=0.203261 fsqlite_p50_wps=114206.519 sqlite_p50_wps=158522.438 fsqlite_failed=0 sqlite_failed=0
+=== pair 3 baseline ===
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.655561 ci95=[0.464478,0.751424] cv_pct=48.004 mad=0.194436 fsqlite_p50_wps=94688.423 sqlite_p50_wps=159025.704 fsqlite_failed=0 sqlite_failed=0
+=== pair 3 flip128 ===
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.658762 ci95=[0.496809,0.801033] cv_pct=52.193 mad=0.189826 fsqlite_p50_wps=99489.546 sqlite_p50_wps=157510.673 fsqlite_failed=0 sqlite_failed=0
+INTERLEAVE_COMPLETE

@@ -499,7 +499,7 @@ mod tests {
             order_by: vec![],
             filter: None,
             over: Some(crate::WindowSpec {
-                base_window: None,
+                window_ref: None,
                 partition_by: vec![],
                 order_by: vec![],
                 frame: None,

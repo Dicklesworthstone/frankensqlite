@@ -249,6 +249,14 @@ pub enum FrankenError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// A synchronous streaming callback attempted to dispatch another
+    /// operation through the same `AsyncConnection`. The dedicated worker is
+    /// still producing that stream, so waiting for it here would deadlock.
+    #[error(
+        "cannot start another operation on an AsyncConnection while its synchronous row stream is active; use a separate connection or defer it until the callback returns"
+    )]
+    SynchronousStreamReentrancy,
+
     /// Operation is not supported by the current backend or configuration.
     #[error("unsupported operation")]
     Unsupported,
@@ -448,6 +456,7 @@ impl FrankenError {
             Self::IntegerOverflow | Self::OutOfRange { .. } => ErrorCode::Range,
             Self::TooBig => ErrorCode::TooBig,
             Self::Internal(_) => ErrorCode::Internal,
+            Self::SynchronousStreamReentrancy => ErrorCode::Misuse,
             Self::Abort => ErrorCode::Abort,
             Self::AuthDenied => ErrorCode::Auth,
             Self::OutOfMemory | Self::PageBufferCapacityExhausted { .. } => ErrorCode::NoMem,
@@ -512,6 +521,9 @@ impl FrankenError {
             }
             Self::PageBufferCapacityExhausted { .. } => Some(
                 "Finish or roll back active transactions, then retry; inspect page-buffer diagnostics before raising the configured limit",
+            ),
+            Self::SynchronousStreamReentrancy => Some(
+                "Use a separate connection inside the row callback, or defer the operation until streaming returns",
             ),
             _ => None,
         }
@@ -1302,6 +1314,16 @@ mod tests {
         assert_eq!(
             FrankenError::Internal(String::new()).error_code(),
             ErrorCode::Internal
+        );
+        assert_eq!(
+            FrankenError::SynchronousStreamReentrancy.error_code(),
+            ErrorCode::Misuse
+        );
+        assert!(!FrankenError::SynchronousStreamReentrancy.is_transient());
+        assert!(
+            FrankenError::SynchronousStreamReentrancy
+                .suggestion()
+                .is_some()
         );
         assert_eq!(FrankenError::Unsupported.error_code(), ErrorCode::NoLfs);
         assert_eq!(FrankenError::Abort.error_code(), ErrorCode::Abort);

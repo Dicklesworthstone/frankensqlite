@@ -20,13 +20,13 @@
 //! complete, valid B-tree page.
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use fsqlite_btree::{
     BtreePageHeader, BtreePageType, header_offset_for_page, read_cell_pointers, write_cell_pointers,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::limits::CELL_POINTER_SIZE;
+use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{PageData, PageNumber, Snapshot};
 use tracing::{debug, info, warn};
 

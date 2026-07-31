@@ -238,9 +238,9 @@ pub type ErasedWindowFunction = dyn WindowFunction<State = Box<dyn Any + Send>>;
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct FunctionKey {
     /// Function name, stored as uppercase ASCII.
-    pub name: String,
+    name: String,
     /// Expected argument count, or `-1` for variadic.
-    pub num_args: i32,
+    num_args: i32,
 }
 
 impl FunctionKey {
@@ -250,6 +250,66 @@ impl FunctionKey {
         Self {
             name: canonical_name(name),
             num_args,
+        }
+    }
+}
+
+/// Immutable SQL-visible argument-count contract for a registered function.
+///
+/// Construct this once from user metadata and publish it alongside the
+/// function object. Runtime lookup uses only this value, never re-entering
+/// user-defined metadata callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionArity {
+    declared_args: i32,
+    min_args: i32,
+    max_args: Option<i32>,
+}
+
+impl FunctionArity {
+    /// Construct an exact-arity contract.
+    #[must_use]
+    pub fn exact(num_args: i32) -> Self {
+        assert!(num_args >= 0, "exact function arity must be non-negative");
+        Self {
+            declared_args: num_args,
+            min_args: num_args,
+            max_args: Some(num_args),
+        }
+    }
+
+    /// Construct a variadic contract with inclusive argument-count bounds.
+    #[must_use]
+    pub fn variadic(min_args: i32, max_args: Option<i32>) -> Self {
+        assert!(min_args >= 0, "minimum function arity must be non-negative");
+        assert!(
+            max_args.is_none_or(|max| max >= min_args),
+            "maximum function arity must not be below its minimum"
+        );
+        Self {
+            declared_args: -1,
+            min_args,
+            max_args,
+        }
+    }
+
+    /// Registry key arity (`-1` for a variadic contract).
+    #[must_use]
+    pub const fn declared_args(self) -> i32 {
+        self.declared_args
+    }
+
+    /// Whether this contract accepts `num_args` SQL-visible arguments.
+    #[must_use]
+    pub fn accepts(self, num_args: i32) -> bool {
+        num_args >= self.min_args && self.max_args.is_none_or(|max| num_args <= max)
+    }
+
+    fn for_key(key: &FunctionKey) -> Self {
+        if key.num_args >= 0 {
+            Self::exact(key.num_args)
+        } else {
+            Self::variadic(0, None)
         }
     }
 }
@@ -266,8 +326,11 @@ impl FunctionKey {
 #[derive(Default)]
 pub struct FunctionRegistry {
     scalars: HashMap<FunctionKey, Arc<dyn ScalarFunction>>,
+    scalar_arities: HashMap<FunctionKey, FunctionArity>,
     aggregates: HashMap<FunctionKey, Arc<ErasedAggregateFunction>>,
+    aggregate_arities: HashMap<FunctionKey, FunctionArity>,
     windows: HashMap<FunctionKey, Arc<ErasedWindowFunction>>,
+    window_arities: HashMap<FunctionKey, FunctionArity>,
 }
 
 struct WrongArgCountScalarFunction {
@@ -411,8 +474,11 @@ impl FunctionRegistry {
     pub fn clone_from_arc(arc: &Arc<Self>) -> Self {
         Self {
             scalars: arc.scalars.clone(),
+            scalar_arities: arc.scalar_arities.clone(),
             aggregates: arc.aggregates.clone(),
+            aggregate_arities: arc.aggregate_arities.clone(),
             windows: arc.windows.clone(),
+            window_arities: arc.window_arities.clone(),
         }
     }
 
@@ -424,7 +490,46 @@ impl FunctionRegistry {
     where
         F: ScalarFunction + 'static,
     {
-        let key = FunctionKey::new(function.name(), function.num_args());
+        let name = function.name().to_owned();
+        let arity = function.arity();
+        self.register_scalar_captured(&name, arity, function)
+    }
+
+    /// Register a scalar function under caller-precomputed identity.
+    ///
+    /// This variant never calls user metadata. It is intended for publication
+    /// paths that must capture `name()` and `num_args()` exactly once before
+    /// taking a registry snapshot, so a reentrant metadata callback cannot make
+    /// a stale clone overwrite a nested registration.
+    pub fn register_scalar_keyed<F>(
+        &mut self,
+        key: FunctionKey,
+        function: F,
+    ) -> Option<Arc<dyn ScalarFunction>>
+    where
+        F: ScalarFunction + 'static,
+    {
+        let arity = FunctionArity::for_key(&key);
+        self.scalar_arities.insert(key.clone(), arity);
+        self.scalars.insert(key, Arc::new(function))
+    }
+
+    /// Register a scalar function with caller-captured metadata.
+    ///
+    /// No user metadata callback runs in this method. The registry key and
+    /// runtime acceptance contract are both derived from the same immutable
+    /// arity value.
+    pub fn register_scalar_captured<F>(
+        &mut self,
+        name: &str,
+        arity: FunctionArity,
+        function: F,
+    ) -> Option<Arc<dyn ScalarFunction>>
+    where
+        F: ScalarFunction + 'static,
+    {
+        let key = FunctionKey::new(name, arity.declared_args());
+        self.scalar_arities.insert(key.clone(), arity);
         self.scalars.insert(key, Arc::new(function))
     }
 
@@ -436,7 +541,46 @@ impl FunctionRegistry {
         F: AggregateFunction + 'static,
         F::State: 'static,
     {
-        let key = FunctionKey::new(function.name(), function.num_args());
+        let name = function.name().to_owned();
+        let arity = function.arity();
+        self.register_aggregate_captured(&name, arity, function)
+    }
+
+    /// Register an aggregate function under caller-precomputed identity.
+    ///
+    /// Returns the displaced adapter, if any. No user metadata callback runs
+    /// here.
+    pub fn register_aggregate_keyed<F>(
+        &mut self,
+        key: FunctionKey,
+        function: F,
+    ) -> Option<Arc<ErasedAggregateFunction>>
+    where
+        F: AggregateFunction + 'static,
+        F::State: 'static,
+    {
+        let arity = FunctionArity::for_key(&key);
+        self.aggregate_arities.insert(key.clone(), arity);
+        self.aggregates
+            .insert(key, Arc::new(AggregateAdapter::new(function)))
+    }
+
+    /// Register an aggregate function with caller-captured metadata.
+    ///
+    /// No user metadata callback runs in this method. The registry key and
+    /// runtime acceptance contract share one immutable arity value.
+    pub fn register_aggregate_captured<F>(
+        &mut self,
+        name: &str,
+        arity: FunctionArity,
+        function: F,
+    ) -> Option<Arc<ErasedAggregateFunction>>
+    where
+        F: AggregateFunction + 'static,
+        F::State: 'static,
+    {
+        let key = FunctionKey::new(name, arity.declared_args());
+        self.aggregate_arities.insert(key.clone(), arity);
         self.aggregates
             .insert(key, Arc::new(AggregateAdapter::new(function)))
     }
@@ -449,9 +593,51 @@ impl FunctionRegistry {
         F: WindowFunction + 'static,
         F::State: 'static,
     {
-        let key = FunctionKey::new(function.name(), function.num_args());
-        self.windows
-            .insert(key, Arc::new(WindowAdapter::new(function)))
+        let name = function.name().to_owned();
+        let arity = function.arity();
+        let (_, displaced) = self.register_window_captured(&name, arity, function);
+        displaced
+    }
+
+    /// Register a window function under caller-precomputed identity.
+    ///
+    /// The returned first Arc is the newly inserted erased adapter; the second
+    /// is the displaced adapter, if any. No user metadata callback runs here.
+    pub fn register_window_keyed<F>(
+        &mut self,
+        key: FunctionKey,
+        function: F,
+    ) -> (Arc<ErasedWindowFunction>, Option<Arc<ErasedWindowFunction>>)
+    where
+        F: WindowFunction + 'static,
+        F::State: 'static,
+    {
+        let registered: Arc<ErasedWindowFunction> = Arc::new(WindowAdapter::new(function));
+        let arity = FunctionArity::for_key(&key);
+        self.window_arities.insert(key.clone(), arity);
+        let displaced = self.windows.insert(key, Arc::clone(&registered));
+        (registered, displaced)
+    }
+
+    /// Register a window function with caller-captured metadata.
+    ///
+    /// No user metadata callback runs in this method. The registry key and
+    /// runtime acceptance contract share one immutable arity value.
+    pub fn register_window_captured<F>(
+        &mut self,
+        name: &str,
+        arity: FunctionArity,
+        function: F,
+    ) -> (Arc<ErasedWindowFunction>, Option<Arc<ErasedWindowFunction>>)
+    where
+        F: WindowFunction + 'static,
+        F::State: 'static,
+    {
+        let registered: Arc<ErasedWindowFunction> = Arc::new(WindowAdapter::new(function));
+        let key = FunctionKey::new(name, arity.declared_args());
+        self.window_arities.insert(key.clone(), arity);
+        let displaced = self.windows.insert(key, Arc::clone(&registered));
+        (registered, displaced)
     }
 
     /// Look up a scalar function by `(name, num_args)`.
@@ -487,7 +673,12 @@ impl FunctionRegistry {
             num_args: -1,
         };
         if let Some(function) = self.scalars.get(&variadic) {
-            if function.accepts_arg_count(num_args) {
+            let arity = self
+                .scalar_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            if arity.accepts(num_args) {
                 debug!(name = %canonical, arity = num_args, kind = "scalar", hit = "variadic", "registry lookup");
                 return Some(Arc::clone(function));
             }
@@ -541,7 +732,12 @@ impl FunctionRegistry {
             num_args: -1,
         };
         if let Some(function) = self.aggregates.get(&variadic) {
-            if function.accepts_arg_count(num_args) {
+            let arity = self
+                .aggregate_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            if arity.accepts(num_args) {
                 debug!(name = %canonical, arity = num_args, kind = "aggregate", hit = "variadic", "registry lookup");
                 return Some(Arc::clone(function));
             }
@@ -585,7 +781,12 @@ impl FunctionRegistry {
             num_args: -1,
         };
         if let Some(function) = self.windows.get(&variadic) {
-            if function.accepts_arg_count(num_args) {
+            let arity = self
+                .window_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            if arity.accepts(num_args) {
                 debug!(name = %canon, arity = num_args, kind = "window", hit = "variadic", "registry lookup");
                 return Some(Arc::clone(function));
             }
@@ -634,6 +835,77 @@ impl FunctionRegistry {
         self.windows.keys().any(|k| k.name == canon)
     }
 
+    /// Return whether a known scalar function accepts the SQL-visible arity.
+    ///
+    /// `None` means the name is not registered as a scalar function at all.
+    /// Unlike [`Self::find_scalar`], this never constructs or invokes a
+    /// wrong-arity sentinel, so preparation-only validation remains free of
+    /// user-function side effects.
+    #[must_use]
+    pub fn scalar_accepts_arg_count(&self, name: &str, num_args: i32) -> Option<bool> {
+        let canon = canonical_name(name);
+        let exact = FunctionKey {
+            name: canon.clone(),
+            num_args,
+        };
+        if self.scalars.contains_key(&exact) {
+            return Some(true);
+        }
+
+        let variadic = FunctionKey {
+            name: canon.clone(),
+            num_args: -1,
+        };
+        if self.scalars.contains_key(&variadic) {
+            let arity = self
+                .scalar_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            return Some(arity.accepts(num_args));
+        }
+
+        self.scalars
+            .keys()
+            .any(|key| key.name == canon)
+            .then_some(false)
+    }
+
+    /// Return whether a known aggregate function accepts the SQL-visible arity.
+    ///
+    /// `None` means the name is not registered as an aggregate function at
+    /// all. This is the side-effect-free counterpart to
+    /// [`Self::find_aggregate`] for preparation-only validation.
+    #[must_use]
+    pub fn aggregate_accepts_arg_count(&self, name: &str, num_args: i32) -> Option<bool> {
+        let canon = canonical_name(name);
+        let exact = FunctionKey {
+            name: canon.clone(),
+            num_args,
+        };
+        if self.aggregates.contains_key(&exact) {
+            return Some(true);
+        }
+
+        let variadic = FunctionKey {
+            name: canon.clone(),
+            num_args: -1,
+        };
+        if self.aggregates.contains_key(&variadic) {
+            let arity = self
+                .aggregate_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            return Some(arity.accepts(num_args));
+        }
+
+        self.aggregates
+            .keys()
+            .any(|key| key.name == canon)
+            .then_some(false)
+    }
+
     /// Return whether a known window function accepts the SQL-visible arity.
     ///
     /// `None` means the name is not registered as a window function at all.
@@ -647,16 +919,21 @@ impl FunctionRegistry {
             name: canon.clone(),
             num_args,
         };
-        if let Some(function) = self.windows.get(&exact) {
-            return Some(function.accepts_arg_count(num_args));
+        if self.windows.contains_key(&exact) {
+            return Some(true);
         }
 
         let variadic = FunctionKey {
             name: canon.clone(),
             num_args: -1,
         };
-        if let Some(function) = self.windows.get(&variadic) {
-            return Some(function.accepts_arg_count(num_args));
+        if self.windows.contains_key(&variadic) {
+            let arity = self
+                .window_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            return Some(arity.accepts(num_args));
         }
 
         self.windows
@@ -779,6 +1056,114 @@ mod tests {
     use fsqlite_types::SqliteValue;
 
     use super::*;
+
+    #[test]
+    fn keyed_registration_never_reinvokes_user_metadata() {
+        struct MetadataPanicsScalar;
+
+        impl ScalarFunction for MetadataPanicsScalar {
+            fn invoke(&self, _args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(1))
+            }
+
+            fn num_args(&self) -> i32 {
+                panic!("keyed scalar registration must not ask for arity")
+            }
+
+            fn name(&self) -> &str {
+                panic!("keyed scalar registration must not ask for name")
+            }
+        }
+
+        struct MetadataPanicsAggregate;
+
+        impl AggregateFunction for MetadataPanicsAggregate {
+            type State = ();
+
+            fn initial_state(&self) -> Self::State {}
+
+            fn step(
+                &self,
+                _state: &mut Self::State,
+                _args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn finalize(&self, _state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(1))
+            }
+
+            fn num_args(&self) -> i32 {
+                panic!("keyed aggregate registration must not ask for arity")
+            }
+
+            fn name(&self) -> &str {
+                panic!("keyed aggregate registration must not ask for name")
+            }
+        }
+
+        struct MetadataPanicsWindow;
+
+        impl WindowFunction for MetadataPanicsWindow {
+            type State = ();
+
+            fn initial_state(&self) -> Self::State {}
+
+            fn step(
+                &self,
+                _state: &mut Self::State,
+                _args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn inverse(
+                &self,
+                _state: &mut Self::State,
+                _args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn value(&self, _state: &Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(1))
+            }
+
+            fn finalize(&self, _state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(1))
+            }
+
+            fn num_args(&self) -> i32 {
+                panic!("keyed window registration must not ask for arity")
+            }
+
+            fn name(&self) -> &str {
+                panic!("keyed window registration must not ask for name")
+            }
+        }
+
+        let mut registry = FunctionRegistry::new();
+        let scalar_displaced = registry
+            .register_scalar_keyed(FunctionKey::new("keyed_scalar", 0), MetadataPanicsScalar);
+        assert!(scalar_displaced.is_none());
+        assert!(registry.find_scalar("keyed_scalar", 0).is_some());
+
+        let aggregate_displaced = registry.register_aggregate_keyed(
+            FunctionKey::new("keyed_aggregate", 0),
+            MetadataPanicsAggregate,
+        );
+        assert!(aggregate_displaced.is_none());
+        assert!(registry.find_aggregate("keyed_aggregate", 0).is_some());
+
+        let (window, window_displaced) = registry
+            .register_window_keyed(FunctionKey::new("keyed_window", 0), MetadataPanicsWindow);
+        assert!(window_displaced.is_none());
+        assert!(Arc::ptr_eq(
+            &window,
+            &registry.find_window("keyed_window", 0).unwrap()
+        ));
+    }
 
     fn runtime_registry_surface_keys() -> BTreeSet<(BuiltinFunctionFamily, String, i32)> {
         let mut registry = FunctionRegistry::new();
@@ -1233,6 +1618,35 @@ mod tests {
         assert!(registry.find_scalar("nonexistent", 1).is_none());
         assert!(registry.find_aggregate("nonexistent", 1).is_none());
         assert!(registry.find_window("nonexistent", 1).is_none());
+    }
+
+    #[test]
+    fn test_registry_scalar_aggregate_arity_introspection_is_side_effect_free() {
+        let mut registry = FunctionRegistry::new();
+        registry.register_scalar(Double);
+        registry.register_scalar(VariadicConcat);
+        registry.register_aggregate(Product);
+
+        assert_eq!(registry.scalar_accepts_arg_count("double", 1), Some(true));
+        assert_eq!(registry.scalar_accepts_arg_count("double", 2), Some(false));
+        assert_eq!(registry.scalar_accepts_arg_count("my_func", 1), Some(true));
+        assert_eq!(registry.scalar_accepts_arg_count("my_func", 3), Some(true));
+        assert_eq!(registry.scalar_accepts_arg_count("my_func", 0), Some(false));
+        assert_eq!(registry.scalar_accepts_arg_count("my_func", 4), Some(false));
+        assert_eq!(registry.scalar_accepts_arg_count("missing_scalar", 1), None);
+
+        assert_eq!(
+            registry.aggregate_accepts_arg_count("product", 1),
+            Some(true)
+        );
+        assert_eq!(
+            registry.aggregate_accepts_arg_count("product", 0),
+            Some(false)
+        );
+        assert_eq!(
+            registry.aggregate_accepts_arg_count("missing_aggregate", 1),
+            None
+        );
     }
 
     #[test]
