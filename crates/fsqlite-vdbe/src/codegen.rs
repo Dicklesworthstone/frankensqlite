@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use crate::{Label, ProgramBuilder};
 use fsqlite_ast::{
-    AssignmentTarget, BinaryOp, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr,
-    FromClause, FunctionArgs, InSet, InsertSource, InsertStatement, JsonArrow, LimitClause,
-    Literal, NullsOrder, OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore,
-    SelectStatement, SortDirection, Span, TableOrSubquery, TimeTravelClause, TimeTravelTarget,
-    UpdateStatement, UpsertAction, UpsertClause, UpsertTarget,
+    AssignmentTarget, BinaryOp, ColumnRef, ConflictAction, CreateIndexStatement, DeleteStatement,
+    Distinctness, Expr, FromClause, FunctionArgs, InSet, IndexedColumn, InsertSource,
+    InsertStatement, JsonArrow, LimitClause, Literal, NullsOrder, OrderingTerm, QualifiedTableRef,
+    ResultColumn, SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery,
+    TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction, UpsertClause, UpsertTarget,
 };
 use fsqlite_error::ErrorCode;
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
@@ -317,6 +317,48 @@ impl IndexSchema {
     }
 }
 
+/// A validated explicit-index definition before a physical root page exists.
+///
+/// This is the common binding result for live `CREATE INDEX` and persisted
+/// `sqlite_master` reloads.  Root allocation deliberately remains a caller
+/// responsibility so malformed catalog SQL and invalid live DDL fail before
+/// they can mutate storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundExplicitIndex {
+    /// Index name exactly as declared by the bound statement.
+    pub name: String,
+    /// Plain indexed column names, or empty for an expression index.
+    pub columns: Vec<String>,
+    /// Executable SQL for every key term when any term is an expression.
+    pub key_expressions: Vec<String>,
+    /// Effective sort direction for every key term.
+    pub key_sort_directions: Vec<SortDirection>,
+    /// Optional validated partial-index predicate SQL.
+    pub where_clause: Option<String>,
+    /// Whether the index enforces uniqueness.
+    pub is_unique: bool,
+    /// Effective collation for every key term.
+    pub key_collations: Vec<Option<String>>,
+}
+
+impl BoundExplicitIndex {
+    /// Attach an already-allocated root page to this validated definition.
+    #[must_use]
+    pub fn into_index_schema(self, root_page: i32) -> IndexSchema {
+        IndexSchema {
+            name: self.name,
+            root_page,
+            columns: self.columns,
+            key_expressions: self.key_expressions,
+            key_sort_directions: self.key_sort_directions,
+            where_clause: self.where_clause,
+            is_unique: self.is_unique,
+            key_collations: self.key_collations,
+            conflict_action: None,
+        }
+    }
+}
+
 /// Planner-selected single-table access-path family that lowering may honor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlannerSelectAccessKind {
@@ -570,6 +612,276 @@ impl TableSchema {
 
     fn resolves_to_hidden_rowid(&self, name: &str) -> bool {
         !self.without_rowid && self.column_index(name).is_none() && is_hidden_rowid_alias_name(name)
+    }
+}
+
+/// Validate and bind an explicit `CREATE INDEX` without allocating storage.
+///
+/// `expected_index_name` and `expected_table_name` let catalog reload callers
+/// bind the SQL text to the surrounding `sqlite_master` row.  Live DDL callers
+/// pass the names from `stmt` itself.  Identifier comparisons are
+/// case-insensitive, while the returned metadata preserves the spelling from
+/// the declaration.
+///
+/// This pass validates expression shape, every table column reference, and
+/// collation placement.  It intentionally does not decide whether a collation
+/// name is registered: that is connection-local state and must be checked by
+/// the caller before allocating the root page.
+pub fn bind_explicit_index(
+    stmt: &CreateIndexStatement,
+    expected_index_name: &str,
+    expected_table_name: &str,
+    table: &TableSchema,
+) -> Result<BoundExplicitIndex, CodegenError> {
+    if stmt.name.name.is_empty() || expected_index_name.is_empty() {
+        return Err(CodegenError::Unsupported(
+            "malformed CREATE INDEX identity: empty index name".to_owned(),
+        ));
+    }
+    if !stmt.name.name.eq_ignore_ascii_case(expected_index_name) {
+        return Err(CodegenError::Unsupported(format!(
+            "CREATE INDEX identity mismatch: statement names `{}`, expected `{expected_index_name}`",
+            stmt.name.name
+        )));
+    }
+    if stmt.table.is_empty() || expected_table_name.is_empty() {
+        return Err(CodegenError::Unsupported(
+            "malformed CREATE INDEX identity: empty table name".to_owned(),
+        ));
+    }
+    if !stmt.table.eq_ignore_ascii_case(expected_table_name) {
+        return Err(CodegenError::Unsupported(format!(
+            "CREATE INDEX table identity mismatch: statement targets `{}`, expected `{expected_table_name}`",
+            stmt.table
+        )));
+    }
+    if !table.name.eq_ignore_ascii_case(expected_table_name) {
+        return Err(CodegenError::TableNotFound(expected_table_name.to_owned()));
+    }
+    if stmt.columns.is_empty() {
+        return Err(CodegenError::Unsupported(format!(
+            "malformed CREATE INDEX `{}`: at least one key term is required",
+            stmt.name.name
+        )));
+    }
+
+    let mut simple_columns = Vec::with_capacity(stmt.columns.len());
+    let mut key_sort_directions = Vec::with_capacity(stmt.columns.len());
+    let mut key_collations = Vec::with_capacity(stmt.columns.len());
+
+    for (term_index, indexed) in stmt.columns.iter().enumerate() {
+        let context = format!("key term {}", term_index + 1);
+        validate_explicit_index_term(indexed, table, &context)?;
+
+        let simple_column = explicit_index_simple_column_name(&indexed.expr);
+        if let Some(column_name) = simple_column {
+            if table.column_index(column_name).is_none() {
+                return Err(CodegenError::ColumnNotFound {
+                    table: table.name.clone(),
+                    column: column_name.to_owned(),
+                });
+            }
+            simple_columns.push(column_name.to_owned());
+        }
+
+        let declared_collation = simple_column
+            .and_then(|column_name| table.column_index(column_name))
+            .and_then(|column_index| table.columns[column_index].collation.as_deref())
+            .or_else(|| column_collation(&indexed.expr, table, None));
+        let effective_collation = indexed
+            .collation
+            .as_deref()
+            .or_else(|| extract_collation(&indexed.expr))
+            .or(declared_collation);
+        validate_explicit_index_collation(effective_collation, &context)?;
+        key_collations.push(effective_collation.map(str::to_owned));
+        key_sort_directions.push(indexed.direction.unwrap_or(SortDirection::Asc));
+    }
+
+    if let Some(predicate) = stmt.where_clause.as_ref() {
+        validate_explicit_index_expr_shape(predicate, "partial-index predicate")?;
+        validate_single_table_expr_columns(predicate, table, None)?;
+    }
+
+    let all_terms_are_simple = simple_columns.len() == stmt.columns.len();
+    let (columns, key_expressions) = if all_terms_are_simple {
+        (simple_columns, Vec::new())
+    } else {
+        (
+            Vec::new(),
+            stmt.columns
+                .iter()
+                .map(|indexed| indexed.expr.to_string())
+                .collect(),
+        )
+    };
+
+    Ok(BoundExplicitIndex {
+        name: stmt.name.name.clone(),
+        columns,
+        key_expressions,
+        key_sort_directions,
+        where_clause: stmt.where_clause.as_ref().map(ToString::to_string),
+        is_unique: stmt.unique,
+        key_collations,
+    })
+}
+
+fn explicit_index_simple_column_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(col_ref.column.as_ref()),
+        // SQLite's indexed-column grammar resolves this legacy spelling as a
+        // column identifier rather than a constant string expression.
+        Expr::Literal(Literal::String(name), _) => Some(name),
+        Expr::Collate { expr, .. } => explicit_index_simple_column_name(expr),
+        _ => None,
+    }
+}
+
+fn validate_explicit_index_term(
+    indexed: &IndexedColumn,
+    table: &TableSchema,
+    context: &str,
+) -> Result<(), CodegenError> {
+    validate_explicit_index_collation(indexed.collation.as_deref(), context)?;
+    validate_explicit_index_expr_shape(&indexed.expr, context)?;
+    validate_single_table_expr_columns(&indexed.expr, table, None)
+}
+
+fn validate_explicit_index_collation(
+    collation: Option<&str>,
+    context: &str,
+) -> Result<(), CodegenError> {
+    if collation.is_some_and(str::is_empty) {
+        return Err(CodegenError::Unsupported(format!(
+            "malformed CREATE INDEX {context}: empty collation name"
+        )));
+    }
+    Ok(())
+}
+
+fn malformed_explicit_index_expr(context: &str, detail: &str) -> CodegenError {
+    CodegenError::Unsupported(format!("malformed CREATE INDEX {context}: {detail}"))
+}
+
+fn validate_explicit_index_expr_shape(expr: &Expr, context: &str) -> Result<(), CodegenError> {
+    match expr {
+        Expr::Literal(..) | Expr::Column(..) => Ok(()),
+        Expr::BinaryOp { left, right, .. } | Expr::JsonAccess { expr: left, path: right, .. } => {
+            validate_explicit_index_expr_shape(left, context)?;
+            validate_explicit_index_expr_shape(right, context)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. } => validate_explicit_index_expr_shape(expr, context),
+        Expr::Collate {
+            expr, collation, ..
+        } => {
+            validate_explicit_index_collation(Some(collation), context)?;
+            validate_explicit_index_expr_shape(expr, context)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_explicit_index_expr_shape(expr, context)?;
+            validate_explicit_index_expr_shape(low, context)?;
+            validate_explicit_index_expr_shape(high, context)
+        }
+        Expr::In { expr, set, .. } => {
+            validate_explicit_index_expr_shape(expr, context)?;
+            let InSet::List(values) = set else {
+                return Err(malformed_explicit_index_expr(
+                    context,
+                    "subqueries and table-valued IN operands are not allowed",
+                ));
+            };
+            for value in values {
+                validate_explicit_index_expr_shape(value, context)?;
+            }
+            Ok(())
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_explicit_index_expr_shape(expr, context)?;
+            validate_explicit_index_expr_shape(pattern, context)?;
+            if let Some(escape) = escape {
+                validate_explicit_index_expr_shape(escape, context)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if whens.is_empty() {
+                return Err(malformed_explicit_index_expr(
+                    context,
+                    "CASE expression has no WHEN terms",
+                ));
+            }
+            if let Some(operand) = operand {
+                validate_explicit_index_expr_shape(operand, context)?;
+            }
+            for (when_expr, then_expr) in whens {
+                validate_explicit_index_expr_shape(when_expr, context)?;
+                validate_explicit_index_expr_shape(then_expr, context)?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_explicit_index_expr_shape(else_expr, context)?;
+            }
+            Ok(())
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if name.is_empty()
+                || *distinct
+                || !order_by.is_empty()
+                || filter.is_some()
+                || over.is_some()
+                || matches!(args, FunctionArgs::Star)
+            {
+                return Err(malformed_explicit_index_expr(
+                    context,
+                    "aggregate or window function term is not allowed",
+                ));
+            }
+            let FunctionArgs::List(values) = args else {
+                unreachable!("star arguments were rejected above");
+            };
+            for value in values {
+                validate_explicit_index_expr_shape(value, context)?;
+            }
+            Ok(())
+        }
+        Expr::Exists { .. } | Expr::Subquery(..) => Err(malformed_explicit_index_expr(
+            context,
+            "subqueries are not allowed",
+        )),
+        Expr::Raise { .. } => Err(malformed_explicit_index_expr(
+            context,
+            "RAISE expressions are not allowed",
+        )),
+        Expr::RowValue(..) => Err(malformed_explicit_index_expr(
+            context,
+            "row-value key terms are not allowed",
+        )),
+        Expr::Placeholder(..) => Err(malformed_explicit_index_expr(
+            context,
+            "bind parameters are not allowed",
+        )),
     }
 }
 
@@ -33197,6 +33509,159 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    fn create_index_sql(sql: &str) -> CreateIndexStatement {
+        let Some((statement, tail)) =
+            parse_first_statement_with_tail(sql).expect("test CREATE INDEX SQL should parse")
+        else {
+            unreachable!("expected parsed CREATE INDEX statement");
+        };
+        assert_eq!(
+            tail,
+            sql.len(),
+            "parser should consume the whole SQL string"
+        );
+        match statement {
+            Statement::CreateIndex(stmt) => stmt,
+            other => unreachable!("expected CREATE INDEX statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_explicit_index_binds_rootless_simple_index_metadata() {
+        let mut schema = test_schema();
+        schema[0].columns[0].collation = Some("NOCASE".to_owned());
+        let stmt = create_index_sql("CREATE UNIQUE INDEX MiXeD ON T(a DESC)");
+
+        let bound = bind_explicit_index(&stmt, "mixed", "t", &schema[0])
+            .expect("simple index should bind");
+
+        assert_eq!(bound.name, "MiXeD");
+        assert_eq!(bound.columns, ["a"]);
+        assert!(bound.key_expressions.is_empty());
+        assert_eq!(bound.key_sort_directions, [SortDirection::Desc]);
+        assert_eq!(bound.key_collations, [Some("NOCASE".to_owned())]);
+        assert!(bound.where_clause.is_none());
+        assert!(bound.is_unique);
+
+        let index = bound.into_index_schema(41);
+        assert_eq!(index.root_page, 41);
+        assert_eq!(index.name, "MiXeD");
+        assert_eq!(index.conflict_action, None);
+    }
+
+    #[test]
+    fn bind_explicit_index_binds_expression_terms_and_preserves_custom_collation() {
+        let schema = test_schema();
+        let stmt = create_index_sql(
+            "CREATE INDEX idx_expr ON t(lower(a) COLLATE custom_sort DESC, b + 1 ASC)",
+        );
+
+        let bound = bind_explicit_index(&stmt, "idx_expr", "t", &schema[0])
+            .expect("expression index should bind before registry validation");
+
+        assert!(bound.columns.is_empty());
+        assert_eq!(bound.key_expressions.len(), 2);
+        assert_eq!(bound.key_expressions[0], "lower(a) COLLATE custom_sort");
+        assert_eq!(bound.key_expressions[1], "b + 1");
+        assert_eq!(
+            bound.key_sort_directions,
+            [SortDirection::Desc, SortDirection::Asc]
+        );
+        assert_eq!(
+            bound.key_collations,
+            [Some("custom_sort".to_owned()), None]
+        );
+    }
+
+    #[test]
+    fn bind_explicit_index_binds_partial_predicate() {
+        let schema = test_schema();
+        let stmt = create_index_sql("CREATE INDEX idx_partial ON t(a) WHERE b > 0");
+
+        let bound = bind_explicit_index(&stmt, "idx_partial", "t", &schema[0])
+            .expect("partial index should bind");
+
+        assert_eq!(bound.columns, ["a"]);
+        assert_eq!(bound.where_clause.as_deref(), Some("b > 0"));
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_catalog_identity_and_unknown_table() {
+        let schema = test_schema();
+        let stmt = create_index_sql("CREATE INDEX declared_name ON t(a)");
+        let error = bind_explicit_index(&stmt, "catalog_name", "t", &schema[0])
+            .expect_err("catalog index-name mismatch must fail");
+        assert!(
+            matches!(error, CodegenError::Unsupported(message) if message.contains("identity mismatch"))
+        );
+
+        let stmt = create_index_sql("CREATE INDEX idx_other ON other(a)");
+        let error = bind_explicit_index(&stmt, "idx_other", "other", &schema[0])
+            .expect_err("supplied schema must match the target table");
+        assert_eq!(error, CodegenError::TableNotFound("other".to_owned()));
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_unknown_simple_and_expression_columns() {
+        let schema = test_schema();
+        for sql in [
+            "CREATE INDEX idx_missing ON t(missing)",
+            "CREATE INDEX idx_missing ON t(lower(missing))",
+            "CREATE INDEX idx_missing ON t(lower(other.a))",
+        ] {
+            let stmt = create_index_sql(sql);
+            let error = bind_explicit_index(&stmt, "idx_missing", "t", &schema[0])
+                .expect_err("unknown indexed column must fail");
+            assert!(matches!(error, CodegenError::ColumnNotFound { .. }));
+        }
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_unknown_partial_predicate_column() {
+        let schema = test_schema();
+        let stmt =
+            create_index_sql("CREATE INDEX idx_partial_missing ON t(a) WHERE missing > 0");
+
+        let error = bind_explicit_index(&stmt, "idx_partial_missing", "t", &schema[0])
+            .expect_err("unknown partial-index predicate column must fail");
+
+        assert_eq!(
+            error,
+            CodegenError::ColumnNotFound {
+                table: "t".to_owned(),
+                column: "missing".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_malformed_terms_and_collation_shape() {
+        let schema = test_schema();
+        let mut empty = create_index_sql("CREATE INDEX idx_empty ON t(a)");
+        empty.columns.clear();
+        let error = bind_explicit_index(&empty, "idx_empty", "t", &schema[0])
+            .expect_err("empty key-term list must fail");
+        assert!(
+            matches!(error, CodegenError::Unsupported(message) if message.contains("at least one key term"))
+        );
+
+        let mut placeholder_term = create_index_sql("CREATE INDEX idx_param ON t(a)");
+        placeholder_term.columns[0].expr = placeholder(1);
+        let error = bind_explicit_index(&placeholder_term, "idx_param", "t", &schema[0])
+            .expect_err("bind parameter key term must fail");
+        assert!(
+            matches!(error, CodegenError::Unsupported(message) if message.contains("bind parameters"))
+        );
+
+        let mut empty_collation = create_index_sql("CREATE INDEX idx_coll ON t(a)");
+        empty_collation.columns[0].collation = Some(String::new());
+        let error = bind_explicit_index(&empty_collation, "idx_coll", "t", &schema[0])
+            .expect_err("empty collation name must fail");
+        assert!(
+            matches!(error, CodegenError::Unsupported(message) if message.contains("empty collation"))
+        );
     }
 
     fn test_schema_with_index() -> Vec<TableSchema> {
