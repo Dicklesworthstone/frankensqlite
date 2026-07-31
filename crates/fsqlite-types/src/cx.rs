@@ -27,6 +27,8 @@
 //
 
 use std::marker::PhantomData;
+#[cfg(feature = "native")]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -431,6 +433,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 struct CxInner {
     cancel_requested: AtomicBool,
+    // Strongest ordinary cancellation for this local node. Kept separate
+    // from `cancel_reason` so operation-local cancellation is never mirrored
+    // into native I/O. NativeCx clones remain upstream-owned overwrite handles;
+    // this rank intentionally does not claim cross-sibling arbitration.
+    #[cfg(feature = "native")]
+    native_cancel_reason: AtomicU8,
     cancel_state: Mutex<CancelState>,
     cancel_reason: Mutex<Option<CancelReason>>,
     mask_depth: AtomicU32,
@@ -442,6 +450,8 @@ struct CxInner {
     attached_native_cx: Mutex<Option<NativeCx>>,
     #[cfg(feature = "native")]
     fallback_native_cx: std::sync::OnceLock<NativeCx>,
+    #[cfg(feature = "native")]
+    fallback_native_cx_gate: Mutex<()>,
     // bd-bjm5d: set only on the root Cx of a dedicated engine OS thread
     // that owns its Connection exclusively and is not a shared scheduler
     // worker. Grants VFS backends permission to issue bounded EINTR-safe
@@ -457,6 +467,8 @@ impl CxInner {
     fn new() -> Self {
         Self {
             cancel_requested: AtomicBool::new(false),
+            #[cfg(feature = "native")]
+            native_cancel_reason: AtomicU8::new(0),
             cancel_state: Mutex::new(CancelState::Created),
             cancel_reason: Mutex::new(None),
             mask_depth: AtomicU32::new(0),
@@ -468,6 +480,8 @@ impl CxInner {
             attached_native_cx: Mutex::new(None),
             #[cfg(feature = "native")]
             fallback_native_cx: std::sync::OnceLock::new(),
+            #[cfg(feature = "native")]
+            fallback_native_cx_gate: Mutex::new(()),
             blocking_io_inline_safe: AtomicBool::new(false),
             unix_millis: AtomicU64::new(0),
         }
@@ -504,7 +518,59 @@ fn native_reason_to_local(reason: &NativeCancelReason) -> CancelReason {
 }
 
 #[cfg(feature = "native")]
-fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
+const fn encode_native_cancel_reason(reason: CancelReason) -> u8 {
+    match reason {
+        CancelReason::Timeout => 1,
+        CancelReason::UserInterrupt => 2,
+        CancelReason::RegionClose => 3,
+        CancelReason::Abort => 4,
+    }
+}
+
+#[cfg(feature = "native")]
+fn decode_native_cancel_reason(encoded: u8) -> Option<CancelReason> {
+    match encoded {
+        0 => None,
+        1 => Some(CancelReason::Timeout),
+        2 => Some(CancelReason::UserInterrupt),
+        3 => Some(CancelReason::RegionClose),
+        4 => Some(CancelReason::Abort),
+        _ => unreachable!("invalid native cancellation reason rank"),
+    }
+}
+
+#[cfg(feature = "native")]
+fn record_native_cancel_reason(inner: &CxInner, reason: CancelReason) {
+    inner
+        .native_cancel_reason
+        .fetch_max(encode_native_cancel_reason(reason), Ordering::AcqRel);
+}
+
+#[cfg(feature = "native")]
+fn mirrored_native_cancel_reason(inner: &CxInner) -> Option<CancelReason> {
+    decode_native_cancel_reason(inner.native_cancel_reason.load(Ordering::Acquire))
+}
+
+#[cfg(feature = "native")]
+fn sync_one_native_cx_cancel(inner: &CxInner, native: &NativeCx) {
+    let mut encoded = inner.native_cancel_reason.load(Ordering::Acquire);
+    while let Some(reason) = decode_native_cancel_reason(encoded) {
+        // NativeCx drops its own lock before invoking arbitrary wakers. Hold
+        // no FrankenSQLite lock across this callback boundary.
+        native.set_cancel_reason(local_reason_to_native(reason));
+        let latest = inner.native_cancel_reason.load(Ordering::Acquire);
+        if latest == encoded {
+            break;
+        }
+        encoded = latest;
+    }
+}
+
+#[cfg(feature = "native")]
+fn sync_native_cx_cancel(inner: &CxInner) {
+    if inner.native_cancel_reason.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let attached_native = inner
         .attached_native_cx
         .lock()
@@ -512,10 +578,17 @@ fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
         .as_ref()
         .cloned();
     if let Some(native) = attached_native {
-        native.set_cancel_reason(local_reason_to_native(reason));
+        sync_one_native_cx_cancel(inner, &native);
     }
-    if let Some(native) = inner.fallback_native_cx.get() {
-        native.set_cancel_reason(local_reason_to_native(reason));
+    let fallback_native = {
+        let _gate = inner
+            .fallback_native_cx_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.fallback_native_cx.get().cloned()
+    };
+    if let Some(native) = fallback_native {
+        sync_one_native_cx_cancel(inner, &native);
     }
 }
 
@@ -555,13 +628,19 @@ fn local_deadline_to_native_time(deadline: Duration) -> NativeTime {
     NativeTime::from_nanos(nanos)
 }
 
-/// Propagate cancellation to a `CxInner` node and all its descendants.
-///
-/// We release each node's lock before recursing into children to avoid
-/// lock-ordering issues.
-fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
-    // Set atomic flag (fast-path for checkpoint).
-    inner.cancel_requested.store(true, Ordering::Release);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeCancelPropagation {
+    LocalAndNative,
+    LocalOnly,
+}
+
+fn propagate_cancel_node(
+    inner: &CxInner,
+    reason: CancelReason,
+    native_propagation: NativeCancelPropagation,
+) -> Vec<Arc<CxInner>> {
+    #[cfg(not(feature = "native"))]
+    let _ = native_propagation;
 
     // Monotone reason update.
     {
@@ -586,22 +665,89 @@ fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
         }
     }
 
+    // Record only cancellation requests that are allowed to cross the native
+    // boundary. This reason is deliberately separate from the aggregate local
+    // reason: a stronger operation-local cancellation must never be laundered
+    // into a shared native context by a later, weaker ordinary cancellation.
+    #[cfg(feature = "native")]
+    if native_propagation == NativeCancelPropagation::LocalAndNative {
+        record_native_cancel_reason(inner, reason);
+    }
+
+    // Publish the fast-path flag only after the reason and state are visible.
+    // This gives attachment and child-registration rechecks a stable reason to
+    // consume once they observe cancellation.
+    inner.cancel_requested.store(true, Ordering::Release);
+
     // Keep attached native asupersync context in sync so downstream combinators
     // observe equivalent cancellation semantics.
     #[cfg(feature = "native")]
-    sync_native_cx_cancel(inner, reason);
+    if native_propagation == NativeCancelPropagation::LocalAndNative {
+        sync_native_cx_cancel(inner);
+    }
 
-    // Collect children (release lock before recursing).
-    let children: Vec<Arc<CxInner>> = {
+    // Collect children and release the lock before traversing them.
+    {
         let mut guard = inner
             .children
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.retain(|child| child.strong_count() > 0);
         guard.iter().filter_map(Weak::upgrade).collect()
-    };
-    for child in &children {
-        propagate_cancel(child, reason);
+    }
+}
+
+/// Propagate cancellation to a `CxInner` node and all its descendants.
+///
+/// The explicit worklist avoids consuming one physical stack frame per
+/// descendant. Each node lock is released before its children are visited.
+fn propagate_cancel_tree(
+    inner: &CxInner,
+    reason: CancelReason,
+    native_propagation: NativeCancelPropagation,
+) {
+    let mut worklist = propagate_cancel_node(inner, reason, native_propagation);
+    while let Some(node) = worklist.pop() {
+        worklist.extend(propagate_cancel_node(&node, reason, native_propagation));
+    }
+}
+
+fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
+    propagate_cancel_tree(inner, reason, NativeCancelPropagation::LocalAndNative);
+}
+
+fn propagate_local_cancel(inner: &CxInner, reason: CancelReason) {
+    propagate_cancel_tree(inner, reason, NativeCancelPropagation::LocalOnly);
+}
+
+/// Cancellation-only authority for one derived [`Cx`] subtree.
+///
+/// This relay deliberately carries only a weak reference to the local
+/// FrankenSQLite cancellation state. It cannot expose the target context,
+/// runtime effects, I/O authority, budgets, or native asupersync context.
+/// Local cancellation reaches the target and its descendants without
+/// cancelling an attached native context that may be shared with the worker
+/// root. Calling the relay performs synchronous local bookkeeping and subtree
+/// traversal; actor integrations must not invoke it from a nonblocking `Drop`.
+#[derive(Debug)]
+#[must_use = "dropping the relay discards the authority to cancel the derived operation"]
+pub struct LocalCancelRelay {
+    inner: Weak<CxInner>,
+}
+
+impl LocalCancelRelay {
+    /// Request cancellation of the derived local context subtree.
+    ///
+    /// The strongest [`CancelReason`] remains monotone. Returns `false` when
+    /// the target context has already been dropped; otherwise returns `true`,
+    /// including for an idempotent repeated request.
+    #[must_use]
+    pub fn cancel_local(&self, reason: CancelReason) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        propagate_local_cancel(&inner, reason);
+        true
     }
 }
 
@@ -663,19 +809,25 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             return native;
         }
 
-        self.inner
-            .fallback_native_cx
-            .get_or_init(|| {
-                let native =
-                    NativeCx::for_request_with_budget(native_budget_from_local(self.budget));
-                if let Some(reason) = self.cancel_reason() {
-                    native.set_cancel_reason(local_reason_to_native(reason));
-                } else if self.is_cancel_requested() {
-                    native.set_cancel_requested(true);
-                }
-                native
-            })
-            .clone()
+        let native = {
+            let _gate = self
+                .inner
+                .fallback_native_cx_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.inner
+                .fallback_native_cx
+                .get_or_init(|| {
+                    NativeCx::for_request_with_budget(native_budget_from_local(self.budget))
+                })
+                .clone()
+        };
+        // Recheck after releasing the registration gate: NativeCx dispatches
+        // arbitrary wakers synchronously, so no application lock may be held
+        // while mirroring the reason. The gate still establishes which side
+        // must observe the other's publication.
+        sync_one_native_cx_cancel(&self.inner, &native);
+        native
     }
 
     #[cfg(feature = "native")]
@@ -903,16 +1055,14 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// Attach a native asupersync context used by [`Self::checkpoint`].
     #[cfg(feature = "native")]
     pub fn set_native_cx(&self, native_cx: NativeCx) {
-        if let Some(reason) = self.cancel_reason() {
-            native_cx.set_cancel_reason(local_reason_to_native(reason));
-        } else if self.is_cancel_requested() {
-            native_cx.set_cancel_requested(true);
-        }
         *self
             .inner
             .attached_native_cx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native_cx);
+        // Register first, then recheck the separate ordinary-reason channel.
+        // A local-only cancellation never crosses this native boundary.
+        sync_native_cx_cancel(&self.inner);
     }
 
     /// Attach a native context shim in non-native builds.
@@ -1239,12 +1389,44 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             children.push(Arc::downgrade(&child.inner));
         }
+        #[cfg(feature = "native")]
+        {
+            let local_reason = self.cancel_reason();
+            let native_reason =
+                local_reason.and_then(|_| mirrored_native_cancel_reason(&self.inner));
+            match (local_reason, native_reason) {
+                (Some(local), Some(native)) if local == native => {
+                    propagate_cancel(&child.inner, native);
+                }
+                (Some(local), Some(native)) => {
+                    propagate_local_cancel(&child.inner, local);
+                    propagate_cancel(&child.inner, native);
+                }
+                (Some(local), None) => propagate_local_cancel(&child.inner, local),
+                (None, Some(native)) => propagate_cancel(&child.inner, native),
+                (None, None) => {}
+            }
+        }
+        #[cfg(not(feature = "native"))]
         if let Some(reason) = self.cancel_reason() {
             child.cancel_with_reason(reason);
-        } else if self.is_cancel_requested() {
-            child.cancel();
         }
         child
+    }
+
+    /// Create a child context plus narrowly scoped local cancellation authority.
+    ///
+    /// The child inherits the same budget, tracing metadata, effect
+    /// capabilities, and native I/O context as [`Self::create_child`]. The
+    /// returned relay can only request local cancellation for that child
+    /// subtree; it cannot access the context or cancel the inherited native
+    /// context.
+    pub fn create_child_with_local_cancel_relay(&self) -> (Self, LocalCancelRelay) {
+        let child = self.create_child();
+        let relay = LocalCancelRelay {
+            inner: Arc::downgrade(&child.inner),
+        };
+        (child, relay)
     }
 
     /// Set a deterministic unix time for tests.
@@ -1651,6 +1833,93 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Cancelled);
     }
 
+    #[test]
+    fn local_cancel_relay_is_subtree_scoped_and_reason_monotone() {
+        let root = Cx::<FullCaps>::new();
+        let sibling = root.create_child();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let existing_descendant = operation.create_child();
+
+        assert!(relay.cancel_local(CancelReason::Timeout));
+        assert!(relay.cancel_local(CancelReason::Abort));
+        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+
+        assert_eq!(operation.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            existing_descendant.cancel_reason(),
+            Some(CancelReason::Abort)
+        );
+        assert!(operation.checkpoint().is_err());
+        assert!(existing_descendant.checkpoint().is_err());
+
+        assert!(root.checkpoint().is_ok());
+        assert!(sibling.checkpoint().is_ok());
+        assert!(!root.is_cancel_requested());
+        assert!(!sibling.is_cancel_requested());
+
+        let late_descendant = operation.create_child();
+        assert_eq!(late_descendant.cancel_reason(), Some(CancelReason::Abort));
+        assert!(late_descendant.checkpoint().is_err());
+        assert!(root.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn local_cancel_relay_is_weak_and_cross_thread_safe() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<LocalCancelRelay>();
+
+        let root = Cx::<FullCaps>::new();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let cancel_thread =
+            std::thread::spawn(move || relay.cancel_local(CancelReason::RegionClose));
+        assert!(
+            cancel_thread
+                .join()
+                .expect("cancel thread should not panic"),
+            "live operation should accept a relayed cancellation"
+        );
+        assert_eq!(operation.cancel_reason(), Some(CancelReason::RegionClose));
+
+        let (dropped_operation, dropped_relay) = root.create_child_with_local_cancel_relay();
+        drop(dropped_operation);
+        assert!(
+            !dropped_relay.cancel_local(CancelReason::Abort),
+            "a weak relay must become inert after its target is dropped"
+        );
+        assert!(root.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn local_cancel_relay_handles_deep_subtrees_on_a_small_stack() {
+        let root = Cx::<FullCaps>::new();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let mut chain = Vec::with_capacity(8_193);
+        chain.push(operation);
+        for _ in 0..8_192 {
+            let child = chain
+                .last()
+                .expect("chain must contain its root")
+                .create_child();
+            chain.push(child);
+        }
+
+        let cancel_thread = std::thread::Builder::new()
+            .name("local-cancel-deep-tree".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || relay.cancel_local(CancelReason::RegionClose))
+            .expect("small-stack cancellation thread should spawn");
+        assert!(
+            cancel_thread
+                .join()
+                .expect("iterative cancellation traversal must not overflow")
+        );
+        assert_eq!(
+            chain.last().and_then(Cx::cancel_reason),
+            Some(CancelReason::RegionClose)
+        );
+        assert!(root.checkpoint().is_ok());
+    }
+
     #[cfg(feature = "native")]
     #[test]
     fn test_cx_checkpoint_native_cx_cancellation_maps_reason() {
@@ -1675,6 +1944,222 @@ mod tests {
         let reason = native
             .cancel_reason()
             .expect("native cancel reason must be set");
+        assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn local_cancel_relay_preserves_shared_native_context_for_late_children() {
+        let root = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        root.set_native_cx(native.clone());
+        let sibling = root.create_child();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let existing_descendant = operation.create_child();
+
+        assert!(relay.cancel_local(CancelReason::Abort));
+        assert!(operation.checkpoint().is_err());
+        assert!(existing_descendant.checkpoint().is_err());
+        assert!(root.checkpoint().is_ok());
+        assert!(sibling.checkpoint().is_ok());
+        assert!(
+            native.checkpoint().is_ok(),
+            "local operation cancellation must not poison shared native I/O state"
+        );
+
+        let late_descendant = operation.create_child();
+        assert!(late_descendant.checkpoint().is_err());
+        assert!(
+            native.checkpoint().is_ok(),
+            "a descendant created after local cancellation must inherit locally"
+        );
+
+        root.cancel_with_reason(CancelReason::RegionClose);
+        assert!(
+            native.is_cancel_requested(),
+            "later ordinary root cancellation must still cross the native boundary"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn local_cancel_relay_preserves_native_contexts_attached_after_cancellation() {
+        let root = Cx::<FullCaps>::new();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        assert!(relay.cancel_local(CancelReason::Abort));
+
+        let fallback = operation.effective_native_cx();
+        assert!(
+            fallback.checkpoint().is_ok(),
+            "local cancellation must not taint a later fallback native context"
+        );
+
+        let replacement = NativeCx::for_testing();
+        operation.set_native_cx(replacement.clone());
+        assert!(
+            replacement.checkpoint().is_ok(),
+            "local cancellation must not taint a later explicit native context"
+        );
+        assert!(operation.checkpoint().is_err());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn local_reason_never_leaks_through_later_ordinary_cancellation() {
+        let root = Cx::<FullCaps>::new();
+        let shared_native = NativeCx::for_testing();
+        root.set_native_cx(shared_native.clone());
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+
+        assert!(relay.cancel_local(CancelReason::Abort));
+        root.cancel_with_reason(CancelReason::Timeout);
+
+        assert_eq!(operation.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            shared_native
+                .cancel_reason()
+                .expect("ordinary cancellation must reach shared native")
+                .kind,
+            NativeCancelKind::Timeout,
+            "the stronger local-only Abort must not cross the native boundary"
+        );
+
+        let late_descendant = operation.create_child();
+        assert_eq!(
+            late_descendant.cancel_reason(),
+            Some(CancelReason::Abort),
+            "late descendants inherit the aggregate local reason"
+        );
+        assert_eq!(
+            shared_native
+                .cancel_reason()
+                .expect("late-child registration must retain ordinary reason")
+                .kind,
+            NativeCancelKind::Timeout
+        );
+
+        operation.clear_native_cx();
+        let fallback = operation.effective_native_cx();
+        assert_eq!(
+            fallback
+                .cancel_reason()
+                .expect("late fallback must receive ordinary reason")
+                .kind,
+            NativeCancelKind::Timeout
+        );
+
+        let replacement = NativeCx::for_testing();
+        operation.set_native_cx(replacement.clone());
+        assert_eq!(
+            replacement
+                .cancel_reason()
+                .expect("late explicit attachment must receive ordinary reason")
+                .kind,
+            NativeCancelKind::Timeout
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn weaker_ordinary_reason_cannot_downgrade_native_cancellation() {
+        let cx = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        cx.set_native_cx(native.clone());
+
+        cx.cancel_with_reason(CancelReason::Abort);
+        cx.cancel_with_reason(CancelReason::Timeout);
+
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            native
+                .cancel_reason()
+                .expect("native reason must remain present")
+                .kind,
+            NativeCancelKind::ResourceUnavailable
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_attachment_racing_ordinary_cancellation_never_misses_reason() {
+        for _ in 0..128 {
+            let cx = Cx::<FullCaps>::new();
+            let cancel_cx = cx.clone();
+            let attach_cx = cx.clone();
+            let native = NativeCx::for_testing();
+            let attached_native = native.clone();
+            let gate = Arc::new(std::sync::Barrier::new(3));
+            let cancel_gate = Arc::clone(&gate);
+            let attach_gate = Arc::clone(&gate);
+
+            let cancel_thread = std::thread::spawn(move || {
+                cancel_gate.wait();
+                cancel_cx.cancel_with_reason(CancelReason::RegionClose);
+            });
+            let attach_thread = std::thread::spawn(move || {
+                attach_gate.wait();
+                attach_cx.set_native_cx(attached_native);
+            });
+            gate.wait();
+            cancel_thread.join().expect("cancellation must not panic");
+            attach_thread.join().expect("attachment must not panic");
+
+            assert_eq!(
+                native
+                    .cancel_reason()
+                    .expect("racing attachment must observe cancellation")
+                    .kind,
+                NativeCancelKind::ParentCancelled
+            );
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn fallback_creation_racing_ordinary_cancellation_never_misses_reason() {
+        for _ in 0..128 {
+            let cx = Cx::<FullCaps>::new();
+            let cancel_cx = cx.clone();
+            let fallback_cx = cx.clone();
+            let gate = Arc::new(std::sync::Barrier::new(3));
+            let cancel_gate = Arc::clone(&gate);
+            let fallback_gate = Arc::clone(&gate);
+
+            let cancel_thread = std::thread::spawn(move || {
+                cancel_gate.wait();
+                cancel_cx.cancel_with_reason(CancelReason::RegionClose);
+            });
+            let fallback_thread = std::thread::spawn(move || {
+                fallback_gate.wait();
+                fallback_cx.effective_native_cx()
+            });
+            gate.wait();
+            cancel_thread.join().expect("cancellation must not panic");
+            let native = fallback_thread
+                .join()
+                .expect("fallback creation must not panic");
+
+            assert_eq!(
+                native
+                    .cancel_reason()
+                    .expect("racing fallback must observe cancellation")
+                    .kind,
+                NativeCancelKind::ParentCancelled
+            );
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn ordinary_cancel_before_native_attachment_is_mirrored_after_registration() {
+        let cx = Cx::<FullCaps>::new();
+        cx.cancel_with_reason(CancelReason::RegionClose);
+
+        let native = NativeCx::for_testing();
+        cx.set_native_cx(native.clone());
+        let reason = native
+            .cancel_reason()
+            .expect("ordinary local cancellation must mirror to a later attachment");
         assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
     }
 
