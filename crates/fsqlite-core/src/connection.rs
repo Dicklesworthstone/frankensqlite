@@ -110270,13 +110270,14 @@ mod tests {
         FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
         FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, InProcessPageLockTable, IoPollStrategy,
-        MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope, Row,
-        RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
-        arm_trigger_stack_probe, bind_placeholders_in_select_for_fallback,
-        canonicalize_select_placeholders, init_global_runtime, is_correlated_subquery,
-        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
-        join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
-        parse_single_statement, qualify_persistent_view_relations, resolve_used_window_spec,
+        ImplicitAutoindexSlot, MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot,
+        PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
+        SimplePager, Snapshot, arm_trigger_stack_probe, bind_placeholders_in_select_for_fallback,
+        canonicalize_select_placeholders, implicit_autoindex_layout, init_global_runtime,
+        is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
+        join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
+        memdb_row_matches_like_fast_path, parse_single_statement,
+        qualify_persistent_view_relations, resolve_used_window_spec,
         select_contains_any_placeholder, set_trigger_depth_limit_override,
         statement_contains_rewritable_subquery, substitute_outer_refs_in_select,
         take_trigger_stack_probe, validate_named_window_definitions, visit_select_qualified_names,
@@ -110284,8 +110285,8 @@ mod tests {
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{
-        Expr, FunctionArgs, JoinKind, Literal, OrderingTerm, PlaceholderType, ResultColumn,
-        SelectCore, SortDirection, Span, Statement, WindowReference, WindowSpec,
+        CreateTableBody, Expr, FunctionArgs, JoinKind, Literal, OrderingTerm, PlaceholderType,
+        ResultColumn, SelectCore, SortDirection, Span, Statement, WindowReference, WindowSpec,
     };
     use fsqlite_btree::BtreeCursorOps;
     use fsqlite_error::{FrankenError, Result};
