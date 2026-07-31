@@ -414,6 +414,14 @@ struct ParsedRtreeModuleArgs {
     dimensions: usize,
 }
 
+fn rtree_sqlite_module_args<'a>(args: &'a [&'a str]) -> Result<&'a [&'a str]> {
+    args.get(3..).ok_or_else(|| {
+        FrankenError::function_error(
+            "rtree factory requires SQLite argv: module, database, table, then module arguments",
+        )
+    })
+}
+
 fn parse_rtree_module_args(args: &[&str]) -> Result<ParsedRtreeModuleArgs> {
     if args.len() < 3 {
         return Err(FrankenError::function_error(
@@ -620,7 +628,7 @@ impl VirtualTable for RtreeVirtualTable {
     type Cursor = RtreeCursor;
 
     fn create(_cx: &Cx, args: &[&str]) -> Result<Self> {
-        Self::from_args(args, RtreeCoordType::Float32)
+        Self::from_args(rtree_sqlite_module_args(args)?, RtreeCoordType::Float32)
     }
 
     fn connect(cx: &Cx, args: &[&str]) -> Result<Self> {
@@ -995,7 +1003,7 @@ impl RtreeFactory {
 
 impl VtabModuleFactory for RtreeFactory {
     fn create(&self, _cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
-        let vtab = RtreeVirtualTable::from_args(args, self.coord_type)?;
+        let vtab = RtreeVirtualTable::from_args(rtree_sqlite_module_args(args)?, self.coord_type)?;
         Ok(Box::new(vtab))
     }
 
@@ -1004,7 +1012,10 @@ impl VtabModuleFactory for RtreeFactory {
     }
 
     fn column_info(&self, args: &[&str]) -> Vec<(String, char)> {
-        let Ok(parsed) = parse_rtree_module_args(args) else {
+        let Ok(module_args) = rtree_sqlite_module_args(args) else {
+            return Vec::new();
+        };
+        let Ok(parsed) = parse_rtree_module_args(module_args) else {
             return Vec::new();
         };
         parsed
@@ -2420,7 +2431,7 @@ mod tests {
     fn test_rtree_module_args_reject_incomplete_dimension_pair() {
         let cx = Cx::new();
         let factory = rtree_module_factory();
-        let err = match factory.create(&cx, &["id", "min_x"]) {
+        let err = match factory.create(&cx, &["rtree", "main", "spatial", "id", "min_x"]) {
             Ok(_) => panic!("incomplete rtree args should be rejected"),
             Err(err) => err,
         };
@@ -2922,8 +2933,10 @@ mod tests {
 
     #[test]
     fn test_rtree_factory_column_info_matches_coord_type() {
-        let float_columns =
-            rtree_module_factory().column_info(&["id", "min_x", "max_x", "min_y", "max_y"]);
+        let full_args = [
+            "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+        ];
+        let float_columns = rtree_module_factory().column_info(&full_args);
         assert_eq!(
             float_columns,
             vec![
@@ -2935,8 +2948,7 @@ mod tests {
             ]
         );
 
-        let int_columns =
-            rtree_i32_module_factory().column_info(&["id", "min_x", "max_x", "min_y", "max_y"]);
+        let int_columns = rtree_i32_module_factory().column_info(&full_args);
         assert_eq!(
             int_columns,
             vec![
@@ -2945,6 +2957,27 @@ mod tests {
                 ("max_x".to_owned(), 'D'),
                 ("min_y".to_owned(), 'D'),
                 ("max_y".to_owned(), 'D'),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rtree_factory_accepts_sqlite_full_argv() {
+        let cx = Cx::new();
+        let args = [
+            "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+        ];
+        let factory = rtree_module_factory();
+
+        assert!(factory.create(&cx, &args).is_ok());
+        assert_eq!(
+            factory.column_info(&args),
+            vec![
+                ("id".to_owned(), 'D'),
+                ("min_x".to_owned(), 'E'),
+                ("max_x".to_owned(), 'E'),
+                ("min_y".to_owned(), 'E'),
+                ("max_y".to_owned(), 'E'),
             ]
         );
     }

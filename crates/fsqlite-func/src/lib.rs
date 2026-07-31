@@ -238,9 +238,9 @@ pub type ErasedWindowFunction = dyn WindowFunction<State = Box<dyn Any + Send>>;
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct FunctionKey {
     /// Function name, stored as uppercase ASCII.
-    pub name: String,
+    name: String,
     /// Expected argument count, or `-1` for variadic.
-    pub num_args: i32,
+    num_args: i32,
 }
 
 impl FunctionKey {
@@ -251,6 +251,47 @@ impl FunctionKey {
             name: canonical_name(name),
             num_args,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FunctionArity {
+    min_args: i32,
+    max_args: Option<i32>,
+}
+
+impl FunctionArity {
+    fn for_key(key: &FunctionKey) -> Self {
+        if key.num_args >= 0 {
+            Self {
+                min_args: key.num_args,
+                max_args: Some(key.num_args),
+            }
+        } else {
+            Self {
+                min_args: 0,
+                max_args: None,
+            }
+        }
+    }
+
+    fn from_declared_bounds(
+        key: &FunctionKey,
+        min_args: i32,
+        max_args: Option<i32>,
+    ) -> Self {
+        if key.num_args >= 0 {
+            Self::for_key(key)
+        } else {
+            Self {
+                min_args,
+                max_args,
+            }
+        }
+    }
+
+    fn accepts(self, num_args: i32) -> bool {
+        num_args >= self.min_args && self.max_args.is_none_or(|max| num_args <= max)
     }
 }
 
@@ -266,8 +307,11 @@ impl FunctionKey {
 #[derive(Default)]
 pub struct FunctionRegistry {
     scalars: HashMap<FunctionKey, Arc<dyn ScalarFunction>>,
+    scalar_arities: HashMap<FunctionKey, FunctionArity>,
     aggregates: HashMap<FunctionKey, Arc<ErasedAggregateFunction>>,
+    aggregate_arities: HashMap<FunctionKey, FunctionArity>,
     windows: HashMap<FunctionKey, Arc<ErasedWindowFunction>>,
+    window_arities: HashMap<FunctionKey, FunctionArity>,
 }
 
 struct WrongArgCountScalarFunction {
@@ -411,8 +455,11 @@ impl FunctionRegistry {
     pub fn clone_from_arc(arc: &Arc<Self>) -> Self {
         Self {
             scalars: arc.scalars.clone(),
+            scalar_arities: arc.scalar_arities.clone(),
             aggregates: arc.aggregates.clone(),
+            aggregate_arities: arc.aggregate_arities.clone(),
             windows: arc.windows.clone(),
+            window_arities: arc.window_arities.clone(),
         }
     }
 
@@ -425,6 +472,49 @@ impl FunctionRegistry {
         F: ScalarFunction + 'static,
     {
         let key = FunctionKey::new(function.name(), function.num_args());
+        let (min_args, max_args) = if key.num_args >= 0 {
+            (key.num_args, Some(key.num_args))
+        } else {
+            (function.min_args(), function.max_args())
+        };
+        self.register_scalar_keyed_with_arity(key, min_args, max_args, function)
+    }
+
+    /// Register a scalar function under caller-precomputed identity.
+    ///
+    /// This variant never calls user metadata. It is intended for publication
+    /// paths that must capture `name()` and `num_args()` exactly once before
+    /// taking a registry snapshot, so a reentrant metadata callback cannot make
+    /// a stale clone overwrite a nested registration.
+    pub fn register_scalar_keyed<F>(
+        &mut self,
+        key: FunctionKey,
+        function: F,
+    ) -> Option<Arc<dyn ScalarFunction>>
+    where
+        F: ScalarFunction + 'static,
+    {
+        let arity = FunctionArity::for_key(&key);
+        self.scalar_arities.insert(key.clone(), arity);
+        self.scalars.insert(key, Arc::new(function))
+    }
+
+    /// Register a scalar function with caller-captured variadic bounds.
+    ///
+    /// No user metadata callback runs in this method. Fixed-arity keys always
+    /// use their exact key arity; bounds are only consulted for a `-1` key.
+    pub fn register_scalar_keyed_with_arity<F>(
+        &mut self,
+        key: FunctionKey,
+        min_args: i32,
+        max_args: Option<i32>,
+        function: F,
+    ) -> Option<Arc<dyn ScalarFunction>>
+    where
+        F: ScalarFunction + 'static,
+    {
+        let arity = FunctionArity::from_declared_bounds(&key, min_args, max_args);
+        self.scalar_arities.insert(key.clone(), arity);
         self.scalars.insert(key, Arc::new(function))
     }
 
@@ -437,6 +527,48 @@ impl FunctionRegistry {
         F::State: 'static,
     {
         let key = FunctionKey::new(function.name(), function.num_args());
+        let (min_args, max_args) = if key.num_args >= 0 {
+            (key.num_args, Some(key.num_args))
+        } else {
+            (function.min_args(), function.max_args())
+        };
+        self.register_aggregate_keyed_with_arity(key, min_args, max_args, function)
+    }
+
+    /// Register an aggregate function under caller-precomputed identity.
+    ///
+    /// Returns the displaced adapter, if any. No user metadata callback runs
+    /// here.
+    pub fn register_aggregate_keyed<F>(
+        &mut self,
+        key: FunctionKey,
+        function: F,
+    ) -> Option<Arc<ErasedAggregateFunction>>
+    where
+        F: AggregateFunction + 'static,
+        F::State: 'static,
+    {
+        let arity = FunctionArity::for_key(&key);
+        self.aggregate_arities.insert(key.clone(), arity);
+        self.aggregates
+            .insert(key, Arc::new(AggregateAdapter::new(function)))
+    }
+
+    /// Register an aggregate function with caller-captured variadic bounds.
+    /// No user metadata callback runs in this method.
+    pub fn register_aggregate_keyed_with_arity<F>(
+        &mut self,
+        key: FunctionKey,
+        min_args: i32,
+        max_args: Option<i32>,
+        function: F,
+    ) -> Option<Arc<ErasedAggregateFunction>>
+    where
+        F: AggregateFunction + 'static,
+        F::State: 'static,
+    {
+        let arity = FunctionArity::from_declared_bounds(&key, min_args, max_args);
+        self.aggregate_arities.insert(key.clone(), arity);
         self.aggregates
             .insert(key, Arc::new(AggregateAdapter::new(function)))
     }
@@ -450,8 +582,54 @@ impl FunctionRegistry {
         F::State: 'static,
     {
         let key = FunctionKey::new(function.name(), function.num_args());
-        self.windows
-            .insert(key, Arc::new(WindowAdapter::new(function)))
+        let (min_args, max_args) = if key.num_args >= 0 {
+            (key.num_args, Some(key.num_args))
+        } else {
+            (function.min_args(), function.max_args())
+        };
+        let (_, displaced) =
+            self.register_window_keyed_with_arity(key, min_args, max_args, function);
+        displaced
+    }
+
+    /// Register a window function under caller-precomputed identity.
+    ///
+    /// The returned first Arc is the newly inserted erased adapter; the second
+    /// is the displaced adapter, if any. No user metadata callback runs here.
+    pub fn register_window_keyed<F>(
+        &mut self,
+        key: FunctionKey,
+        function: F,
+    ) -> (Arc<ErasedWindowFunction>, Option<Arc<ErasedWindowFunction>>)
+    where
+        F: WindowFunction + 'static,
+        F::State: 'static,
+    {
+        let registered: Arc<ErasedWindowFunction> = Arc::new(WindowAdapter::new(function));
+        let arity = FunctionArity::for_key(&key);
+        self.window_arities.insert(key.clone(), arity);
+        let displaced = self.windows.insert(key, Arc::clone(&registered));
+        (registered, displaced)
+    }
+
+    /// Register a window function with caller-captured variadic bounds.
+    /// No user metadata callback runs in this method.
+    pub fn register_window_keyed_with_arity<F>(
+        &mut self,
+        key: FunctionKey,
+        min_args: i32,
+        max_args: Option<i32>,
+        function: F,
+    ) -> (Arc<ErasedWindowFunction>, Option<Arc<ErasedWindowFunction>>)
+    where
+        F: WindowFunction + 'static,
+        F::State: 'static,
+    {
+        let registered: Arc<ErasedWindowFunction> = Arc::new(WindowAdapter::new(function));
+        let arity = FunctionArity::from_declared_bounds(&key, min_args, max_args);
+        self.window_arities.insert(key.clone(), arity);
+        let displaced = self.windows.insert(key, Arc::clone(&registered));
+        (registered, displaced)
     }
 
     /// Look up a scalar function by `(name, num_args)`.
@@ -487,7 +665,12 @@ impl FunctionRegistry {
             num_args: -1,
         };
         if let Some(function) = self.scalars.get(&variadic) {
-            if function.accepts_arg_count(num_args) {
+            let arity = self
+                .scalar_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            if arity.accepts(num_args) {
                 debug!(name = %canonical, arity = num_args, kind = "scalar", hit = "variadic", "registry lookup");
                 return Some(Arc::clone(function));
             }
@@ -541,7 +724,12 @@ impl FunctionRegistry {
             num_args: -1,
         };
         if let Some(function) = self.aggregates.get(&variadic) {
-            if function.accepts_arg_count(num_args) {
+            let arity = self
+                .aggregate_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            if arity.accepts(num_args) {
                 debug!(name = %canonical, arity = num_args, kind = "aggregate", hit = "variadic", "registry lookup");
                 return Some(Arc::clone(function));
             }
@@ -585,7 +773,12 @@ impl FunctionRegistry {
             num_args: -1,
         };
         if let Some(function) = self.windows.get(&variadic) {
-            if function.accepts_arg_count(num_args) {
+            let arity = self
+                .window_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            if arity.accepts(num_args) {
                 debug!(name = %canon, arity = num_args, kind = "window", hit = "variadic", "registry lookup");
                 return Some(Arc::clone(function));
             }
@@ -647,16 +840,21 @@ impl FunctionRegistry {
             name: canon.clone(),
             num_args,
         };
-        if let Some(function) = self.scalars.get(&exact) {
-            return Some(function.accepts_arg_count(num_args));
+        if self.scalars.contains_key(&exact) {
+            return Some(true);
         }
 
         let variadic = FunctionKey {
             name: canon.clone(),
             num_args: -1,
         };
-        if let Some(function) = self.scalars.get(&variadic) {
-            return Some(function.accepts_arg_count(num_args));
+        if self.scalars.contains_key(&variadic) {
+            let arity = self
+                .scalar_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            return Some(arity.accepts(num_args));
         }
 
         self.scalars
@@ -677,16 +875,21 @@ impl FunctionRegistry {
             name: canon.clone(),
             num_args,
         };
-        if let Some(function) = self.aggregates.get(&exact) {
-            return Some(function.accepts_arg_count(num_args));
+        if self.aggregates.contains_key(&exact) {
+            return Some(true);
         }
 
         let variadic = FunctionKey {
             name: canon.clone(),
             num_args: -1,
         };
-        if let Some(function) = self.aggregates.get(&variadic) {
-            return Some(function.accepts_arg_count(num_args));
+        if self.aggregates.contains_key(&variadic) {
+            let arity = self
+                .aggregate_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            return Some(arity.accepts(num_args));
         }
 
         self.aggregates
@@ -708,16 +911,21 @@ impl FunctionRegistry {
             name: canon.clone(),
             num_args,
         };
-        if let Some(function) = self.windows.get(&exact) {
-            return Some(function.accepts_arg_count(num_args));
+        if self.windows.contains_key(&exact) {
+            return Some(true);
         }
 
         let variadic = FunctionKey {
             name: canon.clone(),
             num_args: -1,
         };
-        if let Some(function) = self.windows.get(&variadic) {
-            return Some(function.accepts_arg_count(num_args));
+        if self.windows.contains_key(&variadic) {
+            let arity = self
+                .window_arities
+                .get(&variadic)
+                .copied()
+                .unwrap_or_else(|| FunctionArity::for_key(&variadic));
+            return Some(arity.accepts(num_args));
         }
 
         self.windows
@@ -840,6 +1048,114 @@ mod tests {
     use fsqlite_types::SqliteValue;
 
     use super::*;
+
+    #[test]
+    fn keyed_registration_never_reinvokes_user_metadata() {
+        struct MetadataPanicsScalar;
+
+        impl ScalarFunction for MetadataPanicsScalar {
+            fn invoke(&self, _args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(1))
+            }
+
+            fn num_args(&self) -> i32 {
+                panic!("keyed scalar registration must not ask for arity")
+            }
+
+            fn name(&self) -> &str {
+                panic!("keyed scalar registration must not ask for name")
+            }
+        }
+
+        struct MetadataPanicsAggregate;
+
+        impl AggregateFunction for MetadataPanicsAggregate {
+            type State = ();
+
+            fn initial_state(&self) -> Self::State {}
+
+            fn step(
+                &self,
+                _state: &mut Self::State,
+                _args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn finalize(&self, _state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(1))
+            }
+
+            fn num_args(&self) -> i32 {
+                panic!("keyed aggregate registration must not ask for arity")
+            }
+
+            fn name(&self) -> &str {
+                panic!("keyed aggregate registration must not ask for name")
+            }
+        }
+
+        struct MetadataPanicsWindow;
+
+        impl WindowFunction for MetadataPanicsWindow {
+            type State = ();
+
+            fn initial_state(&self) -> Self::State {}
+
+            fn step(
+                &self,
+                _state: &mut Self::State,
+                _args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn inverse(
+                &self,
+                _state: &mut Self::State,
+                _args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn value(&self, _state: &Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(1))
+            }
+
+            fn finalize(&self, _state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(1))
+            }
+
+            fn num_args(&self) -> i32 {
+                panic!("keyed window registration must not ask for arity")
+            }
+
+            fn name(&self) -> &str {
+                panic!("keyed window registration must not ask for name")
+            }
+        }
+
+        let mut registry = FunctionRegistry::new();
+        let scalar_displaced = registry
+            .register_scalar_keyed(FunctionKey::new("keyed_scalar", 0), MetadataPanicsScalar);
+        assert!(scalar_displaced.is_none());
+        assert!(registry.find_scalar("keyed_scalar", 0).is_some());
+
+        let aggregate_displaced = registry.register_aggregate_keyed(
+            FunctionKey::new("keyed_aggregate", 0),
+            MetadataPanicsAggregate,
+        );
+        assert!(aggregate_displaced.is_none());
+        assert!(registry.find_aggregate("keyed_aggregate", 0).is_some());
+
+        let (window, window_displaced) = registry
+            .register_window_keyed(FunctionKey::new("keyed_window", 0), MetadataPanicsWindow);
+        assert!(window_displaced.is_none());
+        assert!(Arc::ptr_eq(
+            &window,
+            &registry.find_window("keyed_window", 0).unwrap()
+        ));
+    }
 
     fn runtime_registry_surface_keys() -> BTreeSet<(BuiltinFunctionFamily, String, i32)> {
         let mut registry = FunctionRegistry::new();
