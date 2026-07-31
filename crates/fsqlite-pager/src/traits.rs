@@ -1581,6 +1581,40 @@ impl TransactionKind {
             Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => 0,
         }
     }
+
+    /// The fixed database-size bound captured by this transaction's pager
+    /// snapshot. Mock and drained variants do not expose a pager snapshot and
+    /// return 0 so callers can use an explicitly validated fallback.
+    #[must_use]
+    pub fn snapshot_db_size(&self) -> u32 {
+        match self {
+            Self::Memory(txn) => txn.snapshot_db_size(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(txn) => txn.snapshot_db_size(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(txn) => txn.snapshot_db_size(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(txn) => txn.snapshot_db_size(),
+            Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => 0,
+        }
+    }
+
+    /// Largest page visible through the fixed snapshot plus pages issued or
+    /// staged by this transaction. Mock and drained variants return 0 so
+    /// callers can use an explicitly validated fallback.
+    #[must_use]
+    pub fn visible_db_size_bound(&self) -> u32 {
+        match self {
+            Self::Memory(txn) => txn.visible_db_size_bound(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(txn) => txn.visible_db_size_bound(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(txn) => txn.visible_db_size_bound(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(txn) => txn.visible_db_size_bound(),
+            Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => 0,
+        }
+    }
 }
 
 macro_rules! dispatch_transaction_kind {

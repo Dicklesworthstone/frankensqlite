@@ -5953,6 +5953,7 @@ struct PendingGroupCommitTxnAttempt<F: VfsFile> {
     committed_db_size: u32,
     mode: TransactionMode,
     is_writer: bool,
+    staged_page_high_water: u32,
     allocator_delta: PendingGroupCommitAllocatorDelta,
     phase_a_undo: PhaseAWriteSetUndo,
     state: Mutex<PendingGroupCommitTxnAttemptState>,
@@ -5971,6 +5972,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
         committed_db_size: u32,
         mode: TransactionMode,
         is_writer: bool,
+        staged_page_high_water: u32,
         returned_allocations: PendingReturnedAllocations,
         pending_freed_pages: Vec<PageNumber>,
         live_committed_allocations: Vec<PageNumber>,
@@ -5991,6 +5993,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
             committed_db_size,
             mode,
             is_writer,
+            staged_page_high_water,
             allocator_delta,
             phase_a_undo: PhaseAWriteSetUndo::default(),
             state: Mutex::new(PendingGroupCommitTxnAttemptState {
@@ -6065,6 +6068,17 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
         self.inner.lock().map_or(self.committed_db_size, |inner| {
             self.projected_db_size_with_inner(&inner)
         })
+    }
+
+    fn transaction_visible_db_size_bound(&self, snapshot_db_size: u32) -> u32 {
+        self.allocator_delta
+            .live_committed_allocations
+            .iter()
+            .map(|page| page.get())
+            .max()
+            .unwrap_or(snapshot_db_size)
+            .max(snapshot_db_size)
+            .max(self.staged_page_high_water)
     }
 
     fn projected_live_freelist(&self) -> Vec<PageNumber> {
@@ -14807,6 +14821,49 @@ where
         })
     }
 
+    /// Database size captured by this transaction's currently published
+    /// snapshot.
+    ///
+    /// Unlike [`Self::live_db_size`], this does not consult mutable pager
+    /// state and therefore cannot widen a read transaction's page-visibility
+    /// bound after a concurrent commit.
+    #[must_use]
+    pub fn snapshot_db_size(&self) -> u32 {
+        self.published_db_size.get()
+    }
+
+    fn staged_page_high_water(&self, floor: u32) -> u32 {
+        self.write_set
+            .keys()
+            .map(|page| page.get())
+            .max()
+            .unwrap_or(floor)
+            .max(floor)
+    }
+
+    /// Largest page that can be visible through this transaction.
+    ///
+    /// This starts at the fixed snapshot bound and includes only pages issued
+    /// or staged by this transaction. It deliberately excludes the pager's
+    /// mutable global database size, which may advance after an unrelated
+    /// concurrent commit, and excludes unused page-lease reservations.
+    #[must_use]
+    pub fn visible_db_size_bound(&self) -> u32 {
+        if let Some(attempt) = &self.pending_group_commit_attempt {
+            return attempt.transaction_visible_db_size_bound(self.snapshot_db_size());
+        }
+        let snapshot_db_size = self.snapshot_db_size();
+        self.allocated_from_eof
+            .iter()
+            .chain(self.allocated_from_freelist.iter())
+            .chain(self.write_set.keys())
+            .filter(|page| !self.contains_freed_page(**page))
+            .map(|page| page.get())
+            .max()
+            .unwrap_or(snapshot_db_size)
+            .max(snapshot_db_size)
+    }
+
     #[must_use]
     fn freelist_metadata_dirty_with_inner(
         &self,
@@ -18238,6 +18295,8 @@ where
                 pending_freed = std::mem::take(&mut self.freed_pages);
                 self.freed_page_bounds = None;
                 if self.journal_mode == JournalMode::Wal {
+                    let staged_page_high_water =
+                        self.staged_page_high_water(self.snapshot_db_size());
                     let live_committed_allocations = self
                         .allocated_from_freelist
                         .iter()
@@ -18256,6 +18315,7 @@ where
                         committed_db_size,
                         self.mode,
                         self.is_writer,
+                        staged_page_high_water,
                         std::mem::take(&mut returned_allocations),
                         std::mem::take(&mut pending_freed),
                         live_committed_allocations,
@@ -18843,6 +18903,8 @@ where
                 let wal_page1_plan =
                     self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
                 if self.journal_mode == JournalMode::Wal {
+                    let staged_page_high_water =
+                        self.staged_page_high_water(self.snapshot_db_size());
                     let live_committed_allocations = self
                         .allocated_from_freelist
                         .iter()
@@ -18861,6 +18923,7 @@ where
                         committed_db_size,
                         self.mode,
                         self.is_writer,
+                        staged_page_high_water,
                         std::mem::take(&mut returned_allocations),
                         std::mem::take(&mut pending_freed),
                         live_committed_allocations,
@@ -20478,11 +20541,24 @@ mod tests {
     }
 
     #[test]
-    fn pending_group_commit_attempt_fences_transaction_introspection() {
+    fn pending_group_commit_attempt_visible_bound_fences_transaction_introspection() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;
             let cx = Cx::new();
             let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let snapshot_db_size = txn.snapshot_db_size();
+            let owned_page = PageNumber::new(snapshot_db_size + 1).unwrap();
+            let staged_page = PageNumber::new(snapshot_db_size + 2).unwrap();
+            let unrelated_global_size = snapshot_db_size + 3;
+            txn.write_page(&cx, staged_page, &sample_page(0x6D))
+                .await
+                .unwrap();
+            let staged_page_high_water = txn.staged_page_high_water(snapshot_db_size);
+            assert_eq!(staged_page_high_water, staged_page.get());
+            txn.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .db_size = unrelated_global_size;
             let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
                 &txn.group_commit_queue,
                 Arc::clone(&txn.inner),
@@ -20494,13 +20570,21 @@ mod tests {
                 txn.original_db_size,
                 txn.mode,
                 txn.is_writer,
+                staged_page_high_water,
                 PendingReturnedAllocations::default(),
                 Vec::new(),
-                Vec::new(),
+                vec![owned_page],
             ));
             txn.pending_group_commit_attempt = Some(attempt);
 
             assert!(txn.has_pending_writes());
+            assert_eq!(txn.snapshot_db_size(), snapshot_db_size);
+            assert_eq!(txn.live_db_size(), unrelated_global_size);
+            assert_eq!(
+                txn.visible_db_size_bound(),
+                staged_page.get(),
+                "a pending attempt may widen its fixed snapshot for its own live allocation or staged page"
+            );
             assert_eq!(txn.published_visible_commit_seq_hint(), None);
             assert!(matches!(
                 txn.pending_commit_pages(),
@@ -20557,6 +20641,7 @@ mod tests {
                 txn.original_db_size,
                 txn.mode,
                 txn.is_writer,
+                txn.snapshot_db_size(),
                 PendingReturnedAllocations::default(),
                 Vec::new(),
                 Vec::new(),
@@ -20628,6 +20713,7 @@ mod tests {
                 txn.original_db_size,
                 txn.mode,
                 txn.is_writer,
+                txn.snapshot_db_size(),
                 PendingReturnedAllocations::default(),
                 Vec::new(),
                 vec![committed_page],
@@ -20692,6 +20778,7 @@ mod tests {
                 txn.original_db_size,
                 txn.mode,
                 txn.is_writer,
+                txn.snapshot_db_size(),
                 PendingReturnedAllocations::default(),
                 Vec::new(),
                 Vec::new(),
@@ -36958,18 +37045,28 @@ mod tests {
             seed.commit(&cx).await.unwrap();
 
             let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
-            let captured_db_size = reader.published_db_size.get();
+            let captured_db_size = reader.snapshot_db_size();
             let captured_commit_seq = reader.published_visible_commit_seq.get();
             assert_eq!(captured_db_size, baseline_page.get());
 
             let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
             let later_page = writer.allocate_page(&cx).await.unwrap();
+            assert_eq!(writer.visible_db_size_bound(), later_page.get());
             writer
                 .write_page(&cx, later_page, &vec![0xAA; ps])
                 .await
                 .unwrap();
             writer.commit(&cx).await.unwrap();
             assert!(later_page.get() > captured_db_size);
+            assert!(
+                reader.live_db_size() > reader.snapshot_db_size(),
+                "the mutable live extent must not be mistaken for the reader's fixed snapshot bound"
+            );
+            assert_eq!(
+                reader.visible_db_size_bound(),
+                reader.snapshot_db_size(),
+                "an unrelated commit must not widen the reader-visible bound"
+            );
 
             let error = reader
                 .get_page(&cx, later_page)
@@ -36980,7 +37077,7 @@ mod tests {
                 "expected a fixed-snapshot refusal, got {error}"
             );
             assert_eq!(
-                reader.published_db_size.get(),
+                reader.snapshot_db_size(),
                 captured_db_size,
                 "get_page must not expand the reader's captured db_size"
             );
@@ -36990,6 +37087,33 @@ mod tests {
                 "get_page must not advance the reader's captured commit sequence"
             );
             reader.commit(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn transaction_visible_bound_excludes_an_allocation_freed_before_reload() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let snapshot_db_size = txn.snapshot_db_size();
+            let allocated = txn.allocate_page(&cx).await.unwrap();
+
+            assert!(allocated.get() > snapshot_db_size);
+            assert_eq!(txn.visible_db_size_bound(), allocated.get());
+            txn.free_page(&cx, allocated).await.unwrap();
+            assert_eq!(
+                txn.visible_db_size_bound(),
+                snapshot_db_size,
+                "a freed transaction-owned page must not widen the catalog root bound"
+            );
+            assert!(
+                !txn.live_freelist_pages().contains(&allocated),
+                "a returned EOF allocation above the committed extent is fenced by the visible \
+                 bound, not exposed as a durable freelist page"
+            );
+
+            txn.rollback(&cx).await.unwrap();
         });
     }
 
