@@ -39,7 +39,10 @@ After admission, every authoritative main read or write must use the admitted ha
 
 Canonical sibling spelling does not prove that a pre-existing WAL or journal belongs to the admitted main generation. The owner contract must establish generation membership at admission and preserve it by protocol:
 
-- existing recovery-bearing artifacts are discovered, securely opened, and validated before the admission linearization point;
+- absence of recovery-bearing sidecars is a valid clean bootstrap;
+- a pre-existing recovery-bearing artifact is admitted only by an enumerated artifact-specific rule that binds it to the exact main state;
+- canonical name, format, checksum, page-size, or replay compatibility alone are not provenance;
+- cooperating publication routes cannot rewrite or replace the main while a generation authority is live;
 - cooperating generation transitions cannot publish a replacement main while stale or ambiguous recovery artifacts remain;
 - sidecars created or rotated after admission are created only through the retained generation authority; and
 - ambiguity causes typed refusal before database effects.
@@ -59,7 +62,7 @@ The API must not claim universal hostile namespace ownership. Environments requi
 
 ### Live main-generation replacement
 
-A connection that retains generation A cannot silently continue after an operation publishes replacement generation B at the canonical path. The first contract must refuse generation-replacing operations, including database-image publication through the generation-bound connection, before replacement effects. A future separately decided protocol may atomically rotate the complete generation authority.
+A connection that retains generation A cannot silently continue after an operation publishes or rewrites the main image, even when the file identity remains unchanged. Every cooperative publication route—including weaker connection and pager entrypoints—must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. The first contract must refuse publication invoked through a generation-bound connection before effects. A future separately decided protocol may atomically rotate the complete generation authority.
 
 ### Artifact coverage
 
@@ -125,7 +128,7 @@ Admission linearizes only after:
 5. final cooperative generation validation; and
 6. construction of one retained database-generation authority.
 
-Recovery and other database effects occur only after linearization. Failure after potentially durable effects begins must not be reported as an ordinary pre-effect refusal.
+Recovery and other database effects occur only after linearization. Outcomes have three semantic classes: pre-effect refusal, definite completion at the operation's declared durability boundary, or indeterminate effect when database/recovery effects may have begun but completion cannot be established. Indeterminate effects must not be reported as ordinary refusal, and crash recovery must converge to a valid pre-operation or completed post-operation state idempotently.
 
 ## Non-solutions
 
@@ -147,8 +150,10 @@ A reviewed owner contract must prove, for each explicitly supported backend and 
 
 - authoritative main I/O descends from the admitted main handle;
 - cooperative sidecar membership is established at admission or by generation-owned creation;
+- cooperative publication is excluded namespace-wide while a generation authority is live;
 - cooperative generation replacement cannot leave stale artifacts attributed to the new main;
+- pre-existing recovery artifacts without an exact owner binding rule refuse before recovery;
 - unsupported artifact families, filesystems, aliases, and replacement operations refuse before database effects;
 - raw-mutation claims are limited to guarantees the platform can actually provide;
 - concurrent-writer behavior remains enabled with objective overlap evidence; and
-- the exact downstream Agent Kernel pin invokes the conforming constructor before task 4195 receives explicit return authorization.
+- every authoritative Agent Kernel task-4195 execution, readback, and receipt descends exclusively from the conforming constructor, with no weaker fallback, before explicit return authorization.

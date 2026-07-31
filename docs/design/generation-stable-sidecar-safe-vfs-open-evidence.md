@@ -79,6 +79,8 @@ Decision 87's first review closure was superseded by a deeper adversarial pass:
 | API/governance | `asc://dispatch-1785506353764` | Public construction and weaker entrypoints could make conformance toothless |
 | Adversarial synthesis | `asc://dispatch-1785506674823` | Outcome `revise_rfc`; retained-main direction survives, sidecar and transition contract does not |
 
+Round-2 review of packet commit `fbf8f71cc7543259cdacc2b8868cb23dce4d19d9` produced two `ready_for_adr` lanes and three `revise_rfc` lanes. Controlling synthesis `asc://dispatch-1785507796599` preserved `revise_rfc` for four bounded corrections: namespace-wide publication exclusion, an explicit untagged-sidecar bootstrap rule, three-state effect semantics, and exclusive downstream result lineage.
+
 ## Falsifying schedules
 
 ### Raw sidecar substitution
@@ -108,6 +110,24 @@ All participants can obey the namespace protocol while provenance remains wrong.
 
 The first contract must refuse step 2 before effect or atomically rotate the entire generation authority.
 
+### Untagged sidecar false provenance
+
+1. Create main A and unrelated main B with compatible page size and database shape.
+2. Leave a structurally valid recovery-bearing artifact from B at A's canonical sidecar name.
+3. Admit it using canonical name, checksum, format, and replay compatibility alone.
+4. Replay B's state into A.
+
+The revised bootstrap rule requires an enumerated artifact-specific exact binding witness or pre-effect `SidecarProvenanceAmbiguous` refusal. Structural validity alone cannot pass.
+
+### Weaker-peer publication bypass
+
+1. A strong connection retains a generation authority for A.
+2. A cooperative peer enters through a weaker constructor.
+3. The peer attempts an in-place main-image rewrite or validated-image publication that preserves file identity.
+4. The strong connection resumes with stale caches or artifact state.
+
+Every cooperative publication entrypoint must acquire a namespace-wide exclusive gate that conflicts with the strong lifetime lease. Constructor conformance and publication exclusion are separate properties.
+
 ## Required proof matrix
 
 | Proof | Required injection or observation | Pass condition |
@@ -118,11 +138,12 @@ The first contract must refuse step 2 before effect or atomically rotate the ent
 | Cooperative stale sidecar | Leave each recovery-bearing artifact across a legal A-to-B transition | Transition retires/adopts it under the selected rule or refuses before publishing B |
 | Raw main replacement | Replace A with B and restore A at deterministic hooks | Already-open authoritative main I/O stays on A; claims do not exceed checked-boundary detection |
 | Raw sidecar replacement | Swap every supported sidecar between validation, existence check, open/create, and effect | Proved ownership profile prevents it, or the backend/threat mode is explicitly outside the strong guarantee |
-| WAL/SHM | Exercise non-empty WAL, SHM, append, checkpoint, restart, and recovery | Admitted/created artifacts remain in the cooperative generation domain with canonical names |
-| Rollback journal | Exercise hot and non-hot journal recovery | Journal membership is admitted before recovery; ambiguity refuses before replay |
+| Sidecar bootstrap | Present absent, exactly bound, structurally valid but unrelated, and unbound recovery artifacts | Clean or explicitly bound artifacts admit; every unbound artifact returns pre-effect provenance refusal |
+| WAL/SHM | Exercise non-empty WAL, SHM, append, checkpoint, restart, and recovery only where an exact binding rule is selected | Admitted/created artifacts remain in the cooperative generation domain; otherwise pre-existing recovery state refuses |
+| Rollback journal | Exercise hot and non-hot journal inputs | Recovery runs only with an exact binding witness; canonical/format-valid ambiguity refuses before replay |
 | Auxiliary artifacts | Enable WAL-FEC, DB-FEC, MVCC history/witness, and parallel-WAL separately | Each uses the authority or returns typed unsupported before effects |
 | Post-return main reads | Force WAL refresh, export, copy, checkpoint support, and header/conflict reads | No path selects a new authoritative main handle |
-| Main publication | Invoke VACUUM and every validated-image publication route | First-slice generation-bound connection refuses before replacement effects |
+| Main publication | Invoke VACUUM and every validated-image/in-place publication route through strong, weak, pager, compatibility, async, and C entrypoints | A strong connection refuses its own publication before effects; every peer route is excluded while any generation authority is live |
 | Alias handling | Exercise symlink, hard-link, reparse, mount/path alias, case, and relative-path inputs | Supported profiles prove secure admission; ambiguous inputs refuse |
 | Parent replacement | Replace a parent between canonicalization and sidecar acquisition | No universal prevention claim; stronger profiles prove directory authority, otherwise threat limitation is explicit |
 | Filesystem qualification | Run on local qualified filesystems and representative remote/virtual filesystems | Unknown or unproved filesystems refuse exact mode rather than silently weakening it |
@@ -131,18 +152,18 @@ The first contract must refuse step 2 before effect or atomically rotate the ent
 | Memory/custom VFS | Exercise supported and identity-less implementations | Process-local semantics are explicit; unsupported backends refuse |
 | Temporary databases | Pass unnamed and named temporary inputs | Unnamed inputs are inapplicable; named support is claimed only with backend proof |
 | Concurrent writers | Instrument overlapping disjoint-page write transactions and durability phases | Objective overlap exists; no global serialization or default-off MVCC fallback |
-| Failure injection | Fail admission, sidecar open, bind, recovery, sync, validation, cleanup, and close | No false pre-effect success, leaked lease, or ordinary refusal after indeterminate effects |
-| Crash state | Crash at every recovery/publication cut and crash again during recovery | Result is exact allowed pre-state or committed post-state; recovery is idempotent |
+| Failure injection | Fail admission, sidecar open, bind, recovery, sync, validation, cleanup, and close | Outcome is pre-effect refusal, definite completion, or indeterminate effect; no class is mislabeled |
+| Crash state | Crash at every recovery/publication cut and crash again during recovery | Recovery converges to a declared valid pre-operation or completed post-operation state and is idempotent |
 | API conformance | Exercise every public writable existing-open entrypoint | Only the exact generation-bound symbol claims this contract; weaker APIs remain visibly non-conforming |
-| Consumer return gate | Evaluate the exact dependency revision, features, and call path in Agent Kernel | Task 4195 invokes the conforming symbol, passes owner/consumer proof, and receives explicit return authorization |
+| Consumer return gate | Evaluate the exact dependency revision, features, and full result lineage in Agent Kernel | Every authoritative task-4195 execution, readback, and receipt descends exclusively from the conforming constructor with no weak fallback before explicit return authorization |
 
 ## Evidence still required before implementation acceptance
 
-1. A reviewed decision on sidecar admission and cooperative transition cleanup.
+1. Artifact-specific exact-binding rules, or deterministic pre-effect refusal, for every pre-existing recovery family claimed by the first implementation.
 2. A complete artifact classification for every feature reachable from the generation-bound constructor.
-3. A typed error/effect taxonomy.
+3. Concrete typed errors implementing the selected three-state effect semantics.
 4. Qualified platform and filesystem profiles.
-5. Deterministic handle-lineage and sidecar-race instrumentation.
-6. An exact immutable downstream dependency and call-path receipt.
+5. Deterministic handle-lineage, publication-gate, and sidecar-race instrumentation.
+6. An exact immutable downstream dependency and exclusive result-lineage receipt.
 
 These are proof requirements, not evidence that implementation already exists.

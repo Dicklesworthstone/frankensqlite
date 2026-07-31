@@ -7,7 +7,7 @@ type: "rfc"
 
 # RFC: Generation-Stable, Sidecar-Proven Existing-Runtime Open
 
-**Status:** Revised after adversarial review; proposed for re-review
+**Status:** Revised after round-2 synthesis; proposed for re-review
 **Date:** 2026-07-31
 **Owner issue:** [frankensqlite#308](https://github.com/Dicklesworthstone/frankensqlite/issues/308)
 **Decision:** Agent Kernel decision 87
@@ -34,7 +34,7 @@ Connection::open_existing_generation_bound(path, options)
 
 Capability construction and consumption remain crate-private and sealed. Pager/connection construction consumes authority issued by this constructor without independently reopening the main file by pathname.
 
-The first implementation refuses operations that replace the canonical main generation while the connection remains live. Atomic live generation-authority rotation is a separate future decision.
+The first implementation refuses operations that replace the canonical main generation while the connection remains live. Every cooperative publication route, including weaker connection and pager entrypoints, must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. Atomic live generation-authority rotation is a separate future decision.
 
 This RFC decides architecture only. It does not authorize implementation, release, pin rotation, downstream integration, task-4195 resumption, or activation.
 
@@ -197,18 +197,29 @@ A failure before step 12 is a typed pre-effect refusal except for explicitly doc
 
 Generation membership is established at the admission linearization point; it is not inferred merely from historical creation or canonical spelling.
 
+The bootstrap rule is fail-closed:
+
+1. absence of recovery-bearing sidecars is a valid clean bootstrap;
+2. a pre-existing recovery-bearing sidecar is admissible only when an explicitly enumerated, artifact-specific owner rule unambiguously binds it to the exact admitted main state;
+3. canonical spelling, format validity, checksum validity, page-size compatibility, or replay compatibility alone do not establish that binding; and
+4. every other pre-existing recovery-bearing sidecar causes typed `SidecarProvenanceAmbiguous` refusal before recovery effects.
+
+The first implementation must enumerate each admissible artifact rule. If no exact binding rule exists for an artifact family, the strong constructor supports only its clean/quiescent case and proves refusal of its pre-existing recovery state.
+
 For every enabled artifact family:
 
 - all pre-existing recovery-bearing artifacts must be discovered before linearization;
-- each must be securely opened and validated against the admitted database state using owner-native format and recovery rules;
-- the opened object and its role enter `GenerationSidecarSet`; and
+- each admitted artifact must satisfy its enumerated exact-binding rule;
+- the opened object, binding witness, and role enter `GenerationSidecarSet`; and
 - an artifact whose membership cannot be established causes refusal before recovery.
 
 A sidecar not present at linearization may later be created only through the authority's resolver while the cooperative namespace binding remains active. A later pre-existing artifact discovered outside an authority-governed create/rotate path is ambiguous and must not be adopted silently.
 
 ### Generation transition invariant
 
-A cooperative transition from main generation A to B may publish B only after it holds the exclusive transition authority and has one of the following outcomes for every A recovery-bearing artifact:
+Every cooperative route capable of publishing or rewriting a main image must acquire the same namespace-wide exclusive publication authority. This includes ordinary and expected-identity connections, pager-level APIs, compatibility/async/C entrypoints, VACUUM paths, and any internal validated-image publication path. Weaker APIs may remain non-conforming for exact admission, but they cannot bypass a live generation authority. Publication may proceed only when no generation authority holds the conflicting lifetime lease.
+
+A cooperative transition from main generation A to B—or an in-place main-image rewrite that preserves file identity—may publish only after it holds that exclusive authority and has one of the following outcomes for every recovery-bearing artifact:
 
 1. cleanly drained and retired;
 2. explicitly transferred through an owner-proved transition operation; or
@@ -256,9 +267,9 @@ Platform-required identity probes are observational only. Their types and owners
 
 The first generation-bound contract does not rotate authority.
 
-Any operation that would replace or publish a different main-file generation at the canonical path—including validated database-image publication from the live connection—must return a typed `GenerationRotationUnsupported` or equivalent before replacement effects.
+Any operation invoked through a generation-bound connection that would replace, republish, or rewrite the authoritative main image—including validated database-image publication and in-place publication that preserves file identity—must return a typed `GenerationRotationUnsupported` or equivalent before replacement effects.
 
-The refusal applies only to the generation-bound constructor. Existing weaker constructors retain their separately documented behavior and cannot claim Decision-87 conformance.
+Every cooperative publication route, including routes entered through weaker constructors or pager APIs, must first acquire the namespace-wide exclusive publication authority. That acquisition conflicts with every live generation authority. A weaker connection may retain its separately documented publication behavior only when no generation-bound authority is live; it cannot publish around the strong contract.
 
 A future rotation protocol must atomically replace main handle, identity, namespace binding, admitted sidecar state, WAL backend, pager caches, and every dependent lease. It requires a separate decision and proof matrix.
 
@@ -333,6 +344,14 @@ A raw-actor test passes by demonstrating only the guarantee claimed by its profi
 
 ## Error contract
 
+Every admission, recovery, and publication outcome belongs to one of three semantic classes:
+
+1. **Pre-effect refusal:** no database or recovery effect began; documented coordination-only admission effects may have occurred.
+2. **Definite completion:** the operation reached its defined completion and durability boundary and may return success.
+3. **Indeterminate effect:** database or recovery effects may have begun but completion or durability cannot be established; this must never be reported as an ordinary open refusal.
+
+After crash or cancellation, recovery must converge to an explicitly allowed valid pre-operation state or completed post-operation state and remain idempotent across repeated interruption. Exact error variant names and injection cuts remain implementation choices, but the three semantic classes do not.
+
 The implementation must expose typed distinctions for at least:
 
 - unsupported backend/filesystem profile;
@@ -343,7 +362,7 @@ The implementation must expose typed distinctions for at least:
 - unsupported artifact family or feature combination;
 - live generation rotation unsupported;
 - pre-effect admission refusal; and
-- failure after potentially durable or recovery effects began.
+- indeterminate effect after database or recovery work may have begun.
 
 Generic `CannotOpen` is not sufficient for these contract boundaries.
 
@@ -356,18 +375,18 @@ Implementation acceptance requires:
 3. cooperative A/B/A exclusion for the authority lifetime;
 4. stale-sidecar A-to-B transition tests for every enabled artifact family;
 5. raw main and sidecar replacement schedules with claims limited to the active backend profile;
-6. non-empty WAL/SHM, rollback recovery, checkpoint, restart, and crash proof;
+6. non-empty WAL/SHM and rollback recovery only for artifact families with an enumerated exact-binding rule; otherwise deterministic pre-effect provenance refusal;
 7. coverage of WAL-FEC, DB-FEC, MVCC history/witness, and parallel-WAL or typed unsupported refusal;
 8. post-return WAL refresh, export, copy, and auxiliary-read proof;
-9. pre-effect refusal of live main-generation publication;
+9. namespace-wide exclusion of every cooperative publication route while any generation authority is live, plus pre-effect refusal when publication is invoked through the strong connection;
 10. symlink, hard-link, reparse, parent, and filesystem-profile tests;
 11. actual io_uring submission/completion proof separate from fallback;
 12. Windows probe non-authority and weak-identity profile tests;
 13. typed refusal for unnamed temporary and unsupported VFS inputs;
 14. objective concurrent-writer overlap with no serialized fallback;
-15. crash/failure injection with exact allowed-state and effect-aware error oracles;
-16. a public API conformance matrix proving weaker entrypoints do not inherit the claim; and
-17. exact downstream Agent Kernel dependency, feature, and call-path validation.
+15. crash/failure injection with exact pre-operation, completed post-operation, and indeterminate-effect oracles;
+16. a public API conformance matrix proving weaker entrypoints do not inherit admission conformance or bypass namespace-wide publication exclusion; and
+17. exact downstream Agent Kernel dependency, feature, and exclusive result-lineage validation proving that every authoritative task-4195 execution, readback, and receipt descends from the conforming constructor with no weaker fallback.
 
 ## Migration and compatibility
 
@@ -398,9 +417,7 @@ After downstream adoption, rollback requires consumers to return to fail-closed 
 
 ## Open review questions
 
-1. Is admission-time sidecar membership plus transition-time retirement sufficient without durable generation tags?
-2. Which existing artifact families can be safely admitted in the first implementation, and which must refuse?
-3. Which local filesystem profiles qualify on Unix and Windows?
-4. Which coordination records are genuinely generation-independent?
-5. What exact typed error boundary represents failure after recovery effects begin?
-6. Should a future authority-rotation protocol be pursued, or should generation-bound connections remain permanently non-rotating?
+1. Which artifact families have an exact owner binding rule in the first implementation, and which clean/quiescent cases must refuse pre-existing recovery state?
+2. Which local filesystem profiles qualify on Unix and Windows?
+3. Which coordination records are genuinely generation-independent?
+4. Should a future authority-rotation protocol be pursued, or should generation-bound connections remain permanently non-rotating?
