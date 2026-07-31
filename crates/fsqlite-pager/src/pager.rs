@@ -14278,6 +14278,8 @@ impl StagedPage {
 /// batches increase lock contention on write-heavy workloads.
 const PAGE_LEASE_BATCH_SIZE: u32 = 8;
 
+// Dirty shared-cache buffers must never be reclaimed by raw writeback here,
+// because that would bypass rollback-journal/WAL durability and MVCC publication.
 fn acquire_page_buf_with_clean_cache_recovery(
     pool: &PageBufPool,
     cache: &ShardedPageCache,
@@ -20871,57 +20873,93 @@ mod tests {
     }
 
     #[test]
-    fn gh_131_write_stage_reports_capacity_without_evicting_dirty_cache_page() {
+    fn gh_131_write_stage_never_flushes_dirty_cache_page_to_main_db() {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
-            let pager = SimplePager::open_with_cx_and_page_buffer_max(
-                &cx,
-                MemoryVfs::new(),
-                Path::new("/dirty_cache_write_admission.db"),
-                PageSize::DEFAULT,
-                Some(1),
-            )
-            .await
-            .unwrap();
-            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
-            let dirty_page = PageNumber::ONE;
-            pager
-                .cache
-                .insert_fresh(dirty_page, |bytes| bytes[0] = 0xD1)
-                .unwrap();
-
-            let error = txn
-                .write_page(&cx, PageNumber::new(2).unwrap(), &sample_page(0x6B))
-                .await
-                .expect_err("a dirty-only saturated cache must fail closed");
-            match error {
-                FrankenError::PageBufferCapacityExhausted {
-                    operation,
-                    page_size,
-                    max_buffers,
-                    total_buffers,
-                    available_buffers,
-                    cached_clean,
-                    cached_dirty,
-                    successful_evictions,
-                } => {
-                    assert_eq!(operation, "transaction_write_stage");
-                    assert_eq!(page_size, PageSize::DEFAULT.as_usize());
-                    assert_eq!(max_buffers, 1);
-                    assert_eq!(total_buffers, 1);
-                    assert_eq!(available_buffers, 0);
-                    assert_eq!(cached_clean, 0);
-                    assert_eq!(cached_dirty, 1);
-                    assert_eq!(successful_evictions, 0);
+            for (journal_mode, path) in [
+                (
+                    JournalMode::Delete,
+                    Path::new("/dirty_cache_write_admission_delete.db"),
+                ),
+                (
+                    JournalMode::Wal,
+                    Path::new("/dirty_cache_write_admission_wal.db"),
+                ),
+            ] {
+                let vfs = DbWriteFailOnceVfs::new(path.to_path_buf());
+                let pager = vfs
+                    .open_file_backed_pager_with_page_buffer_max(&cx, path, 1)
+                    .await
+                    .unwrap();
+                if journal_mode == JournalMode::Wal {
+                    let (backend, _frames, _, _) = MockWalBackend::new();
+                    pager.set_wal_backend(Box::new(backend)).unwrap();
+                    pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
                 }
-                other => panic!("expected structured capacity exhaustion, got {other:?}"),
+                assert_eq!(pager.journal_mode(), journal_mode);
+
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let dirty_page = PageNumber::ONE;
+                pager
+                    .cache
+                    .insert_fresh(dirty_page, |bytes| bytes[0] = 0xD1)
+                    .unwrap();
+                assert_eq!(pager.pool.total_buffers(), 1);
+                assert_eq!(pager.pool.available(), 0);
+
+                vfs.arm_after_db_writes(0);
+                let error = txn
+                    .write_page(&cx, PageNumber::new(2).unwrap(), &sample_page(0x6B))
+                    .await
+                    .expect_err("a dirty-only saturated cache must fail closed");
+                match error {
+                    FrankenError::PageBufferCapacityExhausted {
+                        operation,
+                        page_size,
+                        max_buffers,
+                        total_buffers,
+                        available_buffers,
+                        cached_clean,
+                        cached_dirty,
+                        successful_evictions,
+                    } => {
+                        assert_eq!(operation, "transaction_write_stage");
+                        assert_eq!(page_size, PageSize::DEFAULT.as_usize());
+                        assert_eq!(max_buffers, 1);
+                        assert_eq!(total_buffers, 1);
+                        assert_eq!(available_buffers, 0);
+                        assert_eq!(cached_clean, 0);
+                        assert_eq!(cached_dirty, 1);
+                        assert_eq!(successful_evictions, 0);
+                    }
+                    other => panic!("expected structured capacity exhaustion, got {other:?}"),
+                }
+                assert_eq!(
+                    vfs.db_write_fault_observation(),
+                    (Vec::new(), None),
+                    "failed staging must not write a dirty shared-cache page to MAIN_DB in {journal_mode:?} mode"
+                );
+                assert!(pager.cache.contains(dirty_page));
+                assert!(
+                    pager
+                        .cache
+                        .page_snapshots()
+                        .iter()
+                        .any(|snapshot| snapshot.page_no == dirty_page && snapshot.dirty)
+                );
+                assert!(!txn.writes_observed);
+                assert!(txn.write_set.is_empty());
+                assert!(txn.write_pages_sorted.is_empty());
+                assert!(!txn.has_pending_writes());
+
+                txn.rollback(&cx).await.unwrap();
+                assert_eq!(vfs.db_write_fault_observation(), (Vec::new(), None));
+                assert!(pager.cache.contains(dirty_page));
+
+                let mut reused = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                reused.rollback(&cx).await.unwrap();
+                assert_eq!(vfs.db_write_fault_observation(), (Vec::new(), None));
             }
-            assert!(pager.cache.contains(dirty_page));
-            assert!(!txn.writes_observed);
-            assert!(txn.write_set.is_empty());
-            txn.commit(&cx)
-                .await
-                .expect("failed staging must leave a valid no-op transaction");
         });
     }
 
@@ -22256,6 +22294,25 @@ mod tests {
         async fn open_file_backed_pager(&self, path: &Path) -> Result<SimplePager<Self>> {
             self.memory_fast_path.store(true, AtomicOrdering::Release);
             let result = SimplePager::open(self.clone(), path, PageSize::DEFAULT).await;
+            self.memory_fast_path.store(false, AtomicOrdering::Release);
+            result
+        }
+
+        async fn open_file_backed_pager_with_page_buffer_max(
+            &self,
+            cx: &Cx,
+            path: &Path,
+            page_buffer_max: usize,
+        ) -> Result<SimplePager<Self>> {
+            self.memory_fast_path.store(true, AtomicOrdering::Release);
+            let result = SimplePager::open_with_cx_and_page_buffer_max(
+                cx,
+                self.clone(),
+                path,
+                PageSize::DEFAULT,
+                Some(page_buffer_max),
+            )
+            .await;
             self.memory_fast_path.store(false, AtomicOrdering::Release);
             result
         }
