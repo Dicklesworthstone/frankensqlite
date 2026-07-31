@@ -1304,7 +1304,6 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// The returned future borrows this context's existing cancellation node;
     /// it does not allocate a child context or attach a native runtime context.
     /// Dropping it removes any pending waker registration.
-    #[must_use]
     pub fn wait_for_local_cancellation(&self) -> LocalCancellation<'_> {
         LocalCancellation {
             inner: &self.inner,
@@ -1318,7 +1317,6 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// This is a raw wakeup primitive for cancellation-sensitive admission
     /// machinery that separately defines whether masked operation is legal.
     /// It does not transition cancellation state or inspect a native context.
-    #[must_use]
     pub fn wait_for_local_cancel_request(&self) -> LocalCancellation<'_> {
         LocalCancellation {
             inner: &self.inner,
