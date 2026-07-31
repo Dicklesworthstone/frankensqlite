@@ -3441,9 +3441,9 @@ impl ShardedPageCache {
                 })?;
             let scope = native_cx.scope();
             let task_cache = Arc::clone(self);
+            let task_cx = cx.create_child_for_spawn();
             let mut writeback = native_cx
                 .spawn_in(&scope, move |task_native_cx| async move {
-                    let task_cx = Cx::new();
                     task_cx.set_native_cx(task_native_cx);
                     task_cache
                         .write_page(&task_cx, file.as_ref(), page_no)
@@ -4447,6 +4447,22 @@ mod tests {
             Ok(())
         }
 
+        fn lock_external_shared_snapshot(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
         fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
             Ok(false)
         }
@@ -4479,6 +4495,7 @@ mod tests {
             std::sync::Mutex<Option<(asupersync::types::TaskId, asupersync::types::RegionId)>>,
         observed_child_task: AtomicBool,
         observed_parent_region: AtomicBool,
+        observed_inline_io_safe: AtomicBool,
         fail_writes: bool,
     }
 
@@ -4490,6 +4507,7 @@ mod tests {
                 parent_task: std::sync::Mutex::new(None),
                 observed_child_task: AtomicBool::new(false),
                 observed_parent_region: AtomicBool::new(false),
+                observed_inline_io_safe: AtomicBool::new(false),
                 fail_writes,
             }
         }
@@ -4562,6 +4580,22 @@ mod tests {
             Ok(())
         }
 
+        fn lock_external_shared_snapshot(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
         fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
             Ok(false)
         }
@@ -4602,6 +4636,8 @@ mod tests {
                 .store(native_cx.task_id() != parent_task, Ordering::Release);
             self.observed_parent_region
                 .store(native_cx.region_id() == parent_region, Ordering::Release);
+            self.observed_inline_io_safe
+                .store(cx.blocking_io_inline_safe(), Ordering::Release);
 
             if self.fail_writes {
                 return Err(FrankenError::internal(
@@ -4741,6 +4777,7 @@ mod tests {
             let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
             task_file.set_parent(&native_cx);
             let cx = Cx::new();
+            cx.mark_blocking_io_inline_safe();
             cx.set_native_cx(native_cx);
             task_cache.evict_any_async(&cx, task_file).await
         });
@@ -4758,6 +4795,10 @@ mod tests {
         assert!(
             file.observed_parent_region.load(Ordering::Acquire),
             "dirty writeback task must remain owned by the caller's region"
+        );
+        assert!(
+            !file.observed_inline_io_safe.load(Ordering::Acquire),
+            "a spawned writeback must not inherit the parent OS-thread inline-I/O permission"
         );
         assert_eq!(file.bytes(), vec![0xD7; page_size.as_usize()]);
         assert!(!cache.contains(PageNumber::ONE));

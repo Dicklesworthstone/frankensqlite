@@ -10,11 +10,10 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use crossbeam_epoch::{Collector, Guard, LocalHandle};
-use fsqlite_types::sync_primitives::Mutex;
+use fsqlite_types::sync_primitives::{Duration, Instant, Mutex};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------

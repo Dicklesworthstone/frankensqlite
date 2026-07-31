@@ -239,9 +239,9 @@ fn parse_timestring(s: &str) -> Option<f64> {
     // A future refinement (Track: Cx time source) could freeze time at
     // statement start for full C SQLite compatibility.
     if s.eq_ignore_ascii_case("now") {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use fsqlite_types::sync_primitives::SystemTime;
         let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
         // Unix epoch (1970-01-01 00:00:00) = JDN 2_440_587.5

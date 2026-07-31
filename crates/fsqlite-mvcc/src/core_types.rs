@@ -7,13 +7,13 @@
 //! Foundation types (TxnId, CommitSeq, Snapshot, etc.) live in
 //! [`fsqlite_types::glossary`]; this module builds the runtime machinery on top.
 
-use fsqlite_types::sync_primitives::{Condvar, Mutex, RwLock};
+use fsqlite_types::sync_primitives::{Condvar, Instant, Mutex, RwLock};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, Thread, ThreadId};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cache_aligned::{
     CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,

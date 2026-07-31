@@ -12720,7 +12720,10 @@ fn bridge_validate_host_stability(
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_result<T>(result: Result<T, fsqlite::FrankenError>, context: &str) -> Result<T, String> {
+fn bridge_result<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    context: &str,
+) -> Result<T, String> {
     result.map_err(|error| format!("{context}: {error}"))
 }
 
@@ -13356,9 +13359,9 @@ fn bridge_sample_insert_single_runtime(
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_worker_command<T>(
+fn bridge_worker_command<T, E: std::fmt::Display>(
     command_count: &mut usize,
-    result: Result<T, fsqlite::FrankenError>,
+    result: Result<T, E>,
     context: &str,
 ) -> Result<T, String> {
     *command_count += 1;

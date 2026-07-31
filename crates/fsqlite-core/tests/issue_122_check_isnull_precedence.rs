@@ -17,6 +17,7 @@
 //!    binaryToUnaryIfNull fold).
 
 use fsqlite_core::connection::Connection;
+use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
 const CREATE_RUNS: &str = "CREATE TABLE runs (
@@ -69,6 +70,93 @@ async fn assert_check_semantics(conn: &Connection, id_base: i64) {
     );
 }
 
+const WIDE_CHECK_TERMS: usize = 32;
+
+fn wide_check_fixture() -> (String, String) {
+    let columns = (0..WIDE_CHECK_TERMS)
+        .map(|index| format!("v{index} INTEGER NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let flat_all_one = (0..WIDE_CHECK_TERMS)
+        .map(|index| format!("v{index} = 1"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let flat_any_zero = (0..WIDE_CHECK_TERMS)
+        .map(|index| format!("v{index} = 0"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let mut right_nested_all_one = format!("v{} = 1", WIDE_CHECK_TERMS - 1);
+    let mut right_nested_any_zero = format!("v{} = 0", WIDE_CHECK_TERMS - 1);
+    for index in (0..WIDE_CHECK_TERMS - 1).rev() {
+        right_nested_all_one = format!("v{index} = 1 AND ({right_nested_all_one})");
+        right_nested_any_zero = format!("v{index} = 0 OR ({right_nested_any_zero})");
+    }
+
+    let expected_check = format!("{flat_all_one} OR ({flat_any_zero}) AND guard = 0");
+    let create_sql = format!(
+        "CREATE TABLE logic (\
+         id INTEGER PRIMARY KEY, {columns}, guard INTEGER NOT NULL, \
+         CHECK(({right_nested_all_one}) OR (({right_nested_any_zero}) AND guard = 0))\
+         ) STRICT"
+    );
+    (create_sql, expected_check)
+}
+
+fn logic_insert_sql(id: i64, zero_at: Option<usize>, guard: i64) -> String {
+    let columns = (0..WIDE_CHECK_TERMS)
+        .map(|index| format!("v{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = (0..WIDE_CHECK_TERMS)
+        .map(|index| if zero_at == Some(index) { "0" } else { "1" })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT INTO logic (id, {columns}, guard) VALUES ({id}, {values}, {guard})")
+}
+
+async fn assert_wide_check_semantics(conn: &Connection, id_base: i64) {
+    conn.execute(&logic_insert_sql(id_base, None, 1))
+        .await
+        .expect("the all-one branch must satisfy the wide CHECK");
+    conn.execute(&logic_insert_sql(id_base + 1, Some(7), 0))
+        .await
+        .expect("the any-zero branch with guard zero must satisfy the wide CHECK");
+
+    let rejected = conn
+        .execute(&logic_insert_sql(id_base + 2, Some(7), 1))
+        .await
+        .expect_err("a zero term with a nonzero guard must violate the wide CHECK");
+    match rejected {
+        FrankenError::CheckViolation { .. } => {}
+        other => panic!("wide CHECK returned the wrong FrankenSQLite error: {other:?}"),
+    }
+    let rejected_rows = conn
+        .query(&format!(
+            "SELECT count(*) FROM logic WHERE id = {}",
+            id_base + 2
+        ))
+        .await
+        .expect("count rejected FrankenSQLite row");
+    assert_eq!(
+        rejected_rows[0].values()[0],
+        SqliteValue::Integer(0),
+        "a CHECK-rejected row must not remain visible"
+    );
+}
+
+async fn stored_logic_schema_sql(conn: &Connection) -> String {
+    let rows = conn
+        .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'logic'")
+        .await
+        .expect("read stored logic schema text");
+    assert_eq!(rows.len(), 1, "expected exactly one logic schema row");
+    match &rows[0].values()[0] {
+        SqliteValue::Text(sql) => sql.to_string(),
+        other => panic!("expected TEXT schema sql, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_issue_122_check_isnull_eq_isnull_in_memory() {
     asupersync::test_utils::run_test(|| async {
@@ -113,6 +201,128 @@ fn test_issue_122_check_survives_schema_round_trip_through_file() {
         );
 
         assert_check_semantics(&conn, 11).await;
+    });
+}
+
+/// Repeated ALTER/reopen cycles used to amplify formatter-added parentheses in
+/// migration-scale boolean constraints. The stored SQL may legitimately gain
+/// each newly added column, but its pre-existing CHECK expression must be
+/// canonical, byte-stable across reopen, and bounded in size.
+#[test]
+fn test_wide_boolean_check_alter_reopen_keeps_schema_bounded_and_semantic() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let path = tmp.path().to_str().expect("utf-8 temp path");
+        let (create_sql, expected_check) = wide_check_fixture();
+
+        let mut previous_sql = {
+            let conn = Connection::open(path).await.expect("open file db");
+            conn.execute(&create_sql).await.expect("create logic table");
+            let stored_sql = stored_logic_schema_sql(&conn).await;
+            assert!(
+                stored_sql.contains(&expected_check),
+                "CREATE must flatten only the associative AND/OR chains while preserving \
+                 mixed-precedence grouping: {stored_sql}"
+            );
+            assert_wide_check_semantics(&conn, 1).await;
+            stored_sql
+        };
+        let baseline_len = previous_sql.len();
+        let baseline_parentheses = previous_sql.matches('(').count();
+
+        for cycle in 0..2 {
+            let conn = Connection::open(path).await.expect("reopen before ALTER");
+            let reopened_sql = stored_logic_schema_sql(&conn).await;
+            assert_eq!(
+                reopened_sql, previous_sql,
+                "schema bytes changed merely by reopening at cycle {cycle}"
+            );
+
+            conn.execute(&format!(
+                "ALTER TABLE logic ADD COLUMN added_{cycle} INTEGER DEFAULT {cycle}"
+            ))
+            .await
+            .expect("ALTER must add a plain defaulted column");
+
+            let altered_sql = stored_logic_schema_sql(&conn).await;
+            assert!(
+                altered_sql.contains(&expected_check),
+                "ALTER cycle {cycle} changed the canonical CHECK expression: {altered_sql}"
+            );
+            assert_eq!(
+                altered_sql.matches('(').count(),
+                baseline_parentheses,
+                "ALTER cycle {cycle} amplified schema parentheses"
+            );
+            assert!(
+                altered_sql.len() <= baseline_len + (cycle + 1) * 64,
+                "ALTER cycle {cycle} grew schema text beyond the added column: \
+                 baseline={baseline_len}, current={}, sql={altered_sql}",
+                altered_sql.len()
+            );
+            let cycle_id = i64::try_from(cycle).expect("test cycle fits i64");
+            assert_wide_check_semantics(&conn, 100 + cycle_id * 10).await;
+            previous_sql = altered_sql;
+        }
+
+        {
+            let conn = Connection::open(path)
+                .await
+                .expect("final FrankenSQLite reopen");
+            assert_eq!(
+                stored_logic_schema_sql(&conn).await,
+                previous_sql,
+                "final FrankenSQLite reopen changed stored schema bytes"
+            );
+            assert_wide_check_semantics(&conn, 1_000).await;
+        }
+
+        let sqlite = rusqlite::Connection::open(path).expect("stock SQLite final reopen");
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("stock SQLite integrity_check");
+        assert_eq!(integrity, "ok");
+        let stock_sql: String = sqlite
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'logic'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stock SQLite must parse and expose the logic schema");
+        assert_eq!(
+            stock_sql, previous_sql,
+            "stock SQLite observed different stored schema bytes"
+        );
+        sqlite
+            .execute_batch(&logic_insert_sql(2_000, None, 1))
+            .expect("stock SQLite must accept the all-one branch");
+        sqlite
+            .execute_batch(&logic_insert_sql(2_001, Some(7), 0))
+            .expect("stock SQLite must accept the guarded any-zero branch");
+        let rejected = sqlite
+            .execute_batch(&logic_insert_sql(2_002, Some(7), 1))
+            .expect_err("stock SQLite must enforce the failing CHECK branch");
+        match rejected {
+            rusqlite::Error::SqliteFailure(error, _) => {
+                assert_eq!(
+                    error.extended_code,
+                    rusqlite::ffi::SQLITE_CONSTRAINT_CHECK,
+                    "stock SQLite failure must be SQLITE_CONSTRAINT_CHECK"
+                );
+            }
+            other => panic!("stock SQLite returned a non-SQLite CHECK error: {other}"),
+        }
+        let rejected_count: i64 = sqlite
+            .query_row(
+                "SELECT count(*) FROM logic WHERE id = ?1",
+                [2_002_i64],
+                |row| row.get(0),
+            )
+            .expect("count rejected stock SQLite row");
+        assert_eq!(
+            rejected_count, 0,
+            "stock SQLite must not retain a CHECK-rejected row"
+        );
     });
 }
 

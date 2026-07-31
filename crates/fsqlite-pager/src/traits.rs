@@ -1495,6 +1495,13 @@ impl TransactionHandle for MemoryMockTransaction {
 
 /// Stack-allocated transaction wrapper used by upper layers to avoid boxing
 /// pager transactions behind `dyn TransactionHandle`.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        clippy::large_enum_variant,
+        reason = "native transaction variants are absent on wasm, making the intentional inline memory transaction an apparent size outlier"
+    )
+)]
 pub enum TransactionKind {
     /// In-memory pager transaction (`:memory:` databases).
     Memory(SimpleTransaction<MemoryVfs>),

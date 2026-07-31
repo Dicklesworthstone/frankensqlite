@@ -26,11 +26,14 @@
 //! ```
 //
 
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 #[cfg(feature = "native")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
 
 #[cfg(feature = "native")]
@@ -431,6 +434,37 @@ impl Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
+struct LocalCancelWaiter {
+    id: u64,
+    waker: Waker,
+}
+
+#[derive(Debug, Default)]
+struct LocalCancelWaiters {
+    next_id: u64,
+    entries: Vec<LocalCancelWaiter>,
+}
+
+impl LocalCancelWaiters {
+    fn allocate_id(&mut self) -> u64 {
+        loop {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if self.entries.iter().all(|waiter| waiter.id != id) {
+                return id;
+            }
+        }
+    }
+
+    fn remove(&mut self, id: u64) -> Option<LocalCancelWaiter> {
+        self.entries
+            .iter()
+            .position(|waiter| waiter.id == id)
+            .map(|position| self.entries.swap_remove(position))
+    }
+}
+
+#[derive(Debug)]
 struct CxInner {
     cancel_requested: AtomicBool,
     // Strongest ordinary cancellation for this local node. Kept separate
@@ -442,6 +476,8 @@ struct CxInner {
     cancel_state: Mutex<CancelState>,
     cancel_reason: Mutex<Option<CancelReason>>,
     mask_depth: AtomicU32,
+    cancel_dispatch_gate: Arc<Mutex<()>>,
+    local_cancel_waiters: Mutex<LocalCancelWaiters>,
     children: Mutex<Vec<Weak<Self>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
     last_eprocess_decision: Mutex<Option<EProcessDecision>>,
@@ -450,8 +486,6 @@ struct CxInner {
     attached_native_cx: Mutex<Option<NativeCx>>,
     #[cfg(feature = "native")]
     fallback_native_cx: std::sync::OnceLock<NativeCx>,
-    #[cfg(feature = "native")]
-    fallback_native_cx_gate: Mutex<()>,
     // bd-bjm5d: set only on the root Cx of a dedicated engine OS thread
     // that owns its Connection exclusively and is not a shared scheduler
     // worker. Grants VFS backends permission to issue bounded EINTR-safe
@@ -464,7 +498,7 @@ struct CxInner {
 }
 
 impl CxInner {
-    fn new() -> Self {
+    fn new(cancel_dispatch_gate: Arc<Mutex<()>>) -> Self {
         Self {
             cancel_requested: AtomicBool::new(false),
             #[cfg(feature = "native")]
@@ -472,6 +506,8 @@ impl CxInner {
             cancel_state: Mutex::new(CancelState::Created),
             cancel_reason: Mutex::new(None),
             mask_depth: AtomicU32::new(0),
+            cancel_dispatch_gate,
+            local_cancel_waiters: Mutex::new(LocalCancelWaiters::default()),
             children: Mutex::new(Vec::new()),
             last_checkpoint_msg: Mutex::new(None),
             last_eprocess_decision: Mutex::new(None),
@@ -480,8 +516,6 @@ impl CxInner {
             attached_native_cx: Mutex::new(None),
             #[cfg(feature = "native")]
             fallback_native_cx: std::sync::OnceLock::new(),
-            #[cfg(feature = "native")]
-            fallback_native_cx_gate: Mutex::new(()),
             blocking_io_inline_safe: AtomicBool::new(false),
             unix_millis: AtomicU64::new(0),
         }
@@ -567,32 +601,6 @@ fn sync_one_native_cx_cancel(inner: &CxInner, native: &NativeCx) {
 }
 
 #[cfg(feature = "native")]
-fn sync_native_cx_cancel(inner: &CxInner) {
-    if inner.native_cancel_reason.load(Ordering::Acquire) == 0 {
-        return;
-    }
-    let attached_native = inner
-        .attached_native_cx
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .cloned();
-    if let Some(native) = attached_native {
-        sync_one_native_cx_cancel(inner, &native);
-    }
-    let fallback_native = {
-        let _gate = inner
-            .fallback_native_cx_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.fallback_native_cx.get().cloned()
-    };
-    if let Some(native) = fallback_native {
-        sync_one_native_cx_cancel(inner, &native);
-    }
-}
-
-#[cfg(feature = "native")]
 #[must_use]
 #[allow(dead_code)]
 fn native_budget_from_local(budget: Budget) -> NativeBudget {
@@ -634,25 +642,72 @@ enum NativeCancelPropagation {
     LocalOnly,
 }
 
-fn propagate_cancel_node(
+#[must_use]
+fn local_cancellation_matches(inner: &CxInner, respect_mask: bool) -> bool {
+    inner.cancel_requested.load(Ordering::Acquire)
+        && (!respect_mask || inner.mask_depth.load(Ordering::Acquire) == 0)
+}
+
+fn take_local_cancel_waiters(inner: &CxInner) -> Vec<LocalCancelWaiter> {
+    let mut waiters = inner
+        .local_cancel_waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut waiters.entries)
+}
+
+fn capture_cancel_callback_panic(
+    first_panic: &mut Option<Box<dyn std::any::Any + Send>>,
+    callback: impl FnOnce(),
+) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+        if first_panic.is_none() {
+            *first_panic = Some(payload);
+        } else {
+            // A panic payload may itself panic when dropped. The first panic
+            // is the one we report; leaking a secondary payload is preferable
+            // to aborting before the remaining cancellation observers run.
+            std::mem::forget(payload);
+        }
+    }
+}
+
+fn dispatch_local_cancel_waiters(
+    waiters: Vec<LocalCancelWaiter>,
+    first_panic: &mut Option<Box<dyn std::any::Any + Send>>,
+) {
+    // A Waker callback or final destructor may run arbitrary executor code.
+    // Both therefore happen only after the FrankenSQLite mutex is released.
+    // One panicking callback must not prevent the remaining observers from
+    // being notified.
+    for waiter in waiters {
+        capture_cancel_callback_panic(first_panic, || waiter.waker.wake_by_ref());
+        capture_cancel_callback_panic(first_panic, || drop(waiter));
+    }
+}
+
+fn publish_cancel_state(
     inner: &CxInner,
-    reason: CancelReason,
-    native_propagation: NativeCancelPropagation,
-) -> Vec<Arc<CxInner>> {
+    local_reason: CancelReason,
+    native_reason: Option<CancelReason>,
+) -> CancelReason {
     #[cfg(not(feature = "native"))]
-    let _ = native_propagation;
+    let _ = native_reason;
 
     // Monotone reason update.
-    {
+    let effective_local_reason = {
         let mut r = inner
             .cancel_reason
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match *r {
-            Some(existing) if existing >= reason => {}
-            _ => *r = Some(reason),
+            Some(existing) if existing >= local_reason => existing,
+            _ => {
+                *r = Some(local_reason);
+                local_reason
+            }
         }
-    }
+    };
 
     // State transition: Created/Running → CancelRequested.
     {
@@ -670,7 +725,7 @@ fn propagate_cancel_node(
     // reason: a stronger operation-local cancellation must never be laundered
     // into a shared native context by a later, weaker ordinary cancellation.
     #[cfg(feature = "native")]
-    if native_propagation == NativeCancelPropagation::LocalAndNative {
+    if let Some(reason) = native_reason {
         record_native_cancel_reason(inner, reason);
     }
 
@@ -679,21 +734,77 @@ fn propagate_cancel_node(
     // consume once they observe cancellation.
     inner.cancel_requested.store(true, Ordering::Release);
 
-    // Keep attached native asupersync context in sync so downstream combinators
-    // observe equivalent cancellation semantics.
-    #[cfg(feature = "native")]
-    if native_propagation == NativeCancelPropagation::LocalAndNative {
-        sync_native_cx_cancel(inner);
+    effective_local_reason
+}
+
+fn try_append_live_children(
+    inner: &CxInner,
+    descendants: &mut Vec<Arc<CxInner>>,
+) -> std::result::Result<(), std::collections::TryReserveError> {
+    let mut children = inner
+        .children
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    children.retain(|child| child.strong_count() > 0);
+    descendants.try_reserve(children.len())?;
+    for child in children.iter().filter_map(Weak::upgrade) {
+        descendants.push(child);
+    }
+    Ok(())
+}
+
+#[must_use]
+fn local_cancel_waiter_count(inner: &CxInner) -> usize {
+    inner
+        .local_cancel_waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .len()
+}
+
+fn drain_local_cancel_waiters_into(inner: &CxInner, waiters: &mut Vec<LocalCancelWaiter>) {
+    let mut registered_waiters = inner
+        .local_cancel_waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    debug_assert!(
+        waiters.capacity() - waiters.len() >= registered_waiters.entries.len(),
+        "cancellation waiter capacity must be reserved before publication"
+    );
+    waiters.append(&mut registered_waiters.entries);
+}
+
+#[cfg(feature = "native")]
+struct NativeCancelTarget {
+    descendant_index: Option<usize>,
+    native_cx: NativeCx,
+}
+
+#[cfg(feature = "native")]
+fn append_native_cancel_targets(
+    inner: &CxInner,
+    descendant_index: Option<usize>,
+    targets: &mut Vec<NativeCancelTarget>,
+) {
+    let attached_native = inner
+        .attached_native_cx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .cloned();
+    if let Some(native_cx) = attached_native {
+        targets.push(NativeCancelTarget {
+            descendant_index,
+            native_cx,
+        });
     }
 
-    // Collect children and release the lock before traversing them.
-    {
-        let mut guard = inner
-            .children
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.retain(|child| child.strong_count() > 0);
-        guard.iter().filter_map(Weak::upgrade).collect()
+    if let Some(native_cx) = inner.fallback_native_cx.get().cloned() {
+        targets.push(NativeCancelTarget {
+            descendant_index,
+            native_cx,
+        });
     }
 }
 
@@ -706,9 +817,105 @@ fn propagate_cancel_tree(
     reason: CancelReason,
     native_propagation: NativeCancelPropagation,
 ) {
-    let mut worklist = propagate_cancel_node(inner, reason, native_propagation);
-    while let Some(node) = worklist.pop() {
-        worklist.extend(propagate_cancel_node(&node, reason, native_propagation));
+    let mut descendants = Vec::new();
+    let mut waiters = Vec::new();
+    #[cfg(feature = "native")]
+    let mut native_targets = Vec::new();
+    let mut reserve_error = None;
+    {
+        // Every context in one parent/child family shares this phase gate.
+        // Only state publication and waiter extraction happen while it is
+        // held; arbitrary native and executor callbacks run after unlock.
+        let _dispatch = inner
+            .cancel_dispatch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let native_reason = match native_propagation {
+            NativeCancelPropagation::LocalAndNative => Some(reason),
+            NativeCancelPropagation::LocalOnly => None,
+        };
+
+        if let Err(error) = try_append_live_children(inner, &mut descendants) {
+            reserve_error = Some(error);
+        }
+        let mut cursor = 0;
+        while reserve_error.is_none() && cursor < descendants.len() {
+            let node = Arc::clone(&descendants[cursor]);
+            if let Err(error) = try_append_live_children(&node, &mut descendants) {
+                reserve_error = Some(error);
+                break;
+            }
+            cursor += 1;
+        }
+
+        if reserve_error.is_none() {
+            // Pending registration takes the same family gate. Concurrent
+            // unregistration can only make this count smaller, so one
+            // aggregate reservation covers every later append.
+            let waiter_count = descendants
+                .iter()
+                .fold(local_cancel_waiter_count(inner), |count, node| {
+                    count.saturating_add(local_cancel_waiter_count(node))
+                });
+            if let Err(error) = waiters.try_reserve(waiter_count) {
+                reserve_error = Some(error);
+            }
+        }
+
+        #[cfg(feature = "native")]
+        if reserve_error.is_none() && native_propagation == NativeCancelPropagation::LocalAndNative
+        {
+            let target_capacity = descendants.len().saturating_mul(2).saturating_add(2);
+            if let Err(error) = native_targets.try_reserve(target_capacity) {
+                reserve_error = Some(error);
+            } else {
+                append_native_cancel_targets(inner, None, &mut native_targets);
+                for (index, node) in descendants.iter().enumerate() {
+                    append_native_cancel_targets(node, Some(index), &mut native_targets);
+                }
+            }
+        }
+
+        if reserve_error.is_none() {
+            let propagated_local_reason = publish_cancel_state(inner, reason, native_reason);
+            drain_local_cancel_waiters_into(inner, &mut waiters);
+
+            #[cfg(feature = "native")]
+            let propagated_native_reason = match native_propagation {
+                NativeCancelPropagation::LocalAndNative => mirrored_native_cancel_reason(inner),
+                NativeCancelPropagation::LocalOnly => None,
+            };
+            #[cfg(not(feature = "native"))]
+            let propagated_native_reason = None;
+
+            for node in &descendants {
+                publish_cancel_state(node, propagated_local_reason, propagated_native_reason);
+                drain_local_cancel_waiters_into(node, &mut waiters);
+            }
+        }
+    }
+
+    // Every node visible when this phase began has its cancellation flag
+    // published before this batch invokes native or executor callbacks.
+    // Reasons are monotone per node; concurrent stronger batches may advance
+    // them further after this phase releases the family gate.
+    if let Some(error) = reserve_error {
+        panic!("failed to reserve cancellation propagation storage: {error}");
+    }
+
+    let mut first_panic = None;
+    #[cfg(feature = "native")]
+    for target in &native_targets {
+        let target_inner = target
+            .descendant_index
+            .map_or(inner, |index| &descendants[index]);
+        capture_cancel_callback_panic(&mut first_panic, || {
+            sync_one_native_cx_cancel(target_inner, &target.native_cx);
+        });
+    }
+    dispatch_local_cancel_waiters(waiters, &mut first_panic);
+    if let Some(payload) = first_panic {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -748,6 +955,141 @@ impl LocalCancelRelay {
         };
         propagate_local_cancel(&inner, reason);
         true
+    }
+}
+
+/// Scoped notification of local cancellation for one [`Cx`].
+///
+/// This future watches only FrankenSQLite's local cancellation state. It does
+/// not inspect or modify a native runtime context, carry effect capabilities,
+/// or create a child context. The constructor determines whether masking
+/// defers readiness or whether the raw request itself is sufficient.
+///
+/// A pending registration is removed on `Drop`, so repeatedly creating and
+/// abandoning these futures does not accumulate stale child or waker entries.
+#[derive(Debug)]
+#[must_use = "futures do nothing unless polled or awaited"]
+pub struct LocalCancellation<'a> {
+    inner: &'a CxInner,
+    waiter_id: Option<u64>,
+    respect_mask: bool,
+}
+
+impl LocalCancellation<'_> {
+    fn unregister(&mut self) {
+        let Some(id) = self.waiter_id.take() else {
+            return;
+        };
+        let retired = {
+            let mut waiters = self
+                .inner
+                .local_cancel_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            waiters.remove(id)
+        };
+        // Releasing the final Waker reference may invoke executor code.
+        drop(retired);
+    }
+}
+
+impl Future for LocalCancellation<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, task_cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let mut prepared_waker = None;
+        let this = self.as_mut().get_mut();
+        let inner = this.inner;
+
+        loop {
+            if local_cancellation_matches(inner, this.respect_mask) {
+                this.unregister();
+                drop(prepared_waker);
+                return Poll::Ready(());
+            }
+
+            // Registration participates in the same family phase gate as
+            // tree publication. This lets cancellation pre-reserve one flat
+            // waiter buffer for the complete tree before it changes any
+            // node. Waker cloning and destruction still happen after both
+            // internal locks are released.
+            let dispatch = inner
+                .cancel_dispatch_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut waiters = inner
+                .local_cancel_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if local_cancellation_matches(inner, this.respect_mask) {
+                let retired = this.waiter_id.take().and_then(|id| waiters.remove(id));
+                drop(waiters);
+                drop(dispatch);
+                drop(retired);
+                drop(prepared_waker);
+                return Poll::Ready(());
+            }
+
+            let existing_position = this.waiter_id.and_then(|id| {
+                waiters
+                    .entries
+                    .iter()
+                    .position(|registered| registered.id == id)
+            });
+            if existing_position
+                .is_some_and(|position| waiters.entries[position].waker.will_wake(task_cx.waker()))
+            {
+                drop(waiters);
+                drop(dispatch);
+                drop(prepared_waker);
+                return Poll::Pending;
+            }
+
+            if existing_position.is_none() {
+                if let Err(error) = waiters.entries.try_reserve(1) {
+                    drop(waiters);
+                    drop(dispatch);
+                    drop(prepared_waker);
+                    panic!("failed to reserve local-cancellation waiter storage: {error}");
+                }
+            }
+
+            let Some(new_waker) = prepared_waker.take() else {
+                // RawWaker::clone may execute arbitrary user code, so prepare
+                // the replacement only after releasing the internal mutex.
+                drop(waiters);
+                drop(dispatch);
+                prepared_waker = Some(task_cx.waker().clone());
+                continue;
+            };
+
+            let retired = if let Some(position) = existing_position {
+                Some(std::mem::replace(
+                    &mut waiters.entries[position].waker,
+                    new_waker,
+                ))
+            } else {
+                let id = waiters.allocate_id();
+                waiters.entries.push(LocalCancelWaiter {
+                    id,
+                    waker: new_waker,
+                });
+                this.waiter_id = Some(id);
+                None
+            };
+            drop(waiters);
+            drop(dispatch);
+            // Waker destruction is deliberately deferred until after every
+            // internal lock is released.
+            drop(retired);
+            return Poll::Pending;
+        }
+    }
+}
+
+impl Drop for LocalCancellation<'_> {
+    fn drop(&mut self) {
+        self.unregister();
     }
 }
 
@@ -798,34 +1140,31 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[must_use]
     #[allow(dead_code)]
     fn effective_native_cx(&self) -> NativeCx {
-        let attached_native = self
-            .inner
-            .attached_native_cx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .cloned();
-        if let Some(native) = attached_native {
-            return native;
-        }
-
         let native = {
-            let _gate = self
+            let _dispatch = self
                 .inner
-                .fallback_native_cx_gate
+                .cancel_dispatch_gate
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.inner
-                .fallback_native_cx
-                .get_or_init(|| {
-                    NativeCx::for_request_with_budget(native_budget_from_local(self.budget))
-                })
-                .clone()
+            let attached_native = self
+                .inner
+                .attached_native_cx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .cloned();
+            attached_native.unwrap_or_else(|| {
+                self.inner
+                    .fallback_native_cx
+                    .get_or_init(|| {
+                        NativeCx::for_request_with_budget(native_budget_from_local(self.budget))
+                    })
+                    .clone()
+            })
         };
-        // Recheck after releasing the registration gate: NativeCx dispatches
-        // arbitrary wakers synchronously, so no application lock may be held
-        // while mirroring the reason. The gate still establishes which side
-        // must observe the other's publication.
+        // Recheck after releasing the family publication gate: NativeCx
+        // dispatches arbitrary wakers synchronously, so no FrankenSQLite lock
+        // may be held while mirroring the reason.
         sync_one_native_cx_cancel(&self.inner, &native);
         native
     }
@@ -845,8 +1184,15 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
 
     #[must_use]
     pub fn with_budget(budget: Budget) -> Self {
+        Self::with_budget_and_cancel_dispatch(budget, Arc::new(Mutex::new(())))
+    }
+
+    fn with_budget_and_cancel_dispatch(
+        budget: Budget,
+        cancel_dispatch_gate: Arc<Mutex<()>>,
+    ) -> Self {
         Self {
-            inner: Arc::new(CxInner::new()),
+            inner: Arc::new(CxInner::new(cancel_dispatch_gate)),
             budget,
             trace_id: 0,
             decision_id: 0,
@@ -968,6 +1314,34 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         self.inner.cancel_requested.load(Ordering::Acquire)
     }
 
+    /// Wait until local cancellation is observable at an unmasked boundary.
+    ///
+    /// The returned future borrows this context's existing cancellation node;
+    /// it does not allocate a child context or attach a native runtime context.
+    /// Dropping it removes any pending waker registration.
+    #[must_use]
+    pub fn wait_for_local_cancellation(&self) -> LocalCancellation<'_> {
+        LocalCancellation {
+            inner: &self.inner,
+            waiter_id: None,
+            respect_mask: true,
+        }
+    }
+
+    /// Wait until local cancellation has been requested, even while masked.
+    ///
+    /// This is a raw wakeup primitive for cancellation-sensitive admission
+    /// machinery that separately defines whether masked operation is legal.
+    /// It does not transition cancellation state or inspect a native context.
+    #[must_use]
+    pub fn wait_for_local_cancel_request(&self) -> LocalCancellation<'_> {
+        LocalCancellation {
+            inner: &self.inner,
+            waiter_id: None,
+            respect_mask: false,
+        }
+    }
+
     /// Request cancellation with the default reason (`UserInterrupt`).
     ///
     /// Propagates to all child contexts per INV-CANCEL-PROPAGATES.
@@ -1055,14 +1429,27 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// Attach a native asupersync context used by [`Self::checkpoint`].
     #[cfg(feature = "native")]
     pub fn set_native_cx(&self, native_cx: NativeCx) {
-        *self
-            .inner
-            .attached_native_cx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native_cx);
-        // Register first, then recheck the separate ordinary-reason channel.
-        // A local-only cancellation never crosses this native boundary.
-        sync_native_cx_cancel(&self.inner);
+        let retired = {
+            let _dispatch = self
+                .inner
+                .cancel_dispatch_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut attached = self
+                .inner
+                .attached_native_cx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            attached.replace(native_cx.clone())
+        };
+        // Synchronize the exact handle supplied by this call. Re-reading the
+        // attachment here would let a racing replacement return with this
+        // handle still uncancelled.
+        sync_one_native_cx_cancel(&self.inner, &native_cx);
+        // Releasing the final old NativeCx reference may retire cancellation
+        // Wakers. Do that only after both FrankenSQLite locks are gone and the
+        // replacement's synchronization postcondition has been established.
+        drop(retired);
     }
 
     /// Attach a native context shim in non-native builds.
@@ -1090,11 +1477,20 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// Remove the currently attached native asupersync context.
     #[cfg(feature = "native")]
     pub fn clear_native_cx(&self) {
-        *self
-            .inner
-            .attached_native_cx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let retired = {
+            let _dispatch = self
+                .inner
+                .cancel_dispatch_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.inner
+                .attached_native_cx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        };
+        // NativeCx destruction may invoke executor-owned cleanup.
+        drop(retired);
     }
 
     /// Mark this context as running on a dedicated engine OS thread where
@@ -1364,7 +1760,27 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// to this child. Tracing IDs propagate to the child.
     #[must_use]
     pub fn create_child(&self) -> Self {
-        let mut child = Self::with_budget(self.budget);
+        self.create_child_with_runtime_affinity(true)
+    }
+
+    /// Create a child context that may be moved into a newly spawned task.
+    ///
+    /// Cancellation lineage, budget, tracing metadata, e-process policy, and
+    /// typed capabilities are inherited exactly as for [`Self::create_child`].
+    /// Task- and OS-thread-affine state is deliberately excluded: the child
+    /// starts without an attached/fallback native context and without inline
+    /// blocking-I/O permission. The spawned task must attach its own native
+    /// context after it starts.
+    #[must_use]
+    pub fn create_child_for_spawn(&self) -> Self {
+        self.create_child_with_runtime_affinity(false)
+    }
+
+    fn create_child_with_runtime_affinity(&self, inherit_runtime_affinity: bool) -> Self {
+        let mut child = Self::with_budget_and_cancel_dispatch(
+            self.budget,
+            Arc::clone(&self.inner.cancel_dispatch_gate),
+        );
         child.trace_id = self.trace_id;
         child.decision_id = self.decision_id;
         child.policy_id = self.policy_id;
@@ -1372,45 +1788,83 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             child.set_eprocess_oracle(oracle);
         }
         // bd-bjm5d: inline-safety is a property of the owning OS thread,
-        // not of the native runtime handle, so it propagates to every
-        // child created on this thread.
-        if self.blocking_io_inline_safe() {
+        // not of the native runtime handle. Ordinary same-thread children
+        // inherit it; spawn-safe children deliberately do not.
+        if inherit_runtime_affinity && self.blocking_io_inline_safe() {
             child.mark_blocking_io_inline_safe();
         }
+
         #[cfg(feature = "native")]
-        if let Some(native_cx) = self.attached_native_cx() {
-            child.set_native_cx(native_cx);
-        }
-        {
+        let native_to_sync = {
+            let _dispatch = self
+                .inner
+                .cancel_dispatch_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let attached_native = inherit_runtime_affinity
+                .then(|| {
+                    self.inner
+                        .attached_native_cx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                })
+                .flatten();
+            if let Some(native) = attached_native.as_ref() {
+                *child
+                    .inner
+                    .attached_native_cx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native.clone());
+            }
+
+            let local_reason = self.cancel_reason();
+            let native_reason = mirrored_native_cancel_reason(&self.inner);
+            if let Some(local_reason) = local_reason.or(native_reason) {
+                publish_cancel_state(&child.inner, local_reason, native_reason);
+            }
+
+            // The child becomes visible only after its inherited cancellation
+            // state is fully initialized.
             let mut children = self
                 .inner
                 .children
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if children.len() == children.capacity() {
+                children.retain(|registered| registered.strong_count() > 0);
+            }
+            children.push(Arc::downgrade(&child.inner));
+
+            attached_native.filter(|_| native_reason.is_some())
+        };
+
+        #[cfg(not(feature = "native"))]
+        {
+            let _dispatch = self
+                .inner
+                .cancel_dispatch_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(reason) = self.cancel_reason() {
+                publish_cancel_state(&child.inner, reason, None);
+            }
+            let mut children = self
+                .inner
+                .children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if children.len() == children.capacity() {
+                children.retain(|registered| registered.strong_count() > 0);
+            }
             children.push(Arc::downgrade(&child.inner));
         }
+
         #[cfg(feature = "native")]
-        {
-            let local_reason = self.cancel_reason();
-            let native_reason =
-                local_reason.and_then(|_| mirrored_native_cancel_reason(&self.inner));
-            match (local_reason, native_reason) {
-                (Some(local), Some(native)) if local == native => {
-                    propagate_cancel(&child.inner, native);
-                }
-                (Some(local), Some(native)) => {
-                    propagate_local_cancel(&child.inner, local);
-                    propagate_cancel(&child.inner, native);
-                }
-                (Some(local), None) => propagate_local_cancel(&child.inner, local),
-                (None, Some(native)) => propagate_cancel(&child.inner, native),
-                (None, None) => {}
-            }
+        if let Some(native) = native_to_sync {
+            sync_one_native_cx_cancel(&child.inner, &native);
         }
-        #[cfg(not(feature = "native"))]
-        if let Some(reason) = self.cancel_reason() {
-            child.cancel_with_reason(reason);
-        }
+
         child
     }
 
@@ -1465,7 +1919,31 @@ pub struct MaskGuard<'a> {
 
 impl Drop for MaskGuard<'_> {
     fn drop(&mut self) {
-        self.inner.mask_depth.fetch_sub(1, Ordering::Release);
+        let previous = self.inner.mask_depth.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "mask depth underflow");
+        if previous == 1 {
+            let waiters = {
+                let _dispatch = self
+                    .inner
+                    .cancel_dispatch_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.inner.mask_depth.load(Ordering::Acquire) == 0
+                    && self.inner.cancel_requested.load(Ordering::Acquire)
+                {
+                    take_local_cancel_waiters(self.inner)
+                } else {
+                    Vec::new()
+                }
+            };
+            let mut first_panic = None;
+            dispatch_local_cancel_waiters(waiters, &mut first_panic);
+            if let Some(payload) = first_panic {
+                // Never resume arbitrary callback panic from a destructor:
+                // this guard may itself be running during another unwind.
+                std::mem::forget(payload);
+            }
+        }
     }
 }
 
@@ -1510,13 +1988,154 @@ mod tests {
     use super::*;
     use crate::eprocess::{EProcessConfig, EProcessSignal};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Weak};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Barrier, Weak};
+
+    #[derive(Debug, Default)]
+    struct CountingWake(AtomicUsize);
+
+    impl std::task::Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Debug)]
+    struct DescendantStateProbeWake {
+        descendant: Weak<CxInner>,
+        wake_count: AtomicUsize,
+        saw_descendant_cancelled: AtomicBool,
+        dispatch_gate_was_unlocked: AtomicBool,
+    }
+
+    impl DescendantStateProbeWake {
+        fn observe(&self) {
+            let descendant = self
+                .descendant
+                .upgrade()
+                .expect("observed descendant should remain alive");
+            self.saw_descendant_cancelled.store(
+                descendant.cancel_requested.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            let dispatch_guard = descendant
+                .cancel_dispatch_gate
+                .try_lock()
+                .expect("cancellation callbacks must run outside the family phase gate");
+            self.dispatch_gate_was_unlocked
+                .store(true, Ordering::Release);
+            drop(dispatch_guard);
+            self.wake_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl std::task::Wake for DescendantStateProbeWake {
+        fn wake(self: Arc<Self>) {
+            self.observe();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe();
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReentrantFamilyWake {
+        cx: Cx<FullCaps>,
+        wake_count: AtomicUsize,
+        child_inherited_cancellation: AtomicBool,
+    }
+
+    impl ReentrantFamilyWake {
+        fn exercise(&self) {
+            self.cx.cancel_with_reason(CancelReason::Abort);
+            let child = self.cx.create_child();
+            self.child_inherited_cancellation.store(
+                child.cancel_reason() == Some(CancelReason::Abort),
+                Ordering::Release,
+            );
+            let mask = self.cx.masked();
+            drop(mask);
+            self.wake_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl std::task::Wake for ReentrantFamilyWake {
+        fn wake(self: Arc<Self>) {
+            self.exercise();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.exercise();
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PanicWake;
+
+    impl std::task::Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            panic!("intentional cancellation-waker panic");
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            panic!("intentional cancellation-waker panic");
+        }
+    }
+
+    #[derive(Debug)]
+    struct RegistryProbeWake {
+        inner: Weak<CxInner>,
+        wake_count: AtomicUsize,
+        registry_was_unlocked: AtomicBool,
+    }
+
+    impl RegistryProbeWake {
+        fn probe_registry(&self) {
+            let inner = self
+                .inner
+                .upgrade()
+                .expect("observed context should remain alive");
+            let registry_guard = inner
+                .local_cancel_waiters
+                .try_lock()
+                .expect("waker callbacks must run after releasing the waiter registry");
+            self.registry_was_unlocked.store(true, Ordering::Release);
+            drop(registry_guard);
+            self.wake_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl std::task::Wake for RegistryProbeWake {
+        fn wake(self: Arc<Self>) {
+            self.probe_registry();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.probe_registry();
+        }
+    }
+
+    fn local_cancel_waiter_count<Caps: cap::SubsetOf<cap::All>>(cx: &Cx<Caps>) -> usize {
+        cx.inner
+            .local_cancel_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
+    }
 
     #[test]
     fn test_cx_checkpoint_observes_cancellation() {
         let cx = Cx::new();
+        assert_eq!(local_cancel_waiter_count(&cx), 0);
         assert!(cx.checkpoint().is_ok());
         cx.cancel();
+        assert_eq!(local_cancel_waiter_count(&cx), 0);
         let err = cx.checkpoint().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Cancelled);
         assert_eq!(err.sqlite_error_code(), SQLITE_INTERRUPT);
@@ -1821,6 +2440,52 @@ mod tests {
     }
 
     #[test]
+    fn spawn_child_preserves_logical_context_without_thread_affinity() {
+        let budget = Budget {
+            deadline: Some(Duration::from_secs(7)),
+            poll_quota: 123,
+            cost_quota: Some(456),
+            priority: 3,
+        };
+        let parent = Cx::<FullCaps>::with_budget(budget).with_trace_context(50, 60, 70);
+        let oracle = Arc::new(EProcessOracle::new(
+            EProcessConfig {
+                p0: 0.1,
+                lambda: 5.0,
+                alpha: 0.05,
+                max_evalue: 1e12,
+            },
+            1,
+        ));
+        parent.set_eprocess_oracle(Arc::clone(&oracle));
+        parent.mark_blocking_io_inline_safe();
+
+        let child = parent.create_child_for_spawn();
+        assert_eq!(child.budget(), budget);
+        assert_eq!(child.trace_id(), 50);
+        assert_eq!(child.decision_id(), 60);
+        assert_eq!(child.policy_id(), 70);
+        assert!(
+            Arc::ptr_eq(
+                child
+                    .inner
+                    .eprocess_oracle
+                    .get()
+                    .expect("spawn child should inherit the e-process oracle"),
+                &oracle
+            ),
+            "spawn child must retain the exact logical policy oracle"
+        );
+        assert!(
+            !child.blocking_io_inline_safe(),
+            "spawn child must not inherit an OS-thread-only I/O permission"
+        );
+
+        parent.cancel_with_reason(CancelReason::RegionClose);
+        assert_eq!(child.cancel_reason(), Some(CancelReason::RegionClose));
+    }
+
+    #[test]
     fn test_create_child_inherits_preexisting_parent_cancellation() {
         let parent = Cx::<FullCaps>::new();
         parent.cancel_with_reason(CancelReason::RegionClose);
@@ -1887,6 +2552,358 @@ mod tests {
             "a weak relay must become inert after its target is dropped"
         );
         assert!(root.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn local_cancellation_future_wakes_for_local_relay() {
+        let root = Cx::<FullCaps>::new();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let wake_count = Arc::new(CountingWake::default());
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut task_cx = TaskContext::from_waker(&waker);
+        let mut cancellation = std::pin::pin!(operation.wait_for_local_cancellation());
+
+        assert_eq!(
+            cancellation.as_mut().poll(&mut task_cx),
+            Poll::Pending,
+            "uncancelled operation should register one waiter"
+        );
+        assert_eq!(local_cancel_waiter_count(&operation), 1);
+
+        assert!(relay.cancel_local(CancelReason::RegionClose));
+        assert_eq!(
+            wake_count.0.load(Ordering::Acquire),
+            1,
+            "local relay cancellation should wake the registered future"
+        );
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Ready(()));
+        assert_eq!(
+            local_cancel_waiter_count(&operation),
+            0,
+            "ready future must leave no stale registration"
+        );
+        assert!(root.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn dropping_local_cancellation_future_unregisters_waiter() {
+        let cx = Cx::<FullCaps>::new();
+        let wake_count = Arc::new(CountingWake::default());
+        let waker = Waker::from(wake_count);
+        let mut task_cx = TaskContext::from_waker(&waker);
+
+        {
+            let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
+            assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Pending);
+            assert_eq!(local_cancel_waiter_count(&cx), 1);
+        }
+
+        assert_eq!(
+            local_cancel_waiter_count(&cx),
+            0,
+            "dropping a pending future must remove its waker"
+        );
+    }
+
+    #[test]
+    fn already_cancelled_local_future_never_registers_a_waiter() {
+        let cx = Cx::<FullCaps>::new();
+        cx.cancel();
+        assert_eq!(local_cancel_waiter_count(&cx), 0);
+
+        let wake_count = Arc::new(CountingWake::default());
+        let waker = Waker::from(wake_count);
+        let mut task_cx = TaskContext::from_waker(&waker);
+        let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Ready(()));
+        assert_eq!(
+            local_cancel_waiter_count(&cx),
+            0,
+            "an already-ready first poll must not register a waiter"
+        );
+    }
+
+    #[test]
+    fn repoll_replaces_the_registered_waker() {
+        let cx = Cx::<FullCaps>::new();
+        let first_wake_count = Arc::new(CountingWake::default());
+        let first_waker = Waker::from(Arc::clone(&first_wake_count));
+        let mut first_task_cx = TaskContext::from_waker(&first_waker);
+        let second_wake_count = Arc::new(CountingWake::default());
+        let second_waker = Waker::from(Arc::clone(&second_wake_count));
+        let mut second_task_cx = TaskContext::from_waker(&second_waker);
+        let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
+
+        assert_eq!(
+            cancellation.as_mut().poll(&mut first_task_cx),
+            Poll::Pending
+        );
+        assert_eq!(
+            cancellation.as_mut().poll(&mut second_task_cx),
+            Poll::Pending
+        );
+        assert_eq!(local_cancel_waiter_count(&cx), 1);
+
+        cx.cancel();
+        assert_eq!(
+            first_wake_count.0.load(Ordering::Acquire),
+            0,
+            "a replaced waker must not be invoked"
+        );
+        assert_eq!(
+            second_wake_count.0.load(Ordering::Acquire),
+            1,
+            "only the most recently registered waker should be invoked"
+        );
+        assert_eq!(
+            cancellation.as_mut().poll(&mut second_task_cx),
+            Poll::Ready(())
+        );
+    }
+
+    #[test]
+    fn local_cancellation_waker_runs_outside_the_registry_lock() {
+        let cx = Cx::<FullCaps>::new();
+        let probe = Arc::new(RegistryProbeWake {
+            inner: Arc::downgrade(&cx.inner),
+            wake_count: AtomicUsize::new(0),
+            registry_was_unlocked: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut task_cx = TaskContext::from_waker(&waker);
+        let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
+
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Pending);
+        cx.cancel();
+        assert!(
+            probe.registry_was_unlocked.load(Ordering::Acquire),
+            "wake callback should acquire the registry without reentrant deadlock"
+        );
+        assert_eq!(probe.wake_count.load(Ordering::Acquire), 1);
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn cancellation_publishes_the_complete_subtree_before_waking_observers() {
+        let root = Cx::<FullCaps>::new();
+        let descendant = root.create_child();
+        let probe = Arc::new(DescendantStateProbeWake {
+            descendant: Arc::downgrade(&descendant.inner),
+            wake_count: AtomicUsize::new(0),
+            saw_descendant_cancelled: AtomicBool::new(false),
+            dispatch_gate_was_unlocked: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut task_cx = TaskContext::from_waker(&waker);
+        let mut cancellation = std::pin::pin!(root.wait_for_local_cancellation());
+
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Pending);
+        root.cancel();
+
+        assert_eq!(probe.wake_count.load(Ordering::Acquire), 1);
+        assert!(
+            probe.saw_descendant_cancelled.load(Ordering::Acquire),
+            "reentrant observers must never see a half-published cancellation tree"
+        );
+        assert!(
+            probe.dispatch_gate_was_unlocked.load(Ordering::Acquire),
+            "callbacks must be able to re-enter family cancellation machinery"
+        );
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Ready(()));
+        assert!(descendant.checkpoint().is_err());
+    }
+
+    #[test]
+    fn panicking_cancellation_waker_does_not_suppress_other_observers() {
+        let root = Cx::<FullCaps>::new();
+        let descendant = root.create_child();
+        let panic_waker = Waker::from(Arc::new(PanicWake));
+        let mut panic_task_cx = TaskContext::from_waker(&panic_waker);
+        let wake_count = Arc::new(CountingWake::default());
+        let counting_waker = Waker::from(Arc::clone(&wake_count));
+        let mut counting_task_cx = TaskContext::from_waker(&counting_waker);
+        let mut panicking = std::pin::pin!(root.wait_for_local_cancellation());
+        let mut counting = std::pin::pin!(root.wait_for_local_cancellation());
+
+        assert_eq!(panicking.as_mut().poll(&mut panic_task_cx), Poll::Pending);
+        assert_eq!(counting.as_mut().poll(&mut counting_task_cx), Poll::Pending);
+        let cancel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            root.cancel();
+        }));
+
+        assert!(
+            cancel_result.is_err(),
+            "the first callback panic must be resumed after notification completes"
+        );
+        assert_eq!(
+            wake_count.0.load(Ordering::Acquire),
+            1,
+            "one panicking observer must not suppress later observers"
+        );
+        assert!(descendant.checkpoint().is_err());
+        assert_eq!(panicking.as_mut().poll(&mut panic_task_cx), Poll::Ready(()));
+        assert_eq!(
+            counting.as_mut().poll(&mut counting_task_cx),
+            Poll::Ready(())
+        );
+        assert_eq!(local_cancel_waiter_count(&root), 0);
+    }
+
+    #[test]
+    fn cancellation_waker_can_reenter_family_state_without_deadlock() {
+        let root = Cx::<FullCaps>::new();
+        let probe = Arc::new(ReentrantFamilyWake {
+            cx: root.clone(),
+            wake_count: AtomicUsize::new(0),
+            child_inherited_cancellation: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut task_cx = TaskContext::from_waker(&waker);
+        let mut cancellation = std::pin::pin!(root.wait_for_local_cancellation());
+
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Pending);
+        root.cancel();
+
+        assert_eq!(probe.wake_count.load(Ordering::Acquire), 1);
+        assert!(
+            probe.child_inherited_cancellation.load(Ordering::Acquire),
+            "a child created reentrantly must be initialized before it is linked"
+        );
+        assert_eq!(root.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn repeated_local_waiter_poll_and_drop_accumulates_nothing() {
+        let cx = Cx::<FullCaps>::new();
+        let initial_children = cx
+            .inner
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let wake_count = Arc::new(CountingWake::default());
+        let waker = Waker::from(wake_count);
+        let mut task_cx = TaskContext::from_waker(&waker);
+
+        for _ in 0..256 {
+            let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
+            assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Pending);
+        }
+
+        assert_eq!(
+            local_cancel_waiter_count(&cx),
+            0,
+            "dropped local wait futures must not accumulate registry entries"
+        );
+        assert_eq!(
+            cx.inner
+                .children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            initial_children,
+            "local wait futures must not allocate child contexts"
+        );
+    }
+
+    #[test]
+    fn local_cancellation_future_defers_while_masked_and_wakes_on_unmask() {
+        let root = Cx::<FullCaps>::new();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let mask = operation.masked();
+        let wake_count = Arc::new(CountingWake::default());
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut task_cx = TaskContext::from_waker(&waker);
+        let mut cancellation = std::pin::pin!(operation.wait_for_local_cancellation());
+
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Pending);
+        assert!(relay.cancel_local(CancelReason::Abort));
+        assert_eq!(wake_count.0.load(Ordering::Acquire), 1);
+
+        assert_eq!(
+            cancellation.as_mut().poll(&mut task_cx),
+            Poll::Pending,
+            "masking must defer cancellation observation"
+        );
+        assert_eq!(
+            local_cancel_waiter_count(&operation),
+            1,
+            "a masked future must remain registered for the unmask boundary"
+        );
+
+        drop(mask);
+        assert_eq!(
+            wake_count.0.load(Ordering::Acquire),
+            2,
+            "outermost unmask must wake a deferred cancellation observer"
+        );
+        assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn local_cancel_request_future_is_ready_while_masked() {
+        let root = Cx::<FullCaps>::new();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let mask = operation.masked();
+        let wake_count = Arc::new(CountingWake::default());
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut task_cx = TaskContext::from_waker(&waker);
+        let mut request = std::pin::pin!(operation.wait_for_local_cancel_request());
+
+        assert_eq!(request.as_mut().poll(&mut task_cx), Poll::Pending);
+        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+        assert_eq!(wake_count.0.load(Ordering::Acquire), 1);
+        assert_eq!(
+            request.as_mut().poll(&mut task_cx),
+            Poll::Ready(()),
+            "raw request notification must not reinterpret masking policy"
+        );
+        assert!(
+            operation.checkpoint().is_ok(),
+            "the context checkpoint itself must continue to defer while masked"
+        );
+        drop(mask);
+        assert!(operation.checkpoint().is_err());
+    }
+
+    #[test]
+    fn local_cancellation_registration_race_leaves_no_stale_waiter() {
+        for _ in 0..64 {
+            let root = Cx::<FullCaps>::new();
+            let (operation, relay) = root.create_child_with_local_cancel_relay();
+            let barrier = Arc::new(Barrier::new(2));
+            let cancel_barrier = Arc::clone(&barrier);
+            let cancel_thread = std::thread::spawn(move || {
+                cancel_barrier.wait();
+                relay.cancel_local(CancelReason::UserInterrupt)
+            });
+
+            let wake_count = Arc::new(CountingWake::default());
+            let waker = Waker::from(Arc::clone(&wake_count));
+            let mut task_cx = TaskContext::from_waker(&waker);
+            let mut cancellation = std::pin::pin!(operation.wait_for_local_cancellation());
+            barrier.wait();
+            let first_poll = cancellation.as_mut().poll(&mut task_cx);
+
+            assert!(
+                cancel_thread
+                    .join()
+                    .expect("cancel thread should not panic")
+            );
+            if first_poll == Poll::Pending {
+                assert!(
+                    wake_count.0.load(Ordering::Acquire) > 0,
+                    "a waiter registered during cancellation must be notified"
+                );
+            }
+            assert_eq!(cancellation.as_mut().poll(&mut task_cx), Poll::Ready(()));
+            assert_eq!(
+                local_cancel_waiter_count(&operation),
+                0,
+                "registration/cancellation race must not strand a waker"
+            );
+        }
     }
 
     #[test]
@@ -2116,6 +3133,47 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
+    fn racing_native_replacements_each_synchronize_the_exact_supplied_handle() {
+        for _ in 0..128 {
+            let cx = Cx::<FullCaps>::new();
+            cx.cancel_with_reason(CancelReason::RegionClose);
+
+            let native_a = NativeCx::for_testing();
+            let native_b = NativeCx::for_testing();
+            let setter_a = cx.clone();
+            let setter_b = cx.clone();
+            let supplied_a = native_a.clone();
+            let supplied_b = native_b.clone();
+            let gate = Arc::new(std::sync::Barrier::new(3));
+            let gate_a = Arc::clone(&gate);
+            let gate_b = Arc::clone(&gate);
+
+            let thread_a = std::thread::spawn(move || {
+                gate_a.wait();
+                setter_a.set_native_cx(supplied_a);
+            });
+            let thread_b = std::thread::spawn(move || {
+                gate_b.wait();
+                setter_b.set_native_cx(supplied_b);
+            });
+            gate.wait();
+            thread_a.join().expect("first replacement must not panic");
+            thread_b.join().expect("second replacement must not panic");
+
+            for native in [&native_a, &native_b] {
+                assert_eq!(
+                    native
+                        .cancel_reason()
+                        .expect("each exact supplied handle must be synchronized")
+                        .kind,
+                    NativeCancelKind::ParentCancelled
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
     fn fallback_creation_racing_ordinary_cancellation_never_misses_reason() {
         for _ in 0..128 {
             let cx = Cx::<FullCaps>::new();
@@ -2248,6 +3306,30 @@ mod tests {
             .expect_err("child should observe inherited native cancel");
         assert_eq!(err.kind(), ErrorKind::Cancelled);
         assert_eq!(child.cancel_reason(), Some(CancelReason::Timeout));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn spawn_child_does_not_carry_a_task_affine_native_context() {
+        let parent = Cx::<FullCaps>::new();
+        parent.set_native_cx(NativeCx::for_testing());
+        let child = parent.create_child_for_spawn();
+
+        assert!(
+            child.attached_native_cx().is_none(),
+            "spawn child must start without the caller task's native context"
+        );
+        assert!(
+            child.inner.fallback_native_cx.get().is_none(),
+            "spawn child must not invent a fallback context before task entry"
+        );
+
+        let task_native = NativeCx::for_testing();
+        child.set_native_cx(task_native);
+        assert!(
+            child.attached_native_cx().is_some(),
+            "the spawned task must be able to attach its own native context"
+        );
     }
 
     #[test]
@@ -2725,6 +3807,38 @@ mod tests {
         };
         assert_eq!(live_count, 1, "only the live child should remain linked");
         assert!(live_child.is_cancel_requested());
+    }
+
+    #[test]
+    fn dropped_children_are_pruned_before_registry_growth_without_cancellation() {
+        let parent = Cx::<FullCaps>::new();
+        drop(parent.create_child());
+        let initial_capacity = parent
+            .inner
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity();
+        assert!(initial_capacity > 0);
+
+        for _ in 0..4_096 {
+            drop(parent.create_child());
+        }
+
+        let children = parent
+            .inner
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            children.capacity(),
+            initial_capacity,
+            "historical dead children must not grow an uncancelled family registry"
+        );
+        assert!(
+            children.len() <= initial_capacity,
+            "only the current bounded batch of dead weak links may remain"
+        );
     }
 
     #[test]

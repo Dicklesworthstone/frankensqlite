@@ -49,6 +49,42 @@ use crate::traits::{
     self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend, WalFuture,
 };
 
+fn atomic_usize_checked_update(
+    counter: &AtomicUsize,
+    success: AtomicOrdering,
+    failure: AtomicOrdering,
+    mut update: impl FnMut(usize) -> Option<usize>,
+) -> std::result::Result<usize, usize> {
+    let mut current = counter.load(failure);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match counter.compare_exchange_weak(current, next, success, failure) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn atomic_u64_checked_update(
+    counter: &AtomicU64,
+    success: AtomicOrdering,
+    failure: AtomicOrdering,
+    mut update: impl FnMut(u64) -> Option<u64>,
+) -> std::result::Result<u64, u64> {
+    let mut current = counter.load(failure);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match counter.compare_exchange_weak(current, next, success, failure) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Identity-hashed `HashMap<PageNumber, V>` used on the INSERT hot path.
 ///
 /// Profile showed `RandomState::hash_one::<&PageNumber>` at ~1.0% self-time.
@@ -854,7 +890,65 @@ impl KeyedWaitRegistry {
 }
 
 /// Per-database group commit queue for WAL write consolidation.
+#[derive(Debug, Clone, Default)]
+struct GroupCommitFinalizationBinding {
+    paths: HashSet<PathBuf>,
+    identity: Option<FileIdentity>,
+}
+
+struct RootedPendingEpochResolution {
+    durability: GroupCommitFlushDurability,
+    durable_io_completions: Vec<Arc<AtomicBool>>,
+    root_attempt: ProcessRootFinalizationAttempt,
+}
+
+struct PendingEpochResolutionClaim {
+    queue: Arc<GroupCommitQueue>,
+    epoch: u64,
+    record: Option<RootedPendingEpochResolution>,
+    in_flight: bool,
+}
+
+#[derive(Default)]
+struct GroupCommitExternalLockCoordination {
+    physical_lock_windows: HashSet<SharedDbFileKey>,
+    logical_exit_in_flight: HashSet<SharedDbFileKey>,
+}
+
+trait PendingGroupCommitTxnAttemptOperation: Send + Sync {
+    fn pager_inner_identity(&self) -> *const ();
+
+    fn allocator_delta(&self) -> PendingGroupCommitAllocatorDelta;
+
+    fn complete_authorized_global(
+        &self,
+        authorization: ParallelWalPublicationAuthorization,
+        complete_group_pages: &HashMap<PageNumber, PageData>,
+        group_allocator_delta: &PendingGroupCommitAllocatorDelta,
+        apply_allocator_delta: bool,
+    ) -> Result<()>;
+
+    fn complete_not_committed_global(&self) -> Result<()>;
+}
+
+struct PendingGroupCommitTxnAttemptRegistration {
+    epoch: u64,
+    operation: Arc<dyn PendingGroupCommitTxnAttemptOperation>,
+}
+
 struct GroupCommitQueue {
+    /// Stable process-local identity. Pointer addresses are unsuitable because
+    /// allocator reuse can alias an old finalization record after its queue is
+    /// dropped.
+    queue_id: u64,
+    /// Purely lexical path aliases plus the concrete open-file identity used
+    /// to find process-root finalization work before a new opener inspects
+    /// storage.
+    finalization_binding: Mutex<GroupCommitFinalizationBinding>,
+    /// Fast-path admission fence. Ordinary begins read only this atomic; the
+    /// process-root registry mutex is touched only while exceptional
+    /// finalization work actually exists.
+    rooted_finalization_attempts: AtomicUsize,
     /// The consolidator managing FILLING→FLUSHING→COMPLETE phases.
     consolidator: Mutex<GroupCommitConsolidator>,
     /// Condvar for waiters to park on until flush completes.
@@ -878,6 +972,15 @@ struct GroupCommitQueue {
     /// RAII lease releases on success, error, or cancellation. Terminal
     /// evidence is reclaimed only after this count reaches zero.
     epoch_consumer_counts: Mutex<HashMap<u64, usize>>,
+    /// Stable per-queue ordering for deferred finalization lanes. A record
+    /// keeps its first sequence across claims and cancellation requeues.
+    next_finalization_sequence: AtomicU64,
+    /// Logical Phase-C owners keyed by the exact physical batch id.
+    ///
+    /// A single physical flush can contain transactions from several pager
+    /// handles. Recovery therefore cannot safely finalize only the flusher's
+    /// local transaction state; it must address each admitted batch member.
+    pending_txn_attempts: Mutex<HashMap<u64, PendingGroupCommitTxnAttemptRegistration>>,
     /// Lazily seeded from the pager's current visible commit clock at the
     /// first physical flush for this database identity.
     durability_combiner: Mutex<Option<Arc<ParallelWalDurabilityCombiner>>>,
@@ -897,19 +1000,56 @@ struct GroupCommitQueue {
     /// removes exactly one entry and returns it on Drop until restoration is
     /// terminal; no detached cleanup task is required.
     pending_external_unlocks: Mutex<VecDeque<PendingExternalUnlock>>,
-    /// Shared ownership records for queued external locks.
+    /// External-unlock records temporarily owned by async claimants.
     ///
-    /// The record remains present while a cleanup claimant temporarily owns
-    /// the queue entry. Transaction Drop can therefore hand its eventual lock
-    /// target to the same obligation without racing a claim/requeue cycle.
-    pending_external_unlock_ownership: Mutex<HashMap<u64, PendingExternalUnlockOwnership>>,
+    /// A claim is removed from `pending_external_unlocks` while it reconciles
+    /// durability and restores the flusher's exact file handle. Logical
+    /// transaction cleanup must remain fenced during that interval or it can
+    /// release a snapshot first and then have the physical claimant restore a
+    /// stronger lock afterward.
+    external_unlock_claims_in_flight: AtomicUsize,
+    /// Identity-wide external restorations temporarily owned by claimants.
+    ///
+    /// This is a subset of `external_unlock_claims_in_flight`. Publishing the
+    /// subset while the pending-queue mutex is held prevents an exact-handle
+    /// settler from racing past a global maintenance or partial-acquisition
+    /// restoration after that record has been removed from the visible queue.
+    identity_wide_external_unlock_claims_in_flight: AtomicUsize,
+    /// Exact file handles whose oldest queued restoration is currently leased.
+    ///
+    /// Queue order alone is insufficient once a claimant removes the oldest
+    /// record: without this set, a second claimant could lease the next record
+    /// for the same handle and restore the two baselines concurrently. Claims
+    /// for unrelated handles remain independent.
+    exact_external_unlock_claims_in_flight: Mutex<HashSet<SharedDbFileKey>>,
+    /// Serializes external-lock transitions on each exact open file handle.
+    ///
+    /// The flusher clones its `SharedDbFile` while briefly holding
+    /// `PagerInner`, drops that guard, then publishes exclusive physical
+    /// ownership for the handle before RESERVED is acquired. Logical
+    /// transitions on that same handle wait until direct or queued restoration
+    /// is terminal. Distinct handles for one file identity remain concurrent.
+    external_lock_coordination: Mutex<GroupCommitExternalLockCoordination>,
+    /// Cancel-safe wake generation for exact-handle external-lock ownership.
+    ///
+    /// Normal admissions and already-authorized logical exits wait here rather
+    /// than surfacing `BusyRecovery` merely because a compatible peer reached
+    /// the coordination boundary first.
+    external_lock_waiters: KeyedWaitSlot,
     /// Epochs whose flusher was dropped after durable mutation started but
     /// before the lower I/O layer reported a terminal durable result.
     ///
     /// These remain fail-closed in FLUSHING. The shared completion signal is
     /// retained so a waiter, subsequent commit, or future lower-layer
     /// reconciler can publish the epoch once durability becomes terminal.
-    in_doubt_epochs: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    in_doubt_epochs: Mutex<HashMap<u64, RootedPendingEpochResolution>>,
+    /// Resolution records temporarily removed from `in_doubt_epochs` while a
+    /// claimant performs the terminal consolidator transition.
+    epoch_resolution_claims_in_flight: AtomicUsize,
+    /// Transaction objects abandoned after physical admission but before
+    /// logical Phase C. Each record carries its own process-root attempt and
+    /// remains queued across cancellation until transaction exit is terminal.
+    pending_logical_cleanups: Mutex<VecDeque<PendingGroupCommitLogicalCleanup>>,
 }
 
 type LaneStagedPreparedBatch = ParallelWalLaneBatch<traits::PreparedWalFrameBatch>;
@@ -986,6 +1126,7 @@ struct PreparedPersistedGroupCommitEpoch {
 struct PendingGroupCommitPublicationState {
     prepared: Option<PreparedPersistedGroupCommitEpoch>,
     receipt: Option<ParallelWalDurabilityReceipt>,
+    interval: Option<(u64, u64)>,
 }
 
 struct PendingGroupCommitPublication {
@@ -994,10 +1135,12 @@ struct PendingGroupCommitPublication {
 
 impl PendingGroupCommitPublication {
     fn new(prepared: PreparedPersistedGroupCommitEpoch) -> Self {
+        let interval = Some((prepared.frames_start, prepared.frames_end));
         Self {
             state: Mutex::new(PendingGroupCommitPublicationState {
                 prepared: Some(prepared),
                 receipt: None,
+                interval,
             }),
         }
     }
@@ -1025,13 +1168,9 @@ impl PendingGroupCommitPublication {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .prepared
-            .as_ref()
-            .map(|prepared| (prepared.frames_start, prepared.frames_end))
-            .ok_or_else(|| {
-                FrankenError::internal("parallel WAL publication has no pending interval")
-            })
+        state.interval.ok_or_else(|| {
+            FrankenError::internal("parallel WAL publication has no recoverable interval")
+        })
     }
 
     fn finalize(&self, queue: &GroupCommitQueue) -> Result<ParallelWalDurabilityReceipt> {
@@ -1109,7 +1248,7 @@ impl PendingGroupCommitPublication {
                 "cannot abort an already-published parallel WAL interval",
             ));
         }
-        let Some(prepared) = state.prepared.take() else {
+        let Some(prepared) = state.prepared.as_ref() else {
             return Ok(());
         };
         prepared
@@ -1120,7 +1259,10 @@ impl PendingGroupCommitPublication {
                     "parallel WAL pending publication abort failed for epoch {}: {error}",
                     prepared.epoch
                 ))
-            })
+            })?;
+        state.prepared.take();
+        state.interval = None;
+        Ok(())
     }
 }
 
@@ -1198,6 +1340,51 @@ fn set_parallel_wal_control_override(control: Option<ParallelWalControlSurface>)
 }
 
 impl GroupCommitQueue {
+    fn bind_finalization_path(self: &Arc<Self>, path: &Path) {
+        let path = lexical_normalize_path(path.to_path_buf());
+        {
+            let mut binding = self
+                .finalization_binding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            binding.paths.insert(path);
+        }
+        refresh_process_root_finalization_binding(self);
+    }
+
+    fn bind_finalization_identity(self: &Arc<Self>, identity: FileIdentity) {
+        {
+            let mut binding = self
+                .finalization_binding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match binding.identity {
+                Some(bound) => debug_assert_eq!(
+                    bound, identity,
+                    "one group-commit queue must not span file identities"
+                ),
+                None => binding.identity = Some(identity),
+            }
+        }
+        refresh_process_root_finalization_binding(self);
+    }
+
+    fn has_process_root_finalization_attempt(&self) -> bool {
+        self.rooted_finalization_attempts
+            .load(AtomicOrdering::Acquire)
+            != 0
+    }
+
+    fn has_identity_wide_process_root(&self) -> bool {
+        self.has_process_root_finalization_attempt()
+            && process_root_finalization_scope_is_relevant(self.queue_id, None)
+    }
+
+    fn has_relevant_process_root(&self, handle_key: SharedDbFileKey) -> bool {
+        self.has_process_root_finalization_attempt()
+            && process_root_finalization_scope_is_relevant(self.queue_id, Some(handle_key))
+    }
+
     fn new(config: GroupCommitConfig) -> Self {
         Self::with_parallel_wal_control(config, resolve_parallel_wal_control_surface())
     }
@@ -1207,20 +1394,31 @@ impl GroupCommitQueue {
         parallel_wal_control: ParallelWalControlSurface,
     ) -> Self {
         Self {
+            queue_id: next_process_root_finalization_id(&NEXT_GROUP_COMMIT_QUEUE_ID),
+            finalization_binding: Mutex::new(GroupCommitFinalizationBinding::default()),
+            rooted_finalization_attempts: AtomicUsize::new(0),
             consolidator: Mutex::new(GroupCommitConsolidator::new(config)),
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
             failed_epochs: Mutex::new(HashMap::new()),
             persisted_epochs: Mutex::new(HashMap::new()),
             epoch_consumer_counts: Mutex::new(HashMap::new()),
+            next_finalization_sequence: AtomicU64::new(1),
+            pending_txn_attempts: Mutex::new(HashMap::new()),
             durability_combiner: Mutex::new(None),
             epoch_waiters: KeyedWaitRegistry::new(),
             commit_service_control_epoch: AtomicU64::new(0),
             commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
             parallel_wal_lanes: ParallelWalLaneStager::new(parallel_wal_control),
             pending_external_unlocks: Mutex::new(VecDeque::new()),
-            pending_external_unlock_ownership: Mutex::new(HashMap::new()),
+            external_unlock_claims_in_flight: AtomicUsize::new(0),
+            identity_wide_external_unlock_claims_in_flight: AtomicUsize::new(0),
+            exact_external_unlock_claims_in_flight: Mutex::new(HashSet::new()),
+            external_lock_coordination: Mutex::new(GroupCommitExternalLockCoordination::default()),
+            external_lock_waiters: KeyedWaitSlot::default(),
             in_doubt_epochs: Mutex::new(HashMap::new()),
+            epoch_resolution_claims_in_flight: AtomicUsize::new(0),
+            pending_logical_cleanups: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -1230,6 +1428,10 @@ impl GroupCommitQueue {
 
     fn next_parallel_wal_batch_id(&self) -> u64 {
         self.parallel_wal_lanes.next_batch_id()
+    }
+
+    fn next_finalization_sequence(&self) -> u64 {
+        next_process_root_finalization_id(&self.next_finalization_sequence)
     }
 
     fn current_parallel_wal_lane_id(&self) -> u16 {
@@ -1461,6 +1663,325 @@ impl GroupCommitQueue {
         })
     }
 
+    fn register_txn_attempt(
+        &self,
+        epoch: u64,
+        batch_id: u64,
+        operation: Arc<dyn PendingGroupCommitTxnAttemptOperation>,
+    ) -> Result<()> {
+        use std::collections::hash_map::Entry;
+
+        let mut attempts = self
+            .pending_txn_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match attempts.entry(batch_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(PendingGroupCommitTxnAttemptRegistration { epoch, operation });
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(FrankenError::internal(format!(
+                "group-commit batch {batch_id} registered two logical Phase-C owners"
+            ))),
+        }
+    }
+
+    fn unregister_txn_attempt(&self, batch_id: u64) {
+        self.pending_txn_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&batch_id);
+    }
+
+    fn complete_txn_attempts_authorized(
+        &self,
+        epoch: u64,
+        batches: &[TransactionFrameBatch],
+        durability_receipt: &ParallelWalDurabilityReceipt,
+        complete_group_pages: &HashMap<PageNumber, PageData>,
+    ) -> Result<()> {
+        let (attempts, registered_for_epoch) = {
+            let attempts = self
+                .pending_txn_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let registered_for_epoch = attempts
+                .values()
+                .filter(|registration| registration.epoch == epoch)
+                .count();
+            let matching_attempts = batches
+                .iter()
+                .filter_map(|batch| {
+                    let batch_id = batch.context.batch_id;
+                    attempts.get(&batch_id).map(|registration| {
+                        (
+                            batch_id,
+                            registration.epoch,
+                            Arc::clone(&registration.operation),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            (matching_attempts, registered_for_epoch)
+        };
+        if attempts.len() != registered_for_epoch {
+            return Err(FrankenError::internal(format!(
+                "group-commit epoch {epoch} omitted a registered logical owner from its durable batch set"
+            )));
+        }
+        if !attempts.is_empty() && attempts.len() != batches.len() {
+            return Err(FrankenError::internal(format!(
+                "group-commit epoch {epoch} mixed owned and ownerless durable batches"
+            )));
+        }
+
+        let mut group_allocator_delta = PendingGroupCommitAllocatorDelta::default();
+        for (_, _, operation) in &attempts {
+            group_allocator_delta.extend(operation.allocator_delta());
+        }
+        group_allocator_delta.normalize();
+
+        let mut normalized_pager_inners = HashSet::new();
+        for (batch_id, registered_epoch, operation) in &attempts {
+            if *registered_epoch != epoch {
+                return Err(FrankenError::internal(format!(
+                    "group-commit batch {batch_id} was registered for epoch {registered_epoch}, \
+                     not recovered epoch {epoch}"
+                )));
+            }
+            let assigned_commit_seq = durability_receipt
+                .commit_seq_for_batch(*batch_id)
+                .ok_or_else(|| {
+                    FrankenError::internal(format!(
+                        "authorized group-commit receipt has no sequence for batch {batch_id}"
+                    ))
+                })?;
+            let apply_allocator_delta =
+                normalized_pager_inners.insert(operation.pager_inner_identity());
+            operation.complete_authorized_global(
+                ParallelWalPublicationAuthorization {
+                    durability_receipt: durability_receipt.clone(),
+                    batch_id: *batch_id,
+                    assigned_commit_seq,
+                },
+                complete_group_pages,
+                &group_allocator_delta,
+                apply_allocator_delta,
+            )?;
+        }
+
+        let mut registered = self
+            .pending_txn_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (batch_id, _, _) in attempts {
+            registered.remove(&batch_id);
+        }
+        Ok(())
+    }
+
+    fn complete_txn_attempts_not_committed(&self, epoch: u64) -> Result<()> {
+        let attempts = {
+            let attempts = self
+                .pending_txn_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            attempts
+                .iter()
+                .filter(|(_, registration)| registration.epoch == epoch)
+                .map(|(&batch_id, registration)| {
+                    (
+                        batch_id,
+                        registration.epoch,
+                        Arc::clone(&registration.operation),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (batch_id, registered_epoch, operation) in &attempts {
+            if *registered_epoch != epoch {
+                return Err(FrankenError::internal(format!(
+                    "group-commit batch {batch_id} was registered for epoch {registered_epoch}, \
+                     not rejected epoch {epoch}"
+                )));
+            }
+            operation.complete_not_committed_global()?;
+        }
+
+        let mut registered = self
+            .pending_txn_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (batch_id, _, _) in attempts {
+            registered.remove(&batch_id);
+        }
+        Ok(())
+    }
+
+    fn enqueue_pending_logical_cleanup(
+        self: &Arc<Self>,
+        mut cleanup: PendingGroupCommitLogicalCleanup,
+    ) {
+        if cleanup.sequence.is_none() {
+            cleanup.sequence = Some(self.next_finalization_sequence());
+        }
+        if cleanup.root_attempt.is_none() {
+            // Publish process-root ownership before the queue record. A
+            // concurrent entry gate in this short interval observes the root
+            // and fails closed instead of mistaking the database for clean.
+            cleanup.root_attempt = Some(ProcessRootFinalizationAttempt::register_scope(
+                self,
+                cleanup.scope,
+            ));
+        }
+        self.pending_logical_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(cleanup);
+    }
+
+    fn requeue_pending_logical_cleanup(
+        self: &Arc<Self>,
+        mut cleanup: PendingGroupCommitLogicalCleanup,
+    ) {
+        if cleanup.sequence.is_none() {
+            tracing::error!(
+                "requeued logical group-commit cleanup lost its FIFO sequence; \
+                 assigning a fail-closed tail sequence"
+            );
+            cleanup.sequence = Some(self.next_finalization_sequence());
+        }
+        if cleanup.root_attempt.is_none() {
+            tracing::error!(
+                "requeued logical group-commit cleanup lost its process-root token; \
+                 installing a replacement fail-closed owner"
+            );
+            cleanup.root_attempt = Some(ProcessRootFinalizationAttempt::register_scope(
+                self,
+                cleanup.scope,
+            ));
+        }
+        let mut pending = self
+            .pending_logical_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_pending_logical_cleanup_by_sequence(&mut pending, cleanup);
+    }
+
+    fn pending_logical_cleanup_count(&self) -> usize {
+        self.pending_logical_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn pending_logical_cleanup_count_for_handle(&self, handle_key: SharedDbFileKey) -> usize {
+        self.pending_logical_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|cleanup| {
+                cleanup.scope == ProcessRootFinalizationScope::ExactHandle(handle_key)
+            })
+            .count()
+    }
+
+    fn claim_pending_logical_cleanup(
+        self: &Arc<Self>,
+    ) -> Option<PendingGroupCommitLogicalCleanupClaim> {
+        self.claim_pending_logical_cleanup_for(ProcessRootFinalizationSelector::Any)
+    }
+
+    fn claim_pending_logical_cleanup_for_handle(
+        self: &Arc<Self>,
+        handle_key: SharedDbFileKey,
+    ) -> Option<PendingGroupCommitLogicalCleanupClaim> {
+        self.claim_pending_logical_cleanup_for(ProcessRootFinalizationSelector::ExactHandle(
+            handle_key,
+        ))
+    }
+
+    fn claim_pending_logical_cleanup_for(
+        self: &Arc<Self>,
+        selector: ProcessRootFinalizationSelector,
+    ) -> Option<PendingGroupCommitLogicalCleanupClaim> {
+        let mut pending_logical_cleanups = self
+            .pending_logical_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut seen_handles = HashSet::new();
+        let (position, logical_exit_claim) =
+            pending_logical_cleanups
+                .iter()
+                .enumerate()
+                .find_map(|(position, cleanup)| {
+                    if !selector.matches(cleanup.scope) {
+                        return None;
+                    }
+                    let handle_key = cleanup.operation.handle_key();
+                    debug_assert_eq!(
+                        cleanup.scope,
+                        ProcessRootFinalizationScope::ExactHandle(handle_key),
+                        "logical cleanup scope must match its pinned file handle"
+                    );
+                    if !seen_handles.insert(handle_key) {
+                        // Preserve FIFO within one exact-handle lane. If its
+                        // oldest entry cannot claim the handle, a younger entry
+                        // for that handle must not overtake it.
+                        return None;
+                    }
+                    GroupCommitLogicalExitClaim::try_register(self, handle_key)
+                        .map(|claim| (position, claim))
+                })?;
+        let cleanup = pending_logical_cleanups
+            .remove(position)
+            .expect("selected cleanup must remain present while its queue lock is held");
+        drop(pending_logical_cleanups);
+        Some(PendingGroupCommitLogicalCleanupClaim {
+            queue: Arc::clone(self),
+            cleanup: Some(cleanup),
+            logical_exit_claim: Some(logical_exit_claim),
+        })
+    }
+
+    async fn resolve_one_pending_logical_cleanup(self: &Arc<Self>) -> Result<bool> {
+        if self.has_pending_or_claimed_identity_wide_external_unlock()
+            || self.has_unresolved_in_doubt_epoch()
+        {
+            return Ok(false);
+        }
+        let Some(mut claim) = self.claim_pending_logical_cleanup() else {
+            return Ok(false);
+        };
+        if !claim.resolve().await? {
+            return Ok(false);
+        }
+        let mut cleanup = claim.finish();
+        cleanup.release_root_after_terminal();
+        Ok(true)
+    }
+
+    async fn resolve_one_pending_logical_cleanup_for_handle(
+        self: &Arc<Self>,
+        handle_key: SharedDbFileKey,
+    ) -> Result<bool> {
+        if self.has_pending_or_claimed_identity_wide_external_unlock()
+            || self.has_unresolved_in_doubt_epoch()
+        {
+            return Ok(false);
+        }
+        let Some(mut claim) = self.claim_pending_logical_cleanup_for_handle(handle_key) else {
+            return Ok(false);
+        };
+        if !claim.resolve().await? {
+            return Ok(false);
+        }
+        let mut cleanup = claim.finish();
+        cleanup.release_root_after_terminal();
+        Ok(true)
+    }
+
     fn release_epoch_consumer(&self, epoch: u64) {
         let mut counts = self
             .epoch_consumer_counts
@@ -1541,8 +2062,9 @@ impl GroupCommitQueue {
     ///
     /// This uses the same mutex discipline as `publish_completed_epoch` so
     /// waiter condition checks and condvar parking stay synchronized.
+    #[cfg(test)]
     fn publish_failed_epoch(&self, epoch: u64, error: &FrankenError, wake_next_epoch: bool) {
-        let _guard = self
+        let guard = self
             .consolidator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1552,11 +2074,19 @@ impl GroupCommitQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         failed_epochs.insert(epoch, GroupCommitEpochFailure::from_error(error));
         drop(failed_epochs);
+        drop(guard);
+        if let Err(logical_error) = self.complete_txn_attempts_not_committed(epoch) {
+            tracing::error!(
+                epoch,
+                %logical_error,
+                "failed group-commit epoch retained unfinished logical owners"
+            );
+        }
         self.signal_failed_epoch_waiters(epoch, wake_next_epoch);
         self.reclaim_epoch_metadata_if_unowned(epoch);
     }
 
-    fn abort_cancelled_flush(&self, epoch: u64) {
+    fn abort_flushing_epoch_as_failed(&self, epoch: u64, error: &FrankenError) -> Result<bool> {
         let wake_next_epoch = {
             let mut consolidator = self
                 .consolidator
@@ -1564,22 +2094,40 @@ impl GroupCommitQueue {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if consolidator.phase() != ConsolidationPhase::Flushing || consolidator.epoch() != epoch
             {
-                return;
+                let already_failed = self
+                    .failed_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&epoch);
+                drop(consolidator);
+                if already_failed {
+                    self.complete_txn_attempts_not_committed(epoch)?;
+                    return Ok(false);
+                }
+                return Err(FrankenError::internal(format!(
+                    "cannot abort group-commit epoch {epoch}: it is not the active FLUSHING epoch"
+                )));
             }
-            if let Err(error) = consolidator.abort_flush() {
-                tracing::error!(
-                    %error,
-                    epoch,
-                    "cancelled group-commit flusher could not abort its epoch"
-                );
-                return;
-            }
-            consolidator.has_flusher_vacancy()
+            consolidator.abort_flush()?;
+            let wake_next_epoch = consolidator.has_flusher_vacancy();
+            self.failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(epoch, GroupCommitEpochFailure::from_error(error));
+            wake_next_epoch
         };
-        self.publish_failed_epoch(epoch, &FrankenError::Abort, wake_next_epoch);
+        self.complete_txn_attempts_not_committed(epoch)?;
+        self.signal_failed_epoch_waiters(epoch, wake_next_epoch);
+        self.reclaim_epoch_metadata_if_unowned(epoch);
+        Ok(wake_next_epoch)
     }
 
-    fn complete_cancelled_durable_flush(&self, epoch: u64) {
+    fn abort_cancelled_flush(&self, epoch: u64) -> Result<()> {
+        self.abort_flushing_epoch_as_failed(epoch, &FrankenError::Abort)?;
+        Ok(())
+    }
+
+    fn complete_cancelled_durable_flush(&self, epoch: u64) -> Result<()> {
         let has_promoted = {
             let mut consolidator = self
                 .consolidator
@@ -1587,29 +2135,37 @@ impl GroupCommitQueue {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if consolidator.phase() != ConsolidationPhase::Flushing || consolidator.epoch() != epoch
             {
-                return;
-            }
-            match consolidator.complete_flush() {
-                Ok(has_promoted) => has_promoted,
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        epoch,
-                        "cancelled durable group-commit flusher could not complete its epoch"
-                    );
-                    return;
+                drop(consolidator);
+                if self.is_epoch_complete(epoch) {
+                    return Ok(());
                 }
+                return Err(FrankenError::internal(format!(
+                    "cannot complete durable group-commit epoch {epoch}: it is not the active FLUSHING epoch"
+                )));
             }
+            consolidator.complete_flush()?
         };
         // The certificate, frames, and requested sync are already durable.
         // Never reinterpret that commit as an Abort merely because its caller
         // was cancelled during local cleanup/publication.
         self.publish_completed_epoch(epoch, has_promoted);
+        Ok(())
     }
 
-    fn enqueue_pending_external_unlock(&self, pending: PendingExternalUnlock) {
+    fn enqueue_pending_external_unlock(self: &Arc<Self>, mut pending: PendingExternalUnlock) {
+        if pending.sequence.is_none() {
+            pending.sequence = Some(self.next_finalization_sequence());
+        }
+        if pending.root_attempt.is_none() {
+            // Install process-root ownership before publishing the queue item.
+            // A concurrent opener that sees this admitted-but-not-yet-queued
+            // interval fails closed with BusyRecovery.
+            pending.root_attempt = Some(ProcessRootFinalizationAttempt::register_scope(
+                self,
+                pending.scope,
+            ));
+        }
         let epoch = pending.epoch;
-        self.remember_pending_external_unlock_owner(&pending);
         self.pending_external_unlocks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1617,98 +2173,281 @@ impl GroupCommitQueue {
         // A waiter already parked on the stranded epoch is the preferred
         // structured cleanup owner. The bounded eventcount fallback still
         // covers a signal that races registration.
-        let _ = self.epoch_waiters.signal(epoch);
-        if GROUP_COMMIT_WAIT_PATH_MODE == WaitPathMode::LegacyCondvarTimeout {
-            self.flush_complete.notify_all();
+        if let Some(epoch) = epoch {
+            let _ = self.epoch_waiters.signal(epoch);
+            if GROUP_COMMIT_WAIT_PATH_MODE == WaitPathMode::LegacyCondvarTimeout {
+                self.flush_complete.notify_all();
+            }
         }
     }
 
-    fn requeue_pending_external_unlock_front(&self, pending: PendingExternalUnlock) {
+    fn requeue_pending_external_unlock(self: &Arc<Self>, mut pending: PendingExternalUnlock) {
+        if pending.sequence.is_none() {
+            tracing::error!(
+                epoch = ?pending.epoch,
+                "requeued group-commit finalization lost its FIFO sequence; assigning a fail-closed tail sequence"
+            );
+            pending.sequence = Some(self.next_finalization_sequence());
+        }
+        if pending.root_attempt.is_none() {
+            tracing::error!(
+                epoch = ?pending.epoch,
+                "requeued group-commit finalization lost its process-root token; installing a replacement fail-closed owner"
+            );
+            pending.root_attempt = Some(ProcessRootFinalizationAttempt::register_scope(
+                self,
+                pending.scope,
+            ));
+        }
         let epoch = pending.epoch;
-        self.remember_pending_external_unlock_owner(&pending);
-        self.pending_external_unlocks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_front(pending);
-        let _ = self.epoch_waiters.signal(epoch);
-        if GROUP_COMMIT_WAIT_PATH_MODE == WaitPathMode::LegacyCondvarTimeout {
-            self.flush_complete.notify_all();
-        }
-    }
-
-    fn remember_pending_external_unlock_owner(&self, pending: &PendingExternalUnlock) {
-        self.pending_external_unlock_ownership
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(pending.epoch)
-            .or_insert_with(|| PendingExternalUnlockOwnership {
-                durability_started: Arc::clone(&pending.durability_started),
-                durable_io_completed: Arc::clone(&pending.durable_io_completed),
-                restored: Arc::clone(&pending.restored),
-                restore_target: Arc::clone(&pending.restore_target),
-            });
-    }
-
-    fn forget_pending_external_unlock_owner(&self, epoch: u64) {
-        self.pending_external_unlock_ownership
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&epoch);
-    }
-
-    /// Transfer a transaction's final external-lock transition to the queued
-    /// in-doubt flusher that already owns RESERVED.
-    ///
-    /// This record is independent of the queue lease so transaction Drop can
-    /// update it even while an async cleanup claimant is inspecting the entry.
-    fn handoff_transaction_unlock_to_in_doubt_owner(
-        &self,
-        restore_target: PendingExternalUnlockTarget,
-    ) -> bool {
-        let owners = self
-            .pending_external_unlock_ownership
+        let mut pending_external_unlocks = self
+            .pending_external_unlocks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut matched = 0_usize;
-        for ownership in owners.values() {
-            if ownership.durability_state() != GroupCommitFlushDurability::InDoubt
-                || ownership.restored.load(AtomicOrdering::Acquire)
-            {
-                continue;
+        insert_pending_external_unlock_by_sequence(&mut pending_external_unlocks, pending);
+        drop(pending_external_unlocks);
+        if let Some(epoch) = epoch {
+            let _ = self.epoch_waiters.signal(epoch);
+            if GROUP_COMMIT_WAIT_PATH_MODE == WaitPathMode::LegacyCondvarTimeout {
+                self.flush_complete.notify_all();
             }
-            let mut target = ownership
-                .restore_target
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if ownership.restored.load(AtomicOrdering::Acquire) {
-                continue;
-            }
-            *target = restore_target;
-            matched = matched.saturating_add(1);
         }
-        if matched > 1 {
-            tracing::error!(
-                matched,
-                "multiple in-doubt group-commit epochs claimed one transaction unlock"
-            );
-        }
-        matched != 0
     }
 
     fn claim_pending_external_unlock(self: &Arc<Self>) -> Option<PendingExternalUnlockClaim> {
-        let pending = self
+        self.claim_pending_external_unlock_for(ProcessRootFinalizationSelector::Any)
+    }
+
+    fn claim_pending_external_unlock_for(
+        self: &Arc<Self>,
+        selector: ProcessRootFinalizationSelector,
+    ) -> Option<PendingExternalUnlockClaim> {
+        let mut pending_external_unlocks = self
             .pending_external_unlocks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front()?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if selector != ProcessRootFinalizationSelector::Any
+            && matches!(selector, ProcessRootFinalizationSelector::ExactHandle(_))
+            && pending_external_unlocks
+                .iter()
+                .any(|pending| pending.scope == ProcessRootFinalizationScope::IdentityWide)
+        {
+            // An admitted global restoration fences every exact handle even
+            // before a claimant removes it from the visible queue.
+            return None;
+        }
+        let identity_wide_claims = self
+            .identity_wide_external_unlock_claims_in_flight
+            .load(AtomicOrdering::Acquire);
+        let total_claims = self
+            .external_unlock_claims_in_flight
+            .load(AtomicOrdering::Acquire);
+        let position = if selector == ProcessRootFinalizationSelector::Any {
+            // Identity-wide restoration is the conservative priority lane.
+            // It fences every exact handle, so an Any claimant must not run a
+            // later exact restoration merely because the global record is not
+            // at the deque front. When no global record exists, skip a
+            // handle whose oldest record is already leased so independent
+            // handles do not convoy behind it.
+            pending_external_unlocks
+                .iter()
+                .position(|pending| pending.scope == ProcessRootFinalizationScope::IdentityWide)
+                .or_else(|| {
+                    let exact_claims = self
+                        .exact_external_unlock_claims_in_flight
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    pending_external_unlocks.iter().position(|pending| {
+                        let ProcessRootFinalizationScope::ExactHandle(handle_key) = pending.scope
+                        else {
+                            return false;
+                        };
+                        !exact_claims.contains(&handle_key)
+                    })
+                })?
+        } else {
+            pending_external_unlocks
+                .iter()
+                .position(|pending| selector.matches(pending.scope))?
+        };
+        let scope = pending_external_unlocks[position].scope;
+        let epoch = pending_external_unlocks[position].epoch;
+        match scope {
+            ProcessRootFinalizationScope::IdentityWide if total_claims != 0 => return None,
+            ProcessRootFinalizationScope::ExactHandle(handle_key)
+                if identity_wide_claims != 0
+                    || self
+                        .exact_external_unlock_claims_in_flight
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(&handle_key) =>
+            {
+                return None;
+            }
+            ProcessRootFinalizationScope::IdentityWide
+            | ProcessRootFinalizationScope::ExactHandle(_) => {}
+        }
+        // Publish the in-flight claim while the queue lock is still held.
+        // Otherwise a settler can observe both an empty queue and a zero
+        // claim count after removal but before fetch_add, and run logical
+        // transaction exit ahead of the physical lock restoration.
+        if !self.publish_external_unlock_claim(scope) {
+            tracing::error!(
+                epoch = ?epoch,
+                "group-commit external-unlock claim ownership could not be published; left queued fail closed"
+            );
+            return None;
+        }
+        let pending = pending_external_unlocks
+            .remove(position)
+            .expect("selected item must remain present while the queue lock is held");
+        drop(pending_external_unlocks);
         Some(PendingExternalUnlockClaim {
             queue: Arc::clone(self),
             pending: Some(pending),
+            scope,
+            in_flight: true,
         })
     }
 
+    fn publish_external_unlock_claim(&self, scope: ProcessRootFinalizationScope) -> bool {
+        if let ProcessRootFinalizationScope::ExactHandle(handle_key) = scope {
+            let mut exact_claims = self
+                .exact_external_unlock_claims_in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !exact_claims.insert(handle_key) {
+                return false;
+            }
+        }
+        if atomic_usize_checked_update(
+            &self.external_unlock_claims_in_flight,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |count| count.checked_add(1),
+        )
+        .is_err()
+        {
+            if let ProcessRootFinalizationScope::ExactHandle(handle_key) = scope {
+                self.exact_external_unlock_claims_in_flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&handle_key);
+            }
+            return false;
+        }
+        if scope == ProcessRootFinalizationScope::IdentityWide
+            && atomic_usize_checked_update(
+                &self.identity_wide_external_unlock_claims_in_flight,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+                |count| count.checked_add(1),
+            )
+            .is_err()
+        {
+            self.release_external_unlock_claim_total();
+            return false;
+        }
+        true
+    }
+
+    fn release_external_unlock_claim(&self, scope: ProcessRootFinalizationScope) {
+        match scope {
+            ProcessRootFinalizationScope::IdentityWide => {
+                if atomic_usize_checked_update(
+                    &self.identity_wide_external_unlock_claims_in_flight,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                    |count| count.checked_sub(1),
+                )
+                .is_err()
+                {
+                    tracing::error!("identity-wide external-unlock claim count underflow");
+                }
+            }
+            ProcessRootFinalizationScope::ExactHandle(handle_key) => {
+                if !self
+                    .exact_external_unlock_claims_in_flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&handle_key)
+                {
+                    tracing::error!(
+                        handle_key = handle_key.0,
+                        "exact-handle external-unlock claim released without ownership"
+                    );
+                }
+            }
+        }
+        self.release_external_unlock_claim_total();
+    }
+
+    fn release_external_unlock_claim_total(&self) {
+        if atomic_usize_checked_update(
+            &self.external_unlock_claims_in_flight,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |count| count.checked_sub(1),
+        )
+        .is_err()
+        {
+            tracing::error!("group-commit external-unlock claim count underflow");
+        }
+    }
+
+    fn has_pending_or_claimed_external_unlock(&self) -> bool {
+        let pending_external_unlocks = self
+            .pending_external_unlocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !pending_external_unlocks.is_empty() {
+            return true;
+        }
+        // Read the claim count only after acquiring the queue mutex. A reader
+        // that loaded the count first could observe zero, wait for a claimant
+        // to increment-and-pop under this mutex, then see an empty queue while
+        // retaining the stale zero.
+        self.external_unlock_claims_in_flight
+            .load(AtomicOrdering::Acquire)
+            != 0
+    }
+
+    fn has_pending_or_claimed_identity_wide_external_unlock(&self) -> bool {
+        let pending_external_unlocks = self
+            .pending_external_unlocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending_external_unlocks
+            .iter()
+            .any(|pending| pending.scope == ProcessRootFinalizationScope::IdentityWide)
+        {
+            return true;
+        }
+        self.identity_wide_external_unlock_claims_in_flight
+            .load(AtomicOrdering::Acquire)
+            != 0
+    }
+
     async fn resolve_one_pending_external_unlock(self: &Arc<Self>) -> Result<bool> {
-        let Some(mut claim) = self.claim_pending_external_unlock() else {
+        self.resolve_one_pending_external_unlock_for(ProcessRootFinalizationSelector::Any)
+            .await
+    }
+
+    async fn resolve_one_pending_external_unlock_for_handle(
+        self: &Arc<Self>,
+        handle_key: SharedDbFileKey,
+    ) -> Result<bool> {
+        self.resolve_one_pending_external_unlock_for(ProcessRootFinalizationSelector::ExactHandle(
+            handle_key,
+        ))
+        .await
+    }
+
+    async fn resolve_one_pending_external_unlock_for(
+        self: &Arc<Self>,
+        selector: ProcessRootFinalizationSelector,
+    ) -> Result<bool> {
+        let Some(mut claim) = self.claim_pending_external_unlock_for(selector) else {
             return Ok(false);
         };
         if claim.durability_state() == GroupCommitFlushDurability::InDoubt {
@@ -1721,8 +2460,9 @@ impl GroupCommitQueue {
             }
         }
         claim.restore().await?;
-        let restored = claim.finish();
-        self.resolve_cancelled_flush_after_external_unlock(restored);
+        self.resolve_cancelled_flush_after_external_unlock(claim.pending_mut())?;
+        let mut restored = claim.finish();
+        restored.release_after_terminal();
         Ok(true)
     }
 
@@ -1738,71 +2478,225 @@ impl GroupCommitQueue {
         if !claim.try_restore()? {
             return Ok(false);
         }
-        let restored = claim.finish();
-        self.resolve_cancelled_flush_after_external_unlock(restored);
+        self.resolve_cancelled_flush_after_external_unlock(claim.pending_mut())?;
+        let mut restored = claim.finish();
+        restored.release_after_terminal();
         Ok(true)
     }
 
-    fn resolve_cancelled_flush_after_external_unlock(&self, pending: PendingExternalUnlock) {
+    fn resolve_cancelled_flush_after_external_unlock(
+        self: &Arc<Self>,
+        pending: &mut PendingExternalUnlock,
+    ) -> Result<()> {
+        let Some(epoch) = pending.epoch else {
+            return Ok(());
+        };
         match pending.durability_state() {
             GroupCommitFlushDurability::PreDurable => {
-                self.abort_cancelled_flush(pending.epoch);
+                self.abort_cancelled_flush(epoch)?;
             }
             GroupCommitFlushDurability::Durable => {
-                self.complete_cancelled_durable_flush(pending.epoch);
+                self.complete_cancelled_durable_flush(epoch)?;
             }
             GroupCommitFlushDurability::InDoubt => {
-                self.register_in_doubt_epoch(pending.epoch, pending.durable_io_completed);
+                let root_attempt = pending.root_attempt.take().ok_or_else(|| {
+                    FrankenError::internal(
+                        "in-doubt group-commit finalization lost its process-root token",
+                    )
+                })?;
+                self.defer_pending_epoch_resolution(
+                    epoch,
+                    GroupCommitFlushDurability::InDoubt,
+                    Arc::clone(&pending.durable_io_completed),
+                    Some(root_attempt),
+                );
             }
         }
+        Ok(())
     }
 
-    fn register_in_doubt_epoch(&self, epoch: u64, durable_io_completed: Arc<AtomicBool>) {
-        self.in_doubt_epochs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(epoch, durable_io_completed);
+    fn defer_pending_epoch_resolution(
+        self: &Arc<Self>,
+        epoch: u64,
+        durability: GroupCommitFlushDurability,
+        durable_io_completed: Arc<AtomicBool>,
+        root_attempt: Option<ProcessRootFinalizationAttempt>,
+    ) {
+        let root_attempt =
+            root_attempt.unwrap_or_else(|| ProcessRootFinalizationAttempt::register(self));
+        self.requeue_pending_epoch_resolution(
+            epoch,
+            RootedPendingEpochResolution {
+                durability,
+                durable_io_completions: if durability == GroupCommitFlushDurability::InDoubt {
+                    vec![durable_io_completed]
+                } else {
+                    Vec::new()
+                },
+                root_attempt,
+            },
+        );
         tracing::warn!(
             epoch,
-            "restored dropped group-commit database lock while durability remains in doubt"
+            ?durability,
+            "deferred dropped group-commit epoch resolution to a process-root owner"
         );
-        // A completion token may have become terminal between the state check
-        // and insertion.
-        self.reconcile_durable_in_doubt_epochs();
     }
 
-    fn reconcile_durable_in_doubt_epochs(&self) {
-        let durable_epochs = {
-            let mut in_doubt = self
+    fn requeue_pending_epoch_resolution(&self, epoch: u64, record: RootedPendingEpochResolution) {
+        let redundant_root = {
+            let mut pending = self
                 .in_doubt_epochs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let durable_epochs = in_doubt
-                .iter()
-                .filter_map(|(&epoch, durable)| {
-                    durable.load(AtomicOrdering::Acquire).then_some(epoch)
-                })
-                .collect::<Vec<_>>();
-            for epoch in &durable_epochs {
-                in_doubt.remove(epoch);
+            match pending.entry(epoch) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(record);
+                    None
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    let explicitly_durable = record.durability
+                        == GroupCommitFlushDurability::Durable
+                        || existing.durability == GroupCommitFlushDurability::Durable;
+                    if explicitly_durable {
+                        existing.durability = GroupCommitFlushDurability::Durable;
+                    } else if existing.durability == GroupCommitFlushDurability::InDoubt
+                        || record.durability == GroupCommitFlushDurability::InDoubt
+                    {
+                        existing.durability = GroupCommitFlushDurability::InDoubt;
+                    }
+                    for completion in &record.durable_io_completions {
+                        if !existing
+                            .durable_io_completions
+                            .iter()
+                            .any(|known| Arc::ptr_eq(known, completion))
+                        {
+                            existing.durable_io_completions.push(Arc::clone(completion));
+                        }
+                    }
+                    Some(record.root_attempt)
+                }
             }
-            durable_epochs
         };
-        for epoch in durable_epochs {
-            self.complete_cancelled_durable_flush(epoch);
+        if let Some(root_attempt) = redundant_root {
+            // A concurrent deferrer installed another owner while this record
+            // was claimed. Preserve that live record and explicitly retire
+            // only the now-redundant process-root token.
+            root_attempt.release_after_terminal();
         }
     }
 
-    fn has_unresolved_in_doubt_epoch(&self) -> bool {
-        self.reconcile_durable_in_doubt_epochs();
-        if !self
+    fn claim_pending_epoch_resolution(
+        self: &Arc<Self>,
+        epoch: u64,
+    ) -> Option<PendingEpochResolutionClaim> {
+        let mut pending = self
+            .in_doubt_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.get(&epoch)?;
+        if atomic_usize_checked_update(
+            &self.epoch_resolution_claims_in_flight,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |count| count.checked_add(1),
+        )
+        .is_err()
+        {
+            tracing::error!(
+                epoch,
+                "group-commit epoch-resolution claim count overflowed; left queued fail closed"
+            );
+            return None;
+        }
+        let record = pending
+            .remove(&epoch)
+            .expect("epoch record must remain present while its map lock is held");
+        drop(pending);
+        Some(PendingEpochResolutionClaim {
+            queue: Arc::clone(self),
+            epoch,
+            record: Some(record),
+            in_flight: true,
+        })
+    }
+
+    fn release_epoch_resolution_claim(&self) {
+        if atomic_usize_checked_update(
+            &self.epoch_resolution_claims_in_flight,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |count| count.checked_sub(1),
+        )
+        .is_err()
+        {
+            tracing::error!("group-commit epoch-resolution claim count underflow");
+        }
+    }
+
+    fn resolve_pending_epoch_resolutions(self: &Arc<Self>) -> Result<()> {
+        let epochs = self
             .in_doubt_epochs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for epoch in epochs {
+            let Some(mut claim) = self.claim_pending_epoch_resolution(epoch) else {
+                continue;
+            };
+            let record = claim
+                .record
+                .as_ref()
+                .expect("epoch-resolution claim must retain its record");
+            let target = match record.durability {
+                GroupCommitFlushDurability::PreDurable => GroupCommitFlushDurability::PreDurable,
+                GroupCommitFlushDurability::Durable => GroupCommitFlushDurability::Durable,
+                GroupCommitFlushDurability::InDoubt
+                    if !record.durable_io_completions.is_empty()
+                        && record
+                            .durable_io_completions
+                            .iter()
+                            .all(|signal| signal.load(AtomicOrdering::Acquire)) =>
+                {
+                    GroupCommitFlushDurability::Durable
+                }
+                GroupCommitFlushDurability::InDoubt => {
+                    drop(claim);
+                    continue;
+                }
+            };
+            let terminal_result = match target {
+                GroupCommitFlushDurability::PreDurable => self.abort_cancelled_flush(epoch),
+                GroupCommitFlushDurability::Durable => self.complete_cancelled_durable_flush(epoch),
+                GroupCommitFlushDurability::InDoubt => unreachable!(),
+            };
+            match terminal_result {
+                Ok(()) => claim.finish_terminal(),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn has_unresolved_in_doubt_epoch(&self) -> bool {
+        let pending_epoch_resolutions = self
+            .in_doubt_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !pending_epoch_resolutions.is_empty() {
+            return true;
+        }
+        if self
+            .epoch_resolution_claims_in_flight
+            .load(AtomicOrdering::Acquire)
+            != 0
         {
             return true;
         }
+        drop(pending_epoch_resolutions);
         self.pending_external_unlocks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1817,8 +2711,35 @@ impl GroupCommitQueue {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match consolidator.abort_filling(target_epoch) {
-                Ok(failed_epoch) => failed_epoch,
+                Ok(failed_epoch) => {
+                    self.failed_epochs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            failed_epoch,
+                            GroupCommitEpochFailure::from_error(&FrankenError::Abort),
+                        );
+                    failed_epoch
+                }
                 Err(error) => {
+                    let already_failed = self
+                        .failed_epochs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains_key(&target_epoch);
+                    drop(consolidator);
+                    if already_failed {
+                        if let Err(logical_error) =
+                            self.complete_txn_attempts_not_committed(target_epoch)
+                        {
+                            tracing::error!(
+                                target_epoch,
+                                %logical_error,
+                                "cancelled filling epoch retained unfinished logical owners"
+                            );
+                        }
+                        return;
+                    }
                     tracing::debug!(
                         target_epoch,
                         %error,
@@ -1828,7 +2749,15 @@ impl GroupCommitQueue {
                 }
             }
         };
-        self.publish_failed_epoch(failed_epoch, &FrankenError::Abort, false);
+        if let Err(error) = self.complete_txn_attempts_not_committed(failed_epoch) {
+            tracing::error!(
+                failed_epoch,
+                %error,
+                "cancelled filling epoch retained unfinished logical owners"
+            );
+        }
+        self.signal_failed_epoch_waiters(failed_epoch, false);
+        self.reclaim_epoch_metadata_if_unowned(failed_epoch);
     }
 
     /// Check if a given epoch has completed (for waiters).
@@ -2050,10 +2979,14 @@ impl GroupCommitQueue {
         target_epoch: u64,
     ) -> Result<WaitForEpochOutcome> {
         loop {
-            while self.resolve_one_pending_external_unlock().await? {}
-            if self.has_unresolved_in_doubt_epoch() {
-                return Err(FrankenError::BusyRecovery);
-            }
+            // A pending exact-handle logical exit can itself depend on this
+            // epoch reaching a terminal verdict. Requiring every exact lane
+            // to settle before observing the epoch creates a progress cycle
+            // when the promoted flusher was dropped. Identity-wide physical
+            // and in-doubt work remains a queue-wide prerequisite; exact
+            // physical ownership is enforced later by the flusher's handle
+            // coordination window.
+            settle_identity_wide_group_commit_finalization(self).await?;
             let slot = self.epoch_waiters.slot(target_epoch);
             let observed_generation = slot.generation();
             let outcome = {
@@ -2084,6 +3017,35 @@ impl GroupCommitQueue {
                 );
             }
             cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        }
+    }
+}
+
+impl PendingEpochResolutionClaim {
+    fn finish_terminal(&mut self) {
+        let record = self
+            .record
+            .take()
+            .expect("terminal epoch-resolution claim must own its record");
+        record.root_attempt.release_after_terminal();
+        if self.in_flight {
+            self.queue.release_epoch_resolution_claim();
+            self.in_flight = false;
+        }
+    }
+}
+
+impl Drop for PendingEpochResolutionClaim {
+    fn drop(&mut self) {
+        if let Some(record) = self.record.take() {
+            self.queue
+                .requeue_pending_epoch_resolution(self.epoch, record);
+        }
+        // Requeue before clearing the claim publication so a concurrent
+        // settler cannot observe both an empty map and a zero claim count.
+        if self.in_flight {
+            self.queue.release_epoch_resolution_claim();
+            self.in_flight = false;
         }
     }
 }
@@ -2214,17 +3176,35 @@ impl Drop for GroupCommitFlushObligation {
             );
             return;
         }
-        match self.durability_state() {
-            GroupCommitFlushDurability::PreDurable => {
-                self.queue.abort_cancelled_flush(self.epoch);
-            }
+        let durability = self.durability_state();
+        let transition_result = match durability {
+            GroupCommitFlushDurability::PreDurable => self.queue.abort_cancelled_flush(self.epoch),
             GroupCommitFlushDurability::InDoubt => {
-                self.queue
-                    .register_in_doubt_epoch(self.epoch, Arc::clone(&self.durable_io_completed));
+                self.queue.defer_pending_epoch_resolution(
+                    self.epoch,
+                    GroupCommitFlushDurability::InDoubt,
+                    Arc::clone(&self.durable_io_completed),
+                    None,
+                );
+                Ok(())
             }
             GroupCommitFlushDurability::Durable => {
-                self.queue.complete_cancelled_durable_flush(self.epoch);
+                self.queue.complete_cancelled_durable_flush(self.epoch)
             }
+        };
+        if let Err(error) = transition_result {
+            tracing::error!(
+                %error,
+                epoch = self.epoch,
+                ?durability,
+                "dropped group-commit epoch transition failed; retained for process-root retry"
+            );
+            self.queue.defer_pending_epoch_resolution(
+                self.epoch,
+                durability,
+                Arc::clone(&self.durable_io_completed),
+                None,
+            );
         }
     }
 }
@@ -2233,24 +3213,27 @@ trait PendingGroupCommitRecoveryOperation: Send + Sync {
     fn reconcile(&self) -> LocalPagerFuture<'_, GroupCommitFlushDurability>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingGroupCommitRecoveryResolution {
-    Authorized,
+    AuthorizedPendingLogical(ParallelWalDurabilityReceipt),
+    Authorized(ParallelWalDurabilityReceipt),
+    NotCommittedPendingLogical,
     NotCommitted,
 }
 
 struct PendingGroupCommitRecovery<F: VfsFile + 'static> {
     queue: Weak<GroupCommitQueue>,
+    epoch: u64,
     _epoch_consumer: Arc<GroupCommitEpochConsumer>,
     publication: Arc<PendingGroupCommitPublication>,
-    wal_backend: SharedWalBackend,
+    /// Exact backend instance that accepted the certified frame interval.
+    /// The pager's outer `SharedWalBackend` slot is replaceable and therefore
+    /// cannot identify recovery work after the initiating future is dropped.
+    wal_backend: WalBackendHandle,
     inner: Arc<Mutex<PagerInner<F>>>,
     published: Option<Arc<PublishedPagerState>>,
     batches: Vec<TransactionFrameBatch>,
     final_db_size: u32,
-    publication_journal_mode: JournalMode,
-    publication_freelist_count: usize,
-    checkpoint_active: bool,
     sync: bool,
     sidecar_completion: Arc<Mutex<Option<VfsWriteCompletion>>>,
     wal_completion: Arc<Mutex<Option<VfsWriteCompletion>>>,
@@ -2278,47 +3261,62 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
     }
 
     fn complete_authorized(&self, cx: &Cx) -> Result<ParallelWalDurabilityReceipt> {
-        if self
+        let recorded_resolution = self
             .resolution
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some_and(|resolution| {
-                resolution == PendingGroupCommitRecoveryResolution::NotCommitted
-            })
-        {
-            return Err(FrankenError::internal(
-                "cannot publish a parallel WAL interval already proven not committed",
-            ));
+            .clone();
+        match recorded_resolution {
+            Some(PendingGroupCommitRecoveryResolution::Authorized(receipt)) => {
+                return Ok(receipt);
+            }
+            Some(
+                PendingGroupCommitRecoveryResolution::NotCommitted
+                | PendingGroupCommitRecoveryResolution::NotCommittedPendingLogical,
+            ) => {
+                return Err(FrankenError::internal(
+                    "cannot publish a parallel WAL interval already proven not committed",
+                ));
+            }
+            Some(PendingGroupCommitRecoveryResolution::AuthorizedPendingLogical(_)) | None => {}
         }
         // Validate and materialize the full page plane before consuming the
         // combiner's exact pending handle. Once `finalize` succeeds, every
-        // remaining operation in this method is deliberately infallible so a
-        // recovery retry can never need a handle that has already been spent.
-        let prepared_pages = self
-            .published
-            .as_ref()
-            .map(|_| PublishedPagerState::prepare_parallel_wal_group_pages(&self.batches))
-            .transpose()?;
+        // later retry can reconstruct the same map from the retained batches.
+        let complete_group_pages =
+            PublishedPagerState::prepare_parallel_wal_group_pages(&self.batches)?;
         let queue = self.queue.upgrade().ok_or_else(|| {
             FrankenError::internal(
                 "group-commit queue dropped before pending durability recovery finalized",
             )
         })?;
-        let receipt = self.publication.finalize(&queue)?;
-        if let (Some(published), Some(prepared_pages)) = (self.published.as_ref(), prepared_pages) {
-            published.publish_prepared_parallel_wal_group(
-                cx,
-                PublishedPagerUpdate {
-                    visible_commit_seq: receipt.certificate.commit_seq_hi,
-                    db_size: self.final_db_size,
-                    journal_mode: self.publication_journal_mode,
-                    freelist_count: self.publication_freelist_count,
-                    checkpoint_active: self.checkpoint_active,
-                },
-                prepared_pages,
-            );
-        }
-        {
+        let receipt = match recorded_resolution {
+            Some(PendingGroupCommitRecoveryResolution::AuthorizedPendingLogical(receipt)) => {
+                receipt
+            }
+            None => {
+                let receipt = self.publication.finalize(&queue)?;
+                *self
+                    .resolution
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                    PendingGroupCommitRecoveryResolution::AuthorizedPendingLogical(receipt.clone()),
+                );
+                receipt
+            }
+            Some(
+                PendingGroupCommitRecoveryResolution::Authorized(_)
+                | PendingGroupCommitRecoveryResolution::NotCommitted
+                | PendingGroupCommitRecoveryResolution::NotCommittedPendingLogical,
+            ) => unreachable!("terminal recovery states returned above"),
+        };
+        queue.complete_txn_attempts_authorized(
+            self.epoch,
+            &self.batches,
+            &receipt,
+            &complete_group_pages,
+        )?;
+        let publish_update = {
             let mut inner = self
                 .inner
                 .lock()
@@ -2326,12 +3324,30 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
             // Concurrent transactions may reserve later EOF pages while the
             // physical writer is in flight. Never erase those reservations.
             inner.db_size = inner.db_size.max(self.final_db_size);
+            let next_unallocated_page = if inner.db_size >= 2 {
+                inner.db_size.saturating_add(1)
+            } else {
+                2
+            };
+            inner.next_page = inner.next_page.max(next_unallocated_page);
+            inner.record_local_wal_commit_at(receipt.certificate.commit_seq_hi);
+            PublishedPagerUpdate {
+                visible_commit_seq: receipt.certificate.commit_seq_hi,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            }
+        };
+        if let Some(published) = self.published.as_ref() {
+            published.publish_prepared_parallel_wal_group(cx, publish_update, complete_group_pages);
         }
         *self
             .resolution
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(PendingGroupCommitRecoveryResolution::Authorized);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            PendingGroupCommitRecoveryResolution::Authorized(receipt.clone()),
+        );
         self.durable_io_completed
             .store(true, AtomicOrdering::Release);
         Ok(receipt)
@@ -2341,19 +3357,37 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
 impl<F: VfsFile + 'static> PendingGroupCommitRecoveryOperation for PendingGroupCommitRecovery<F> {
     fn reconcile(&self) -> LocalPagerFuture<'_, GroupCommitFlushDurability> {
         Box::pin(async move {
-            let recorded_resolution = *self
+            let recorded_resolution = self
                 .resolution
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(resolution) = recorded_resolution {
-                return Ok(match resolution {
-                    PendingGroupCommitRecoveryResolution::Authorized => {
-                        GroupCommitFlushDurability::Durable
-                    }
-                    PendingGroupCommitRecoveryResolution::NotCommitted => {
-                        GroupCommitFlushDurability::PreDurable
-                    }
-                });
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            match recorded_resolution.as_ref() {
+                Some(PendingGroupCommitRecoveryResolution::Authorized(_)) => {
+                    return Ok(GroupCommitFlushDurability::Durable);
+                }
+                Some(PendingGroupCommitRecoveryResolution::NotCommitted) => {
+                    return Ok(GroupCommitFlushDurability::PreDurable);
+                }
+                Some(PendingGroupCommitRecoveryResolution::AuthorizedPendingLogical(_)) => {
+                    self.complete_authorized(&self.cleanup_cx)?;
+                    return Ok(GroupCommitFlushDurability::Durable);
+                }
+                Some(PendingGroupCommitRecoveryResolution::NotCommittedPendingLogical) => {
+                    let queue = self.queue.upgrade().ok_or_else(|| {
+                        FrankenError::internal(
+                            "group-commit queue dropped before logical rejection finalized",
+                        )
+                    })?;
+                    queue.complete_txn_attempts_not_committed(self.epoch)?;
+                    *self
+                        .resolution
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(PendingGroupCommitRecoveryResolution::NotCommitted);
+                    return Ok(GroupCommitFlushDurability::PreDurable);
+                }
+                None => {}
             }
             if !self.writes_are_terminal() {
                 return Ok(GroupCommitFlushDurability::InDoubt);
@@ -2366,9 +3400,9 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecoveryOperation for PendingGroupC
             let _recovery_mask = self.cleanup_cx.masked();
             let certificate = self.publication.certificate()?;
             let (frames_start, frames_end) = self.publication.interval()?;
-            let backend = wal_backend_handle(&self.wal_backend)?;
             let mut wal =
-                async_rwlock_write(&backend, &self.cleanup_cx, "WAL recovery backend").await?;
+                async_rwlock_write(&self.wal_backend, &self.cleanup_cx, "WAL recovery backend")
+                    .await?;
             let verdict = wal
                 .reconcile_parallel_wal_commit(
                     &self.cleanup_cx,
@@ -2387,6 +3421,17 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecoveryOperation for PendingGroupC
                 }
                 traits::ParallelWalCommitReconciliation::NotCommitted => {
                     self.publication.abort()?;
+                    *self
+                        .resolution
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(PendingGroupCommitRecoveryResolution::NotCommittedPendingLogical);
+                    let queue = self.queue.upgrade().ok_or_else(|| {
+                        FrankenError::internal(
+                            "group-commit queue dropped before logical rejection finalized",
+                        )
+                    })?;
+                    queue.complete_txn_attempts_not_committed(self.epoch)?;
                     *self
                         .resolution
                         .lock()
@@ -2411,6 +3456,167 @@ trait PendingExternalUnlockOperation: Send {
     fn try_restore(&mut self) -> Result<bool>;
 }
 
+struct GroupCommitPhysicalLockWindow {
+    queue: Arc<GroupCommitQueue>,
+    handle_key: SharedDbFileKey,
+    active: bool,
+}
+
+impl GroupCommitPhysicalLockWindow {
+    #[cfg(test)]
+    fn register(queue: &Arc<GroupCommitQueue>, handle_key: SharedDbFileKey) -> Result<Self> {
+        Self::try_register(queue, handle_key).ok_or(FrankenError::BusyRecovery)
+    }
+
+    fn try_register(queue: &Arc<GroupCommitQueue>, handle_key: SharedDbFileKey) -> Option<Self> {
+        let mut coordination = queue
+            .external_lock_coordination
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if coordination.logical_exit_in_flight.contains(&handle_key)
+            || coordination.physical_lock_windows.contains(&handle_key)
+        {
+            return None;
+        }
+        coordination.physical_lock_windows.insert(handle_key);
+        drop(coordination);
+        Some(Self {
+            queue: Arc::clone(queue),
+            handle_key,
+            active: true,
+        })
+    }
+
+    async fn acquire(
+        queue: &Arc<GroupCommitQueue>,
+        handle_key: SharedDbFileKey,
+        cx: &Cx,
+    ) -> Result<Self> {
+        loop {
+            let observed_generation = queue.external_lock_waiters.generation();
+            if let Some(window) = Self::try_register(queue, handle_key) {
+                return Ok(window);
+            }
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let _ = queue
+                .external_lock_waiters
+                .wait_for_change_async(observed_generation)
+                .await;
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut coordination = self
+            .queue
+            .external_lock_coordination
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !coordination.physical_lock_windows.remove(&self.handle_key) {
+            tracing::error!(
+                handle_key = self.handle_key.0,
+                "group-commit physical lock window released without ownership"
+            );
+        }
+        drop(coordination);
+        self.active = false;
+        self.queue.external_lock_waiters.signal();
+    }
+}
+
+impl Drop for GroupCommitPhysicalLockWindow {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct GroupCommitLogicalExitClaim {
+    queue: Arc<GroupCommitQueue>,
+    handle_key: SharedDbFileKey,
+    active: bool,
+}
+
+impl GroupCommitLogicalExitClaim {
+    fn try_register(queue: &Arc<GroupCommitQueue>, handle_key: SharedDbFileKey) -> Option<Self> {
+        let mut coordination = queue
+            .external_lock_coordination
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if coordination.physical_lock_windows.contains(&handle_key)
+            || coordination.logical_exit_in_flight.contains(&handle_key)
+        {
+            return None;
+        }
+        coordination.logical_exit_in_flight.insert(handle_key);
+        drop(coordination);
+        Some(Self {
+            queue: Arc::clone(queue),
+            handle_key,
+            active: true,
+        })
+    }
+
+    async fn acquire(
+        queue: &Arc<GroupCommitQueue>,
+        handle_key: SharedDbFileKey,
+        cx: &Cx,
+    ) -> Result<Self> {
+        loop {
+            let observed_generation = queue.external_lock_waiters.generation();
+            if let Some(claim) = Self::try_register(queue, handle_key) {
+                return Ok(claim);
+            }
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let _ = queue
+                .external_lock_waiters
+                .wait_for_change_async(observed_generation)
+                .await;
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut coordination = self
+            .queue
+            .external_lock_coordination
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !coordination.logical_exit_in_flight.remove(&self.handle_key) {
+            tracing::error!(
+                handle_key = self.handle_key.0,
+                "group-commit logical exit claim released without ownership"
+            );
+        }
+        drop(coordination);
+        self.active = false;
+        self.queue.external_lock_waiters.signal();
+    }
+}
+
+impl Drop for GroupCommitLogicalExitClaim {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+enum GroupCommitExternalLockOwner {
+    Physical(GroupCommitPhysicalLockWindow),
+    Exclusive(GroupCommitLogicalExitClaim),
+}
+
+impl GroupCommitExternalLockOwner {
+    fn release(self) {
+        match self {
+            Self::Physical(window) => drop(window),
+            Self::Exclusive(claim) => drop(claim),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingExternalUnlockTarget {
     /// Restore the ordinary SQLite lock state while other transactions remain.
@@ -2419,32 +3625,153 @@ enum PendingExternalUnlockTarget {
     /// distinct from `LockLevel::None` on VFSes that track the fence's prior
     /// lock level separately.
     ExternalSnapshot,
+    /// Release the cross-process maintenance epoch, including WAL writer and
+    /// checkpoint slots when recovery entered from WAL mode.
+    ExternalMaintenance,
 }
 
 impl PendingExternalUnlockTarget {
     fn restore<F: VfsFile>(self, file: &mut F, cx: &Cx) -> Result<()> {
         match self {
             Self::LockLevel(level) => file.unlock(cx, level),
-            Self::ExternalSnapshot => file.unlock_external_shared_snapshot(cx),
+            Self::ExternalSnapshot => file.restore_external_shared_snapshot_attempt(cx),
+            Self::ExternalMaintenance => file.restore_external_maintenance_attempt(cx),
         }
     }
 }
 
-struct PendingExternalUnlockOwnership {
-    durability_started: Arc<AtomicBool>,
-    durable_io_completed: Arc<AtomicBool>,
-    restored: Arc<AtomicBool>,
-    restore_target: Arc<Mutex<PendingExternalUnlockTarget>>,
+struct BeginExternalLockState<F: VfsFile + 'static> {
+    queue: Arc<GroupCommitQueue>,
+    db_file: SharedDbFile<F>,
+    cleanup_cx: Cx,
+    restore_target: Option<PendingExternalUnlockTarget>,
+    restore_scope: Option<ProcessRootFinalizationScope>,
 }
 
-impl PendingExternalUnlockOwnership {
-    fn durability_state(&self) -> GroupCommitFlushDurability {
-        if self.durable_io_completed.load(AtomicOrdering::Acquire) {
-            GroupCommitFlushDurability::Durable
-        } else if self.durability_started.load(AtomicOrdering::Acquire) {
-            GroupCommitFlushDurability::InDoubt
+impl<F: VfsFile + 'static> BeginExternalLockState<F> {
+    fn new(queue: &Arc<GroupCommitQueue>, db_file: SharedDbFile<F>, cx: &Cx) -> Self {
+        Self {
+            queue: Arc::clone(queue),
+            db_file,
+            cleanup_cx: cleanup_child_cx(cx),
+            restore_target: None,
+            restore_scope: None,
+        }
+    }
+
+    async fn acquire_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        debug_assert!(
+            self.restore_target.is_none(),
+            "snapshot acquisition requires no previously armed external lock"
+        );
+        self.restore_target = Some(PendingExternalUnlockTarget::ExternalSnapshot);
+        self.restore_scope = Some(ProcessRootFinalizationScope::IdentityWide);
+        let result = shared_db_lock_external_snapshot(&self.db_file, cx).await;
+        if result.is_ok() {
+            self.restore_scope = Some(ProcessRootFinalizationScope::ExactHandle(
+                shared_db_file_key(&self.db_file),
+            ));
+        }
+        result
+    }
+
+    async fn acquire_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        debug_assert!(
+            self.restore_target.is_none(),
+            "maintenance acquisition requires no previously armed external lock"
+        );
+        self.restore_target = Some(PendingExternalUnlockTarget::ExternalMaintenance);
+        self.restore_scope = Some(ProcessRootFinalizationScope::IdentityWide);
+        shared_db_lock_external_maintenance(&self.db_file, cx, wal_mode).await
+    }
+
+    async fn restore(&mut self) -> Result<()> {
+        let Some(restore_target) = self.restore_target else {
+            return Ok(());
+        };
+        let cleanup_cx = self.cleanup_cx.clone();
+        let _cleanup_mask = cleanup_cx.masked();
+        let mut file = shared_db_file_write(&self.db_file, &cleanup_cx).await?;
+        restore_target.restore(&mut *file, &cleanup_cx)?;
+        self.restore_target = None;
+        self.restore_scope = None;
+        Ok(())
+    }
+
+    fn arm_lock_level(&mut self, restore_level: LockLevel) {
+        debug_assert!(
+            self.restore_target.is_none(),
+            "lock-level restoration requires no previously armed external lock"
+        );
+        self.restore_target = Some(PendingExternalUnlockTarget::LockLevel(restore_level));
+        self.restore_scope = Some(ProcessRootFinalizationScope::IdentityWide);
+    }
+
+    fn mark_lock_level_acquired(&mut self) {
+        let Some(PendingExternalUnlockTarget::LockLevel(restore_level)) = self.restore_target
+        else {
+            debug_assert!(
+                false,
+                "lock acquisition marker requires a lock-level target"
+            );
+            return;
+        };
+        self.restore_scope = Some(if restore_level <= LockLevel::Reserved {
+            ProcessRootFinalizationScope::ExactHandle(shared_db_file_key(&self.db_file))
         } else {
-            GroupCommitFlushDurability::PreDurable
+            ProcessRootFinalizationScope::IdentityWide
+        });
+    }
+
+    fn disarm(&mut self) {
+        self.restore_target = None;
+        self.restore_scope = None;
+    }
+
+    fn is_armed(&self) -> bool {
+        self.restore_target.is_some()
+    }
+}
+
+impl<F: VfsFile + 'static> Drop for BeginExternalLockState<F> {
+    fn drop(&mut self) {
+        let Some(restore_target) = self.restore_target.take() else {
+            return;
+        };
+        let restore_scope = self.restore_scope.take().unwrap_or_else(|| {
+            tracing::error!(
+                "armed external-lock attempt lost its finalization scope; retaining an identity-wide root"
+            );
+            ProcessRootFinalizationScope::IdentityWide
+        });
+        let restored = Arc::new(AtomicBool::new(false));
+        let operation = SharedDbPendingExternalUnlock {
+            db_file: Arc::clone(&self.db_file),
+            cleanup_cx: self.cleanup_cx.clone(),
+            restore_target,
+            restored: Arc::clone(&restored),
+        };
+        let mut pending = PendingExternalUnlock {
+            sequence: None,
+            scope: restore_scope,
+            epoch: None,
+            durability_started: Arc::new(AtomicBool::new(false)),
+            durable_io_completed: Arc::new(AtomicBool::new(false)),
+            coordination_owner: None,
+            recovery: None,
+            root_attempt: None,
+            operation: Box::new(operation),
+        };
+        match pending.operation.try_restore() {
+            Ok(true) => {}
+            Ok(false) => self.queue.enqueue_pending_external_unlock(pending),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "drop-time external-lock attempt restoration failed; queued for structured retry"
+                );
+                self.queue.enqueue_pending_external_unlock(pending);
+            }
         }
     }
 }
@@ -2452,7 +3779,7 @@ impl PendingExternalUnlockOwnership {
 struct SharedDbPendingExternalUnlock<F: VfsFile> {
     db_file: SharedDbFile<F>,
     cleanup_cx: Cx,
-    restore_target: Arc<Mutex<PendingExternalUnlockTarget>>,
+    restore_target: PendingExternalUnlockTarget,
     restored: Arc<AtomicBool>,
 }
 
@@ -2465,14 +3792,13 @@ impl<F: VfsFile> SharedDbPendingExternalUnlock<F> {
 impl<F: VfsFile + 'static> PendingExternalUnlockOperation for SharedDbPendingExternalUnlock<F> {
     fn restore(&mut self) -> LocalPagerFuture<'_, ()> {
         Box::pin(async move {
+            if self.restored.load(AtomicOrdering::Acquire) {
+                return Ok(());
+            }
             let restore_result = {
                 let _cleanup_mask = self.cleanup_cx.masked();
                 let mut file = shared_db_file_write(&self.db_file, &self.cleanup_cx).await?;
-                let restore_target = self
-                    .restore_target
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let result = restore_target.restore(&mut *file, &self.cleanup_cx);
+                let result = self.restore_target.restore(&mut *file, &self.cleanup_cx);
                 if result.is_ok() {
                     self.mark_restored();
                 }
@@ -2483,6 +3809,9 @@ impl<F: VfsFile + 'static> PendingExternalUnlockOperation for SharedDbPendingExt
     }
 
     fn try_restore(&mut self) -> Result<bool> {
+        if self.restored.load(AtomicOrdering::Acquire) {
+            return Ok(true);
+        }
         let _cleanup_mask = self.cleanup_cx.masked();
         let mut file = match self.db_file.try_write() {
             Ok(file) => file,
@@ -2493,23 +3822,240 @@ impl<F: VfsFile + 'static> PendingExternalUnlockOperation for SharedDbPendingExt
                 ));
             }
         };
-        let restore_target = self
-            .restore_target
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        restore_target.restore(&mut *file, &self.cleanup_cx)?;
+        self.restore_target.restore(&mut *file, &self.cleanup_cx)?;
         self.mark_restored();
         Ok(true)
     }
 }
 
+struct BeginAdmissionPendingExternalUnlock<F: VfsFile + 'static> {
+    inner: Arc<Mutex<PagerInner<F>>>,
+    db_file: SharedDbFile<F>,
+    writer_idle: Arc<Condvar>,
+    cleanup_cx: Cx,
+    restore_target: PendingExternalUnlockTarget,
+    writer_baton_owned: bool,
+    maintenance_lease: Option<PagerMaintenanceLease>,
+    external_restored: bool,
+    completed: bool,
+}
+
+impl<F: VfsFile + 'static> BeginAdmissionPendingExternalUnlock<F> {
+    fn finish_restored_state(&mut self, inner: &mut PagerInner<F>) -> bool {
+        let notify_writer_idle = self.writer_baton_owned && release_single_writer_baton(inner);
+        self.writer_baton_owned = false;
+        self.maintenance_lease.take();
+        self.completed = true;
+        notify_writer_idle
+    }
+}
+
+impl<F: VfsFile + 'static> PendingExternalUnlockOperation
+    for BeginAdmissionPendingExternalUnlock<F>
+{
+    #[allow(clippy::await_holding_lock)]
+    fn restore(&mut self) -> LocalPagerFuture<'_, ()> {
+        Box::pin(async move {
+            if self.completed {
+                return Ok(());
+            }
+            let cleanup_cx = self.cleanup_cx.clone();
+            let _cleanup_mask = cleanup_cx.masked();
+            if !self.external_restored {
+                let db_file = Arc::clone(&self.db_file);
+                let mut file = shared_db_file_write(&db_file, &cleanup_cx).await?;
+                self.restore_target.restore(&mut *file, &cleanup_cx)?;
+                drop(file);
+                self.external_restored = true;
+            }
+            loop {
+                let inner_arc = Arc::clone(&self.inner);
+                match inner_arc.try_lock() {
+                    Ok(mut inner) => {
+                        let notify_writer_idle = self.finish_restored_state(&mut inner);
+                        drop(inner);
+                        if notify_writer_idle {
+                            self.writer_idle.notify_one();
+                        }
+                        return Ok(());
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        asupersync::runtime::yield_now().await;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(error)) => {
+                        tracing::error!(
+                            "cancelled begin recovered a poisoned pager guard for fail-closed cleanup"
+                        );
+                        let mut inner = error.into_inner();
+                        let notify_writer_idle = self.finish_restored_state(&mut inner);
+                        drop(inner);
+                        if notify_writer_idle {
+                            self.writer_idle.notify_one();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        })
+    }
+
+    fn try_restore(&mut self) -> Result<bool> {
+        if self.completed {
+            return Ok(true);
+        }
+        let cleanup_cx = self.cleanup_cx.clone();
+        let _cleanup_mask = cleanup_cx.masked();
+        if !self.external_restored {
+            let db_file = Arc::clone(&self.db_file);
+            let mut file = match db_file.try_write() {
+                Ok(file) => file,
+                Err(asupersync::sync::TryWriteError::Locked) => return Ok(false),
+                Err(asupersync::sync::TryWriteError::Poisoned) => {
+                    return Err(FrankenError::internal(
+                        "cancelled begin database-file lock is poisoned",
+                    ));
+                }
+            };
+            self.restore_target.restore(&mut *file, &cleanup_cx)?;
+            drop(file);
+            self.external_restored = true;
+        }
+        let inner_arc = Arc::clone(&self.inner);
+        let mut inner = match inner_arc.try_lock() {
+            Ok(inner) => inner,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                tracing::error!(
+                    "cancelled begin recovered a poisoned pager guard for fail-closed cleanup"
+                );
+                error.into_inner()
+            }
+        };
+        let notify_writer_idle = self.finish_restored_state(&mut inner);
+        drop(inner);
+        if notify_writer_idle {
+            self.writer_idle.notify_one();
+        }
+        Ok(true)
+    }
+}
+
+struct BeginAdmission<F: VfsFile + 'static> {
+    queue: Arc<GroupCommitQueue>,
+    inner: Arc<Mutex<PagerInner<F>>>,
+    external_lock: BeginExternalLockState<F>,
+    writer_idle: Arc<Condvar>,
+    maintenance_lease: Option<PagerMaintenanceLease>,
+    coordination_owner: Option<GroupCommitExternalLockOwner>,
+    writer_baton_owned: bool,
+    completed: bool,
+}
+
+impl<F: VfsFile + 'static> BeginAdmission<F> {
+    fn new(
+        queue: &Arc<GroupCommitQueue>,
+        inner: Arc<Mutex<PagerInner<F>>>,
+        db_file: SharedDbFile<F>,
+        writer_idle: Arc<Condvar>,
+        maintenance_lease: PagerMaintenanceLease,
+        logical_claim: Option<GroupCommitLogicalExitClaim>,
+        cx: &Cx,
+    ) -> Self {
+        Self {
+            queue: Arc::clone(queue),
+            inner,
+            external_lock: BeginExternalLockState::new(queue, db_file, cx),
+            writer_idle,
+            maintenance_lease: Some(maintenance_lease),
+            coordination_owner: logical_claim.map(GroupCommitExternalLockOwner::Exclusive),
+            writer_baton_owned: false,
+            completed: false,
+        }
+    }
+
+    fn mark_writer_baton_owned(&mut self) {
+        self.writer_baton_owned = true;
+    }
+
+    fn complete(&mut self) -> Result<PagerMaintenanceLease> {
+        let maintenance_lease = self.maintenance_lease.take().ok_or_else(|| {
+            FrankenError::internal("completed begin admission lost its maintenance lease")
+        })?;
+        self.external_lock.disarm();
+        self.writer_baton_owned = false;
+        self.coordination_owner.take();
+        self.completed = true;
+        Ok(maintenance_lease)
+    }
+}
+
+impl<F: VfsFile + 'static> Drop for BeginAdmission<F> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let Some(restore_target) = self.external_lock.restore_target.take() else {
+            self.coordination_owner.take();
+            self.maintenance_lease.take();
+            return;
+        };
+        let restore_scope = self.external_lock.restore_scope.take().unwrap_or_else(|| {
+            tracing::error!(
+                "armed begin admission lost its finalization scope; retaining an identity-wide root"
+            );
+            ProcessRootFinalizationScope::IdentityWide
+        });
+
+        let operation = BeginAdmissionPendingExternalUnlock {
+            inner: Arc::clone(&self.inner),
+            db_file: Arc::clone(&self.external_lock.db_file),
+            writer_idle: Arc::clone(&self.writer_idle),
+            cleanup_cx: self.external_lock.cleanup_cx.clone(),
+            restore_target,
+            writer_baton_owned: self.writer_baton_owned,
+            maintenance_lease: self.maintenance_lease.take(),
+            external_restored: false,
+            completed: false,
+        };
+        let mut pending = PendingExternalUnlock {
+            sequence: None,
+            scope: restore_scope,
+            epoch: None,
+            durability_started: Arc::new(AtomicBool::new(false)),
+            durable_io_completed: Arc::new(AtomicBool::new(false)),
+            coordination_owner: self.coordination_owner.take(),
+            recovery: None,
+            root_attempt: None,
+            operation: Box::new(operation),
+        };
+        match pending.operation.try_restore() {
+            Ok(true) => pending.release_after_terminal(),
+            Ok(false) => self.queue.enqueue_pending_external_unlock(pending),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "drop-time begin-admission lock restoration failed; queued for structured retry"
+                );
+                self.queue.enqueue_pending_external_unlock(pending);
+            }
+        }
+    }
+}
+
 struct PendingExternalUnlock {
-    epoch: u64,
+    /// Stable FIFO sequence retained across claim cancellation.
+    sequence: Option<u64>,
+    /// Admission scope of this physical restoration.
+    scope: ProcessRootFinalizationScope,
+    /// Physical group-commit epoch, when restoration also terminates a flush.
+    /// `None` denotes a pure exact-handle restoration such as a cancelled
+    /// admission; it must not mutate consolidator state.
+    epoch: Option<u64>,
     durability_started: Arc<AtomicBool>,
     durable_io_completed: Arc<AtomicBool>,
-    restored: Arc<AtomicBool>,
-    restore_target: Arc<Mutex<PendingExternalUnlockTarget>>,
+    coordination_owner: Option<GroupCommitExternalLockOwner>,
     recovery: Option<Arc<dyn PendingGroupCommitRecoveryOperation>>,
+    root_attempt: Option<ProcessRootFinalizationAttempt>,
     operation: Box<dyn PendingExternalUnlockOperation>,
 }
 
@@ -2523,11 +4069,22 @@ impl PendingExternalUnlock {
             GroupCommitFlushDurability::PreDurable
         }
     }
+
+    fn release_after_terminal(&mut self) {
+        if let Some(owner) = self.coordination_owner.take() {
+            owner.release();
+        }
+        if let Some(root_attempt) = self.root_attempt.take() {
+            root_attempt.release_after_terminal();
+        }
+    }
 }
 
 struct PendingExternalUnlockClaim {
     queue: Arc<GroupCommitQueue>,
     pending: Option<PendingExternalUnlock>,
+    scope: ProcessRootFinalizationScope,
+    in_flight: bool,
 }
 
 impl PendingExternalUnlockClaim {
@@ -2536,6 +4093,12 @@ impl PendingExternalUnlockClaim {
             .as_ref()
             .expect("pending external unlock claim must own its operation")
             .durability_state()
+    }
+
+    fn pending_mut(&mut self) -> &mut PendingExternalUnlock {
+        self.pending
+            .as_mut()
+            .expect("pending external unlock claim must own its operation")
     }
 
     async fn restore(&mut self) -> Result<()> {
@@ -2571,8 +4134,10 @@ impl PendingExternalUnlockClaim {
             .pending
             .take()
             .expect("finished external unlock claim must own its operation");
-        self.queue
-            .forget_pending_external_unlock_owner(pending.epoch);
+        if self.in_flight {
+            self.queue.release_external_unlock_claim(self.scope);
+            self.in_flight = false;
+        }
         pending
     }
 }
@@ -2580,8 +4145,33 @@ impl PendingExternalUnlockClaim {
 impl Drop for PendingExternalUnlockClaim {
     fn drop(&mut self) {
         if let Some(pending) = self.pending.take() {
-            self.queue.requeue_pending_external_unlock_front(pending);
+            self.queue.requeue_pending_external_unlock(pending);
         }
+        if self.in_flight {
+            self.queue.release_external_unlock_claim(self.scope);
+            self.in_flight = false;
+        }
+    }
+}
+
+fn insert_pending_external_unlock_by_sequence(
+    pending: &mut VecDeque<PendingExternalUnlock>,
+    unlock: PendingExternalUnlock,
+) {
+    let sequence = unlock
+        .sequence
+        .expect("queued external unlock must have a stable sequence");
+    let scope = unlock.scope;
+    let insert_at = pending.iter().position(|queued| {
+        queued.scope == scope
+            && queued
+                .sequence
+                .is_none_or(|queued_sequence| queued_sequence > sequence)
+    });
+    if let Some(insert_at) = insert_at {
+        pending.insert(insert_at, unlock);
+    } else {
+        pending.push_back(unlock);
     }
 }
 
@@ -2594,6 +4184,7 @@ struct GroupCommitDbLockObligation<F: VfsFile + 'static> {
     durability_started: Arc<AtomicBool>,
     durable_io_completed: Arc<AtomicBool>,
     restored: Arc<AtomicBool>,
+    physical_lock_window: Option<GroupCommitPhysicalLockWindow>,
     recovery: Option<Arc<dyn PendingGroupCommitRecoveryOperation>>,
     armed: bool,
 }
@@ -2612,6 +4203,7 @@ impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
         durability_started: Arc<AtomicBool>,
         durable_io_completed: Arc<AtomicBool>,
         restored: Arc<AtomicBool>,
+        physical_lock_window: GroupCommitPhysicalLockWindow,
     ) -> Self {
         restored.store(false, AtomicOrdering::Release);
         Self {
@@ -2623,6 +4215,7 @@ impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
             durability_started,
             durable_io_completed,
             restored,
+            physical_lock_window: Some(physical_lock_window),
             recovery: None,
             armed: true,
         }
@@ -2639,6 +4232,7 @@ impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
         };
         if restore_result.is_ok() {
             self.restored.store(true, AtomicOrdering::Release);
+            self.physical_lock_window.take();
             self.armed = false;
         }
         restore_result
@@ -2650,22 +4244,25 @@ impl<F: VfsFile + 'static> Drop for GroupCommitDbLockObligation<F> {
         if !self.armed {
             return;
         }
-        let restore_target = Arc::new(Mutex::new(PendingExternalUnlockTarget::LockLevel(
-            self.restore_lock_level,
-        )));
+        let restore_target = PendingExternalUnlockTarget::LockLevel(self.restore_lock_level);
         let operation = SharedDbPendingExternalUnlock {
             db_file: Arc::clone(&self.db_file),
             cleanup_cx: self.cleanup_cx.clone(),
-            restore_target: Arc::clone(&restore_target),
+            restore_target,
             restored: Arc::clone(&self.restored),
         };
         let mut pending = PendingExternalUnlock {
-            epoch: self.epoch,
+            sequence: None,
+            scope: ProcessRootFinalizationScope::IdentityWide,
+            epoch: Some(self.epoch),
             durability_started: Arc::clone(&self.durability_started),
             durable_io_completed: Arc::clone(&self.durable_io_completed),
-            restored: Arc::clone(&self.restored),
-            restore_target,
+            coordination_owner: self
+                .physical_lock_window
+                .take()
+                .map(GroupCommitExternalLockOwner::Physical),
             recovery: self.recovery.clone(),
+            root_attempt: None,
             operation: Box::new(operation),
         };
         if pending.durability_state() == GroupCommitFlushDurability::InDoubt {
@@ -2729,6 +4326,13 @@ type WalBackendHandle = Arc<AsyncRwLock<Box<dyn WalBackend>>>;
 pub type SharedWalBackend = Arc<std::sync::RwLock<Option<WalBackendHandle>>>;
 type SharedDbFile<F> = Arc<AsyncRwLock<F>>;
 type LocalPagerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SharedDbFileKey(usize);
+
+fn shared_db_file_key<F>(file: &SharedDbFile<F>) -> SharedDbFileKey {
+    SharedDbFileKey(Arc::as_ptr(file).cast::<()>() as usize)
+}
 
 async fn async_rwlock_read<'a, T>(
     lock: &'a AsyncRwLock<T>,
@@ -2810,13 +4414,13 @@ async fn shared_db_lock_external_snapshot<F: VfsFile>(
         .lock_external_shared_snapshot(cx)
 }
 
-async fn shared_db_unlock_external_snapshot<F: VfsFile>(
+async fn shared_db_restore_external_snapshot_attempt<F: VfsFile>(
     file: &SharedDbFile<F>,
     cx: &Cx,
 ) -> Result<()> {
     shared_db_file_write(file, cx)
         .await?
-        .unlock_external_shared_snapshot(cx)
+        .restore_external_shared_snapshot_attempt(cx)
 }
 
 async fn shared_db_lock_external_maintenance<F: VfsFile>(
@@ -2827,16 +4431,6 @@ async fn shared_db_lock_external_maintenance<F: VfsFile>(
     shared_db_file_write(file, cx)
         .await?
         .lock_external_maintenance(cx, wal_mode)
-}
-
-async fn shared_db_unlock_external_maintenance<F: VfsFile>(
-    file: &SharedDbFile<F>,
-    cx: &Cx,
-    wal_mode: bool,
-) -> Result<()> {
-    shared_db_file_write(file, cx)
-        .await?
-        .unlock_external_maintenance(cx, wal_mode)
 }
 
 async fn shared_db_lock<F: VfsFile>(
@@ -2938,6 +4532,400 @@ static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>
     OnceLock::new();
 static GROUP_COMMIT_IDENTITY_QUEUES: OnceLock<Mutex<IdentityWeakRegistry<GroupCommitQueue>>> =
     OnceLock::new();
+static NEXT_GROUP_COMMIT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_GROUP_COMMIT_FINALIZATION_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_process_root_finalization_id(counter: &AtomicU64) -> u64 {
+    atomic_u64_checked_update(
+        counter,
+        AtomicOrdering::Relaxed,
+        AtomicOrdering::Relaxed,
+        |current| current.checked_add(1),
+    )
+    .expect("process-root pager finalization identifier space exhausted")
+}
+
+struct RootedGroupCommitQueue {
+    queue: GroupCommitQueueRef,
+    attempts: HashMap<u64, ProcessRootFinalizationScope>,
+    paths: HashSet<PathBuf>,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ProcessRootFinalizationScope {
+    IdentityWide,
+    ExactHandle(SharedDbFileKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessRootFinalizationSelector {
+    Any,
+    IdentityWide,
+    ExactHandle(SharedDbFileKey),
+}
+
+impl ProcessRootFinalizationSelector {
+    fn matches(self, scope: ProcessRootFinalizationScope) -> bool {
+        match (self, scope) {
+            (Self::Any, _) | (Self::IdentityWide, ProcessRootFinalizationScope::IdentityWide) => {
+                true
+            }
+            (Self::ExactHandle(selected), ProcessRootFinalizationScope::ExactHandle(candidate)) => {
+                selected == candidate
+            }
+            (Self::IdentityWide, ProcessRootFinalizationScope::ExactHandle(_))
+            | (Self::ExactHandle(_), ProcessRootFinalizationScope::IdentityWide) => false,
+        }
+    }
+}
+
+#[allow(clippy::struct_field_names)]
+#[derive(Default)]
+struct ProcessRootFinalizationRegistry {
+    by_queue: HashMap<u64, RootedGroupCommitQueue>,
+    by_path: HashMap<PathBuf, HashSet<u64>>,
+    by_identity: HashMap<FileIdentity, HashSet<u64>>,
+}
+
+static PROCESS_ROOT_FINALIZATION_REGISTRY: OnceLock<Mutex<ProcessRootFinalizationRegistry>> =
+    OnceLock::new();
+
+fn process_root_finalization_registry() -> &'static Mutex<ProcessRootFinalizationRegistry> {
+    PROCESS_ROOT_FINALIZATION_REGISTRY
+        .get_or_init(|| Mutex::new(ProcessRootFinalizationRegistry::default()))
+}
+
+struct ProcessRootFinalizationAttempt {
+    queue_id: u64,
+    attempt_id: u64,
+    released: bool,
+}
+
+impl ProcessRootFinalizationAttempt {
+    fn register(queue: &GroupCommitQueueRef) -> Self {
+        Self::register_identity_wide(queue)
+    }
+
+    fn register_identity_wide(queue: &GroupCommitQueueRef) -> Self {
+        Self::register_with_scope_and_publication_hook(
+            queue,
+            ProcessRootFinalizationScope::IdentityWide,
+            || {},
+        )
+    }
+
+    fn register_exact_handle(queue: &GroupCommitQueueRef, handle_key: SharedDbFileKey) -> Self {
+        Self::register_with_scope_and_publication_hook(
+            queue,
+            ProcessRootFinalizationScope::ExactHandle(handle_key),
+            || {},
+        )
+    }
+
+    fn register_scope(queue: &GroupCommitQueueRef, scope: ProcessRootFinalizationScope) -> Self {
+        match scope {
+            ProcessRootFinalizationScope::IdentityWide => Self::register_identity_wide(queue),
+            ProcessRootFinalizationScope::ExactHandle(handle_key) => {
+                Self::register_exact_handle(queue, handle_key)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn register_with_publication_hook(
+        queue: &GroupCommitQueueRef,
+        after_queue_fence: impl FnOnce(),
+    ) -> Self {
+        Self::register_with_scope_and_publication_hook(
+            queue,
+            ProcessRootFinalizationScope::IdentityWide,
+            after_queue_fence,
+        )
+    }
+
+    fn register_with_scope_and_publication_hook(
+        queue: &GroupCommitQueueRef,
+        scope: ProcessRootFinalizationScope,
+        after_queue_fence: impl FnOnce(),
+    ) -> Self {
+        let attempt_id =
+            next_process_root_finalization_id(&NEXT_GROUP_COMMIT_FINALIZATION_ATTEMPT_ID);
+        let queue_id = queue.queue_id;
+        // Lock order is binding -> process-root registry everywhere. Holding
+        // both across the queue-local fence and every global index insertion
+        // makes the Release increment the single publication point:
+        //
+        // * same-queue admission observes the atomic and fails closed;
+        // * same-path/replacement admission blocks on the registry mutex until
+        //   the old queue is present in every applicable index.
+        //
+        // In particular, there must be no observable atomic->registry gap.
+        let binding = queue
+            .finalization_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut registry = process_root_finalization_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        atomic_usize_checked_update(
+            &queue.rooted_finalization_attempts,
+            AtomicOrdering::Release,
+            AtomicOrdering::Relaxed,
+            |current| current.checked_add(1),
+        )
+        .expect("process-root pager finalization attempt count exhausted");
+        after_queue_fence();
+        {
+            let rooted =
+                registry
+                    .by_queue
+                    .entry(queue_id)
+                    .or_insert_with(|| RootedGroupCommitQueue {
+                        queue: Arc::clone(queue),
+                        attempts: HashMap::new(),
+                        paths: HashSet::new(),
+                        identity: binding.identity,
+                    });
+            debug_assert!(
+                Arc::ptr_eq(&rooted.queue, queue),
+                "stable queue id must identify exactly one group-commit queue"
+            );
+            if let (Some(bound), Some(incoming)) = (rooted.identity, binding.identity) {
+                debug_assert_eq!(
+                    bound, incoming,
+                    "rooted group-commit queue identity must remain stable"
+                );
+            } else if rooted.identity.is_none() {
+                rooted.identity = binding.identity;
+            }
+            rooted.paths.extend(binding.paths.iter().cloned());
+            rooted.attempts.insert(attempt_id, scope);
+        }
+        let (paths, identity) = registry
+            .by_queue
+            .get(&queue_id)
+            .map(|rooted| (rooted.paths.clone(), rooted.identity))
+            .expect("new process-root finalization queue must remain registered");
+        for path in paths {
+            registry.by_path.entry(path).or_default().insert(queue_id);
+        }
+        if let Some(identity) = identity {
+            registry
+                .by_identity
+                .entry(identity)
+                .or_default()
+                .insert(queue_id);
+        }
+        drop(registry);
+        drop(binding);
+        Self {
+            queue_id,
+            attempt_id,
+            released: false,
+        }
+    }
+
+    fn release_after_terminal(mut self) {
+        self.released = release_process_root_finalization_attempt(self.queue_id, self.attempt_id);
+    }
+}
+
+impl Drop for ProcessRootFinalizationAttempt {
+    fn drop(&mut self) {
+        if !self.released {
+            tracing::error!(
+                queue_id = self.queue_id,
+                attempt_id = self.attempt_id,
+                "process-root pager finalization token dropped before terminal release; retaining fail-closed root"
+            );
+        }
+    }
+}
+
+fn process_root_finalization_scope_is_relevant(
+    queue_id: u64,
+    handle_key: Option<SharedDbFileKey>,
+) -> bool {
+    let registry = process_root_finalization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    process_root_finalization_scope_is_relevant_in_registry(&registry, queue_id, handle_key)
+}
+
+fn process_root_finalization_scope_is_relevant_in_registry(
+    registry: &ProcessRootFinalizationRegistry,
+    queue_id: u64,
+    handle_key: Option<SharedDbFileKey>,
+) -> bool {
+    let Some(rooted) = registry.by_queue.get(&queue_id) else {
+        tracing::error!(
+            queue_id,
+            "process-root scope registry is missing a queue whose atomic root count is nonzero"
+        );
+        return true;
+    };
+    rooted.attempts.values().any(|scope| match scope {
+        ProcessRootFinalizationScope::IdentityWide => true,
+        ProcessRootFinalizationScope::ExactHandle(rooted_key) => {
+            handle_key.is_some_and(|handle_key| *rooted_key == handle_key)
+        }
+    })
+}
+
+fn refresh_process_root_finalization_binding(queue: &GroupCommitQueueRef) {
+    // Match register's binding -> registry lock order. If registration is
+    // waiting for this binding, it will snapshot the new alias after we
+    // release it. If registration already published its atomic fence, this
+    // refresh holds the binding until the alias is globally indexed.
+    let binding = queue
+        .finalization_binding
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !queue.has_process_root_finalization_attempt() {
+        return;
+    }
+    let Some(registry) = PROCESS_ROOT_FINALIZATION_REGISTRY.get() else {
+        return;
+    };
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(rooted) = registry.by_queue.get_mut(&queue.queue_id) else {
+        return;
+    };
+    rooted.paths.extend(binding.paths.iter().cloned());
+    if let Some(identity) = binding.identity {
+        if let Some(bound) = rooted.identity {
+            debug_assert_eq!(
+                bound, identity,
+                "rooted group-commit queue identity must remain stable"
+            );
+        } else {
+            rooted.identity = Some(identity);
+        }
+    }
+    let paths = rooted.paths.clone();
+    let identity = rooted.identity;
+    let queue_id = queue.queue_id;
+    for path in paths {
+        registry.by_path.entry(path).or_default().insert(queue_id);
+    }
+    if let Some(identity) = identity {
+        registry
+            .by_identity
+            .entry(identity)
+            .or_default()
+            .insert(queue_id);
+    }
+}
+
+fn release_process_root_finalization_attempt(queue_id: u64, attempt_id: u64) -> bool {
+    let mut registry = process_root_finalization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(rooted) = registry.by_queue.get_mut(&queue_id) else {
+        tracing::error!(
+            queue_id,
+            attempt_id,
+            "terminal pager finalization queue root is missing"
+        );
+        return false;
+    };
+    if rooted.attempts.remove(&attempt_id).is_none() {
+        tracing::error!(
+            queue_id,
+            attempt_id,
+            "terminal pager finalization attempted to release an unknown root token; retaining fail-closed root"
+        );
+        return false;
+    }
+    atomic_usize_checked_update(
+        &rooted.queue.rooted_finalization_attempts,
+        AtomicOrdering::Release,
+        AtomicOrdering::Relaxed,
+        |current| current.checked_sub(1),
+    )
+    .expect("process-root pager finalization attempt count underflowed");
+    let remove_queue = rooted.attempts.is_empty();
+    let released_queue = Arc::clone(&rooted.queue);
+    if !remove_queue {
+        drop(registry);
+        drop(released_queue);
+        return true;
+    }
+    let Some(rooted) = registry.by_queue.remove(&queue_id) else {
+        tracing::error!(
+            queue_id,
+            attempt_id,
+            "terminal pager finalization queue disappeared during release"
+        );
+        return false;
+    };
+    for path in &rooted.paths {
+        if let Some(queue_ids) = registry.by_path.get_mut(path) {
+            queue_ids.remove(&queue_id);
+            if queue_ids.is_empty() {
+                registry.by_path.remove(path);
+            }
+        }
+    }
+    if let Some(identity) = rooted.identity
+        && let Some(queue_ids) = registry.by_identity.get_mut(&identity)
+    {
+        queue_ids.remove(&queue_id);
+        if queue_ids.is_empty() {
+            registry.by_identity.remove(&identity);
+        }
+    }
+    drop(registry);
+    drop(released_queue);
+    drop(rooted);
+    true
+}
+
+fn process_root_finalization_queues_for_path(path: &Path) -> Vec<GroupCommitQueueRef> {
+    let key = lexical_normalize_path(path.to_path_buf());
+    let registry = process_root_finalization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry
+        .by_path
+        .get(&key)
+        .map_or_else(Vec::new, |queue_ids| {
+            queue_ids
+                .iter()
+                .filter_map(|queue_id| {
+                    registry
+                        .by_queue
+                        .get(queue_id)
+                        .map(|rooted| Arc::clone(&rooted.queue))
+                })
+                .collect()
+        })
+}
+
+fn process_root_finalization_queues_for_identity(
+    identity: FileIdentity,
+) -> Vec<GroupCommitQueueRef> {
+    let registry = process_root_finalization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry
+        .by_identity
+        .get(&identity)
+        .map_or_else(Vec::new, |queue_ids| {
+            queue_ids
+                .iter()
+                .filter_map(|queue_id| {
+                    registry
+                        .by_queue
+                        .get(queue_id)
+                        .map(|rooted| Arc::clone(&rooted.queue))
+                })
+                .collect()
+        })
+}
 
 // ---------------------------------------------------------------------------
 // bd-yfdb6: Recovery fence registry
@@ -3290,11 +5278,14 @@ fn group_commit_queue_for_path(db_path: &Path) -> GroupCommitQueueRef {
     let mut queues = queues
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Arc::clone(
+    let queue = Arc::clone(
         queues
             .entry(key)
             .or_insert_with(|| Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()))),
-    )
+    );
+    drop(queues);
+    queue.bind_finalization_path(db_path);
+    queue
 }
 
 fn group_commit_queue_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> GroupCommitQueueRef {
@@ -3308,15 +5299,25 @@ fn group_commit_queue_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> GroupCommi
     }
 }
 
-fn group_commit_queue_for_identity(identity: FileIdentity) -> GroupCommitQueueRef {
+fn group_commit_queue_for_identity(
+    identity: FileIdentity,
+    db_path: &Path,
+    bind_path: bool,
+) -> GroupCommitQueueRef {
     let queues =
         GROUP_COMMIT_IDENTITY_QUEUES.get_or_init(|| Mutex::new(IdentityWeakRegistry::default()));
     let mut queues = queues
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    queues.get_or_insert_with(identity, || {
+    let queue = queues.get_or_insert_with(identity, || {
         Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()))
-    })
+    });
+    drop(queues);
+    queue.bind_finalization_identity(identity);
+    if bind_path {
+        queue.bind_finalization_path(db_path);
+    }
+    queue
 }
 
 fn identity_bound_group_commit_queue<V: Vfs>(
@@ -3326,8 +5327,113 @@ fn identity_bound_group_commit_queue<V: Vfs>(
 ) -> Result<GroupCommitQueueRef> {
     file.file_identity()?.map_or_else(
         || Ok(group_commit_queue_for_backend(vfs, db_path)),
-        |identity| Ok(group_commit_queue_for_identity(identity)),
+        |identity| {
+            Ok(group_commit_queue_for_identity(
+                identity,
+                db_path,
+                !vfs.is_memory(),
+            ))
+        },
     )
+}
+
+async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -> Result<()> {
+    if !queue.has_process_root_finalization_attempt() {
+        return Ok(());
+    }
+    while queue.resolve_one_pending_external_unlock().await? {}
+    queue.resolve_pending_epoch_resolutions()?;
+    if queue.has_pending_or_claimed_external_unlock() || queue.has_unresolved_in_doubt_epoch() {
+        return Err(FrankenError::BusyRecovery);
+    }
+    let logical_cleanup_count = queue.pending_logical_cleanup_count();
+    let mut first_logical_cleanup_error = None;
+    for _ in 0..logical_cleanup_count {
+        if let Err(error) = queue.resolve_one_pending_logical_cleanup().await
+            && first_logical_cleanup_error.is_none()
+        {
+            first_logical_cleanup_error = Some(error);
+        }
+    }
+    if let Some(error) = first_logical_cleanup_error {
+        return Err(error);
+    }
+    if queue.has_unresolved_in_doubt_epoch() || queue.has_process_root_finalization_attempt() {
+        return Err(FrankenError::BusyRecovery);
+    }
+    Ok(())
+}
+
+async fn settle_identity_wide_group_commit_finalization(queue: &GroupCommitQueueRef) -> Result<()> {
+    if !queue.has_identity_wide_process_root() && !queue.has_unresolved_in_doubt_epoch() {
+        return Ok(());
+    }
+    while queue
+        .resolve_one_pending_external_unlock_for(ProcessRootFinalizationSelector::IdentityWide)
+        .await?
+    {}
+    queue.resolve_pending_epoch_resolutions()?;
+    if queue.has_pending_or_claimed_identity_wide_external_unlock()
+        || queue.has_unresolved_in_doubt_epoch()
+        || queue.has_identity_wide_process_root()
+    {
+        return Err(FrankenError::BusyRecovery);
+    }
+    Ok(())
+}
+
+async fn settle_pending_group_commit_finalization_for_handle(
+    queue: &GroupCommitQueueRef,
+    handle_key: SharedDbFileKey,
+) -> Result<()> {
+    if !queue.has_identity_wide_process_root() && !queue.has_relevant_process_root(handle_key) {
+        return Ok(());
+    }
+    settle_identity_wide_group_commit_finalization(queue).await?;
+    while queue
+        .resolve_one_pending_external_unlock_for_handle(handle_key)
+        .await?
+    {}
+    if queue.has_pending_or_claimed_identity_wide_external_unlock()
+        || queue.has_unresolved_in_doubt_epoch()
+    {
+        return Err(FrankenError::BusyRecovery);
+    }
+
+    let logical_cleanup_count = queue.pending_logical_cleanup_count_for_handle(handle_key);
+    let mut first_logical_cleanup_error = None;
+    for _ in 0..logical_cleanup_count {
+        if let Err(error) = queue
+            .resolve_one_pending_logical_cleanup_for_handle(handle_key)
+            .await
+            && first_logical_cleanup_error.is_none()
+        {
+            first_logical_cleanup_error = Some(error);
+        }
+    }
+    if let Some(error) = first_logical_cleanup_error {
+        return Err(error);
+    }
+    if queue.has_identity_wide_process_root() || queue.has_relevant_process_root(handle_key) {
+        return Err(FrankenError::BusyRecovery);
+    }
+    Ok(())
+}
+
+async fn settle_process_root_finalizations_for_path(path: &Path) -> Result<()> {
+    let queues = process_root_finalization_queues_for_path(path);
+    for queue in queues {
+        settle_pending_group_commit_finalization(&queue).await?;
+    }
+    Ok(())
+}
+
+async fn settle_process_root_finalizations_for_identity(identity: FileIdentity) -> Result<()> {
+    let queues = process_root_finalization_queues_for_identity(identity);
+    for queue in queues {
+        settle_pending_group_commit_finalization(&queue).await?;
+    }
+    Ok(())
 }
 
 /// Remove the group commit queue for the given database path.
@@ -3547,18 +5653,21 @@ async fn classify_rollback_journal_prefix<F: VfsFile>(
 
 async fn with_main_shared_lock<F, S, T>(
     cx: &Cx,
-    db_file: &mut F,
+    queue: &Arc<GroupCommitQueue>,
+    db_file: &SharedDbFile<F>,
     state: &mut S,
     operation: impl for<'a> FnOnce(&'a Cx, &'a F, &'a mut S) -> LocalPagerFuture<'a, T>,
 ) -> Result<T>
 where
-    F: VfsFile,
+    F: VfsFile + 'static,
 {
-    db_file.lock_external_shared_snapshot(cx)?;
-    let operation_result = operation(cx, &*db_file, state).await;
-    let cleanup_cx = cleanup_child_cx(cx);
-    let _cleanup_mask = cleanup_cx.masked();
-    let unlock_result = db_file.unlock_external_shared_snapshot(&cleanup_cx);
+    let mut attempt = BeginExternalLockState::new(queue, Arc::clone(db_file), cx);
+    attempt.acquire_snapshot(cx).await?;
+    let file = shared_db_file_read(db_file, cx).await?;
+    let operation_result = operation(cx, &*file, state).await;
+    drop(file);
+    let unlock_result = attempt.restore().await;
+    drop(attempt);
     match (operation_result, unlock_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -3670,12 +5779,818 @@ struct CommittedStateRefresh {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleCommitProbe {
+    visible_commit_seq: CommitSeq,
+    file_size: u64,
+    wal_snapshot_initialized: bool,
+    durable_identity_changed: bool,
+    db_change_counter: u64,
+    wal_generation: Option<WalGenerationIdentity>,
+    wal_visible_commit_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommittedStateRefreshMode {
     Normal,
     /// A hot rollback journal has already restored the durable bytes. Cached
     /// candidate metadata is never authoritative in this mode: bypass the
     /// identity fast path and allow the database extent to shrink exactly.
     PostRecovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingGroupCommitTxnResolution {
+    Pending,
+    Authorized(ParallelWalPublicationAuthorization),
+    NotCommitted,
+}
+
+#[derive(Clone, Default)]
+struct PendingReturnedAllocations {
+    from_freelist: Vec<PageNumber>,
+    from_eof: Vec<PageNumber>,
+    page_lease: Vec<PageNumber>,
+}
+
+impl PendingReturnedAllocations {
+    fn all_pages(&self) -> Vec<PageNumber> {
+        self.from_freelist
+            .iter()
+            .chain(&self.from_eof)
+            .chain(&self.page_lease)
+            .copied()
+            .collect()
+    }
+}
+
+#[derive(Clone, Default)]
+struct PendingGroupCommitAllocatorDelta {
+    live_committed_allocations: Vec<PageNumber>,
+    returned_or_freed_pages: Vec<PageNumber>,
+}
+
+impl PendingGroupCommitAllocatorDelta {
+    fn new(
+        live_committed_allocations: Vec<PageNumber>,
+        returned_allocations: &PendingReturnedAllocations,
+        pending_freed_pages: &[PageNumber],
+    ) -> Self {
+        let mut delta = Self {
+            live_committed_allocations,
+            returned_or_freed_pages: returned_allocations
+                .all_pages()
+                .into_iter()
+                .chain(pending_freed_pages.iter().copied())
+                .collect(),
+        };
+        delta.normalize();
+        delta
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.live_committed_allocations
+            .extend(other.live_committed_allocations);
+        self.returned_or_freed_pages
+            .extend(other.returned_or_freed_pages);
+    }
+
+    fn normalize(&mut self) {
+        self.live_committed_allocations.sort_unstable();
+        self.live_committed_allocations.dedup();
+        self.returned_or_freed_pages
+            .retain(|page| self.live_committed_allocations.binary_search(page).is_err());
+        self.returned_or_freed_pages.sort_unstable();
+        self.returned_or_freed_pages.dedup();
+    }
+
+    fn apply_to_freelist(&self, freelist: &mut Vec<PageNumber>) {
+        freelist.retain(|page| self.live_committed_allocations.binary_search(page).is_err());
+        return_pages_to_freelist(freelist, self.returned_or_freed_pages.iter().copied());
+    }
+}
+
+#[derive(Default)]
+struct PhaseAWriteSetUndo {
+    entries: Mutex<HashMap<PageNumber, Option<PageData>>>,
+}
+
+impl PhaseAWriteSetUndo {
+    fn capture<S: std::hash::BuildHasher>(
+        &self,
+        write_set: &HashMap<PageNumber, StagedPage, S>,
+        page_no: PageNumber,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries
+            .entry(page_no)
+            .or_insert_with(|| write_set.get(&page_no).map(StagedPage::published_page));
+    }
+
+    fn restore<S: std::hash::BuildHasher>(
+        &self,
+        write_set: &mut HashMap<PageNumber, StagedPage, S>,
+        write_pages_sorted: &mut Vec<PageNumber>,
+    ) {
+        let entries = std::mem::take(
+            &mut *self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (page_no, original) in entries {
+            match original {
+                Some(page) => {
+                    write_set.insert(page_no, StagedPage::from_page_data(page));
+                    insert_page_sorted(write_pages_sorted, page_no);
+                }
+                None => {
+                    write_set.remove(&page_no);
+                    remove_page_sorted(write_pages_sorted, page_no);
+                }
+            }
+        }
+    }
+
+    fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+struct PendingGroupCommitNotCommittedState {
+    returned_allocations: PendingReturnedAllocations,
+    pending_freed_pages: Vec<PageNumber>,
+}
+
+struct PendingGroupCommitTxnAttemptState {
+    consumer: Option<Arc<GroupCommitEpochConsumer>>,
+    batch_id: Option<u64>,
+    resolution: PendingGroupCommitTxnResolution,
+    returned_allocations: Option<PendingReturnedAllocations>,
+    pending_freed_pages: Vec<PageNumber>,
+    publication_intent: Option<ParallelWalPublicationIntent>,
+    publication_applied: bool,
+    transaction_exit_complete: bool,
+    terminal: bool,
+}
+
+struct PendingGroupCommitTxnAttempt<F: VfsFile> {
+    queue: Weak<GroupCommitQueue>,
+    inner: Arc<Mutex<PagerInner<F>>>,
+    /// Retains the exact open handle for the lifetime of every deferred
+    /// logical-exit claim. This makes `SharedDbFileKey` immune to allocator
+    /// address reuse while the claim or its queued operation is live.
+    db_file: SharedDbFile<F>,
+    committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
+    published: Arc<PublishedPagerState>,
+    writer_idle: Arc<Condvar>,
+    cleanup_cx: Cx,
+    committed_db_size: u32,
+    mode: TransactionMode,
+    is_writer: bool,
+    allocator_delta: PendingGroupCommitAllocatorDelta,
+    phase_a_undo: PhaseAWriteSetUndo,
+    state: Mutex<PendingGroupCommitTxnAttemptState>,
+}
+
+impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        queue: &GroupCommitQueueRef,
+        inner: Arc<Mutex<PagerInner<F>>>,
+        db_file: SharedDbFile<F>,
+        committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
+        published: Arc<PublishedPagerState>,
+        writer_idle: Arc<Condvar>,
+        cleanup_cx: Cx,
+        committed_db_size: u32,
+        mode: TransactionMode,
+        is_writer: bool,
+        returned_allocations: PendingReturnedAllocations,
+        pending_freed_pages: Vec<PageNumber>,
+        live_committed_allocations: Vec<PageNumber>,
+    ) -> Self {
+        let allocator_delta = PendingGroupCommitAllocatorDelta::new(
+            live_committed_allocations,
+            &returned_allocations,
+            &pending_freed_pages,
+        );
+        Self {
+            queue: Arc::downgrade(queue),
+            inner,
+            db_file,
+            committed_snapshot,
+            published,
+            writer_idle,
+            cleanup_cx,
+            committed_db_size,
+            mode,
+            is_writer,
+            allocator_delta,
+            phase_a_undo: PhaseAWriteSetUndo::default(),
+            state: Mutex::new(PendingGroupCommitTxnAttemptState {
+                consumer: None,
+                batch_id: None,
+                resolution: PendingGroupCommitTxnResolution::Pending,
+                returned_allocations: Some(returned_allocations),
+                pending_freed_pages,
+                publication_intent: None,
+                publication_applied: false,
+                transaction_exit_complete: false,
+                terminal: false,
+            }),
+        }
+    }
+
+    fn admit(&self, consumer: Arc<GroupCommitEpochConsumer>, batch_id: u64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.consumer.is_some() || state.batch_id.is_some() {
+            return Err(FrankenError::internal(
+                "group-commit transaction attempt was admitted twice",
+            ));
+        }
+        state.consumer = Some(consumer);
+        state.batch_id = Some(batch_id);
+        Ok(())
+    }
+
+    fn evidence_key(&self) -> Option<(u64, u64)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some((state.consumer.as_ref()?.epoch, state.batch_id?))
+    }
+
+    fn resolution(&self) -> PendingGroupCommitTxnResolution {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolution
+            .clone()
+    }
+
+    fn publication_intent(&self) -> Result<ParallelWalPublicationIntent> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publication_intent
+            .ok_or_else(|| {
+                FrankenError::internal(
+                    "authorized group-commit transaction has no publication intent",
+                )
+            })
+    }
+
+    fn projected_db_size_with_inner(&self, inner: &PagerInner<F>) -> u32 {
+        self.allocator_delta
+            .live_committed_allocations
+            .iter()
+            .map(|page| page.get())
+            .max()
+            .unwrap_or(self.committed_db_size)
+            .max(self.committed_db_size)
+            .max(inner.db_size)
+    }
+
+    fn projected_db_size(&self) -> u32 {
+        self.inner.lock().map_or(self.committed_db_size, |inner| {
+            self.projected_db_size_with_inner(&inner)
+        })
+    }
+
+    fn projected_live_freelist(&self) -> Vec<PageNumber> {
+        self.inner.lock().map_or_else(
+            |_| Vec::new(),
+            |inner| {
+                let projected_db_size = self.projected_db_size_with_inner(&inner);
+                let upper_bound = inner.next_page.saturating_sub(1).max(projected_db_size);
+                let mut freelist = inner.freelist.clone();
+                self.allocator_delta.apply_to_freelist(&mut freelist);
+                normalize_freelist(&freelist, upper_bound)
+                    .into_iter()
+                    .filter(|page| page.get() <= projected_db_size)
+                    .collect()
+            },
+        )
+    }
+
+    fn reconcile_global_from_queue(&self) -> Result<PendingGroupCommitTxnResolution> {
+        if !matches!(self.resolution(), PendingGroupCommitTxnResolution::Pending) {
+            return Ok(self.resolution());
+        }
+        let queue = self.queue.upgrade().ok_or_else(|| {
+            FrankenError::internal(
+                "group-commit queue dropped before logical transaction finalization",
+            )
+        })?;
+        let Some((epoch, batch_id)) = self.evidence_key() else {
+            self.complete_not_committed_global()?;
+            return Ok(self.resolution());
+        };
+        if let Some(persisted) = queue.persisted_epoch_for(epoch) {
+            if !persisted.members.contains(&batch_id) {
+                return Err(FrankenError::internal(format!(
+                    "persisted group-commit epoch {epoch} omits admitted batch {batch_id}"
+                )));
+            }
+            // Certificate persistence precedes logical Phase C by design.
+            // The receipt proves durability, but only the physical recovery
+            // owner has the complete consolidated page plane needed to apply
+            // the Authorized verdict. Keep the logical attempt pending until
+            // that owner publishes the page plane and terminal resolution.
+            return Ok(PendingGroupCommitTxnResolution::Pending);
+        } else if queue
+            .failed_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&epoch)
+        {
+            self.complete_not_committed_global()?;
+            queue.unregister_txn_attempt(batch_id);
+        }
+        Ok(self.resolution())
+    }
+
+    fn take_not_committed_state(&self) -> Result<PendingGroupCommitNotCommittedState> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(
+            state.resolution,
+            PendingGroupCommitTxnResolution::NotCommitted
+        ) {
+            return Err(FrankenError::internal(
+                "cannot restore transaction state before a NotCommitted verdict",
+            ));
+        }
+        Ok(PendingGroupCommitNotCommittedState {
+            returned_allocations: state.returned_allocations.take().ok_or_else(|| {
+                FrankenError::internal(
+                    "NotCommitted group-commit allocations were already restored",
+                )
+            })?,
+            pending_freed_pages: std::mem::take(&mut state.pending_freed_pages),
+        })
+    }
+
+    fn restore_phase_a_write_set<S: std::hash::BuildHasher>(
+        &self,
+        write_set: &mut HashMap<PageNumber, StagedPage, S>,
+        write_pages_sorted: &mut Vec<PageNumber>,
+    ) {
+        self.phase_a_undo.restore(write_set, write_pages_sorted);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn finish_txn_exit(
+        &self,
+        logical_exit_claim: &GroupCommitLogicalExitClaim,
+    ) -> Result<()> {
+        let queue = self.queue.upgrade().ok_or_else(|| {
+            FrankenError::internal("group-commit queue dropped before logical transaction exit")
+        })?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.transaction_exit_complete {
+            return Ok(());
+        }
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(error) => {
+                tracing::error!(
+                    "group-commit transaction exit recovered a poisoned PagerInner for fail-closed cleanup"
+                );
+                error.into_inner()
+            }
+        };
+        let releases_writer_baton = self.is_writer && self.mode != TransactionMode::Concurrent;
+        let notify_writer_idle = coordinated_transaction_exit(
+            &queue,
+            &self.cleanup_cx,
+            &mut inner,
+            releases_writer_baton,
+            logical_exit_claim,
+        )
+        .await?;
+        state.transaction_exit_complete = true;
+        drop(inner);
+        drop(state);
+        if notify_writer_idle {
+            self.writer_idle.notify_one();
+        }
+        Ok(())
+    }
+
+    fn finish_terminal(&self, transaction_released: bool) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.terminal {
+            return Ok(());
+        }
+        if matches!(state.resolution, PendingGroupCommitTxnResolution::Pending) {
+            return Err(FrankenError::internal(
+                "group-commit transaction finalized before a terminal verdict",
+            ));
+        }
+        if matches!(
+            state.resolution,
+            PendingGroupCommitTxnResolution::Authorized(_)
+        ) && !state.publication_applied
+        {
+            return Err(FrankenError::internal(
+                "authorized group-commit transaction finalized before publication",
+            ));
+        }
+        if transaction_released && !state.transaction_exit_complete {
+            return Err(FrankenError::internal(
+                "group-commit transaction finalized before exit and snapshot release",
+            ));
+        }
+        state.consumer.take();
+        state.terminal = true;
+        self.phase_a_undo.clear();
+        Ok(())
+    }
+}
+
+impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
+    for PendingGroupCommitTxnAttempt<F>
+{
+    fn pager_inner_identity(&self) -> *const () {
+        Arc::as_ptr(&self.inner).cast()
+    }
+
+    fn allocator_delta(&self) -> PendingGroupCommitAllocatorDelta {
+        self.allocator_delta.clone()
+    }
+
+    fn complete_authorized_global(
+        &self,
+        authorization: ParallelWalPublicationAuthorization,
+        complete_group_pages: &HashMap<PageNumber, PageData>,
+        group_allocator_delta: &PendingGroupCommitAllocatorDelta,
+        apply_allocator_delta: bool,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &state.resolution {
+            PendingGroupCommitTxnResolution::Authorized(existing) => {
+                if existing == &authorization {
+                    return Ok(());
+                }
+                return Err(FrankenError::internal(
+                    "group-commit transaction received two different authorized verdicts",
+                ));
+            }
+            PendingGroupCommitTxnResolution::NotCommitted => {
+                return Err(FrankenError::internal(
+                    "cannot authorize a group-commit transaction already proven NotCommitted",
+                ));
+            }
+            PendingGroupCommitTxnResolution::Pending => {}
+        }
+        if state
+            .batch_id
+            .is_some_and(|batch_id| batch_id != authorization.batch_id)
+        {
+            return Err(FrankenError::internal(
+                "authorized group-commit batch does not match its logical owner",
+            ));
+        }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut committed_freelist = inner.freelist.clone();
+        if apply_allocator_delta {
+            group_allocator_delta.apply_to_freelist(&mut committed_freelist);
+        }
+        state.returned_allocations.as_ref().ok_or_else(|| {
+            FrankenError::internal(
+                "authorized group-commit returned allocations were already finalized",
+            )
+        })?;
+        let committed_db_size = inner.db_size.max(self.committed_db_size);
+        let publication_intent = parallel_wal_publication_intent(
+            &authorization,
+            committed_db_size,
+            inner.journal_mode,
+            committed_freelist.len(),
+            inner.checkpoint_active,
+        )?;
+
+        state.returned_allocations.take();
+        if apply_allocator_delta {
+            inner.freelist = committed_freelist;
+        }
+        state.pending_freed_pages.clear();
+        inner.db_size = publication_intent.db_size;
+        let next_unallocated_page = if inner.db_size >= 2 {
+            inner.db_size.saturating_add(1)
+        } else {
+            2
+        };
+        inner.next_page = inner.next_page.max(next_unallocated_page);
+        inner.record_local_wal_commit_at(publication_intent.visible_commit_seq);
+        let committed_snapshot = Arc::new(PagerCommittedSnapshot::from_inner(&inner));
+        *self
+            .committed_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = committed_snapshot;
+        let update = PublishedPagerUpdate {
+            visible_commit_seq: publication_intent.visible_commit_seq,
+            db_size: publication_intent.db_size,
+            journal_mode: publication_intent.journal_mode,
+            freelist_count: publication_intent.freelist_count,
+            checkpoint_active: publication_intent.checkpoint_active,
+        };
+        state.publication_intent = Some(publication_intent);
+        state.resolution = PendingGroupCommitTxnResolution::Authorized(authorization);
+        drop(inner);
+        self.published.publish_prepared_parallel_wal_group(
+            &self.cleanup_cx,
+            update,
+            complete_group_pages.clone(),
+        );
+        self.published
+            .bind_parallel_wal_publication(publication_intent);
+        state.publication_applied = true;
+        self.phase_a_undo.clear();
+        Ok(())
+    }
+
+    fn complete_not_committed_global(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.resolution {
+            PendingGroupCommitTxnResolution::NotCommitted => return Ok(()),
+            PendingGroupCommitTxnResolution::Authorized(_) => {
+                return Err(FrankenError::internal(
+                    "cannot reject a group-commit transaction already authorized",
+                ));
+            }
+            PendingGroupCommitTxnResolution::Pending => {}
+        }
+        state.resolution = PendingGroupCommitTxnResolution::NotCommitted;
+        Ok(())
+    }
+}
+
+trait PendingGroupCommitLogicalCleanupOperation: Send {
+    /// Exact open-handle key whose transition this cleanup will perform.
+    ///
+    /// Every implementor must retain the corresponding `SharedDbFile` for at
+    /// least as long as the operation so the pointer-derived key cannot be
+    /// reused for a different handle.
+    fn handle_key(&self) -> SharedDbFileKey;
+
+    fn resolve<'a>(
+        &'a mut self,
+        logical_exit_claim: &'a GroupCommitLogicalExitClaim,
+    ) -> LocalPagerFuture<'a, bool>;
+}
+
+struct DetachedPendingGroupCommitTxnCleanup<F: VfsFile + 'static> {
+    attempt: Arc<PendingGroupCommitTxnAttempt<F>>,
+    maintenance_lease: Option<PagerMaintenanceLease>,
+    allocated_from_freelist: Vec<PageNumber>,
+    allocated_from_eof: Vec<PageNumber>,
+    page_lease: Vec<PageNumber>,
+    allocation_cleanup_applied: bool,
+}
+
+impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
+    for DetachedPendingGroupCommitTxnCleanup<F>
+{
+    fn handle_key(&self) -> SharedDbFileKey {
+        shared_db_file_key(&self.attempt.db_file)
+    }
+
+    fn resolve<'a>(
+        &'a mut self,
+        logical_exit_claim: &'a GroupCommitLogicalExitClaim,
+    ) -> LocalPagerFuture<'a, bool> {
+        Box::pin(async move {
+            match self.attempt.reconcile_global_from_queue()? {
+                PendingGroupCommitTxnResolution::Pending => return Ok(false),
+                PendingGroupCommitTxnResolution::Authorized(_) => {
+                    if !self.allocation_cleanup_applied {
+                        self.allocated_from_freelist.clear();
+                        self.allocated_from_eof.clear();
+                        self.page_lease.clear();
+                        self.allocation_cleanup_applied = true;
+                    }
+                }
+                PendingGroupCommitTxnResolution::NotCommitted => {
+                    if !self.allocation_cleanup_applied {
+                        let not_committed = self.attempt.take_not_committed_state()?;
+                        let mut inner = self
+                            .attempt
+                            .inner
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            self.allocated_from_freelist.drain(..),
+                        );
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            not_committed.returned_allocations.from_freelist,
+                        );
+                        // Deferred cleanup may run after later transactions
+                        // reserved higher EOF pages. Never rewind next_page;
+                        // quarantine every abandoned EOF reservation in the
+                        // in-memory freelist instead.
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            self.allocated_from_eof.drain(..),
+                        );
+                        return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            not_committed.returned_allocations.from_eof,
+                        );
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            not_committed.returned_allocations.page_lease,
+                        );
+                        drop(not_committed.pending_freed_pages);
+                        self.allocation_cleanup_applied = true;
+                    }
+                }
+            }
+
+            self.attempt.finish_txn_exit(logical_exit_claim).await?;
+            self.maintenance_lease.take();
+            self.attempt.finish_terminal(true)?;
+            Ok(true)
+        })
+    }
+}
+
+struct DetachedTransactionExit<F: VfsFile + 'static> {
+    queue: Arc<GroupCommitQueue>,
+    inner: Arc<Mutex<PagerInner<F>>>,
+    /// Owns the exact handle for the entire deferred-exit lifetime.
+    db_file: SharedDbFile<F>,
+    writer_idle: Arc<Condvar>,
+    cleanup_cx: Cx,
+    mode: TransactionMode,
+    is_writer: bool,
+    maintenance_lease: Option<PagerMaintenanceLease>,
+}
+
+impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
+    for DetachedTransactionExit<F>
+{
+    fn handle_key(&self) -> SharedDbFileKey {
+        shared_db_file_key(&self.db_file)
+    }
+
+    // The exact-handle logical-exit claim excludes every physical transition
+    // while this guard protects the matching PagerInner state update.
+    #[allow(clippy::await_holding_lock)]
+    fn resolve<'a>(
+        &'a mut self,
+        logical_exit_claim: &'a GroupCommitLogicalExitClaim,
+    ) -> LocalPagerFuture<'a, bool> {
+        Box::pin(async move {
+            let _cleanup_mask = self.cleanup_cx.masked();
+            let mut inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(error) => {
+                    tracing::error!(
+                        "detached transaction exit recovered a poisoned PagerInner for fail-closed cleanup"
+                    );
+                    error.into_inner()
+                }
+            };
+            let releases_writer_baton = self.is_writer && self.mode != TransactionMode::Concurrent;
+            let notify_writer_idle = coordinated_transaction_exit(
+                &self.queue,
+                &self.cleanup_cx,
+                &mut inner,
+                releases_writer_baton,
+                logical_exit_claim,
+            )
+            .await?;
+            drop(inner);
+            self.maintenance_lease.take();
+            if notify_writer_idle {
+                self.writer_idle.notify_one();
+            }
+            Ok(true)
+        })
+    }
+}
+
+struct PendingGroupCommitLogicalCleanup {
+    sequence: Option<u64>,
+    scope: ProcessRootFinalizationScope,
+    root_attempt: Option<ProcessRootFinalizationAttempt>,
+    operation: Box<dyn PendingGroupCommitLogicalCleanupOperation>,
+}
+
+impl PendingGroupCommitLogicalCleanup {
+    fn new(
+        root_attempt: Option<ProcessRootFinalizationAttempt>,
+        operation: Box<dyn PendingGroupCommitLogicalCleanupOperation>,
+    ) -> Self {
+        let scope = ProcessRootFinalizationScope::ExactHandle(operation.handle_key());
+        Self {
+            sequence: None,
+            scope,
+            root_attempt,
+            operation,
+        }
+    }
+
+    fn release_root_after_terminal(&mut self) {
+        if let Some(root_attempt) = self.root_attempt.take() {
+            root_attempt.release_after_terminal();
+        }
+    }
+}
+
+fn insert_pending_logical_cleanup_by_sequence(
+    pending: &mut VecDeque<PendingGroupCommitLogicalCleanup>,
+    cleanup: PendingGroupCommitLogicalCleanup,
+) {
+    let sequence = cleanup
+        .sequence
+        .expect("queued logical cleanup must have a stable sequence");
+    let scope = cleanup.scope;
+    let insert_at = pending.iter().position(|queued| {
+        queued.scope == scope
+            && queued
+                .sequence
+                .is_none_or(|queued_sequence| queued_sequence > sequence)
+    });
+    if let Some(insert_at) = insert_at {
+        pending.insert(insert_at, cleanup);
+    } else {
+        pending.push_back(cleanup);
+    }
+}
+
+struct PendingGroupCommitLogicalCleanupClaim {
+    queue: Arc<GroupCommitQueue>,
+    cleanup: Option<PendingGroupCommitLogicalCleanup>,
+    logical_exit_claim: Option<GroupCommitLogicalExitClaim>,
+}
+
+impl PendingGroupCommitLogicalCleanupClaim {
+    async fn resolve(&mut self) -> Result<bool> {
+        let logical_exit_claim = self
+            .logical_exit_claim
+            .as_ref()
+            .expect("logical cleanup claim must retain its queue transition claim");
+        self.cleanup
+            .as_mut()
+            .expect("logical group-commit cleanup claim must own its operation")
+            .operation
+            .resolve(logical_exit_claim)
+            .await
+    }
+
+    fn finish(mut self) -> PendingGroupCommitLogicalCleanup {
+        let cleanup = self
+            .cleanup
+            .take()
+            .expect("finished logical group-commit cleanup claim must own its operation");
+        self.logical_exit_claim.take();
+        cleanup
+    }
+}
+
+impl Drop for PendingGroupCommitLogicalCleanupClaim {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            self.queue.requeue_pending_logical_cleanup(cleanup);
+        }
+        // Requeue by stable lane sequence before releasing the exact-handle
+        // claim so a second settler cannot overtake a cancelled operation.
+        self.logical_exit_claim.take();
+    }
 }
 
 impl<F: VfsFile> PagerInner<F> {
@@ -3820,10 +6735,10 @@ impl<F: VfsFile> PagerInner<F> {
     /// avoids page-1 materialization and freelist reconstruction unless the
     /// visible state actually changed.
     async fn probe_visible_commit_seq(
-        &mut self,
+        &self,
         cx: &Cx,
         wal_backend: &SharedWalBackend,
-    ) -> Result<(CommitSeq, u64, bool, bool)> {
+    ) -> Result<VisibleCommitProbe> {
         let file_size = shared_db_file_read(&self.db_file, cx)
             .await?
             .file_size(cx)?;
@@ -3896,8 +6811,6 @@ impl<F: VfsFile> PagerInner<F> {
             let base_commit_seq = previous_base_commit_seq.saturating_add(u64::from(
                 raw_base_change_counter.wrapping_sub(previous_raw_change_counter),
             ));
-            self.committed_db_change_counter = u64::from(raw_base_change_counter);
-            self.committed_wal_generation = wal_generation;
             (base_commit_seq, u64::from(raw_base_change_counter))
         };
         let visible_commit_seq =
@@ -3906,13 +6819,15 @@ impl<F: VfsFile> PagerInner<F> {
             || raw_base_change_counter != previous_db_change_counter
             || wal_generation != previous_wal_generation
             || wal_visible_commit_count != previous_wal_visible_commit_count;
-        self.committed_wal_visible_commit_count = wal_visible_commit_count;
-        Ok((
+        Ok(VisibleCommitProbe {
             visible_commit_seq,
             file_size,
             wal_snapshot_initialized,
             durable_identity_changed,
-        ))
+            db_change_counter: raw_base_change_counter,
+            wal_generation,
+            wal_visible_commit_count,
+        })
     }
 
     /// Record a commit performed through this pager in both the aggregate
@@ -3942,14 +6857,17 @@ impl<F: VfsFile> PagerInner<F> {
         }
     }
 
-    /// Record one member of an already-certified WAL group without deriving
-    /// commit order from Phase C thread arrival.
+    /// Catch this pager up to an already-certified WAL group horizon without
+    /// deriving commit order from Phase C thread arrival.
     fn record_local_wal_commit_at(&mut self, certified_commit_seq: CommitSeq) {
         debug_assert_eq!(self.journal_mode, JournalMode::Wal);
+        let newly_visible_commits = certified_commit_seq
+            .get()
+            .saturating_sub(self.commit_seq.get());
         self.commit_seq = self.commit_seq.max(certified_commit_seq);
         self.committed_wal_visible_commit_count = self
             .committed_wal_visible_commit_count
-            .checked_add(1)
+            .checked_add(newly_visible_commits)
             .expect("visible WAL commit count overflow after 2^64 commits");
     }
 
@@ -3995,26 +6913,25 @@ impl<F: VfsFile> PagerInner<F> {
         wal_backend: &SharedWalBackend,
         mode: CommittedStateRefreshMode,
     ) -> Result<CommittedStateRefresh> {
-        let previous_committed_db_change_counter = self.committed_db_change_counter;
-        let previous_committed_wal_generation = self.committed_wal_generation;
-        let previous_committed_wal_visible_commit_count = self.committed_wal_visible_commit_count;
-        let (new_commit_seq, current_file_size, wal_snapshot_initialized, durable_identity_changed) =
-            self.probe_visible_commit_seq(cx, wal_backend).await?;
+        let probe = self.probe_visible_commit_seq(cx, wal_backend).await?;
         if mode == CommittedStateRefreshMode::Normal
-            && new_commit_seq == self.commit_seq
-            && current_file_size == self.committed_db_file_size_bytes
-            && !durable_identity_changed
+            && probe.visible_commit_seq == self.commit_seq
+            && probe.file_size == self.committed_db_file_size_bytes
+            && !probe.durable_identity_changed
         {
+            self.committed_db_change_counter = probe.db_change_counter;
+            self.committed_wal_generation = probe.wal_generation;
+            self.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
             return Ok(CommittedStateRefresh {
-                wal_snapshot_initialized,
+                wal_snapshot_initialized: probe.wal_snapshot_initialized,
                 page_cache_invalidated: false,
             });
         }
 
-        // `probe_visible_commit_seq` updates cached WAL/base identity. If the
-        // full materialization below fails, restore that identity so a retry
-        // still observes the same durable composition change and refreshes
-        // instead of treating the failed probe as already accepted.
+        // The probe above is pure with respect to pager metadata. Publish its
+        // identity fields only after every awaited page/freelist read below
+        // succeeds, so cancellation cannot make a partial refresh look
+        // accepted to the next transaction.
         let full_refresh_result = (async {
             let page1 = self
                 .read_committed_page_copy(cx, wal_backend, PageNumber::ONE)
@@ -4078,13 +6995,7 @@ impl<F: VfsFile> PagerInner<F> {
         .await;
         let (db_size, freelist) = match full_refresh_result {
             Ok(refreshed) => refreshed,
-            Err(err) => {
-                self.committed_db_change_counter = previous_committed_db_change_counter;
-                self.committed_wal_generation = previous_committed_wal_generation;
-                self.committed_wal_visible_commit_count =
-                    previous_committed_wal_visible_commit_count;
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
 
         // Cross-process monotonicity (#70): never shrink self.db_size from a
@@ -4110,15 +7021,19 @@ impl<F: VfsFile> PagerInner<F> {
         // Only clear the cache if the database was modified by another
         // connection. In WAL mode this uses the latest visible page-1
         // durable header baseline plus the visible WAL commit horizon.
-        let page_cache_invalidated = new_commit_seq != self.commit_seq || durable_identity_changed;
+        let page_cache_invalidated =
+            probe.visible_commit_seq != self.commit_seq || probe.durable_identity_changed;
         if page_cache_invalidated {
             cache.clear();
         }
-        self.commit_seq = new_commit_seq;
-        self.committed_db_file_size_bytes = current_file_size;
+        self.commit_seq = probe.visible_commit_seq;
+        self.committed_db_file_size_bytes = probe.file_size;
+        self.committed_db_change_counter = probe.db_change_counter;
+        self.committed_wal_generation = probe.wal_generation;
+        self.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
 
         Ok(CommittedStateRefresh {
-            wal_snapshot_initialized,
+            wal_snapshot_initialized: probe.wal_snapshot_initialized,
             page_cache_invalidated,
         })
     }
@@ -4379,6 +7294,7 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     write_pages_sorted: &mut Vec<PageNumber>,
     committed_db_size: u32,
     pending_free_pages: &[PageNumber],
+    phase_a_undo: Option<&PhaseAWriteSetUndo>,
 ) -> Result<()> {
     if committed_db_size == 0 {
         inner.freelist.clear();
@@ -4452,11 +7368,17 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
             leaf_index += take;
 
             if let Some(pg) = PageNumber::new(*trunk_pg) {
+                if let Some(undo) = phase_a_undo {
+                    undo.capture(write_set, pg);
+                }
                 insert_staged_page(write_set, write_pages_sorted, pg, StagedPage::from_buf(buf));
             }
         }
     }
 
+    if let Some(undo) = phase_a_undo {
+        undo.capture(write_set, PageNumber::ONE);
+    }
     let mut page1 =
         ensure_page_one_in_write_set(cx, inner, cache, wal_backend, pool, write_set).await?;
 
@@ -5682,7 +8604,7 @@ pub struct ParallelWalPublicationIntent {
     pub page_set_size: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParallelWalPublicationAuthorization {
     durability_receipt: ParallelWalDurabilityReceipt,
     batch_id: u64,
@@ -6560,7 +9482,7 @@ impl PublishedPagerState {
     fn bind_parallel_wal_publication(&self, intent: ParallelWalPublicationIntent) {
         self.visible_commit_seq
             .fetch_max(intent.visible_commit_seq.get(), AtomicOrdering::Release);
-        self.page_plane_visible_commit_seq.fetch_min(
+        self.page_plane_visible_commit_seq.fetch_max(
             intent.page_plane_visible_commit_seq.get(),
             AtomicOrdering::Release,
         );
@@ -7172,20 +10094,55 @@ where
         mode: TransactionMode,
     ) -> impl Future<Output = Result<Self::Txn>> + 'a {
         async move {
-            while self
-                .group_commit_queue
-                .resolve_one_pending_external_unlock()
-                .await?
-            {}
-            if self.group_commit_queue.has_unresolved_in_doubt_epoch() {
-                return Err(FrankenError::BusyRecovery);
-            }
-            let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
+            let begin_handle_key = {
+                let inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+                shared_db_file_key(&inner.db_file)
+            };
+            settle_pending_group_commit_finalization_for_handle(
+                &self.group_commit_queue,
+                begin_handle_key,
+            )
+            .await?;
+            let mut maintenance_lease = Some(self.maintenance_gate.enter_transaction()?);
             self.validate_namespace_binding()?;
+            // PagerInner ownership is the admission linearization point. A
+            // root that won before this point publishes the queue atomic
+            // before its registry record; the Acquire load observes it and
+            // the registry mutex then closes that publication interval. A
+            // root published after the load is ordered after this admission.
+            //
+            // Never hold the process-global registry while waiting for a
+            // pager-local mutex. Cancellation cleanup can publish a root while
+            // it still owns PagerInner, so registry -> inner would deadlock
+            // against its required inner -> registry Drop order. The atomic
+            // also keeps ordinary begins off the global registry fast path.
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if shared_db_file_key(&inner.db_file) != begin_handle_key {
+                return Err(FrankenError::internal(
+                    "pager database-file handle changed during begin admission",
+                ));
+            }
+            if self
+                .group_commit_queue
+                .has_process_root_finalization_attempt()
+            {
+                let registry = process_root_finalization_registry()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if process_root_finalization_scope_is_relevant_in_registry(
+                    &registry,
+                    self.group_commit_queue.queue_id,
+                    Some(begin_handle_key),
+                ) {
+                    return Err(FrankenError::BusyRecovery);
+                }
+            }
 
             if inner.checkpoint_active {
                 let active_transactions = inner.active_transactions;
@@ -7223,11 +10180,37 @@ where
             // sharing the same `MemoryVfs` can mutate the durable image or the
             // shared WAL backend between transactions.
             if self.vfs.is_memory() {
+                // Declared after `inner`: on cancellation the admission guard
+                // publishes its rooted cleanup before the pager mutex becomes
+                // observable to another task. The pending restorer never
+                // blocks on that mutex while holding the shared file handle.
+                let mut admission = BeginAdmission::new(
+                    &self.group_commit_queue,
+                    Arc::clone(&self.inner),
+                    Arc::clone(&inner.db_file),
+                    Arc::clone(&self.writer_idle),
+                    maintenance_lease
+                        .take()
+                        .expect("memory begin must own its transaction maintenance lease"),
+                    None,
+                    cx,
+                );
                 let commit_seq_before_refresh = inner.commit_seq;
                 let (committed_refresh, journal_visibility_invalidation) =
                     if active_transactions_before_begin == 0 {
-                        self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)
-                            .await?
+                        let maintenance_lease =
+                            admission.maintenance_lease.as_mut().ok_or_else(|| {
+                                FrankenError::internal(
+                                    "memory begin admission lost its maintenance lease before refresh",
+                                )
+                            })?;
+                        self.refresh_runtime_committed_state(
+                            cx,
+                            maintenance_lease,
+                            &mut inner,
+                            Some(&mut admission.external_lock),
+                        )
+                        .await?
                     } else {
                         (
                             CommittedStateRefresh {
@@ -7259,10 +10242,15 @@ where
                 if eager_writer && inner.writer_active {
                     return Err(FrankenError::Busy);
                 }
+                let active_transactions_after_begin =
+                    inner.active_transactions.checked_add(1).ok_or_else(|| {
+                        FrankenError::internal("active transaction count overflow during begin")
+                    })?;
                 if eager_writer {
                     inner.writer_active = true;
+                    admission.mark_writer_baton_owned();
                 }
-                inner.active_transactions += 1;
+                inner.active_transactions = active_transactions_after_begin;
                 let original_db_size = inner.db_size;
                 let journal_mode = inner.journal_mode;
                 let published_snapshot = self.published.snapshot();
@@ -7279,6 +10267,7 @@ where
                 let cleanup_cx = cx.clone();
                 let memory_db_bump_alloc =
                     self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
+                let maintenance_lease = admission.complete()?;
                 return Ok(SimpleTransaction {
                     vfs: Arc::clone(&self.vfs),
                     journal_path: Self::journal_path(&self.db_path),
@@ -7286,6 +10275,7 @@ where
                     namespace_binding: self.namespace_binding.clone(),
                     group_commit_queue: Arc::clone(&self.group_commit_queue),
                     inner: Arc::clone(&self.inner),
+                    db_file: Arc::clone(&inner.db_file),
                     writer_idle: Arc::clone(&self.writer_idle),
                     cache: Arc::clone(&self.cache),
                     published: Arc::clone(&self.published),
@@ -7293,7 +10283,7 @@ where
                     committed_snapshot: Arc::clone(&self.committed_snapshot),
                     shared_connection_count: self.shared_connection_count.get().cloned(),
                     maintenance_lease: Some(maintenance_lease),
-                    pending_group_commit_epoch_consumer: None,
+                    pending_group_commit_attempt: None,
                     recovery_fence: Arc::clone(&self.recovery_fence),
                     read_only_pager: inner.access_mode.is_readonly(),
                     published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
@@ -7324,11 +10314,47 @@ where
             }
 
             // ── File-backed path (full locking + recovery) ──────────────
+            let logical_transition_claim = if active_transactions_before_begin == 0 || eager_writer
+            {
+                Some(
+                    GroupCommitLogicalExitClaim::try_register(
+                        &self.group_commit_queue,
+                        shared_db_file_key(&inner.db_file),
+                    )
+                    .ok_or(FrankenError::BusyRecovery)?,
+                )
+            } else {
+                None
+            };
+            // Declared after `inner` for the same publication-before-visibility
+            // rule as the memory-backed path above.
+            let mut admission = BeginAdmission::new(
+                &self.group_commit_queue,
+                Arc::clone(&self.inner),
+                Arc::clone(&inner.db_file),
+                Arc::clone(&self.writer_idle),
+                maintenance_lease
+                    .take()
+                    .expect("file begin must own its transaction maintenance lease"),
+                logical_transition_claim,
+                cx,
+            );
             let commit_seq_before_refresh = inner.commit_seq;
             let (committed_refresh, journal_visibility_invalidation) =
                 if active_transactions_before_begin == 0 {
-                    self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)
-                        .await?
+                    let maintenance_lease =
+                        admission.maintenance_lease.as_mut().ok_or_else(|| {
+                            FrankenError::internal(
+                                "file begin admission lost its maintenance lease before refresh",
+                            )
+                        })?;
+                    self.refresh_runtime_committed_state(
+                        cx,
+                        maintenance_lease,
+                        &mut inner,
+                        Some(&mut admission.external_lock),
+                    )
+                    .await?
                 } else {
                     (
                         CommittedStateRefresh {
@@ -7342,8 +10368,7 @@ where
                 // Retain one stock-visible SHARED snapshot fence for the lifetime
                 // of the first local transaction. Later local transactions share
                 // this file handle and the last one releases it.
-                let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
-                db_file.lock_external_shared_snapshot(cx)?;
+                admission.external_lock.acquire_snapshot(cx).await?;
             }
 
             if active_transactions_before_begin == 0 {
@@ -7395,21 +10420,6 @@ where
             }
 
             if eager_writer && inner.writer_active {
-                if active_transactions_before_begin == 0 {
-                    let busy = FrankenError::Busy;
-                    return match release_snapshot_after_failed_begin(
-                        cx,
-                        &inner,
-                        active_transactions_before_begin,
-                    )
-                    .await
-                    {
-                        Ok(()) => Err(busy),
-                        Err(cleanup_error) => Err(FrankenError::internal(format!(
-                            "writer admission was busy and could not release its snapshot fence: admission={busy}; cleanup={cleanup_error}"
-                        ))),
-                    };
-                }
                 return Err(FrankenError::Busy);
             }
 
@@ -7417,55 +10427,30 @@ where
             // to other processes. This is a non-blocking advisory lock that
             // prevents multiple processes from writing simultaneously.
             if eager_writer {
-                let lock_result = {
+                if active_transactions_before_begin != 0 {
+                    admission.external_lock.arm_lock_level(LockLevel::Shared);
+                }
+                {
                     let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
-                    db_file.lock(cx, LockLevel::Reserved)
-                };
-                if let Err(err) = lock_result {
-                    return match release_snapshot_after_failed_begin(
-                        cx,
-                        &inner,
-                        active_transactions_before_begin,
-                    )
-                    .await
-                    {
-                        Ok(()) => Err(err),
-                        Err(cleanup_error) => Err(FrankenError::internal(format!(
-                            "writer lock acquisition failed and could not restore the retained snapshot lock: lock={err}; cleanup={cleanup_error}"
-                        ))),
-                    };
+                    db_file.lock(cx, LockLevel::Reserved)?;
+                }
+                if active_transactions_before_begin != 0 {
+                    admission.external_lock.mark_lock_level_acquired();
                 }
                 inner.writer_active = true;
+                admission.mark_writer_baton_owned();
             }
 
             if inner.journal_mode == JournalMode::Wal && !committed_refresh.wal_snapshot_initialized
             {
-                let wal_begin_result =
-                    with_wal_backend(&self.wal_backend, cx, |wal, cx| wal.begin_transaction(cx))
-                        .await;
-                if let Err(err) = wal_begin_result {
-                    let notify_writer_idle =
-                        eager_writer && release_single_writer_baton(&mut inner);
-                    let cleanup_result = release_snapshot_after_failed_begin(
-                        cx,
-                        &inner,
-                        active_transactions_before_begin,
-                    )
-                    .await;
-                    drop(inner);
-                    if notify_writer_idle {
-                        self.writer_idle.notify_one();
-                    }
-                    return match cleanup_result {
-                        Ok(()) => Err(err),
-                        Err(cleanup_error) => Err(FrankenError::internal(format!(
-                            "WAL snapshot acquisition failed and could not restore the retained snapshot lock: wal={err}; cleanup={cleanup_error}"
-                        ))),
-                    };
-                }
+                with_wal_backend(&self.wal_backend, cx, |wal, cx| wal.begin_transaction(cx))
+                    .await?;
             }
 
-            inner.active_transactions = inner.active_transactions.saturating_add(1);
+            inner.active_transactions =
+                inner.active_transactions.checked_add(1).ok_or_else(|| {
+                    FrankenError::internal("active transaction count overflow during begin")
+                })?;
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
             let pool = self.pool.clone();
@@ -7474,6 +10459,8 @@ where
             let memory_db_bump_alloc =
                 self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
             let read_only_pager = inner.access_mode.is_readonly();
+            let db_file = Arc::clone(&inner.db_file);
+            let maintenance_lease = admission.complete()?;
             drop(inner);
 
             Ok(SimpleTransaction {
@@ -7483,6 +10470,7 @@ where
                 namespace_binding: self.namespace_binding.clone(),
                 group_commit_queue: Arc::clone(&self.group_commit_queue),
                 inner: Arc::clone(&self.inner),
+                db_file,
                 writer_idle: Arc::clone(&self.writer_idle),
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
@@ -7490,7 +10478,7 @@ where
                 committed_snapshot: Arc::clone(&self.committed_snapshot),
                 shared_connection_count: self.shared_connection_count.get().cloned(),
                 maintenance_lease: Some(maintenance_lease),
-                pending_group_commit_epoch_consumer: None,
+                pending_group_commit_attempt: None,
                 recovery_fence: Arc::clone(&self.recovery_fence),
                 read_only_pager,
                 published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
@@ -7543,6 +10531,7 @@ where
         mode: JournalMode,
     ) -> impl Future<Output = Result<JournalMode>> + 'a {
         async move {
+            settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
             let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
             self.validate_namespace_binding()?;
             let mut inner = self
@@ -7620,7 +10609,19 @@ where
     }
 
     fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()> {
+        if self
+            .group_commit_queue
+            .has_process_root_finalization_attempt()
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
+        if self
+            .group_commit_queue
+            .has_process_root_finalization_attempt()
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
         let inner = self
             .inner
             .lock()
@@ -7642,7 +10643,7 @@ where
 
 impl<V: Vfs> SimplePager<V>
 where
-    V::File: Send + Sync,
+    V::File: Send + Sync + 'static,
 {
     const EXPORT_COPY_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -7692,7 +10693,56 @@ where
             &'a mut S,
         ) -> LocalPagerFuture<'a, T>,
     ) -> Result<T> {
+        struct MaintenanceActivityGuard<'a, F: VfsFile> {
+            inner: &'a Mutex<PagerInner<F>>,
+            published: &'a PublishedPagerState,
+            cleanup_cx: Cx,
+            active: bool,
+        }
+
+        impl<F: VfsFile> MaintenanceActivityGuard<'_, F> {
+            fn disarm(&mut self) {
+                self.active = false;
+            }
+        }
+
+        impl<F: VfsFile> Drop for MaintenanceActivityGuard<'_, F> {
+            fn drop(&mut self) {
+                if !self.active {
+                    return;
+                }
+                let mut inner = match self.inner.lock() {
+                    Ok(inner) => inner,
+                    Err(error) => {
+                        tracing::error!(
+                            "maintenance activity guard recovered a poisoned PagerInner for fail-closed cleanup"
+                        );
+                        error.into_inner()
+                    }
+                };
+                let _mask = self.cleanup_cx.masked();
+                inner.checkpoint_active = false;
+                self.published.publish_metadata_only(
+                    &self.cleanup_cx,
+                    PublishedPagerUpdate {
+                        visible_commit_seq: inner.commit_seq,
+                        db_size: inner.db_size,
+                        journal_mode: inner.journal_mode,
+                        freelist_count: inner.freelist.len(),
+                        checkpoint_active: false,
+                    },
+                );
+            }
+        }
+
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
         let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
+        let mut activity_guard = MaintenanceActivityGuard {
+            inner: &self.inner,
+            published: self.published.as_ref(),
+            cleanup_cx: cleanup_child_cx(cx),
+            active: false,
+        };
         self.validate_namespace_binding()?;
         let mut inner = self
             .inner
@@ -7718,50 +10768,28 @@ where
                 checkpoint_active: true,
             },
         );
+        activity_guard.active = true;
 
         let wal_handle = if inner.journal_mode == JournalMode::Wal {
             match wal_backend_handle(&self.wal_backend) {
                 Ok(handle) => Some(handle),
-                Err(error) => {
-                    inner.checkpoint_active = false;
-                    self.published.publish_metadata_only(
-                        cx,
-                        PublishedPagerUpdate {
-                            visible_commit_seq: inner.commit_seq,
-                            db_size: inner.db_size,
-                            journal_mode: inner.journal_mode,
-                            freelist_count: inner.freelist.len(),
-                            checkpoint_active: false,
-                        },
-                    );
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         } else {
             None
         };
 
         // Acquire one VFS-defined fence over every lock surface relevant to a
-        // whole-image replacement. Unix composes the stock main/SHM locks in
-        // the default hook; Windows additionally takes the real byte ranges
-        // used by stock SQLite rather than relying on FrankenSQLite sidecars.
+        // whole-image replacement. Each native backend composes its main-file
+        // and shared-memory lock surfaces according to its platform protocol.
         let wal_mode = inner.journal_mode == JournalMode::Wal;
-        let maintenance_lock_result = {
-            let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
-            db_file.lock_external_maintenance(cx, wal_mode)
-        };
+        let mut external_lock =
+            BeginExternalLockState::new(&self.group_commit_queue, Arc::clone(&inner.db_file), cx);
+        let maintenance_lock_result = external_lock.acquire_maintenance(cx, wal_mode).await;
         if let Err(err) = maintenance_lock_result {
-            inner.checkpoint_active = false;
-            self.published.publish_metadata_only(
-                cx,
-                PublishedPagerUpdate {
-                    visible_commit_seq: inner.commit_seq,
-                    db_size: inner.db_size,
-                    journal_mode: inner.journal_mode,
-                    freelist_count: inner.freelist.len(),
-                    checkpoint_active: false,
-                },
-            );
+            // Terminalize synchronously or publish the process-root retry
+            // before advertising that maintenance is inactive.
+            drop(external_lock);
             return Err(err);
         }
 
@@ -7792,15 +10820,14 @@ where
         // masked child so inherited cancellation cannot strand either lock.
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
-        let unlock_result = match shared_db_file_write(&inner.db_file, &cleanup_cx).await {
-            Ok(mut db_file) => db_file.unlock_external_maintenance(&cleanup_cx, wal_mode),
-            Err(error) => Err(FrankenError::internal(format!(
-                "database-file write lock failed during maintenance cleanup: {error}"
-            ))),
-        };
+        let unlock_result = external_lock.restore().await;
+        // `restore()` deliberately leaves the attempt armed on error. Its
+        // Drop either finishes synchronously or queues a process-root owner;
+        // only after that handoff may observers see maintenance as inactive.
+        drop(external_lock);
         inner.checkpoint_active = false;
         self.published.publish_metadata_only(
-            cx,
+            &cleanup_cx,
             PublishedPagerUpdate {
                 visible_commit_seq: inner.commit_seq,
                 db_size: inner.db_size,
@@ -7809,6 +10836,7 @@ where
                 checkpoint_active: false,
             },
         );
+        activity_guard.disarm();
         self.publish_committed_snapshot_from_inner(&inner);
         drop(wal_handle);
 
@@ -7925,10 +10953,22 @@ where
     where
         B: WalBackend + 'static,
     {
+        if self
+            .group_commit_queue
+            .has_process_root_finalization_attempt()
+        {
+            return Err((FrankenError::BusyRecovery, backend));
+        }
         let _maintenance_lease = match self.maintenance_gate.enter_transaction() {
             Ok(lease) => lease,
             Err(err) => return Err((err, backend)),
         };
+        if self
+            .group_commit_queue
+            .has_process_root_finalization_attempt()
+        {
+            return Err((FrankenError::BusyRecovery, backend));
+        }
         let inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(_) => {
@@ -8711,6 +11751,7 @@ where
     /// The pager must be quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the returned bytes contain the durable main image.
     pub async fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_full = self.vfs.full_pathname(cx, &self.db_path)?;
@@ -8774,6 +11815,7 @@ where
     /// allowed when the pager is quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the destination contains a self-contained main DB.
     pub async fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_path = self.db_path.clone();
@@ -8897,6 +11939,7 @@ where
     // belong to the Phase-C pager reconstruction.
     #[allow(clippy::await_holding_lock)]
     pub async fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
         let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let mut inner = self
@@ -8911,7 +11954,7 @@ where
         let had_recovery_pending = inner.rollback_journal_recovery_state.is_pending();
         let commit_seq_before_refresh = inner.commit_seq;
         let (refresh, journal_visibility_invalidation) = self
-            .refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)
+            .refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner, None)
             .await?;
 
         let clear_published_pages = had_recovery_pending
@@ -9045,6 +12088,12 @@ where
     /// post-commit poll into a global WAL RwLock write-contention
     /// point.
     pub async fn wal_frame_count(&self, cx: &Cx) -> usize {
+        if self
+            .group_commit_queue
+            .has_process_root_finalization_attempt()
+        {
+            return 0;
+        }
         with_wal_backend_read(&self.wal_backend, cx, |wal, _| {
             Box::pin(async move { Ok(wal.frame_count()) })
         })
@@ -9080,6 +12129,7 @@ where
     /// the same epoch. If the rebuild fails after durable replay, the distinct
     /// `MetadataRefreshPending` state makes a later attempt retry metadata
     /// without requiring the already-invalidated journal.
+    #[allow(clippy::too_many_arguments)]
     async fn recover_runtime_rollback_journal(
         cx: &Cx,
         vfs: &V,
@@ -9087,9 +12137,17 @@ where
         journal_path: &Path,
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
+        group_commit_queue: &Arc<GroupCommitQueue>,
+        begin_external_lock: Option<&mut BeginExternalLockState<V::File>>,
     ) -> Result<bool> {
         let wal_mode = inner.journal_mode == JournalMode::Wal;
-        shared_db_lock_external_maintenance(&inner.db_file, cx, wal_mode).await?;
+        let mut standalone_external_lock = begin_external_lock.is_none().then(|| {
+            BeginExternalLockState::new(group_commit_queue, Arc::clone(&inner.db_file), cx)
+        });
+        let external_lock = begin_external_lock
+            .or(standalone_external_lock.as_mut())
+            .expect("runtime recovery must own one external-lock attempt guard");
+        external_lock.acquire_maintenance(cx, wal_mode).await?;
         let recovery_result = async {
             let journal_exists = vfs.access(cx, journal_path, AccessFlags::EXISTS)?;
             if inner.rollback_journal_recovery_state.needs_replay() && !journal_exists {
@@ -9154,10 +12212,7 @@ where
             Ok(journal_observed)
         }
         .await;
-        let cleanup_cx = cleanup_child_cx(cx);
-        let _cleanup_mask = cleanup_cx.masked();
-        let unlock_result =
-            shared_db_unlock_external_maintenance(&inner.db_file, &cleanup_cx, wal_mode).await;
+        let unlock_result = external_lock.restore().await;
         match (recovery_result, unlock_result) {
             (Ok(recovered), Ok(())) => Ok(recovered),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -9170,7 +12225,8 @@ where
     async fn recover_rollback_journal_for_open(
         cx: &Cx,
         vfs: &V,
-        db_file: &mut V::File,
+        group_commit_queue: &Arc<GroupCommitQueue>,
+        db_file: &SharedDbFile<V::File>,
         journal_path: &Path,
     ) -> Result<Option<RollbackJournalReplayOutcome>> {
         if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
@@ -9181,7 +12237,10 @@ where
         // mode. Conservatively exclude WAL writers/checkpointers as well as
         // main-file users; this is safe for rollback-mode files and prevents a
         // crashed WAL-mode whole-image publication racing recovery.
-        db_file.lock_external_maintenance(cx, true)?;
+        let mut maintenance_attempt =
+            BeginExternalLockState::new(group_commit_queue, Arc::clone(db_file), cx);
+        maintenance_attempt.acquire_maintenance(cx, true).await?;
+        let mut file = shared_db_file_write(db_file, cx).await?;
         let recovery_result = async {
             if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
                 return Ok(None);
@@ -9189,7 +12248,7 @@ where
             let outcome = Self::replay_journal_with_optional_page_size_validator(
                 cx,
                 vfs,
-                db_file,
+                &mut *file,
                 journal_path,
                 None,
                 |validator_cx, restored_file, journal_page_size| Box::pin(async move {
@@ -9251,9 +12310,9 @@ where
         }
         .await;
 
-        let cleanup_cx = cleanup_child_cx(cx);
-        let _cleanup_mask = cleanup_cx.masked();
-        let unlock_result = db_file.unlock_external_maintenance(&cleanup_cx, true);
+        drop(file);
+        let unlock_result = maintenance_attempt.restore().await;
+        drop(maintenance_attempt);
         match (recovery_result, unlock_result) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -9298,16 +12357,21 @@ where
         cx: &Cx,
         maintenance_lease: &mut PagerMaintenanceLease,
         inner: &mut PagerInner<V::File>,
+        begin_external_lock: Option<&mut BeginExternalLockState<V::File>>,
     ) -> Result<(CommittedStateRefresh, bool)> {
         let journal_path = Self::journal_path(&self.db_path);
-        shared_db_lock_external_snapshot(&inner.db_file, cx).await?;
+        let mut standalone_external_lock = begin_external_lock.is_none().then(|| {
+            BeginExternalLockState::new(&self.group_commit_queue, Arc::clone(&inner.db_file), cx)
+        });
+        let external_lock = begin_external_lock
+            .or(standalone_external_lock.as_mut())
+            .expect("runtime refresh must own one external-lock attempt guard");
+        external_lock.acquire_snapshot(cx).await?;
 
         let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
             Ok(exists) => exists,
             Err(error) => {
-                let cleanup_cx = cleanup_child_cx(cx);
-                let _cleanup_mask = cleanup_cx.masked();
-                return match shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await {
+                return match external_lock.restore().await {
                     Ok(()) => Err(error),
                     Err(unlock_error) => Err(FrankenError::internal(format!(
                         "rollback-journal probe failed and could not release SHARED: probe={error}; unlock={unlock_error}"
@@ -9332,10 +12396,7 @@ where
                     Err(error) => Err(error),
                 }
             };
-            let cleanup_cx = cleanup_child_cx(cx);
-            let _cleanup_mask = cleanup_cx.masked();
-            let unlock_result =
-                shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await;
+            let unlock_result = external_lock.restore().await;
             return match (operation_result, unlock_result) {
                 (Ok(refresh), Ok(())) => Ok((refresh, journal_exists)),
                 (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -9349,9 +12410,7 @@ where
             // Never wait for the recovery fence or acquire WAL slots while
             // retaining main SHARED: maintenance publishers use the opposite,
             // canonical order.
-            let cleanup_cx = cleanup_child_cx(cx);
-            let _cleanup_mask = cleanup_cx.masked();
-            shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await?;
+            external_lock.restore().await?;
             let _recovery_guard = self.recovery_fence.acquire_for_recovery()?;
             let prior_kind = maintenance_lease.upgrade_to_exclusive()?;
             let recovery_result = Self::recover_runtime_rollback_journal(
@@ -9361,8 +12420,19 @@ where
                 &journal_path,
                 &self.cache,
                 &self.wal_backend,
+                &self.group_commit_queue,
+                Some(&mut *external_lock),
             )
             .await;
+            let external_restore_pending = external_lock.is_armed();
+            if external_restore_pending {
+                return match recovery_result {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(FrankenError::internal(
+                        "runtime recovery reported success while its external maintenance lock remained armed",
+                    )),
+                };
+            }
             let cleanup_cx = cleanup_child_cx(cx);
             let _cleanup_mask = cleanup_cx.masked();
             let downgrade_result = maintenance_lease.downgrade_from_exclusive(prior_kind);
@@ -9376,16 +12446,14 @@ where
                 }
             }
 
-            shared_db_lock_external_snapshot(&inner.db_file, cx).await?;
+            external_lock.acquire_snapshot(cx).await?;
             // A non-hot leftover is harmless if deletion failed. A new hot
             // record here means another process won a publication race after
             // our recovery epoch; fail closed instead of reading through it.
             if let Err(error) =
                 Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path).await
             {
-                let cleanup_cx = cleanup_child_cx(cx);
-                let _cleanup_mask = cleanup_cx.masked();
-                return match shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await {
+                return match external_lock.restore().await {
                     Ok(()) => Err(error),
                     Err(unlock_error) => Err(FrankenError::internal(format!(
                         "post-recovery journal verification failed and could not release SHARED: verification={error}; unlock={unlock_error}"
@@ -9397,9 +12465,7 @@ where
         let refresh_result = inner
             .refresh_committed_state(cx, &self.cache, &self.wal_backend)
             .await;
-        let cleanup_cx = cleanup_child_cx(cx);
-        let _cleanup_mask = cleanup_cx.masked();
-        let unlock_result = shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await;
+        let unlock_result = external_lock.restore().await;
         match (refresh_result, unlock_result) {
             (Ok(refresh), Ok(())) => Ok((refresh, had_pending || journal_exists)),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -9612,6 +12678,17 @@ where
         } = policy;
         let vfs = Arc::new(vfs);
         let db_path = vfs.full_pathname(cx, path)?;
+        // A lexical path gate runs before namespace admission or file open so
+        // a prior caller cannot leave process-root finalization work while a
+        // replacement opener begins inspecting the same name.
+        //
+        // Private memory VFS instances may legitimately reuse the same
+        // synthetic path for unrelated storage identities. Their identity
+        // gate below provides same-database coordination without cross-wiring
+        // independent databases through a process-global path.
+        if !vfs.is_memory() {
+            settle_process_root_finalizations_for_path(&db_path).await?;
+        }
         let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
         let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
@@ -9649,7 +12726,7 @@ where
         if disposition == ReadWriteOpenDisposition::CreateIfMissing {
             flags |= VfsOpenFlags::CREATE;
         }
-        let (mut db_file, _actual_flags) = match (disposition, effective_expected_identity) {
+        let (db_file, _actual_flags) = match (disposition, effective_expected_identity) {
             (ReadWriteOpenDisposition::ReservedEmpty, Some(expected_identity)) => {
                 vfs.open_reserved_with_expected_identity(cx, &db_path, flags, expected_identity)?
             }
@@ -9661,10 +12738,17 @@ where
             }
             (_, None) => vfs.open(cx, Some(&db_path), flags)?,
         };
+        if let Some(identity) = db_file.file_identity()? {
+            settle_process_root_finalizations_for_identity(identity).await?;
+        }
         let maintenance_gate =
             identity_bound_maintenance_gate(&*vfs, &path_maintenance_gate, &db_file)?;
         let recovery_fence = identity_bound_recovery_fence(&*vfs, &db_path, &db_file)?;
         let group_commit_queue = identity_bound_group_commit_queue(&*vfs, &db_path, &db_file)?;
+        // A prior caller may have disappeared after physical WAL mutation
+        // started. Settle that identity-bound obligation before this opener
+        // inspects the main file, journal, WAL, or cached header state.
+        settle_pending_group_commit_finalization(&group_commit_queue).await?;
         let mut maintenance_open_lease = if Arc::ptr_eq(&maintenance_gate, &path_maintenance_gate) {
             path_maintenance_lease
         } else {
@@ -9686,12 +12770,17 @@ where
         } else {
             None
         };
+        let db_file = Arc::new(AsyncRwLock::with_name("pager_db_file", db_file));
 
         let journal_path = Self::journal_path(&db_path);
         if disposition == ReadWriteOpenDisposition::ExistingOnly
-            && with_main_shared_lock(cx, &mut db_file, &mut (), |cx, db_file, ()| {
-                Box::pin(async move { db_file.file_size(cx) })
-            })
+            && with_main_shared_lock(
+                cx,
+                &group_commit_queue,
+                &db_file,
+                &mut (),
+                |cx, db_file, ()| Box::pin(async move { db_file.file_size(cx) }),
+            )
             .await?
                 == 0
         {
@@ -9703,7 +12792,11 @@ where
         let (mut file_size, coherent_header_bytes, accept_proven_non_hot_leftover) = if disposition
             == ReadWriteOpenDisposition::ReservedEmpty
         {
-            (db_file.file_size(cx)?, None, false)
+            (
+                shared_db_file_read(&db_file, cx).await?.file_size(cx)?,
+                None,
+                false,
+            )
         } else {
             let mut accept_proven_non_hot_leftover = false;
             loop {
@@ -9719,7 +12812,8 @@ where
                     let recovery_result = Self::recover_rollback_journal_for_open(
                         cx,
                         &*vfs,
-                        &mut db_file,
+                        &group_commit_queue,
+                        &db_file,
                         &journal_path,
                     )
                     .await;
@@ -9750,7 +12844,8 @@ where
                 );
                 let snapshot = with_main_shared_lock(
                     cx,
-                    &mut db_file,
+                    &group_commit_queue,
+                    &db_file,
                     &mut snapshot_state,
                     |cx, db_file, state| {
                     let (vfs, journal_path, accept_non_hot, disposition, db_path) = state;
@@ -9839,14 +12934,19 @@ where
                 return Err(FrankenError::CannotOpen { path: db_path });
             }
             let reserved_bootstrap = disposition == ReadWriteOpenDisposition::ReservedEmpty;
-            if reserved_bootstrap {
-                db_file.lock(cx, LockLevel::Exclusive)?;
+            let mut bootstrap_lock = reserved_bootstrap.then(|| {
+                BeginExternalLockState::new(&group_commit_queue, Arc::clone(&db_file), cx)
+            });
+            if let Some(lock) = bootstrap_lock.as_mut() {
+                lock.arm_lock_level(LockLevel::None);
+                shared_db_lock(&db_file, cx, LockLevel::Exclusive).await?;
+                lock.mark_lock_level_acquired();
             }
 
             let bootstrap_result = async {
+                let mut file = shared_db_file_write(&db_file, cx).await?;
                 if reserved_bootstrap {
-                    if db_file.file_identity()? != expected_identity || db_file.file_size(cx)? != 0
-                    {
+                    if file.file_identity()? != expected_identity || file.file_size(cx)? != 0 {
                         return Err(FrankenError::CannotOpen {
                             path: db_path.clone(),
                         });
@@ -9886,14 +12986,14 @@ where
                 let usable = page_size.usable(header.reserved_per_page);
                 BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
 
-                db_file.write(cx, &page1, 0).await?;
-                db_file.sync(cx, SyncFlags::NORMAL)?;
-                Ok((header, db_file.file_size(cx)?))
+                file.write(cx, &page1, 0).await?;
+                file.sync(cx, SyncFlags::NORMAL)?;
+                Ok((header, file.file_size(cx)?))
             }
             .await;
 
-            let unlock_result = if reserved_bootstrap {
-                db_file.unlock(cx, LockLevel::None)
+            let unlock_result = if let Some(lock) = bootstrap_lock.as_mut() {
+                lock.restore().await
             } else {
                 Ok(())
             };
@@ -10004,7 +13104,8 @@ where
             );
             with_main_shared_lock(
                 cx,
-                &mut db_file,
+                &group_commit_queue,
+                &db_file,
                 &mut freelist_state,
                 |cx, db_file, state| {
                     let (
@@ -10069,7 +13170,7 @@ where
             recovery_fence,
             maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
-                db_file: Arc::new(AsyncRwLock::with_name("pager_db_file", db_file)),
+                db_file,
                 page_size,
                 db_size,
                 next_page,
@@ -10217,6 +13318,9 @@ where
     ) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let db_path = vfs.full_pathname(cx, path)?;
+        if !vfs.is_memory() {
+            settle_process_root_finalizations_for_path(&db_path).await?;
+        }
         let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
         let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
@@ -10258,16 +13362,23 @@ where
         #[cfg(not(all(feature = "native", any(unix, windows))))]
         let effective_expected_identity = expected_identity;
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-        let (mut db_file, _actual_flags) =
-            if let Some(expected_identity) = effective_expected_identity {
-                vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
-            } else {
-                vfs.open(cx, Some(&db_path), flags)?
-            };
+        let (db_file, _actual_flags) = if let Some(expected_identity) = effective_expected_identity
+        {
+            vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
+        } else {
+            vfs.open(cx, Some(&db_path), flags)?
+        };
+        if let Some(identity) = db_file.file_identity()? {
+            settle_process_root_finalizations_for_identity(identity).await?;
+        }
         let maintenance_gate =
             identity_bound_maintenance_gate(&*vfs, &path_maintenance_gate, &db_file)?;
         let recovery_fence = identity_bound_recovery_fence(&*vfs, &db_path, &db_file)?;
         let group_commit_queue = identity_bound_group_commit_queue(&*vfs, &db_path, &db_file)?;
+        // Read-only open is still an observer of the physical database
+        // generation, so it must not inspect storage while a prior admitted
+        // WAL finalization remains unresolved.
+        settle_pending_group_commit_finalization(&group_commit_queue).await?;
         let maintenance_open_lease = if Arc::ptr_eq(&maintenance_gate, &path_maintenance_gate) {
             path_maintenance_lease
         } else {
@@ -10289,12 +13400,14 @@ where
         } else {
             None
         };
+        let db_file = Arc::new(AsyncRwLock::with_name("pager_db_file", db_file));
 
         let journal_path = Self::journal_path(&db_path);
         let mut header_state = (Arc::clone(&vfs), journal_path.clone(), db_path.clone());
         let (file_size, header_bytes) = with_main_shared_lock(
             cx,
-            &mut db_file,
+            &group_commit_queue,
+            &db_file,
             &mut header_state,
             |cx, db_file, state| {
             let (vfs, journal_path, db_path) = state;
@@ -10405,7 +13518,7 @@ where
             recovery_fence,
             maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
-                db_file: Arc::new(AsyncRwLock::with_name("pager_db_file", db_file)),
+                db_file,
                 page_size,
                 db_size,
                 next_page,
@@ -11204,13 +14317,21 @@ fn acquire_page_buf_with_clean_cache_recovery(
 }
 
 #[allow(clippy::struct_excessive_bools)]
-pub struct SimpleTransaction<V: Vfs> {
+pub struct SimpleTransaction<V>
+where
+    V: Vfs,
+    V::File: 'static,
+{
     vfs: Arc<V>,
     journal_path: PathBuf,
     #[cfg(all(feature = "native", any(unix, windows)))]
     namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
     group_commit_queue: GroupCommitQueueRef,
     inner: Arc<Mutex<PagerInner<V::File>>>,
+    /// Exact stable handle used for lock-transition coordination. Distinct
+    /// handles for one file identity may proceed independently; transitions on
+    /// this handle must not overtake one another.
+    db_file: SharedDbFile<V::File>,
     writer_idle: Arc<Condvar>,
     cache: Arc<ShardedPageCache>,
     published: Arc<PublishedPagerState>,
@@ -11223,11 +14344,10 @@ pub struct SimpleTransaction<V: Vfs> {
     /// Same-path transaction lease. Released as soon as commit/rollback
     /// finishes, before the transaction value itself is dropped.
     maintenance_lease: Option<PagerMaintenanceLease>,
-    /// Exact group-commit terminal-evidence owner retained after an ambiguous
-    /// physical callback. Recovery may share this lease, but cannot become its
-    /// sole logical owner while this transaction can still classify the
-    /// admitted WAL attempt.
-    pending_group_commit_epoch_consumer: Option<Arc<GroupCommitEpochConsumer>>,
+    /// Exact logical owner for one WAL group-commit attempt. It retains
+    /// admission evidence plus Phase-A allocation/undo state until durable
+    /// authorization or rejection and logical Phase C are terminal.
+    pending_group_commit_attempt: Option<Arc<PendingGroupCommitTxnAttempt<V::File>>>,
     recovery_fence: Arc<RecoveryFence>,
     /// The physical pager was opened read-only. This is stronger than a
     /// read-only transaction mode and must reject every later writer upgrade.
@@ -11307,7 +14427,12 @@ pub struct SimpleTransaction<V: Vfs> {
     scratch_arena: bumpalo::Bump,
 }
 
-impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
+impl<V> traits::sealed::Sealed for SimpleTransaction<V>
+where
+    V: Vfs,
+    V::File: 'static,
+{
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalPageOneWritePlan {
@@ -11348,7 +14473,11 @@ impl WalPageOneWritePlan {
     }
 }
 
-impl<V: Vfs> SimpleTransaction<V> {
+impl<V> SimpleTransaction<V>
+where
+    V: Vfs,
+    V::File: 'static,
+{
     #[cfg(all(feature = "native", any(unix, windows)))]
     fn validate_namespace_binding(&self) -> Result<()> {
         if let Some(binding) = &self.namespace_binding {
@@ -11359,6 +14488,17 @@ impl<V: Vfs> SimpleTransaction<V> {
 
     #[cfg(not(all(feature = "native", any(unix, windows))))]
     fn validate_namespace_binding(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn reacquire_external_snapshot(&self, cx: &Cx) -> Result<()> {
+        let mut attempt =
+            BeginExternalLockState::new(&self.group_commit_queue, Arc::clone(&self.db_file), cx);
+        attempt.acquire_snapshot(cx).await?;
+        // The live transaction resumes ownership of the successful snapshot
+        // attempt. Its ordinary commit/rollback/Drop path performs the exact
+        // terminal restoration.
+        attempt.disarm();
         Ok(())
     }
 
@@ -11385,11 +14525,11 @@ impl<V: Vfs> SimpleTransaction<V> {
             return Ok(false);
         }
 
-        shared_db_unlock_external_snapshot(&inner.db_file, cx).await?;
+        shared_db_restore_external_snapshot_attempt(&inner.db_file, cx).await?;
         let recovery_guard = match self.recovery_fence.acquire_for_recovery() {
             Ok(guard) => guard,
             Err(error) => {
-                return match shared_db_lock_external_snapshot(&inner.db_file, cx).await {
+                return match self.reacquire_external_snapshot(cx).await {
                     Ok(()) => Err(error),
                     Err(relock_error) => Err(FrankenError::internal(format!(
                         "could not enter rollback recovery or restore the transaction snapshot lock: recovery={error}; relock={relock_error}"
@@ -11403,7 +14543,7 @@ impl<V: Vfs> SimpleTransaction<V> {
         let prior_kind = match maintenance_lease.upgrade_to_exclusive() {
             Ok(prior_kind) => prior_kind,
             Err(error) => {
-                return match shared_db_lock_external_snapshot(&inner.db_file, cx).await {
+                return match self.reacquire_external_snapshot(cx).await {
                     Ok(()) => Err(error),
                     Err(relock_error) => Err(FrankenError::internal(format!(
                         "could not exclude same-process pagers for rollback recovery or restore the transaction snapshot lock: recovery={error}; relock={relock_error}"
@@ -11419,12 +14559,14 @@ impl<V: Vfs> SimpleTransaction<V> {
             &self.journal_path,
             &self.cache,
             &self.wal_backend,
+            &self.group_commit_queue,
+            None,
         )
         .await;
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
         let downgrade_result = maintenance_lease.downgrade_from_exclusive(prior_kind);
-        let relock_result = shared_db_lock_external_snapshot(&inner.db_file, &cleanup_cx).await;
+        let relock_result = self.reacquire_external_snapshot(&cleanup_cx).await;
         let operation_result = match (recovery_result, downgrade_result, relock_result) {
             (Ok(recovered), Ok(()), Ok(())) => Ok(recovered),
             (Err(error), Ok(()), Ok(()))
@@ -11487,6 +14629,13 @@ impl<V: Vfs> SimpleTransaction<V> {
         &self.scratch_arena
     }
 
+    fn ensure_no_pending_group_commit_attempt(&self) -> Result<()> {
+        if self.pending_group_commit_attempt.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(())
+    }
+
     /// Allocate a staged write buffer, reclaiming only clean shared-cache
     /// entries if the common pool has reached its configured ceiling.
     fn stage_page_bytes(&self, data: &[u8]) -> Result<StagedPage> {
@@ -11525,6 +14674,9 @@ impl<V: Vfs> SimpleTransaction<V> {
         budget: usize,
         penalty: f64,
     ) {
+        if self.pending_group_commit_attempt.is_some() {
+            return;
+        }
         let selected = crate::submodular_prefetch::greedy_select(candidates, budget, penalty);
         if selected.is_empty() {
             return;
@@ -11608,6 +14760,9 @@ impl<V: Vfs> SimpleTransaction<V> {
     /// instead of the stale on-disk trunk.
     #[must_use]
     pub fn live_freelist_pages(&self) -> Vec<PageNumber> {
+        if let Some(attempt) = &self.pending_group_commit_attempt {
+            return attempt.projected_live_freelist();
+        }
         self.inner.lock().map_or_else(
             |_| Vec::new(),
             |inner| {
@@ -11635,6 +14790,9 @@ impl<V: Vfs> SimpleTransaction<V> {
     /// caller falls back to the published size.
     #[must_use]
     pub fn live_db_size(&self) -> u32 {
+        if let Some(attempt) = &self.pending_group_commit_attempt {
+            return attempt.projected_db_size();
+        }
         self.inner.lock().map_or(0, |inner| {
             self.allocated_from_eof
                 .iter()
@@ -12126,8 +15284,11 @@ impl<V: Vfs> SimpleTransaction<V> {
         Ok(())
     }
 
-    fn retain_committed_pages_in_txn_read_cache(&mut self) {
+    fn retain_committed_pages_in_txn_read_cache(&mut self, invalidate_prior_snapshot: bool) {
         let mut txn_read_cache = self.txn_read_cache.borrow_mut();
+        if invalidate_prior_snapshot {
+            txn_read_cache.clear();
+        }
         for (page_no, staged) in self.write_set.drain() {
             txn_read_cache.insert(page_no, staged.into_published_page());
         }
@@ -12197,8 +15358,8 @@ impl<V: Vfs> SimpleTransaction<V> {
         pending
     }
 
-    fn drain_unstaged_allocated_pages(&mut self) -> Vec<PageNumber> {
-        let mut unstaged = Vec::new();
+    fn drain_unstaged_allocated_pages(&mut self) -> PendingReturnedAllocations {
+        let mut unstaged = PendingReturnedAllocations::default();
         let write_set = &self.write_set;
         let freed_pages = &self.freed_pages;
         let freed_page_bounds = self.freed_page_bounds;
@@ -12208,7 +15369,7 @@ impl<V: Vfs> SimpleTransaction<V> {
                 || freed_page_bounds.is_some_and(|(low, high)| low <= *page && *page <= high)
                     && freed_pages.contains(page);
             if !keep {
-                unstaged.push(*page);
+                unstaged.from_eof.push(*page);
             }
             keep
         });
@@ -12217,7 +15378,7 @@ impl<V: Vfs> SimpleTransaction<V> {
                 || freed_page_bounds.is_some_and(|(low, high)| low <= *page && *page <= high)
                     && freed_pages.contains(page);
             if !keep {
-                unstaged.push(*page);
+                unstaged.from_freelist.push(*page);
             }
             keep
         });
@@ -12671,7 +15832,6 @@ where
         };
 
         let mut publication_authorization = None;
-        let mut epoch_consumer = None;
         Self::commit_wal_group_commit_with_snapshot(
             cx,
             wal_backend,
@@ -12685,7 +15845,7 @@ where
             &[],
             queue,
             &mut publication_authorization,
-            &mut epoch_consumer,
+            None,
         )
         .await
     }
@@ -12705,16 +15865,20 @@ where
         conflict_page_baselines: &[TransactionConflictPageBaseline],
         queue: &GroupCommitQueueRef,
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
-        epoch_consumer_out: &mut Option<Arc<GroupCommitEpochConsumer>>,
+        txn_attempt: Option<&Arc<PendingGroupCommitTxnAttempt<V::File>>>,
     ) -> Result<()> {
-        // A prior flusher may have been dropped while the shared database-file
-        // handle was contended. The next commit is an existing structured
-        // owner for that cleanup; it must restore the external lock before it
-        // submits another physical-write obligation.
-        while queue.resolve_one_pending_external_unlock().await? {}
-        if queue.has_unresolved_in_doubt_epoch() {
-            return Err(FrankenError::BusyRecovery);
-        }
+        // A prior flusher on this exact handle may have been dropped while
+        // restoration was contended. Settle the global lane and this handle,
+        // but do not convoy submission behind unrelated exact-handle exits.
+        let current_handle_key = if let Some(attempt) = txn_attempt {
+            shared_db_file_key(&attempt.db_file)
+        } else {
+            let inner = inner_arc
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            shared_db_file_key(&inner.db_file)
+        };
+        settle_pending_group_commit_finalization_for_handle(queue, current_handle_key).await?;
 
         let detailed_metrics = detailed_consolidation_metrics_enabled();
         let lane_staging_debug_enabled =
@@ -12871,7 +16035,7 @@ where
             target_epoch,
             consolidator_lock_wait_us,
             flushing_wait_us,
-            epoch_consumer,
+            _epoch_consumer,
         ) = {
             let mut consolidator = queue
                 .consolidator
@@ -12892,7 +16056,11 @@ where
             // cannot publish this target epoch between admission and consumer
             // ownership becoming visible.
             let epoch_consumer = queue.register_epoch_consumer(receipt.target_epoch);
-            *epoch_consumer_out = Some(Arc::clone(&epoch_consumer));
+            if let Some(attempt) = txn_attempt {
+                attempt.admit(Arc::clone(&epoch_consumer), waiter_id)?;
+                let operation: Arc<dyn PendingGroupCommitTxnAttemptOperation> = attempt.clone();
+                queue.register_txn_attempt(receipt.target_epoch, waiter_id, operation)?;
+            }
             (
                 receipt.outcome,
                 epoch_at_queue,
@@ -13062,17 +16230,9 @@ where
                             "discarded stale prepared WAL lane payloads before group-commit overlap abort"
                         );
                     }
-                    let (abort_result, wake_next_epoch) = {
-                        let mut consolidator = queue
-                            .consolidator
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let abort_result = consolidator.abort_flush();
-                        let wake_next_epoch =
-                            abort_result.is_ok() && consolidator.has_flusher_vacancy();
-                        (abort_result, wake_next_epoch)
-                    };
-                    queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
+                    let abort_result = queue
+                        .abort_flushing_epoch_as_failed(flush_epoch, &error)
+                        .map(|_| ());
                     if abort_result.is_ok() {
                         flush_obligation.disarm();
                     }
@@ -13272,20 +16432,27 @@ where
                 let mut fsync_seq: u64 = 0;
                 for attempt in 0..MAX_FLUSH_RETRIES {
                     let t_inner_lock_start = phase_timing.then(Instant::now);
-                    let (
-                        db_file,
-                        restore_lock_level,
-                        publication_journal_mode,
-                        publication_freelist_count,
-                        initial_visible_commit_seq,
-                        checkpoint_active,
-                    ) = {
+                    let db_file = {
+                        let inner = inner_arc.lock().map_err(|_| {
+                            FrankenError::internal("SimpleTransaction lock poisoned")
+                        })?;
+                        Arc::clone(&inner.db_file)
+                    };
+                    // Never wait for exact-handle lock coordination while
+                    // retaining a PagerInner. A logical exit may need that
+                    // exact inner before it can release the gate.
+                    let physical_lock_window = GroupCommitPhysicalLockWindow::acquire(
+                        queue,
+                        shared_db_file_key(&db_file),
+                        cx,
+                    )
+                    .await?;
+                    let (restore_lock_level, initial_visible_commit_seq, checkpoint_active) = {
                         let inner = inner_arc.lock().map_err(|_| {
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
                         inner_lock_wait_us = elapsed_profile_us(t_inner_lock_start);
                         (
-                            Arc::clone(&inner.db_file),
                             if inner.writer_active {
                                 // Immediate/exclusive transactions enter commit
                                 // already owning RESERVED. If WAL append fails,
@@ -13296,8 +16463,6 @@ where
                             } else {
                                 LockLevel::Shared
                             },
-                            inner.journal_mode,
-                            inner.freelist.len(),
                             inner.commit_seq,
                             inner.checkpoint_active,
                         )
@@ -13320,6 +16485,7 @@ where
                             flush_obligation.durability_started_signal(),
                             flush_obligation.durable_io_signal(),
                             flush_obligation.external_lock_state(),
+                            physical_lock_window,
                         );
                         exclusive_lock_us = elapsed_profile_us(t_excl_start);
 
@@ -13403,19 +16569,19 @@ where
                                     Arc::new(Mutex::new(None::<VfsWriteCompletion>));
                                 let wal_completion =
                                     Arc::new(Mutex::new(None::<VfsWriteCompletion>));
+                                let recovery_epoch_consumer =
+                                    queue.register_epoch_consumer(flush_epoch);
                                 let recovery =
                                     Arc::new(PendingGroupCommitRecovery::<V::File> {
                                         queue: Arc::downgrade(queue),
-                                        _epoch_consumer: Arc::clone(&epoch_consumer),
+                                        epoch: flush_epoch,
+                                        _epoch_consumer: recovery_epoch_consumer,
                                         publication: Arc::clone(&publication),
-                                        wal_backend: Arc::clone(wal_backend),
+                                        wal_backend: Arc::clone(&backend),
                                         inner: Arc::clone(inner_arc),
                                         published: published.clone(),
                                         batches: batches.clone(),
                                         final_db_size,
-                                        publication_journal_mode,
-                                        publication_freelist_count,
-                                        checkpoint_active,
                                         sync: sync_policy.should_sync_on_commit(),
                                         sidecar_completion: Arc::clone(&sidecar_completion),
                                         wal_completion: Arc::clone(&wal_completion),
@@ -13836,17 +17002,9 @@ where
                             failure_context = %error,
                             "physical writer flush failed"
                         );
-                        let (abort_result, wake_next_epoch) = {
-                            let mut consolidator = queue
-                                .consolidator
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let abort_result = consolidator.abort_flush();
-                            let wake_next_epoch =
-                                abort_result.is_ok() && consolidator.has_flusher_vacancy();
-                            (abort_result, wake_next_epoch)
-                        };
-                        queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
+                        let abort_result = queue
+                            .abort_flushing_epoch_as_failed(flush_epoch, &error)
+                            .map(|_| ());
                         if abort_result.is_ok() {
                             flush_obligation.disarm();
                         }
@@ -14015,7 +17173,6 @@ where
             batch_id: waiter_id,
             assigned_commit_seq,
         });
-        *epoch_consumer_out = None;
         Ok(())
     }
 
@@ -14027,8 +17184,21 @@ where
         if self.read_only_pager {
             return Err(FrankenError::ReadOnly);
         }
+        if self.pending_group_commit_attempt.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
         if self.is_writer {
             return Ok(());
+        }
+        if self
+            .group_commit_queue
+            .has_process_root_finalization_attempt()
+        {
+            settle_pending_group_commit_finalization_for_handle(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+            )
+            .await?;
         }
 
         match self.mode {
@@ -14038,6 +17208,12 @@ where
                     .inner
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                if self
+                    .group_commit_queue
+                    .has_relevant_process_root(shared_db_file_key(&self.db_file))
+                {
+                    return Err(FrankenError::BusyRecovery);
+                }
                 if inner.checkpoint_active {
                     let active_transactions = inner.active_transactions;
                     let checkpoint_active = inner.checkpoint_active;
@@ -14064,58 +17240,211 @@ where
                 Ok(())
             }
             TransactionMode::Deferred => {
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-                if inner.checkpoint_active {
-                    let active_transactions = inner.active_transactions;
-                    let checkpoint_active = inner.checkpoint_active;
-                    drop(inner);
-                    log_checkpoint_coordination(
-                        cx,
+                loop {
+                    let observed_generation =
+                        self.group_commit_queue.external_lock_waiters.generation();
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                    if self
+                        .group_commit_queue
+                        .has_relevant_process_root(shared_db_file_key(&self.db_file))
+                    {
+                        return Err(FrankenError::BusyRecovery);
+                    }
+                    if inner.checkpoint_active {
+                        let active_transactions = inner.active_transactions;
+                        let checkpoint_active = inner.checkpoint_active;
+                        drop(inner);
+                        log_checkpoint_coordination(
+                            cx,
+                            &self.group_commit_queue,
+                            "active_gate",
+                            "ensure_writer",
+                            transaction_mode_name(self.mode),
+                            "checkpoint_excludes_foreground_writer_upgrade",
+                            true,
+                            active_transactions,
+                            checkpoint_active,
+                        );
+                        return Err(FrankenError::Busy);
+                    }
+                    if inner.writer_active {
+                        inner =
+                            wait_for_single_writer_baton(&self.inner, &self.writer_idle, inner)?;
+                    }
+                    if inner.checkpoint_active {
+                        let active_transactions = inner.active_transactions;
+                        let checkpoint_active = inner.checkpoint_active;
+                        drop(inner);
+                        log_checkpoint_coordination(
+                            cx,
+                            &self.group_commit_queue,
+                            "active_gate",
+                            "ensure_writer",
+                            transaction_mode_name(self.mode),
+                            "checkpoint_excludes_foreground_writer_upgrade_after_baton_wait",
+                            true,
+                            active_transactions,
+                            checkpoint_active,
+                        );
+                        return Err(FrankenError::Busy);
+                    }
+                    let Some(physical_lock_window) = GroupCommitPhysicalLockWindow::try_register(
                         &self.group_commit_queue,
-                        "active_gate",
-                        "ensure_writer",
-                        transaction_mode_name(self.mode),
-                        "checkpoint_excludes_foreground_writer_upgrade",
-                        true,
-                        active_transactions,
-                        checkpoint_active,
-                    );
-                    return Err(FrankenError::Busy);
-                }
-                if inner.writer_active {
-                    inner = wait_for_single_writer_baton(&self.inner, &self.writer_idle, inner)?;
-                }
-                if inner.checkpoint_active {
-                    let active_transactions = inner.active_transactions;
-                    let checkpoint_active = inner.checkpoint_active;
+                        shared_db_file_key(&self.db_file),
+                    ) else {
+                        drop(inner);
+                        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                        let _ = self
+                            .group_commit_queue
+                            .external_lock_waiters
+                            .wait_for_change_async(observed_generation)
+                            .await;
+                        continue;
+                    };
+                    // Escalate to RESERVED under a counted physical window.
+                    // Distinct admissions may overlap; exact-handle downgrade
+                    // and release remain fenced until writer state publishes.
+                    shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
+                    inner.writer_active = true;
+                    drop(physical_lock_window);
                     drop(inner);
-                    log_checkpoint_coordination(
-                        cx,
-                        &self.group_commit_queue,
-                        "active_gate",
-                        "ensure_writer",
-                        transaction_mode_name(self.mode),
-                        "checkpoint_excludes_foreground_writer_upgrade_after_baton_wait",
-                        true,
-                        active_transactions,
-                        checkpoint_active,
-                    );
-                    return Err(FrankenError::Busy);
+                    self.is_writer = true;
+                    return Ok(());
                 }
-                // Escalate to RESERVED lock for cross-process writer exclusion.
-                shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
-                inner.writer_active = true;
-                drop(inner);
-                self.is_writer = true;
-                Ok(())
             }
             TransactionMode::Immediate | TransactionMode::Exclusive => Err(FrankenError::internal(
                 "writer transaction lost writer role",
             )),
         }
+    }
+}
+
+impl<V> SimpleTransaction<V>
+where
+    V: Vfs + Send,
+    V::File: Send + Sync + 'static,
+{
+    fn restore_not_committed_wal_attempt(&mut self) -> Result<()> {
+        let attempt = self.pending_group_commit_attempt.clone().ok_or_else(|| {
+            FrankenError::internal("cannot restore a missing group-commit transaction attempt")
+        })?;
+        attempt.complete_not_committed_global()?;
+        let not_committed = attempt.take_not_committed_state()?;
+        self.allocated_from_freelist
+            .extend(not_committed.returned_allocations.from_freelist);
+        self.allocated_from_eof
+            .extend(not_committed.returned_allocations.from_eof);
+        self.page_lease
+            .extend(not_committed.returned_allocations.page_lease);
+        self.restore_pending_freed_pages(not_committed.pending_freed_pages);
+        attempt.restore_phase_a_write_set(&mut self.write_set, &mut self.write_pages_sorted);
+        attempt.finish_terminal(false)?;
+        self.pending_group_commit_attempt.take();
+        Ok(())
+    }
+
+    async fn finish_authorized_wal_attempt(&mut self, cx: &Cx, release: bool) -> Result<()> {
+        let attempt = self.pending_group_commit_attempt.clone().ok_or_else(|| {
+            FrankenError::internal("cannot finalize a missing authorized group-commit transaction")
+        })?;
+        if !matches!(
+            attempt.resolution(),
+            PendingGroupCommitTxnResolution::Authorized(_)
+        ) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let publication_intent = attempt.publication_intent()?;
+
+        let (db_file, memory_file_size) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            (
+                Arc::clone(&inner.db_file),
+                self.memory_db_bump_alloc
+                    .then(|| u64::from(inner.db_size) * u64::from(inner.page_size.get())),
+            )
+        };
+        let committed_file_size = if let Some(file_size) = memory_file_size {
+            Some(file_size)
+        } else {
+            match shared_db_file_read(&db_file, cx).await {
+                Ok(db_file) => db_file.file_size(cx).ok(),
+                Err(_) => None,
+            }
+        };
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            if let Some(file_size) = committed_file_size {
+                inner.committed_db_file_size_bytes = file_size;
+            }
+            self.publish_committed_snapshot_from_inner(&inner);
+        }
+
+        if release {
+            let logical_exit_claim = GroupCommitLogicalExitClaim::acquire(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+                cx,
+            )
+            .await?;
+            attempt.finish_txn_exit(&logical_exit_claim).await?;
+        }
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_during_phase_c(
+            publication_intent.visible_commit_seq.get(),
+            publication_intent.db_size,
+        )?;
+
+        self.published
+            .bind_parallel_wal_publication(publication_intent);
+        self.published_visible_commit_seq
+            .set(publication_intent.visible_commit_seq);
+        self.published_db_size.set(publication_intent.db_size);
+
+        if release {
+            if self.single_connection_fast_path_enabled() {
+                self.drain_committed_cache_pages_into_cache();
+            } else {
+                self.discard_committed_pages();
+            }
+        } else {
+            // Group consolidation may rewrite cloned Page 1 frames to the
+            // certificate-wide db_size. Member-local staged images are
+            // therefore not authoritative after an Authorized group commit.
+            // Let the complete published group plane repopulate the retained
+            // transaction instead of caching a stale local Page 1.
+            self.discard_committed_pages();
+            self.txn_read_cache.borrow_mut().clear();
+        }
+        self.retained_memory_overlay_dirty_pages.clear();
+        self.clear_freed_pages();
+        self.allocated_from_freelist.clear();
+        self.allocated_from_eof.clear();
+        self.page_lease.clear();
+        self.savepoint_stack.clear();
+        self.rolled_back_pages.clear();
+        self.writes_observed = false;
+        self.scratch_arena.reset();
+
+        attempt.finish_terminal(release)?;
+        self.pending_group_commit_attempt.take();
+        if release {
+            self.committed = true;
+            self.maintenance_lease.take();
+            self.finished = true;
+        } else {
+            self.original_db_size = publication_intent.db_size;
+        }
+        Ok(())
     }
 }
 
@@ -14132,37 +17461,39 @@ const fn retained_lock_level_after_txn_exit(
     }
 }
 
-async fn release_snapshot_after_failed_begin<F: VfsFile>(
+#[allow(clippy::await_holding_lock)]
+async fn coordinated_transaction_exit<F: VfsFile>(
+    queue: &Arc<GroupCommitQueue>,
     cx: &Cx,
-    inner: &PagerInner<F>,
-    active_transactions_before_begin: u32,
-) -> Result<()> {
+    inner: &mut PagerInner<F>,
+    releases_writer_baton: bool,
+    logical_exit_claim: &GroupCommitLogicalExitClaim,
+) -> Result<bool> {
+    debug_assert!(
+        Arc::ptr_eq(queue, &logical_exit_claim.queue)
+            && logical_exit_claim.handle_key == shared_db_file_key(&inner.db_file)
+            && logical_exit_claim.active,
+        "transaction exit requires a live claim for the exact identity queue"
+    );
+    let remaining_active_transactions =
+        inner.active_transactions.checked_sub(1).ok_or_else(|| {
+            FrankenError::internal("transaction exit would underflow active transactions")
+        })?;
+    let writer_active_after_exit = inner.writer_active && !releases_writer_baton;
     let cleanup_cx = cleanup_child_cx(cx);
     let _cleanup_mask = cleanup_cx.masked();
-    if active_transactions_before_begin == 0 {
-        shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await
+    if remaining_active_transactions == 0 {
+        shared_db_restore_external_snapshot_attempt(&inner.db_file, &cleanup_cx).await?;
     } else {
         let preserve_level = retained_lock_level_after_txn_exit(
-            active_transactions_before_begin,
-            inner.writer_active,
+            remaining_active_transactions,
+            writer_active_after_exit,
         );
-        shared_db_unlock(&inner.db_file, &cleanup_cx, preserve_level).await
+        shared_db_unlock(&inner.db_file, &cleanup_cx, preserve_level).await?;
     }
-}
-
-async fn release_retained_snapshot_after_txn_exit<F: VfsFile>(
-    cx: &Cx,
-    inner: &PagerInner<F>,
-) -> Result<()> {
-    let cleanup_cx = cleanup_child_cx(cx);
-    let _cleanup_mask = cleanup_cx.masked();
-    if inner.active_transactions == 0 {
-        shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await
-    } else {
-        let preserve_level =
-            retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-        shared_db_unlock(&inner.db_file, &cleanup_cx, preserve_level).await
-    }
+    inner.active_transactions = remaining_active_transactions;
+    let notify_writer_idle = releases_writer_baton && release_single_writer_baton(inner);
+    Ok(notify_writer_idle)
 }
 
 impl<V> TransactionHandle for SimpleTransaction<V>
@@ -14180,6 +17511,9 @@ where
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a {
         async move {
+            if self.pending_group_commit_attempt.is_some() {
+                return Err(FrankenError::BusyRecovery);
+            }
             if self.contains_freed_page(page_no) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -14392,6 +17726,9 @@ where
     }
 
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
+        if self.pending_group_commit_attempt.is_some() {
+            return;
+        }
         if let Some(staged) = self.write_set.get(&page_no) {
             prefetch_l1_read(staged.as_page_bytes().as_ptr());
             return;
@@ -14497,6 +17834,9 @@ where
     }
 
     fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
+        if self.pending_group_commit_attempt.is_some() {
+            return None;
+        }
         let staged = self.write_set.remove(&page_no)?;
         match staged.try_into_unpublished_owned_page_data() {
             Ok(data) => {
@@ -14515,6 +17855,9 @@ where
         page_no: PageNumber,
         f: &mut dyn FnMut(&mut PageData),
     ) -> bool {
+        if self.pending_group_commit_attempt.is_some() {
+            return false;
+        }
         let Some(staged) = self.write_set.get_mut(&page_no) else {
             return false;
         };
@@ -14693,23 +18036,32 @@ where
             }
             // Rollback/close is another structured owner for a lock
             // restoration stranded by a dropped commit future.
-            while self
-                .group_commit_queue
-                .resolve_one_pending_external_unlock()
-                .await?
-            {}
-            if self.pending_group_commit_epoch_consumer.is_some() {
-                // Recovery may have reached a physical verdict, but this
-                // transaction has not yet recorded that ambiguous admitted
-                // attempt as committed or not committed. Never submit a second
-                // WAL attempt over the retained evidence.
-                return Err(FrankenError::BusyRecovery);
-            }
-            if self.group_commit_queue.has_unresolved_in_doubt_epoch() {
-                return Err(FrankenError::BusyRecovery);
+            settle_pending_group_commit_finalization_for_handle(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+            )
+            .await?;
+            if let Some(attempt) = self.pending_group_commit_attempt.clone() {
+                match attempt.reconcile_global_from_queue()? {
+                    PendingGroupCommitTxnResolution::Pending => {
+                        return Err(FrankenError::BusyRecovery);
+                    }
+                    PendingGroupCommitTxnResolution::NotCommitted => {
+                        self.restore_not_committed_wal_attempt()?;
+                    }
+                    PendingGroupCommitTxnResolution::Authorized(_) => {
+                        return self.finish_authorized_wal_attempt(cx, true).await;
+                    }
+                }
             }
             self.validate_namespace_binding()?;
             if !self.is_writer {
+                let logical_exit_claim = GroupCommitLogicalExitClaim::acquire(
+                    &self.group_commit_queue,
+                    shared_db_file_key(&self.db_file),
+                    cx,
+                )
+                .await?;
                 let mut inner = self
                     .inner
                     .lock()
@@ -14717,8 +18069,15 @@ where
                 // Return any unused lease pages to the freelist so they can
                 // be reused by other transactions.
                 return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                inner.active_transactions = inner.active_transactions.saturating_sub(1);
-                let _ = release_retained_snapshot_after_txn_exit(cx, &inner).await;
+                let notify_writer_idle = coordinated_transaction_exit(
+                    &self.group_commit_queue,
+                    cx,
+                    &mut inner,
+                    false,
+                    &logical_exit_claim,
+                )
+                .await?;
+                debug_assert!(!notify_writer_idle);
                 drop(inner);
                 self.committed = true;
                 self.maintenance_lease.take();
@@ -14749,15 +18108,25 @@ where
                      state was dropped between staging and commit",
                     ));
                 }
+                let logical_exit_claim = GroupCommitLogicalExitClaim::acquire(
+                    &self.group_commit_queue,
+                    shared_db_file_key(&self.db_file),
+                    cx,
+                )
+                .await?;
                 let inner_arc = Arc::clone(&self.inner);
                 let mut inner = inner_arc
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                 self.restore_uncommitted_allocations_for_clean_commit(&mut inner);
-                inner.active_transactions = inner.active_transactions.saturating_sub(1);
-                let notify_writer_idle = self.mode != TransactionMode::Concurrent
-                    && release_single_writer_baton(&mut inner);
-                let _ = release_retained_snapshot_after_txn_exit(cx, &inner).await;
+                let notify_writer_idle = coordinated_transaction_exit(
+                    &self.group_commit_queue,
+                    cx,
+                    &mut inner,
+                    self.mode != TransactionMode::Concurrent,
+                    &logical_exit_claim,
+                )
+                .await?;
                 drop(inner);
                 if notify_writer_idle {
                     self.writer_idle.notify_one();
@@ -14802,6 +18171,22 @@ where
             let pager_commit_profile_active = pager_commit_profile_enabled();
             record_pager_commit_call(pager_commit_profile_active);
             let t_pager_phase_a_start = pager_commit_profile_start(pager_commit_profile_active);
+            // Journal and private-memory Phase B can mutate the durable image
+            // before Phase C. Reserve their exact logical exit before any such
+            // mutation so terminal cleanup can never fail with BusyRecovery
+            // after publication has already won.
+            let non_wal_exit_claim = if self.journal_mode == JournalMode::Wal {
+                None
+            } else {
+                Some(
+                    GroupCommitLogicalExitClaim::acquire(
+                        &self.group_commit_queue,
+                        shared_db_file_key(&self.db_file),
+                        cx,
+                    )
+                    .await?,
+                )
+            };
 
             // Phase A: Prepare write_set under inner lock (~20us)
             // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
@@ -14810,14 +18195,16 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             let committed_db_size = self.committed_db_size_with_inner(&inner);
-            let mut pending_returned_pages = self.drain_unstaged_allocated_pages();
-            pending_returned_pages.append(&mut self.page_lease);
+            let mut returned_allocations = self.drain_unstaged_allocated_pages();
+            returned_allocations.page_lease.append(&mut self.page_lease);
+            let pending_returned_pages = returned_allocations.all_pages();
             let mut pending_free_pages = pending_returned_pages.clone();
             pending_free_pages.extend(self.freed_pages.iter().copied());
 
             // Declared outside the block so it survives to Phase C where freed
             // pages are promoted into inner.freelist after successful WAL commit.
-            let pending_freed: Vec<PageNumber>;
+            let mut pending_freed: Vec<PageNumber>;
+            let mut wal_attempt: Option<Arc<PendingGroupCommitTxnAttempt<V::File>>> = None;
             let cross_process_conflict_pages: Vec<PageNumber>;
             {
                 // ShardedPageCache uses per-shard internal locking
@@ -14848,6 +18235,32 @@ where
                     self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
                 pending_freed = std::mem::take(&mut self.freed_pages);
                 self.freed_page_bounds = None;
+                if self.journal_mode == JournalMode::Wal {
+                    let live_committed_allocations = self
+                        .allocated_from_freelist
+                        .iter()
+                        .chain(&self.allocated_from_eof)
+                        .filter(|page| self.write_set.contains_key(*page))
+                        .copied()
+                        .collect();
+                    let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                        &self.group_commit_queue,
+                        Arc::clone(&self.inner),
+                        Arc::clone(&self.db_file),
+                        Arc::clone(&self.committed_snapshot),
+                        Arc::clone(&self.published),
+                        Arc::clone(&self.writer_idle),
+                        cleanup_child_cx(cx),
+                        committed_db_size,
+                        self.mode,
+                        self.is_writer,
+                        std::mem::take(&mut returned_allocations),
+                        std::mem::take(&mut pending_freed),
+                        live_committed_allocations,
+                    ));
+                    self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
+                    wal_attempt = Some(attempt);
+                }
                 if freelist_dirty {
                     if let Err(e) = serialize_freelist_to_write_set(
                         cx,
@@ -14859,11 +18272,17 @@ where
                         &mut self.write_pages_sorted,
                         committed_db_size,
                         &pending_free_pages,
+                        wal_attempt.as_ref().map(|attempt| &attempt.phase_a_undo),
                     )
                     .await
                     {
-                        self.restore_pending_freed_pages(pending_freed);
-                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                        if wal_attempt.is_some() {
+                            drop(inner);
+                            self.restore_not_committed_wal_attempt()?;
+                        } else {
+                            self.restore_pending_freed_pages(pending_freed);
+                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                        }
                         return Err(e);
                     }
                 }
@@ -14880,6 +18299,11 @@ where
                     true
                 };
                 if must_write_page1 {
+                    if let Some(attempt) = wal_attempt.as_ref() {
+                        attempt
+                            .phase_a_undo
+                            .capture(&self.write_set, PageNumber::ONE);
+                    }
                     let mut page1 = match ensure_page_one_in_write_set(
                         cx,
                         &inner,
@@ -14892,8 +18316,16 @@ where
                     {
                         Ok(p) => p,
                         Err(e) => {
-                            self.restore_pending_freed_pages(pending_freed);
-                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                            if wal_attempt.is_some() {
+                                drop(inner);
+                                self.restore_not_committed_wal_attempt()?;
+                            } else {
+                                self.restore_pending_freed_pages(pending_freed);
+                                return_pages_to_freelist(
+                                    &mut inner.freelist,
+                                    pending_returned_pages,
+                                );
+                            }
                             return Err(e);
                         }
                     };
@@ -14968,23 +18400,9 @@ where
                     &cross_process_conflict_page_baselines,
                     &self.group_commit_queue,
                     &mut wal_publication_authorization,
-                    &mut self.pending_group_commit_epoch_consumer,
+                    wal_attempt.as_ref(),
                 )
                 .await;
-                let recovery_owns_epoch = result.is_err()
-                    && self
-                        .pending_group_commit_epoch_consumer
-                        .as_ref()
-                        .is_some_and(|consumer| {
-                            self.group_commit_queue
-                                .pending_external_unlock_ownership
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .contains_key(&consumer.epoch)
-                        });
-                if result.is_err() && !recovery_owns_epoch {
-                    self.pending_group_commit_epoch_consumer.take();
-                }
                 record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
 
                 // Re-acquire inner lock for Phase C (finalize).
@@ -14993,16 +18411,7 @@ where
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
                 {
                     Ok(guard) => guard,
-                    Err(e) => {
-                        self.restore_pending_freed_pages(pending_freed);
-                        if let Ok(mut recovery_inner) = inner_arc.lock() {
-                            return_pages_to_freelist(
-                                &mut recovery_inner.freelist,
-                                pending_returned_pages,
-                            );
-                        }
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 };
 
                 result
@@ -15051,6 +18460,46 @@ where
             };
 
             let t_phase_b_done = phase_timing.then(Instant::now);
+
+            if self.journal_mode == JournalMode::Wal {
+                drop(inner);
+                let attempt = wal_attempt.clone().ok_or_else(|| {
+                    FrankenError::internal(
+                        "WAL commit reached Phase B without a logical transaction owner",
+                    )
+                })?;
+                let commit_error = commit_result.err();
+                match attempt.resolution() {
+                    PendingGroupCommitTxnResolution::Authorized(_) => {
+                        if commit_error.is_none() && wal_publication_authorization.is_none() {
+                            return Err(FrankenError::internal(
+                                "successful WAL group commit omitted publication authorization",
+                            ));
+                        }
+                        let cleanup_cx = cleanup_child_cx(cx);
+                        let _cleanup_mask = cleanup_cx.masked();
+                        settle_pending_group_commit_finalization_for_handle(
+                            &self.group_commit_queue,
+                            shared_db_file_key(&self.db_file),
+                        )
+                        .await?;
+                        self.finish_authorized_wal_attempt(&cleanup_cx, true)
+                            .await?;
+                        return Ok(());
+                    }
+                    PendingGroupCommitTxnResolution::NotCommitted => {
+                        self.restore_not_committed_wal_attempt()?;
+                        return Err(commit_error.unwrap_or_else(|| {
+                            FrankenError::internal(
+                                "WAL group commit reported success after a NotCommitted verdict",
+                            )
+                        }));
+                    }
+                    PendingGroupCommitTxnResolution::Pending => {
+                        return Err(commit_error.unwrap_or(FrankenError::BusyRecovery));
+                    }
+                }
+            }
 
             if commit_result.is_ok() {
                 let t_phase_c_metadata_start =
@@ -15103,9 +18552,6 @@ where
                     inner.committed_db_file_size_bytes = file_size;
                 }
                 record_pager_commit_duration(&PAGER_COMMIT_FILE_SIZE_TIME_NS, t_file_size_start);
-                inner.active_transactions = inner.active_transactions.saturating_sub(1);
-                let notify_writer_idle = self.mode != TransactionMode::Concurrent
-                    && release_single_writer_baton(&mut inner);
                 let publish_update = PublishedPagerUpdate {
                     visible_commit_seq: wal_publication_intent
                         .map_or(inner.commit_seq, |intent| intent.visible_commit_seq),
@@ -15125,7 +18571,17 @@ where
                 // committed metadata even if this commit skipped page-plane publish.
                 self.publish_committed_snapshot_from_inner(&inner);
                 let t_unlock_start = pager_commit_profile_start(pager_commit_profile_active);
-                let _ = release_retained_snapshot_after_txn_exit(cx, &inner).await;
+                let notify_writer_idle = coordinated_transaction_exit(
+                    &self.group_commit_queue,
+                    cx,
+                    &mut inner,
+                    self.mode != TransactionMode::Concurrent,
+                    non_wal_exit_claim
+                        .as_ref()
+                        .expect("non-WAL commit must retain its pre-durability logical exit claim"),
+                )
+                .await?;
+                drop(non_wal_exit_claim);
                 record_pager_commit_duration(&PAGER_COMMIT_UNLOCK_TIME_NS, t_unlock_start);
                 drop(inner);
                 if notify_writer_idle {
@@ -15286,6 +18742,25 @@ where
     #[allow(clippy::await_holding_lock)]
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
         async move {
+            settle_pending_group_commit_finalization_for_handle(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+            )
+            .await?;
+            if let Some(attempt) = self.pending_group_commit_attempt.clone() {
+                match attempt.reconcile_global_from_queue()? {
+                    PendingGroupCommitTxnResolution::Pending => {
+                        return Err(FrankenError::BusyRecovery);
+                    }
+                    PendingGroupCommitTxnResolution::NotCommitted => {
+                        self.restore_not_committed_wal_attempt()?;
+                    }
+                    PendingGroupCommitTxnResolution::Authorized(_) => {
+                        self.finish_authorized_wal_attempt(cx, false).await?;
+                        return Ok(true);
+                    }
+                }
+            }
             // Only supported for in-memory pagers where we can skip I/O.
             if !self.vfs.is_memory() {
                 self.commit(cx).await?;
@@ -15350,19 +18825,47 @@ where
             // inner.freelist. The serializer receives pending_free_pages so
             // inner.freelist remains untouched until Phase C (after successful
             // commit).
-            let mut pending_returned_pages = self.drain_unstaged_allocated_pages();
-            pending_returned_pages.append(&mut self.page_lease);
+            let mut returned_allocations = self.drain_unstaged_allocated_pages();
+            returned_allocations.page_lease.append(&mut self.page_lease);
+            let pending_returned_pages = returned_allocations.all_pages();
             let mut pending_free_pages = pending_returned_pages.clone();
             pending_free_pages.extend(self.freed_pages.iter().copied());
-            let pending_freed: Vec<PageNumber> = std::mem::take(&mut self.freed_pages);
+            let mut pending_freed: Vec<PageNumber> = std::mem::take(&mut self.freed_pages);
             self.freed_page_bounds = None;
             let mut wal_publication_authorization = None;
+            let mut wal_attempt: Option<Arc<PendingGroupCommitTxnAttempt<V::File>>> = None;
             let commit_result = {
                 let freelist_dirty = freelist_dirty_for_retain;
                 // Match the normal commit path: capture semantic Page 1 intent
                 // before freelist serialization can inject bookkeeping Page 1.
                 let wal_page1_plan =
                     self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+                if self.journal_mode == JournalMode::Wal {
+                    let live_committed_allocations = self
+                        .allocated_from_freelist
+                        .iter()
+                        .chain(&self.allocated_from_eof)
+                        .filter(|page| self.write_set.contains_key(*page))
+                        .copied()
+                        .collect();
+                    let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                        &self.group_commit_queue,
+                        Arc::clone(&self.inner),
+                        Arc::clone(&self.db_file),
+                        Arc::clone(&self.committed_snapshot),
+                        Arc::clone(&self.published),
+                        Arc::clone(&self.writer_idle),
+                        cleanup_child_cx(cx),
+                        committed_db_size,
+                        self.mode,
+                        self.is_writer,
+                        std::mem::take(&mut returned_allocations),
+                        std::mem::take(&mut pending_freed),
+                        live_committed_allocations,
+                    ));
+                    self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
+                    wal_attempt = Some(attempt);
+                }
                 if freelist_dirty {
                     if let Err(e) = serialize_freelist_to_write_set(
                         cx,
@@ -15374,11 +18877,17 @@ where
                         &mut self.write_pages_sorted,
                         committed_db_size,
                         &pending_free_pages,
+                        wal_attempt.as_ref().map(|attempt| &attempt.phase_a_undo),
                     )
                     .await
                     {
-                        self.restore_pending_freed_pages(pending_freed);
-                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                        if wal_attempt.is_some() {
+                            drop(inner);
+                            self.restore_not_committed_wal_attempt()?;
+                        } else {
+                            self.restore_pending_freed_pages(pending_freed);
+                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                        }
                         return Err(e);
                     }
                 }
@@ -15400,6 +18909,11 @@ where
                     true
                 };
                 if must_write_page1 {
+                    if let Some(attempt) = wal_attempt.as_ref() {
+                        attempt
+                            .phase_a_undo
+                            .capture(&self.write_set, PageNumber::ONE);
+                    }
                     let mut page1 = match ensure_page_one_in_write_set(
                         cx,
                         &inner,
@@ -15412,8 +18926,16 @@ where
                     {
                         Ok(p) => p,
                         Err(e) => {
-                            self.restore_pending_freed_pages(pending_freed);
-                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                            if wal_attempt.is_some() {
+                                drop(inner);
+                                self.restore_not_committed_wal_attempt()?;
+                            } else {
+                                self.restore_pending_freed_pages(pending_freed);
+                                return_pages_to_freelist(
+                                    &mut inner.freelist,
+                                    pending_returned_pages,
+                                );
+                            }
                             return Err(e);
                         }
                     };
@@ -15468,38 +18990,15 @@ where
                         &cross_process_conflict_page_baselines,
                         &self.group_commit_queue,
                         &mut wal_publication_authorization,
-                        &mut self.pending_group_commit_epoch_consumer,
+                        wal_attempt.as_ref(),
                     )
                     .await;
-                    let recovery_owns_epoch = result.is_err()
-                        && self
-                            .pending_group_commit_epoch_consumer
-                            .as_ref()
-                            .is_some_and(|consumer| {
-                                self.group_commit_queue
-                                    .pending_external_unlock_ownership
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .contains_key(&consumer.epoch)
-                            });
-                    if result.is_err() && !recovery_owns_epoch {
-                        self.pending_group_commit_epoch_consumer.take();
-                    }
                     inner = match inner_arc
                         .lock()
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
                     {
                         Ok(guard) => guard,
-                        Err(e) => {
-                            self.restore_pending_freed_pages(pending_freed);
-                            if let Ok(mut recovery_inner) = inner_arc.lock() {
-                                return_pages_to_freelist(
-                                    &mut recovery_inner.freelist,
-                                    pending_returned_pages,
-                                );
-                            }
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     };
                     result
                 } else if self.vfs.is_memory() {
@@ -15549,6 +19048,46 @@ where
                 }
             };
 
+            if self.journal_mode == JournalMode::Wal {
+                drop(inner);
+                let attempt = wal_attempt.clone().ok_or_else(|| {
+                    FrankenError::internal(
+                        "retained WAL commit reached Phase B without a logical transaction owner",
+                    )
+                })?;
+                let commit_error = commit_result.err();
+                match attempt.resolution() {
+                    PendingGroupCommitTxnResolution::Authorized(_) => {
+                        if commit_error.is_none() && wal_publication_authorization.is_none() {
+                            return Err(FrankenError::internal(
+                                "successful retained WAL commit omitted publication authorization",
+                            ));
+                        }
+                        let cleanup_cx = cleanup_child_cx(cx);
+                        let _cleanup_mask = cleanup_cx.masked();
+                        settle_pending_group_commit_finalization_for_handle(
+                            &self.group_commit_queue,
+                            shared_db_file_key(&self.db_file),
+                        )
+                        .await?;
+                        self.finish_authorized_wal_attempt(&cleanup_cx, false)
+                            .await?;
+                        return Ok(true);
+                    }
+                    PendingGroupCommitTxnResolution::NotCommitted => {
+                        self.restore_not_committed_wal_attempt()?;
+                        return Err(commit_error.unwrap_or_else(|| {
+                            FrankenError::internal(
+                                "retained WAL commit reported success after a NotCommitted verdict",
+                            )
+                        }));
+                    }
+                    PendingGroupCommitTxnResolution::Pending => {
+                        return Err(commit_error.unwrap_or(FrankenError::BusyRecovery));
+                    }
+                }
+            }
+
             if commit_result.is_ok() {
                 // For journal mode, update db_size from our computed value.
                 // For WAL mode with group commit, the flusher already set inner.db_size
@@ -15578,7 +19117,7 @@ where
                     inner.record_local_commit();
                 }
                 // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip
-                if self.vfs.is_memory() {
+                if self.memory_db_bump_alloc {
                     inner.committed_db_file_size_bytes =
                         u64::from(inner.db_size) * u64::from(inner.page_size.get());
                 } else {
@@ -15619,7 +19158,7 @@ where
                         self.retained_memory_overlay_dirty_pages.clear();
                     }
                     self.publish_single_connection_metadata_only(cx, publish_update);
-                    self.retain_committed_pages_in_txn_read_cache();
+                    self.retain_committed_pages_in_txn_read_cache(false);
                 } else {
                     self.retained_memory_overlay_dirty_pages.clear();
                     self.publish_committed_state_draining_write_set(cx, publish_update);
@@ -15664,14 +19203,20 @@ where
     }
 
     fn has_pending_writes(&self) -> bool {
-        !self.write_set.is_empty() || self.freelist_metadata_dirty()
+        self.pending_group_commit_attempt.is_some()
+            || !self.write_set.is_empty()
+            || self.freelist_metadata_dirty()
     }
 
     fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> {
+        if self.pending_group_commit_attempt.is_some() {
+            return None;
+        }
         Some(self.published_visible_commit_seq.get())
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        self.ensure_no_pending_group_commit_attempt()?;
         if !self.has_pending_writes() {
             return Ok(Vec::new());
         }
@@ -15683,6 +19228,7 @@ where
     }
 
     fn pending_conflict_pages(&self) -> Result<Vec<PageNumber>> {
+        self.ensure_no_pending_group_commit_attempt()?;
         if !self.has_pending_writes() {
             return Ok(Vec::new());
         }
@@ -15694,6 +19240,9 @@ where
     }
 
     fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber> {
+        if self.pending_group_commit_attempt.is_some() {
+            return vec![PageNumber::ONE];
+        }
         let mut pages = Vec::with_capacity(
             self.write_pages_sorted
                 .len()
@@ -15728,6 +19277,9 @@ where
     }
 
     fn write_set_page_numbers(&self) -> Vec<PageNumber> {
+        if self.pending_group_commit_attempt.is_some() {
+            return vec![PageNumber::ONE];
+        }
         self.write_pages_sorted.clone()
     }
 
@@ -15737,6 +19289,7 @@ where
     }
 
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
+        self.ensure_no_pending_group_commit_attempt()?;
         if !self.has_pending_writes() {
             return Ok(false);
         }
@@ -15748,6 +19301,7 @@ where
     }
 
     fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
+        self.ensure_no_pending_group_commit_attempt()?;
         let inner = self
             .inner
             .lock()
@@ -15756,6 +19310,7 @@ where
     }
 
     fn free_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
+        self.ensure_no_pending_group_commit_attempt()?;
         let inner = self
             .inner
             .lock()
@@ -15764,6 +19319,7 @@ where
     }
 
     fn write_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
+        self.ensure_no_pending_group_commit_attempt()?;
         let inner = self
             .inner
             .lock()
@@ -15780,6 +19336,30 @@ where
             if self.finished {
                 return Ok(());
             }
+            settle_pending_group_commit_finalization_for_handle(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+            )
+            .await?;
+            if let Some(attempt) = self.pending_group_commit_attempt.clone() {
+                match attempt.reconcile_global_from_queue()? {
+                    PendingGroupCommitTxnResolution::Pending => {
+                        return Err(FrankenError::BusyRecovery);
+                    }
+                    PendingGroupCommitTxnResolution::Authorized(_) => {
+                        let cleanup_cx = cleanup_child_cx(cx);
+                        let _cleanup_mask = cleanup_cx.masked();
+                        self.finish_authorized_wal_attempt(&cleanup_cx, true)
+                            .await?;
+                        return Err(FrankenError::internal(
+                            "rollback could not undo a group commit that became durable during recovery",
+                        ));
+                    }
+                    PendingGroupCommitTxnResolution::NotCommitted => {
+                        self.restore_not_committed_wal_attempt()?;
+                    }
+                }
+            }
             self.validate_namespace_binding()?;
 
             // Rollback is mandatory cleanup. A caller may reach it precisely
@@ -15788,6 +19368,12 @@ where
             // masked child rather than inherit that cancellation.
             let cleanup_cx = cleanup_child_cx(cx);
             let _cleanup_mask = cleanup_cx.masked();
+            let logical_exit_claim = GroupCommitLogicalExitClaim::acquire(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+                &cleanup_cx,
+            )
+            .await?;
             if self.vfs.is_memory()
                 && self.memory_db_bump_alloc
                 && !self.retained_memory_overlay_dirty_pages.is_empty()
@@ -15830,9 +19416,6 @@ where
                 // disk. After journal recovery rebuilds committed state, these
                 // page numbers don't exist — just drop them.
                 self.page_lease.clear();
-                if self.mode != TransactionMode::Concurrent {
-                    notify_writer_idle |= release_single_writer_baton(&mut inner);
-                }
             } else {
                 // Restore pages allocated from the freelist.
                 return_pages_to_freelist(
@@ -15859,8 +19442,6 @@ where
                     } else {
                         2
                     };
-
-                    notify_writer_idle |= release_single_writer_baton(&mut inner);
                 } else if self.is_writer && self.mode == TransactionMode::Concurrent {
                     // Concurrent: next_page is NOT reset, so lease pages and
                     // aborted EOF allocations must return to the in-memory
@@ -15878,8 +19459,14 @@ where
                     self.page_lease.clear();
                 }
             }
-            inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &inner).await;
+            notify_writer_idle |= coordinated_transaction_exit(
+                &self.group_commit_queue,
+                &cleanup_cx,
+                &mut inner,
+                self.is_writer && self.mode != TransactionMode::Concurrent,
+                &logical_exit_claim,
+            )
+            .await?;
             drop(inner);
             if notify_writer_idle {
                 self.writer_idle.notify_one();
@@ -15890,7 +19477,6 @@ where
             }
             self.committed = false;
             self.maintenance_lease.take();
-            self.pending_group_commit_epoch_consumer.take();
             self.finished = true;
             // IMPL-3 / AG-4B: reset scratch arena so transient allocations do not
             // carry across transaction boundaries.
@@ -15902,6 +19488,9 @@ where
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
 
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        if self.pending_group_commit_attempt.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
         let inner = self
             .inner
             .lock()
@@ -15926,6 +19515,9 @@ where
     }
 
     fn release_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        if self.pending_group_commit_attempt.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
         let pos = self
             .savepoint_stack
             .iter()
@@ -15938,6 +19530,9 @@ where
     }
 
     fn rollback_to_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        if self.pending_group_commit_attempt.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
         let pos = self
             .savepoint_stack
             .iter()
@@ -16041,9 +19636,49 @@ where
     }
 }
 
-impl<V: Vfs> Drop for SimpleTransaction<V> {
+impl<V> Drop for SimpleTransaction<V>
+where
+    V: Vfs,
+    V::File: 'static,
+{
     fn drop(&mut self) {
         if self.finished {
+            return;
+        }
+        // Publish exact-handle ownership before touching PagerInner. If Drop
+        // is interrupted by a poisoned lock or any later non-terminal edge,
+        // subsequent admission observes this root and fails closed rather
+        // than reading half-applied transaction-exit state.
+        let mut drop_root_attempt = Some(ProcessRootFinalizationAttempt::register_exact_handle(
+            &self.group_commit_queue,
+            shared_db_file_key(&self.db_file),
+        ));
+        if self.pending_group_commit_attempt.is_some() {
+            let attempt = self
+                .pending_group_commit_attempt
+                .take()
+                .expect("pending group-commit attempt remained attached during Drop");
+            let cleanup = DetachedPendingGroupCommitTxnCleanup {
+                attempt,
+                maintenance_lease: self.maintenance_lease.take(),
+                allocated_from_freelist: std::mem::take(&mut self.allocated_from_freelist),
+                allocated_from_eof: std::mem::take(&mut self.allocated_from_eof),
+                page_lease: std::mem::take(&mut self.page_lease),
+                allocation_cleanup_applied: false,
+            };
+            self.group_commit_queue.enqueue_pending_logical_cleanup(
+                PendingGroupCommitLogicalCleanup::new(drop_root_attempt.take(), Box::new(cleanup)),
+            );
+            if let Err(error) = self
+                .group_commit_queue
+                .try_resolve_one_pending_external_unlock()
+            {
+                tracing::error!(
+                    %error,
+                    "transaction drop could not claim a pending group-commit external unlock"
+                );
+            }
+            self.finished = true;
             return;
         }
         if let Err(error) = self
@@ -16056,106 +19691,135 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             );
         }
         let mut notify_writer_idle = false;
+        let mut direct_cleanup_terminal = false;
         // Drop is the last synchronous fail-safe after a caller abandons a
         // transaction. A hot journal stays marked pending for the pager's next
         // explicit async recovery epoch; Drop only restores in-memory state and
         // releases the already-held snapshot lock without blocking an executor.
         let cleanup_cx = self.cleanup_cx.clone();
         let _cleanup_mask = cleanup_cx.masked();
-        let recovery_was_pending = self
-            .inner
-            .lock()
-            .map(|inner| {
-                self.is_writer
-                    && self.journal_mode != JournalMode::Wal
-                    && inner.rollback_journal_recovery_state.is_pending()
-            })
-            .unwrap_or(false);
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(error) => {
+                tracing::error!(
+                    "transaction Drop recovered a poisoned PagerInner for fail-closed cleanup"
+                );
+                error.into_inner()
+            }
+        };
+        let recovery_was_pending = self.is_writer
+            && self.journal_mode != JournalMode::Wal
+            && inner.rollback_journal_recovery_state.is_pending();
         if recovery_was_pending {
             tracing::warn!(
                 "drop left a pending rollback journal for the pager's next recovery epoch"
             );
         }
-        if let Ok(mut inner) = self.inner.lock() {
-            if recovery_was_pending {
-                // Never merge transaction-local allocation state into an
-                // image whose recovery failed. Keep Pending set so every
-                // subsequent begin retries or fails closed.
-                self.cache.clear();
-                self.allocated_from_freelist.clear();
-                self.allocated_from_eof.clear();
-                self.page_lease.clear();
-                if self.mode != TransactionMode::Concurrent {
-                    notify_writer_idle = release_single_writer_baton(&mut inner);
-                }
-            } else {
-                // Ordinary uncommitted drop: restore freelist allocations.
-                return_pages_to_freelist(
-                    &mut inner.freelist,
-                    self.allocated_from_freelist.drain(..),
-                );
+        if recovery_was_pending {
+            // Never merge transaction-local allocation state into an
+            // image whose recovery failed. Keep Pending set so every
+            // subsequent begin retries or fails closed.
+            self.cache.clear();
+            self.allocated_from_freelist.clear();
+            self.allocated_from_eof.clear();
+            self.page_lease.clear();
+        } else {
+            // Ordinary uncommitted drop: restore freelist allocations.
+            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
 
-                if self.is_writer && self.mode != TransactionMode::Concurrent {
-                    // Non-concurrent: next_page will be reset, so lease pages
-                    // are re-issued naturally. Just drop them to avoid holes.
-                    self.page_lease.clear();
-                    inner.db_size = self.original_db_size;
-                    inner.next_page = if inner.db_size >= 2 {
-                        inner.db_size.saturating_add(1)
-                    } else {
-                        2
-                    };
-                    notify_writer_idle = release_single_writer_baton(&mut inner);
-                } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                    // Concurrent: next_page stays advanced, so return lease
-                    // pages and EOF allocations to the freelist.
-                    return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                    return_pages_to_freelist(
-                        &mut inner.freelist,
-                        self.allocated_from_eof.drain(..),
-                    );
+            if self.is_writer && self.mode != TransactionMode::Concurrent {
+                // Non-concurrent: next_page will be reset, so lease pages
+                // are re-issued naturally. Just drop them to avoid holes.
+                self.page_lease.clear();
+                inner.db_size = self.original_db_size;
+                inner.next_page = if inner.db_size >= 2 {
+                    inner.db_size.saturating_add(1)
                 } else {
-                    // Read-only: lease should be empty, clear defensively.
-                    self.page_lease.clear();
-                }
+                    2
+                };
+            } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+                // Concurrent: next_page stays advanced, so return lease
+                // pages and EOF allocations to the freelist.
+                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+            } else {
+                // Read-only: lease should be empty, clear defensively.
+                self.page_lease.clear();
             }
-            inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let preserve_level =
-                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-            let pending_restore_target = if inner.active_transactions == 0 {
+        }
+
+        let logical_exit_claim = GroupCommitLogicalExitClaim::try_register(
+            &self.group_commit_queue,
+            shared_db_file_key(&self.db_file),
+        );
+        let mut defer_transaction_exit = logical_exit_claim.is_none();
+        if logical_exit_claim.is_none() {
+            tracing::warn!(
+                "drop-time transaction exit was queued behind a live physical or logical external-lock owner"
+            );
+        } else if let Some(remaining_active_transactions) = inner.active_transactions.checked_sub(1)
+        {
+            let releases_writer_baton = self.is_writer && self.mode != TransactionMode::Concurrent;
+            let writer_active_after_exit = inner.writer_active && !releases_writer_baton;
+            let restore_target = if remaining_active_transactions == 0 {
                 PendingExternalUnlockTarget::ExternalSnapshot
             } else {
-                PendingExternalUnlockTarget::LockLevel(preserve_level)
+                PendingExternalUnlockTarget::LockLevel(retained_lock_level_after_txn_exit(
+                    remaining_active_transactions,
+                    writer_active_after_exit,
+                ))
             };
-            let handed_off_unlock = self
-                .group_commit_queue
-                .handoff_transaction_unlock_to_in_doubt_owner(pending_restore_target);
-            if handed_off_unlock {
-                tracing::warn!(
-                    restore_target = ?pending_restore_target,
-                    "transaction Drop transferred its final lock transition to an in-doubt group-commit owner"
-                );
-            } else {
-                match inner.db_file.try_write() {
-                    Ok(mut db_file) => {
-                        let release_result = if inner.active_transactions == 0 {
-                            db_file.unlock_external_shared_snapshot(&cleanup_cx)
-                        } else {
-                            db_file.unlock(&cleanup_cx, preserve_level)
-                        };
-                        if let Err(error) = release_result {
-                            tracing::error!(
-                                %error,
-                                "drop-time transaction snapshot lock release failed"
-                            );
-                        }
+            let db_file = Arc::clone(&inner.db_file);
+            match db_file.try_write() {
+                Ok(mut db_file) => {
+                    if let Err(error) = restore_target.restore(&mut *db_file, &cleanup_cx) {
+                        tracing::warn!(
+                            %error,
+                            "drop-time transaction exit was queued after snapshot unlock failed"
+                        );
+                        defer_transaction_exit = true;
+                    } else {
+                        inner.active_transactions = remaining_active_transactions;
+                        notify_writer_idle =
+                            releases_writer_baton && release_single_writer_baton(&mut inner);
                     }
-                    Err(error) => tracing::error!(
+                }
+                Err(error) => {
+                    tracing::warn!(
                         %error,
-                        "drop-time transaction snapshot lock was still in use"
-                    ),
+                        "drop-time transaction snapshot lock was busy; queued full exact-handle exit"
+                    );
+                    defer_transaction_exit = true;
                 }
             }
+        } else {
+            tracing::error!(
+                "drop-time transaction exit would underflow active transactions; retained as fail-closed rooted work"
+            );
+            defer_transaction_exit = true;
+        }
+        drop(logical_exit_claim);
+
+        if defer_transaction_exit {
+            let cleanup = DetachedTransactionExit {
+                queue: Arc::clone(&self.group_commit_queue),
+                inner: Arc::clone(&self.inner),
+                db_file: Arc::clone(&self.db_file),
+                writer_idle: Arc::clone(&self.writer_idle),
+                cleanup_cx: cleanup_cx.clone(),
+                mode: self.mode,
+                is_writer: self.is_writer,
+                maintenance_lease: self.maintenance_lease.take(),
+            };
+            self.group_commit_queue.enqueue_pending_logical_cleanup(
+                PendingGroupCommitLogicalCleanup::new(drop_root_attempt.take(), Box::new(cleanup)),
+            );
+        } else {
+            direct_cleanup_terminal = true;
+        }
+        drop(inner);
+        if direct_cleanup_terminal {
+            self.maintenance_lease.take();
         }
         if notify_writer_idle {
             self.writer_idle.notify_one();
@@ -16164,6 +19828,9 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
         // take a Context or return a Result. It's best effort cleanup.
         // Hot journal recovery will handle any leftover files on next open.
         self.finished = true;
+        if direct_cleanup_terminal && let Some(root_attempt) = drop_root_attempt.take() {
+            root_attempt.release_after_terminal();
+        }
     }
 }
 
@@ -16391,7 +20058,7 @@ where
 
 impl<V: Vfs> SimplePager<V>
 where
-    V::File: Send + Sync,
+    V::File: Send + Sync + 'static,
 {
     /// Create a checkpoint page writer for WAL checkpointing.
     ///
@@ -16404,7 +20071,7 @@ where
     /// This method does not panic, but the returned writer's methods may
     /// return errors if the pager's internal mutex is poisoned.
     #[must_use]
-    pub fn checkpoint_writer(&self) -> SimplePagerCheckpointWriter<V> {
+    pub(crate) fn checkpoint_writer(&self) -> SimplePagerCheckpointWriter<V> {
         SimplePagerCheckpointWriter {
             inner: Arc::clone(&self.inner),
             cache: Arc::clone(&self.cache),
@@ -16449,6 +20116,7 @@ where
         cx: &Cx,
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let cleanup_cx = cleanup_child_cx(cx);
@@ -16456,7 +20124,7 @@ where
         // Reserve exclusive checkpoint ownership while marking checkpoint active.
         // `begin()` and deferred writer upgrades are blocked while this flag is
         // set so commits cannot observe "WAL mode but no backend".
-        let wal = {
+        let (wal, external_lock) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -16509,9 +20177,12 @@ where
             // VACUUM. On Windows this includes stock SQLite's real main-file
             // and -shm byte ranges in addition to FrankenSQLite's cooperative
             // sidecars; on Unix the default hook is the native lock protocol.
-            let cross_process_fence_result =
-                shared_db_lock_external_maintenance(&inner.db_file, cx, true).await;
-            cross_process_fence_result?;
+            let mut external_lock = BeginExternalLockState::new(
+                &self.group_commit_queue,
+                Arc::clone(&inner.db_file),
+                cx,
+            );
+            external_lock.acquire_maintenance(cx, true).await?;
 
             inner.checkpoint_active = true;
             checkpoint_gate_state = (inner.active_transactions, inner.checkpoint_active);
@@ -16526,7 +20197,7 @@ where
                     checkpoint_active: inner.checkpoint_active,
                 },
             );
-            wal
+            (wal, external_lock)
         };
         // Lock is released here.
         log_checkpoint_coordination(
@@ -16541,57 +20212,47 @@ where
             checkpoint_gate_state.1,
         );
 
-        struct CheckpointGuard<'a, F: VfsFile> {
+        struct CheckpointGuard<'a, F: VfsFile + 'static> {
             inner: &'a std::sync::Mutex<PagerInner<F>>,
             published: &'a PublishedPagerState,
             cleanup_cx: Cx,
-            cross_process_fence_held: bool,
+            external_lock: Option<BeginExternalLockState<F>>,
         }
 
-        impl<F: VfsFile> Drop for CheckpointGuard<'_, F> {
+        impl<F: VfsFile + 'static> Drop for CheckpointGuard<'_, F> {
             fn drop(&mut self) {
-                if let Ok(mut inner) = self.inner.lock() {
-                    let _mask = self.cleanup_cx.masked();
-                    if self.cross_process_fence_held {
-                        match inner.db_file.try_write() {
-                            Ok(mut db_file) => {
-                                if let Err(error) =
-                                    db_file.unlock_external_maintenance(&self.cleanup_cx, true)
-                                {
-                                    tracing::error!(
-                                        %error,
-                                        "checkpoint could not release its external maintenance fence"
-                                    );
-                                }
-                            }
-                            Err(error) => tracing::error!(
-                                %error,
-                                "checkpoint database file was still in use during fence release"
-                            ),
-                        }
-                        self.cross_process_fence_held = false;
+                // Terminalize the physical fence or publish its process-root
+                // retry before observers can see checkpoint activity clear.
+                drop(self.external_lock.take());
+                let mut inner = match self.inner.lock() {
+                    Ok(inner) => inner,
+                    Err(error) => {
+                        tracing::error!(
+                            "checkpoint guard recovered a poisoned PagerInner for fail-closed cleanup"
+                        );
+                        error.into_inner()
                     }
-                    inner.checkpoint_active = false;
-                    // D1-CRITICAL Change 3: Use sharded publish_metadata_only.
-                    self.published.publish_metadata_only(
-                        &self.cleanup_cx,
-                        PublishedPagerUpdate {
-                            visible_commit_seq: inner.commit_seq,
-                            db_size: inner.db_size,
-                            journal_mode: inner.journal_mode,
-                            freelist_count: inner.freelist.len(),
-                            checkpoint_active: inner.checkpoint_active,
-                        },
-                    );
-                }
+                };
+                let _mask = self.cleanup_cx.masked();
+                inner.checkpoint_active = false;
+                self.published.publish_metadata_only(
+                    &self.cleanup_cx,
+                    PublishedPagerUpdate {
+                        visible_commit_seq: inner.commit_seq,
+                        db_size: inner.db_size,
+                        journal_mode: inner.journal_mode,
+                        freelist_count: inner.freelist.len(),
+                        checkpoint_active: inner.checkpoint_active,
+                    },
+                );
             }
         }
 
-        let _guard = CheckpointGuard {
+        let mut guard = CheckpointGuard {
             inner: &self.inner,
             published: self.published.as_ref(),
             cleanup_cx,
-            cross_process_fence_held: true,
+            external_lock: Some(external_lock),
         };
 
         // Create a checkpoint writer that writes directly to the database file.
@@ -16682,6 +20343,13 @@ where
             wal_was_reset = result.wal_was_reset,
             "checkpoint completed without re-entering the foreground physical writer lane"
         );
+        guard
+            .external_lock
+            .as_mut()
+            .expect("checkpoint guard must own its external maintenance attempt")
+            .restore()
+            .await?;
+        drop(guard);
         Ok(result)
     }
 }
@@ -16703,7 +20371,7 @@ mod tests {
     use fsqlite_vfs::{NamespaceOpenIntent, PendingNamespaceOpen, UnixVfs};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
 
     static FAULT_HOOK_TEST_GUARD: crate::fault_hooks::FaultInjectionSessionLock =
         crate::fault_hooks::FaultInjectionSessionLock::new();
@@ -16747,6 +20415,310 @@ mod tests {
     }
 
     #[test]
+    fn group_commit_allocator_delta_prefers_live_allocations_over_returns() {
+        let page_three = PageNumber::new(3).unwrap();
+        let page_four = PageNumber::new(4).unwrap();
+        let page_five = PageNumber::new(5).unwrap();
+        let page_six = PageNumber::new(6).unwrap();
+        let returned = PendingReturnedAllocations {
+            from_freelist: vec![page_four, page_five],
+            from_eof: vec![page_six],
+            page_lease: vec![page_five],
+        };
+        let delta = PendingGroupCommitAllocatorDelta::new(
+            vec![page_five, page_five],
+            &returned,
+            &[page_three, page_five],
+        );
+
+        assert_eq!(delta.live_committed_allocations, vec![page_five]);
+        assert_eq!(
+            delta.returned_or_freed_pages,
+            vec![page_three, page_four, page_six],
+            "a page committed by any group member must not be returned by another member"
+        );
+
+        let mut freelist = vec![page_six, page_five, page_four];
+        delta.apply_to_freelist(&mut freelist);
+        assert_eq!(
+            freelist,
+            vec![page_six, page_four, page_three],
+            "allocator reconciliation must be idempotent and keep committed pages live"
+        );
+        delta.apply_to_freelist(&mut freelist);
+        assert_eq!(freelist, vec![page_six, page_four, page_three]);
+    }
+
+    #[test]
+    fn group_commit_record_local_wal_commit_at_catches_up_once_to_certificate_horizon() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let mut inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.journal_mode = JournalMode::Wal;
+            inner.commit_seq = CommitSeq::new(7);
+            inner.committed_wal_visible_commit_count = 11;
+
+            inner.record_local_wal_commit_at(CommitSeq::new(10));
+            assert_eq!(inner.commit_seq, CommitSeq::new(10));
+            assert_eq!(inner.committed_wal_visible_commit_count, 14);
+
+            inner.record_local_wal_commit_at(CommitSeq::new(9));
+            inner.record_local_wal_commit_at(CommitSeq::new(10));
+            assert_eq!(inner.commit_seq, CommitSeq::new(10));
+            assert_eq!(
+                inner.committed_wal_visible_commit_count, 14,
+                "replayed or out-of-order Phase C callbacks must not double-count commits"
+            );
+        });
+    }
+
+    #[test]
+    fn pending_group_commit_attempt_fences_transaction_introspection() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                &txn.group_commit_queue,
+                Arc::clone(&txn.inner),
+                Arc::clone(&txn.db_file),
+                Arc::clone(&txn.committed_snapshot),
+                Arc::clone(&txn.published),
+                Arc::clone(&txn.writer_idle),
+                txn.cleanup_cx.clone(),
+                txn.original_db_size,
+                txn.mode,
+                txn.is_writer,
+                PendingReturnedAllocations::default(),
+                Vec::new(),
+                Vec::new(),
+            ));
+            txn.pending_group_commit_attempt = Some(attempt);
+
+            assert!(txn.has_pending_writes());
+            assert_eq!(txn.published_visible_commit_seq_hint(), None);
+            assert!(matches!(
+                txn.pending_commit_pages(),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                txn.pending_conflict_pages(),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert_eq!(
+                txn.pending_conflict_pages_conservative(),
+                vec![PageNumber::ONE]
+            );
+            assert_eq!(txn.write_set_page_numbers(), vec![PageNumber::ONE]);
+            assert!(matches!(
+                txn.page_one_in_pending_commit_surface(),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                txn.allocate_page_requires_page_one_conflict_tracking(),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                txn.free_page_requires_page_one_conflict_tracking(PageNumber::new(2).unwrap()),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                txn.write_page_requires_page_one_conflict_tracking(PageNumber::new(2).unwrap()),
+                Err(FrankenError::BusyRecovery)
+            ));
+            txn.prefetch_page_hint(&cx, PageNumber::ONE);
+            txn.prefetch_page_hints_greedy(&[], 0, 0.0);
+
+            txn.pending_group_commit_attempt.take();
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn group_commit_persisted_certificate_waits_for_complete_logical_phase_c_page_plane() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let queue = Arc::clone(&txn.group_commit_queue);
+            let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                &queue,
+                Arc::clone(&txn.inner),
+                Arc::clone(&txn.db_file),
+                Arc::clone(&txn.committed_snapshot),
+                Arc::clone(&txn.published),
+                Arc::clone(&txn.writer_idle),
+                txn.cleanup_cx.clone(),
+                txn.original_db_size,
+                txn.mode,
+                txn.is_writer,
+                PendingReturnedAllocations::default(),
+                Vec::new(),
+                Vec::new(),
+            ));
+            let authorization = publication_authorization_for_test(false);
+            let epoch = authorization
+                .durability_receipt
+                .certificate
+                .certificate_epoch;
+            let batch_id = authorization.batch_id;
+            attempt
+                .admit(queue.register_epoch_consumer(epoch), batch_id)
+                .unwrap();
+            txn.pending_group_commit_attempt = Some(Arc::clone(&attempt));
+            queue
+                .persisted_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    epoch,
+                    PersistedGroupCommitEpoch {
+                        members: HashSet::from([batch_id]),
+                        frames_start: 1,
+                        frames_end: 2,
+                        fsync_seq: 1,
+                        durability_receipt: authorization.durability_receipt,
+                    },
+                );
+
+            assert!(matches!(
+                attempt.reconcile_global_from_queue().unwrap(),
+                PendingGroupCommitTxnResolution::Pending
+            ));
+            assert!(matches!(
+                txn.pending_commit_pages(),
+                Err(FrankenError::BusyRecovery)
+            ));
+
+            txn.restore_not_committed_wal_attempt().unwrap();
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn rollback_after_authorized_group_commit_reports_commit_and_keeps_page_live() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let committed_page = PageNumber::new(2).unwrap();
+            let committed_bytes = sample_page(0xA7);
+            txn.write_page(&cx, committed_page, &committed_bytes)
+                .await
+                .unwrap();
+            txn.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .freelist
+                .push(committed_page);
+
+            let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                &txn.group_commit_queue,
+                Arc::clone(&txn.inner),
+                Arc::clone(&txn.db_file),
+                Arc::clone(&txn.committed_snapshot),
+                Arc::clone(&txn.published),
+                Arc::clone(&txn.writer_idle),
+                txn.cleanup_cx.clone(),
+                txn.original_db_size,
+                txn.mode,
+                txn.is_writer,
+                PendingReturnedAllocations::default(),
+                Vec::new(),
+                vec![committed_page],
+            ));
+            txn.pending_group_commit_attempt = Some(Arc::clone(&attempt));
+            let authorization = publication_authorization_for_test(false);
+            let group_delta = attempt.allocator_delta();
+            attempt
+                .complete_authorized_global(
+                    authorization,
+                    &HashMap::from([(committed_page, PageData::from_vec(committed_bytes))]),
+                    &group_delta,
+                    true,
+                )
+                .unwrap();
+
+            let error = txn
+                .rollback(&cx)
+                .await
+                .expect_err("a durable group commit cannot be rolled back");
+            assert!(
+                error
+                    .to_string()
+                    .contains("could not undo a group commit that became durable"),
+                "rollback must distinguish committed recovery from successful rollback: {error}"
+            );
+            assert!(txn.finished);
+            assert!(txn.committed);
+            assert!(txn.pending_group_commit_attempt.is_none());
+            let inner = txn
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(inner.active_transactions, 0);
+            assert!(
+                !inner.freelist.contains(&committed_page),
+                "authorized rollback cleanup must never recycle a committed page"
+            );
+        });
+    }
+
+    #[test]
+    fn authorized_retained_group_commit_reads_certified_page_plane_not_local_page_one() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let local_page_one = sample_page(0x11);
+            let certified_page_one = PageData::from_vec(sample_page(0x22));
+            txn.write_page(&cx, PageNumber::ONE, &local_page_one)
+                .await
+                .unwrap();
+
+            let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                &txn.group_commit_queue,
+                Arc::clone(&txn.inner),
+                Arc::clone(&txn.db_file),
+                Arc::clone(&txn.committed_snapshot),
+                Arc::clone(&txn.published),
+                Arc::clone(&txn.writer_idle),
+                txn.cleanup_cx.clone(),
+                txn.original_db_size,
+                txn.mode,
+                txn.is_writer,
+                PendingReturnedAllocations::default(),
+                Vec::new(),
+                Vec::new(),
+            ));
+            txn.pending_group_commit_attempt = Some(Arc::clone(&attempt));
+            let group_delta = attempt.allocator_delta();
+            attempt
+                .complete_authorized_global(
+                    publication_authorization_for_test(false),
+                    &HashMap::from([(PageNumber::ONE, certified_page_one.clone())]),
+                    &group_delta,
+                    true,
+                )
+                .unwrap();
+            txn.finish_authorized_wal_attempt(&cx, false).await.unwrap();
+
+            assert!(
+                txn.txn_read_cache.borrow().get(&PageNumber::ONE).is_none(),
+                "retained Phase C must not cache the member-local pre-consolidation Page 1"
+            );
+            assert_eq!(
+                txn.get_page(&cx, PageNumber::ONE).await.unwrap(),
+                certified_page_one
+            );
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
     fn identity_registries_replace_expired_same_generation_state() {
         let cx = Cx::new();
         let vfs = MemoryVfs::new();
@@ -16761,7 +20733,8 @@ mod tests {
 
         let old_fence = recovery_fence_for_identity(identity);
         let old_gate = maintenance_gate_for_identity(identity);
-        let old_queue = group_commit_queue_for_identity(identity);
+        let queue_path = Path::new("/identity-registry.db");
+        let old_queue = group_commit_queue_for_identity(identity, queue_path, true);
         assert!(Arc::ptr_eq(
             &old_fence,
             &recovery_fence_for_identity(identity)
@@ -16772,7 +20745,7 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(
             &old_queue,
-            &group_commit_queue_for_identity(identity)
+            &group_commit_queue_for_identity(identity, queue_path, true)
         ));
 
         let old_fence_weak = Arc::downgrade(&old_fence);
@@ -16787,7 +20760,7 @@ mod tests {
 
         let replacement_fence = recovery_fence_for_identity(identity);
         let replacement_gate = maintenance_gate_for_identity(identity);
-        let replacement_queue = group_commit_queue_for_identity(identity);
+        let replacement_queue = group_commit_queue_for_identity(identity, queue_path, true);
         assert!(!Weak::ptr_eq(
             &old_fence_weak,
             &Arc::downgrade(&replacement_fence)
@@ -16841,6 +20814,11 @@ mod tests {
                 PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared),
                 Err(FrankenError::Busy)
             ));
+
+            let (backend, _, _, _) = MockWalBackend::new();
+            pager
+                .set_wal_backend(Box::new(backend))
+                .expect("connection bootstrap must permit WAL backend installation");
 
             pager
                 .finish_namespace_bootstrap()
@@ -17325,7 +21303,7 @@ mod tests {
     fn read_surface_snapshot<V>(pager: &SimplePager<V>) -> ReadSurfaceSnapshot
     where
         V: Vfs + Send + Sync,
-        V::File: Send + Sync,
+        V::File: Send + Sync + 'static,
     {
         ReadSurfaceSnapshot {
             cache: pager.cache_metrics_snapshot().unwrap(),
@@ -17553,6 +21531,11 @@ mod tests {
         observed_unlock_trace_ids: ObservedUnlockTraceIds,
         fail_unlock_on_checkpoint_error: bool,
         memory_fast_path: Arc<AtomicBool>,
+        external_snapshot_acquire_failures: Arc<AtomicUsize>,
+        external_maintenance_acquire_failures: Arc<AtomicUsize>,
+        external_restore_failures: Arc<AtomicUsize>,
+        external_restore_publication_probe: Arc<Mutex<Option<Weak<PublishedPagerState>>>>,
+        external_restore_checkpoint_observations: Arc<Mutex<Vec<bool>>>,
     }
 
     impl ObservedLockVfs {
@@ -17563,6 +21546,11 @@ mod tests {
                 observed_unlock_trace_ids: Arc::new(Mutex::new(Vec::new())),
                 fail_unlock_on_checkpoint_error: false,
                 memory_fast_path: Arc::new(AtomicBool::new(true)),
+                external_snapshot_acquire_failures: Arc::new(AtomicUsize::new(0)),
+                external_maintenance_acquire_failures: Arc::new(AtomicUsize::new(0)),
+                external_restore_failures: Arc::new(AtomicUsize::new(0)),
+                external_restore_publication_probe: Arc::new(Mutex::new(None)),
+                external_restore_checkpoint_observations: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -17587,6 +21575,23 @@ mod tests {
                 ..Self::new()
             }
         }
+
+        fn with_external_attempt_failures(
+            snapshot_acquire_failures: usize,
+            maintenance_acquire_failures: usize,
+            restore_failures: usize,
+        ) -> Self {
+            Self {
+                external_snapshot_acquire_failures: Arc::new(AtomicUsize::new(
+                    snapshot_acquire_failures,
+                )),
+                external_maintenance_acquire_failures: Arc::new(AtomicUsize::new(
+                    maintenance_acquire_failures,
+                )),
+                external_restore_failures: Arc::new(AtomicUsize::new(restore_failures)),
+                ..Self::new()
+            }
+        }
     }
 
     struct ObservedLockFile {
@@ -17594,6 +21599,40 @@ mod tests {
         observed_lock_level: ObservedLockLevel,
         observed_unlock_trace_ids: ObservedUnlockTraceIds,
         fail_unlock_on_checkpoint_error: bool,
+        external_snapshot_prior_level: Option<LockLevel>,
+        external_maintenance_prior_level: Option<LockLevel>,
+        external_snapshot_acquire_failures: Arc<AtomicUsize>,
+        external_maintenance_acquire_failures: Arc<AtomicUsize>,
+        external_restore_failures: Arc<AtomicUsize>,
+        external_restore_publication_probe: Arc<Mutex<Option<Weak<PublishedPagerState>>>>,
+        external_restore_checkpoint_observations: Arc<Mutex<Vec<bool>>>,
+    }
+
+    fn consume_observed_lock_failure(counter: &AtomicUsize) -> bool {
+        atomic_usize_checked_update(
+            counter,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok()
+    }
+
+    fn record_observed_restore_checkpoint_activity(
+        probe: &Mutex<Option<Weak<PublishedPagerState>>>,
+        observations: &Mutex<Vec<bool>>,
+    ) {
+        let published = probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(published) = published {
+            observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(published.snapshot().checkpoint_active);
+        }
     }
 
     impl Vfs for ObservedLockVfs {
@@ -17616,6 +21655,21 @@ mod tests {
                     observed_lock_level: self.observed_lock_level(),
                     observed_unlock_trace_ids: self.observed_unlock_trace_ids(),
                     fail_unlock_on_checkpoint_error: self.fail_unlock_on_checkpoint_error,
+                    external_snapshot_prior_level: None,
+                    external_maintenance_prior_level: None,
+                    external_snapshot_acquire_failures: Arc::clone(
+                        &self.external_snapshot_acquire_failures,
+                    ),
+                    external_maintenance_acquire_failures: Arc::clone(
+                        &self.external_maintenance_acquire_failures,
+                    ),
+                    external_restore_failures: Arc::clone(&self.external_restore_failures),
+                    external_restore_publication_probe: Arc::clone(
+                        &self.external_restore_publication_probe,
+                    ),
+                    external_restore_checkpoint_observations: Arc::clone(
+                        &self.external_restore_checkpoint_observations,
+                    ),
                 },
                 actual_flags,
             ))
@@ -17694,6 +21748,100 @@ mod tests {
             }
             self.inner.unlock(cx, level)?;
             *self.observed_lock_level.lock().unwrap() = level;
+            Ok(())
+        }
+
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            if self.external_snapshot_prior_level.is_some()
+                || self.external_maintenance_prior_level.is_some()
+            {
+                return Err(FrankenError::internal(
+                    "observed-lock external attempt is already active",
+                ));
+            }
+            let prior_level = *self.observed_lock_level.lock().unwrap();
+            self.external_snapshot_prior_level = Some(prior_level);
+            self.inner.lock_external_shared_snapshot(cx)?;
+            *self.observed_lock_level.lock().unwrap() = prior_level.max(LockLevel::Shared);
+            if consume_observed_lock_failure(&self.external_snapshot_acquire_failures) {
+                return Err(FrankenError::internal(
+                    "injected external snapshot acquisition failure after arming",
+                ));
+            }
+            Ok(())
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            let Some(prior_level) = self.external_snapshot_prior_level else {
+                return self.inner.restore_external_shared_snapshot_attempt(cx);
+            };
+            record_observed_restore_checkpoint_activity(
+                &self.external_restore_publication_probe,
+                &self.external_restore_checkpoint_observations,
+            );
+            if consume_observed_lock_failure(&self.external_restore_failures) {
+                return Err(FrankenError::internal(
+                    "injected external snapshot restoration failure",
+                ));
+            }
+            self.observed_unlock_trace_ids
+                .lock()
+                .unwrap()
+                .push(cx.trace_id());
+            if self.fail_unlock_on_checkpoint_error {
+                cx.checkpoint()
+                    .map_err(|err| FrankenError::internal(err.to_string()))?;
+            }
+            self.inner.restore_external_shared_snapshot_attempt(cx)?;
+            *self.observed_lock_level.lock().unwrap() = prior_level;
+            self.external_snapshot_prior_level = None;
+            Ok(())
+        }
+
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+            if self.external_snapshot_prior_level.is_some()
+                || self.external_maintenance_prior_level.is_some()
+            {
+                return Err(FrankenError::internal(
+                    "observed-lock external attempt is already active",
+                ));
+            }
+            let prior_level = *self.observed_lock_level.lock().unwrap();
+            self.external_maintenance_prior_level = Some(prior_level);
+            self.inner.lock_external_maintenance(cx, wal_mode)?;
+            *self.observed_lock_level.lock().unwrap() = LockLevel::Exclusive;
+            if consume_observed_lock_failure(&self.external_maintenance_acquire_failures) {
+                return Err(FrankenError::internal(
+                    "injected external maintenance acquisition failure after arming",
+                ));
+            }
+            Ok(())
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            let Some(prior_level) = self.external_maintenance_prior_level else {
+                return self.inner.restore_external_maintenance_attempt(cx);
+            };
+            record_observed_restore_checkpoint_activity(
+                &self.external_restore_publication_probe,
+                &self.external_restore_checkpoint_observations,
+            );
+            if consume_observed_lock_failure(&self.external_restore_failures) {
+                return Err(FrankenError::internal(
+                    "injected external maintenance restoration failure",
+                ));
+            }
+            self.observed_unlock_trace_ids
+                .lock()
+                .unwrap()
+                .push(cx.trace_id());
+            if self.fail_unlock_on_checkpoint_error {
+                cx.checkpoint()
+                    .map_err(|err| FrankenError::internal(err.to_string()))?;
+            }
+            self.inner.restore_external_maintenance_attempt(cx)?;
+            *self.observed_lock_level.lock().unwrap() = prior_level;
+            self.external_maintenance_prior_level = None;
             Ok(())
         }
 
@@ -17823,9 +21971,27 @@ mod tests {
         handle_id: u64,
         lock_level: LockLevel,
         exclusive_metrics: StdArc<(StdMutex<ExclusiveLockMetrics>, StdCondvar)>,
+        external_snapshot_prior_level: Option<LockLevel>,
+        external_maintenance_prior_level: Option<LockLevel>,
     }
 
     impl BlockingObservedLockFile {
+        fn acquire_exclusive_hold(&self) {
+            let wait_started = Instant::now();
+            let (metrics_lock, metrics_ready) = &*self.exclusive_metrics;
+            let mut metrics = metrics_lock.lock().unwrap();
+            while metrics.owner.is_some() && metrics.owner != Some(self.handle_id) {
+                metrics = metrics_ready.wait(metrics).unwrap();
+            }
+            metrics
+                .wait_samples_ns
+                .push(u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            metrics.owner = Some(self.handle_id);
+            metrics.acquired_at = Some(Instant::now());
+            metrics.acquisition_count = metrics.acquisition_count.saturating_add(1);
+            metrics_ready.notify_all();
+        }
+
         fn release_exclusive_hold(&self) {
             let (metrics_lock, metrics_ready) = &*self.exclusive_metrics;
             let mut metrics = metrics_lock.lock().unwrap();
@@ -17862,6 +22028,8 @@ mod tests {
                     handle_id: self.next_handle_id.fetch_add(1, AtomicOrdering::Relaxed),
                     lock_level: LockLevel::None,
                     exclusive_metrics: StdArc::clone(&self.exclusive_metrics),
+                    external_snapshot_prior_level: None,
+                    external_maintenance_prior_level: None,
                 },
                 actual_flags,
             ))
@@ -17927,19 +22095,7 @@ mod tests {
 
         fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
             if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
-                let wait_started = Instant::now();
-                let (metrics_lock, metrics_ready) = &*self.exclusive_metrics;
-                let mut metrics = metrics_lock.lock().unwrap();
-                while metrics.owner.is_some() && metrics.owner != Some(self.handle_id) {
-                    metrics = metrics_ready.wait(metrics).unwrap();
-                }
-                metrics
-                    .wait_samples_ns
-                    .push(u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-                metrics.owner = Some(self.handle_id);
-                metrics.acquired_at = Some(Instant::now());
-                metrics.acquisition_count = metrics.acquisition_count.saturating_add(1);
-                metrics_ready.notify_all();
+                self.acquire_exclusive_hold();
             }
 
             self.inner.lock(cx, level)?;
@@ -17960,6 +22116,66 @@ mod tests {
                 self.lock_level = level;
             }
             *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            Ok(())
+        }
+
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            if self.external_snapshot_prior_level.is_some()
+                || self.external_maintenance_prior_level.is_some()
+            {
+                return Err(FrankenError::internal(
+                    "blocking observed-lock external attempt is already active",
+                ));
+            }
+            let prior_level = self.lock_level;
+            self.external_snapshot_prior_level = Some(prior_level);
+            self.inner.lock_external_shared_snapshot(cx)?;
+            self.lock_level = prior_level.max(LockLevel::Shared);
+            *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            Ok(())
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            let Some(prior_level) = self.external_snapshot_prior_level else {
+                return self.inner.restore_external_shared_snapshot_attempt(cx);
+            };
+            self.inner.restore_external_shared_snapshot_attempt(cx)?;
+            self.lock_level = prior_level;
+            *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            self.external_snapshot_prior_level = None;
+            Ok(())
+        }
+
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+            if self.external_snapshot_prior_level.is_some()
+                || self.external_maintenance_prior_level.is_some()
+            {
+                return Err(FrankenError::internal(
+                    "blocking observed-lock external attempt is already active",
+                ));
+            }
+            let prior_level = self.lock_level;
+            self.external_maintenance_prior_level = Some(prior_level);
+            if prior_level < LockLevel::Exclusive {
+                self.acquire_exclusive_hold();
+            }
+            self.inner.lock_external_maintenance(cx, wal_mode)?;
+            self.lock_level = LockLevel::Exclusive;
+            *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            Ok(())
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            let Some(prior_level) = self.external_maintenance_prior_level else {
+                return self.inner.restore_external_maintenance_attempt(cx);
+            };
+            self.inner.restore_external_maintenance_attempt(cx)?;
+            if prior_level < LockLevel::Exclusive {
+                self.release_exclusive_hold();
+            }
+            self.lock_level = prior_level;
+            *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            self.external_maintenance_prior_level = None;
             Ok(())
         }
 
@@ -18001,8 +22217,13 @@ mod tests {
     #[derive(Debug)]
     struct DbWriteFailState {
         target_path: PathBuf,
+        target_journal_path: PathBuf,
         armed: bool,
         remaining_successful_db_writes: usize,
+        live_journal_bytes: Vec<u8>,
+        captured_journal_bytes: Option<Vec<u8>>,
+        successful_db_write_offsets: Vec<u64>,
+        failed_db_write_offset: Option<u64>,
     }
 
     #[derive(Clone)]
@@ -18014,12 +22235,19 @@ mod tests {
 
     impl DbWriteFailOnceVfs {
         fn new(target_path: PathBuf) -> Self {
+            let mut target_journal_path = target_path.as_os_str().to_owned();
+            target_journal_path.push("-journal");
             Self {
                 inner: MemoryVfs::new(),
                 state: Arc::new(Mutex::new(DbWriteFailState {
                     target_path,
+                    target_journal_path: PathBuf::from(target_journal_path),
                     armed: false,
                     remaining_successful_db_writes: 0,
+                    live_journal_bytes: Vec::new(),
+                    captured_journal_bytes: None,
+                    successful_db_write_offsets: Vec::new(),
+                    failed_db_write_offset: None,
                 })),
                 memory_fast_path: Arc::new(AtomicBool::new(true)),
             }
@@ -18039,6 +22267,28 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.armed = true;
             state.remaining_successful_db_writes = successful_db_writes_before_failure;
+            state.captured_journal_bytes = None;
+            state.successful_db_write_offsets.clear();
+            state.failed_db_write_offset = None;
+        }
+
+        fn captured_journal_bytes(&self) -> Option<Vec<u8>> {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .captured_journal_bytes
+                .clone()
+        }
+
+        fn db_write_fault_observation(&self) -> (Vec<u64>, Option<u64>) {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.successful_db_write_offsets.clone(),
+                state.failed_db_write_offset,
+            )
         }
     }
 
@@ -18047,6 +22297,7 @@ mod tests {
         inner: MemoryFile,
         state: Arc<Mutex<DbWriteFailState>>,
         is_target_db: bool,
+        is_target_journal: bool,
     }
 
     impl Vfs for DbWriteFailOnceVfs {
@@ -18063,25 +22314,39 @@ mod tests {
             flags: VfsOpenFlags,
         ) -> Result<(Self::File, VfsOpenFlags)> {
             let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
-            let is_target_db = {
+            let (is_target_db, is_target_journal) = {
                 let state = self
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                path == Some(state.target_path.as_path()) && flags.contains(VfsOpenFlags::MAIN_DB)
+                (
+                    path == Some(state.target_path.as_path())
+                        && flags.contains(VfsOpenFlags::MAIN_DB),
+                    path == Some(state.target_journal_path.as_path())
+                        && flags.contains(VfsOpenFlags::MAIN_JOURNAL),
+                )
             };
             Ok((
                 DbWriteFailOnceFile {
                     inner,
                     state: Arc::clone(&self.state),
                     is_target_db,
+                    is_target_journal,
                 },
                 actual_flags,
             ))
         }
 
         fn delete(&self, cx: &Cx, path: &std::path::Path, sync_dir: bool) -> Result<()> {
-            self.inner.delete(cx, path, sync_dir)
+            self.inner.delete(cx, path, sync_dir)?;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if path == state.target_journal_path.as_path() {
+                state.live_journal_bytes.clear();
+            }
+            Ok(())
         }
 
         fn access(&self, cx: &Cx, path: &std::path::Path, flags: AccessFlags) -> Result<bool> {
@@ -18118,6 +22383,26 @@ mod tests {
             offset: u64,
         ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
             async move {
+                if self.is_target_journal {
+                    let start = usize::try_from(offset).map_err(|_| {
+                        FrankenError::Io(std::io::Error::other(
+                            "journal observation offset exceeds usize",
+                        ))
+                    })?;
+                    let end = start.checked_add(buf.len()).ok_or_else(|| {
+                        FrankenError::Io(std::io::Error::other(
+                            "journal observation range overflows usize",
+                        ))
+                    })?;
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.live_journal_bytes.len() < end {
+                        state.live_journal_bytes.resize(end, 0);
+                    }
+                    state.live_journal_bytes[start..end].copy_from_slice(buf);
+                }
                 if self.is_target_db {
                     let mut state = self
                         .state
@@ -18126,10 +22411,14 @@ mod tests {
                     if state.armed {
                         if state.remaining_successful_db_writes == 0 {
                             state.armed = false;
+                            state.failed_db_write_offset = Some(offset);
+                            let captured = state.live_journal_bytes.clone();
+                            state.captured_journal_bytes = Some(captured);
                             return Err(FrankenError::Io(std::io::Error::other(
                                 "simulated main-db write failure",
                             )));
                         }
+                        state.successful_db_write_offsets.push(offset);
                         state.remaining_successful_db_writes -= 1;
                     }
                 }
@@ -18138,7 +22427,20 @@ mod tests {
         }
 
         fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
-            self.inner.truncate(cx, size)
+            self.inner.truncate(cx, size)?;
+            if self.is_target_journal {
+                let new_len = usize::try_from(size).map_err(|_| {
+                    FrankenError::Io(std::io::Error::other(
+                        "journal observation size exceeds usize",
+                    ))
+                })?;
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .live_journal_bytes
+                    .resize(new_len, 0);
+            }
+            Ok(())
         }
 
         fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
@@ -18155,6 +22457,22 @@ mod tests {
 
         fn unlock(&mut self, cx: &Cx, level: fsqlite_types::LockLevel) -> Result<()> {
             self.inner.unlock(cx, level)
+        }
+
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_shared_snapshot(cx)
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+            self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_maintenance_attempt(cx)
         }
 
         fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
@@ -18392,6 +22710,22 @@ mod tests {
 
         fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
             self.inner.unlock(cx, level)
+        }
+
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_shared_snapshot(cx)
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+            self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_maintenance_attempt(cx)
         }
 
         fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
@@ -19394,7 +23728,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rollback_recovers_after_partial_commit_failure() {
+    fn test_partial_commit_failure_recovers_before_return_and_rollback_finalizes() {
         asupersync::test_utils::run_test(|| async {
             let path = PathBuf::from("/rollback_after_failed_commit.db");
             let journal_path = SimplePager::<DbWriteFailOnceVfs>::journal_path(&path);
@@ -19417,7 +23751,20 @@ mod tests {
                 (page_two, page_three)
             };
 
-            vfs.arm_after_db_writes(1);
+            let original_db_image = {
+                let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+                let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+                let file_size = usize::try_from(db_file.file_size(&cx).unwrap()).unwrap();
+                let mut image = vec![0_u8; file_size];
+                assert_eq!(db_file.read(&cx, &mut image, 0).await.unwrap(), file_size);
+                db_file.close(&cx).unwrap();
+                image
+            };
+
+            // Page 1 and the first user page land before the second user-page
+            // write fails, proving recovery restores user data rather than
+            // merely the header change counter.
+            vfs.arm_after_db_writes(2);
 
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
             txn.write_page(&cx, page_two, &vec![0x22; ps])
@@ -19429,47 +23776,103 @@ mod tests {
 
             let err = txn.commit(&cx).await.unwrap_err();
             assert!(
-                matches!(err, FrankenError::Io(_)),
+                matches!(&err, FrankenError::Io(_)),
                 "bead_id={BEAD_ID} case=partial_commit_surfaces_io_error"
             );
+            assert!(
+                err.to_string().contains("simulated main-db write failure"),
+                "bead_id={BEAD_ID} case=partial_commit_preserves_original_injected_error error={err}"
+            );
 
-            // MemoryVfs reports a 4 KiB device sector. The complete preimage
-            // payload must begin after that sector so publishing the magic-bearing
-            // header can never share a physical sector with a record.
-            let journal_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
-            let (mut hot_journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
-            let mut raw_header = vec![0_u8; crate::journal::JOURNAL_HEADER_SIZE];
-            hot_journal.read(&cx, &mut raw_header, 0).await.unwrap();
-            let hot_header = JournalHeader::decode(&raw_header).unwrap();
+            let (successful_offsets, failed_offset) = vfs.db_write_fault_observation();
+            assert_eq!(
+                successful_offsets,
+                vec![0, u64::from(page_two.get() - 1) * ps as u64],
+                "bead_id={BEAD_ID} case=partial_commit_applies_header_and_first_user_page"
+            );
+            assert_eq!(
+                failed_offset,
+                Some(u64::from(page_three.get() - 1) * ps as u64),
+                "bead_id={BEAD_ID} case=partial_commit_fails_on_second_user_page"
+            );
+
+            // Capture at the exact database-write fault boundary: commit()
+            // synchronously consumes and deletes the live hot journal before
+            // returning the original I/O error.
+            let captured_journal = vfs
+                .captured_journal_bytes()
+                .expect("database-write fault must capture the complete hot journal");
+            assert!(
+                captured_journal.len() >= crate::journal::JOURNAL_HEADER_SIZE,
+                "bead_id={BEAD_ID} case=partial_commit_captures_complete_journal_header"
+            );
+            let hot_header =
+                JournalHeader::decode(&captured_journal[..crate::journal::JOURNAL_HEADER_SIZE])
+                    .unwrap();
             assert_eq!(hot_header.sector_size, 4096);
             // The two user pages plus page 1's commit-counter update all require
             // preimages; the header count must match the exact encoded records.
             assert_eq!(hot_header.page_count, 3);
             let record_size = 4 + ps + 4;
-            assert_eq!(
-                hot_journal.file_size(&cx).unwrap(),
-                4096 + 3 * record_size as u64
-            );
+            assert_eq!(captured_journal.len(), 4096 + 3 * record_size);
             let mut preimages = HashMap::new();
-            for record_index in 0..3_u64 {
-                let mut raw_record = vec![0_u8; record_size];
-                hot_journal
-                    .read(
-                        &cx,
-                        &mut raw_record,
-                        4096 + record_index * record_size as u64,
-                    )
-                    .await
-                    .unwrap();
-                let record = JournalPageRecord::decode(&raw_record, ps as u32).unwrap();
+            for record_index in 0..3_usize {
+                let record_start = 4096 + record_index * record_size;
+                let record_end = record_start + record_size;
+                let record = JournalPageRecord::decode(
+                    &captured_journal[record_start..record_end],
+                    ps as u32,
+                )
+                .unwrap();
                 record.verify_checksum(hot_header.nonce).unwrap();
                 preimages.insert(record.page_number, record.content);
             }
-            hot_journal.close(&cx).unwrap();
+            assert_eq!(
+                preimages
+                    .get(&PageNumber::ONE.get())
+                    .map(std::vec::Vec::as_slice),
+                Some(&original_db_image[..ps]),
+                "bead_id={BEAD_ID} case=partial_commit_journal_captures_page_one_preimage"
+            );
             assert_eq!(preimages.get(&page_two.get()), Some(&original_two));
             assert_eq!(preimages.get(&page_three.get()), Some(&original_three));
 
+            let recovered_db_image = {
+                let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+                let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+                let file_size = usize::try_from(db_file.file_size(&cx).unwrap()).unwrap();
+                let mut image = vec![0_u8; file_size];
+                assert_eq!(db_file.read(&cx, &mut image, 0).await.unwrap(), file_size);
+                db_file.close(&cx).unwrap();
+                image
+            };
+            assert_eq!(
+                recovered_db_image, original_db_image,
+                "bead_id={BEAD_ID} case=commit_error_returns_only_after_exact_image_recovery"
+            );
+            assert_eq!(
+                txn.inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .rollback_journal_recovery_state,
+                RollbackJournalRecoveryState::Clean,
+                "bead_id={BEAD_ID} case=commit_error_returns_after_metadata_recovery"
+            );
+            assert!(
+                !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+                "bead_id={BEAD_ID} case=commit_error_returns_after_journal_cleanup"
+            );
+            let Err(busy) = pager.begin(&cx, TransactionMode::Immediate).await else {
+                panic!("failed transaction must retain writer ownership until rollback");
+            };
+            assert!(
+                matches!(busy, FrankenError::Busy),
+                "bead_id={BEAD_ID} case=recovery_does_not_finalize_failed_transaction"
+            );
+
             txn.rollback(&cx).await.unwrap();
+            let mut next_writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            next_writer.rollback(&cx).await.unwrap();
 
             let reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
             assert_eq!(
@@ -19483,7 +23886,7 @@ mod tests {
 
             assert!(
                 !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
-                "bead_id={BEAD_ID} case=rollback_removes_failed_commit_journal"
+                "bead_id={BEAD_ID} case=rollback_preserves_completed_journal_cleanup"
             );
 
             let reopened = vfs.open_file_backed_pager(&path).await.unwrap();
@@ -19497,7 +23900,7 @@ mod tests {
                     .await
                     .unwrap()
                     .into_vec(),
-                vec![0x11; ps]
+                original_two
             );
             assert_eq!(
                 reopened_reader
@@ -19505,7 +23908,7 @@ mod tests {
                     .await
                     .unwrap()
                     .into_vec(),
-                vec![0x44; ps]
+                original_three
             );
         });
     }
@@ -23954,6 +28357,22 @@ mod tests {
             self.inner.unlock(cx, level)
         }
 
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_shared_snapshot(cx)
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+            self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_maintenance_attempt(cx)
+        }
+
         fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
             self.inner.check_reserved_lock(cx)
         }
@@ -24508,15 +28927,35 @@ mod tests {
             pager.set_wal_backend(Box::new(backend)).unwrap();
             pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
 
-            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
-            let new_page = txn.allocate_page(&cx).await.unwrap();
-            txn.write_page(&cx, PageNumber::ONE, &vec![0x11; ps])
-                .await
-                .unwrap();
-            txn.write_page(&cx, new_page, &vec![0x22; ps])
-                .await
-                .unwrap();
-            txn.commit(&cx).await.unwrap();
+            let new_page = PageNumber::new(2).unwrap();
+            let mut write_set = HashMap::new();
+            write_set.insert(
+                PageNumber::ONE,
+                StagedPage::from_bytes(&pager.pool, &vec![0x11; ps]).unwrap(),
+            );
+            write_set.insert(
+                new_page,
+                StagedPage::from_bytes(&pager.pool, &vec![0x22; ps]).unwrap(),
+            );
+            let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+                GroupCommitConfig::default(),
+                ParallelWalControlSurface {
+                    mode: ParallelWalOperatingMode::Auto,
+                    lane_count_override: Some(1),
+                    ..ParallelWalControlSurface::default()
+                },
+            ));
+            SimpleTransaction::<ObservedLockVfs>::commit_wal_group_commit(
+                &cx,
+                &pager.wal_backend,
+                &pager.inner,
+                &write_set,
+                &[PageNumber::ONE, new_page],
+                &[],
+                &queue,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(
                 *append_frames_calls.lock().unwrap(),
@@ -24530,7 +28969,7 @@ mod tests {
             );
             assert_eq!(
                 prepare_lock_levels.lock().unwrap().as_slice(),
-                &[LockLevel::Reserved],
+                &[LockLevel::None],
                 "bead_id=bd-db300.3.2 case=prepare_runs_before_reserved_publish"
             );
             assert_eq!(
@@ -24749,12 +29188,12 @@ mod tests {
     }
 
     #[test]
-    fn test_group_commit_awaited_error_hands_transaction_unlock_to_reconciliation() {
+    fn test_group_commit_awaited_error_separates_physical_and_logical_unlocks() {
         asupersync::test_utils::run_test(|| async {
             let vfs = ObservedLockVfs::new();
             let observed_lock_level = vfs.observed_lock_level();
             let observed_unlock_trace_ids = vfs.observed_unlock_trace_ids();
-            let path = PathBuf::from("/wal_group_commit_awaited_error_handoff.db");
+            let path = PathBuf::from("/wal_group_commit_awaited_error_separate_unlocks.db");
             let pager = vfs.open_file_backed_pager(&path).await.unwrap();
             let cx = Cx::new();
             let (backend, frames, sync_calls, reconcile_calls) =
@@ -24833,8 +29272,8 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&flush_epoch),
-                Some(&1),
-                "pending recovery must retain the admitted epoch consumer after caller error"
+                Some(&2),
+                "physical recovery and logical Phase C must each retain an epoch consumer after caller error"
             );
             assert!(
                 observed_unlock_trace_ids.lock().unwrap().is_empty(),
@@ -24845,41 +29284,65 @@ mod tests {
                 LockLevel::Reserved,
                 "awaited in-doubt error must retain RESERVED"
             );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "the stranded physical restoration must own one process root while the transaction remains attached"
+            );
 
             drop(txn);
             assert!(
                 observed_unlock_trace_ids.lock().unwrap().is_empty(),
-                "transaction Drop must hand off instead of independently unlocking"
+                "transaction Drop must enqueue its rooted logical exit while physical recovery owns RESERVED"
             );
             assert_eq!(
                 *observed_lock_level.lock().unwrap(),
                 LockLevel::Reserved,
                 "queued obligation must still own RESERVED after caller Drop"
             );
-            let restore_target = {
-                let owners = queue
-                    .pending_external_unlock_ownership
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let ownership = owners
-                    .get(&flush_epoch)
-                    .expect("queued epoch must retain explicit external-lock ownership");
-                let target = *ownership
-                    .restore_target
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                target
-            };
             assert_eq!(
-                restore_target,
-                PendingExternalUnlockTarget::ExternalSnapshot,
-                "last transaction Drop must record the eventual snapshot-fence release"
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                2,
+                "physical recovery and detached logical exit must own independent roots"
             );
 
             assert!(
                 queue.resolve_one_pending_external_unlock().await.unwrap(),
                 "durable reconciliation must claim the queued external lock"
             );
+            assert_eq!(
+                queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&flush_epoch),
+                Some(&1),
+                "physical reconciliation must leave the detached logical owner intact"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::Reserved,
+                "physical recovery must restore only the flusher handle's captured RESERVED baseline"
+            );
+            assert_eq!(
+                observed_unlock_trace_ids.lock().unwrap().len(),
+                1,
+                "physical recovery must perform its own baseline restoration"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "terminal physical restoration must leave only the logical root"
+            );
+            settle_pending_group_commit_finalization(&queue)
+                .await
+                .expect("detached logical Phase C must settle its own transaction exit");
 
             assert_eq!(
                 *reconcile_calls.lock().unwrap(),
@@ -24893,13 +29356,20 @@ mod tests {
             );
             assert_eq!(
                 observed_unlock_trace_ids.lock().unwrap().len(),
-                1,
-                "reconciliation must perform exactly one final unlock transition"
+                2,
+                "physical baseline restoration and logical transaction exit are distinct unlock transitions"
             );
             assert_eq!(
                 *observed_lock_level.lock().unwrap(),
                 LockLevel::None,
                 "recorded final target must release the last snapshot fence"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "terminal logical exit must release the final process root"
             );
             assert!(queue.is_epoch_complete(flush_epoch));
             assert!(
@@ -24979,13 +29449,22 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&flush_epoch),
-                Some(&1),
-                "bead_id={BEAD} case=logical_attempt_owns_ambiguous_epoch"
+                Some(&2),
+                "bead_id={BEAD} case=physical_and_logical_owners_own_ambiguous_epoch"
             );
 
             assert!(
                 queue.resolve_one_pending_external_unlock().await.unwrap(),
                 "physical recovery must reach an authorized terminal verdict"
+            );
+            assert_eq!(
+                queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&flush_epoch),
+                Some(&1),
+                "bead_id={BEAD} case=logical_owner_outlives_physical_recovery"
             );
             assert!(
                 queue.persisted_epoch_for(flush_epoch).is_some(),
@@ -25001,8 +29480,20 @@ mod tests {
 
             drop(txn);
             assert!(
+                queue.persisted_epoch_for(flush_epoch).is_some(),
+                "bead_id={BEAD} case=drop_keeps_evidence_until_rooted_logical_cleanup"
+            );
+            assert_eq!(
+                queue.pending_logical_cleanup_count(),
+                1,
+                "bead_id={BEAD} case=drop_enqueues_exact_logical_cleanup"
+            );
+            settle_pending_group_commit_finalization(&queue)
+                .await
+                .expect("bead_id={BEAD} case=rooted_logical_cleanup_reaches_terminal");
+            assert!(
                 queue.persisted_epoch_for(flush_epoch).is_none(),
-                "bead_id={BEAD} case=logical_final_owner_reclaims_recovered_certificate"
+                "bead_id={BEAD} case=logical_finalization_reclaims_recovered_certificate"
             );
             assert!(
                 !queue
@@ -25016,14 +29507,14 @@ mod tests {
     }
 
     #[test]
-    fn test_group_commit_nonterminal_recovery_does_not_retain_queue() {
+    fn test_group_commit_nonterminal_recovery_is_rooted_until_terminal() {
         asupersync::test_utils::run_test(|| async {
-            const BEAD: &str = "bd-532zd";
+            const BEAD: &str = "bd-6xjma";
             let vfs = ObservedLockVfs::new();
-            let path = PathBuf::from("/wal_group_commit_nonterminal_recovery_weak_queue.db");
+            let path = PathBuf::from("/wal_group_commit_nonterminal_recovery_rooted_queue.db");
             let pager = vfs.open_file_backed_pager(&path).await.unwrap();
             let cx = Cx::new();
-            let (backend, _frames, _sync_calls, _reconcile_calls) =
+            let (backend, _frames, sync_calls, reconcile_calls) =
                 MockWalBackend::new_with_failing_sync();
             pager.set_wal_backend(Box::new(backend)).unwrap();
             pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
@@ -25031,6 +29522,7 @@ mod tests {
                 .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
                 .unwrap();
             let queue = Arc::clone(&pager.group_commit_queue);
+            queue.bind_finalization_path(&path);
             let queue_weak = Arc::downgrade(&queue);
 
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
@@ -25067,18 +29559,55 @@ mod tests {
                 "bead_id={BEAD} case=nonterminal_recovery_retains_epoch_consumer"
             );
 
+            // Emulate the narrow TOCTOU in which a replacement backend is
+            // installed after the old backend accepted the certified interval
+            // but before process-root recovery reconciles it. Recovery must
+            // retain and address the exact accepting backend, never reacquire
+            // the pager's replaceable outer slot.
+            let (replacement, _, _, _) = MockWalBackend::new();
+            let replacement_reconcile_calls = Arc::clone(&replacement.reconcile_calls);
+            *pager
+                .wal_backend
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+                AsyncRwLock::with_name("replacement_wal_backend", Box::new(replacement)),
+            ));
+
             drop(txn);
             drop(pager);
             drop(queue);
+            drop(
+                queue_weak.upgrade().expect(
+                    "bead_id={BEAD} case=nonterminal_recovery_keeps_process_root_ownership",
+                ),
+            );
+            settle_process_root_finalizations_for_path(&path)
+                .await
+                .expect("bead_id={BEAD} case=same_path_gate_reaches_terminal_resolution");
+            assert_eq!(
+                *reconcile_calls.lock().unwrap(),
+                1,
+                "bead_id={BEAD} case=rooted_recovery_reconciles_exact_wal_interval"
+            );
+            assert_eq!(
+                *replacement_reconcile_calls.lock().unwrap(),
+                0,
+                "bead_id={BEAD} case=recovery_never_reconciles_a_replacement_backend"
+            );
+            assert_eq!(
+                *sync_calls.lock().unwrap(),
+                2,
+                "bead_id={BEAD} case=rooted_recovery_reestablishes_durability_fence"
+            );
             assert!(
                 queue_weak.upgrade().is_none(),
-                "bead_id={BEAD} case=nonterminal_recovery_must_not_form_queue_cycle"
+                "bead_id={BEAD} case=terminal_recovery_releases_process_root_without_cycle"
             );
         });
     }
 
     #[test]
-    fn test_group_commit_prewrite_error_reconciles_not_committed_and_unlocks_once() {
+    fn test_group_commit_prewrite_error_separates_physical_and_logical_unlocks() {
         asupersync::test_utils::run_test(|| async {
             let vfs = ObservedLockVfs::new();
             let observed_lock_level = vfs.observed_lock_level();
@@ -25145,8 +29674,15 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&flush_epoch),
-                Some(&1),
-                "pre-write recovery must own the admitted epoch after the caller returns"
+                Some(&2),
+                "physical recovery and logical Phase C must each own the admitted epoch after the caller returns"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "NotCommitted reconciliation must remain process-rooted until its terminal verdict"
             );
             assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::Reserved);
             assert!(observed_unlock_trace_ids.lock().unwrap().is_empty());
@@ -25154,13 +29690,49 @@ mod tests {
             drop(txn);
             assert!(
                 observed_unlock_trace_ids.lock().unwrap().is_empty(),
-                "transaction Drop must transfer the final unlock to recovery"
+                "transaction Drop must queue its exact logical exit behind physical recovery"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                2,
+                "NotCommitted physical recovery and detached logical exit must own independent roots"
             );
 
             assert!(
                 queue.resolve_one_pending_external_unlock().await.unwrap(),
                 "exact reconciliation must classify and release the absent interval"
             );
+            assert_eq!(
+                queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&flush_epoch),
+                Some(&1),
+                "physical NotCommitted reconciliation must leave logical cleanup ownership intact"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::Reserved,
+                "physical NotCommitted recovery must restore only the captured RESERVED baseline"
+            );
+            assert_eq!(
+                observed_unlock_trace_ids.lock().unwrap().len(),
+                1,
+                "physical NotCommitted recovery must perform its own baseline restoration"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "terminal physical NotCommitted recovery must leave only the logical root"
+            );
+            settle_pending_group_commit_finalization(&queue)
+                .await
+                .expect("detached NotCommitted logical cleanup must settle its own exit");
 
             assert_eq!(
                 *reconcile_calls.lock().unwrap(),
@@ -25174,10 +29746,17 @@ mod tests {
             );
             assert_eq!(
                 observed_unlock_trace_ids.lock().unwrap().len(),
-                1,
-                "NotCommitted recovery must perform exactly one unlock transition"
+                2,
+                "NotCommitted physical restoration and logical exit are distinct unlock transitions"
             );
             assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::None);
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "terminal NotCommitted logical exit must release the final process root"
+            );
             assert!(
                 queue.persisted_epoch_for(flush_epoch).is_none(),
                 "NotCommitted recovery must not publish a durability receipt"
@@ -25200,6 +29779,13 @@ mod tests {
                 "NotCommitted recovery must release its final epoch consumer"
             );
             assert!(!queue.has_unresolved_in_doubt_epoch());
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "NotCommitted reconciliation must release its exact root only after unlock and epoch abort"
+            );
         });
     }
 
@@ -26718,6 +31304,66 @@ mod tests {
     }
 
     #[test]
+    fn test_process_root_phase_c_wal_submission_ignores_unrelated_exact_handle_root() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = SimplePager::open(
+                MemoryVfs::new(),
+                Path::new("/wal-unrelated-exact-root.db"),
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+            let observed_lock_level = Arc::new(Mutex::new(LockLevel::Reserved));
+            let (
+                backend,
+                frames,
+                _append_frames_calls,
+                _append_prepared_calls,
+                _prepare_lock_levels,
+                _append_lock_levels,
+            ) = PreparedBatchObservedWalBackend::new(observed_lock_level);
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let (unrelated_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/wal-unrelated-exact-root-other.db"));
+            let unrelated_key = shared_db_file_key(&unrelated_file);
+            let current_key = {
+                let inner = pager.inner.lock().unwrap();
+                shared_db_file_key(&inner.db_file)
+            };
+            assert_ne!(unrelated_key, current_key);
+            let unrelated_root =
+                ProcessRootFinalizationAttempt::register_exact_handle(&queue, unrelated_key);
+
+            let page_two = PageNumber::new(2).unwrap();
+            let mut write_set = HashMap::new();
+            write_set.insert(
+                page_two,
+                StagedPage::from_bytes(&pager.pool, &sample_page(0x73)).unwrap(),
+            );
+            SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                &cx,
+                &pager.wal_backend,
+                &pager.inner,
+                &write_set,
+                &[page_two],
+                &[],
+                &queue,
+            )
+            .await
+            .expect("an unrelated exact-handle root must not convoy WAL submission");
+
+            assert_eq!(frames.lock().unwrap().len(), 1);
+            assert!(queue.has_relevant_process_root(unrelated_key));
+            assert!(!queue.has_relevant_process_root(current_key));
+            unrelated_root.release_after_terminal();
+        });
+    }
+
+    #[test]
     fn test_parallel_wal_shadow_compare_divergence_falls_back_to_append_frames() {
         asupersync::test_utils::run_test(|| async {
             let vfs = MemoryVfs::new();
@@ -27227,6 +31873,60 @@ mod tests {
     }
 
     #[test]
+    fn test_group_commit_duplicate_in_doubt_evidence_requires_every_completion() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let flush_epoch = {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            consolidator
+                .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: 1,
+                    page_data: sample_page(0x64),
+                    db_size_if_commit: 1,
+                }]))
+                .unwrap();
+            let _ = consolidator.begin_flush().unwrap();
+            consolidator.epoch()
+        };
+        let completed_first = Arc::new(AtomicBool::new(true));
+        let completed_second = Arc::new(AtomicBool::new(false));
+        queue.defer_pending_epoch_resolution(
+            flush_epoch,
+            GroupCommitFlushDurability::InDoubt,
+            Arc::clone(&completed_first),
+            None,
+        );
+        queue.defer_pending_epoch_resolution(
+            flush_epoch,
+            GroupCommitFlushDurability::InDoubt,
+            Arc::clone(&completed_second),
+            None,
+        );
+
+        queue.resolve_pending_epoch_resolutions().unwrap();
+        assert_eq!(
+            queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .phase(),
+            ConsolidationPhase::Flushing,
+            "one true completion must not authorize an epoch with a second unresolved write"
+        );
+        assert!(queue.has_process_root_finalization_attempt());
+
+        completed_second.store(true, AtomicOrdering::Release);
+        queue.resolve_pending_epoch_resolutions().unwrap();
+        assert!(queue.is_epoch_complete(flush_epoch));
+        assert!(
+            !queue.has_process_root_finalization_attempt(),
+            "terminal resolution must release the single surviving process-root owner"
+        );
+    }
+
+    #[test]
     fn test_group_commit_durable_obligation_does_not_complete_before_external_unlock() {
         let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
         let flush_epoch = {
@@ -27313,6 +32013,1344 @@ mod tests {
     }
 
     #[test]
+    fn test_group_commit_external_lock_coordination_is_exact_handle_scoped() {
+        let cx = Cx::new();
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let (first_file, _, _) =
+            pending_unlock_test_db_file(&cx, Path::new("/exact-handle-first.db"));
+        let (second_file, _, _) =
+            pending_unlock_test_db_file(&cx, Path::new("/exact-handle-second.db"));
+        let first_key = shared_db_file_key(&first_file);
+        let second_key = shared_db_file_key(&second_file);
+        assert_ne!(
+            first_key, second_key,
+            "distinct shared file handles require distinct coordination keys"
+        );
+
+        let first_physical = GroupCommitPhysicalLockWindow::register(&queue, first_key).unwrap();
+        assert!(
+            GroupCommitPhysicalLockWindow::try_register(&queue, first_key).is_none(),
+            "a second physical owner on the same handle must be rejected"
+        );
+        assert!(
+            GroupCommitLogicalExitClaim::try_register(&queue, first_key).is_none(),
+            "a logical transition on the same handle must wait for physical restoration"
+        );
+
+        let second_logical = GroupCommitLogicalExitClaim::try_register(&queue, second_key)
+            .expect("a distinct handle must remain logically admissible");
+        assert!(
+            GroupCommitPhysicalLockWindow::try_register(&queue, second_key).is_none(),
+            "the distinct handle's own logical owner must still exclude its physical owner"
+        );
+        drop(second_logical);
+        let second_physical = GroupCommitPhysicalLockWindow::register(&queue, second_key).unwrap();
+        drop(second_physical);
+        drop(first_physical);
+
+        let first_logical = GroupCommitLogicalExitClaim::try_register(&queue, first_key)
+            .expect("terminal physical restoration must release the exact handle");
+        drop(first_logical);
+        let coordination = queue
+            .external_lock_coordination
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(coordination.physical_lock_windows.is_empty());
+        assert!(coordination.logical_exit_in_flight.is_empty());
+    }
+
+    #[test]
+    fn test_queued_physical_restoration_pins_exact_file_handle_until_terminal() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("queued physical lifetime test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            let (db_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/queued-handle-lifetime.db"));
+            let weak_file = Arc::downgrade(&db_file);
+            let held_file = db_file
+                .try_write()
+                .expect("test must contend the exact shared file handle");
+            let flush_obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+            let db_lock_obligation = GroupCommitDbLockObligation::new(
+                &queue,
+                flush_epoch,
+                &db_file,
+                &cx,
+                LockLevel::Shared,
+                flush_obligation.durability_started_signal(),
+                flush_obligation.durable_io_signal(),
+                flush_obligation.external_lock_state(),
+                GroupCommitPhysicalLockWindow::register(&queue, shared_db_file_key(&db_file))
+                    .unwrap(),
+            );
+
+            drop(db_lock_obligation);
+            drop(flush_obligation);
+            assert!(
+                weak_file.upgrade().is_some(),
+                "queued restoration must retain the exact file handle"
+            );
+            drop(held_file);
+            drop(db_file);
+            assert!(
+                weak_file.upgrade().is_some(),
+                "the queue record must be the final strong owner before restoration"
+            );
+
+            assert!(queue.resolve_one_pending_external_unlock().await.unwrap());
+            assert!(
+                weak_file.upgrade().is_none(),
+                "terminal restoration must release the queue's exact file-handle pin"
+            );
+        });
+    }
+
+    #[test]
+    fn test_identity_wide_external_claim_fences_every_exact_handle_lane() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            let (global_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/global-restore.db"));
+            let (exact_file, exact_lock_level, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/exact-restore.db"));
+            let held_global_file = global_file
+                .try_write()
+                .expect("test must initially contend the identity-wide restoration");
+            let flush_obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+            let global_obligation = GroupCommitDbLockObligation::new(
+                &queue,
+                flush_epoch,
+                &global_file,
+                &cx,
+                LockLevel::Shared,
+                flush_obligation.durability_started_signal(),
+                flush_obligation.durable_io_signal(),
+                flush_obligation.external_lock_state(),
+                GroupCommitPhysicalLockWindow::register(&queue, shared_db_file_key(&global_file))
+                    .unwrap(),
+            );
+            drop(global_obligation);
+            drop(flush_obligation);
+
+            let exact_key = shared_db_file_key(&exact_file);
+            queue.enqueue_pending_external_unlock(PendingExternalUnlock {
+                sequence: None,
+                scope: ProcessRootFinalizationScope::ExactHandle(exact_key),
+                epoch: None,
+                durability_started: Arc::new(AtomicBool::new(false)),
+                durable_io_completed: Arc::new(AtomicBool::new(false)),
+                coordination_owner: Some(GroupCommitExternalLockOwner::Physical(
+                    GroupCommitPhysicalLockWindow::register(&queue, exact_key).unwrap(),
+                )),
+                recovery: None,
+                root_attempt: None,
+                operation: Box::new(SharedDbPendingExternalUnlock {
+                    db_file: Arc::clone(&exact_file),
+                    cleanup_cx: cleanup_child_cx(&cx),
+                    restore_target: PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
+                    restored: Arc::new(AtomicBool::new(false)),
+                }),
+            });
+
+            let global_claim = queue
+                .claim_pending_external_unlock_for(ProcessRootFinalizationSelector::IdentityWide)
+                .expect("identity-wide restoration must be claimable");
+            assert_eq!(
+                queue
+                    .identity_wide_external_unlock_claims_in_flight
+                    .load(AtomicOrdering::Acquire),
+                1
+            );
+            assert!(
+                queue
+                    .claim_pending_external_unlock_for(
+                        ProcessRootFinalizationSelector::ExactHandle(exact_key),
+                    )
+                    .is_none(),
+                "an in-flight identity-wide restoration must fence every exact handle"
+            );
+            drop(global_claim);
+            assert!(
+                queue
+                    .claim_pending_external_unlock_for(
+                        ProcessRootFinalizationSelector::ExactHandle(exact_key),
+                    )
+                    .is_none(),
+                "a queued identity-wide restoration must fence exact handles before claim"
+            );
+
+            drop(held_global_file);
+            assert!(
+                queue
+                    .resolve_one_pending_external_unlock_for(
+                        ProcessRootFinalizationSelector::IdentityWide,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                queue
+                    .resolve_one_pending_external_unlock_for_handle(exact_key)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(*exact_lock_level.lock().unwrap(), LockLevel::Shared);
+            assert!(!queue.has_process_root_finalization_attempt());
+        });
+    }
+
+    #[test]
+    fn test_process_root_phase_c_any_claim_prioritizes_identity_scope_and_preserves_exact_fifo() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let (exact_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/any-priority-exact.db"));
+            let (global_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/any-priority-global.db"));
+            let (independent_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/any-priority-independent.db"));
+            let exact_key = shared_db_file_key(&exact_file);
+            let independent_key = shared_db_file_key(&independent_file);
+
+            let enqueue = |db_file: &SharedDbFile<ObservedLockFile>,
+                           scope: ProcessRootFinalizationScope| {
+                queue.enqueue_pending_external_unlock(PendingExternalUnlock {
+                    sequence: None,
+                    scope,
+                    epoch: None,
+                    durability_started: Arc::new(AtomicBool::new(false)),
+                    durable_io_completed: Arc::new(AtomicBool::new(false)),
+                    coordination_owner: None,
+                    recovery: None,
+                    root_attempt: None,
+                    operation: Box::new(SharedDbPendingExternalUnlock {
+                        db_file: Arc::clone(db_file),
+                        cleanup_cx: cleanup_child_cx(&cx),
+                        restore_target: PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
+                        restored: Arc::new(AtomicBool::new(false)),
+                    }),
+                });
+            };
+
+            enqueue(
+                &exact_file,
+                ProcessRootFinalizationScope::ExactHandle(exact_key),
+            );
+            enqueue(
+                &independent_file,
+                ProcessRootFinalizationScope::ExactHandle(independent_key),
+            );
+            enqueue(&global_file, ProcessRootFinalizationScope::IdentityWide);
+            enqueue(
+                &exact_file,
+                ProcessRootFinalizationScope::ExactHandle(exact_key),
+            );
+
+            let global_sequence = {
+                let global_claim = queue
+                    .claim_pending_external_unlock()
+                    .expect("Any must claim the admitted identity-wide restoration first");
+                assert_eq!(
+                    global_claim.scope,
+                    ProcessRootFinalizationScope::IdentityWide
+                );
+                assert!(
+                    queue
+                        .claim_pending_external_unlock_for(
+                            ProcessRootFinalizationSelector::ExactHandle(exact_key),
+                        )
+                        .is_none(),
+                    "an in-flight identity-wide claim must fence every exact lane"
+                );
+                global_claim
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.sequence)
+                    .expect("queued restoration must retain its sequence")
+            };
+
+            let global_claim = queue
+                .claim_pending_external_unlock()
+                .expect("cancelled Any claim must requeue the identity-wide restoration");
+            assert_eq!(
+                global_claim.scope,
+                ProcessRootFinalizationScope::IdentityWide
+            );
+            assert_eq!(
+                global_claim
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.sequence),
+                Some(global_sequence),
+                "claim cancellation must preserve the identity-wide record's sequence"
+            );
+            drop(global_claim);
+
+            assert!(
+                queue
+                    .resolve_one_pending_external_unlock_for(
+                        ProcessRootFinalizationSelector::IdentityWide,
+                    )
+                    .await
+                    .unwrap(),
+                "the identity-wide restoration must become terminal before exact work proceeds"
+            );
+
+            let first_exact_sequence = {
+                let first_exact = queue
+                    .claim_pending_external_unlock_for(
+                        ProcessRootFinalizationSelector::ExactHandle(exact_key),
+                    )
+                    .expect("the first exact restoration must be claimable");
+                let sequence = first_exact
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.sequence)
+                    .expect("the first exact restoration must retain its sequence");
+                assert!(
+                    queue
+                        .claim_pending_external_unlock_for(
+                            ProcessRootFinalizationSelector::ExactHandle(exact_key),
+                        )
+                        .is_none(),
+                    "a live exact-handle claim must fence the younger record for that handle"
+                );
+                let independent = queue
+                    .claim_pending_external_unlock()
+                    .expect("Any must skip a leased handle and claim independent exact work");
+                assert_eq!(
+                    independent.scope,
+                    ProcessRootFinalizationScope::ExactHandle(independent_key)
+                );
+                drop(independent);
+                drop(first_exact);
+                sequence
+            };
+            let first_exact = queue
+                .claim_pending_external_unlock_for(ProcessRootFinalizationSelector::ExactHandle(
+                    exact_key,
+                ))
+                .expect("cancelled exact claim must return to the front of its lane");
+            assert_eq!(
+                first_exact
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.sequence),
+                Some(first_exact_sequence),
+                "exact-handle cancellation must preserve same-lane FIFO"
+            );
+            drop(first_exact);
+
+            assert!(
+                queue
+                    .resolve_one_pending_external_unlock_for_handle(exact_key)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                queue
+                    .resolve_one_pending_external_unlock_for_handle(exact_key)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                queue
+                    .resolve_one_pending_external_unlock_for_handle(independent_key)
+                    .await
+                    .unwrap()
+            );
+            assert!(!queue.has_process_root_finalization_attempt());
+        });
+    }
+
+    #[test]
+    fn test_process_root_phase_c_dropped_maintenance_clears_activity_before_reentry() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("dropped maintenance test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/dropped-maintenance-activity.db"))
+                .await
+                .unwrap();
+            let entered = Arc::new(AtomicBool::new(false));
+            let mut state = ();
+            let mut maintenance =
+                Box::pin(
+                    pager.with_exclusive_maintenance(&cx, &mut state, |_, _, _, ()| {
+                        let entered = Arc::clone(&entered);
+                        Box::pin(std::future::poll_fn(move |_| {
+                            entered.store(true, AtomicOrdering::Release);
+                            std::task::Poll::<Result<()>>::Pending
+                        }))
+                    }),
+                );
+
+            std::future::poll_fn(|poll_cx| match maintenance.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("maintenance unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+            assert!(entered.load(AtomicOrdering::Acquire));
+            assert!(
+                pager.published_snapshot().checkpoint_active,
+                "a suspended whole-image operation must publish maintenance as active"
+            );
+
+            drop(maintenance);
+            assert!(
+                !pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .checkpoint_active,
+                "dropping the admitted future must clear the internal maintenance gate"
+            );
+            assert!(
+                !pager.published_snapshot().checkpoint_active,
+                "dropping the admitted future must clear the published maintenance gate"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::None,
+                "drop cleanup must restore the exact external lock baseline"
+            );
+            assert!(
+                !pager
+                    .group_commit_queue
+                    .has_process_root_finalization_attempt(),
+                "uncontended drop cleanup must not leave a process root"
+            );
+
+            pager
+                .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| Box::pin(async { Ok(()) }))
+                .await
+                .expect("a later maintenance entrant must not remain fenced");
+        });
+    }
+
+    #[test]
+    fn test_exclusive_maintenance_stays_active_until_failed_restore_is_rooted() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/maintenance-root-before-inactive.db"))
+                .await
+                .unwrap();
+            *vfs.external_restore_publication_probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::downgrade(&pager.published));
+            vfs.external_restore_failures
+                .store(2, AtomicOrdering::Release);
+
+            let error = pager
+                .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| Box::pin(async { Ok(()) }))
+                .await
+                .expect_err("the injected external restoration must fail the operation");
+            assert!(
+                error
+                    .to_string()
+                    .contains("external maintenance restoration failure")
+            );
+            assert_eq!(
+                *vfs.external_restore_checkpoint_observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![true, true],
+                "both the explicit restore and Drop retry must run before inactivity is published"
+            );
+            assert!(!pager.published_snapshot().checkpoint_active);
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::Exclusive,
+                "failed restoration must retain the physical maintenance fence"
+            );
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "inactivity may be published only after the retry has a process root"
+            );
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1
+            );
+
+            assert!(
+                pager
+                    .group_commit_queue
+                    .resolve_one_pending_external_unlock()
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::None);
+            assert!(
+                !pager
+                    .group_commit_queue
+                    .has_process_root_finalization_attempt()
+            );
+        });
+    }
+
+    #[test]
+    fn test_exclusive_maintenance_acquire_failure_roots_before_publishing_inactive() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/maintenance-acquire-root-before-inactive.db"))
+                .await
+                .unwrap();
+            *vfs.external_restore_publication_probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::downgrade(&pager.published));
+            vfs.external_maintenance_acquire_failures
+                .store(1, AtomicOrdering::Release);
+            vfs.external_restore_failures
+                .store(1, AtomicOrdering::Release);
+
+            let error = pager
+                .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| Box::pin(async { Ok(()) }))
+                .await
+                .expect_err("the injected partial maintenance acquisition must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("external maintenance acquisition failure")
+            );
+            assert_eq!(
+                *vfs.external_restore_checkpoint_observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![true],
+                "the failed-acquisition Drop retry must run before inactivity is published"
+            );
+            assert!(!pager.published_snapshot().checkpoint_active);
+            assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::Exclusive);
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1
+            );
+
+            assert!(
+                pager
+                    .group_commit_queue
+                    .resolve_one_pending_external_unlock()
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::None);
+            assert!(
+                !pager
+                    .group_commit_queue
+                    .has_process_root_finalization_attempt()
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_stays_active_until_failed_restore_is_rooted() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/checkpoint-root-before-inactive.db"))
+                .await
+                .unwrap();
+            let (backend, _, _, _) = MockWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+
+            *vfs.external_restore_publication_probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::downgrade(&pager.published));
+            let db_file = Arc::clone(
+                &pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .db_file,
+            );
+            let baseline_file_owners = Arc::strong_count(&db_file);
+            vfs.external_restore_failures
+                .store(2, AtomicOrdering::Release);
+
+            let error = pager
+                .checkpoint(&cx, traits::CheckpointMode::Passive)
+                .await
+                .expect_err("the injected external restoration must fail the checkpoint");
+            assert!(
+                error
+                    .to_string()
+                    .contains("external maintenance restoration failure")
+            );
+            assert_eq!(
+                *vfs.external_restore_checkpoint_observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![true, true],
+                "explicit restoration and the guard's Drop retry must precede inactivity"
+            );
+            assert!(!pager.published_snapshot().checkpoint_active);
+            assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::Exclusive);
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1
+            );
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1
+            );
+            assert_eq!(
+                Arc::strong_count(&db_file),
+                baseline_file_owners + 1,
+                "the rooted restoration must retain the exact database file"
+            );
+
+            assert!(
+                pager
+                    .group_commit_queue
+                    .resolve_one_pending_external_unlock()
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::None);
+            assert!(
+                !pager
+                    .group_commit_queue
+                    .has_process_root_finalization_attempt()
+            );
+            assert!(
+                pager
+                    .group_commit_queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            );
+            assert_eq!(Arc::strong_count(&db_file), baseline_file_owners);
+        });
+    }
+
+    async fn assert_observed_external_attempt_retry_is_rooted(
+        queue: &Arc<GroupCommitQueue>,
+        db_file: SharedDbFile<ObservedLockFile>,
+        expected_scope: ProcessRootFinalizationScope,
+    ) {
+        let weak_file = Arc::downgrade(&db_file);
+        drop(db_file);
+        {
+            let pending = queue
+                .pending_external_unlocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending.front().map(|record| record.scope),
+                Some(expected_scope)
+            );
+        }
+        assert_eq!(
+            queue
+                .rooted_finalization_attempts
+                .load(AtomicOrdering::Acquire),
+            1,
+            "failed Drop restoration must publish exactly one process root"
+        );
+        assert!(
+            weak_file.upgrade().is_some(),
+            "the rooted retry must retain the exact opened file"
+        );
+
+        assert!(
+            queue.resolve_one_pending_external_unlock().await.is_err(),
+            "the first structured retry must surface the second injected restoration failure"
+        );
+        assert_eq!(
+            queue
+                .pending_external_unlocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "a failed structured retry must requeue the same obligation"
+        );
+        assert!(queue.has_process_root_finalization_attempt());
+        assert!(weak_file.upgrade().is_some());
+
+        assert!(
+            queue.resolve_one_pending_external_unlock().await.unwrap(),
+            "the retained attempt must become terminal after faults are exhausted"
+        );
+        assert!(!queue.has_process_root_finalization_attempt());
+        assert!(
+            weak_file.upgrade().is_none(),
+            "terminal cleanup must release the retained file owner"
+        );
+    }
+
+    fn observed_external_attempt_test_file(
+        cx: &Cx,
+        vfs: &ObservedLockVfs,
+        path: &Path,
+    ) -> SharedDbFile<ObservedLockFile> {
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (file, _) = vfs.open(cx, Some(path), flags).unwrap();
+        Arc::new(AsyncRwLock::with_name(
+            "observed_external_attempt_test_file",
+            file,
+        ))
+    }
+
+    #[test]
+    fn test_open_snapshot_partial_acquire_cleanup_is_rooted() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::with_external_attempt_failures(1, 0, 2);
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let db_file = observed_external_attempt_test_file(
+                &cx,
+                &vfs,
+                Path::new("/snapshot-partial-acquire-root.db"),
+            );
+            let mut attempt = BeginExternalLockState::new(&queue, Arc::clone(&db_file), &cx);
+            assert!(attempt.acquire_snapshot(&cx).await.is_err());
+            drop(attempt);
+            assert_observed_external_attempt_retry_is_rooted(
+                &queue,
+                db_file,
+                ProcessRootFinalizationScope::IdentityWide,
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_open_snapshot_drop_restore_failure_is_rooted() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::with_external_attempt_failures(0, 0, 2);
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let db_file = observed_external_attempt_test_file(
+                &cx,
+                &vfs,
+                Path::new("/snapshot-drop-restore-root.db"),
+            );
+            let handle_key = shared_db_file_key(&db_file);
+            let mut attempt = BeginExternalLockState::new(&queue, Arc::clone(&db_file), &cx);
+            attempt.acquire_snapshot(&cx).await.unwrap();
+            drop(attempt);
+            assert_observed_external_attempt_retry_is_rooted(
+                &queue,
+                db_file,
+                ProcessRootFinalizationScope::ExactHandle(handle_key),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_open_recovery_maintenance_partial_acquire_cleanup_is_rooted() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::with_external_attempt_failures(0, 1, 2);
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let db_file = observed_external_attempt_test_file(
+                &cx,
+                &vfs,
+                Path::new("/maintenance-partial-acquire-root.db"),
+            );
+            let mut attempt = BeginExternalLockState::new(&queue, Arc::clone(&db_file), &cx);
+            assert!(attempt.acquire_maintenance(&cx, true).await.is_err());
+            drop(attempt);
+            assert_observed_external_attempt_retry_is_rooted(
+                &queue,
+                db_file,
+                ProcessRootFinalizationScope::IdentityWide,
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_open_recovery_maintenance_drop_restore_failure_is_rooted() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::with_external_attempt_failures(0, 0, 2);
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let db_file = observed_external_attempt_test_file(
+                &cx,
+                &vfs,
+                Path::new("/maintenance-drop-restore-root.db"),
+            );
+            let mut attempt = BeginExternalLockState::new(&queue, Arc::clone(&db_file), &cx);
+            attempt.acquire_maintenance(&cx, true).await.unwrap();
+            drop(attempt);
+            assert_observed_external_attempt_retry_is_rooted(
+                &queue,
+                db_file,
+                ProcessRootFinalizationScope::IdentityWide,
+            )
+            .await;
+        });
+    }
+
+    struct CountingLogicalCleanup {
+        resolutions: Arc<AtomicUsize>,
+        db_file: SharedDbFile<ObservedLockFile>,
+    }
+
+    impl PendingGroupCommitLogicalCleanupOperation for CountingLogicalCleanup {
+        fn handle_key(&self) -> SharedDbFileKey {
+            shared_db_file_key(&self.db_file)
+        }
+
+        fn resolve<'a>(
+            &'a mut self,
+            _logical_exit_claim: &'a GroupCommitLogicalExitClaim,
+        ) -> LocalPagerFuture<'a, bool> {
+            Box::pin(async move {
+                self.resolutions.fetch_add(1, AtomicOrdering::AcqRel);
+                Ok(true)
+            })
+        }
+    }
+
+    struct OrderedLogicalCleanup {
+        id: u8,
+        order: Arc<Mutex<Vec<u8>>>,
+        db_file: SharedDbFile<ObservedLockFile>,
+    }
+
+    impl PendingGroupCommitLogicalCleanupOperation for OrderedLogicalCleanup {
+        fn handle_key(&self) -> SharedDbFileKey {
+            shared_db_file_key(&self.db_file)
+        }
+
+        fn resolve<'a>(
+            &'a mut self,
+            _logical_exit_claim: &'a GroupCommitLogicalExitClaim,
+        ) -> LocalPagerFuture<'a, bool> {
+            Box::pin(async move {
+                self.order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(self.id);
+                Ok(true)
+            })
+        }
+    }
+
+    #[test]
+    fn test_logical_cleanup_claim_is_single_flight_and_cancellation_preserves_fifo() {
+        asupersync::test_utils::run_test(|| async {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let cx = Cx::new();
+            let (db_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/logical-cleanup-fifo.db"));
+            for id in [1, 2] {
+                queue.enqueue_pending_logical_cleanup(PendingGroupCommitLogicalCleanup::new(
+                    None,
+                    Box::new(OrderedLogicalCleanup {
+                        id,
+                        order: Arc::clone(&order),
+                        db_file: Arc::clone(&db_file),
+                    }),
+                ));
+            }
+
+            let first_claim = queue
+                .claim_pending_logical_cleanup()
+                .expect("front logical cleanup must be claimable");
+            assert!(
+                queue.claim_pending_logical_cleanup().is_none(),
+                "exactly one logical exit may be in flight"
+            );
+            drop(first_claim);
+            assert_eq!(
+                queue.pending_logical_cleanup_count(),
+                2,
+                "claim cancellation must requeue the front operation"
+            );
+
+            assert!(queue.resolve_one_pending_logical_cleanup().await.unwrap());
+            assert!(queue.resolve_one_pending_logical_cleanup().await.unwrap());
+            assert_eq!(
+                *order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![1, 2],
+                "cancelled front cleanup must not move behind a later exit"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "both logical process roots must release after FIFO completion"
+            );
+        });
+    }
+
+    #[test]
+    fn test_blocked_logical_cleanup_does_not_convoy_a_distinct_handle_lane() {
+        asupersync::test_utils::run_test(|| async {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let cx = Cx::new();
+            let (blocked_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/logical-lane-blocked.db"));
+            let (ready_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/logical-lane-ready.db"));
+            let blocked_key = shared_db_file_key(&blocked_file);
+            let blocker = GroupCommitPhysicalLockWindow::register(&queue, blocked_key)
+                .expect("test must own the blocked handle's physical window");
+
+            for (id, db_file) in [(1, blocked_file), (2, ready_file)] {
+                queue.enqueue_pending_logical_cleanup(PendingGroupCommitLogicalCleanup::new(
+                    None,
+                    Box::new(OrderedLogicalCleanup {
+                        id,
+                        order: Arc::clone(&order),
+                        db_file,
+                    }),
+                ));
+            }
+
+            assert!(
+                queue.resolve_one_pending_logical_cleanup().await.unwrap(),
+                "a ready handle must not wait behind another handle's physical window"
+            );
+            assert_eq!(
+                *order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![2],
+                "only the unrelated ready lane may run while the first handle is blocked"
+            );
+            assert_eq!(queue.pending_logical_cleanup_count(), 1);
+
+            drop(blocker);
+            assert!(queue.resolve_one_pending_logical_cleanup().await.unwrap());
+            assert_eq!(
+                *order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![2, 1]
+            );
+            assert!(!queue.has_process_root_finalization_attempt());
+        });
+    }
+
+    #[test]
+    fn test_in_flight_epoch_resolution_claim_fences_logical_cleanup() {
+        asupersync::test_utils::run_test(|| async {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let cx = Cx::new();
+            let (db_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/epoch-logical-cleanup-fence.db"));
+            let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            queue.defer_pending_epoch_resolution(
+                flush_epoch,
+                GroupCommitFlushDurability::PreDurable,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            );
+            let epoch_claim = queue
+                .claim_pending_epoch_resolution(flush_epoch)
+                .expect("deferred epoch resolution must be claimable");
+            assert!(
+                queue
+                    .in_doubt_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "the claimant must temporarily own the only epoch record"
+            );
+            assert_eq!(
+                queue
+                    .epoch_resolution_claims_in_flight
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "claim publication must remain visible while the map is empty"
+            );
+
+            let logical_resolutions = Arc::new(AtomicUsize::new(0));
+            queue.enqueue_pending_logical_cleanup(PendingGroupCommitLogicalCleanup::new(
+                None,
+                Box::new(CountingLogicalCleanup {
+                    resolutions: Arc::clone(&logical_resolutions),
+                    db_file: Arc::clone(&db_file),
+                }),
+            ));
+            assert!(
+                !queue.resolve_one_pending_logical_cleanup().await.unwrap(),
+                "logical cleanup must not overtake an in-flight epoch transition"
+            );
+            assert_eq!(
+                logical_resolutions.load(AtomicOrdering::Acquire),
+                0,
+                "the fenced logical cleanup must remain unpolled"
+            );
+
+            drop(epoch_claim);
+            assert!(
+                queue
+                    .in_doubt_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "claim cancellation must requeue the exact epoch record"
+            );
+            assert_eq!(
+                queue
+                    .epoch_resolution_claims_in_flight
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "requeue must precede clearing the claim publication"
+            );
+            queue.resolve_pending_epoch_resolutions().unwrap();
+            assert!(
+                queue.resolve_one_pending_logical_cleanup().await.unwrap(),
+                "logical cleanup may run after the epoch transition is terminal"
+            );
+            assert_eq!(
+                logical_resolutions.load(AtomicOrdering::Acquire),
+                1,
+                "logical cleanup must run exactly once"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "epoch and logical roots must both release after terminal work"
+            );
+        });
+    }
+
+    #[test]
+    fn test_in_flight_external_unlock_claim_fences_logical_cleanup() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("in-flight external unlock test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            let (db_file, observed_lock_level, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/pending-unlock-claim-fence.db"));
+            let held_file = db_file
+                .try_write()
+                .expect("test should hold the shared database-file handle");
+            let flush_obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+            let db_lock_obligation = GroupCommitDbLockObligation::new(
+                &queue,
+                flush_epoch,
+                &db_file,
+                &cx,
+                LockLevel::Shared,
+                flush_obligation.durability_started_signal(),
+                flush_obligation.durable_io_signal(),
+                flush_obligation.external_lock_state(),
+                GroupCommitPhysicalLockWindow::register(&queue, shared_db_file_key(&db_file))
+                    .unwrap(),
+            );
+
+            drop(db_lock_obligation);
+            drop(flush_obligation);
+            let physical_claim = queue
+                .claim_pending_external_unlock()
+                .expect("physical restoration must be claimable");
+            assert_eq!(
+                queue
+                    .external_unlock_claims_in_flight
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "claim publication must precede removal from the visible queue"
+            );
+            assert!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "the physical claimant must hold the only external-unlock record"
+            );
+
+            let logical_resolutions = Arc::new(AtomicUsize::new(0));
+            queue.enqueue_pending_logical_cleanup(PendingGroupCommitLogicalCleanup::new(
+                None,
+                Box::new(CountingLogicalCleanup {
+                    resolutions: Arc::clone(&logical_resolutions),
+                    db_file: Arc::clone(&db_file),
+                }),
+            ));
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                2,
+                "physical and logical cleanup must own independent process roots"
+            );
+            assert!(
+                !queue.resolve_one_pending_logical_cleanup().await.unwrap(),
+                "logical cleanup must not overtake an in-flight physical claimant"
+            );
+            assert_eq!(
+                logical_resolutions.load(AtomicOrdering::Acquire),
+                0,
+                "the fenced logical operation must remain unpolled"
+            );
+
+            drop(physical_claim);
+            assert_eq!(
+                queue
+                    .external_unlock_claims_in_flight
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "claim cancellation must clear the in-flight publication"
+            );
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "claim cancellation must requeue the exact physical obligation"
+            );
+            drop(held_file);
+            assert!(
+                queue.resolve_one_pending_external_unlock().await.unwrap(),
+                "requeued physical restoration must reach a terminal result"
+            );
+            assert_eq!(
+                *observed_lock_level
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                LockLevel::Shared,
+                "physical restoration must restore its captured baseline"
+            );
+            assert!(
+                queue.resolve_one_pending_logical_cleanup().await.unwrap(),
+                "logical cleanup may run after physical restoration is terminal"
+            );
+            assert_eq!(
+                logical_resolutions.load(AtomicOrdering::Acquire),
+                1,
+                "logical cleanup must run exactly once"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "both process-root obligations must release only after terminal cleanup"
+            );
+        });
+    }
+
+    #[test]
+    fn test_contended_writer_drop_retains_state_until_exact_handle_exit() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let observed_unlock_trace_ids = vfs.observed_unlock_trace_ids();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/contended-transaction-drop.db"))
+                .await
+                .unwrap();
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let cx = Cx::new();
+            let txn = pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .expect("immediate writer transaction must begin");
+            let inner_state = Arc::clone(&txn.inner);
+            let db_file = {
+                let inner = txn
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Arc::clone(&inner.db_file)
+            };
+            observed_unlock_trace_ids.lock().unwrap().clear();
+            let held_file = shared_db_file_write(&db_file, &cx)
+                .await
+                .expect("test must contend the exact database-file handle");
+
+            drop(txn);
+            assert_eq!(
+                queue.pending_logical_cleanup_count(),
+                1,
+                "contended Drop must preserve its exact-handle unlock as queued work"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "the deferred transaction exit must own a process root"
+            );
+            assert!(
+                observed_unlock_trace_ids.lock().unwrap().is_empty(),
+                "Drop may not claim an unlock completed while the exact handle is contended"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::Reserved,
+                "the writer lock must remain held until rooted cleanup runs"
+            );
+            {
+                let inner = inner_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(
+                    inner.active_transactions, 1,
+                    "contended Drop must retain its active-transaction slot"
+                );
+                assert!(
+                    inner.writer_active,
+                    "contended Drop must retain the writer baton until exact unlock succeeds"
+                );
+            }
+
+            drop(held_file);
+            assert!(
+                queue.resolve_one_pending_logical_cleanup().await.unwrap(),
+                "rooted exact-handle cleanup must finish after contention clears"
+            );
+            assert_eq!(
+                observed_unlock_trace_ids.lock().unwrap().len(),
+                1,
+                "the deferred transaction exit must perform exactly one unlock"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::None,
+                "the last transaction exit must release the snapshot fence"
+            );
+            {
+                let inner = inner_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(
+                    inner.active_transactions, 0,
+                    "terminal detached exit must release the active-transaction slot"
+                );
+                assert!(
+                    !inner.writer_active,
+                    "terminal detached exit must release the writer baton"
+                );
+            }
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "terminal exact-handle cleanup must release its process root"
+            );
+        });
+    }
+
+    #[test]
+    fn test_process_root_phase_c_transaction_drop_recovers_poison_and_releases_root_terminally() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/poisoned-transaction-drop.db"))
+                .await
+                .unwrap();
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let cx = Cx::new();
+            let txn = pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .expect("writer transaction must begin before poisoning its state mutex");
+            let inner_state = Arc::clone(&txn.inner);
+
+            let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+                let inner_state = Arc::clone(&inner_state);
+                move || {
+                    let _guard = inner_state.lock().unwrap();
+                    panic!("intentional PagerInner poison for Drop recovery coverage");
+                }
+            }));
+            assert!(poison_result.is_err());
+
+            drop(txn);
+            let inner = inner_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                inner.active_transactions, 0,
+                "poison recovery must still release the active-transaction slot"
+            );
+            assert!(
+                !inner.writer_active,
+                "poison recovery must still release the writer baton"
+            );
+            drop(inner);
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::None,
+                "poison recovery must restore the exact external snapshot baseline"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "the Drop root may release only after all exit state is terminal"
+            );
+            assert!(!queue.has_process_root_finalization_attempt());
+        });
+    }
+
+    #[test]
     fn test_dropped_pending_unlock_claim_requeues_until_waiter_restores_lock() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .blocking_threads(1, 1)
@@ -27322,6 +33360,7 @@ mod tests {
             let cx = Cx::new();
             let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
             let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            let epoch_consumer = queue.register_epoch_consumer(flush_epoch);
             let (db_file, observed_lock_level, _) =
                 pending_unlock_test_db_file(&cx, Path::new("/pending-unlock-requeue.db"));
             let held_file = db_file
@@ -27337,6 +33376,8 @@ mod tests {
                 flush_obligation.durability_started_signal(),
                 flush_obligation.durable_io_signal(),
                 flush_obligation.external_lock_state(),
+                GroupCommitPhysicalLockWindow::register(&queue, shared_db_file_key(&db_file))
+                    .unwrap(),
             );
 
             drop(db_lock_obligation);
@@ -27349,6 +33390,13 @@ mod tests {
                     .len(),
                 1,
                 "contended Drop must transfer its external unlock into the queue"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "queued cleanup must install exactly one process-root attempt"
             );
 
             let mut first_claim = Box::pin(queue.resolve_one_pending_external_unlock());
@@ -27373,6 +33421,13 @@ mod tests {
                 1,
                 "dropping the cleanup future must requeue its leased obligation"
             );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "claim cancellation must retain the original root rather than duplicate it"
+            );
 
             drop(held_file);
             assert!(queue.resolve_one_pending_external_unlock().await.unwrap());
@@ -27391,6 +33446,292 @@ mod tests {
                     .contains_key(&flush_epoch),
                 "a pre-side-effect dropped flusher resolves as Abort after unlock"
             );
+            drop(epoch_consumer);
+            assert!(
+                !queue
+                    .failed_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "the final epoch consumer must reclaim the retained Abort"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "terminal restoration must release the exact root attempt"
+            );
+        });
+    }
+
+    #[test]
+    fn test_process_root_attempts_release_individually_and_unknown_release_fails_closed() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let path = PathBuf::from("/process-root-attempt-accounting.db");
+        queue.bind_finalization_path(&path);
+        let queue_weak = Arc::downgrade(&queue);
+        let queue_id = queue.queue_id;
+        let first = ProcessRootFinalizationAttempt::register(&queue);
+        let second = ProcessRootFinalizationAttempt::register(&queue);
+
+        assert_eq!(
+            queue
+                .rooted_finalization_attempts
+                .load(AtomicOrdering::Acquire),
+            2,
+            "two admitted attempts require two independently owned root tokens"
+        );
+        assert!(
+            !release_process_root_finalization_attempt(queue_id, 0),
+            "an unknown token must never release a process-root queue"
+        );
+        assert_eq!(
+            queue
+                .rooted_finalization_attempts
+                .load(AtomicOrdering::Acquire),
+            2,
+            "unknown release must preserve the fail-closed root count"
+        );
+
+        first.release_after_terminal();
+        assert_eq!(
+            queue
+                .rooted_finalization_attempts
+                .load(AtomicOrdering::Acquire),
+            1,
+            "one terminal attempt must not unpin its sibling"
+        );
+        drop(queue);
+        assert!(
+            queue_weak.upgrade().is_some(),
+            "the remaining attempt must retain the queue at process root"
+        );
+
+        second.release_after_terminal();
+        assert!(
+            queue_weak.upgrade().is_none(),
+            "the final terminal attempt must remove the root without an Arc cycle"
+        );
+    }
+
+    #[test]
+    fn test_exact_handle_process_root_does_not_convoy_unrelated_handle_settlement() {
+        asupersync::test_utils::run_test(|| async {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let cx = Cx::new();
+            let (first_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/root-scope-first.db"));
+            let (second_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/root-scope-second.db"));
+            let first_key = shared_db_file_key(&first_file);
+            let second_key = shared_db_file_key(&second_file);
+            let root = ProcessRootFinalizationAttempt::register_exact_handle(&queue, first_key);
+
+            assert!(queue.has_relevant_process_root(first_key));
+            assert!(!queue.has_identity_wide_process_root());
+            assert!(
+                !queue.has_relevant_process_root(second_key),
+                "an exact-handle root must not become an identity-wide admission fence"
+            );
+            settle_pending_group_commit_finalization_for_handle(&queue, second_key)
+                .await
+                .expect("an unrelated handle must not wait behind exact-handle cleanup");
+            assert!(
+                matches!(
+                    settle_pending_group_commit_finalization_for_handle(&queue, first_key).await,
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "the rooted handle itself must remain fail closed"
+            );
+
+            root.release_after_terminal();
+            assert!(!queue.has_process_root_finalization_attempt());
+        });
+    }
+
+    #[test]
+    fn test_process_root_queue_fence_and_path_registry_publish_atomically() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let path = PathBuf::from("/process-root-publication-linearization.db");
+        queue.bind_finalization_path(&path);
+
+        let fence_published = Arc::new(std::sync::Barrier::new(2));
+        let allow_registry_publish = Arc::new(std::sync::Barrier::new(2));
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::sync_channel(1);
+        let register_queue = Arc::clone(&queue);
+        let register_fence = Arc::clone(&fence_published);
+        let register_release = Arc::clone(&allow_registry_publish);
+        let register_thread = std::thread::spawn(move || {
+            let attempt = ProcessRootFinalizationAttempt::register_with_publication_hook(
+                &register_queue,
+                || {
+                    register_fence.wait();
+                    register_release.wait();
+                },
+            );
+            attempt_tx.send(attempt).unwrap();
+        });
+
+        fence_published.wait();
+        assert_eq!(
+            queue
+                .rooted_finalization_attempts
+                .load(AtomicOrdering::Acquire),
+            1,
+            "the queue-local admission fence must publish before the global indexes"
+        );
+
+        let lookup_started = Arc::new(std::sync::Barrier::new(2));
+        let (lookup_tx, lookup_rx) = std::sync::mpsc::sync_channel(1);
+        let lookup_path = path.clone();
+        let lookup_barrier = Arc::clone(&lookup_started);
+        let lookup_thread = std::thread::spawn(move || {
+            lookup_barrier.wait();
+            let queues = process_root_finalization_queues_for_path(&lookup_path);
+            lookup_tx.send(queues).unwrap();
+        });
+        lookup_started.wait();
+        assert!(
+            matches!(
+                lookup_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "a same-path replacement lookup must block during atomic-to-registry publication"
+        );
+
+        allow_registry_publish.wait();
+        let rooted_queues = lookup_rx.recv().unwrap();
+        assert_eq!(rooted_queues.len(), 1);
+        assert!(
+            Arc::ptr_eq(&rooted_queues[0], &queue),
+            "the unblocked path gate must observe the exact rooted queue"
+        );
+        let attempt = attempt_rx.recv().unwrap();
+        register_thread.join().unwrap();
+        lookup_thread.join().unwrap();
+        attempt.release_after_terminal();
+    }
+
+    #[test]
+    fn test_private_memory_same_synthetic_path_does_not_share_process_root_gate() {
+        asupersync::test_utils::run_test(|| async {
+            let path = Path::new("/private-memory-process-root-isolation.db");
+            let first = SimplePager::open(MemoryVfs::new(), path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let root = ProcessRootFinalizationAttempt::register(&first.group_commit_queue);
+
+            let second = SimplePager::open(MemoryVfs::new(), path, PageSize::DEFAULT)
+                .await
+                .expect("an unrelated private-memory identity must not inherit a path root");
+            assert!(
+                !Arc::ptr_eq(&first.group_commit_queue, &second.group_commit_queue),
+                "private memory databases with the same synthetic path require distinct queues"
+            );
+
+            root.release_after_terminal();
+        });
+    }
+
+    #[test]
+    fn test_same_database_entry_points_fail_closed_while_root_attempt_is_admitted() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = SimplePager::open(
+                MemoryVfs::new(),
+                Path::new("/process-root-entry-gates.db"),
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+
+            let mut txn = pager.begin(&cx, TransactionMode::Deferred).await.unwrap();
+            let rollback_root = ProcessRootFinalizationAttempt::register(&pager.group_commit_queue);
+            assert!(
+                matches!(txn.rollback(&cx).await, Err(FrankenError::BusyRecovery)),
+                "rollback must not pass an admitted physical finalization"
+            );
+            rollback_root.release_after_terminal();
+            txn.rollback(&cx).await.unwrap();
+
+            let root = ProcessRootFinalizationAttempt::register(&pager.group_commit_queue);
+            assert!(
+                matches!(
+                    pager.begin(&cx, TransactionMode::Deferred).await,
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "begin must fail closed while an admitted root has no terminal receipt"
+            );
+            assert!(
+                matches!(
+                    pager.set_journal_mode(&cx, JournalMode::Wal).await,
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "journal-mode transitions must settle rooted work first"
+            );
+            assert!(
+                matches!(
+                    pager.checkpoint(&cx, traits::CheckpointMode::Passive).await,
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "checkpoint must settle rooted work before inspecting WAL state"
+            );
+            assert!(
+                matches!(
+                    pager.export_database_bytes(&cx).await,
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "export must settle rooted work before reading the database image"
+            );
+            assert!(
+                matches!(
+                    pager
+                        .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| {
+                            Box::pin(async { Ok(()) })
+                        })
+                        .await,
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "whole-database maintenance must settle rooted work before entering"
+            );
+            let copy_target = Path::new("/process-root-entry-gates-copy.db");
+            assert!(
+                matches!(
+                    pager.copy_database_to(&cx, copy_target).await,
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "database copy must settle rooted work before creating its target"
+            );
+            assert!(
+                !pager
+                    .vfs
+                    .access(&cx, copy_target, AccessFlags::EXISTS)
+                    .unwrap(),
+                "a rejected copy must not create its target"
+            );
+            assert!(
+                matches!(
+                    pager.refresh_published_snapshot(&cx).await,
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "snapshot refresh must settle rooted work before inspecting durable state"
+            );
+            let (backend, _, _, _) = MockWalBackend::new();
+            assert!(
+                matches!(
+                    pager.set_wal_backend(Box::new(backend)),
+                    Err(FrankenError::BusyRecovery)
+                ),
+                "synchronous WAL replacement must reject unresolved rooted work"
+            );
+            let (owned_backend, _, _, _) = MockWalBackend::new();
+            let owned_result = pager.set_wal_backend_owned(owned_backend);
+            assert!(
+                matches!(owned_result, Err((FrankenError::BusyRecovery, _))),
+                "ownership-preserving WAL replacement must return the backend on BusyRecovery"
+            );
+            root.release_after_terminal();
         });
     }
 
@@ -27419,6 +33760,8 @@ mod tests {
                 Arc::clone(&durability_started),
                 Arc::clone(&durable_io_completed),
                 flush_obligation.external_lock_state(),
+                GroupCommitPhysicalLockWindow::register(&queue, shared_db_file_key(&db_file))
+                    .unwrap(),
             );
 
             drop(db_lock_obligation);
@@ -27527,6 +33870,8 @@ mod tests {
                 durability_started,
                 durable_io_completed,
                 flush_obligation.external_lock_state(),
+                GroupCommitPhysicalLockWindow::register(&queue, shared_db_file_key(&db_file))
+                    .unwrap(),
             );
 
             drop(db_lock_obligation);
@@ -27711,6 +34056,78 @@ mod tests {
         };
         assert_eq!(flush_epoch, 2);
         assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn test_process_root_phase_c_async_epoch_takeover_precedes_exact_logical_cleanup() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let (db_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/async-epoch-takeover.db"));
+            let handle_key = shared_db_file_key(&db_file);
+
+            {
+                let mut consolidator = queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let first = consolidator
+                    .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 1,
+                        page_data: sample_page(0x71),
+                        db_size_if_commit: 1,
+                    }]))
+                    .unwrap();
+                assert_eq!(first.outcome, SubmitOutcome::Flusher);
+                let _ = consolidator.begin_flush().unwrap();
+                let promoted = consolidator
+                    .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 2,
+                        page_data: sample_page(0x72),
+                        db_size_if_commit: 2,
+                    }]))
+                    .unwrap();
+                assert_eq!(promoted.outcome, SubmitOutcome::Waiter);
+                assert_eq!(promoted.target_epoch, 2);
+                assert!(consolidator.complete_flush().unwrap());
+            }
+            queue.publish_completed_epoch(1, true);
+
+            let physical_owner = GroupCommitPhysicalLockWindow::register(&queue, handle_key)
+                .expect("test must hold the exact handle's physical lane");
+            let resolutions = Arc::new(AtomicUsize::new(0));
+            queue.enqueue_pending_logical_cleanup(PendingGroupCommitLogicalCleanup::new(
+                None,
+                Box::new(CountingLogicalCleanup {
+                    resolutions: Arc::clone(&resolutions),
+                    db_file,
+                }),
+            ));
+
+            let outcome = queue
+                .wait_for_epoch_outcome_async(&cx, 2)
+                .await
+                .expect("a promoted waiter must not depend on its exact logical cleanup");
+            let WaitForEpochOutcome::TakeOverFlusher {
+                flush_epoch,
+                batches,
+            } = outcome
+            else {
+                panic!("the production async waiter must take over the promoted epoch");
+            };
+            assert_eq!(flush_epoch, 2);
+            assert_eq!(batches.len(), 1);
+            assert_eq!(
+                resolutions.load(AtomicOrdering::Acquire),
+                0,
+                "epoch observation must not poll exact logical cleanup first"
+            );
+
+            drop(physical_owner);
+            assert!(queue.resolve_one_pending_logical_cleanup().await.unwrap());
+            assert_eq!(resolutions.load(AtomicOrdering::Acquire), 1);
+        });
     }
 
     #[test]
@@ -29138,6 +35555,229 @@ mod tests {
                 1,
                 "bead_id={BEAD_ID} case=rejected_writer_must_not_mutate_wal_state"
             );
+        });
+    }
+
+    #[test]
+    fn test_cancelled_begin_after_reserved_retains_ownership_until_exact_restore() {
+        use crate::traits::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
+
+        struct PendingBeginWalBackend {
+            begin_calls: Arc<AtomicUsize>,
+            pending_entered: Arc<AtomicBool>,
+        }
+
+        impl WalBackend for PendingBeginWalBackend {
+            fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                let call_index = self.begin_calls.fetch_add(1, AtomicOrdering::AcqRel);
+                if call_index == 0 {
+                    Box::pin(async { Ok(()) })
+                } else {
+                    Box::pin(std::future::poll_fn(move |_| {
+                        self.pending_entered.store(true, AtomicOrdering::Release);
+                        std::task::Poll::Pending
+                    }))
+                }
+            }
+
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                _page_number: u32,
+                _page_data: &'a [u8],
+                _db_size_if_commit: u32,
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                _page_number: u32,
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                0
+            }
+
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                mode: CheckpointMode,
+                _writer: &'a mut dyn CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> WalFuture<'a, CheckpointResult> {
+                Box::pin(async move {
+                    Ok(CheckpointResult {
+                        total_frames: 0,
+                        frames_backfilled: 0,
+                        completed: true,
+                        wal_was_reset: false,
+                        requested_mode: mode,
+                        effective_mode: mode,
+                    })
+                })
+            }
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("cancelled begin test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let observed_unlock_trace_ids = vfs.observed_unlock_trace_ids();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/cancelled-wal-begin.db"))
+                .await
+                .unwrap();
+            let begin_calls = Arc::new(AtomicUsize::new(0));
+            let pending_entered = Arc::new(AtomicBool::new(false));
+            pager
+                .set_wal_backend(Box::new(PendingBeginWalBackend {
+                    begin_calls: Arc::clone(&begin_calls),
+                    pending_entered: Arc::clone(&pending_entered),
+                }))
+                .unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(begin_calls.load(AtomicOrdering::Acquire), 1);
+            let reader_lock_level = *observed_lock_level
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(reader_lock_level, LockLevel::Shared);
+
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let inner_state = Arc::clone(&pager.inner);
+            let db_file = {
+                let inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Arc::clone(&inner.db_file)
+            };
+            let handle_key = shared_db_file_key(&db_file);
+            observed_unlock_trace_ids.lock().unwrap().clear();
+
+            let mut begin = Box::pin(pager.begin(&cx, TransactionMode::Immediate));
+            std::future::poll_fn(|poll_cx| match begin.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending if pending_entered.load(AtomicOrdering::Acquire) => {
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => {
+                    poll_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(Ok(_)) => panic!("WAL begin unexpectedly succeeded"),
+                std::task::Poll::Ready(Err(error)) => {
+                    panic!("WAL begin unexpectedly failed: {error}")
+                }
+            })
+            .await;
+            assert!(pending_entered.load(AtomicOrdering::Acquire));
+            assert_eq!(begin_calls.load(AtomicOrdering::Acquire), 2);
+            let suspended_lock_level = *observed_lock_level
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                suspended_lock_level,
+                LockLevel::Reserved,
+                "the suspended eager begin must own RESERVED"
+            );
+
+            let held_file = db_file
+                .try_write()
+                .expect("test must contend the exact file during cancellation");
+            drop(begin);
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "cancellation must root one exact-handle restoration before PagerInner is visible"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1
+            );
+            {
+                let coordination = queue
+                    .external_lock_coordination
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(
+                    coordination.logical_exit_in_flight.contains(&handle_key),
+                    "same-handle admission must remain fenced until restoration is terminal"
+                );
+            }
+            {
+                let inner = inner_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(inner.active_transactions, 1);
+                assert!(
+                    inner.writer_active,
+                    "the writer baton must remain owned while RESERVED is stranded"
+                );
+            }
+
+            drop(held_file);
+            assert!(queue.resolve_one_pending_external_unlock().await.unwrap());
+            let restored_lock_level = *observed_lock_level
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(restored_lock_level, LockLevel::Shared);
+            assert_eq!(
+                observed_unlock_trace_ids.lock().unwrap().len(),
+                1,
+                "the cancelled begin must perform exactly one terminal RESERVED release"
+            );
+            {
+                let inner = inner_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(inner.active_transactions, 1);
+                assert!(!inner.writer_active);
+            }
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0
+            );
+            {
+                let coordination = queue
+                    .external_lock_coordination
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(!coordination.logical_exit_in_flight.contains(&handle_key));
+            }
+
+            reader.rollback(&cx).await.unwrap();
+            let final_lock_level = *observed_lock_level
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(final_lock_level, LockLevel::None);
+            assert_eq!(observed_unlock_trace_ids.lock().unwrap().len(), 2);
+            let inner = inner_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(inner.active_transactions, 0);
+            assert!(!inner.writer_active);
         });
     }
 
@@ -31680,6 +38320,7 @@ mod tests {
                     &mut txn.write_pages_sorted,
                     committed_db_size,
                     &pending_freed,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -31750,6 +38391,7 @@ mod tests {
                     &mut txn.write_pages_sorted,
                     committed_db_size,
                     &pending_freed,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -34297,6 +40939,77 @@ mod tests {
                 read_after.published_hits,
                 read_before.published_hits + 1,
                 "bead_id={BEAD_ID} case=wal_post_commit_read_hits_publication"
+            );
+        });
+    }
+
+    #[test]
+    fn test_named_memory_vfs_wal_retain_records_physical_main_file_size() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let db_path = PathBuf::from("/named_memory_wal_retain_file_size.db");
+            let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let (backend, _frames, _begin_calls, _batch_calls) = MockWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+
+            let initial_main_file_size = {
+                let db_file = {
+                    let inner = pager.inner.lock().unwrap();
+                    Arc::clone(&inner.db_file)
+                };
+                shared_db_file_read(&db_file, &cx)
+                    .await
+                    .unwrap()
+                    .file_size(&cx)
+                    .unwrap()
+            };
+
+            let ps = PageSize::DEFAULT.as_usize();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &vec![0x6D; ps]).await.unwrap();
+            assert!(
+                txn.commit_and_retain(&cx).await.unwrap(),
+                "named MemoryVfs must retain its admitted writer transaction"
+            );
+
+            let (recorded_main_file_size, logical_db_size, db_file) = {
+                let inner = pager.inner.lock().unwrap();
+                (
+                    inner.committed_db_file_size_bytes,
+                    inner.db_size,
+                    Arc::clone(&inner.db_file),
+                )
+            };
+            let physical_main_file_size = shared_db_file_read(&db_file, &cx)
+                .await
+                .unwrap()
+                .file_size(&cx)
+                .unwrap();
+            assert_eq!(
+                physical_main_file_size, initial_main_file_size,
+                "WAL append must not grow a named MemoryVfs main database file"
+            );
+            assert_eq!(
+                recorded_main_file_size, physical_main_file_size,
+                "retained WAL commit must record the named database's physical main-file size"
+            );
+            assert_ne!(
+                recorded_main_file_size,
+                u64::from(logical_db_size) * u64::from(PageSize::DEFAULT.get()),
+                "named MemoryVfs must not use the private :memory: synthetic size rule"
+            );
+
+            txn.rollback(&cx).await.unwrap();
+            let reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                reader.get_page(&cx, page).await.unwrap().as_ref()[0],
+                0x6D,
+                "retained commit must keep its WAL-published page visible after finalization"
             );
         });
     }
@@ -37450,6 +44163,7 @@ mod tests {
 
             struct SlowWalBackend {
                 append_calls: SharedCounter,
+                total_frames: SharedCounter,
                 io_delay: Duration,
             }
 
@@ -37461,7 +44175,12 @@ mod tests {
                     _page_data: &'a [u8],
                     _db_size_if_commit: u32,
                 ) -> WalFuture<'a, ()> {
-                    Box::pin(async { Ok(()) })
+                    Box::pin(async move {
+                        *self.append_calls.lock().unwrap() += 1;
+                        *self.total_frames.lock().unwrap() += 1;
+                        std::thread::sleep(self.io_delay);
+                        Ok(())
+                    })
                 }
 
                 fn append_frames<'a>(
@@ -37471,8 +44190,8 @@ mod tests {
                 ) -> WalFuture<'a, ()> {
                     Box::pin(async move {
                         *self.append_calls.lock().unwrap() += 1;
+                        *self.total_frames.lock().unwrap() += frames.len();
                         std::thread::sleep(self.io_delay);
-                        let _ = frames;
                         Ok(())
                     })
                 }
@@ -37529,10 +44248,11 @@ mod tests {
                 fn append_prepared_frames<'a>(
                     &'a mut self,
                     _cx: &'a Cx,
-                    _prepared: &'a mut crate::traits::PreparedWalFrameBatch,
+                    prepared: &'a mut crate::traits::PreparedWalFrameBatch,
                 ) -> WalFuture<'a, ()> {
                     Box::pin(async move {
                         *self.append_calls.lock().unwrap() += 1;
+                        *self.total_frames.lock().unwrap() += prepared.frame_count();
                         std::thread::sleep(self.io_delay);
                         Ok(())
                     })
@@ -37551,7 +44271,7 @@ mod tests {
                 }
 
                 fn frame_count(&self) -> usize {
-                    0
+                    *self.total_frames.lock().unwrap()
                 }
 
                 fn checkpoint<'a>(
@@ -37588,6 +44308,7 @@ mod tests {
             let append_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let backend = SlowWalBackend {
                 append_calls: StdArc::clone(&append_calls),
+                total_frames: StdArc::new(StdMutex::new(0)),
                 io_delay: Duration::from_millis(20),
             };
             pager.set_wal_backend(Box::new(backend)).unwrap();
@@ -38587,7 +45308,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_wal_group_publication_replaces_stale_pages_before_out_of_order_phase_c() {
+    fn parallel_wal_group_commit_publication_replaces_stale_pages_before_out_of_order_phase_c() {
         init_publication_test_tracing();
         let cx = Cx::new();
         let published = PublishedPagerState::new(3, CommitSeq::ZERO, JournalMode::Wal, 0);
@@ -38665,8 +45386,8 @@ mod tests {
             Some(committed_page_three.clone())
         );
 
-        // Simulate Phase C for the higher-sequence member running first, then
-        // the lower-sequence member. Neither callback may reveal the stale
+        // Simulate the current group binding first, then a delayed callback
+        // from an older certificate. Neither callback may reveal the stale
         // pre-group page or regress the contiguous page-plane horizon.
         let higher_member_intent = ParallelWalPublicationIntent {
             certificate_epoch: 1,
@@ -38680,8 +45401,11 @@ mod tests {
         };
         published.bind_parallel_wal_publication(higher_member_intent);
         let lower_member_intent = ParallelWalPublicationIntent {
-            visible_commit_seq: CommitSeq::new(2),
-            page_plane_visible_commit_seq: CommitSeq::new(2),
+            certificate_epoch: 0,
+            visible_commit_seq: CommitSeq::new(1),
+            page_plane_visible_commit_seq: CommitSeq::new(1),
+            db_size: 2,
+            page_set_size: 1,
             ..higher_member_intent
         };
         published.bind_parallel_wal_publication(lower_member_intent);

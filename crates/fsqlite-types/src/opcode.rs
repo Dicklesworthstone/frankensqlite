@@ -1,3 +1,15 @@
+/// Read the top-N bound for `SorterOpen` from register P3 instead of treating
+/// P3 as an immediate integer.
+pub const SORTER_OPEN_TOP_N_REGISTER: u16 = 0x0001;
+
+/// Make `SorterCompare` treat P3 as a candidate sort-key record and jump to P2
+/// when a bounded sorter would reject that candidate.
+///
+/// In this mode P3 is consumed: after either the P2 jump or fallthrough, the
+/// register is dead and its contents are undefined. Bytecode must rewrite P3
+/// before any later read.
+pub const SORTER_COMPARE_TOP_N_PREFLIGHT: u16 = 0x0001;
+
 /// VDBE (Virtual Database Engine) opcodes.
 ///
 /// These correspond 1:1 to the upstream SQLite VDBE opcode set. Each opcode
@@ -263,7 +275,13 @@ pub enum Opcode {
     ResetCount = 103,
 
     // === Sorter Operations ===
-    /// Compare sorter key.
+    /// Compare a sorter key.
+    ///
+    /// With `SORTER_COMPARE_TOP_N_PREFLIGHT`, P3 is a packed candidate-key
+    /// record and execution jumps to P2 when the bounded sorter is full and
+    /// the candidate cannot displace its current worst row.
+    /// The preflight form consumes P3; it is dead and undefined after either
+    /// the jump or fallthrough and must be rewritten before any later read.
     SorterCompare = 104,
     /// Read data from the sorter.
     SorterData = 105,

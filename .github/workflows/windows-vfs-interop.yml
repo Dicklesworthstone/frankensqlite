@@ -58,39 +58,35 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Path artifacts -Force | Out-Null
 
-      - name: Bootstrap local path dependencies
-        shell: pwsh
-        run: |
-          $depsRoot = "D:\dp"
-          New-Item -ItemType Directory -Path $depsRoot -Force | Out-Null
-
-          if (-not (Test-Path "D:\dp\asupersync\Cargo.toml")) {
-            git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git D:\dp\asupersync
-          }
-
-          if (-not (Test-Path "D:\dp\frankentui\Cargo.toml")) {
-            git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git D:\dp\frankentui
-          }
-
-          if (-not (Test-Path "D:\dp\asupersync\Cargo.toml")) {
-            throw "Missing dependency manifest: D:\dp\asupersync\Cargo.toml"
-          }
-
-          if (-not (Test-Path "D:\dp\frankentui\Cargo.toml")) {
-            throw "Missing dependency manifest: D:\dp\frankentui\Cargo.toml"
-          }
-
       - name: Check fsqlite-vfs
         shell: pwsh
-        run: cargo check -p fsqlite-vfs --all-targets 2>&1 | Tee-Object -FilePath artifacts/cargo-check-fsqlite-vfs.txt
+        run: |
+          $checkOutput = & cargo check --locked -p fsqlite-vfs --all-targets 2>&1
+          $checkExitCode = $LASTEXITCODE
+          $checkOutput | Tee-Object -FilePath artifacts/cargo-check-fsqlite-vfs.txt
+          if ($checkExitCode -ne 0) {
+            throw "fsqlite-vfs cargo check failed with exit code $checkExitCode"
+          }
 
       - name: Clippy fsqlite-vfs
         shell: pwsh
-        run: cargo clippy -p fsqlite-vfs --all-targets -- -D warnings 2>&1 | Tee-Object -FilePath artifacts/cargo-clippy-fsqlite-vfs.txt
+        run: |
+          $clippyOutput = & cargo clippy --locked -p fsqlite-vfs --all-targets -- -D warnings 2>&1
+          $clippyExitCode = $LASTEXITCODE
+          $clippyOutput | Tee-Object -FilePath artifacts/cargo-clippy-fsqlite-vfs.txt
+          if ($clippyExitCode -ne 0) {
+            throw "fsqlite-vfs clippy failed with exit code $clippyExitCode"
+          }
 
       - name: Run full fsqlite-vfs tests
         shell: pwsh
-        run: cargo test -p fsqlite-vfs -- --nocapture 2>&1 | Tee-Object -FilePath artifacts/cargo-test-fsqlite-vfs.txt
+        run: |
+          $testOutput = & cargo test --locked -p fsqlite-vfs -- --nocapture 2>&1
+          $testExitCode = $LASTEXITCODE
+          $testOutput | Tee-Object -FilePath artifacts/cargo-test-fsqlite-vfs.txt
+          if ($testExitCode -ne 0) {
+            throw "fsqlite-vfs tests failed with exit code $testExitCode"
+          }
 
       - name: Prove descriptor-bound facade opens exactly on Windows
         shell: pwsh
@@ -124,9 +120,16 @@ jobs:
 
       - name: Run Windows interop E2E test
         shell: pwsh
-        run: cargo test -p fsqlite-vfs test_e2e_windowsvfs_c_sqlite_interop -- --nocapture 2>&1 | Tee-Object -FilePath artifacts/cargo-test-windows-interop.txt
+        run: |
+          $interopOutput = & cargo test --locked -p fsqlite-vfs test_e2e_windowsvfs_c_sqlite_interop -- --nocapture 2>&1
+          $interopExitCode = $LASTEXITCODE
+          $interopOutput | Tee-Object -FilePath artifacts/cargo-test-windows-interop.txt
+          if ($interopExitCode -ne 0) {
+            throw "Windows VFS interop test failed with exit code $interopExitCode"
+          }
 
       - name: Upload Windows VFS artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-vfs-interop-logs

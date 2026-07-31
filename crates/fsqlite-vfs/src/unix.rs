@@ -38,8 +38,8 @@ use tracing::{error, warn};
 
 use crate::shm::{
     SHM_READ_MARK_OFFSET, SHM_SEGMENT_SIZE, SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK,
-    SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_NREADER_USIZE, WAL_TOTAL_LOCKS,
-    WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
+    SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_CKPT_LOCK, WAL_NREADER_USIZE,
+    WAL_TOTAL_LOCKS, WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
 };
 use crate::traits::{
     FileIdentity, SyncKind, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource,
@@ -562,6 +562,15 @@ struct InodeInfo {
     n_reserved: u32,
     /// Number of handles holding a PENDING lock.
     n_pending: u32,
+    /// Number of interrupted SHARED acquisitions that still retain their
+    /// transient read lock on SQLite's PENDING byte.
+    ///
+    /// This is distinct from `n_pending`: those claims are write locks in the
+    /// ordinary five-level ladder. Keeping the transient claim visible
+    /// prevents another handle from treating an unresolved acquisition as an
+    /// unlocked inode and closing a descriptor that would erase the process'
+    /// record locks.
+    n_transient_shared_pending: u32,
     /// Number of handles holding an EXCLUSIVE lock.
     n_exclusive: u32,
     /// Extra descriptors opened by racing/repeated opens while this process
@@ -581,13 +590,18 @@ impl InodeInfo {
             n_shared: 0,
             n_reserved: 0,
             n_pending: 0,
+            n_transient_shared_pending: 0,
             n_exclusive: 0,
             deferred_close_files: Vec::new(),
         }
     }
 
     fn has_lock_claims(&self) -> bool {
-        self.n_shared != 0 || self.n_reserved != 0 || self.n_pending != 0 || self.n_exclusive != 0
+        self.n_shared != 0
+            || self.n_reserved != 0
+            || self.n_pending != 0
+            || self.n_transient_shared_pending != 0
+            || self.n_exclusive != 0
     }
 
     /// Close redundant descriptors only while the inode mutex proves that no
@@ -967,6 +981,8 @@ impl Vfs for UnixVfs {
         path: Option<&Path>,
         flags: VfsOpenFlags,
     ) -> Result<(Self::File, VfsOpenFlags)> {
+        retry_deferred_unix_cleanups();
+
         let is_temp = path.is_none();
         let delete_on_close = flags.contains(VfsOpenFlags::DELETEONCLOSE) || is_temp;
         let resolved = if let Some(p) = path {
@@ -1044,6 +1060,9 @@ impl Vfs for UnixVfs {
             file: Some(file),
             path: resolved,
             lock_level: LockLevel::None,
+            transient_shared_pending_gate: false,
+            external_shared_snapshot_attempt: None,
+            external_maintenance_attempt: None,
             delete_on_close,
             closed: false,
             inode_key,
@@ -1170,12 +1189,50 @@ fn inode_key_from_file(file: &File) -> Result<InodeKey> {
 // UnixFile
 // ---------------------------------------------------------------------------
 
+/// Armed baseline for one external shared-snapshot acquisition attempt.
+#[derive(Debug, Clone, Copy)]
+struct UnixExternalSharedSnapshotAttempt {
+    prior_main_level: LockLevel,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnixExternalMaintenanceAttempt {
+    prior_main_level: LockLevel,
+    main_restore_pending: bool,
+    wal_mode: bool,
+    /// Bit `slot` is set only when this attempt newly acquired that WAL slot.
+    newly_acquired_wal_slots: u8,
+}
+
+impl UnixExternalMaintenanceAttempt {
+    const fn acquired_slot(self, slot: u32) -> bool {
+        self.newly_acquired_wal_slots & (1_u8 << slot) != 0
+    }
+
+    const fn record_acquired_slot(&mut self, slot: u32) {
+        self.newly_acquired_wal_slots |= 1_u8 << slot;
+    }
+
+    const fn record_released_slot(&mut self, slot: u32) {
+        self.newly_acquired_wal_slots &= !(1_u8 << slot);
+    }
+}
+
 /// A file handle opened by [`UnixVfs`].
 #[derive(Debug)]
 pub struct UnixFile {
     file: Option<Arc<File>>,
     path: PathBuf,
     lock_level: LockLevel,
+    /// A transient SHARED-acquisition read lock on SQLite's PENDING byte.
+    ///
+    /// This remains armed until the raw unlock succeeds. It is deliberately
+    /// separate from `lock_level`, because an interrupted attempt can retain
+    /// this one byte while holding either no complete main-lock prefix or a
+    /// complete SHARED prefix.
+    transient_shared_pending_gate: bool,
+    external_shared_snapshot_attempt: Option<UnixExternalSharedSnapshotAttempt>,
+    external_maintenance_attempt: Option<UnixExternalMaintenanceAttempt>,
     delete_on_close: bool,
     closed: bool,
     inode_key: InodeKey,
@@ -1209,6 +1266,154 @@ impl UnixFile {
             .expect("open UnixFile must retain its inode state")
     }
 
+    fn release_transient_shared_pending_gate_state(
+        info: &mut InodeInfo,
+        transient_shared_pending_gate: &mut bool,
+    ) -> Result<()> {
+        if !*transient_shared_pending_gate {
+            return Ok(());
+        }
+        if info.n_transient_shared_pending == 0 {
+            return Err(FrankenError::internal(
+                "Unix SHARED acquisition owns a transient PENDING gate without an inode claim",
+            ));
+        }
+
+        // Raw first, state second. If another coalesced transient claim or a
+        // real PENDING writer remains, its process-wide record lock still
+        // covers this byte and no syscall is needed for this one release.
+        if info.n_transient_shared_pending == 1 && info.n_pending == 0 {
+            posix_unlock(&*info.file, PENDING_BYTE, 1)?;
+        }
+        info.n_transient_shared_pending -= 1;
+        *transient_shared_pending_gate = false;
+        info.close_deferred_files_if_unlocked();
+        Ok(())
+    }
+
+    /// Restore the highest valid main-lock prefix no lower than `target`.
+    ///
+    /// Every raw transition precedes its in-memory publication. A failed raw
+    /// unlock therefore leaves both the handle and the inode counters at the
+    /// last complete prefix, which makes a later retry exact.
+    fn rollback_main_lock_state(
+        info: &mut InodeInfo,
+        lock_level: &mut LockLevel,
+        transient_shared_pending_gate: &mut bool,
+        target: LockLevel,
+    ) -> Result<()> {
+        Self::release_transient_shared_pending_gate_state(info, transient_shared_pending_gate)?;
+
+        if target > *lock_level {
+            return Err(FrankenError::internal(format!(
+                "Unix main-lock restore target {target:?} exceeds retained prefix {lock_level:?}"
+            )));
+        }
+
+        if *lock_level >= LockLevel::Exclusive && target < LockLevel::Exclusive {
+            if info.n_exclusive == 0 {
+                return Err(FrankenError::internal(
+                    "Unix EXCLUSIVE handle has no inode EXCLUSIVE claim",
+                ));
+            }
+            if info.n_exclusive == 1 {
+                if info.n_shared == 0 {
+                    posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
+                } else if !posix_lock(&*info.file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)? {
+                    return Err(FrankenError::Busy);
+                }
+            }
+            info.n_exclusive -= 1;
+            *lock_level = LockLevel::Pending;
+        }
+
+        if *lock_level >= LockLevel::Pending && target < LockLevel::Pending {
+            if info.n_pending == 0 {
+                return Err(FrankenError::internal(
+                    "Unix PENDING handle has no inode PENDING claim",
+                ));
+            }
+            if info.n_pending == 1 {
+                if info.n_transient_shared_pending == 0 {
+                    posix_unlock(&*info.file, PENDING_BYTE, 1)?;
+                } else if !posix_lock(&*info.file, libc::F_RDLCK, PENDING_BYTE, 1)? {
+                    return Err(FrankenError::Busy);
+                }
+            }
+            info.n_pending -= 1;
+            *lock_level = LockLevel::Reserved;
+        }
+
+        if *lock_level >= LockLevel::Reserved && target < LockLevel::Reserved {
+            if info.n_reserved == 0 {
+                return Err(FrankenError::internal(
+                    "Unix RESERVED handle has no inode RESERVED claim",
+                ));
+            }
+            if info.n_reserved == 1 {
+                posix_unlock(&*info.file, RESERVED_BYTE, 1)?;
+            }
+            info.n_reserved -= 1;
+            *lock_level = LockLevel::Shared;
+        }
+
+        if *lock_level >= LockLevel::Shared && target < LockLevel::Shared {
+            if info.n_shared == 0 {
+                return Err(FrankenError::internal(
+                    "Unix SHARED handle has no inode SHARED claim",
+                ));
+            }
+            if info.n_shared == 1 && info.n_exclusive == 0 {
+                posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
+            }
+            info.n_shared -= 1;
+            *lock_level = LockLevel::None;
+        }
+
+        info.close_deferred_files_if_unlocked();
+        Ok(())
+    }
+
+    fn return_after_main_lock_failure(
+        info: &mut InodeInfo,
+        lock_level: &mut LockLevel,
+        transient_shared_pending_gate: &mut bool,
+        prior_level: LockLevel,
+        lock_error: FrankenError,
+    ) -> Result<()> {
+        match Self::rollback_main_lock_state(
+            info,
+            lock_level,
+            transient_shared_pending_gate,
+            prior_level,
+        ) {
+            Ok(()) => Err(lock_error),
+            Err(rollback_error) => Err(FrankenError::internal(format!(
+                "Unix main-lock acquisition failed and retained a retryable partial prefix: lock={lock_error}; rollback={rollback_error}"
+            ))),
+        }
+    }
+
+    fn acquire_external_wal_slot(&mut self, slot: u32) -> Result<bool> {
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.acquire_shm_exclusive_slot(&mut info, slot)
+    }
+
+    fn release_external_wal_slot(&self, slot: u32) -> Result<()> {
+        let shm_info = self.shm_info.as_ref().ok_or_else(|| {
+            FrankenError::internal(format!(
+                "Unix external maintenance retained WAL slot {slot} without SHM state"
+            ))
+        })?;
+        let mut info = shm_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.release_shm_exclusive_slot(&mut info, slot)
+    }
+
     fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<ShmInfo>>> {
         if let Some(info) = &self.shm_info {
             return Ok(Arc::clone(info));
@@ -1221,7 +1426,7 @@ impl UnixFile {
     }
 
     fn release_shm_owner_state(&mut self, delete: bool) -> Result<()> {
-        let Some(info_arc) = self.shm_info.take() else {
+        let Some(info_arc) = self.shm_info.as_ref().map(Arc::clone) else {
             if delete {
                 drop(fs::remove_file(&self.shm_path));
             }
@@ -1342,19 +1547,35 @@ impl UnixFile {
                     }
                 }
 
-                if slot_state
-                    .shared_holders
-                    .remove(&self.shm_owner_id)
-                    .is_some()
-                    && slot_state.exclusive_owner.is_none()
-                    && slot_state.shared_holders.is_empty()
-                {
-                    if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
-                        if first_error.is_none() {
-                            first_error = Some(err);
+                if slot_state.shared_holders.contains_key(&self.shm_owner_id) {
+                    let raw_released = if slot_state.exclusive_owner.is_none()
+                        && slot_state.shared_holders.len() == 1
+                    {
+                        match posix_unlock(&*shm_file, lock_byte, 1) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                if first_error.is_none() {
+                                    first_error = Some(err);
+                                }
+                                false
+                            }
                         }
+                    } else {
+                        true
+                    };
+                    if raw_released {
+                        slot_state.shared_holders.remove(&self.shm_owner_id);
                     }
                 }
+            }
+
+            let error_to_return = first_error;
+            if let Some(err) = error_to_return {
+                // Keep both the handle's SHM pointer and its owner reference
+                // until every raw lock release is terminal. Slots released
+                // earlier in this pass were cleared raw-first/state-second;
+                // failed slots remain represented and are retried exactly.
+                return Err(err);
             }
 
             if let Some(count) = info.owner_refs.get_mut(&self.shm_owner_id) {
@@ -1364,14 +1585,9 @@ impl UnixFile {
                     info.owner_refs.remove(&self.shm_owner_id);
                 }
             }
-
-            let error_to_return = first_error;
-            drop(info);
-            if let Some(err) = error_to_return {
-                return Err(err);
-            }
         }
 
+        self.shm_info = None;
         if delete {
             drop(fs::remove_file(&self.shm_path));
         }
@@ -1435,10 +1651,16 @@ impl UnixFile {
             return Err(FrankenError::Busy);
         }
 
-        *slot_state
+        let next_owner_count = slot_state
             .shared_holders
-            .entry(self.shm_owner_id)
-            .or_insert(0) += 1;
+            .get(&self.shm_owner_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::internal("Unix SHM DMS owner count overflow"))?;
+        slot_state
+            .shared_holders
+            .insert(self.shm_owner_id, next_owner_count);
         lock_debug!(
             slot = SQLITE_SHM_DMS_SLOT,
             lock_byte,
@@ -1455,7 +1677,7 @@ impl UnixFile {
         let slot_idx = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
         let read_marks = info.read_marks();
         let slot_state = &mut info.slots[slot_idx];
-        let Some(holder_count) = slot_state.shared_holders.get_mut(&self.shm_owner_id) else {
+        let Some(holder_count) = slot_state.shared_holders.get(&self.shm_owner_id).copied() else {
             Self::log_lock_conflict(
                 SQLITE_SHM_DMS_SLOT,
                 "unlock-shared",
@@ -1467,14 +1689,20 @@ impl UnixFile {
             });
         };
 
-        if *holder_count > 1 {
-            *holder_count -= 1;
+        // Raw first, state second. A failed unlock retains the exact owner
+        // count for a later retry.
+        if holder_count == 1
+            && slot_state.exclusive_owner.is_none()
+            && slot_state.shared_holders.len() == 1
+        {
+            posix_unlock(&*info.file, lock_byte, 1)?;
+        }
+        if holder_count > 1 {
+            slot_state
+                .shared_holders
+                .insert(self.shm_owner_id, holder_count - 1);
         } else {
             slot_state.shared_holders.remove(&self.shm_owner_id);
-        }
-
-        if slot_state.exclusive_owner.is_none() && slot_state.shared_holders.is_empty() {
-            posix_unlock(&*info.file, lock_byte, 1)?;
         }
 
         lock_debug!(
@@ -1488,7 +1716,9 @@ impl UnixFile {
         Ok(())
     }
 
-    fn acquire_shm_shared_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<()> {
+    /// Acquire one SHM shared claim and report whether this call changed
+    /// ownership. Holding EXCLUSIVE as the same owner is a true no-op.
+    fn acquire_shm_shared_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<bool> {
         let Some(lock_byte) = wal_lock_byte(slot) else {
             error!(slot, "invalid SHM slot for shared lock");
             return Err(FrankenError::LockFailed {
@@ -1510,19 +1740,25 @@ impl UnixFile {
                 return Err(FrankenError::Busy);
             }
             // Same owner already holds exclusive; no extra transition required.
-            return Ok(());
+            return Ok(false);
         }
 
+        let next_owner_count = slot_state
+            .shared_holders
+            .get(&self.shm_owner_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::internal("Unix SHM shared-owner count overflow"))?;
         let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
         if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(slot, "shared", Self::observed_mode(slot_state), read_marks);
             return Err(FrankenError::Busy);
         }
 
-        *slot_state
+        slot_state
             .shared_holders
-            .entry(self.shm_owner_id)
-            .or_insert(0) += 1;
+            .insert(self.shm_owner_id, next_owner_count);
         lock_debug!(
             slot,
             lock_byte,
@@ -1531,10 +1767,11 @@ impl UnixFile {
             ?read_marks,
             "acquired shm shared lock"
         );
-        Ok(())
+        Ok(true)
     }
 
-    fn acquire_shm_exclusive_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<()> {
+    /// Acquire one SHM exclusive slot and report whether ownership changed.
+    fn acquire_shm_exclusive_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<bool> {
         let Some(lock_byte) = wal_lock_byte(slot) else {
             error!(slot, "invalid SHM slot for exclusive lock");
             return Err(FrankenError::LockFailed {
@@ -1546,24 +1783,10 @@ impl UnixFile {
         let slot_state = &mut info.slots[slot_idx];
 
         if slot_state.exclusive_owner == Some(self.shm_owner_id) {
-            if !posix_lock(&*info.file, libc::F_WRLCK, lock_byte, 1)? {
-                Self::log_lock_conflict(
-                    slot,
-                    "exclusive-reassert",
-                    Self::observed_mode(slot_state),
-                    read_marks,
-                );
-                return Err(FrankenError::Busy);
-            }
-            lock_debug!(
-                slot,
-                lock_byte,
-                requested_mode = "exclusive-reassert",
-                observed_mode = Self::observed_mode(slot_state),
-                ?read_marks,
-                "reasserted shm exclusive lock"
-            );
-            return Ok(());
+            // Do not reissue fcntl: external-attempt bookkeeping must be able
+            // to distinguish a pre-existing owner claim from a newly acquired
+            // slot that this attempt is obligated to unwind.
+            return Ok(false);
         }
         if slot_state.exclusive_owner.is_some() {
             Self::log_lock_conflict(
@@ -1611,7 +1834,7 @@ impl UnixFile {
             ?read_marks,
             "acquired shm exclusive lock"
         );
-        Ok(())
+        Ok(true)
     }
 
     fn release_shm_shared_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<()> {
@@ -1624,7 +1847,7 @@ impl UnixFile {
         let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
         let read_marks = info.read_marks();
         let slot_state = &mut info.slots[slot_idx];
-        let Some(holder_count) = slot_state.shared_holders.get_mut(&self.shm_owner_id) else {
+        let Some(holder_count) = slot_state.shared_holders.get(&self.shm_owner_id).copied() else {
             Self::log_lock_conflict(
                 slot,
                 "unlock-shared",
@@ -1639,14 +1862,20 @@ impl UnixFile {
             });
         };
 
-        if *holder_count > 1 {
-            *holder_count -= 1;
+        // Raw first, state second, so an unlock failure preserves the exact
+        // owner claim for the next attempt.
+        if holder_count == 1
+            && slot_state.exclusive_owner.is_none()
+            && slot_state.shared_holders.len() == 1
+        {
+            posix_unlock(&*info.file, lock_byte, 1)?;
+        }
+        if holder_count > 1 {
+            slot_state
+                .shared_holders
+                .insert(self.shm_owner_id, holder_count - 1);
         } else {
             slot_state.shared_holders.remove(&self.shm_owner_id);
-        }
-
-        if slot_state.exclusive_owner.is_none() && slot_state.shared_holders.is_empty() {
-            posix_unlock(&*info.file, lock_byte, 1)?;
         }
 
         lock_debug!(
@@ -1939,6 +2168,67 @@ impl UnixFile {
                 .read_marks()
         })
     }
+
+    /// Move every live close obligation into a process-root-owned handle.
+    ///
+    /// This is used only after `close` failed from `Drop`. The returned handle
+    /// retains the canonical descriptor, inode claim, exact main/SHM lock
+    /// state, external-attempt markers, and delete-on-close obligation. The
+    /// dropped shell is made inert so it cannot consume the sole retry state.
+    fn take_for_deferred_cleanup(&mut self) -> Self {
+        let deferred = Self {
+            file: self.file.take(),
+            path: std::mem::take(&mut self.path),
+            lock_level: self.lock_level,
+            transient_shared_pending_gate: self.transient_shared_pending_gate,
+            external_shared_snapshot_attempt: self.external_shared_snapshot_attempt.take(),
+            external_maintenance_attempt: self.external_maintenance_attempt.take(),
+            delete_on_close: self.delete_on_close,
+            closed: false,
+            inode_key: self.inode_key,
+            inode_info: self.inode_info.take(),
+            shm_owner_id: self.shm_owner_id,
+            shm_path: std::mem::take(&mut self.shm_path),
+            shm_info: self.shm_info.take(),
+            busy_timeout_ms: self.busy_timeout_ms,
+        };
+
+        self.lock_level = LockLevel::None;
+        self.transient_shared_pending_gate = false;
+        self.delete_on_close = false;
+        self.closed = true;
+        deferred
+    }
+}
+
+/// Process-root ownership for Unix handles whose implicit close encountered a
+/// retryable raw-lock failure.
+///
+/// A static queue is intentional: dropping the only canonical descriptor or
+/// owner record after a failed unlock would make the process' published lock
+/// state unrecoverable. No detached task is needed; later opens retry the
+/// queue synchronously, and process exit remains the final OS-level cleanup
+/// boundary if a raw failure is permanent.
+fn deferred_unix_cleanup_queue() -> &'static Mutex<Vec<UnixFile>> {
+    static QUEUE: OnceLock<Mutex<Vec<UnixFile>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn retry_deferred_unix_cleanups() {
+    let cx = Cx::new();
+    let mut queue = deferred_unix_cleanup_queue()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut index = 0;
+    while index < queue.len() {
+        if queue[index].close(&cx).is_ok() {
+            // The removed handle is fully closed, so its Drop may now finish
+            // the canonical inode generation without re-enqueuing itself.
+            drop(queue.swap_remove(index));
+        } else {
+            index += 1;
+        }
+    }
 }
 
 impl VfsFile for UnixFile {
@@ -1947,8 +2237,23 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
-        // Downgrade to no lock before closing.
-        if self.lock_level != LockLevel::None {
+        if self.external_shared_snapshot_attempt.is_some() {
+            self.restore_external_shared_snapshot_attempt(cx)?;
+        }
+        if self.external_maintenance_attempt.is_some() {
+            self.restore_external_maintenance_attempt(cx)?;
+        }
+        if self.external_shared_snapshot_attempt.is_some()
+            || self.external_maintenance_attempt.is_some()
+        {
+            return Err(FrankenError::internal(
+                "Unix close retained an external lock-attempt obligation",
+            ));
+        }
+
+        // Downgrade to no lock before closing. The transient gate is an
+        // independent obligation even when no complete prefix remains.
+        if self.lock_level != LockLevel::None || self.transient_shared_pending_gate {
             self.unlock(cx, LockLevel::None)?;
         }
         self.release_shm_owner_state(self.delete_on_close)?;
@@ -2003,13 +2308,23 @@ impl VfsFile for UnixFile {
         Ok(total)
     }
 
-    fn write<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
+    async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "write")?;
+        let file = Arc::clone(
+            self.file
+                .as_ref()
+                .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+        );
+        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+            write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write")?;
+            return checkpoint_or_abort(cx);
+        }
+        let data = buf.to_vec();
+        spawn_blocking_io(move || write_owned_at(file, data, offset))
+            .await
+            .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)
     }
 
     async fn write_tracked(
@@ -2154,42 +2469,31 @@ impl VfsFile for UnixFile {
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if level <= self.lock_level {
-            return Ok(());
-        }
-
         let timeout = Duration::from_millis(self.busy_timeout_ms);
         let prior_level = self.lock_level;
         let inode_info = Arc::clone(self.inode_info_ref());
         let mut info = inode_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let rollback = |info: &mut InodeInfo, lock_level: &mut LockLevel| -> Result<()> {
-            if *lock_level >= LockLevel::Pending && prior_level < LockLevel::Pending {
-                info.n_pending = info.n_pending.saturating_sub(1);
-                if info.n_pending == 0 {
-                    posix_unlock(&*info.file, PENDING_BYTE, 1)?;
-                }
-            }
 
-            if *lock_level >= LockLevel::Reserved && prior_level < LockLevel::Reserved {
-                info.n_reserved = info.n_reserved.saturating_sub(1);
-                if info.n_reserved == 0 {
-                    posix_unlock(&*info.file, RESERVED_BYTE, 1)?;
-                }
-            }
-
-            if *lock_level >= LockLevel::Shared && prior_level < LockLevel::Shared {
-                info.n_shared = info.n_shared.saturating_sub(1);
-                if info.n_shared == 0 && info.n_exclusive == 0 {
-                    posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
-                }
-            }
-
-            *lock_level = prior_level;
-            info.close_deferred_files_if_unlocked();
-            Ok(())
-        };
+        // A prior SHARED attempt may have completed its main prefix but failed
+        // to release the transient PENDING gate. Retire that obligation before
+        // treating an already-reached level as a no-op.
+        if self.transient_shared_pending_gate && self.lock_level >= LockLevel::Shared {
+            Self::release_transient_shared_pending_gate_state(
+                &mut info,
+                &mut self.transient_shared_pending_gate,
+            )?;
+        }
+        if level <= self.lock_level {
+            return Ok(());
+        }
+        if info.n_transient_shared_pending > 0 && !self.transient_shared_pending_gate {
+            // An unresolved transient PENDING byte is process-wide, not
+            // descriptor-local. Do not let another local handle overwrite its
+            // raw lock type while the owning attempt still needs to retry.
+            return Err(FrankenError::Busy);
+        }
 
         // None -> Shared: acquire F_RDLCK on the shared byte range.
         if self.lock_level < LockLevel::Shared && level >= LockLevel::Shared {
@@ -2199,58 +2503,177 @@ impl VfsFile for UnixFile {
             if info.n_pending > 0 || info.n_exclusive > 0 {
                 return Err(FrankenError::Busy);
             }
+            let Some(next_shared) = info.n_shared.checked_add(1) else {
+                return Self::return_after_main_lock_failure(
+                    &mut info,
+                    &mut self.lock_level,
+                    &mut self.transient_shared_pending_gate,
+                    prior_level,
+                    FrankenError::internal("Unix inode SHARED count overflow"),
+                );
+            };
             if info.n_shared == 0 {
                 // Readers must pass through the PENDING byte so a waiting
                 // writer can block new SHARED acquisitions while upgrading.
-                if !posix_lock_with_timeout(&*info.file, libc::F_RDLCK, PENDING_BYTE, 1, timeout)? {
-                    return Err(FrankenError::Busy);
+                if !self.transient_shared_pending_gate {
+                    let next_transient = info
+                        .n_transient_shared_pending
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            FrankenError::internal(
+                                "Unix inode transient SHARED PENDING count overflow",
+                            )
+                        })?;
+                    match posix_lock_with_timeout(
+                        &*info.file,
+                        libc::F_RDLCK,
+                        PENDING_BYTE,
+                        1,
+                        timeout,
+                    ) {
+                        Ok(true) => {
+                            info.n_transient_shared_pending = next_transient;
+                            self.transient_shared_pending_gate = true;
+                        }
+                        Ok(false) => return Err(FrankenError::Busy),
+                        Err(error) => return Err(error),
+                    }
                 }
-                let shared_locked = posix_lock_with_timeout(
+
+                let shared_result = posix_lock_with_timeout(
                     &*info.file,
                     libc::F_RDLCK,
                     SHARED_FIRST,
                     SHARED_SIZE,
                     timeout,
-                )?;
-                let pending_unlock = posix_unlock(&*info.file, PENDING_BYTE, 1);
-                if !shared_locked {
-                    pending_unlock?;
-                    return Err(FrankenError::Busy);
-                }
-                if let Err(err) = pending_unlock {
-                    posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
-                    return Err(err);
+                );
+                match shared_result {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Self::return_after_main_lock_failure(
+                            &mut info,
+                            &mut self.lock_level,
+                            &mut self.transient_shared_pending_gate,
+                            prior_level,
+                            FrankenError::Busy,
+                        );
+                    }
+                    Err(error) => {
+                        return Self::return_after_main_lock_failure(
+                            &mut info,
+                            &mut self.lock_level,
+                            &mut self.transient_shared_pending_gate,
+                            prior_level,
+                            error,
+                        );
+                    }
                 }
             }
-            info.n_shared += 1;
+            info.n_shared = next_shared;
             self.lock_level = LockLevel::Shared;
+            if let Err(error) = Self::release_transient_shared_pending_gate_state(
+                &mut info,
+                &mut self.transient_shared_pending_gate,
+            ) {
+                return Self::return_after_main_lock_failure(
+                    &mut info,
+                    &mut self.lock_level,
+                    &mut self.transient_shared_pending_gate,
+                    prior_level,
+                    error,
+                );
+            }
         }
 
         // Shared -> Reserved: acquire F_WRLCK on the reserved byte.
         if self.lock_level < LockLevel::Reserved && level >= LockLevel::Reserved {
             if info.n_reserved > 0 {
                 // Another handle in this process already holds RESERVED.
-                rollback(&mut info, &mut self.lock_level)?;
-                return Err(FrankenError::Busy);
+                return Self::return_after_main_lock_failure(
+                    &mut info,
+                    &mut self.lock_level,
+                    &mut self.transient_shared_pending_gate,
+                    prior_level,
+                    FrankenError::Busy,
+                );
             }
-            if !posix_lock_with_timeout(&*info.file, libc::F_WRLCK, RESERVED_BYTE, 1, timeout)? {
-                rollback(&mut info, &mut self.lock_level)?;
-                return Err(FrankenError::Busy);
+            let Some(next_reserved) = info.n_reserved.checked_add(1) else {
+                return Self::return_after_main_lock_failure(
+                    &mut info,
+                    &mut self.lock_level,
+                    &mut self.transient_shared_pending_gate,
+                    prior_level,
+                    FrankenError::internal("Unix inode RESERVED count overflow"),
+                );
+            };
+            match posix_lock_with_timeout(&*info.file, libc::F_WRLCK, RESERVED_BYTE, 1, timeout) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Self::return_after_main_lock_failure(
+                        &mut info,
+                        &mut self.lock_level,
+                        &mut self.transient_shared_pending_gate,
+                        prior_level,
+                        FrankenError::Busy,
+                    );
+                }
+                Err(error) => {
+                    return Self::return_after_main_lock_failure(
+                        &mut info,
+                        &mut self.lock_level,
+                        &mut self.transient_shared_pending_gate,
+                        prior_level,
+                        error,
+                    );
+                }
             }
-            info.n_reserved += 1;
+            info.n_reserved = next_reserved;
             self.lock_level = LockLevel::Reserved;
         }
 
         // Reserved -> Pending: acquire F_WRLCK on the pending byte.
         // This blocks new shared-lock acquisitions from other processes.
         if self.lock_level < LockLevel::Pending && level >= LockLevel::Pending {
-            if info.n_pending == 0
-                && !posix_lock_with_timeout(&*info.file, libc::F_WRLCK, PENDING_BYTE, 1, timeout)?
-            {
-                rollback(&mut info, &mut self.lock_level)?;
-                return Err(FrankenError::Busy);
+            if info.n_pending > 0 {
+                return Self::return_after_main_lock_failure(
+                    &mut info,
+                    &mut self.lock_level,
+                    &mut self.transient_shared_pending_gate,
+                    prior_level,
+                    FrankenError::Busy,
+                );
             }
-            info.n_pending += 1;
+            let Some(next_pending) = info.n_pending.checked_add(1) else {
+                return Self::return_after_main_lock_failure(
+                    &mut info,
+                    &mut self.lock_level,
+                    &mut self.transient_shared_pending_gate,
+                    prior_level,
+                    FrankenError::internal("Unix inode PENDING count overflow"),
+                );
+            };
+            match posix_lock_with_timeout(&*info.file, libc::F_WRLCK, PENDING_BYTE, 1, timeout) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Self::return_after_main_lock_failure(
+                        &mut info,
+                        &mut self.lock_level,
+                        &mut self.transient_shared_pending_gate,
+                        prior_level,
+                        FrankenError::Busy,
+                    );
+                }
+                Err(error) => {
+                    return Self::return_after_main_lock_failure(
+                        &mut info,
+                        &mut self.lock_level,
+                        &mut self.transient_shared_pending_gate,
+                        prior_level,
+                        error,
+                    );
+                }
+            }
+            info.n_pending = next_pending;
             self.lock_level = LockLevel::Pending;
         }
 
@@ -2262,21 +2685,52 @@ impl VfsFile for UnixFile {
             // single owner, so it would happily grant WRLCK even while another
             // local handle still has a SHARED claim. Refuse that false upgrade
             // and unwind PENDING (plus any levels acquired by this request).
-            if info.n_shared > 1 {
-                rollback(&mut info, &mut self.lock_level)?;
-                return Err(FrankenError::Busy);
+            if info.n_shared > 1 || info.n_exclusive > 0 {
+                return Self::return_after_main_lock_failure(
+                    &mut info,
+                    &mut self.lock_level,
+                    &mut self.transient_shared_pending_gate,
+                    prior_level,
+                    FrankenError::Busy,
+                );
             }
-            if !posix_lock_with_timeout(
+            let Some(next_exclusive) = info.n_exclusive.checked_add(1) else {
+                return Self::return_after_main_lock_failure(
+                    &mut info,
+                    &mut self.lock_level,
+                    &mut self.transient_shared_pending_gate,
+                    prior_level,
+                    FrankenError::internal("Unix inode EXCLUSIVE count overflow"),
+                );
+            };
+            match posix_lock_with_timeout(
                 &*info.file,
                 libc::F_WRLCK,
                 SHARED_FIRST,
                 SHARED_SIZE,
                 timeout,
-            )? {
-                rollback(&mut info, &mut self.lock_level)?;
-                return Err(FrankenError::Busy);
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Self::return_after_main_lock_failure(
+                        &mut info,
+                        &mut self.lock_level,
+                        &mut self.transient_shared_pending_gate,
+                        prior_level,
+                        FrankenError::Busy,
+                    );
+                }
+                Err(error) => {
+                    return Self::return_after_main_lock_failure(
+                        &mut info,
+                        &mut self.lock_level,
+                        &mut self.transient_shared_pending_gate,
+                        prior_level,
+                        error,
+                    );
+                }
             }
-            info.n_exclusive += 1;
+            info.n_exclusive = next_exclusive;
             self.lock_level = LockLevel::Exclusive;
         }
 
@@ -2284,7 +2738,7 @@ impl VfsFile for UnixFile {
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if level >= self.lock_level {
+        if level >= self.lock_level && !self.transient_shared_pending_gate {
             return Ok(());
         }
 
@@ -2292,43 +2746,160 @@ impl VfsFile for UnixFile {
         let mut info = inode_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let target = level.min(self.lock_level);
+        Self::rollback_main_lock_state(
+            &mut info,
+            &mut self.lock_level,
+            &mut self.transient_shared_pending_gate,
+            target,
+        )
+    }
 
-        // Exclusive -> (Shared or lower): downgrade exclusive on shared range.
-        if self.lock_level >= LockLevel::Exclusive && level < LockLevel::Exclusive {
-            info.n_exclusive = info.n_exclusive.saturating_sub(1);
-            if info.n_exclusive == 0 && info.n_shared > 0 {
-                // Other handles still hold shared -- downgrade the OS lock back
-                // to a read lock on the shared range.
-                let _ = posix_lock(&*info.file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        if self.external_shared_snapshot_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "Unix external shared-snapshot attempt is already armed",
+            ));
+        }
+        if self.external_maintenance_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire a Unix shared-snapshot fence during external maintenance",
+            ));
+        }
+
+        // Arm the exact prior baseline before the first raw side effect.
+        self.external_shared_snapshot_attempt = Some(UnixExternalSharedSnapshotAttempt {
+            prior_main_level: self.lock_level,
+        });
+        self.lock(cx, LockLevel::Shared)
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        let Some(attempt) = self.external_shared_snapshot_attempt else {
+            return Ok(());
+        };
+        let inode_info = Arc::clone(self.inode_info_ref());
+        let mut info = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::rollback_main_lock_state(
+            &mut info,
+            &mut self.lock_level,
+            &mut self.transient_shared_pending_gate,
+            attempt.prior_main_level,
+        )?;
+        self.external_shared_snapshot_attempt = None;
+        Ok(())
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        if self.external_shared_snapshot_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire Unix external maintenance during a shared-snapshot attempt",
+            ));
+        }
+        if self.external_maintenance_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "Unix external maintenance attempt is already armed",
+            ));
+        }
+
+        // The marker must exist before opening SHM or touching any raw lock.
+        self.external_maintenance_attempt = Some(UnixExternalMaintenanceAttempt {
+            prior_main_level: self.lock_level,
+            main_restore_pending: true,
+            wal_mode,
+            newly_acquired_wal_slots: 0,
+        });
+
+        if wal_mode {
+            for slot in [WAL_WRITE_LOCK, WAL_CKPT_LOCK] {
+                if self.acquire_external_wal_slot(slot)?
+                    && let Some(attempt) = self.external_maintenance_attempt.as_mut()
+                {
+                    attempt.record_acquired_slot(slot);
+                }
             }
         }
 
-        // Pending -> (Reserved or lower): release pending byte.
-        if self.lock_level >= LockLevel::Pending && level < LockLevel::Pending {
-            info.n_pending = info.n_pending.saturating_sub(1);
-            if info.n_pending == 0 {
-                posix_unlock(&*info.file, PENDING_BYTE, 1)?;
+        self.lock(cx, LockLevel::Exclusive)
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        let Some(attempt) = self.external_maintenance_attempt else {
+            return Ok(());
+        };
+        let mut restore_errors = Vec::new();
+
+        // Reverse of acquisition: restore the main-file prefix first, then
+        // CKPT and WRITE. Every still-pending surface is attempted
+        // independently in this pass; successful pieces are removed from the
+        // retained marker immediately.
+        if attempt.main_restore_pending {
+            let inode_info = Arc::clone(self.inode_info_ref());
+            let mut info = inode_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match Self::rollback_main_lock_state(
+                &mut info,
+                &mut self.lock_level,
+                &mut self.transient_shared_pending_gate,
+                attempt.prior_main_level,
+            ) {
+                Ok(()) => {
+                    if let Some(current) = self.external_maintenance_attempt.as_mut() {
+                        current.main_restore_pending = false;
+                    }
+                }
+                Err(error) => restore_errors.push(format!("main lock prefix: {error}")),
             }
         }
 
-        // Reserved -> (Shared or lower): release reserved byte.
-        if self.lock_level >= LockLevel::Reserved && level < LockLevel::Reserved {
-            info.n_reserved = info.n_reserved.saturating_sub(1);
-            if info.n_reserved == 0 {
-                posix_unlock(&*info.file, RESERVED_BYTE, 1)?;
+        if attempt.wal_mode {
+            for slot in [WAL_CKPT_LOCK, WAL_WRITE_LOCK] {
+                let acquired = self
+                    .external_maintenance_attempt
+                    .is_some_and(|current| current.acquired_slot(slot));
+                if !acquired {
+                    continue;
+                }
+                match self.release_external_wal_slot(slot) {
+                    Ok(()) => {
+                        if let Some(current) = self.external_maintenance_attempt.as_mut() {
+                            current.record_released_slot(slot);
+                        }
+                    }
+                    Err(error) => restore_errors.push(format!("WAL slot {slot}: {error}")),
+                }
             }
         }
 
-        // Shared -> None: release shared range.
-        if self.lock_level >= LockLevel::Shared && level < LockLevel::Shared {
-            info.n_shared = info.n_shared.saturating_sub(1);
-            if info.n_shared == 0 && info.n_exclusive == 0 {
-                posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
-            }
+        let all_wal_released = self
+            .external_maintenance_attempt
+            .is_some_and(|current| current.newly_acquired_wal_slots == 0);
+        let main_restored = self
+            .external_maintenance_attempt
+            .is_some_and(|current| !current.main_restore_pending);
+        if restore_errors.is_empty() && main_restored && all_wal_released {
+            self.external_maintenance_attempt = None;
         }
 
-        self.lock_level = level;
-        info.close_deferred_files_if_unlocked();
+        if !restore_errors.is_empty() {
+            return Err(FrankenError::internal(format!(
+                "Unix external maintenance retained retryable surfaces after restore: {}",
+                restore_errors.join(", ")
+            )));
+        }
+        if !all_wal_released {
+            return Err(FrankenError::internal(
+                "Unix external maintenance retained WAL ownership without a recorded release error",
+            ));
+        }
+        if !main_restored {
+            return Err(FrankenError::internal(
+                "Unix external maintenance retained its main-lock obligation without a recorded release error",
+            ));
+        }
         Ok(())
     }
 
@@ -2495,14 +3066,29 @@ impl VfsFile for UnixFile {
                     self.acquire_shm_shared_slot(&mut info, slot)
                 };
                 match result {
-                    Ok(()) => acquired.push(slot),
+                    Ok(true) => acquired.push(slot),
+                    Ok(false) => {}
                     Err(err) => {
+                        let mut rollback_errors = Vec::new();
                         for acquired_slot in acquired.into_iter().rev() {
-                            if exclusive_mode {
-                                let _ = self.release_shm_exclusive_slot(&mut info, acquired_slot);
+                            let release_result = if exclusive_mode {
+                                self.release_shm_exclusive_slot(&mut info, acquired_slot)
                             } else {
-                                let _ = self.release_shm_shared_slot(&mut info, acquired_slot);
+                                self.release_shm_shared_slot(&mut info, acquired_slot)
+                            };
+                            if let Err(release_error) = release_result {
+                                // The slot helper is raw-first/state-second, so
+                                // a failed unwind remains represented in the
+                                // owner table for close or an explicit retry.
+                                rollback_errors
+                                    .push(format!("slot {acquired_slot}: {release_error}"));
                             }
+                        }
+                        if !rollback_errors.is_empty() {
+                            return Err(FrankenError::internal(format!(
+                                "Unix SHM range acquisition failed and retained retryable slots: lock={err}; rollback={}",
+                                rollback_errors.join(", ")
+                            )));
                         }
                         return Err(err);
                     }
@@ -2570,7 +3156,19 @@ impl Drop for UnixFile {
     fn drop(&mut self) {
         if !self.closed {
             let cx = Cx::new();
-            let _ = self.close(&cx);
+            if let Err(error) = self.close(&cx) {
+                warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "Unix implicit close retained its exact cleanup state for process-root retry"
+                );
+                let deferred = self.take_for_deferred_cleanup();
+                deferred_unix_cleanup_queue()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(deferred);
+                return;
+            }
         }
 
         if let (Some(inode_info), Some(file)) = (self.inode_info.take(), self.file.take()) {
@@ -2796,6 +3394,268 @@ mod tests {
         late_reader.close(&cx).expect("close late reader");
         writer.close(&cx).expect("close writer");
         reader.close(&cx).expect("close reader");
+    }
+
+    #[test]
+    fn external_snapshot_restore_is_exact_before_after_and_across_retries() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("external-snapshot-attempt.db");
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open database");
+
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("pre-acquisition restore is a no-op");
+        file.lock_external_shared_snapshot(&cx)
+            .expect("acquire external snapshot");
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        assert!(!file.transient_shared_pending_gate);
+        assert_eq!(
+            file.inode_info_ref()
+                .lock()
+                .expect("inode state")
+                .n_transient_shared_pending,
+            0
+        );
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("restore newly acquired SHARED");
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert!(file.external_shared_snapshot_attempt.is_none());
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("double restore is a no-op");
+
+        file.lock(&cx, LockLevel::Shared)
+            .expect("establish prior SHARED baseline");
+        file.lock_external_shared_snapshot(&cx)
+            .expect("snapshot over pre-existing SHARED");
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("restore exact pre-existing baseline");
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        file.unlock(&cx, LockLevel::None).expect("release baseline");
+        file.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn external_maintenance_restores_only_wal_slots_newly_acquired_by_attempt() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("external-maintenance-preowned-wal.db");
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open database");
+
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("pre-acquire WRITE");
+        file.lock_external_maintenance(&cx, true)
+            .expect("acquire maintenance");
+        let attempt = file
+            .external_maintenance_attempt
+            .expect("maintenance marker");
+        assert!(!attempt.acquired_slot(WAL_WRITE_LOCK));
+        assert!(attempt.acquired_slot(WAL_CKPT_LOCK));
+
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("restore the exact surfaces recorded by the attempt");
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert!(file.external_maintenance_attempt.is_none());
+        {
+            let info = file
+                .shm_info
+                .as_ref()
+                .expect("SHM state")
+                .lock()
+                .expect("SHM state lock");
+            assert_eq!(
+                info.slots[usize::try_from(WAL_WRITE_LOCK).expect("slot")].exclusive_owner,
+                Some(file.shm_owner_id)
+            );
+            assert_eq!(
+                info.slots[usize::try_from(WAL_CKPT_LOCK).expect("slot")].exclusive_owner,
+                None
+            );
+        }
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("repeated restore is a no-op");
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("release pre-existing WRITE");
+        file.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn failed_maintenance_acquisition_retains_and_restores_exact_partial_wal_set() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("external-maintenance-partial-wal.db");
+        let (mut attempt_file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open attempt file");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut blocker, _) = vfs.open(&cx, Some(&path), flags).expect("open blocker");
+
+        blocker
+            .shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .expect("block CKPT");
+        assert!(matches!(
+            attempt_file.lock_external_maintenance(&cx, true),
+            Err(FrankenError::Busy)
+        ));
+        let attempt = attempt_file
+            .external_maintenance_attempt
+            .expect("partial attempt marker");
+        assert!(attempt.acquired_slot(WAL_WRITE_LOCK));
+        assert!(!attempt.acquired_slot(WAL_CKPT_LOCK));
+        assert_eq!(attempt_file.lock_level, LockLevel::None);
+
+        attempt_file
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore partial attempt");
+        assert!(attempt_file.external_maintenance_attempt.is_none());
+        {
+            let info = blocker
+                .shm_info
+                .as_ref()
+                .expect("SHM state")
+                .lock()
+                .expect("SHM state lock");
+            assert_eq!(
+                info.slots[usize::try_from(WAL_WRITE_LOCK).expect("slot")].exclusive_owner,
+                None
+            );
+            assert_eq!(
+                info.slots[usize::try_from(WAL_CKPT_LOCK).expect("slot")].exclusive_owner,
+                Some(blocker.shm_owner_id)
+            );
+        }
+
+        blocker
+            .shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .expect("release blocker");
+        blocker.close(&cx).expect("close blocker");
+        attempt_file.close(&cx).expect("close attempt");
+    }
+
+    #[test]
+    fn maintenance_restore_releases_wal_surfaces_when_main_restore_fails() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("external-maintenance-main-retry.db");
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open database");
+
+        file.lock(&cx, LockLevel::Shared)
+            .expect("establish prior main-lock baseline");
+        file.lock_external_maintenance(&cx, true)
+            .expect("acquire every maintenance surface");
+        assert_eq!(file.lock_level, LockLevel::Exclusive);
+
+        // Exercise the failure scheduler without a syscall fault injector:
+        // make the retained target temporarily exceed the published prefix.
+        // The inode counters and raw main locks are left untouched and
+        // restored below, so this isolates independent surface cleanup.
+        file.lock_level = LockLevel::None;
+        assert!(file.restore_external_maintenance_attempt(&cx).is_err());
+        let retained = file
+            .external_maintenance_attempt
+            .expect("failed main surface remains armed");
+        assert!(retained.main_restore_pending);
+        assert_eq!(
+            retained.newly_acquired_wal_slots, 0,
+            "CKPT and WRITE must restore independently of the main failure"
+        );
+        {
+            let info = file
+                .shm_info
+                .as_ref()
+                .expect("SHM state")
+                .lock()
+                .expect("SHM state lock");
+            for slot in [WAL_CKPT_LOCK, WAL_WRITE_LOCK] {
+                assert_eq!(
+                    info.slots[usize::try_from(slot).expect("slot")].exclusive_owner,
+                    None
+                );
+            }
+        }
+
+        file.lock_level = LockLevel::Exclusive;
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("retry restores the sole retained main surface");
+        assert!(file.external_maintenance_attempt.is_none());
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        file.unlock(&cx, LockLevel::None)
+            .expect("release prior main-lock baseline");
+        file.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn deferred_cleanup_transfer_preserves_every_live_lock_obligation() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("deferred-cleanup-owner.db");
+        let (mut dropped_shell, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open database");
+
+        dropped_shell
+            .lock_external_maintenance(&cx, true)
+            .expect("acquire every maintenance surface");
+        let owner_id = dropped_shell.shm_owner_id;
+        let inode_info = Arc::clone(dropped_shell.inode_info_ref());
+        let shm_info = dropped_shell
+            .shm_info
+            .as_ref()
+            .map(Arc::clone)
+            .expect("maintenance SHM state");
+
+        let mut deferred = dropped_shell.take_for_deferred_cleanup();
+        assert!(dropped_shell.closed);
+        assert!(dropped_shell.file.is_none());
+        assert!(dropped_shell.inode_info.is_none());
+        assert!(dropped_shell.shm_info.is_none());
+        assert_eq!(deferred.lock_level, LockLevel::Exclusive);
+        assert!(deferred.external_maintenance_attempt.is_some());
+
+        deferred
+            .close(&cx)
+            .expect("process-root owner retries all cleanup to terminal");
+        assert!(deferred.closed);
+        assert!(deferred.external_maintenance_attempt.is_none());
+        assert!(deferred.shm_info.is_none());
+        {
+            let info = shm_info.lock().expect("SHM state");
+            assert!(!info.owner_refs.contains_key(&owner_id));
+            assert!(info.slots.iter().all(|slot| {
+                slot.exclusive_owner != Some(owner_id)
+                    && !slot.shared_holders.contains_key(&owner_id)
+            }));
+        }
+        {
+            let info = inode_info.lock().expect("inode state");
+            assert_eq!(info.n_ref, 0);
+            assert!(!info.has_lock_claims());
+        }
     }
 
     fn assert_invalid_input_error(err: FrankenError, expected_detail: &str) {

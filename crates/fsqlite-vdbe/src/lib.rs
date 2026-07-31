@@ -14,9 +14,11 @@
 use hashbrown::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+use fsqlite_types::opcode::{
+    Opcode, P4, SORTER_COMPARE_TOP_N_PREFLIGHT, SORTER_OPEN_TOP_N_REGISTER, VdbeOp,
+};
+use fsqlite_types::sync_primitives::Instant;
 use std::sync::Arc;
-use std::time::Instant;
 
 pub mod codegen;
 pub mod dataflow;
@@ -304,6 +306,20 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
         }
         Opcode::If | Opcode::IfNot | Opcode::IsNull | Opcode::NotNull | Opcode::IsTrue => {
             let (read_start, read_len) = register_range(op.p1, 1);
+            (read_start, read_len, -1, 0)
+        }
+        Opcode::SorterCompare => {
+            let (read_start, read_len) = register_range(op.p3, 1);
+            let (write_start, write_len) =
+                if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 {
+                    (read_start, read_len)
+                } else {
+                    (-1, 0)
+                };
+            (read_start, read_len, write_start, write_len)
+        }
+        Opcode::SorterOpen if (op.p5 & SORTER_OPEN_TOP_N_REGISTER) != 0 => {
+            let (read_start, read_len) = register_range(op.p3, 1);
             (read_start, read_len, -1, 0)
         }
         Opcode::MakeRecord => {
@@ -2665,6 +2681,88 @@ mod tests {
             program.register_count(),
             9,
             "SQLITE_STOREP2 comparisons must reserve the destination register in the pre-sized register file",
+        );
+    }
+
+    #[test]
+    fn test_program_builder_tracks_sorter_preflight_and_runtime_bound_registers() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(
+            Opcode::SorterOpen,
+            0,
+            1,
+            8,
+            P4::None,
+            SORTER_OPEN_TOP_N_REGISTER,
+        );
+        builder.emit_op(
+            Opcode::SorterCompare,
+            0,
+            2,
+            7,
+            P4::None,
+            fsqlite_types::opcode::SORTER_COMPARE_TOP_N_PREFLIGHT,
+        );
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let program = builder.finish().expect("program should build");
+        assert_eq!(
+            program.register_count(),
+            8,
+            "runtime SorterOpen.p3 and SorterCompare.p3 must contribute to register sizing"
+        );
+    }
+
+    #[test]
+    fn test_sorter_compare_register_spans_distinguish_preflight_consumption() {
+        let ordinary = VdbeOp {
+            opcode: Opcode::SorterCompare,
+            p1: 0,
+            p2: 1,
+            p3: 7,
+            p4: P4::None,
+            p5: 0,
+        };
+        let ordinary_spans = opcode_register_spans(&ordinary);
+        let preflight = VdbeOp {
+            p5: SORTER_COMPARE_TOP_N_PREFLIGHT,
+            ..ordinary
+        };
+        let preflight_spans = opcode_register_spans(&preflight);
+
+        assert_eq!(
+            ordinary_spans,
+            OpcodeRegisterSpans {
+                read_start: 7,
+                read_len: 1,
+                write_start: -1,
+                write_len: 0,
+            },
+            "ordinary SorterCompare must leave P3 read-only"
+        );
+        assert_eq!(
+            preflight_spans,
+            OpcodeRegisterSpans {
+                read_start: 7,
+                read_len: 1,
+                write_start: 7,
+                write_len: 1,
+            },
+            "top-N preflight must model P3 as consumed"
+        );
+    }
+
+    #[test]
+    fn test_program_builder_does_not_treat_immediate_sorter_bound_as_register() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::SorterOpen, 0, 1, 500, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let program = builder.finish().expect("program should build");
+        assert_eq!(
+            program.register_count(),
+            0,
+            "legacy immediate SorterOpen.p3 is not a register operand"
         );
     }
 

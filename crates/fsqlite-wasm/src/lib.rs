@@ -2123,6 +2123,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_sql_reports_missing_statement_separator() {
+        let (stmts, errors) = parse_sql("SELECT 1 SELECT 2");
+        assert_eq!(
+            stmts.len(),
+            2,
+            "recovery should retain both independently valid statements"
+        );
+        assert_eq!(errors.len(), 1, "the missing separator must be reported");
+        assert!(
+            errors[0].message.contains("expected ';' separator"),
+            "unexpected diagnostic: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
     fn core_connection_roundtrip_for_wasm_wrapper() {
         asupersync::test_utils::run_test(|| async {
             let _guard = host_connection_test_guard();

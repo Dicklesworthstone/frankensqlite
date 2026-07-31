@@ -10,7 +10,6 @@
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::time::Instant;
 
 use smallvec::SmallVec;
 
@@ -29,6 +28,7 @@ use crate::serial_type::{
     serial_type_for_blob, serial_type_for_integer, serial_type_for_text, serial_type_len,
     varint_len, write_varint,
 };
+use crate::sync_primitives::Instant;
 use crate::value::{SqliteValue, pool_acquire, pool_return_reusable};
 
 static FSQLITE_RECORD_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);

@@ -6,6 +6,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use crate::*;
+use smallvec::SmallVec;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -236,60 +237,164 @@ pub fn write_qualified_name(
     write_ident(f, &name.name)
 }
 
-/// Write an expression appearing as the operand of an enclosing operator,
-/// wrapping it in parentheses unless it is self-delimiting.
-///
-/// An expression is self-delimiting when its rendering is bounded by fixed
-/// tokens that no adjacent operator can capture on re-parse (literals,
-/// identifiers, `CAST(...)`, `CASE ... END`, `(...)`-bracketed forms, ...).
-/// Every operator-bearing form — binary/unary operators, postfix
-/// `IS [NOT] NULL` / `COLLATE`, `BETWEEN` / `IN` / `LIKE`, JSON `->` / `->>`
-/// — must be parenthesized: otherwise precedence and associativity can
-/// regroup the expression when the rendered text is re-parsed. For example
-/// `(a IS NULL) = (b IS NULL)` rendered without parentheses is
-/// `a IS NULL = b IS NULL`, which re-parses as `((a IS NULL) = b) IS NULL`
-/// because the null-test and comparison operators share one left-associative
-/// precedence level in SQLite — a semantically different expression.
-/// Parenthesizing also prevents operator merging (e.g. `--x`, which would
-/// lex as a line comment).
-fn operand_needs_parentheses(expr: &crate::Expr) -> bool {
-    match expr {
-        // Operator-bearing forms: never safe to embed bare in an operand
-        // position; precedence on re-parse could regroup them.
-        crate::Expr::BinaryOp { .. }
-        | crate::Expr::UnaryOp { .. }
-        | crate::Expr::Between { .. }
-        | crate::Expr::In { .. }
-        | crate::Expr::Like { .. }
-        | crate::Expr::Collate { .. }
-        | crate::Expr::IsNull { .. }
-        | crate::Expr::JsonAccess { .. } => true,
-        // `NOT EXISTS (...)` starts with the low-precedence prefix operator
-        // NOT; plain `EXISTS (...)` is self-delimiting.
-        crate::Expr::Exists { not, .. } => *not,
-        // Self-delimiting forms.
-        crate::Expr::Literal(crate::Literal::Integer(value), _) => *value < 0,
-        crate::Expr::Literal(crate::Literal::Float(value), _) => value.is_sign_negative(),
-        crate::Expr::Literal(..)
-        | crate::Expr::Column(..)
-        | crate::Expr::Case { .. }
-        | crate::Expr::Cast { .. }
-        | crate::Expr::Subquery(..)
-        | crate::Expr::FunctionCall { .. }
-        | crate::Expr::Raise { .. }
-        | crate::Expr::RowValue(..)
-        | crate::Expr::Placeholder(..) => false,
+const PREC_OR: u8 = 1;
+const PREC_AND: u8 = 3;
+const PREC_NOT: u8 = 5;
+const PREC_EQUALITY: u8 = 7;
+const PREC_COMPARISON: u8 = 9;
+const PREC_ESCAPE: u8 = 11;
+const PREC_BITWISE: u8 = 13;
+const PREC_ADD: u8 = 15;
+const PREC_MULTIPLY: u8 = 17;
+const PREC_CONCAT: u8 = 19;
+const PREC_COLLATE: u8 = 21;
+const PREC_UNARY: u8 = 23;
+const PREC_ATOM: u8 = u8::MAX;
+
+#[derive(Clone, Copy)]
+enum ExprParent {
+    Binary(BinaryOp),
+    Unary(UnaryOp),
+    Between,
+    In,
+    Like,
+    Escape,
+    Collate,
+    IsNull,
+    Json,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OperandSide {
+    Left,
+    Right,
+    Prefix,
+}
+
+fn binary_precedence(op: BinaryOp) -> u8 {
+    match op {
+        BinaryOp::Or => PREC_OR,
+        BinaryOp::And => PREC_AND,
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Is | BinaryOp::IsNot => PREC_EQUALITY,
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => PREC_COMPARISON,
+        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
+            PREC_BITWISE
+        }
+        BinaryOp::Add | BinaryOp::Subtract => PREC_ADD,
+        BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo => PREC_MULTIPLY,
+        BinaryOp::Concat => PREC_CONCAT,
     }
+}
+
+fn parent_precedence(parent: ExprParent) -> u8 {
+    match parent {
+        ExprParent::Binary(op) => binary_precedence(op),
+        ExprParent::Unary(UnaryOp::Not) => PREC_NOT,
+        ExprParent::Unary(_) => PREC_UNARY,
+        ExprParent::Between | ExprParent::In | ExprParent::Like | ExprParent::IsNull => {
+            PREC_EQUALITY
+        }
+        ExprParent::Escape => PREC_ESCAPE,
+        ExprParent::Collate => PREC_COLLATE,
+        ExprParent::Json => PREC_CONCAT,
+    }
+}
+
+fn expr_precedence(expr: &Expr) -> u8 {
+    match expr {
+        Expr::BinaryOp { op, .. } => binary_precedence(*op),
+        Expr::UnaryOp {
+            op: UnaryOp::Not, ..
+        }
+        | Expr::Exists { not: true, .. } => PREC_NOT,
+        Expr::UnaryOp { .. } => PREC_UNARY,
+        Expr::Literal(Literal::Integer(value), _) if *value < 0 => PREC_UNARY,
+        Expr::Literal(Literal::Float(value), _) if !value.is_nan() && value.is_sign_negative() => {
+            PREC_UNARY
+        }
+        Expr::Between { .. } | Expr::In { .. } | Expr::Like { .. } | Expr::IsNull { .. } => {
+            PREC_EQUALITY
+        }
+        Expr::JsonAccess { .. } => PREC_CONCAT,
+        Expr::Collate { .. } => PREC_COLLATE,
+        Expr::Literal(..)
+        | Expr::Column(..)
+        | Expr::Case { .. }
+        | Expr::Cast { .. }
+        | Expr::Exists { .. }
+        | Expr::Subquery(..)
+        | Expr::FunctionCall { .. }
+        | Expr::Raise { .. }
+        | Expr::RowValue(..)
+        | Expr::Placeholder(..) => PREC_ATOM,
+    }
+}
+
+/// Decide whether an operator child needs grouping in its exact parent
+/// context. SQLite's infix operators are left-associative: an equal-precedence
+/// left child is already grouped correctly, while an equal-precedence right
+/// child must normally stay parenthesized. AND and OR are the only right-side
+/// exceptions because their associative chains have a deliberately flat
+/// canonical form.
+fn operand_needs_parentheses(expr: &Expr, parent: ExprParent, side: OperandSide) -> bool {
+    let child_precedence = expr_precedence(expr);
+    let parent_precedence = parent_precedence(parent);
+    if child_precedence != parent_precedence {
+        return child_precedence < parent_precedence;
+    }
+    if side == OperandSide::Left {
+        return false;
+    }
+    if side == OperandSide::Right {
+        return !matches!(
+            (parent, expr),
+            (
+                ExprParent::Binary(BinaryOp::And),
+                Expr::BinaryOp {
+                    op: BinaryOp::And,
+                    ..
+                }
+            ) | (
+                ExprParent::Binary(BinaryOp::Or),
+                Expr::BinaryOp {
+                    op: BinaryOp::Or,
+                    ..
+                }
+            )
+        );
+    }
+    true
 }
 
 enum ExprWriteTask<'a> {
     Expr(&'a Expr),
-    Operand(&'a Expr),
+    Operand {
+        expr: &'a Expr,
+        parent: ExprParent,
+        side: OperandSide,
+    },
+    Statement(&'a Statement),
+    Select(&'a SelectStatement),
+    SelectBody(&'a SelectBody),
+    With(&'a WithClause),
+    Cte(&'a Cte),
+    SelectCore(&'a SelectCore),
+    ResultColumn(&'a ResultColumn),
+    From(&'a FromClause),
+    Table(&'a TableOrSubquery),
+    Join(&'a JoinClause),
+    JoinConstraint(&'a JoinConstraint),
+    WindowDef(&'a WindowDef),
+    Limit(&'a LimitClause),
+    Update(&'a UpdateStatement),
+    CreateTrigger(&'a CreateTriggerStatement),
     Text(&'static str),
     Ident(&'a str),
     Literal(&'a Literal),
     Column(&'a ColumnRef),
     BinaryOp(&'a BinaryOp),
+    CompoundOp(&'a CompoundOp),
+    JoinType(&'a JoinType),
     UnaryOp(&'a UnaryOp),
     LikeOp(&'a LikeOp),
     TypeName(&'a TypeName),
@@ -302,7 +407,65 @@ enum ExprWriteTask<'a> {
     FrameBound(&'a FrameBound),
 }
 
-fn push_comma_separated_exprs<'a>(tasks: &mut Vec<ExprWriteTask<'a>>, exprs: &'a [Expr]) {
+const INLINE_EXPR_WRITE_TASKS: usize = 32;
+
+struct ExprWriteTaskStack<'a> {
+    tasks: SmallVec<[ExprWriteTask<'a>; INLINE_EXPR_WRITE_TASKS]>,
+    #[cfg(test)]
+    peak_len: usize,
+    #[cfg(test)]
+    ever_spilled: bool,
+}
+
+impl<'a> ExprWriteTaskStack<'a> {
+    fn new(task: ExprWriteTask<'a>) -> Self {
+        let mut tasks = SmallVec::new();
+        tasks.push(task);
+        Self {
+            tasks,
+            #[cfg(test)]
+            peak_len: 1,
+            #[cfg(test)]
+            ever_spilled: false,
+        }
+    }
+
+    fn push(&mut self, task: ExprWriteTask<'a>) {
+        self.tasks.push(task);
+        #[cfg(test)]
+        {
+            self.peak_len = self.peak_len.max(self.tasks.len());
+            self.ever_spilled |= self.tasks.spilled();
+        }
+    }
+
+    fn pop(&mut self) -> Option<ExprWriteTask<'a>> {
+        self.tasks.pop()
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> ExprWriteTaskStackStats {
+        ExprWriteTaskStackStats {
+            peak_len: self.peak_len,
+            spilled: self.ever_spilled,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ExprWriteTaskStackStats {
+    peak_len: usize,
+    spilled: bool,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LAST_EXPR_WRITE_TASK_STACK_STATS: std::cell::Cell<ExprWriteTaskStackStats> =
+        const { std::cell::Cell::new(ExprWriteTaskStackStats { peak_len: 0, spilled: false }) };
+}
+
+fn push_comma_separated_exprs<'a>(tasks: &mut ExprWriteTaskStack<'a>, exprs: &'a [Expr]) {
     for (index, expr) in exprs.iter().enumerate().rev() {
         tasks.push(ExprWriteTask::Expr(expr));
         if index > 0 {
@@ -312,7 +475,7 @@ fn push_comma_separated_exprs<'a>(tasks: &mut Vec<ExprWriteTask<'a>>, exprs: &'a
 }
 
 fn push_comma_separated_ordering_terms<'a>(
-    tasks: &mut Vec<ExprWriteTask<'a>>,
+    tasks: &mut ExprWriteTaskStack<'a>,
     terms: &'a [OrderingTerm],
 ) {
     for (index, term) in terms.iter().enumerate().rev() {
@@ -323,9 +486,85 @@ fn push_comma_separated_ordering_terms<'a>(
     }
 }
 
+fn push_comma_separated_result_columns<'a>(
+    tasks: &mut ExprWriteTaskStack<'a>,
+    columns: &'a [ResultColumn],
+) {
+    for (index, column) in columns.iter().enumerate().rev() {
+        tasks.push(ExprWriteTask::ResultColumn(column));
+        if index > 0 {
+            tasks.push(ExprWriteTask::Text(", "));
+        }
+    }
+}
+
+fn push_comma_separated_ctes<'a>(tasks: &mut ExprWriteTaskStack<'a>, ctes: &'a [Cte]) {
+    for (index, cte) in ctes.iter().enumerate().rev() {
+        tasks.push(ExprWriteTask::Cte(cte));
+        if index > 0 {
+            tasks.push(ExprWriteTask::Text(", "));
+        }
+    }
+}
+
+fn push_comma_separated_window_defs<'a>(
+    tasks: &mut ExprWriteTaskStack<'a>,
+    windows: &'a [WindowDef],
+) {
+    for (index, window) in windows.iter().enumerate().rev() {
+        tasks.push(ExprWriteTask::WindowDef(window));
+        if index > 0 {
+            tasks.push(ExprWriteTask::Text(", "));
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
-    let mut tasks = vec![ExprWriteTask::Expr(root)];
+    write_expr_tasks(f, ExprWriteTask::Expr(root))
+}
+
+fn write_select(f: &mut fmt::Formatter<'_>, root: &SelectStatement) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::Select(root))
+}
+
+fn write_select_body(f: &mut fmt::Formatter<'_>, root: &SelectBody) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::SelectBody(root))
+}
+
+fn write_select_core(f: &mut fmt::Formatter<'_>, root: &SelectCore) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::SelectCore(root))
+}
+
+fn write_from(f: &mut fmt::Formatter<'_>, root: &FromClause) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::From(root))
+}
+
+fn write_table(f: &mut fmt::Formatter<'_>, root: &TableOrSubquery) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::Table(root))
+}
+
+fn write_join(f: &mut fmt::Formatter<'_>, root: &JoinClause) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::Join(root))
+}
+
+fn write_update(f: &mut fmt::Formatter<'_>, root: &UpdateStatement) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::Update(root))
+}
+
+fn write_create_trigger(f: &mut fmt::Formatter<'_>, root: &CreateTriggerStatement) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::CreateTrigger(root))
+}
+
+fn write_statement(f: &mut fmt::Formatter<'_>, root: &Statement) -> fmt::Result {
+    write_expr_tasks(f, ExprWriteTask::Statement(root))
+}
+
+#[allow(clippy::too_many_lines)]
+fn write_expr_tasks(f: &mut fmt::Formatter<'_>, root: ExprWriteTask<'_>) -> fmt::Result {
+    #[cfg(test)]
+    LAST_EXPR_WRITE_TASK_STACK_STATS.set(ExprWriteTaskStackStats::default());
+    let mut tasks = ExprWriteTaskStack::new(root);
     while let Some(task) = tasks.pop() {
         match task {
             ExprWriteTask::Text(text) => f.write_str(text)?,
@@ -333,20 +572,365 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
             ExprWriteTask::Literal(literal) => write!(f, "{literal}")?,
             ExprWriteTask::Column(column) => write!(f, "{column}")?,
             ExprWriteTask::BinaryOp(op) => write!(f, "{op}")?,
+            ExprWriteTask::CompoundOp(op) => write!(f, "{op}")?,
+            ExprWriteTask::JoinType(join_type) => write!(f, "{join_type}")?,
             ExprWriteTask::UnaryOp(op) => write!(f, "{op}")?,
             ExprWriteTask::LikeOp(op) => write!(f, "{op}")?,
             ExprWriteTask::TypeName(type_name) => write!(f, "{type_name}")?,
             ExprWriteTask::Placeholder(placeholder) => write!(f, "{placeholder}")?,
             ExprWriteTask::QualifiedName(name) => write!(f, "{name}")?,
-            ExprWriteTask::ParenthesizedSelect(select) => write!(f, "({select})")?,
-            ExprWriteTask::Operand(expr) => {
-                if operand_needs_parentheses(expr) {
+            ExprWriteTask::ParenthesizedSelect(select) => {
+                tasks.push(ExprWriteTask::Text(")"));
+                tasks.push(ExprWriteTask::Select(select));
+                tasks.push(ExprWriteTask::Text("("));
+            }
+            ExprWriteTask::Operand { expr, parent, side } => {
+                if operand_needs_parentheses(expr, parent, side) {
                     tasks.push(ExprWriteTask::Text(")"));
                     tasks.push(ExprWriteTask::Expr(expr));
                     tasks.push(ExprWriteTask::Text("("));
                 } else {
                     tasks.push(ExprWriteTask::Expr(expr));
                 }
+            }
+            ExprWriteTask::Statement(statement) => match statement {
+                Statement::Select(select) => tasks.push(ExprWriteTask::Select(select)),
+                Statement::Update(update) => tasks.push(ExprWriteTask::Update(update)),
+                Statement::CreateTrigger(trigger) => {
+                    tasks.push(ExprWriteTask::CreateTrigger(trigger));
+                }
+                Statement::Explain { query_plan, stmt } => {
+                    tasks.push(ExprWriteTask::Statement(stmt));
+                    if *query_plan {
+                        tasks.push(ExprWriteTask::Text("EXPLAIN QUERY PLAN "));
+                    } else {
+                        tasks.push(ExprWriteTask::Text("EXPLAIN "));
+                    }
+                }
+                Statement::Insert(insert) => write!(f, "{insert}")?,
+                Statement::Delete(delete) => write!(f, "{delete}")?,
+                Statement::CreateTable(create) => write!(f, "{create}")?,
+                Statement::CreateIndex(create) => write!(f, "{create}")?,
+                Statement::CreateView(create) => write!(f, "{create}")?,
+                Statement::CreateVirtualTable(create) => write!(f, "{create}")?,
+                Statement::Drop(drop) => write!(f, "{drop}")?,
+                Statement::AlterTable(alter) => write!(f, "{alter}")?,
+                Statement::Begin(begin) => write!(f, "{begin}")?,
+                Statement::Commit => f.write_str("COMMIT")?,
+                Statement::Rollback(rollback) => write!(f, "{rollback}")?,
+                Statement::Savepoint(name) => {
+                    f.write_str("SAVEPOINT ")?;
+                    write_ident(f, name)?;
+                }
+                Statement::Release(name) => {
+                    f.write_str("RELEASE ")?;
+                    write_ident(f, name)?;
+                }
+                Statement::Attach(attach) => write!(f, "{attach}")?,
+                Statement::Detach(schema) => {
+                    f.write_str("DETACH ")?;
+                    write_ident(f, schema)?;
+                }
+                Statement::Pragma(pragma) => write!(f, "{pragma}")?,
+                Statement::Vacuum(vacuum) => write!(f, "{vacuum}")?,
+                Statement::Reindex(None) => f.write_str("REINDEX")?,
+                Statement::Reindex(Some(name)) => write!(f, "REINDEX {name}")?,
+                Statement::Analyze(None) => f.write_str("ANALYZE")?,
+                Statement::Analyze(Some(name)) => write!(f, "ANALYZE {name}")?,
+            },
+            ExprWriteTask::Select(select) => {
+                if let Some(limit) = &select.limit {
+                    tasks.push(ExprWriteTask::Limit(limit));
+                    tasks.push(ExprWriteTask::Text(" "));
+                }
+                if !select.order_by.is_empty() {
+                    push_comma_separated_ordering_terms(&mut tasks, &select.order_by);
+                    tasks.push(ExprWriteTask::Text(" ORDER BY "));
+                }
+                for (op, core) in select.body.compounds.iter().rev() {
+                    tasks.push(ExprWriteTask::SelectCore(core));
+                    tasks.push(ExprWriteTask::Text(" "));
+                    tasks.push(ExprWriteTask::CompoundOp(op));
+                    tasks.push(ExprWriteTask::Text(" "));
+                }
+                tasks.push(ExprWriteTask::SelectCore(&select.body.select));
+                if let Some(with) = &select.with {
+                    tasks.push(ExprWriteTask::Text(" "));
+                    tasks.push(ExprWriteTask::With(with));
+                }
+            }
+            ExprWriteTask::SelectBody(body) => {
+                for (op, core) in body.compounds.iter().rev() {
+                    tasks.push(ExprWriteTask::SelectCore(core));
+                    tasks.push(ExprWriteTask::Text(" "));
+                    tasks.push(ExprWriteTask::CompoundOp(op));
+                    tasks.push(ExprWriteTask::Text(" "));
+                }
+                tasks.push(ExprWriteTask::SelectCore(&body.select));
+            }
+            ExprWriteTask::With(with) => {
+                push_comma_separated_ctes(&mut tasks, &with.ctes);
+                if with.recursive {
+                    tasks.push(ExprWriteTask::Text("WITH RECURSIVE "));
+                } else {
+                    tasks.push(ExprWriteTask::Text("WITH "));
+                }
+            }
+            ExprWriteTask::Cte(cte) => {
+                tasks.push(ExprWriteTask::Text(")"));
+                tasks.push(ExprWriteTask::Select(&cte.query));
+                tasks.push(ExprWriteTask::Text("("));
+                match cte.materialized {
+                    Some(CteMaterialized::Materialized) => {
+                        tasks.push(ExprWriteTask::Text("MATERIALIZED "));
+                    }
+                    Some(CteMaterialized::NotMaterialized) => {
+                        tasks.push(ExprWriteTask::Text("NOT MATERIALIZED "));
+                    }
+                    None => {}
+                }
+                tasks.push(ExprWriteTask::Text(" AS "));
+                if !cte.columns.is_empty() {
+                    tasks.push(ExprWriteTask::Text(")"));
+                    for (index, column) in cte.columns.iter().enumerate().rev() {
+                        tasks.push(ExprWriteTask::Ident(column));
+                        if index > 0 {
+                            tasks.push(ExprWriteTask::Text(", "));
+                        }
+                    }
+                    tasks.push(ExprWriteTask::Text("("));
+                }
+                tasks.push(ExprWriteTask::Ident(&cte.name));
+            }
+            ExprWriteTask::SelectCore(core) => match core {
+                SelectCore::Select {
+                    distinct,
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    having,
+                    windows,
+                } => {
+                    if !windows.is_empty() {
+                        push_comma_separated_window_defs(&mut tasks, windows);
+                        tasks.push(ExprWriteTask::Text(" WINDOW "));
+                    }
+                    if let Some(having) = having {
+                        tasks.push(ExprWriteTask::Expr(having));
+                        tasks.push(ExprWriteTask::Text(" HAVING "));
+                    }
+                    if !group_by.is_empty() {
+                        push_comma_separated_exprs(&mut tasks, group_by);
+                        tasks.push(ExprWriteTask::Text(" GROUP BY "));
+                    }
+                    if let Some(where_clause) = where_clause {
+                        tasks.push(ExprWriteTask::Expr(where_clause));
+                        tasks.push(ExprWriteTask::Text(" WHERE "));
+                    }
+                    if let Some(from) = from {
+                        tasks.push(ExprWriteTask::From(from));
+                        tasks.push(ExprWriteTask::Text(" FROM "));
+                    }
+                    push_comma_separated_result_columns(&mut tasks, columns);
+                    if *distinct == Distinctness::Distinct {
+                        tasks.push(ExprWriteTask::Text("SELECT DISTINCT "));
+                    } else {
+                        tasks.push(ExprWriteTask::Text("SELECT "));
+                    }
+                }
+                SelectCore::Values(rows) => {
+                    for (row_index, row) in rows.iter().enumerate().rev() {
+                        tasks.push(ExprWriteTask::Text(")"));
+                        push_comma_separated_exprs(&mut tasks, row);
+                        tasks.push(ExprWriteTask::Text("("));
+                        if row_index > 0 {
+                            tasks.push(ExprWriteTask::Text(", "));
+                        }
+                    }
+                    tasks.push(ExprWriteTask::Text("VALUES "));
+                }
+            },
+            ExprWriteTask::ResultColumn(column) => match column {
+                ResultColumn::Star => tasks.push(ExprWriteTask::Text("*")),
+                ResultColumn::TableStar(name) => {
+                    tasks.push(ExprWriteTask::Text(".*"));
+                    tasks.push(ExprWriteTask::QualifiedName(name));
+                }
+                ResultColumn::Expr { expr, alias } => {
+                    if let Some(alias) = alias {
+                        tasks.push(ExprWriteTask::Ident(alias));
+                        tasks.push(ExprWriteTask::Text(" AS "));
+                    }
+                    tasks.push(ExprWriteTask::Expr(expr));
+                }
+            },
+            ExprWriteTask::From(from) => {
+                for join in from.joins.iter().rev() {
+                    tasks.push(ExprWriteTask::Join(join));
+                    tasks.push(ExprWriteTask::Text(" "));
+                }
+                tasks.push(ExprWriteTask::Table(&from.source));
+            }
+            ExprWriteTask::Table(table) => match table {
+                TableOrSubquery::Table {
+                    name,
+                    alias,
+                    index_hint,
+                    time_travel,
+                } => {
+                    if let Some(time_travel) = time_travel {
+                        write!(f, "{name}")?;
+                        if let Some(alias) = alias {
+                            f.write_str(" AS ")?;
+                            write_ident(f, alias)?;
+                        }
+                        if let Some(index_hint) = index_hint {
+                            write!(f, " {index_hint}")?;
+                        }
+                        write!(f, " {time_travel}")?;
+                    } else {
+                        if let Some(index_hint) = index_hint {
+                            match index_hint {
+                                IndexHint::IndexedBy(name) => {
+                                    tasks.push(ExprWriteTask::Ident(name));
+                                    tasks.push(ExprWriteTask::Text(" INDEXED BY "));
+                                }
+                                IndexHint::NotIndexed => {
+                                    tasks.push(ExprWriteTask::Text(" NOT INDEXED"));
+                                }
+                            }
+                        }
+                        if let Some(alias) = alias {
+                            tasks.push(ExprWriteTask::Ident(alias));
+                            tasks.push(ExprWriteTask::Text(" AS "));
+                        }
+                        tasks.push(ExprWriteTask::QualifiedName(name));
+                    }
+                }
+                TableOrSubquery::Subquery { query, alias } => {
+                    if let Some(alias) = alias {
+                        tasks.push(ExprWriteTask::Ident(alias));
+                        tasks.push(ExprWriteTask::Text(" AS "));
+                    }
+                    tasks.push(ExprWriteTask::Text(")"));
+                    tasks.push(ExprWriteTask::Select(query));
+                    tasks.push(ExprWriteTask::Text("("));
+                }
+                TableOrSubquery::TableFunction { name, args, alias } => {
+                    if let Some(alias) = alias {
+                        tasks.push(ExprWriteTask::Ident(alias));
+                        tasks.push(ExprWriteTask::Text(" AS "));
+                    }
+                    tasks.push(ExprWriteTask::Text(")"));
+                    push_comma_separated_exprs(&mut tasks, args);
+                    tasks.push(ExprWriteTask::Text("("));
+                    tasks.push(ExprWriteTask::Ident(name));
+                }
+                TableOrSubquery::ParenJoin(inner) => {
+                    tasks.push(ExprWriteTask::Text(")"));
+                    tasks.push(ExprWriteTask::From(inner));
+                    tasks.push(ExprWriteTask::Text("("));
+                }
+            },
+            ExprWriteTask::Join(join) => {
+                if let Some(constraint) = &join.constraint {
+                    tasks.push(ExprWriteTask::JoinConstraint(constraint));
+                    tasks.push(ExprWriteTask::Text(" "));
+                }
+                tasks.push(ExprWriteTask::Table(&join.table));
+                tasks.push(ExprWriteTask::Text(" "));
+                tasks.push(ExprWriteTask::JoinType(&join.join_type));
+            }
+            ExprWriteTask::JoinConstraint(constraint) => match constraint {
+                JoinConstraint::On(expr) => {
+                    tasks.push(ExprWriteTask::Expr(expr));
+                    tasks.push(ExprWriteTask::Text("ON "));
+                }
+                JoinConstraint::Using(columns) => {
+                    tasks.push(ExprWriteTask::Text(")"));
+                    for (index, column) in columns.iter().enumerate().rev() {
+                        tasks.push(ExprWriteTask::Ident(column));
+                        if index > 0 {
+                            tasks.push(ExprWriteTask::Text(", "));
+                        }
+                    }
+                    tasks.push(ExprWriteTask::Text("USING ("));
+                }
+            },
+            ExprWriteTask::WindowDef(window) => {
+                tasks.push(ExprWriteTask::Window(&window.spec));
+                tasks.push(ExprWriteTask::Text(" AS "));
+                tasks.push(ExprWriteTask::Ident(&window.name));
+            }
+            ExprWriteTask::Limit(limit) => {
+                if let Some(offset) = &limit.offset {
+                    tasks.push(ExprWriteTask::Expr(offset));
+                    tasks.push(ExprWriteTask::Text(" OFFSET "));
+                }
+                tasks.push(ExprWriteTask::Expr(&limit.limit));
+                tasks.push(ExprWriteTask::Text("LIMIT "));
+            }
+            ExprWriteTask::Update(update) => {
+                if let Some(limit) = &update.limit {
+                    tasks.push(ExprWriteTask::Limit(limit));
+                    tasks.push(ExprWriteTask::Text(" "));
+                }
+                if !update.order_by.is_empty() {
+                    push_comma_separated_ordering_terms(&mut tasks, &update.order_by);
+                    tasks.push(ExprWriteTask::Text(" ORDER BY "));
+                }
+                if !update.returning.is_empty() {
+                    push_comma_separated_result_columns(&mut tasks, &update.returning);
+                    tasks.push(ExprWriteTask::Text(" RETURNING "));
+                }
+                if let Some(where_clause) = &update.where_clause {
+                    tasks.push(ExprWriteTask::Expr(where_clause));
+                    tasks.push(ExprWriteTask::Text(" WHERE "));
+                }
+                if let Some(from) = &update.from {
+                    tasks.push(ExprWriteTask::From(from));
+                    tasks.push(ExprWriteTask::Text(" FROM "));
+                }
+
+                if let Some(with) = &update.with {
+                    write!(f, "{with} ")?;
+                }
+                f.write_str("UPDATE")?;
+                if let Some(action) = &update.or_conflict {
+                    write!(f, " OR {action}")?;
+                }
+                write!(f, " {} SET ", update.table)?;
+                comma_list(f, &update.assignments)?;
+            }
+            ExprWriteTask::CreateTrigger(trigger) => {
+                tasks.push(ExprWriteTask::Text("END"));
+                for statement in trigger.body.iter().rev() {
+                    tasks.push(ExprWriteTask::Text("; "));
+                    tasks.push(ExprWriteTask::Statement(statement));
+                }
+
+                f.write_str("CREATE ")?;
+                if trigger.temporary {
+                    f.write_str("TEMP ")?;
+                }
+                f.write_str("TRIGGER ")?;
+                if trigger.if_not_exists {
+                    f.write_str("IF NOT EXISTS ")?;
+                }
+                write!(
+                    f,
+                    "{} {} {} ON ",
+                    trigger.name, trigger.timing, trigger.event
+                )?;
+                write_ident(f, &trigger.table)?;
+                if trigger.for_each_row {
+                    f.write_str(" FOR EACH ROW")?;
+                }
+                if let Some(when) = &trigger.when {
+                    write!(f, " WHEN {when}")?;
+                }
+                f.write_str(" BEGIN ")?;
             }
             ExprWriteTask::OrderingTerm(term) => {
                 if let Some(nulls) = term.nulls {
@@ -364,7 +948,7 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                 tasks.push(ExprWriteTask::Expr(&term.expr));
             }
             ExprWriteTask::Window(window) => {
-                let has_base = window.base_window.is_some();
+                let has_base = window.window_ref.is_some();
                 let has_partition = !window.partition_by.is_empty();
                 let has_order = !window.order_by.is_empty();
                 tasks.push(ExprWriteTask::Text(")"));
@@ -388,8 +972,8 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                         tasks.push(ExprWriteTask::Text(" "));
                     }
                 }
-                if let Some(base) = &window.base_window {
-                    tasks.push(ExprWriteTask::Ident(base));
+                if let Some(window_ref) = &window.window_ref {
+                    tasks.push(ExprWriteTask::Ident(window_ref.name()));
                 }
                 tasks.push(ExprWriteTask::Text("("));
             }
@@ -448,14 +1032,26 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                 Expr::BinaryOp {
                     left, op, right, ..
                 } => {
-                    tasks.push(ExprWriteTask::Operand(right));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr: right,
+                        parent: ExprParent::Binary(*op),
+                        side: OperandSide::Right,
+                    });
                     tasks.push(ExprWriteTask::Text(" "));
                     tasks.push(ExprWriteTask::BinaryOp(op));
                     tasks.push(ExprWriteTask::Text(" "));
-                    tasks.push(ExprWriteTask::Operand(left));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr: left,
+                        parent: ExprParent::Binary(*op),
+                        side: OperandSide::Left,
+                    });
                 }
                 Expr::UnaryOp { op, expr, .. } => {
-                    tasks.push(ExprWriteTask::Operand(expr));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr,
+                        parent: ExprParent::Unary(*op),
+                        side: OperandSide::Prefix,
+                    });
                     if matches!(op, UnaryOp::Not) {
                         tasks.push(ExprWriteTask::Text("NOT "));
                     } else {
@@ -469,14 +1065,26 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                     not,
                     ..
                 } => {
-                    tasks.push(ExprWriteTask::Operand(high));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr: high,
+                        parent: ExprParent::Between,
+                        side: OperandSide::Right,
+                    });
                     tasks.push(ExprWriteTask::Text(" AND "));
-                    tasks.push(ExprWriteTask::Operand(low));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr: low,
+                        parent: ExprParent::Between,
+                        side: OperandSide::Right,
+                    });
                     tasks.push(ExprWriteTask::Text(" BETWEEN "));
                     if *not {
                         tasks.push(ExprWriteTask::Text(" NOT"));
                     }
-                    tasks.push(ExprWriteTask::Operand(expr));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr,
+                        parent: ExprParent::Between,
+                        side: OperandSide::Left,
+                    });
                 }
                 Expr::In { expr, set, not, .. } => {
                     match set {
@@ -494,7 +1102,11 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                     if *not {
                         tasks.push(ExprWriteTask::Text(" NOT"));
                     }
-                    tasks.push(ExprWriteTask::Operand(expr));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr,
+                        parent: ExprParent::In,
+                        side: OperandSide::Left,
+                    });
                 }
                 Expr::Like {
                     expr,
@@ -505,17 +1117,29 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                     ..
                 } => {
                     if let Some(escape) = escape {
-                        tasks.push(ExprWriteTask::Operand(escape));
+                        tasks.push(ExprWriteTask::Operand {
+                            expr: escape,
+                            parent: ExprParent::Escape,
+                            side: OperandSide::Right,
+                        });
                         tasks.push(ExprWriteTask::Text(" ESCAPE "));
                     }
-                    tasks.push(ExprWriteTask::Operand(pattern));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr: pattern,
+                        parent: ExprParent::Like,
+                        side: OperandSide::Right,
+                    });
                     tasks.push(ExprWriteTask::Text(" "));
                     tasks.push(ExprWriteTask::LikeOp(op));
                     tasks.push(ExprWriteTask::Text(" "));
                     if *not {
                         tasks.push(ExprWriteTask::Text(" NOT"));
                     }
-                    tasks.push(ExprWriteTask::Operand(expr));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr,
+                        parent: ExprParent::Like,
+                        side: OperandSide::Left,
+                    });
                 }
                 Expr::Case {
                     operand,
@@ -550,12 +1174,19 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                     tasks.push(ExprWriteTask::Text("CAST("));
                 }
                 Expr::Exists { subquery, not, .. } => {
+                    tasks.push(ExprWriteTask::Text(")"));
+                    tasks.push(ExprWriteTask::Select(subquery));
                     if *not {
-                        f.write_str("NOT ")?;
+                        tasks.push(ExprWriteTask::Text("NOT EXISTS ("));
+                    } else {
+                        tasks.push(ExprWriteTask::Text("EXISTS ("));
                     }
-                    write!(f, "EXISTS ({subquery})")?;
                 }
-                Expr::Subquery(select, _) => write!(f, "({select})")?,
+                Expr::Subquery(select, _) => {
+                    tasks.push(ExprWriteTask::Text(")"));
+                    tasks.push(ExprWriteTask::Select(select));
+                    tasks.push(ExprWriteTask::Text("("));
+                }
                 Expr::FunctionCall {
                     name,
                     args,
@@ -566,13 +1197,13 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                     ..
                 } => {
                     if let Some(window) = over {
-                        match &window.base_window {
-                            Some(base)
+                        match &window.window_ref {
+                            Some(WindowReference::Direct(name))
                                 if window.partition_by.is_empty()
                                     && window.order_by.is_empty()
                                     && window.frame.is_none() =>
                             {
-                                tasks.push(ExprWriteTask::Ident(base));
+                                tasks.push(ExprWriteTask::Ident(name));
                             }
                             _ => tasks.push(ExprWriteTask::Window(window)),
                         }
@@ -605,7 +1236,11 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                 } => {
                     tasks.push(ExprWriteTask::Ident(collation));
                     tasks.push(ExprWriteTask::Text(" COLLATE "));
-                    tasks.push(ExprWriteTask::Operand(expr));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr,
+                        parent: ExprParent::Collate,
+                        side: OperandSide::Left,
+                    });
                 }
                 Expr::IsNull { expr, not, .. } => {
                     if *not {
@@ -613,7 +1248,11 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                     } else {
                         tasks.push(ExprWriteTask::Text(" IS NULL"));
                     }
-                    tasks.push(ExprWriteTask::Operand(expr));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr,
+                        parent: ExprParent::IsNull,
+                        side: OperandSide::Left,
+                    });
                 }
                 Expr::Raise {
                     action, message, ..
@@ -627,12 +1266,20 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                 Expr::JsonAccess {
                     expr, path, arrow, ..
                 } => {
-                    tasks.push(ExprWriteTask::Operand(path));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr: path,
+                        parent: ExprParent::Json,
+                        side: OperandSide::Right,
+                    });
                     match arrow {
                         JsonArrow::Arrow => tasks.push(ExprWriteTask::Text(" -> ")),
                         JsonArrow::DoubleArrow => tasks.push(ExprWriteTask::Text(" ->> ")),
                     }
-                    tasks.push(ExprWriteTask::Operand(expr));
+                    tasks.push(ExprWriteTask::Operand {
+                        expr,
+                        parent: ExprParent::Json,
+                        side: OperandSide::Left,
+                    });
                 }
                 Expr::RowValue(exprs, _) => {
                     tasks.push(ExprWriteTask::Text(")"));
@@ -645,6 +1292,8 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
             },
         }
     }
+    #[cfg(test)]
+    LAST_EXPR_WRITE_TASK_STACK_STATS.set(tasks.stats());
     Ok(())
 }
 
@@ -657,8 +1306,20 @@ impl fmt::Display for Literal {
         match self {
             Self::Integer(n) => write!(f, "{n}"),
             Self::Float(v) => {
-                // Ensure the float always has a decimal point.
-                if v.fract() == 0.0 && !v.is_infinite() && !v.is_nan() {
+                if v.is_nan() {
+                    // SQLite never surfaces NaN as a REAL value. Arithmetic
+                    // and register writes normalize it to SQL NULL, so the
+                    // executable SQL rendering must preserve that policy
+                    // instead of emitting the identifier `NaN`.
+                    f.write_str("NULL")
+                } else if v.is_infinite() {
+                    if v.is_sign_negative() {
+                        f.write_str("-9e999")
+                    } else {
+                        f.write_str("9e999")
+                    }
+                // Ensure a finite integral float always has a decimal point.
+                } else if v.fract() == 0.0 && !v.is_nan() {
                     write!(f, "{v:.1}")
                 } else {
                     write!(f, "{v}")
@@ -775,9 +1436,16 @@ impl fmt::Display for Expr {
 
 impl fmt::Display for WindowSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(WindowReference::Direct(name)) = &self.window_ref
+            && self.partition_by.is_empty()
+            && self.order_by.is_empty()
+            && self.frame.is_none()
+        {
+            return write_ident(f, name);
+        }
         f.write_str("(")?;
-        let mut need_space = if let Some(base) = &self.base_window {
-            write_ident(f, base)?;
+        let mut need_space = if let Some(window_ref) = &self.window_ref {
+            write_ident(f, window_ref.name())?;
             true
         } else {
             false
@@ -925,18 +1593,7 @@ impl fmt::Display for ResultColumn {
 
 impl fmt::Display for SelectStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ref with) = self.with {
-            write!(f, "{with} ")?;
-        }
-        write!(f, "{}", self.body)?;
-        if !self.order_by.is_empty() {
-            f.write_str(" ORDER BY ")?;
-            comma_list(f, &self.order_by)?;
-        }
-        if let Some(ref lim) = self.limit {
-            write!(f, " {lim}")?;
-        }
-        Ok(())
+        write_select(f, self)
     }
 }
 
@@ -985,11 +1642,7 @@ impl fmt::Display for CteMaterialized {
 
 impl fmt::Display for SelectBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.select)?;
-        for (op, core) in &self.compounds {
-            write!(f, " {op} {core}")?;
-        }
-        Ok(())
+        write_select_body(f, self)
     }
 }
 
@@ -1006,53 +1659,7 @@ impl fmt::Display for CompoundOp {
 
 impl fmt::Display for SelectCore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Select {
-                distinct,
-                columns,
-                from,
-                where_clause,
-                group_by,
-                having,
-                windows,
-            } => {
-                f.write_str("SELECT ")?;
-                if *distinct == Distinctness::Distinct {
-                    f.write_str("DISTINCT ")?;
-                }
-                comma_list(f, columns)?;
-                if let Some(from_clause) = from {
-                    write!(f, " FROM {from_clause}")?;
-                }
-                if let Some(w) = where_clause {
-                    write!(f, " WHERE {w}")?;
-                }
-                if !group_by.is_empty() {
-                    f.write_str(" GROUP BY ")?;
-                    comma_list(f, group_by)?;
-                }
-                if let Some(h) = having {
-                    write!(f, " HAVING {h}")?;
-                }
-                if !windows.is_empty() {
-                    f.write_str(" WINDOW ")?;
-                    comma_list(f, windows)?;
-                }
-                Ok(())
-            }
-            Self::Values(rows) => {
-                f.write_str("VALUES ")?;
-                for (i, row) in rows.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
-                    f.write_str("(")?;
-                    comma_list(f, row)?;
-                    f.write_str(")")?;
-                }
-                Ok(())
-            }
-        }
+        write_select_core(f, self)
     }
 }
 
@@ -1062,57 +1669,13 @@ impl fmt::Display for SelectCore {
 
 impl fmt::Display for FromClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.source)?;
-        for join in &self.joins {
-            write!(f, " {join}")?;
-        }
-        Ok(())
+        write_from(f, self)
     }
 }
 
 impl fmt::Display for TableOrSubquery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Table {
-                name,
-                alias,
-                index_hint,
-                time_travel,
-            } => {
-                write!(f, "{name}")?;
-                if let Some(a) = alias {
-                    f.write_str(" AS ")?;
-                    write_ident(f, a)?;
-                }
-                if let Some(hint) = index_hint {
-                    write!(f, " {hint}")?;
-                }
-                if let Some(tt) = time_travel {
-                    write!(f, " {tt}")?;
-                }
-                Ok(())
-            }
-            Self::Subquery { query, alias } => {
-                write!(f, "({query})")?;
-                if let Some(a) = alias {
-                    f.write_str(" AS ")?;
-                    write_ident(f, a)?;
-                }
-                Ok(())
-            }
-            Self::TableFunction { name, args, alias } => {
-                write_ident(f, name)?;
-                f.write_str("(")?;
-                comma_list(f, args)?;
-                f.write_str(")")?;
-                if let Some(a) = alias {
-                    f.write_str(" AS ")?;
-                    write_ident(f, a)?;
-                }
-                Ok(())
-            }
-            Self::ParenJoin(inner) => write!(f, "({inner})"),
-        }
+        write_table(f, self)
     }
 }
 
@@ -1153,11 +1716,7 @@ impl fmt::Display for TimeTravelTarget {
 
 impl fmt::Display for JoinClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.join_type, self.table)?;
-        if let Some(ref constraint) = self.constraint {
-            write!(f, " {constraint}")?;
-        }
-        Ok(())
+        write_join(f, self)
     }
 }
 
@@ -1369,34 +1928,7 @@ impl fmt::Display for AssignmentTarget {
 
 impl fmt::Display for UpdateStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ref with) = self.with {
-            write!(f, "{with} ")?;
-        }
-        f.write_str("UPDATE")?;
-        if let Some(ref action) = self.or_conflict {
-            write!(f, " OR {action}")?;
-        }
-        write!(f, " {}", self.table)?;
-        f.write_str(" SET ")?;
-        comma_list(f, &self.assignments)?;
-        if let Some(ref from_clause) = self.from {
-            write!(f, " FROM {from_clause}")?;
-        }
-        if let Some(ref w) = self.where_clause {
-            write!(f, " WHERE {w}")?;
-        }
-        if !self.returning.is_empty() {
-            f.write_str(" RETURNING ")?;
-            comma_list(f, &self.returning)?;
-        }
-        if !self.order_by.is_empty() {
-            f.write_str(" ORDER BY ")?;
-            comma_list(f, &self.order_by)?;
-        }
-        if let Some(ref lim) = self.limit {
-            write!(f, " {lim}")?;
-        }
-        Ok(())
+        write_update(f, self)
     }
 }
 
@@ -1751,27 +2283,7 @@ impl fmt::Display for CreateViewStatement {
 
 impl fmt::Display for CreateTriggerStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("CREATE ")?;
-        if self.temporary {
-            f.write_str("TEMP ")?;
-        }
-        f.write_str("TRIGGER ")?;
-        if self.if_not_exists {
-            f.write_str("IF NOT EXISTS ")?;
-        }
-        write!(f, "{} {} {} ON ", self.name, self.timing, self.event)?;
-        write_ident(f, &self.table)?;
-        if self.for_each_row {
-            f.write_str(" FOR EACH ROW")?;
-        }
-        if let Some(ref w) = self.when {
-            write!(f, " WHEN {w}")?;
-        }
-        f.write_str(" BEGIN ")?;
-        for stmt in &self.body {
-            write!(f, "{stmt}; ")?;
-        }
-        f.write_str("END")
+        write_create_trigger(f, self)
     }
 }
 
@@ -1966,57 +2478,678 @@ impl fmt::Display for VacuumStatement {
 impl fmt::Display for Statement {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Select(s) => write!(f, "{s}"),
-            Self::Insert(s) => write!(f, "{s}"),
-            Self::Update(s) => write!(f, "{s}"),
-            Self::Delete(s) => write!(f, "{s}"),
-            Self::CreateTable(s) => write!(f, "{s}"),
-            Self::CreateIndex(s) => write!(f, "{s}"),
-            Self::CreateView(s) => write!(f, "{s}"),
-            Self::CreateTrigger(s) => write!(f, "{s}"),
-            Self::CreateVirtualTable(s) => write!(f, "{s}"),
-            Self::Drop(s) => write!(f, "{s}"),
-            Self::AlterTable(s) => write!(f, "{s}"),
-            Self::Begin(s) => write!(f, "{s}"),
-            Self::Commit => f.write_str("COMMIT"),
-            Self::Rollback(s) => write!(f, "{s}"),
-            Self::Savepoint(name) => {
-                f.write_str("SAVEPOINT ")?;
-                write_ident(f, name)
-            }
-            Self::Release(name) => {
-                f.write_str("RELEASE ")?;
-                write_ident(f, name)
-            }
-            Self::Attach(s) => write!(f, "{s}"),
-            Self::Detach(schema) => {
-                f.write_str("DETACH ")?;
-                write_ident(f, schema)
-            }
-            Self::Pragma(s) => write!(f, "{s}"),
-            Self::Vacuum(s) => write!(f, "{s}"),
-            Self::Reindex(None) => f.write_str("REINDEX"),
-            Self::Reindex(Some(name)) => write!(f, "REINDEX {name}"),
-            Self::Analyze(None) => f.write_str("ANALYZE"),
-            Self::Analyze(Some(name)) => write!(f, "ANALYZE {name}"),
-            Self::Explain { query_plan, stmt } => {
-                if *query_plan {
-                    write!(f, "EXPLAIN QUERY PLAN {stmt}")
-                } else {
-                    write!(f, "EXPLAIN {stmt}")
-                }
-            }
-        }
+        write_statement(f, self)
     }
 }
 
 #[cfg(test)]
 mod expr_display_tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn column(name: &str) -> Expr {
         Expr::Column(ColumnRef::bare(name), Span::ZERO)
+    }
+
+    fn integer(value: i64) -> Expr {
+        Expr::Literal(Literal::Integer(value), Span::ZERO)
+    }
+
+    fn binary(left: Expr, op: BinaryOp, right: Expr) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+            span: Span::ZERO,
+        }
+    }
+
+    fn table_source(name: &str) -> TableOrSubquery {
+        TableOrSubquery::Table {
+            name: QualifiedName::bare(name),
+            alias: None,
+            index_hint: None,
+            time_travel: None,
+        }
+    }
+
+    fn nested_from(height: usize) -> FromClause {
+        let mut from = FromClause {
+            source: table_source("leaf"),
+            joins: Vec::new(),
+        };
+        for _ in 0..height {
+            from = FromClause {
+                source: TableOrSubquery::ParenJoin(Box::new(from)),
+                joins: Vec::new(),
+            };
+        }
+        from
+    }
+
+    fn update_with_from(from: FromClause) -> UpdateStatement {
+        UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("target"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("x".to_owned()),
+                value: integer(1),
+            }],
+            from: Some(from),
+            where_clause: None,
+            returning: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        }
+    }
+
+    fn drop_table(name: &str) -> Statement {
+        Statement::Drop(DropStatement {
+            object_type: DropObjectType::Table,
+            if_exists: false,
+            name: QualifiedName::bare(name),
+        })
+    }
+
+    fn drop_from_iteratively(root: FromClause) {
+        let mut from_clauses = vec![root];
+        let mut tables = Vec::new();
+        while let Some(FromClause { source, joins }) = from_clauses.pop() {
+            tables.push(source);
+            for join in joins {
+                tables.push(join.table);
+                drop(join.constraint);
+            }
+            while let Some(table) = tables.pop() {
+                match table {
+                    TableOrSubquery::ParenJoin(inner) => from_clauses.push(*inner),
+                    leaf => drop(leaf),
+                }
+            }
+        }
+    }
+
+    fn drop_table_iteratively(table: TableOrSubquery) {
+        match table {
+            TableOrSubquery::ParenJoin(inner) => drop_from_iteratively(*inner),
+            leaf => drop(leaf),
+        }
+    }
+
+    fn drop_select_core_iteratively(core: SelectCore) {
+        match core {
+            SelectCore::Select { from, .. } => {
+                if let Some(from) = from {
+                    drop_from_iteratively(from);
+                }
+            }
+            SelectCore::Values(_) => {}
+        }
+    }
+
+    fn drop_select_body_iteratively(body: SelectBody) {
+        drop_select_core_iteratively(body.select);
+        for (_, core) in body.compounds {
+            drop_select_core_iteratively(core);
+        }
+    }
+
+    fn drop_statement_iteratively(mut statement: Statement) {
+        loop {
+            match statement {
+                Statement::Explain { stmt, .. } => statement = *stmt,
+                Statement::CreateTrigger(mut trigger) if trigger.body.len() == 1 => {
+                    statement = trigger
+                        .body
+                        .pop()
+                        .expect("single trigger body statement must exist");
+                }
+                Statement::Update(mut update) => {
+                    if let Some(from) = update.from.take() {
+                        drop_from_iteratively(from);
+                    }
+                    break;
+                }
+                leaf => {
+                    drop(leaf);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn drop_scalar_subquery_chain_iteratively(mut expr: Expr) {
+        loop {
+            match expr {
+                Expr::Subquery(select, _) => {
+                    let SelectStatement {
+                        with,
+                        body,
+                        order_by,
+                        limit,
+                    } = *select;
+                    assert!(with.is_none());
+                    assert!(order_by.is_empty());
+                    assert!(limit.is_none());
+                    let SelectBody { select, compounds } = body;
+                    assert!(compounds.is_empty());
+                    let SelectCore::Select {
+                        mut columns,
+                        from,
+                        where_clause,
+                        group_by,
+                        having,
+                        windows,
+                        ..
+                    } = select
+                    else {
+                        panic!("scalar-subquery chain must contain SELECT cores");
+                    };
+                    assert!(from.is_none());
+                    assert!(where_clause.is_none());
+                    assert!(group_by.is_empty());
+                    assert!(having.is_none());
+                    assert!(windows.is_empty());
+                    assert_eq!(columns.len(), 1);
+                    let ResultColumn::Expr { expr: child, alias } = columns
+                        .pop()
+                        .expect("scalar-subquery SELECT must contain one column")
+                    else {
+                        panic!("scalar-subquery SELECT column must be an expression");
+                    };
+                    assert!(alias.is_none());
+                    expr = child;
+                }
+                leaf => {
+                    drop(leaf);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn format_statement_on_one_mib_stack(statement: Statement) -> String {
+        let (rendered, statement) = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || (statement.to_string(), statement))
+            .expect("1 MiB formatter thread must spawn")
+            .join()
+            .expect("formatting on a 1 MiB stack must not overflow");
+        drop_statement_iteratively(statement);
+        rendered
+    }
+
+    #[test]
+    fn expression_task_stack_uses_inline_boundary_and_preserves_lifo() {
+        let mut stack = ExprWriteTaskStack::new(ExprWriteTask::Text("first"));
+        stack.push(ExprWriteTask::Text("second"));
+        stack.push(ExprWriteTask::Text("third"));
+        assert!(matches!(stack.pop(), Some(ExprWriteTask::Text("third"))));
+        assert!(matches!(stack.pop(), Some(ExprWriteTask::Text("second"))));
+        assert!(matches!(stack.pop(), Some(ExprWriteTask::Text("first"))));
+
+        let mut boundary = ExprWriteTaskStack::new(ExprWriteTask::Text("inline"));
+        for _ in 1..INLINE_EXPR_WRITE_TASKS {
+            boundary.push(ExprWriteTask::Text("inline"));
+        }
+        assert!(!boundary.tasks.spilled());
+        boundary.push(ExprWriteTask::Text("spill"));
+        assert!(boundary.tasks.spilled());
+        while boundary.pop().is_some() {}
+        assert!(
+            boundary.stats().spilled,
+            "spill history must survive draining the task stack"
+        );
+    }
+
+    #[test]
+    fn formatter_error_resets_task_stack_stats() {
+        struct FailingWriter;
+
+        impl fmt::Write for FailingWriter {
+            fn write_str(&mut self, _: &str) -> fmt::Result {
+                Err(fmt::Error)
+            }
+        }
+
+        let mut deep = integer(1);
+        for _ in 1..100 {
+            deep = binary(deep, BinaryOp::Add, integer(1));
+        }
+        let _ = deep.to_string();
+        assert!(
+            LAST_EXPR_WRITE_TASK_STACK_STATS
+                .with(std::cell::Cell::get)
+                .spilled
+        );
+
+        let mut writer = FailingWriter;
+        write!(&mut writer, "{}", column("value"))
+            .expect_err("the test writer must reject formatter output");
+        assert_eq!(
+            LAST_EXPR_WRITE_TASK_STACK_STATS.with(std::cell::Cell::get),
+            ExprWriteTaskStackStats::default(),
+            "an early formatter error must not expose the previous call's task stats"
+        );
+    }
+
+    #[test]
+    fn public_from_roots_format_height_1000_and_1001_on_one_mib_stack() {
+        for height in [1000, 1001] {
+            let from_root = nested_from(height);
+            let table_root = TableOrSubquery::ParenJoin(Box::new(nested_from(height)));
+            let join_root = JoinClause {
+                join_type: JoinType {
+                    natural: false,
+                    kind: JoinKind::Inner,
+                },
+                table: TableOrSubquery::ParenJoin(Box::new(nested_from(height))),
+                constraint: None,
+            };
+            let select_core_root = SelectCore::Select {
+                distinct: Distinctness::All,
+                columns: vec![ResultColumn::Star],
+                from: Some(nested_from(height)),
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            };
+            let select_body_root = SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(nested_from(height)),
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    windows: Vec::new(),
+                },
+                compounds: Vec::new(),
+            };
+            let update_root = Statement::Update(update_with_from(nested_from(height)));
+
+            let (rendered, roots) = std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(move || {
+                    let rendered = [
+                        from_root.to_string(),
+                        table_root.to_string(),
+                        join_root.to_string(),
+                        select_core_root.to_string(),
+                        select_body_root.to_string(),
+                        update_root.to_string(),
+                    ];
+                    (
+                        rendered,
+                        (
+                            from_root,
+                            table_root,
+                            join_root,
+                            select_core_root,
+                            select_body_root,
+                            update_root,
+                        ),
+                    )
+                })
+                .expect("1 MiB formatter thread must spawn")
+                .join()
+                .expect("all public FROM roots must format without stack overflow");
+            let (
+                from_root,
+                table_root,
+                JoinClause {
+                    table: join_table, ..
+                },
+                select_core_root,
+                select_body_root,
+                update_root,
+            ) = roots;
+            drop_from_iteratively(from_root);
+            drop_table_iteratively(table_root);
+            drop_table_iteratively(join_table);
+            drop_select_core_iteratively(select_core_root);
+            drop_select_body_iteratively(select_body_root);
+            drop_statement_iteratively(update_root);
+
+            let expected_parentheses = [height, height + 1, height + 1, height, height, height];
+            for (sql, expected) in rendered.iter().zip(expected_parentheses) {
+                assert_eq!(sql.matches('(').count(), expected);
+                assert_eq!(sql.matches(')').count(), expected);
+                assert!(sql.contains("leaf"));
+            }
+            assert!(rendered[2].starts_with("INNER JOIN "));
+            assert!(rendered[3].starts_with("SELECT * FROM "));
+            assert!(rendered[4].starts_with("SELECT * FROM "));
+            assert!(rendered[5].starts_with("UPDATE target SET x = 1 FROM "));
+        }
+    }
+
+    #[test]
+    fn nested_explain_height_1000_and_1001_formats_on_one_mib_stack() {
+        for height in [1000, 1001] {
+            let mut statement = drop_table("leaf");
+            for level in 0..height {
+                statement = Statement::Explain {
+                    query_plan: level % 2 == 0,
+                    stmt: Box::new(statement),
+                };
+            }
+
+            let rendered = format_statement_on_one_mib_stack(statement);
+            let mut tail = rendered.as_str();
+            for level in (0..height).rev() {
+                let prefix = if level % 2 == 0 {
+                    "EXPLAIN QUERY PLAN "
+                } else {
+                    "EXPLAIN "
+                };
+                tail = tail
+                    .strip_prefix(prefix)
+                    .expect("EXPLAIN wrappers must retain their exact order");
+            }
+            assert_eq!(tail, "DROP TABLE leaf");
+        }
+    }
+
+    #[test]
+    fn nested_trigger_body_height_1000_and_1001_formats_on_one_mib_stack() {
+        for height in [1000, 1001] {
+            let mut statement = drop_table("leaf");
+            for level in 0..height {
+                statement = Statement::CreateTrigger(CreateTriggerStatement {
+                    if_not_exists: false,
+                    temporary: false,
+                    name: QualifiedName::bare(format!("trigger_{level}")),
+                    timing: TriggerTiming::After,
+                    event: TriggerEvent::Insert,
+                    table: "target".to_owned(),
+                    for_each_row: false,
+                    when: None,
+                    body: vec![statement],
+                });
+            }
+
+            let rendered = format_statement_on_one_mib_stack(statement);
+            assert_eq!(rendered.matches("CREATE TRIGGER ").count(), height);
+            assert_eq!(rendered.matches("; END").count(), height);
+            assert!(rendered.contains("DROP TABLE leaf"));
+            assert!(rendered.ends_with("END"));
+        }
+    }
+
+    #[test]
+    fn iterative_public_roots_preserve_shallow_sql() {
+        let joined = FromClause {
+            source: table_source("a"),
+            joins: vec![JoinClause {
+                join_type: JoinType {
+                    natural: false,
+                    kind: JoinKind::Inner,
+                },
+                table: table_source("b"),
+                constraint: Some(JoinConstraint::On(binary(
+                    column("a_id"),
+                    BinaryOp::Eq,
+                    column("b_id"),
+                ))),
+            }],
+        };
+        assert_eq!(joined.to_string(), "a INNER JOIN b ON a_id = b_id");
+
+        let body = SelectBody {
+            select: SelectCore::Select {
+                distinct: Distinctness::All,
+                columns: vec![ResultColumn::Star],
+                from: Some(joined),
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            compounds: Vec::new(),
+        };
+        assert_eq!(
+            body.to_string(),
+            "SELECT * FROM a INNER JOIN b ON a_id = b_id"
+        );
+
+        let compounds = SelectBody {
+            select: SelectCore::Values(vec![vec![integer(1)]]),
+            compounds: vec![
+                (
+                    CompoundOp::UnionAll,
+                    SelectCore::Values(vec![vec![integer(2)]]),
+                ),
+                (
+                    CompoundOp::Except,
+                    SelectCore::Values(vec![vec![integer(3)]]),
+                ),
+            ],
+        };
+        assert_eq!(
+            compounds.to_string(),
+            "VALUES (1) UNION ALL VALUES (2) EXCEPT VALUES (3)"
+        );
+
+        let update = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("target"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("x".to_owned()),
+                value: integer(1),
+            }],
+            from: Some(FromClause {
+                source: table_source("source"),
+                joins: Vec::new(),
+            }),
+            where_clause: Some(binary(column("id"), BinaryOp::Eq, integer(7))),
+            returning: vec![ResultColumn::Expr {
+                expr: column("x"),
+                alias: Some("updated".to_owned()),
+            }],
+            order_by: vec![OrderingTerm {
+                expr: column("id"),
+                direction: Some(SortDirection::Desc),
+                nulls: Some(NullsOrder::Last),
+            }],
+            limit: Some(LimitClause {
+                limit: integer(10),
+                offset: Some(integer(2)),
+            }),
+        };
+        assert_eq!(
+            update.to_string(),
+            "UPDATE target SET x = 1 FROM source WHERE id = 7 RETURNING x AS updated \
+             ORDER BY id DESC NULLS LAST LIMIT 10 OFFSET 2"
+        );
+
+        let explained = Statement::Explain {
+            query_plan: true,
+            stmt: Box::new(drop_table("old")),
+        };
+        assert_eq!(explained.to_string(), "EXPLAIN QUERY PLAN DROP TABLE old");
+
+        let trigger = CreateTriggerStatement {
+            if_not_exists: false,
+            temporary: false,
+            name: QualifiedName::bare("tr"),
+            timing: TriggerTiming::After,
+            event: TriggerEvent::Insert,
+            table: "target".to_owned(),
+            for_each_row: false,
+            when: None,
+            body: vec![drop_table("old"), drop_table("older")],
+        };
+        assert_eq!(
+            trigger.to_string(),
+            "CREATE TRIGGER tr AFTER INSERT ON target BEGIN \
+             DROP TABLE old; DROP TABLE older; END"
+        );
+    }
+
+    #[test]
+    fn representative_rich_select_stays_in_inline_task_stack() {
+        let cte_query = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(vec![vec![integer(1)]]),
+                compounds: Vec::new(),
+            },
+            order_by: Vec::new(),
+            limit: None,
+        };
+        let select = SelectStatement {
+            with: Some(WithClause {
+                recursive: false,
+                ctes: vec![Cte {
+                    name: "seed".to_owned(),
+                    columns: vec!["id".to_owned()],
+                    materialized: Some(CteMaterialized::NotMaterialized),
+                    query: cte_query,
+                }],
+            }),
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::Distinct,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: column("a_id"),
+                            alias: Some("id".to_owned()),
+                        },
+                        ResultColumn::Expr {
+                            expr: column("b_value"),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: table_source("a"),
+                        joins: vec![JoinClause {
+                            join_type: JoinType {
+                                natural: false,
+                                kind: JoinKind::Left,
+                            },
+                            table: table_source("b"),
+                            constraint: Some(JoinConstraint::On(binary(
+                                column("a_id"),
+                                BinaryOp::Eq,
+                                column("b_id"),
+                            ))),
+                        }],
+                    }),
+                    where_clause: Some(Box::new(binary(column("a_id"), BinaryOp::Gt, integer(0)))),
+                    group_by: vec![column("a_id")],
+                    having: Some(Box::new(binary(
+                        column("b_value"),
+                        BinaryOp::IsNot,
+                        Expr::Literal(Literal::Null, Span::ZERO),
+                    ))),
+                    windows: vec![WindowDef {
+                        name: "w".to_owned(),
+                        spec: WindowSpec {
+                            window_ref: None,
+                            partition_by: vec![column("a_id")],
+                            order_by: vec![OrderingTerm {
+                                expr: column("b_value"),
+                                direction: Some(SortDirection::Desc),
+                                nulls: None,
+                            }],
+                            frame: None,
+                        },
+                    }],
+                },
+                compounds: Vec::new(),
+            },
+            order_by: vec![OrderingTerm {
+                expr: column("a_id"),
+                direction: Some(SortDirection::Asc),
+                nulls: Some(NullsOrder::First),
+            }],
+            limit: Some(LimitClause {
+                limit: integer(25),
+                offset: Some(integer(5)),
+            }),
+        };
+
+        assert_eq!(
+            select.to_string(),
+            "WITH seed(id) AS NOT MATERIALIZED (VALUES (1)) \
+             SELECT DISTINCT a_id AS id, b_value FROM a \
+             LEFT JOIN b ON a_id = b_id WHERE a_id > 0 GROUP BY a_id \
+             HAVING b_value IS NOT NULL WINDOW w AS \
+             (PARTITION BY a_id ORDER BY b_value DESC) \
+             ORDER BY a_id ASC NULLS FIRST LIMIT 25 OFFSET 5"
+        );
+        let task_stats = LAST_EXPR_WRITE_TASK_STACK_STATS.with(std::cell::Cell::get);
+        assert!(
+            !task_stats.spilled,
+            "representative rich SELECT should remain in the inline task stack"
+        );
+        assert!(task_stats.peak_len <= INLINE_EXPR_WRITE_TASKS);
+    }
+
+    #[test]
+    fn binary_operands_use_minimal_semantics_preserving_parentheses() {
+        let tighter_right = binary(
+            column("a"),
+            BinaryOp::Add,
+            binary(column("b"), BinaryOp::Multiply, integer(2)),
+        );
+        assert_eq!(tighter_right.to_string(), "a + b * 2");
+
+        let looser_right = binary(
+            column("a"),
+            BinaryOp::Multiply,
+            binary(column("b"), BinaryOp::Add, column("c")),
+        );
+        assert_eq!(looser_right.to_string(), "a * (b + c)");
+
+        let left_associative = binary(
+            binary(column("a"), BinaryOp::Subtract, column("b")),
+            BinaryOp::Subtract,
+            column("c"),
+        );
+        assert_eq!(left_associative.to_string(), "a - b - c");
+
+        let right_subtract = binary(
+            column("a"),
+            BinaryOp::Subtract,
+            binary(column("b"), BinaryOp::Subtract, column("c")),
+        );
+        assert_eq!(right_subtract.to_string(), "a - (b - c)");
+
+        let right_divide = binary(
+            column("a"),
+            BinaryOp::Divide,
+            binary(column("b"), BinaryOp::Divide, column("c")),
+        );
+        assert_eq!(right_divide.to_string(), "a / (b / c)");
+
+        let and_chain = binary(
+            column("a"),
+            BinaryOp::And,
+            binary(column("b"), BinaryOp::And, column("c")),
+        );
+        assert_eq!(and_chain.to_string(), "a AND b AND c");
+
+        let or_chain = binary(
+            column("a"),
+            BinaryOp::Or,
+            binary(column("b"), BinaryOp::Or, column("c")),
+        );
+        assert_eq!(or_chain.to_string(), "a OR b OR c");
     }
 
     #[test]
@@ -2032,8 +3165,54 @@ mod expr_display_tests {
         }
 
         let rendered = expr.to_string();
+        let task_stats = LAST_EXPR_WRITE_TASK_STACK_STATS.with(std::cell::Cell::get);
+        assert!(
+            task_stats.spilled,
+            "height-1000 expression should exercise the heap spill path"
+        );
+        assert!(task_stats.peak_len > INLINE_EXPR_WRITE_TASKS);
         assert_eq!(rendered.matches('+').count(), 999);
         assert!(rendered.ends_with(" + 1"));
+    }
+
+    #[test]
+    fn scalar_subquery_display_height_1000_uses_one_mib_stack() {
+        let mut expr = Expr::Literal(Literal::Integer(1), Span::ZERO);
+        for _ in 1..1000 {
+            expr = Expr::Subquery(
+                Box::new(SelectStatement {
+                    with: None,
+                    body: SelectBody {
+                        select: SelectCore::Select {
+                            distinct: Distinctness::All,
+                            columns: vec![ResultColumn::Expr { expr, alias: None }],
+                            from: None,
+                            where_clause: None,
+                            group_by: Vec::new(),
+                            having: None,
+                            windows: Vec::new(),
+                        },
+                        compounds: Vec::new(),
+                    },
+                    order_by: Vec::new(),
+                    limit: None,
+                }),
+                Span::ZERO,
+            );
+        }
+
+        let (rendered, expr) = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let rendered = expr.to_string();
+                (rendered, expr)
+            })
+            .expect("1 MiB formatter thread must spawn")
+            .join()
+            .expect("height-1000 scalar subquery formatting must not overflow");
+        drop_scalar_subquery_chain_iteratively(expr);
+        assert_eq!(rendered.matches("(SELECT ").count(), 999);
+        assert!(rendered.ends_with(&")".repeat(999)));
     }
 
     #[test]
@@ -2054,6 +3233,34 @@ mod expr_display_tests {
     }
 
     #[test]
+    fn like_escape_operand_preserves_comparison_grouping() {
+        let expr = Expr::Like {
+            expr: Box::new(column("value")),
+            pattern: Box::new(column("pattern")),
+            escape: Some(Box::new(binary(
+                column("lower"),
+                BinaryOp::Lt,
+                column("upper"),
+            ))),
+            op: LikeOp::Like,
+            not: false,
+            span: Span::ZERO,
+        };
+        assert_eq!(
+            expr.to_string(),
+            "value LIKE pattern ESCAPE (lower < upper)"
+        );
+    }
+
+    #[test]
+    fn infinite_float_literals_render_as_numeric_sql() {
+        assert_eq!(Literal::Float(f64::INFINITY).to_string(), "9e999");
+        assert_eq!(Literal::Float(f64::NEG_INFINITY).to_string(), "-9e999");
+        assert_eq!(Literal::Float(f64::NAN).to_string(), "NULL");
+        assert_eq!(Literal::Float(-f64::NAN).to_string(), "NULL");
+    }
+
+    #[test]
     fn collation_names_use_identifier_quoting() {
         let expr = Expr::Collate {
             expr: Box::new(column("value")),
@@ -2064,7 +3271,7 @@ mod expr_display_tests {
     }
 
     #[test]
-    fn window_base_keeps_extensions_but_bare_base_stays_unparenthesized() {
+    fn window_reference_form_is_preserved_exactly() {
         let extended = Expr::FunctionCall {
             name: "sum".to_owned(),
             args: FunctionArgs::List(vec![column("x")]),
@@ -2072,7 +3279,7 @@ mod expr_display_tests {
             order_by: Vec::new(),
             filter: None,
             over: Some(WindowSpec {
-                base_window: Some("base".to_owned()),
+                window_ref: Some(WindowReference::Base("base".to_owned())),
                 partition_by: vec![column("p")],
                 order_by: vec![OrderingTerm {
                     expr: column("y"),
@@ -2092,6 +3299,12 @@ mod expr_display_tests {
             extended.to_string(),
             "sum(x) OVER (base PARTITION BY p ORDER BY y ROWS BETWEEN z PRECEDING AND CURRENT ROW)"
         );
+        let task_stats = LAST_EXPR_WRITE_TASK_STACK_STATS.with(std::cell::Cell::get);
+        assert!(
+            !task_stats.spilled,
+            "representative window expression should remain in the inline task stack"
+        );
+        assert!(task_stats.peak_len <= INLINE_EXPR_WRITE_TASKS);
 
         let bare = Expr::FunctionCall {
             name: "sum".to_owned(),
@@ -2100,7 +3313,7 @@ mod expr_display_tests {
             order_by: Vec::new(),
             filter: None,
             over: Some(WindowSpec {
-                base_window: Some("base".to_owned()),
+                window_ref: Some(WindowReference::Direct("base".to_owned())),
                 partition_by: Vec::new(),
                 order_by: Vec::new(),
                 frame: None,
@@ -2108,5 +3321,37 @@ mod expr_display_tests {
             span: Span::ZERO,
         };
         assert_eq!(bare.to_string(), "sum(x) OVER base");
+        let Expr::FunctionCall {
+            over: Some(bare_window),
+            ..
+        } = &bare
+        else {
+            panic!("bare window function should carry a window");
+        };
+        assert_eq!(bare_window.to_string(), "base");
+
+        let parenthesized = Expr::FunctionCall {
+            name: "sum".to_owned(),
+            args: FunctionArgs::List(vec![column("x")]),
+            distinct: false,
+            order_by: Vec::new(),
+            filter: None,
+            over: Some(WindowSpec {
+                window_ref: Some(WindowReference::Base("base".to_owned())),
+                partition_by: Vec::new(),
+                order_by: Vec::new(),
+                frame: None,
+            }),
+            span: Span::ZERO,
+        };
+        assert_eq!(parenthesized.to_string(), "sum(x) OVER (base)");
+        let Expr::FunctionCall {
+            over: Some(parenthesized_window),
+            ..
+        } = &parenthesized
+        else {
+            panic!("parenthesized window function should carry a window");
+        };
+        assert_eq!(parenthesized_window.to_string(), "(base)");
     }
 }

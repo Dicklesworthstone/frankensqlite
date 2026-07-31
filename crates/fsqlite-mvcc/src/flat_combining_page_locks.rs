@@ -110,6 +110,7 @@ fn record_fc_slot_full_event() {
     FC_SLOT_FULL_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn record_fc_slot_full_park_ns(ns: u64) {
     FC_SLOT_FULL_PARK_NS_TOTAL.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
 }

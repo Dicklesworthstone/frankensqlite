@@ -140,7 +140,7 @@ FrankenSQLite is organized as a 27-member Cargo workspace with strict layered de
 | | `fsqlite-mvcc` | MVCC page versioning, snapshot management, conflict detection, epoch-based reclamation |
 | | `fsqlite-btree` | B-tree/B+tree: cell parsing, page splitting, overflow chains, cursor navigation |
 | **SQL** | `fsqlite-ast` | Typed AST nodes for all SQL statements and expressions |
-| | `fsqlite-parser` | Hand-written recursive descent parser with Pratt expression parsing |
+| | `fsqlite-parser` | Hand-written statement grammar with explicit-state Pratt/SELECT parsing |
 | | `fsqlite-planner` | Name resolution, WHERE analysis, join ordering, index selection |
 | | `fsqlite-vdbe` | Bytecode VM: 190+ opcodes, register file, fetch-execute loop |
 | | `fsqlite-func` | Scalar, aggregate, and window functions (abs, count, row_number, etc.) |
@@ -490,7 +490,14 @@ Deleted pages go onto a freelist rather than being returned to the OS. The freel
 
 ## The SQL Parser
 
-FrankenSQLite uses a hand-written recursive descent parser rather than a parser generator. C SQLite uses LEMON (a yacc variant); we chose recursive descent because it produces better error messages, is easier to debug, and gives us full control over precedence and associativity.
+FrankenSQLite uses a hand-written parser rather than a parser generator. Direct
+statement and DDL routines handle the outer grammar, while explicit
+heap-backed state machines use Pratt binding powers for expressions and a
+separate frame stack for SELECT trees. C SQLite uses LEMON (a yacc variant);
+the hand-written design keeps precise source-span diagnostics and gives us
+direct control over precedence, associativity, and expression-height
+enforcement without relying on the native call stack for deeply nested
+expression or SELECT trees.
 
 ### Lexer
 
@@ -2289,7 +2296,7 @@ Actions on parent change:
     Same five actions available for ON UPDATE.
 
 Implementation:
-    Each FK creates implicit triggers:
+    DML dispatch enforces each FK as an implicit action program:
     - Before INSERT on child: verify parent exists
     - Before UPDATE on child FK cols: verify new parent exists
     - After DELETE on parent: execute ON DELETE action
@@ -2300,7 +2307,9 @@ Deferred foreign keys interact with savepoints: `ROLLBACK TO savepoint` can re-v
 
 ### Trigger System Architecture
 
-Triggers fire procedural code in response to DML events. FrankenSQLite implements the complete SQLite trigger model, including INSTEAD OF triggers on views.
+Triggers fire procedural code in response to DML events. FrankenSQLite implements
+BEFORE, AFTER, and INSTEAD OF trigger infrastructure, but its control-flow
+semantics are not yet a complete SQLite match.
 
 ```
 Trigger types:
@@ -2312,19 +2321,33 @@ Pseudo-table access:
     NEW.column    → the row being inserted/updated (available in INSERT, UPDATE)
     OLD.column    → the row being deleted/updated (available in DELETE, UPDATE)
 
-RAISE functions (trigger-specific error control):
-    RAISE(IGNORE)                → silently skip this row
+SQLite target semantics for RAISE functions:
+    RAISE(IGNORE)                → abandon the rest of the current trigger
+                                   program, the causing statement, and subsequent
+                                   trigger programs, without rolling back changes
+                                   already made
     RAISE(ROLLBACK, 'message')   → rollback entire transaction
     RAISE(ABORT, 'message')      → rollback statement, keep transaction
     RAISE(FAIL, 'message')       → stop statement but keep changes so far
 
 Execution model:
-    Triggers compile to VDBE subroutines.
-    Trigger body is a sequence of DML statements, each compiled independently.
-    Current generated trigger/FK action depth bound: 8.
+    Trigger bodies currently re-enter Connection DML dispatch recursively;
+    they are not VDBE Program subroutines.
+    Each body statement is dispatched independently through the normal
+    trigger/FK/constraint/transaction pipeline.
+    Pure-trigger admission currently stops at depth 8. Trigger and FK-action
+    programs also share an aggregate admission ceiling of 50.
+    Neither ceiling is a release-certified native-stack safety claim: the
+    required out-of-process requested-1-MiB-stack matrix must pass in both debug
+    and the exact release profile, with target and toolchain provenance, before
+    a native recursive ceiling is certified.
     SQLite's default depth of 1000 remains a compatibility target gated on
-    exact bounded-stack proof.
+    replacing recursive native dispatch with a heap work stack or trampoline.
     Recursive triggers require PRAGMA recursive_triggers = ON.
+
+Current `RAISE(IGNORE)` handling only proves the narrower BEFORE-trigger,
+single-row `SkipDml` path. Statement-wide abandonment, subsequent-trigger
+suppression, and SQLite's no-rollback boundary remain release blockers.
 ```
 
 Triggers interact with MVCC: a BEFORE trigger that reads other tables establishes rw-dependencies tracked by the SireadTable for SSI validation. A trigger that writes to other tables extends the transaction's write set and page lock set.
@@ -2569,7 +2592,13 @@ FrankenSQLite deliberately omits several components of the C SQLite ecosystem. E
 
 **TCL test harness.** C SQLite's test suite is driven by ~90,000+ lines of TCL scripts deeply intertwined with the C API. These cannot be meaningfully ported. Instead, FrankenSQLite uses native Rust `#[test]` modules, proptest for property-based testing, a conformance harness comparing SQL output against C SQLite golden files, and asupersync's lab reactor for deterministic concurrency tests.
 
-**LEMON parser generator.** C SQLite uses a custom LALR(1) parser generator called LEMON to produce `parse.c` from `parse.y`. FrankenSQLite uses a hand-written recursive descent parser with Pratt precedence for expressions. This yields better error messages with precise source span reporting, simpler maintenance, and no build-time code generation step. The `parse.y` grammar still serves as an authoritative reference.
+**LEMON parser generator.** C SQLite uses a custom LALR(1) parser generator
+called LEMON to produce `parse.c` from `parse.y`. FrankenSQLite instead uses
+hand-written statement and DDL routines plus explicit heap-backed state
+machines: Pratt tasks for expressions and frames for SELECT trees. This yields
+precise source-span diagnostics, direct expression-height enforcement, simpler
+maintenance, and no build-time code generation step. The `parse.y` grammar
+still serves as an authoritative reference.
 
 **Loadable extension API (.so/.dll).** C SQLite supports dynamically loading extensions via `sqlite3_load_extension()`, requiring a C-compatible ABI and `dlopen`/`LoadLibrary` calls. FrankenSQLite instead compiles all extensions directly into the binary, controlled by Cargo features. This eliminates an entire class of security vulnerabilities (arbitrary code loading) and simplifies deployment. Users who need custom extensions implement Rust traits and recompile.
 

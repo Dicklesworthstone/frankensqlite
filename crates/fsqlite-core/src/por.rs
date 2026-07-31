@@ -9,8 +9,8 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
+use fsqlite_types::sync_primitives::Instant;
 use tracing::{Level, error, info, span};
 
 // ---------------------------------------------------------------------------

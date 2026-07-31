@@ -1820,6 +1820,8 @@ mod tests {
                 .bind_with_gate_release(identity, |gate| {
                     #[cfg(unix)]
                     retained_gate.replace(Some(gate.try_clone()?));
+                    #[cfg(not(unix))]
+                    let _ = &gate;
                     Err(FrankenError::internal(
                         "injected namespace gate release failure",
                     ))

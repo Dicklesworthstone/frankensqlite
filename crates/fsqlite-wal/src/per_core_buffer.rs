@@ -1,13 +1,13 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(test)]
 use asupersync::runtime::{Runtime, RuntimeBuilder, spawn_blocking};
 #[cfg(test)]
 use asupersync::time::{sleep, wall_now};
-use fsqlite_types::{CommitSeq, PageNumber, TxnEpoch, TxnId, TxnToken};
+use fsqlite_types::{CommitSeq, PageNumber, TxnEpoch, TxnId, TxnToken, sync_primitives::Instant};
 
 /// Per-core WAL buffer capacity in bytes. With N CPU cores, the total
 /// memory commitment is N × 4 MiB. On memory-constrained systems, reduce

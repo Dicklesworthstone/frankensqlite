@@ -1,7 +1,8 @@
 # fsqlite-parser
 
-Hand-written recursive descent SQL parser with Pratt precedence-climbing for
-expressions. Converts SQL text into a typed AST defined in `fsqlite-ast`.
+Hand-written SQL parser with direct statement/DDL routines and explicit
+heap-backed state machines: Pratt tasks for expressions and frames for SELECT
+trees. Converts SQL text into a typed AST defined in `fsqlite-ast`.
 
 ## Overview
 
@@ -24,7 +25,8 @@ SQL text
     --> fsqlite-vdbe (bytecode codegen)
 ```
 
-Dependencies: `fsqlite-types`, `fsqlite-error`, `fsqlite-ast`, `memchr`.
+Dependencies: `fsqlite-types`, `fsqlite-error`, `fsqlite-ast`, `hashbrown`,
+`memchr`, and `tracing`.
 
 ## Key Types
 
@@ -33,8 +35,9 @@ Dependencies: `fsqlite-types`, `fsqlite-error`, `fsqlite-ast`, `memchr`.
   error reporting.
 - `Token` / `TokenKind` -- A single lexical token with span information and its
   variant (keyword, identifier, literal, operator, etc.).
-- `Parser` -- Recursive descent parser. Call `Parser::parse()` to produce a
-  `Vec<Statement>` (from `fsqlite-ast`).
+- `Parser` -- SQL parser. Use `Parser::from_sql()` followed by
+  `Parser::parse_all()` to produce `Statement` values and structured parse
+  errors.
 - `ParseError` -- Error type returned when parsing fails, with span and message.
 - `Resolver` / `Schema` / `Scope` -- Semantic analysis layer for name
   resolution, column validation, and function arity checking after parsing.
@@ -46,16 +49,20 @@ Dependencies: `fsqlite-types`, `fsqlite-error`, `fsqlite-ast`, `memchr`.
 ## Usage
 
 ```rust
-use fsqlite_parser::{Lexer, Parser, Token, TokenKind};
+use fsqlite_parser::{Lexer, Parser};
 use fsqlite_ast::Statement;
 
 // Tokenize
-let lexer = Lexer::new("SELECT 1 + 2;");
-let tokens: Vec<Token> = lexer.collect();
+let tokens = Lexer::tokenize("SELECT 1 + 2;");
+assert!(!tokens.is_empty());
 
 // Parse
-let mut parser = Parser::new("SELECT name, age FROM users WHERE id = ?1;");
-let statements: Vec<Statement> = parser.parse().expect("valid SQL");
+let mut parser = Parser::from_sql(
+    "SELECT name, age FROM users WHERE id = ?1;",
+);
+let (statements, errors) = parser.parse_all();
+assert!(errors.is_empty(), "valid SQL: {errors:?}");
+assert!(matches!(statements.as_slice(), [Statement::Select(_)]));
 
 // Semantic analysis (optional, requires schema info)
 use fsqlite_parser::{Resolver, Schema};

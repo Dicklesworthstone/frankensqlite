@@ -765,11 +765,35 @@ pub enum RaiseAction {
 // Window specifications
 // ---------------------------------------------------------------------------
 
+/// How a window specification refers to a named window.
+///
+/// SQLite assigns different semantics to a bare `OVER name` reference and a
+/// leading base name inside `OVER (name ...)` or `WINDOW child AS (name ...)`.
+/// The former selects the named definition directly, while the latter derives
+/// a new window and is therefore subject to clause-override restrictions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WindowReference {
+    /// A bare `OVER name` reference.
+    Direct(String),
+    /// A base name inside a parenthesized window specification.
+    Base(String),
+}
+
+impl WindowReference {
+    /// Return the referenced window name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Direct(name) | Self::Base(name) => name,
+        }
+    }
+}
+
 /// Window specification for window functions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowSpec {
-    /// Optional base window name.
-    pub base_window: Option<String>,
+    /// Optional direct or derived reference to a named window.
+    pub window_ref: Option<WindowReference>,
     /// PARTITION BY expressions.
     pub partition_by: Vec<Expr>,
     /// ORDER BY terms within the window.
@@ -2239,7 +2263,7 @@ mod tests {
             order_by: vec![],
             filter: None,
             over: Some(WindowSpec {
-                base_window: None,
+                window_ref: None,
                 partition_by: vec![Expr::Column(ColumnRef::bare("dept"), span)],
                 order_by: vec![OrderingTerm {
                     expr: Expr::Column(ColumnRef::bare("salary"), span),

@@ -10,8 +10,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsqlite_types::sync_primitives::SystemTime;
 use fsqlite_types::{CommitSeq, PageNumber, TxnToken};
 use tracing::{debug, info, warn};
 
@@ -1505,7 +1505,7 @@ fn with_locked<T, U>(state: &Mutex<T>, f: impl FnOnce(&mut T) -> U) -> U {
 }
 
 fn now_unix_ns() -> u64 {
-    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+    let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
         return 0;
     };
     let nanos = duration.as_nanos();

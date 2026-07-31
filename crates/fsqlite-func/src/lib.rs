@@ -634,6 +634,67 @@ impl FunctionRegistry {
         self.windows.keys().any(|k| k.name == canon)
     }
 
+    /// Return whether a known scalar function accepts the SQL-visible arity.
+    ///
+    /// `None` means the name is not registered as a scalar function at all.
+    /// Unlike [`Self::find_scalar`], this never constructs or invokes a
+    /// wrong-arity sentinel, so preparation-only validation remains free of
+    /// user-function side effects.
+    #[must_use]
+    pub fn scalar_accepts_arg_count(&self, name: &str, num_args: i32) -> Option<bool> {
+        let canon = canonical_name(name);
+        let exact = FunctionKey {
+            name: canon.clone(),
+            num_args,
+        };
+        if let Some(function) = self.scalars.get(&exact) {
+            return Some(function.accepts_arg_count(num_args));
+        }
+
+        let variadic = FunctionKey {
+            name: canon.clone(),
+            num_args: -1,
+        };
+        if let Some(function) = self.scalars.get(&variadic) {
+            return Some(function.accepts_arg_count(num_args));
+        }
+
+        self.scalars
+            .keys()
+            .any(|key| key.name == canon)
+            .then_some(false)
+    }
+
+    /// Return whether a known aggregate function accepts the SQL-visible arity.
+    ///
+    /// `None` means the name is not registered as an aggregate function at
+    /// all. This is the side-effect-free counterpart to
+    /// [`Self::find_aggregate`] for preparation-only validation.
+    #[must_use]
+    pub fn aggregate_accepts_arg_count(&self, name: &str, num_args: i32) -> Option<bool> {
+        let canon = canonical_name(name);
+        let exact = FunctionKey {
+            name: canon.clone(),
+            num_args,
+        };
+        if let Some(function) = self.aggregates.get(&exact) {
+            return Some(function.accepts_arg_count(num_args));
+        }
+
+        let variadic = FunctionKey {
+            name: canon.clone(),
+            num_args: -1,
+        };
+        if let Some(function) = self.aggregates.get(&variadic) {
+            return Some(function.accepts_arg_count(num_args));
+        }
+
+        self.aggregates
+            .keys()
+            .any(|key| key.name == canon)
+            .then_some(false)
+    }
+
     /// Return whether a known window function accepts the SQL-visible arity.
     ///
     /// `None` means the name is not registered as a window function at all.
@@ -1233,6 +1294,35 @@ mod tests {
         assert!(registry.find_scalar("nonexistent", 1).is_none());
         assert!(registry.find_aggregate("nonexistent", 1).is_none());
         assert!(registry.find_window("nonexistent", 1).is_none());
+    }
+
+    #[test]
+    fn test_registry_scalar_aggregate_arity_introspection_is_side_effect_free() {
+        let mut registry = FunctionRegistry::new();
+        registry.register_scalar(Double);
+        registry.register_scalar(VariadicConcat);
+        registry.register_aggregate(Product);
+
+        assert_eq!(registry.scalar_accepts_arg_count("double", 1), Some(true));
+        assert_eq!(registry.scalar_accepts_arg_count("double", 2), Some(false));
+        assert_eq!(registry.scalar_accepts_arg_count("my_func", 1), Some(true));
+        assert_eq!(registry.scalar_accepts_arg_count("my_func", 3), Some(true));
+        assert_eq!(registry.scalar_accepts_arg_count("my_func", 0), Some(false));
+        assert_eq!(registry.scalar_accepts_arg_count("my_func", 4), Some(false));
+        assert_eq!(registry.scalar_accepts_arg_count("missing_scalar", 1), None);
+
+        assert_eq!(
+            registry.aggregate_accepts_arg_count("product", 1),
+            Some(true)
+        );
+        assert_eq!(
+            registry.aggregate_accepts_arg_count("product", 0),
+            Some(false)
+        );
+        assert_eq!(
+            registry.aggregate_accepts_arg_count("missing_aggregate", 1),
+            None
+        );
     }
 
     #[test]

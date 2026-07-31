@@ -25,10 +25,10 @@ use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{LockLevel, PageNumber, PageSize};
-use fsqlite_vfs::traits::{Vfs, VfsFile};
 #[cfg(unix)]
-use fsqlite_vfs::{FileIdentity, SyncKind, UnixVfs};
-use fsqlite_vfs::{MemoryVfs, ShmRegion};
+use fsqlite_vfs::UnixVfs;
+use fsqlite_vfs::traits::{Vfs, VfsFile};
+use fsqlite_vfs::{FileIdentity, MemoryVfs, ShmRegion, SyncKind};
 use serde_json::{Value, json};
 
 const BEAD_ID: &str = "bd-mblr.2.3";
@@ -273,6 +273,10 @@ impl<F: VfsFile> VfsFile for TargetedFaultFile<F> {
         self.inner.close(cx)
     }
 
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.file_identity()
+    }
+
     fn read<'a>(
         &'a self,
         cx: &'a Cx,
@@ -355,6 +359,29 @@ impl<F: VfsFile> VfsFile for TargetedFaultFile<F> {
         }
     }
 
+    fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        let should_fail = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.sync_io_armed {
+                state.sync_io_armed = false;
+                state.triggered_sync_failures += 1;
+                state.last_sync_failure_detail = Some(format!("kind={kind:?}"));
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_fail {
+            Err(targeted_io_error("fault injection: sync failure"))
+        } else {
+            self.inner.durable_sync(cx, kind)
+        }
+    }
+
     fn file_size(&self, cx: &Cx) -> Result<u64> {
         self.inner.file_size(cx)
     }
@@ -365,6 +392,22 @@ impl<F: VfsFile> VfsFile for TargetedFaultFile<F> {
 
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
         self.inner.unlock(cx, level)
+    }
+
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_shared_snapshot(cx)
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_shared_snapshot_attempt(cx)
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        self.inner.lock_external_maintenance(cx, wal_mode)
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_maintenance_attempt(cx)
     }
 
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
@@ -510,6 +553,42 @@ fn fault_injection_io_error_mid_write_recovers_original_page_on_reopen() {
             "triggered_faults": fault_triggers_json(&triggers),
         }),
     );
+}
+
+#[test]
+fn targeted_fault_wrapper_preserves_identity_and_durable_sync_semantics() {
+    let path = PathBuf::from("/bd_mblr_2_3_wrapper_contract.db");
+    let backing = MemoryVfs::new();
+    let fault_vfs = TargetedFaultVfs::new(backing);
+    let cx = Cx::new();
+    let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+    let (mut file, _) = fault_vfs
+        .open(&cx, Some(&path), flags)
+        .expect("open targeted fault file");
+
+    assert!(
+        file.file_identity()
+            .expect("read wrapped file identity")
+            .is_some(),
+        "the wrapper must preserve the open file's stable identity"
+    );
+
+    fault_vfs.inject_sync_io();
+    let error = file
+        .durable_sync(&cx, SyncKind::FullDurable)
+        .expect_err("armed sync fault must apply to durable sync");
+    assert!(matches!(error, FrankenError::Io(_)));
+    let snapshot = fault_vfs.snapshot();
+    assert_eq!(snapshot.triggered_sync_failures, 1);
+    assert_eq!(
+        snapshot.last_sync_failure_detail.as_deref(),
+        Some("kind=FullDurable"),
+        "the wrapper must observe durable intent rather than collapsing through sync"
+    );
+
+    file.durable_sync(&cx, SyncKind::FullDurable)
+        .expect("one-shot fault must leave later durable syncs delegated");
+    file.close(&cx).expect("close targeted fault file");
 }
 
 #[test]
@@ -1135,6 +1214,22 @@ impl<F: VfsFile> VfsFile for VacuumFaultFile<F> {
 
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
         self.inner.unlock(cx, level)
+    }
+
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_shared_snapshot(cx)
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_shared_snapshot_attempt(cx)
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        self.inner.lock_external_maintenance(cx, wal_mode)
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_maintenance_attempt(cx)
     }
 
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
