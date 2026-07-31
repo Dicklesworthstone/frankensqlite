@@ -95,11 +95,11 @@ use fsqlite_func::builtins::{
 };
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::{
-    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexConstraint, IndexInfo, VirtualTable,
-    VirtualTableCursor, VtabModuleFactory, module_factory_from,
+    ColumnContext, ConstraintOp, ErasedVtabCursor, ErasedVtabInstance, IndexConstraint, IndexInfo,
+    VirtualTable, VirtualTableCursor, VtabModuleFactory, module_factory_from,
 };
 use fsqlite_func::{
-    ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
+    ErasedWindowFunction, FunctionKey, FunctionRegistry, get_last_changes, get_last_insert_rowid,
     get_total_changes, sqlite_compile_options,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -8941,6 +8941,12 @@ struct DbSnapshot {
 }
 
 #[derive(Debug, Clone)]
+struct PendingLocalLiveVtabPreservation {
+    commit_seq: CommitSeq,
+    table_keys: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
 struct AnalyzePlan {
     targets: Vec<AnalyzeTarget>,
     ensure_stat_table: bool,
@@ -8979,6 +8985,107 @@ struct SavepointEntry {
 enum LiveVtabRegistryUndo {
     Created { table_name: String },
     Dropped { table_name: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveVtabRegistryOrigin {
+    Live,
+    Dropped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveVtabCleanupAction {
+    Disconnect,
+    Destroy,
+}
+
+struct TakenLiveVtabInstance {
+    origin: LiveVtabRegistryOrigin,
+    instance: Box<dyn ErasedVtabInstance>,
+}
+
+fn live_vtab_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+struct LiveVtabCallbackGuard<'a> {
+    depth: &'a Cell<u32>,
+}
+
+impl Drop for LiveVtabCallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get().saturating_sub(1));
+    }
+}
+
+/// Owns an erased virtual-table cursor and keeps its user-defined destructor
+/// inside the same callback phase as xFilter/xColumn/xNext. The guard is built
+/// inside xOpen callbacks so it also protects cursors discarded while a
+/// detached table instance is being reconciled with the live registry.
+struct LiveVtabCursorGuard<'a> {
+    depth: &'a Cell<u32>,
+    cursor: Option<Box<dyn ErasedVtabCursor>>,
+}
+
+impl<'a> LiveVtabCursorGuard<'a> {
+    fn new(depth: &'a Cell<u32>, cursor: Box<dyn ErasedVtabCursor>) -> Self {
+        Self {
+            depth,
+            cursor: Some(cursor),
+        }
+    }
+}
+
+impl std::ops::Deref for LiveVtabCursorGuard<'_> {
+    type Target = dyn ErasedVtabCursor;
+
+    fn deref(&self) -> &Self::Target {
+        self.cursor
+            .as_deref()
+            .expect("live virtual-table cursor is present until guard drop")
+    }
+}
+
+impl std::ops::DerefMut for LiveVtabCursorGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.cursor
+            .as_deref_mut()
+            .expect("live virtual-table cursor is present until guard drop")
+    }
+}
+
+impl Drop for LiveVtabCursorGuard<'_> {
+    fn drop(&mut self) {
+        let Some(cursor) = self.cursor.take() else {
+            return;
+        };
+        let installed_guard = if self.depth.get() == 0 {
+            self.depth.set(1);
+            Some(LiveVtabCallbackGuard { depth: self.depth })
+        } else {
+            None
+        };
+        let already_unwinding = std::thread::panicking();
+        let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(cursor);
+        }));
+        drop(installed_guard);
+        if let Err(payload) = drop_result {
+            if already_unwinding {
+                tracing::error!(
+                    "virtual-table cursor destructor panicked while another callback panic was unwinding"
+                );
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -9688,6 +9795,10 @@ pub struct Connection {
     /// Active transaction handle (Phase 5/bd-1dqg).
     /// Stores the pager transaction state during BEGIN/COMMIT/ROLLBACK.
     active_txn: RefCell<Option<TransactionKind>>,
+    /// Local schema generation captured when the current implicit transaction
+    /// began. Used to prevent a reentrant schema change during DML from arming
+    /// a live-vtab preservation receipt merely because the outer AST was DML.
+    autocommit_txn_begin_schema_generation: Cell<Option<u64>>,
     /// Cached read-only pager transaction for autocommit SELECT fast-path.
     ///
     /// When a read-only autocommit SELECT finishes, instead of committing the
@@ -9970,8 +10081,7 @@ pub struct Connection {
     /// Retaining the exact registry `Arc` lets that path fail closed only when
     /// lookup actually selected a custom function, including exact-vs-variadic
     /// precedence, without rejecting unrelated built-ins.
-    custom_window_functions:
-        RefCell<HashMap<(String, i32), Arc<ErasedWindowFunction>>>,
+    custom_window_functions: RefCell<HashMap<(String, i32), Arc<ErasedWindowFunction>>>,
     /// Whether a replacement can change `LIKE`/`GLOB` prefix semantics.
     ///
     /// Codegen and planner prefix rewrites are valid only for the built-ins.
@@ -10223,10 +10333,10 @@ pub struct Connection {
     /// Last commit sequence assigned to a successful local COMMIT executed
     /// through this connection.
     last_local_commit_seq: RefCell<Option<CommitSeq>>,
-    /// One-shot self-read fast path: after this connection durably commits live
-    /// VTAB changes, allow the next schema-stable reload to reuse the current
-    /// in-process instance instead of rebuilding it from persisted rows.
-    pending_local_live_vtab_preserve_once: Cell<bool>,
+    /// One-shot self-read fast path for the exact live VTAB instances enlisted
+    /// in a validated local commit. The receipt is tied to that commit sequence;
+    /// any other committed write clears it before a later reload can reuse it.
+    pending_local_live_vtab_preservation: RefCell<Option<PendingLocalLiveVtabPreservation>>,
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
@@ -10314,11 +10424,38 @@ pub struct Connection {
     /// transaction hook dispatch until COMMIT or rollback restoration.
     dropped_vtab_instances: RefCell<HashMap<String, Box<dyn ErasedVtabInstance>>>,
     /// Live virtual tables that currently participate in this connection's
-    /// transaction/savepoint stack.
-    live_vtab_transactions: RefCell<HashSet<String>>,
+    /// transaction/savepoint stack, mapped to SQLite's `VTable.iSavepoint`
+    /// high-water mark. A table created inside a savepoint is enlisted at zero
+    /// and must not receive an xRelease/xRollbackTo for a savepoint it never
+    /// observed.
+    live_vtab_transactions: RefCell<HashMap<String, usize>>,
     /// Undo log for connection-local VTAB registry topology changes so
     /// savepoint/statement rollback can restore CREATE/DROP VIRTUAL TABLE.
     live_vtab_registry_undo: RefCell<Vec<LiveVtabRegistryUndo>>,
+    /// Late-enlistment savepoint cleanup whose compensating xRollback failed.
+    /// The detached-owner wrapper consumes this marker and disconnects the
+    /// suspect instance instead of restoring it to a public registry.
+    live_vtab_failed_begin_cleanup: RefCell<HashSet<String>>,
+    /// Permanent fail-closed marker installed when an enlisted virtual table's
+    /// final xRollback fails. The instance is no longer trustworthy, and a
+    /// generic module cannot necessarily be rehydrated from pager state, so
+    /// subsequent SQL must not run against a schema/registry split.
+    live_vtab_lifecycle_failure: RefCell<Option<String>>,
+    /// One-shot failure after xCreate has been published into the live
+    /// registry but before the catalog row is written. This proves the
+    /// statement savepoint restores both registry and schema publication.
+    #[cfg(test)]
+    fail_live_vtab_create_after_registry_once: Cell<bool>,
+    /// One-shot failure after a DROP has moved a live instance into the
+    /// transaction-local dropped registry but before the catalog row is
+    /// removed. This proves statement rollback restores the exact instance.
+    #[cfg(test)]
+    fail_live_vtab_drop_after_stage_once: Cell<bool>,
+    /// Non-zero while open user virtual-table code is running against a
+    /// connection-local instance. Public SQL entry points reject recursive
+    /// transaction mutation during this phase instead of observing partially
+    /// published lifecycle state or panicking on a nested `RefCell` borrow.
+    live_vtab_callback_depth: Cell<u32>,
     // ── Parse cache (br-legjy.7.3) ──────────────────────────────────────────
     /// LRU-bounded cache of parsed SQL ASTs keyed by SQL text hash.
     /// Avoids re-parsing the same SQL string on repeated query/execute calls.
@@ -10464,6 +10601,312 @@ impl std::fmt::Debug for Connection {
 
 struct PreparedDirectInsertScratchResetGuard<'a> {
     conn: &'a Connection,
+}
+
+struct TakenLiveVtabRestoreGuard<'a> {
+    conn: &'a Connection,
+    table_key: String,
+    taken: Option<TakenLiveVtabInstance>,
+}
+
+struct PendingLiveVtabGuard<'a> {
+    conn: &'a Connection,
+    cx: Cx,
+    table_name: String,
+    cleanup_action: LiveVtabCleanupAction,
+    instance: Option<Box<dyn ErasedVtabInstance>>,
+}
+
+struct PendingConnectedLiveVtabRegistryGuard<'a> {
+    conn: &'a Connection,
+    cx: Cx,
+    instances: HashMap<String, Box<dyn ErasedVtabInstance>>,
+}
+
+impl<'a> TakenLiveVtabRestoreGuard<'a> {
+    fn new(
+        conn: &'a Connection,
+        table_key: String,
+        taken: TakenLiveVtabInstance,
+    ) -> Self {
+        Self {
+            conn,
+            table_key,
+            taken: Some(taken),
+        }
+    }
+
+    fn instance_mut(&mut self) -> &mut dyn ErasedVtabInstance {
+        self.taken
+            .as_mut()
+            .expect("taken live-vtab guard owns an instance")
+            .instance
+            .as_mut()
+    }
+
+    fn restore(mut self, cx: &Cx) -> Result<()> {
+        let taken = self
+            .taken
+            .take()
+            .expect("taken live-vtab guard owns an instance");
+        self.conn
+            .restore_taken_live_vtab_instance(cx, &self.table_key, taken)
+    }
+
+    fn cleanup(mut self, cx: &Cx, action: LiveVtabCleanupAction) -> Result<()> {
+        let taken = self
+            .taken
+            .take()
+            .expect("taken live-vtab guard owns an instance");
+        self.conn
+            .cleanup_detached_live_vtab(cx, &self.table_key, taken, action)
+    }
+}
+
+impl Drop for TakenLiveVtabRestoreGuard<'_> {
+    fn drop(&mut self) {
+        let Some(taken) = self.taken.take() else {
+            return;
+        };
+        if self
+            .conn
+            .live_vtab_failed_begin_cleanup
+            .borrow_mut()
+            .remove(&self.table_key)
+        {
+            let cx = self.conn.teardown_cx();
+            let cleanup_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.conn.cleanup_detached_live_vtab(
+                        &cx,
+                        &self.table_key,
+                        taken,
+                        LiveVtabCleanupAction::Disconnect,
+                    )
+                }));
+            match cleanup_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::error!(
+                    table = %self.table_key,
+                    error = %error,
+                    "failed to disconnect a cancelled late-enlistment instance"
+                ),
+                Err(_) => tracing::error!(
+                    table = %self.table_key,
+                    "disconnect panicked for a cancelled late-enlistment instance"
+                ),
+            }
+            return;
+        }
+        let origin = taken.origin;
+        let mut instance = Some(taken.instance);
+        let restored = match origin {
+            LiveVtabRegistryOrigin::Live => self
+                .conn
+                .vtab_instances
+                .try_borrow_mut()
+                .ok()
+                .is_some_and(|mut registry| {
+                    if registry.contains_key(&self.table_key) {
+                        false
+                    } else {
+                        registry.insert(
+                            self.table_key.clone(),
+                            instance
+                                .take()
+                                .expect("cancellation restore owns live-vtab instance"),
+                        );
+                        true
+                    }
+                }),
+            LiveVtabRegistryOrigin::Dropped => self
+                .conn
+                .dropped_vtab_instances
+                .try_borrow_mut()
+                .ok()
+                .is_some_and(|mut registry| {
+                    if registry.contains_key(&self.table_key) {
+                        false
+                    } else {
+                        registry.insert(
+                            self.table_key.clone(),
+                            instance
+                                .take()
+                                .expect("cancellation restore owns dropped-vtab instance"),
+                        );
+                        true
+                    }
+                }),
+        };
+        if !restored {
+            tracing::error!(
+                table = %self.table_key,
+                "could not restore a detached virtual table while unwinding an async operation"
+            );
+            let prior_depth = self.conn.live_vtab_callback_depth.get();
+            self.conn
+                .live_vtab_callback_depth
+                .set(prior_depth.saturating_add(1));
+            drop(instance);
+            self.conn.live_vtab_callback_depth.set(prior_depth);
+        }
+    }
+}
+
+impl<'a> PendingLiveVtabGuard<'a> {
+    fn created(
+        conn: &'a Connection,
+        cx: &Cx,
+        table_name: &str,
+        instance: Box<dyn ErasedVtabInstance>,
+    ) -> Self {
+        Self {
+            conn,
+            cx: cx.clone(),
+            table_name: table_name.to_owned(),
+            cleanup_action: LiveVtabCleanupAction::Destroy,
+            instance: Some(instance),
+        }
+    }
+
+    fn connected(
+        conn: &'a Connection,
+        cx: &Cx,
+        table_name: &str,
+        instance: Box<dyn ErasedVtabInstance>,
+    ) -> Self {
+        Self {
+            conn,
+            cx: cx.clone(),
+            table_name: table_name.to_owned(),
+            cleanup_action: LiveVtabCleanupAction::Disconnect,
+            instance: Some(instance),
+        }
+    }
+
+    fn instance(&self) -> &dyn ErasedVtabInstance {
+        self.instance
+            .as_deref()
+            .expect("pending created live-vtab guard owns an instance")
+    }
+
+    fn instance_mut(&mut self) -> &mut dyn ErasedVtabInstance {
+        self.instance
+            .as_deref_mut()
+            .expect("pending live-vtab guard owns an instance")
+    }
+
+    fn take_instance(&mut self) -> Box<dyn ErasedVtabInstance> {
+        self.instance
+            .take()
+            .expect("pending live-vtab guard owns an instance")
+    }
+
+    fn cleanup(mut self) -> Result<()> {
+        let instance = self.take_instance();
+        self.conn.cleanup_detached_live_vtab(
+            &self.cx,
+            &self.table_name,
+            TakenLiveVtabInstance {
+                origin: LiveVtabRegistryOrigin::Live,
+                instance,
+            },
+            self.cleanup_action,
+        )
+    }
+}
+
+impl Drop for PendingLiveVtabGuard<'_> {
+    fn drop(&mut self) {
+        let Some(instance) = self.instance.take() else {
+            return;
+        };
+        let cleanup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.conn.cleanup_detached_live_vtab(
+                &self.cx,
+                &self.table_name,
+                TakenLiveVtabInstance {
+                    origin: LiveVtabRegistryOrigin::Live,
+                    instance,
+                },
+                self.cleanup_action,
+            )
+        }));
+        match cleanup_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(
+                table = %self.table_name,
+                error = %error,
+                "failed to clean up an unpublished virtual-table instance"
+            ),
+            Err(_) => tracing::error!(
+                table = %self.table_name,
+                "virtual-table cleanup panicked while cleaning up an unpublished instance"
+            ),
+        }
+    }
+}
+
+impl<'a> PendingConnectedLiveVtabRegistryGuard<'a> {
+    fn new(conn: &'a Connection, cx: &Cx) -> Self {
+        Self {
+            conn,
+            cx: cx.clone(),
+            instances: HashMap::new(),
+        }
+    }
+
+    fn contains_key(&self, table_key: &str) -> bool {
+        self.instances.contains_key(table_key)
+    }
+
+    fn insert_pending(
+        &mut self,
+        table_key: String,
+        pending: &mut PendingLiveVtabGuard<'_>,
+    ) -> Result<()> {
+        if self.instances.contains_key(&table_key) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "schema reload contains duplicate virtual table key `{table_key}`"
+                ),
+            });
+        }
+        self.instances.insert(table_key, pending.take_instance());
+        Ok(())
+    }
+
+    fn merge(&mut self, mut other: Self) -> Result<()> {
+        if let Some(duplicate) = other
+            .instances
+            .keys()
+            .find(|key| self.instances.contains_key(*key))
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "schema reload contains duplicate virtual table key `{duplicate}`"
+                ),
+            });
+        }
+        self.instances.extend(std::mem::take(&mut other.instances));
+        Ok(())
+    }
+
+    fn into_instances(mut self) -> HashMap<String, Box<dyn ErasedVtabInstance>> {
+        std::mem::take(&mut self.instances)
+    }
+}
+
+impl Drop for PendingConnectedLiveVtabRegistryGuard<'_> {
+    fn drop(&mut self) {
+        let instances = std::mem::take(&mut self.instances);
+        self.conn.cleanup_live_vtab_instances_best_effort(
+            &self.cx,
+            instances,
+            LiveVtabCleanupAction::Disconnect,
+            "abandoned schema-reload candidate registry",
+        );
+    }
 }
 
 impl Drop for PreparedDirectInsertScratchResetGuard<'_> {
@@ -10974,6 +11417,7 @@ impl Connection {
             db: Rc::new(RefCell::new(MemDatabase::new())),
             pager,
             active_txn: RefCell::new(None),
+            autocommit_txn_begin_schema_generation: Cell::new(None),
             cached_read_snapshot: RefCell::new(None),
             cached_read_snapshot_cookie: Cell::new(0),
             cached_read_snapshot_commit_epoch: Cell::new(0),
@@ -11089,7 +11533,7 @@ impl Connection {
             memdb_requires_active_txn_reload: Cell::new(false),
             memdb_storage_count_shortcuts_safe: Cell::new(false),
             last_local_commit_seq: RefCell::new(None),
-            pending_local_live_vtab_preserve_once: Cell::new(false),
+            pending_local_live_vtab_preservation: RefCell::new(None),
             closed: RefCell::new(false),
             post_vacuum_rebind_failure: RefCell::new(None),
             #[cfg(test)]
@@ -11120,8 +11564,15 @@ impl Connection {
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
             dropped_vtab_instances: RefCell::new(HashMap::new()),
-            live_vtab_transactions: RefCell::new(HashSet::new()),
+            live_vtab_transactions: RefCell::new(HashMap::new()),
             live_vtab_registry_undo: RefCell::new(Vec::new()),
+            live_vtab_failed_begin_cleanup: RefCell::new(HashSet::new()),
+            live_vtab_lifecycle_failure: RefCell::new(None),
+            #[cfg(test)]
+            fail_live_vtab_create_after_registry_once: Cell::new(false),
+            #[cfg(test)]
+            fail_live_vtab_drop_after_stage_once: Cell::new(false),
+            live_vtab_callback_depth: Cell::new(0),
             parse_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             parse_cache_cookie: RefCell::new(0),
             compiled_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
@@ -11414,6 +11865,7 @@ impl Connection {
             db: Rc::new(RefCell::new(MemDatabase::new())),
             pager,
             active_txn: RefCell::new(None),
+            autocommit_txn_begin_schema_generation: Cell::new(None),
             cached_read_snapshot: RefCell::new(None),
             cached_read_snapshot_cookie: Cell::new(0),
             cached_read_snapshot_commit_epoch: Cell::new(0),
@@ -11531,7 +11983,7 @@ impl Connection {
             memdb_requires_active_txn_reload: Cell::new(false),
             memdb_storage_count_shortcuts_safe: Cell::new(eager_memdb_rows),
             last_local_commit_seq: RefCell::new(None),
-            pending_local_live_vtab_preserve_once: Cell::new(false),
+            pending_local_live_vtab_preservation: RefCell::new(None),
             closed: RefCell::new(false),
             post_vacuum_rebind_failure: RefCell::new(None),
             #[cfg(test)]
@@ -11569,8 +12021,15 @@ impl Connection {
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
             dropped_vtab_instances: RefCell::new(HashMap::new()),
-            live_vtab_transactions: RefCell::new(HashSet::new()),
+            live_vtab_transactions: RefCell::new(HashMap::new()),
             live_vtab_registry_undo: RefCell::new(Vec::new()),
+            live_vtab_failed_begin_cleanup: RefCell::new(HashSet::new()),
+            live_vtab_lifecycle_failure: RefCell::new(None),
+            #[cfg(test)]
+            fail_live_vtab_create_after_registry_once: Cell::new(false),
+            #[cfg(test)]
+            fail_live_vtab_drop_after_stage_once: Cell::new(false),
+            live_vtab_callback_depth: Cell::new(0),
             // Parse cache (br-legjy.7.3)
             parse_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             parse_cache_cookie: RefCell::new(0),
@@ -11735,9 +12194,20 @@ impl Connection {
 
     /// Return the background-runtime health for this connection's database.
     pub fn background_status(&self) -> Result<()> {
+        if self.live_vtab_callback_depth.get() != 0 {
+            return Err(FrankenError::Internal(
+                "recursive SQL is not allowed while a virtual-table callback is active"
+                    .to_owned(),
+            ));
+        }
         if let Some(detail) = self.post_vacuum_rebind_failure.borrow().as_deref() {
             return Err(FrankenError::Internal(format!(
                 "connection is unusable after a committed VACUUM image could not be rebound: {detail}"
+            )));
+        }
+        if let Some(detail) = self.live_vtab_lifecycle_failure.borrow().as_deref() {
+            return Err(FrankenError::Internal(format!(
+                "connection is unusable after a virtual-table rollback finalizer failed: {detail}"
             )));
         }
         self._shared_mvcc_state.background_status()
@@ -12366,10 +12836,7 @@ impl Connection {
                     )?;
                     let target_exists = self.with_attached_connection(&target_schema, |conn| {
                         Ok(conn
-                            .view_index_for_scope(
-                                &create_view.name.name,
-                                PragmaSchemaScope::Main,
-                            )
+                            .view_index_for_scope(&create_view.name.name, PragmaSchemaScope::Main)
                             .is_some()
                             || conn.table_exists_for_scope(
                                 &create_view.name.name,
@@ -12389,10 +12856,7 @@ impl Connection {
                     // Rebase self-qualified body relations (`aux.t`) before
                     // storing the view so later child-local execution can pin
                     // the persistent body to its owner catalog.
-                    strip_attached_schema_from_select(
-                        &mut rewritten.query,
-                        &target_schema,
-                    );
+                    strip_attached_schema_from_select(&mut rewritten.query, &target_schema);
                     tracing::debug!(
                         schema = %target_schema,
                         view = %create_view.name.name,
@@ -12756,35 +13220,269 @@ impl Connection {
         self.local_transaction_scope_is_active()
     }
 
-    fn can_preserve_existing_live_vtabs_after_reload(
+    fn clear_pending_local_live_vtab_preservation(&self) {
+        *self.pending_local_live_vtab_preservation.borrow_mut() = None;
+    }
+
+    fn arm_pending_local_live_vtab_preservation(
+        &self,
+        txn_begin_visible_commit_seq: Option<CommitSeq>,
+        table_keys: HashSet<String>,
+        schema_unchanged: bool,
+        live_vtab_commit_succeeded: bool,
+    ) {
+        let committed_seq = *self.last_local_commit_seq.borrow();
+        let no_intervening_commit = txn_begin_visible_commit_seq.zip(committed_seq).is_some_and(
+            |(begin_seq, commit_seq)| begin_seq.get().checked_add(1) == Some(commit_seq.get()),
+        );
+        let receipt = (schema_unchanged
+            && live_vtab_commit_succeeded
+            && no_intervening_commit
+            && !table_keys.is_empty())
+        .then(|| PendingLocalLiveVtabPreservation {
+            commit_seq: committed_seq.expect("validated preservation commit sequence"),
+            table_keys,
+        });
+        *self.pending_local_live_vtab_preservation.borrow_mut() = receipt;
+    }
+
+    fn pending_local_live_vtab_keys_for_reload(
         &self,
         bound_visible_commit_seq: CommitSeq,
         reloaded_schema_cookie: u32,
-    ) -> bool {
+    ) -> HashSet<String> {
         // Reusing the in-process live-vtab object is only safe for the
-        // one-shot reload that catches up to this connection's own latest
-        // committed visibility. Any later external commit, even with an
-        // unchanged schema cookie, must rebuild from persisted rows so the
-        // live instance observes other connections' writes.
+        // one-shot reload bound to the exact validated local commit receipt.
+        // Any later commit, even with an unchanged schema cookie, must rebuild
+        // from persisted rows so the live instance observes other connections'
+        // writes. Only the exact locally enlisted table keys are eligible.
         let current_schema_cookie = *self.schema_cookie.borrow();
-        let last_local_commit_seq = *self.last_local_commit_seq.borrow();
-        let pending_local_preserve = self.pending_local_live_vtab_preserve_once.get();
-        let same_local_commit =
-            last_local_commit_seq.is_some_and(|seq| seq == bound_visible_commit_seq);
-        reloaded_schema_cookie == current_schema_cookie
-            && pending_local_preserve
-            && same_local_commit
+        let receipt = self.pending_local_live_vtab_preservation.borrow();
+        receipt
+            .as_ref()
+            .filter(|receipt| {
+                reloaded_schema_cookie == current_schema_cookie
+                    && receipt.commit_seq == bound_visible_commit_seq
+            })
+            .map_or_else(HashSet::new, |receipt| receipt.table_keys.clone())
     }
 
-    fn active_live_vtab_instance_mut<'a>(
-        live_instances: &'a mut HashMap<String, Box<dyn ErasedVtabInstance>>,
-        dropped_instances: &'a mut HashMap<String, Box<dyn ErasedVtabInstance>>,
+    fn enter_live_vtab_callback(&self, callback_name: &str) -> Result<LiveVtabCallbackGuard<'_>> {
+        if self.live_vtab_callback_depth.get() != 0 {
+            return Err(FrankenError::Internal(format!(
+                "recursive virtual-table callback is not allowed while {callback_name} is active"
+            )));
+        }
+        self.live_vtab_callback_depth.set(1);
+        Ok(LiveVtabCallbackGuard {
+            depth: &self.live_vtab_callback_depth,
+        })
+    }
+
+    fn take_active_live_vtab_instance(&self, table_name: &str) -> Option<TakenLiveVtabInstance> {
+        if let Some(instance) = self.vtab_instances.borrow_mut().remove(table_name) {
+            return Some(TakenLiveVtabInstance {
+                origin: LiveVtabRegistryOrigin::Live,
+                instance,
+            });
+        }
+        self.dropped_vtab_instances
+            .borrow_mut()
+            .remove(table_name)
+            .map(|instance| TakenLiveVtabInstance {
+                origin: LiveVtabRegistryOrigin::Dropped,
+                instance,
+            })
+    }
+
+    fn cleanup_detached_live_vtab(
+        &self,
+        cx: &Cx,
         table_name: &str,
-    ) -> Option<&'a mut Box<dyn ErasedVtabInstance>> {
-        if let Some(instance) = live_instances.get_mut(table_name) {
-            Some(instance)
+        mut taken: TakenLiveVtabInstance,
+        action: LiveVtabCleanupAction,
+    ) -> Result<()> {
+        let callback_name = match action {
+            LiveVtabCleanupAction::Disconnect => "xDisconnect",
+            LiveVtabCleanupAction::Destroy => "xDestroy",
+        };
+        let _callback_guard = self.enter_live_vtab_callback(callback_name)?;
+        let cleanup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match action {
+                LiveVtabCleanupAction::Disconnect => taken.instance.disconnect(cx),
+                LiveVtabCleanupAction::Destroy => taken.instance.destroy(cx),
+            }
+        }));
+        // The erased instance can own a user-defined Rust destructor. Drop it
+        // while the callback-phase guard is still active so reentrant SQL
+        // cannot observe partially reconciled transaction state. This is also
+        // deliberately before a callback panic is resumed: otherwise ordinary
+        // parameter unwinding would drop the callback guard first.
+        let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(taken);
+        }));
+        match (cleanup_result, drop_result) {
+            (Ok(Ok(())), Ok(())) => Ok(()),
+            (Ok(Err(error)), Ok(())) => Err(FrankenError::Internal(format!(
+                "virtual table {table_name} {callback_name} failed: {error}"
+            ))),
+            (Err(payload), Ok(())) => Err(FrankenError::Internal(format!(
+                "virtual table {table_name} {callback_name} panicked: {}",
+                live_vtab_panic_message(payload.as_ref()),
+            ))),
+            (Ok(result), Err(payload)) => {
+                let callback_detail = result.err().map_or_else(String::new, |error| {
+                    format!(" after {callback_name} failed: {error}")
+                });
+                Err(FrankenError::Internal(format!(
+                    "virtual table {table_name} destructor panicked{callback_detail}: {}",
+                    live_vtab_panic_message(payload.as_ref()),
+                )))
+            }
+            (Err(callback_payload), Err(drop_payload)) => Err(FrankenError::Internal(format!(
+                "virtual table {table_name} {callback_name} panicked: {}; destructor also panicked: {}",
+                live_vtab_panic_message(callback_payload.as_ref()),
+                live_vtab_panic_message(drop_payload.as_ref()),
+            ))),
+        }
+    }
+
+    fn restore_taken_live_vtab_instance(
+        &self,
+        cx: &Cx,
+        table_name: &str,
+        taken: TakenLiveVtabInstance,
+    ) -> Result<()> {
+        let origin = taken.origin;
+        let mut instance = Some(taken.instance);
+        let occupied = match origin {
+            LiveVtabRegistryOrigin::Live => {
+                let mut registry = self.vtab_instances.borrow_mut();
+                if registry.contains_key(table_name) {
+                    true
+                } else {
+                    registry.insert(
+                        table_name.to_owned(),
+                        instance.take().expect("taken live-vtab instance is present"),
+                    );
+                    return Ok(());
+                }
+            }
+            LiveVtabRegistryOrigin::Dropped => {
+                let mut registry = self.dropped_vtab_instances.borrow_mut();
+                if registry.contains_key(table_name) {
+                    true
+                } else {
+                    registry.insert(
+                        table_name.to_owned(),
+                        instance
+                            .take()
+                            .expect("taken dropped-vtab instance is present"),
+                    );
+                    return Ok(());
+                }
+            }
+        };
+        debug_assert!(occupied);
+        self.cleanup_detached_live_vtab(
+            cx,
+            table_name,
+            TakenLiveVtabInstance {
+                origin,
+                instance: instance.expect("occupied registry leaves taken instance detached"),
+            },
+            LiveVtabCleanupAction::Disconnect,
+        )?;
+        Err(FrankenError::Internal(format!(
+            "virtual table {table_name} changed registry identity during a callback"
+        )))
+    }
+
+    fn invoke_live_vtab_callback<R>(
+        &self,
+        callback_name: &str,
+        callback: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let _callback_guard = self.enter_live_vtab_callback(callback_name)?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+            Ok(result) => result,
+            Err(payload) => Err(FrankenError::Internal(format!(
+                "virtual-table callback {callback_name} panicked: {}",
+                live_vtab_panic_message(payload.as_ref()),
+            ))),
+        }
+    }
+
+    fn invoke_taken_live_vtab_instance<R>(
+        &self,
+        taken: &mut TakenLiveVtabInstance,
+        callback_name: &str,
+        callback: impl FnOnce(&mut dyn ErasedVtabInstance) -> Result<R>,
+    ) -> Result<R> {
+        self.invoke_live_vtab_callback(callback_name, || callback(taken.instance.as_mut()))
+    }
+
+    fn with_active_live_vtab_instance<R>(
+        &self,
+        cx: &Cx,
+        table_name: &str,
+        callback_name: &str,
+        callback: impl FnOnce(&mut dyn ErasedVtabInstance) -> Result<R>,
+    ) -> Result<R> {
+        let key = table_name.to_ascii_uppercase();
+        let mut taken = self
+            .take_active_live_vtab_instance(&key)
+            .ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "virtual table {table_name} missing for {callback_name}"
+                ))
+            })?;
+        let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.invoke_taken_live_vtab_instance(&mut taken, callback_name, callback)
+        }));
+        let invalidate_after_callback = self
+            .live_vtab_failed_begin_cleanup
+            .borrow_mut()
+            .remove(&key);
+        let registry_result = if invalidate_after_callback {
+            self.cleanup_detached_live_vtab(
+                cx,
+                &key,
+                taken,
+                LiveVtabCleanupAction::Disconnect,
+            )
         } else {
-            dropped_instances.get_mut(table_name)
+            self.restore_taken_live_vtab_instance(cx, &key, taken)
+        };
+
+        match callback_result {
+            Ok(Ok(value)) => {
+                registry_result?;
+                if invalidate_after_callback {
+                    Err(FrankenError::Internal(format!(
+                        "virtual table {table_name} was invalidated after failed xBegin cleanup"
+                    )))
+                } else {
+                    Ok(value)
+                }
+            }
+            Ok(Err(callback_error)) => match registry_result {
+                Ok(()) => Err(callback_error),
+                Err(registry_error) => Err(FrankenError::Internal(format!(
+                    "virtual table {table_name} {callback_name} failed: {callback_error}; registry reconciliation failed: {registry_error}"
+                ))),
+            },
+            Err(payload) => {
+                let panic_message = live_vtab_panic_message(payload.as_ref());
+                match registry_result {
+                    Ok(()) => Err(FrankenError::Internal(format!(
+                        "virtual table {table_name} {callback_name} panicked: {panic_message}"
+                    ))),
+                    Err(registry_error) => Err(FrankenError::Internal(format!(
+                        "virtual table {table_name} {callback_name} panicked: {panic_message}; registry reconciliation failed: {registry_error}"
+                    ))),
+                }
+            }
         }
     }
 
@@ -12794,15 +13492,33 @@ impl Connection {
             .contains_key(&table_name.to_ascii_uppercase())
     }
 
+    fn live_vtab_was_created_in_current_transaction(&self, table_name: &str) -> bool {
+        self.live_vtab_registry_undo.borrow().iter().any(|entry| {
+            matches!(
+                entry,
+                LiveVtabRegistryUndo::Created {
+                    table_name: created
+                } if created == table_name
+            )
+        })
+    }
+
     fn note_live_vtab_created(&self, table_name: &str) {
         if !self.transactional_live_vtab_registry_active() {
             return;
         }
+        let table_name = table_name.to_ascii_uppercase();
         self.live_vtab_registry_undo
             .borrow_mut()
             .push(LiveVtabRegistryUndo::Created {
-                table_name: table_name.to_ascii_uppercase(),
+                table_name: table_name.clone(),
             });
+        // SQLite enlists a successfully-created virtual table directly in the
+        // current virtual-table transaction without calling xBegin. This is
+        // what gives xCreate its matching xSync/xCommit or xRollback hooks.
+        self.live_vtab_transactions
+            .borrow_mut()
+            .insert(table_name, 0);
     }
 
     fn stage_dropped_live_vtab(
@@ -12814,11 +13530,19 @@ impl Connection {
         let key = table_name.to_ascii_uppercase();
         if !self.transactional_live_vtab_registry_active() {
             self.live_vtab_transactions.borrow_mut().remove(&key);
-            return instance.destroy(cx);
+            return self.invoke_live_vtab_callback("xDestroy", move || {
+                let destroy_result = instance.destroy(cx);
+                drop(instance);
+                destroy_result
+            });
         }
 
         let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
         if dropped_instances.contains_key(&key) {
+            drop(dropped_instances);
+            let callback_guard = self.enter_live_vtab_callback("Drop")?;
+            drop(instance);
+            drop(callback_guard);
             return Err(FrankenError::Internal(format!(
                 "dropped virtual table registry already contains {table_name}"
             )));
@@ -12850,8 +13574,16 @@ impl Connection {
                         let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
                         dropped_instances.remove(&table_name)
                     });
-                    if let Some(mut instance) = removed
-                        && let Err(error) = instance.destroy(cx)
+                    if let Some(instance) = removed
+                        && let Err(error) = self.cleanup_detached_live_vtab(
+                            cx,
+                            &table_name,
+                            TakenLiveVtabInstance {
+                                origin: LiveVtabRegistryOrigin::Live,
+                                instance,
+                            },
+                            LiveVtabCleanupAction::Destroy,
+                        )
                         && first_error.is_none()
                     {
                         first_error = Some(FrankenError::Internal(format!(
@@ -12863,12 +13595,20 @@ impl Connection {
                     let instance = {
                         let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
                         dropped_instances.remove(&table_name)
-                    }
-                    .ok_or_else(|| {
-                        FrankenError::Internal(format!(
+                    };
+                    let Some(instance) = instance else {
+                        // A table created and then dropped in this transaction
+                        // may already have been xDestroyed after its xRollback
+                        // failed. Its earlier Created undo entry will finish
+                        // draining the topology; there is no pre-transaction
+                        // instance to restore.
+                        if self.live_vtab_was_created_in_current_transaction(&table_name) {
+                            continue;
+                        }
+                        return Err(FrankenError::Internal(format!(
                             "dropped virtual table {table_name} missing during rollback restore"
-                        ))
-                    })?;
+                        )));
+                    };
                     let mut live_instances = self.vtab_instances.borrow_mut();
                     if live_instances.contains_key(&table_name) {
                         self.dropped_vtab_instances
@@ -12888,15 +13628,37 @@ impl Connection {
         Ok(())
     }
 
-    fn finalize_live_vtab_registry_commit(&self, cx: &Cx) {
+    fn take_committed_dropped_live_vtabs(
+        &self,
+    ) -> HashMap<String, Box<dyn ErasedVtabInstance>> {
         if self.dropped_vtab_instances.borrow().is_empty()
             && self.live_vtab_registry_undo.borrow().is_empty()
         {
-            return;
+            return HashMap::new();
         }
-        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
-        for (table_name, mut instance) in dropped_instances.drain() {
-            if let Err(error) = instance.destroy(cx) {
+        let dropped_instances = {
+            let mut registry = self.dropped_vtab_instances.borrow_mut();
+            std::mem::take(&mut *registry)
+        };
+        self.live_vtab_registry_undo.borrow_mut().clear();
+        dropped_instances
+    }
+
+    fn cleanup_committed_dropped_live_vtabs(
+        &self,
+        cx: &Cx,
+        dropped_instances: HashMap<String, Box<dyn ErasedVtabInstance>>,
+    ) {
+        for (table_name, instance) in dropped_instances {
+            if let Err(error) = self.cleanup_detached_live_vtab(
+                cx,
+                &table_name,
+                TakenLiveVtabInstance {
+                    origin: LiveVtabRegistryOrigin::Dropped,
+                    instance,
+                },
+                LiveVtabCleanupAction::Destroy,
+            ) {
                 tracing::error!(
                     table = %table_name,
                     error = %error,
@@ -12904,15 +13666,55 @@ impl Connection {
                 );
             }
         }
-        drop(dropped_instances);
-        self.live_vtab_registry_undo.borrow_mut().clear();
+    }
+
+    fn cleanup_live_vtab_instances_best_effort(
+        &self,
+        cx: &Cx,
+        instances: HashMap<String, Box<dyn ErasedVtabInstance>>,
+        action: LiveVtabCleanupAction,
+        context: &str,
+    ) {
+        for (table_name, instance) in instances {
+            let cleanup_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.cleanup_detached_live_vtab(
+                        cx,
+                        &table_name,
+                        TakenLiveVtabInstance {
+                            origin: LiveVtabRegistryOrigin::Live,
+                            instance,
+                        },
+                        action,
+                    )
+                }));
+            match cleanup_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::error!(
+                    table = %table_name,
+                    error = %error,
+                    %context,
+                    "virtual-table cleanup failed"
+                ),
+                Err(_) => tracing::error!(
+                    table = %table_name,
+                    %context,
+                    "virtual-table cleanup panicked"
+                ),
+            }
+        }
+    }
+
+    fn finalize_live_vtab_registry_commit(&self, cx: &Cx) {
+        let dropped_instances = self.take_committed_dropped_live_vtabs();
+        self.cleanup_committed_dropped_live_vtabs(cx, dropped_instances);
     }
 
     fn active_live_vtab_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .live_vtab_transactions
             .borrow()
-            .iter()
+            .keys()
             .cloned()
             .collect();
         names.sort_unstable();
@@ -12950,7 +13752,7 @@ impl Connection {
         cx: &Cx,
     ) -> Result<()> {
         let key = table_name.to_ascii_uppercase();
-        if self.live_vtab_transactions.borrow().contains(&key) {
+        if self.live_vtab_transactions.borrow().contains_key(&key) {
             return Ok(());
         }
 
@@ -12959,9 +13761,30 @@ impl Connection {
         })?;
 
         if self.current_live_vtab_savepoint_depth() > 0 {
-            let level = self.current_live_vtab_savepoint_level()?;
+            let level = match self.current_live_vtab_savepoint_level() {
+                Ok(level) => level,
+                Err(error) => {
+                    let rollback_error = instance.rollback(cx).err();
+                    if rollback_error.is_some() {
+                        self.live_vtab_failed_begin_cleanup
+                            .borrow_mut()
+                            .insert(key.clone());
+                    }
+                    return Err(match rollback_error {
+                        Some(rollback_error) => FrankenError::Internal(format!(
+                            "virtual table {table_name} savepoint level calculation failed after xBegin: {error}; rollback failed: {rollback_error}"
+                        )),
+                        None => error,
+                    });
+                }
+            };
             if let Err(error) = instance.savepoint(cx, level) {
                 let rollback_error = instance.rollback(cx).err();
+                if rollback_error.is_some() {
+                    self.live_vtab_failed_begin_cleanup
+                        .borrow_mut()
+                        .insert(key.clone());
+                }
                 return Err(match rollback_error {
                     Some(rollback_error) => FrankenError::Internal(format!(
                         "virtual table {table_name} savepoint catch-up failed at level {level}: {error}; rollback failed: {rollback_error}"
@@ -12973,239 +13796,227 @@ impl Connection {
             }
         }
 
-        self.live_vtab_transactions.borrow_mut().insert(key);
+        let savepoint_watermark = self.current_live_vtab_savepoint_depth();
+        self.live_vtab_transactions
+            .borrow_mut()
+            .insert(key, savepoint_watermark);
         Ok(())
     }
 
     fn live_vtab_sync_all(&self, cx: &Cx) -> Result<()> {
         let names = self.active_live_vtab_names();
-        let mut live_instances = self.vtab_instances.borrow_mut();
-        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
         for table_name in names {
-            if let Some(instance) = Self::active_live_vtab_instance_mut(
-                &mut live_instances,
-                &mut dropped_instances,
-                &table_name,
-            ) {
-                instance.sync_txn(cx).map_err(|error| {
-                    FrankenError::Internal(format!(
-                        "virtual table {table_name} sync failed: {error}"
-                    ))
-                })?;
-            }
+            self.with_active_live_vtab_instance(cx, &table_name, "xSync", |instance| {
+                instance.sync_txn(cx)
+            })
+            .map_err(|error| {
+                FrankenError::Internal(format!(
+                    "virtual table {table_name} sync failed: {error}"
+                ))
+            })?;
         }
         Ok(())
     }
 
     fn live_vtab_savepoint_all(&self, cx: &Cx, level: i32) -> Result<()> {
+        let savepoint_watermark = usize::try_from(level)
+            .ok()
+            .and_then(|level| level.checked_add(1))
+            .ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "virtual-table savepoint watermark overflow at level {level}"
+                ))
+            })?;
         let names = self.active_live_vtab_names();
-        let mut live_instances = self.vtab_instances.borrow_mut();
-        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
-        let mut completed: Vec<String> = Vec::new();
         for table_name in names {
-            if let Some(instance) = Self::active_live_vtab_instance_mut(
-                &mut live_instances,
-                &mut dropped_instances,
-                &table_name,
-            ) {
-                if let Err(error) = instance.savepoint(cx, level) {
-                    let mut cleanup_errors = Vec::new();
-                    for applied in &completed {
-                        if let Some(applied_instance) = Self::active_live_vtab_instance_mut(
-                            &mut live_instances,
-                            &mut dropped_instances,
-                            applied,
-                        ) {
-                            match applied_instance.rollback_to(cx, level) {
-                                Ok(()) => {
-                                    if let Err(cleanup_error) = applied_instance.release(cx, level)
-                                    {
-                                        cleanup_errors.push(format!(
-                                            "virtual table {applied} release({level}) failed: {cleanup_error}"
-                                        ));
-                                    }
-                                }
-                                Err(cleanup_error) => {
-                                    cleanup_errors.push(format!(
-                                        "virtual table {applied} rollback_to({level}) failed: {cleanup_error}"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    if !cleanup_errors.is_empty() {
-                        return Err(FrankenError::Internal(format!(
-                            "virtual table {table_name} savepoint({level}) failed: {error}; cleanup failed: {}",
-                            cleanup_errors.join("; ")
-                        )));
-                    }
-                    return Err(FrankenError::Internal(format!(
-                        "virtual table {table_name} savepoint({level}) failed: {error}"
-                    )));
-                }
-                completed.push(table_name);
+            if let Some(watermark) = self
+                .live_vtab_transactions
+                .borrow_mut()
+                .get_mut(&table_name)
+            {
+                // Match SQLite's VTable.iSavepoint transition: SAVEPOINT_BEGIN
+                // advances the high-water mark before invoking xSavepoint.
+                *watermark = savepoint_watermark;
             }
+            self.with_active_live_vtab_instance(cx, &table_name, "xSavepoint", |instance| {
+                instance.savepoint(cx, level)
+            })
+            .map_err(|error| {
+                FrankenError::Internal(format!(
+                    "virtual table {table_name} savepoint({level}) failed: {error}"
+                ))
+            })?;
         }
         Ok(())
-    }
-
-    fn cleanup_failed_savepoint_setup(
-        &self,
-        cx: &Cx,
-        savepoint_name: &str,
-        concurrent_snapshot: Option<&ConcurrentSavepoint>,
-    ) -> Vec<String> {
-        let mut cleanup_errors = Vec::new();
-        if let Some(concurrent_snap) = concurrent_snapshot {
-            if let Some(session_id) = *self.concurrent_session_id.borrow() {
-                let registry = lock_unpoisoned(&self.concurrent_registry);
-                if let Some(mut handle) = registry.get_mut(session_id) {
-                    if let Err(err) = concurrent_rollback_to_savepoint(
-                        &mut handle,
-                        &self.concurrent_lock_table,
-                        session_id,
-                        concurrent_snap,
-                    ) {
-                        cleanup_errors.push(format!(
-                            "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
-                        ));
-                        return cleanup_errors;
-                    }
-                    self.clear_memory_concurrent_synced_write_roots();
-                } else {
-                    cleanup_errors.push(format!(
-                        "concurrent session {session_id} missing during rollback"
-                    ));
-                    return cleanup_errors;
-                }
-            } else {
-                cleanup_errors.push(
-                    "concurrent transaction active but no session ID during rollback".to_owned(),
-                );
-                return cleanup_errors;
-            }
-        }
-
-        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            match txn.rollback_to_savepoint(cx, savepoint_name) {
-                Ok(()) => {
-                    if let Err(err) = txn.release_savepoint(cx, savepoint_name) {
-                        cleanup_errors.push(format!(
-                            "pager release_savepoint('{savepoint_name}') failed: {err}"
-                        ));
-                    }
-                }
-                Err(err) => {
-                    cleanup_errors.push(format!(
-                        "pager rollback_to_savepoint('{savepoint_name}') failed: {err}"
-                    ));
-                }
-            }
-        }
-
-        cleanup_errors
-    }
-
-    async fn rollback_failed_implicit_savepoint_transaction(&self) -> Option<String> {
-        if !self.in_transaction.get() {
-            return None;
-        }
-        let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
-        self.execute_rollback(&rollback_stmt)
-            .await
-            .err()
-            .map(|err| {
-                format!("implicit transaction rollback after SAVEPOINT setup failure failed: {err}")
-            })
     }
 
     fn live_vtab_release_all(&self, cx: &Cx, level: i32) -> Result<()> {
+        let target = usize::try_from(level).map_err(|_| {
+            FrankenError::Internal(format!(
+                "virtual-table release received negative savepoint level {level}"
+            ))
+        })?;
         let names = self.active_live_vtab_names();
-        let mut live_instances = self.vtab_instances.borrow_mut();
-        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
+        let mut errors = Vec::new();
         for table_name in names {
-            if let Some(instance) = Self::active_live_vtab_instance_mut(
-                &mut live_instances,
-                &mut dropped_instances,
+            let should_invoke = self
+                .live_vtab_transactions
+                .borrow()
+                .get(&table_name)
+                .is_some_and(|watermark| *watermark > target);
+            if !should_invoke {
+                continue;
+            }
+            if let Err(error) = self.with_active_live_vtab_instance(
+                cx,
                 &table_name,
+                "xRelease",
+                |instance| instance.release(cx, level),
             ) {
-                instance.release(cx, level).map_err(|error| {
-                    FrankenError::Internal(format!(
-                        "virtual table {table_name} release({level}) failed: {error}"
-                    ))
-                })?;
+                errors.push(format!(
+                    "virtual table {table_name} release({level}) failed: {error}"
+                ));
             }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(FrankenError::Internal(errors.join("; ")))
+        }
     }
 
     fn live_vtab_rollback_to_all(&self, cx: &Cx, level: i32) -> Result<()> {
+        let target = usize::try_from(level).map_err(|_| {
+            FrankenError::Internal(format!(
+                "virtual-table rollback_to received negative savepoint level {level}"
+            ))
+        })?;
         let names = self.active_live_vtab_names();
-        let mut live_instances = self.vtab_instances.borrow_mut();
-        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
+        let mut errors = Vec::new();
         for table_name in names {
-            if let Some(instance) = Self::active_live_vtab_instance_mut(
-                &mut live_instances,
-                &mut dropped_instances,
+            let should_invoke = self
+                .live_vtab_transactions
+                .borrow()
+                .get(&table_name)
+                .is_some_and(|watermark| *watermark > target);
+            if !should_invoke {
+                continue;
+            }
+            if let Err(error) = self.with_active_live_vtab_instance(
+                cx,
                 &table_name,
+                "xRollbackTo",
+                |instance| instance.rollback_to(cx, level),
             ) {
-                instance.rollback_to(cx, level).map_err(|error| {
-                    FrankenError::Internal(format!(
-                        "virtual table {table_name} rollback_to({level}) failed: {error}"
-                    ))
-                })?;
+                errors.push(format!(
+                    "virtual table {table_name} rollback_to({level}) failed: {error}"
+                ));
             }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(FrankenError::Internal(errors.join("; ")))
+        }
     }
 
-    fn live_vtab_commit_all_best_effort(&self, cx: &Cx) {
+    fn live_vtab_commit_all_best_effort(
+        &self,
+        cx: &Cx,
+    ) -> (bool, Vec<(String, TakenLiveVtabInstance)>) {
         if self.live_vtab_transactions.borrow().is_empty() {
-            return;
+            return (true, Vec::new());
         }
         let names = self.active_live_vtab_names();
-        let mut live_instances = self.vtab_instances.borrow_mut();
-        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
-        for table_name in &names {
-            if let Some(instance) = Self::active_live_vtab_instance_mut(
-                &mut live_instances,
-                &mut dropped_instances,
-                table_name,
-            ) && let Err(error) = instance.commit(cx)
-            {
+        let mut all_succeeded = true;
+        let mut invalidated_instances = Vec::new();
+        for table_name in names {
+            let commit_result = self.with_active_live_vtab_instance(
+                cx,
+                &table_name,
+                "xCommit",
+                |instance| instance.commit(cx),
+            );
+            if let Err(error) = commit_result {
+                all_succeeded = false;
                 tracing::error!(
                     table = %table_name,
                     error = %error,
                     "virtual-table commit finalizer failed after durable commit"
                 );
+                if let Some(taken) = self.take_active_live_vtab_instance(&table_name) {
+                    invalidated_instances.push((table_name, taken));
+                }
             }
         }
         self.live_vtab_transactions.borrow_mut().clear();
+        (all_succeeded, invalidated_instances)
+    }
+
+    fn cleanup_failed_live_vtab_commits(
+        &self,
+        cx: &Cx,
+        invalidated_instances: Vec<(String, TakenLiveVtabInstance)>,
+    ) {
+        for (table_name, taken) in invalidated_instances {
+            let action = match taken.origin {
+                LiveVtabRegistryOrigin::Live => LiveVtabCleanupAction::Disconnect,
+                LiveVtabRegistryOrigin::Dropped => LiveVtabCleanupAction::Destroy,
+            };
+            if let Err(error) =
+                self.cleanup_detached_live_vtab(cx, &table_name, taken, action)
+            {
+                tracing::error!(
+                    table = %table_name,
+                    error = %error,
+                    "failed to clean up virtual table after xCommit failure"
+                );
+            }
+        }
     }
 
     fn live_vtab_rollback_all(&self, cx: &Cx) -> Result<()> {
         let names = self.active_live_vtab_names();
-        let mut live_instances = self.vtab_instances.borrow_mut();
-        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
-        let mut first_error = None;
-        for table_name in &names {
-            if let Some(instance) = Self::active_live_vtab_instance_mut(
-                &mut live_instances,
-                &mut dropped_instances,
-                table_name,
-            ) && let Err(error) = instance.rollback(cx)
-                && first_error.is_none()
-            {
-                first_error = Some(FrankenError::Internal(format!(
+        let mut errors = Vec::new();
+        for table_name in names {
+            if let Err(error) = self.with_active_live_vtab_instance(
+                cx,
+                &table_name,
+                "xRollback",
+                |instance| instance.rollback(cx),
+            ) {
+                errors.push(format!(
                     "virtual table {table_name} rollback failed: {error}"
-                )));
+                ));
+                let cleanup_action = if self
+                    .live_vtab_was_created_in_current_transaction(&table_name)
+                {
+                    LiveVtabCleanupAction::Destroy
+                } else {
+                    LiveVtabCleanupAction::Disconnect
+                };
+                if let Some(taken) = self.take_active_live_vtab_instance(&table_name)
+                    && let Err(cleanup_error) = self.cleanup_detached_live_vtab(
+                        cx,
+                        &table_name,
+                        taken,
+                        cleanup_action,
+                    )
+                {
+                    errors.push(format!(
+                        "virtual table {table_name} cleanup after rollback failure failed: {cleanup_error}"
+                    ));
+                }
             }
         }
         self.live_vtab_transactions.borrow_mut().clear();
-        if let Some(error) = first_error {
-            return Err(error);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let detail = errors.join("; ");
+            *self.live_vtab_lifecycle_failure.borrow_mut() = Some(detail.clone());
+            Err(FrankenError::Internal(detail))
         }
-        Ok(())
     }
 
     /// Plan a scan against a live virtual-table instance by consulting
@@ -13240,28 +14051,67 @@ impl Connection {
         let constraints: Vec<IndexConstraint> =
             candidates.iter().map(|c| c.constraint.clone()).collect();
         let mut info = IndexInfo::new(constraints, Vec::new());
+        let input_constraints = info.constraints.clone();
+        let input_order_by = info.order_by.clone();
 
+        let callback_cx = self.op_cx()?;
+        self.with_active_live_vtab_instance(
+            &callback_cx,
+            &src.table_name,
+            "xBestIndex",
+            |instance| instance.best_index(&mut info),
+        )?;
+
+        // xBestIndex receives a public Rust structure, so a downstream module
+        // can accidentally resize the usage vector or return a malformed argv
+        // mapping. Validate the complete contract before indexing candidates or
+        // constructing xFilter arguments. SQLite's argvIndex values are a
+        // unique, gap-free, 1-based sequence for the constraints passed to
+        // xFilter; non-positive values supply no argument.
+        if info.constraints != input_constraints
+            || info.order_by != input_order_by
+            || info.constraint_usage.len() != candidates.len()
         {
-            let instances = self.vtab_instances.borrow();
-            let key = src.table_name.to_ascii_uppercase();
-            let instance = instances.get(&key).ok_or_else(|| {
-                FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
-            })?;
-            instance.best_index(&mut info)?;
+            return Err(FrankenError::FunctionError(format!(
+                "{}.xBestIndex malfunction",
+                src.table_name,
+            )));
         }
 
-        // Collect consumed constraint values in argv_index order and move
-        // unconsumed constraints into the residual WHERE.
+        // Collect consumed constraint values in argv_index order. A consumed
+        // constraint remains in the residual WHERE unless xBestIndex sets
+        // `omit`, which is the module's guarantee that xFilter fully enforces
+        // it. A non-positive argv_index supplies no argument (matching SQLite's
+        // observable handling) and is always residual, even if `omit` was set.
         let mut indexed_args: Vec<(i32, SqliteValue)> = Vec::new();
-        for (i, usage) in info.constraint_usage.iter().enumerate() {
+        for (candidate, usage) in candidates.iter().zip(&info.constraint_usage) {
             if usage.argv_index > 0 {
-                indexed_args.push((usage.argv_index, candidates[i].value.clone()));
+                indexed_args.push((usage.argv_index, candidate.value.clone()));
+                if !usage.omit {
+                    residual_terms.push(candidate.expr.clone());
+                }
             } else {
-                // Not consumed by the vtab — must be checked post-scan.
-                residual_terms.push(candidates[i].expr.clone());
+                residual_terms.push(candidate.expr.clone());
             }
         }
         indexed_args.sort_by_key(|(idx, _)| *idx);
+        for (zero_based, (actual, _)) in indexed_args.iter().enumerate() {
+            let expected = i32::try_from(zero_based)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| {
+                    FrankenError::FunctionError(format!(
+                        "{}.xBestIndex malfunction",
+                        src.table_name,
+                    ))
+                })?;
+            if *actual != expected {
+                return Err(FrankenError::FunctionError(format!(
+                    "{}.xBestIndex malfunction",
+                    src.table_name,
+                )));
+            }
+        }
         let args = indexed_args.into_iter().map(|(_, v)| v).collect();
 
         let residual_where = rebuild_and_terms(residual_terms);
@@ -13325,31 +14175,38 @@ impl Connection {
             }
         }
 
-        let mut cursor = {
-            let instances = self.vtab_instances.borrow();
-            let instance = instances.get(&key).ok_or_else(|| {
-                FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
-            })?;
-            instance.open_cursor()?
-        };
-
         let cx = self.op_cx()?;
-        cursor.erased_filter(&cx, plan.idx_num, plan.idx_str.as_deref(), &plan.args)?;
+        let mut cursor = self.with_active_live_vtab_instance(
+            &cx,
+            &src.table_name,
+            "xOpen",
+            |instance| {
+                instance.open_cursor().map(|cursor| {
+                    LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor)
+                })
+            },
+        )?;
+        self.invoke_live_vtab_callback("xFilter", || {
+            cursor.erased_filter(&cx, plan.idx_num, plan.idx_str.as_deref(), &plan.args)
+        })?;
 
         let mut rows: Vec<Vec<SqliteValue>> = Vec::new();
-        while !cursor.erased_eof() {
+        while !self.invoke_live_vtab_callback("xEof", || Ok(cursor.erased_eof()))? {
             let mut row = Vec::with_capacity(num_cols + 1);
             for col_idx in 0..num_cols {
                 let mut col_ctx = ColumnContext::new();
-                cursor.erased_column(&mut col_ctx, i32::try_from(col_idx).unwrap_or(0))?;
+                self.invoke_live_vtab_callback("xColumn", || {
+                    cursor.erased_column(&mut col_ctx, i32::try_from(col_idx).unwrap_or(0))
+                })?;
                 row.push(col_ctx.take_value().unwrap_or(SqliteValue::Null));
             }
             if src.hidden_rowid_projection.is_some() {
-                let rowid = cursor.erased_rowid()?;
+                let rowid =
+                    self.invoke_live_vtab_callback("xRowid", || cursor.erased_rowid())?;
                 row.push(SqliteValue::Integer(rowid));
             }
             rows.push(row);
-            cursor.erased_next(&cx)?;
+            self.invoke_live_vtab_callback("xNext", || cursor.erased_next(&cx))?;
         }
 
         Ok(rows)
@@ -13376,31 +14233,51 @@ impl Connection {
             return Ok(None);
         };
 
-        enum LiveVtabCountStrategy {
+        enum LiveVtabCountStrategy<'a> {
             #[cfg(feature = "ext-fts5")]
             Known(usize),
-            Cursor(Box<dyn fsqlite_func::vtab::ErasedVtabCursor>),
+            Cursor(LiveVtabCursorGuard<'a>),
         }
 
-        let strategy = {
+        #[cfg(feature = "ext-fts5")]
+        let known_count = {
             let instances = self.vtab_instances.borrow();
             let key = name.name.to_ascii_uppercase();
             let instance = instances.get(&key).ok_or_else(|| {
                 FrankenError::Internal(format!("virtual table not found: {}", name.name))
             })?;
-            #[cfg(feature = "ext-fts5")]
-            {
-                if let Some(fts5) = instance.as_any().downcast_ref::<Fts5Table>() {
-                    LiveVtabCountStrategy::Known(fts5.row_count())
-                } else {
-                    LiveVtabCountStrategy::Cursor(instance.open_cursor()?)
-                }
-            }
-            #[cfg(not(feature = "ext-fts5"))]
-            {
-                LiveVtabCountStrategy::Cursor(instance.open_cursor()?)
-            }
+            instance
+                .as_any()
+                .downcast_ref::<Fts5Table>()
+                .map(Fts5Table::row_count)
         };
+        let cursor_cx = self.op_cx()?;
+        #[cfg(feature = "ext-fts5")]
+        let strategy = if let Some(count) = known_count {
+            LiveVtabCountStrategy::Known(count)
+        } else {
+            LiveVtabCountStrategy::Cursor(self.with_active_live_vtab_instance(
+                &cursor_cx,
+                &name.name,
+                "xOpen",
+                |instance| {
+                    instance.open_cursor().map(|cursor| {
+                        LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor)
+                    })
+                },
+            )?)
+        };
+        #[cfg(not(feature = "ext-fts5"))]
+        let strategy = LiveVtabCountStrategy::Cursor(self.with_active_live_vtab_instance(
+            &cursor_cx,
+            &name.name,
+            "xOpen",
+            |instance| {
+                instance.open_cursor().map(|cursor| {
+                    LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor)
+                })
+            },
+        )?);
 
         let count = match strategy {
             #[cfg(feature = "ext-fts5")]
@@ -13411,17 +14288,22 @@ impl Connection {
                 ))
             })?,
             LiveVtabCountStrategy::Cursor(mut cursor) => {
-                let cx = self.op_cx()?;
-                cursor.erased_filter(&cx, 0, None, &[])?;
+                self.invoke_live_vtab_callback("xFilter", || {
+                    cursor.erased_filter(&cursor_cx, 0, None, &[])
+                })?;
                 let mut count = 0_i64;
-                while !cursor.erased_eof() {
+                while !self
+                    .invoke_live_vtab_callback("xEof", || Ok(cursor.erased_eof()))?
+                {
                     count = count.checked_add(1).ok_or_else(|| {
                         FrankenError::Internal(format!(
                             "virtual table row count exceeds i64: {}",
                             name.name
                         ))
                     })?;
-                    cursor.erased_next(&cx)?;
+                    self.invoke_live_vtab_callback("xNext", || {
+                        cursor.erased_next(&cursor_cx)
+                    })?;
                 }
                 count
             }
@@ -15206,6 +16088,7 @@ impl Connection {
 
     #[inline]
     fn advance_commit_clock(&self) -> CommitSeq {
+        self.clear_pending_local_live_vtab_preservation();
         let committed_seq = {
             let mut active_commit_seqs = lock_unpoisoned(&self.active_commit_seqs);
             let committed_seq =
@@ -15220,6 +16103,7 @@ impl Connection {
 
     #[inline]
     fn advance_commit_clock_without_memdb_visibility(&self) -> CommitSeq {
+        self.clear_pending_local_live_vtab_preservation();
         let committed_seq = {
             let mut active_commit_seqs = lock_unpoisoned(&self.active_commit_seqs);
             let committed_seq =
@@ -15233,6 +16117,7 @@ impl Connection {
 
     #[inline]
     fn sync_memory_autocommit_commit_seq(&self, committed_seq: CommitSeq) {
+        self.clear_pending_local_live_vtab_preservation();
         // `:memory:` autocommit writes already advance the pager's published
         // visibility sequence inside `commit_and_retain()`. Keep the
         // connection-level clock aligned with that published seq using a pair
@@ -15298,6 +16183,7 @@ impl Connection {
 
     #[inline]
     fn sync_filebacked_post_commit_visibility_floor(&self) -> CommitSeq {
+        self.clear_pending_local_live_vtab_preservation();
         let committed_seq = self.pager.published_snapshot().visible_commit_seq;
         self.align_commit_clock_floor(committed_seq);
         // Use max to avoid decreasing last_local_commit_seq — a lower pager
@@ -15915,6 +16801,17 @@ impl Connection {
             });
         }
         self.discard_cached_vdbe_engine();
+        // Same-cookie DML can change persisted virtual-table content without
+        // changing ordinary schema metadata. A lightweight refresh would
+        // advance the visible commit floor while leaving the old live instance
+        // installed forever, so any advanced publication with a live vtab must
+        // take the full rebuild path.
+        if !self.vtab_instances.borrow().is_empty() {
+            return Ok(PreparedSchemaRefreshResult {
+                outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
+                publication,
+            });
+        }
         if !allow_lightweight_refresh || self.should_eagerly_hydrate_memdb_rows() {
             return Ok(PreparedSchemaRefreshResult {
                 outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
@@ -16088,8 +16985,20 @@ impl Connection {
             } else {
                 retained.commit(&cx).await
             };
+            let retained_commit_succeeded = !close_memory_db && result.is_ok();
             if !best_effort {
                 result?;
+            }
+            if retained_commit_succeeded {
+                // This is a real ordinary write commit performed outside the
+                // normal autocommit finalizer. Publish its visibility floor and
+                // invalidate any live-vtab receipt that predates it before a
+                // later close step can fail and return the handle for retry.
+                self.sync_filebacked_post_commit_visibility_floor();
+            } else {
+                // A memory rollback or ignored best-effort failure is teardown,
+                // never a reason to keep a one-shot preservation capability.
+                self.clear_pending_local_live_vtab_preservation();
             }
             self.retained_autocommit_stmt_count.set(0);
             self.retained_autocommit_dirty_tables.get_mut().clear();
@@ -16150,6 +17059,25 @@ impl Connection {
             self.savepoints.get_mut().clear();
             self.db.borrow_mut().commit_undo();
         }
+
+        let live_vtab_instances = std::mem::take(self.vtab_instances.get_mut());
+        let staged_dropped_vtab_instances =
+            std::mem::take(self.dropped_vtab_instances.get_mut());
+        self.live_vtab_transactions.get_mut().clear();
+        self.live_vtab_registry_undo.get_mut().clear();
+        self.live_vtab_failed_begin_cleanup.get_mut().clear();
+        self.cleanup_live_vtab_instances_best_effort(
+            &cx,
+            live_vtab_instances,
+            LiveVtabCleanupAction::Disconnect,
+            "connection close",
+        );
+        self.cleanup_live_vtab_instances_best_effort(
+            &cx,
+            staged_dropped_vtab_instances,
+            LiveVtabCleanupAction::Disconnect,
+            "connection close staged drop",
+        );
 
         if checkpoint_on_close
             && !self.pager.is_memory()
@@ -16217,6 +17145,11 @@ impl Connection {
     {
         let func_name = function.name().to_owned();
         let func_args = function.num_args();
+        let (min_args, max_args) = if func_args >= 0 {
+            (func_args, Some(func_args))
+        } else {
+            (function.min_args(), function.max_args())
+        };
         let deterministic = function.is_deterministic();
         tracing::info!(
             target: "fsqlite.udf",
@@ -16227,9 +17160,20 @@ impl Connection {
             "udf_register"
         );
         fsqlite_func::record_udf_registered();
-        let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
-        registry.register_scalar(function);
-        *self.func_registry.borrow_mut() = Arc::new(registry);
+        let mut registry = {
+            let published = self.func_registry.borrow();
+            FunctionRegistry::clone_from_arc(&published)
+        };
+        let displaced_function = registry.register_scalar_keyed_with_arity(
+            FunctionKey::new(&func_name, func_args),
+            min_args,
+            max_args,
+            function,
+        );
+        let displaced_registry = {
+            let mut published = self.func_registry.borrow_mut();
+            std::mem::replace(&mut *published, Arc::new(registry))
+        };
         self.scalar_function_overridden.set(true);
         let canonical_name = func_name.trim().to_ascii_lowercase();
         let replaces_like_or_glob = match canonical_name.as_str() {
@@ -16240,7 +17184,11 @@ impl Connection {
         if replaces_like_or_glob {
             self.like_or_glob_overridden.set(true);
         }
+        // Publish the new registry generation and clear stale caches before a
+        // displaced user function can run Drop and re-enter this connection.
         self.note_function_registry_changed();
+        drop(displaced_function);
+        drop(displaced_registry);
     }
 
     /// Register a custom aggregate function.
@@ -16258,6 +17206,11 @@ impl Connection {
     {
         let func_name = function.name().to_owned();
         let func_args = function.num_args();
+        let (min_args, max_args) = if func_args >= 0 {
+            (func_args, Some(func_args))
+        } else {
+            (function.min_args(), function.max_args())
+        };
         tracing::info!(
             target: "fsqlite.udf",
             func_name = %func_name,
@@ -16266,13 +17219,31 @@ impl Connection {
             "udf_register"
         );
         fsqlite_func::record_udf_registered();
-        let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
-        registry.register_aggregate(function);
-        *self.func_registry.borrow_mut() = Arc::new(registry);
-        Arc::make_mut(&mut *self.custom_aggregate_keys.borrow_mut())
-            .insert((func_name.trim().to_ascii_lowercase(), func_args));
+        let mut registry = {
+            let published = self.func_registry.borrow();
+            FunctionRegistry::clone_from_arc(&published)
+        };
+        let displaced_function = registry.register_aggregate_keyed_with_arity(
+            FunctionKey::new(&func_name, func_args),
+            min_args,
+            max_args,
+            function,
+        );
+        let displaced_registry = {
+            let mut published = self.func_registry.borrow_mut();
+            std::mem::replace(&mut *published, Arc::new(registry))
+        };
+        {
+            let mut custom_aggregate_keys = self.custom_aggregate_keys.borrow_mut();
+            Arc::make_mut(&mut *custom_aggregate_keys)
+                .insert((func_name.trim().to_ascii_lowercase(), func_args));
+        }
         self.custom_aggregate_registered.set(true);
+        // Keep the old registry/function alive until replacement identity and
+        // cache invalidation are fully published and every RefCell borrow ends.
         self.note_function_registry_changed();
+        drop(displaced_function);
+        drop(displaced_registry);
     }
 
     /// Register a custom window function.
@@ -16290,6 +17261,11 @@ impl Connection {
     {
         let func_name = function.name().to_owned();
         let func_args = function.num_args();
+        let (min_args, max_args) = if func_args >= 0 {
+            (func_args, Some(func_args))
+        } else {
+            (function.min_args(), function.max_args())
+        };
         tracing::info!(
             target: "fsqlite.udf",
             func_name = %func_name,
@@ -16298,17 +17274,33 @@ impl Connection {
             "udf_register"
         );
         fsqlite_func::record_udf_registered();
-        let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
-        registry.register_window(function);
-        let registered = registry
-            .find_window(&func_name, func_args)
-            .expect("a window function must be findable immediately after registration");
-        *self.func_registry.borrow_mut() = Arc::new(registry);
-        self.custom_window_functions.borrow_mut().insert(
-            (func_name.trim().to_ascii_lowercase(), func_args),
-            registered,
+        let mut registry = {
+            let published = self.func_registry.borrow();
+            FunctionRegistry::clone_from_arc(&published)
+        };
+        let (registered, displaced_function) = registry.register_window_keyed_with_arity(
+            FunctionKey::new(&func_name, func_args),
+            min_args,
+            max_args,
+            function,
         );
+        let displaced_registry = {
+            let mut published = self.func_registry.borrow_mut();
+            std::mem::replace(&mut *published, Arc::new(registry))
+        };
+        let displaced_custom_window = {
+            let mut custom_windows = self.custom_window_functions.borrow_mut();
+            custom_windows.insert(
+                (func_name.trim().to_ascii_lowercase(), func_args),
+                registered,
+            )
+        };
+        // Publish generation/cache invalidation before any of the displaced
+        // window adapter Arcs can run user Drop reentrantly.
         self.note_function_registry_changed();
+        drop(displaced_custom_window);
+        drop(displaced_function);
+        drop(displaced_registry);
     }
 
     fn is_custom_window_function(&self, function: &Arc<ErasedWindowFunction>) -> bool {
@@ -16321,11 +17313,19 @@ impl Connection {
     /// Register a virtual-table module factory under the given name.
     ///
     /// Once registered, `CREATE VIRTUAL TABLE t USING name(args)` will
-    /// invoke the factory's `create` method to instantiate the vtab.
+    /// invoke the factory's `create` method to instantiate the vtab. Existing
+    /// prepared statements are invalidated so cached table-function metadata
+    /// cannot outlive a module replacement.
     pub fn register_module(&self, name: &str, factory: Box<dyn VtabModuleFactory>) {
-        self.vtab_modules
-            .borrow_mut()
-            .insert(name.to_ascii_uppercase(), Arc::from(factory));
+        let displaced_factory = {
+            let mut modules = self.vtab_modules.borrow_mut();
+            modules.insert(name.to_ascii_uppercase(), Arc::from(factory))
+        };
+        // Publish invalidation before a displaced user-defined factory can
+        // re-enter and execute a prepared statement against the replacement.
+        self.note_function_registry_changed();
+        // Drop only after the registry RefCell borrow has ended.
+        drop(displaced_factory);
     }
 
     fn register_cache_pages_module(&self) {
@@ -16343,21 +17343,24 @@ impl Connection {
         geometry_name: &str,
         geometry: Box<dyn RtreeGeometry>,
     ) -> Result<()> {
-        let key = table_name.to_ascii_uppercase();
-        let mut instances = self.vtab_instances.borrow_mut();
-        let instance = instances.get_mut(&key).ok_or_else(|| {
-            FrankenError::Internal(format!("virtual table not found: {table_name}"))
-        })?;
-        let rtree = instance
-            .as_any_mut()
-            .downcast_mut::<RtreeVirtualTable>()
-            .ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "virtual table {table_name} is not an R-tree instance",
-                ))
-            })?;
-        rtree.register_geometry(geometry_name, geometry);
-        Ok(())
+        let cx = self.op_cx()?;
+        self.with_active_live_vtab_instance(
+            &cx,
+            table_name,
+            "xRegisterGeometry",
+            move |instance| {
+                let rtree = instance
+                    .as_any_mut()
+                    .downcast_mut::<RtreeVirtualTable>()
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "virtual table {table_name} is not an R-tree instance",
+                        ))
+                    })?;
+                rtree.register_geometry(geometry_name, geometry);
+                Ok(())
+            },
+        )
     }
 
     /// Return lowercase `(name, arity)` keys for custom aggregate UDFs.
@@ -16605,7 +17608,13 @@ impl Connection {
         record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, lookup_start);
         let prepared = self.prepare_uncached(sql).await?;
         let cache_insert_start = profile_enabled.then(Instant::now);
-        self.insert_prepared_cache(key, sql, &prepared);
+        // User module metadata callbacks may re-register a callable while
+        // uncached preparation is in progress, advancing the registry
+        // generation embedded in the cache identity. Insert under the final
+        // identity rather than orphaning the template under the stale lookup
+        // key captured before the callback.
+        let insert_key = self.prepared_cache_key(sql);
+        self.insert_prepared_cache(insert_key, sql, &prepared);
         self.log_statement_reuse_event("prepared", sql, false, "none", 0, 0, "none");
         record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, cache_insert_start);
         self.note_connection_prepare_call();
@@ -25500,8 +26509,20 @@ impl Connection {
             depth: &self.internal_statement_savepoint_depth,
         };
 
-        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            txn.savepoint(cx, &savepoint_name)?;
+        let pager_savepoint_result = {
+            let mut active_txn = self.active_txn.borrow_mut();
+            active_txn
+                .as_mut()
+                .map_or(Ok(()), |txn| txn.savepoint(cx, &savepoint_name))
+        };
+        if let Err(error) = pager_savepoint_result {
+            return Err(self
+                .rollback_after_savepoint_boundary_failure(
+                    cx,
+                    &format!("statement savepoint setup failed after {purpose}"),
+                    error,
+                )
+                .await);
         }
 
         let concurrent_snapshot = if self.concurrent_txn.get() {
@@ -25523,42 +26544,66 @@ impl Connection {
             match concurrent_result {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    let cleanup_errors =
-                        self.cleanup_failed_savepoint_setup(cx, &savepoint_name, None);
-                    if !cleanup_errors.is_empty() {
-                        return Err(FrankenError::Internal(format!(
-                            "statement savepoint setup failed after {purpose}: {error}; cleanup failed: {}",
-                            cleanup_errors.join("; ")
-                        )));
-                    }
-                    return Err(error);
+                    return Err(self
+                        .rollback_after_savepoint_boundary_failure(
+                            cx,
+                            &format!("statement concurrent savepoint setup failed after {purpose}"),
+                            error,
+                        )
+                        .await);
                 }
             }
         } else {
             None
         };
-        let live_vtab_level = self.current_live_vtab_savepoint_level()?;
-        if let Err(error) = self.live_vtab_savepoint_all(cx, live_vtab_level) {
-            let cleanup_errors = self.cleanup_failed_savepoint_setup(
-                cx,
-                &savepoint_name,
-                concurrent_snapshot.as_ref(),
-            );
-            if !cleanup_errors.is_empty() {
-                return Err(FrankenError::Internal(format!(
-                    "statement savepoint setup failed after {purpose}: {error}; cleanup failed: {}",
-                    cleanup_errors.join("; ")
-                )));
+        let live_vtab_level = match self.current_live_vtab_savepoint_level() {
+            Ok(level) => level,
+            Err(error) => {
+                return Err(self
+                    .rollback_after_savepoint_boundary_failure(
+                        cx,
+                        &format!("statement savepoint level failed after {purpose}"),
+                        error,
+                    )
+                    .await);
             }
-            return Err(error);
+        };
+        if let Err(error) = self.live_vtab_savepoint_all(cx, live_vtab_level) {
+            return Err(self
+                .rollback_after_savepoint_boundary_failure(
+                    cx,
+                    &format!("statement virtual-table savepoint setup failed after {purpose}"),
+                    error,
+                )
+                .await);
         }
 
         match body().await {
             Ok(value) => {
-                if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                    txn.release_savepoint(cx, &savepoint_name)?;
+                let pager_release_result = {
+                    let mut active_txn = self.active_txn.borrow_mut();
+                    active_txn.as_mut().map_or(Ok(()), |txn| {
+                        txn.release_savepoint(cx, &savepoint_name)
+                    })
+                };
+                if let Err(error) = pager_release_result {
+                    return Err(self
+                        .rollback_after_savepoint_boundary_failure(
+                            cx,
+                            &format!("statement pager release failed after {purpose}"),
+                            error,
+                        )
+                        .await);
                 }
-                self.live_vtab_release_all(cx, live_vtab_level)?;
+                if let Err(error) = self.live_vtab_release_all(cx, live_vtab_level) {
+                    return Err(self
+                        .rollback_after_savepoint_boundary_failure(
+                            cx,
+                            &format!("statement virtual-table release failed after {purpose}"),
+                            error,
+                        )
+                        .await);
+                }
                 Ok(value)
             }
             Err(statement_error) => {
@@ -25566,10 +26611,34 @@ impl Connection {
                 // are KEPT. Release the savepoint exactly as on success (instead
                 // of rolling back to it), then propagate the error.
                 if matches!(statement_error, FrankenError::RaiseFail(_)) {
-                    if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                        txn.release_savepoint(cx, &savepoint_name)?;
+                    let pager_release_result = {
+                        let mut active_txn = self.active_txn.borrow_mut();
+                        active_txn.as_mut().map_or(Ok(()), |txn| {
+                            txn.release_savepoint(cx, &savepoint_name)
+                        })
+                    };
+                    if let Err(error) = pager_release_result {
+                        return Err(self
+                            .rollback_after_savepoint_boundary_failure(
+                                cx,
+                                &format!(
+                                    "RAISE(FAIL) statement pager release failed after {purpose}"
+                                ),
+                                error,
+                            )
+                            .await);
                     }
-                    self.live_vtab_release_all(cx, live_vtab_level)?;
+                    if let Err(error) = self.live_vtab_release_all(cx, live_vtab_level) {
+                        return Err(self
+                            .rollback_after_savepoint_boundary_failure(
+                                cx,
+                                &format!(
+                                    "RAISE(FAIL) virtual-table release failed after {purpose}"
+                                ),
+                                error,
+                            )
+                            .await);
+                    }
                     return Err(statement_error);
                 }
 
@@ -25651,17 +26720,24 @@ impl Connection {
                     }
                 }
 
+                if !cleanup_errors.is_empty() {
+                    let boundary_error = FrankenError::Internal(format!(
+                        "statement savepoint rollback failed after {purpose}: {statement_error}; cleanup failed: {}",
+                        cleanup_errors.join("; ")
+                    ));
+                    return Err(self
+                        .rollback_after_savepoint_boundary_failure(
+                            cx,
+                            &format!("statement savepoint cleanup failed after {purpose}"),
+                            boundary_error,
+                        )
+                        .await);
+                }
+
                 if pager_rollback_succeeded {
                     self.txn_metrics_note_rollback();
                     self.clear_prepared_direct_insert_append_hint();
                     self.restore_snapshot(cx, &snapshot).await?;
-                }
-
-                if !cleanup_errors.is_empty() {
-                    return Err(FrankenError::Internal(format!(
-                        "statement savepoint rollback failed after {purpose}: {statement_error}; cleanup failed: {}",
-                        cleanup_errors.join("; ")
-                    )));
                 }
 
                 Err(statement_error)
@@ -26408,6 +27484,8 @@ impl Connection {
                 Statement::Insert(_)
                     | Statement::Update(_)
                     | Statement::Delete(_)
+                    | Statement::CreateVirtualTable(_)
+                    | Statement::Drop(_)
                     | Statement::CreateIndex(_)
                     | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
                         action: AlterTableAction::DropColumn(_),
@@ -26831,10 +27909,7 @@ impl Connection {
                     )?;
                     self.execute_correlated_subquery_where_fallback(cx, select, params)
                         .await
-                } else if select_has_correlated_in_subquery(
-                    select,
-                    &self.schema.borrow(),
-                ) {
+                } else if select_has_correlated_in_subquery(select, &self.schema.borrow()) {
                     // bd-zvk68: a correlated `x IN (SELECT ...)` predicate in the
                     // WHERE clause references outer columns and must be evaluated
                     // per outer row. The VDBE codegen IN-subquery path builds the
@@ -30038,10 +31113,19 @@ impl Connection {
         sql: &str,
         statement: &Statement,
     ) -> Result<PreparedStatement<'_>> {
-        let registry = Some(Arc::clone(&*self.func_registry.borrow()));
+        // Column metadata can invoke user vtab factories, which may re-register
+        // modules or functions. Finish every callback-capable metadata lookup
+        // before snapshotting the callable registry and its generation.
         let prepared_column_names = self.prepared_statement_column_names(statement);
+        // The prepared names already carry the deferred SELECT result width.
+        // Asking for the count separately would call user vtab metadata a
+        // second time, allowing a stateful or self-replacing factory to return
+        // names and a width from different registry snapshots.
+        let prepared_column_count = prepared_column_names.len();
         let prepared_query_fast_path = self.prepared_query_fast_path(statement);
         let may_observe_change_tracking = self.statement_may_observe_change_tracking(statement);
+        let registry = Some(Arc::clone(&*self.func_registry.borrow()));
+        let function_registry_generation = self.function_registry_generation();
         match statement {
             Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => {
                 Ok(PreparedStatement {
@@ -30057,13 +31141,11 @@ impl Connection {
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
-                    function_registry_generation: self.function_registry_generation(),
+                    function_registry_generation,
                     dml_dispatch: None,
                     prepared_update_delete_fast_path: None,
                     deferred_query_statement: Some(Arc::new(statement.clone())),
-                    deferred_query_column_count: Some(
-                        self.prepared_statement_column_count(statement),
-                    ),
+                    deferred_query_column_count: Some(prepared_column_count),
                     column_names: prepared_column_names,
                     prepared_query_fast_path,
                     may_observe_change_tracking,
@@ -30090,7 +31172,7 @@ impl Connection {
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
-                    function_registry_generation: self.function_registry_generation(),
+                    function_registry_generation,
                     dml_dispatch: None,
                     prepared_update_delete_fast_path: None,
                     deferred_query_statement: None,
@@ -30141,7 +31223,7 @@ impl Connection {
                     post_distinct_limit,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
-                    function_registry_generation: self.function_registry_generation(),
+                    function_registry_generation,
                     dml_dispatch: None,
                     prepared_update_delete_fast_path: None,
                     deferred_query_statement: None,
@@ -30214,7 +31296,7 @@ impl Connection {
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
-                        function_registry_generation: self.function_registry_generation(),
+                        function_registry_generation,
                         dml_dispatch: Some(if supports_direct_dispatch {
                             let runtime_requirements = self.insert_runtime_requirements(insert)?;
                             PreparedDmlDispatch::Precompiled(Rc::new(PreparedPrecompiledDml {
@@ -30264,7 +31346,7 @@ impl Connection {
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
-                        function_registry_generation: self.function_registry_generation(),
+                        function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
@@ -30317,7 +31399,7 @@ impl Connection {
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
-                        function_registry_generation: self.function_registry_generation(),
+                        function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
@@ -30341,7 +31423,7 @@ impl Connection {
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
-                        function_registry_generation: self.function_registry_generation(),
+                        function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
@@ -30394,7 +31476,7 @@ impl Connection {
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
-                        function_registry_generation: self.function_registry_generation(),
+                        function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
@@ -30418,7 +31500,7 @@ impl Connection {
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
-                        function_registry_generation: self.function_registry_generation(),
+                        function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
@@ -30443,7 +31525,7 @@ impl Connection {
                 post_distinct_limit: None,
                 schema_cookie: self.schema_cookie(),
                 schema_generation: self.schema_generation(),
-                function_registry_generation: self.function_registry_generation(),
+                function_registry_generation,
                 dml_dispatch: None,
                 prepared_update_delete_fast_path: None,
                 deferred_query_statement: Some(Arc::new(statement.clone())),
@@ -31787,7 +32869,9 @@ impl Connection {
         let views_idx = self.views_by_name.borrow();
         let indexed_view_count = views_idx
             .values()
-            .map(|indices| usize::from(indices.main.is_some()) + usize::from(indices.temp.is_some()))
+            .map(|indices| {
+                usize::from(indices.main.is_some()) + usize::from(indices.temp.is_some())
+            })
             .sum::<usize>();
         assert_eq!(
             views.len(),
@@ -31799,9 +32883,9 @@ impl Connection {
                 let Some(index) = index else {
                     continue;
                 };
-                let entry = views.get(index).unwrap_or_else(|| {
-                    panic!("views_by_name[{name}] -> out-of-bounds {index}")
-                });
+                let entry = views
+                    .get(index)
+                    .unwrap_or_else(|| panic!("views_by_name[{name}] -> out-of-bounds {index}"));
                 assert!(entry.name.eq_ignore_ascii_case(name));
                 assert_eq!(entry.temporary, temporary);
             }
@@ -34180,16 +35264,6 @@ impl Connection {
         })
     }
 
-    fn prepared_statement_column_count(&self, statement: &Statement) -> usize {
-        match statement {
-            Statement::Select(select) => {
-                self.select_result_column_count(select, &[], &mut Vec::new())
-            }
-            Statement::Pragma(pragma) => pragma_result_columns(pragma).len(),
-            _ => 0,
-        }
-    }
-
     fn validate_statement_select_structure(&self, statement: &Statement) -> Result<()> {
         self.validate_statement_select_relations(statement)?;
         self.validate_statement_select_semantics(statement)
@@ -34539,22 +35613,48 @@ impl Connection {
     }
 
     fn table_function_result_column_names(&self, name: &str) -> Option<Vec<String>> {
-        if let Some(columns) = table_function_column_names(name) {
-            return Some(columns.iter().map(|col| (*col).to_owned()).collect());
+        if let Some(columns) = pragma_table_function_columns(name) {
+            return Some(columns.iter().map(|column| (*column).to_owned()).collect());
         }
-
         let module_key = name.to_ascii_uppercase();
-        self.vtab_modules
-            .borrow()
-            .get(&module_key)
-            .map(|factory| {
-                factory
-                    .column_info(&[])
-                    .into_iter()
-                    .map(|(column_name, _)| column_name)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|columns| !columns.is_empty())
+        let factory_args = [name.to_owned(), "main".to_owned(), name.to_owned()];
+        let factory_arg_refs = factory_args.iter().map(String::as_str).collect::<Vec<_>>();
+        // A metadata callback may replace its own module. Retry against the
+        // newly published Arc so every successful answer belongs to the factory
+        // that is still current. Persistent churn fails closed as unsupported.
+        for _ in 0..8 {
+            let factory = {
+                let modules = self.vtab_modules.borrow();
+                modules.get(&module_key).cloned()
+            };
+            let Some(factory) = factory else {
+                return table_function_column_names(name)
+                    .map(|columns| columns.iter().map(|column| (*column).to_owned()).collect());
+            };
+            let columns = self
+                .invoke_live_vtab_callback("xColumnInfo", || {
+                    Ok(factory.column_info(&factory_arg_refs))
+                })
+                .ok()?
+                .into_iter()
+                .map(|(column_name, _)| column_name)
+                .collect::<Vec<_>>();
+            let factory_is_still_current = {
+                let modules = self.vtab_modules.borrow();
+                modules
+                    .get(&module_key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &factory))
+            };
+            if !factory_is_still_current {
+                continue;
+            }
+            if !columns.is_empty() {
+                return Some(columns);
+            }
+            return table_function_column_names(name)
+                .map(|columns| columns.iter().map(|column| (*column).to_owned()).collect());
+        }
+        None
     }
 
     fn table_or_subquery_result_column_names(
@@ -34774,10 +35874,7 @@ impl Connection {
         Box::pin(async move {
             match expr {
                 Expr::Subquery(subquery, _)
-                    if !is_correlated_subquery_with_schema(
-                        subquery,
-                        &self.schema.borrow(),
-                    )
+                    if !is_correlated_subquery_with_schema(subquery, &self.schema.borrow())
                         && subquery_references_table(subquery, target_table) =>
                 {
                     let rows = self
@@ -35419,6 +36516,14 @@ impl Connection {
             return Ok(None);
         };
         let layout = self.resolve_live_vtab_insert_layout(insert)?;
+        // Non-direct layouts may evaluate DEFAULT expressions through nested
+        // statement execution. The streaming path owns the pager transaction
+        // and detaches the target vtab across its async row loop, so such
+        // re-entry would observe a half-published state. Materialize those
+        // shapes first through the ordinary path instead.
+        if layout.direct_projection.is_none() {
+            return Ok(None);
+        }
         let table_name = insert.table.name.as_str();
         let root_page = {
             let schema = self.schema.borrow();
@@ -35436,14 +36541,17 @@ impl Connection {
         let key = table_name.to_ascii_uppercase();
         let mut inserted_row_count = 0usize;
         let mut source_row_count = 0usize;
-        let streamed = self
+        let taken = self.take_active_live_vtab_instance(&key).ok_or_else(|| {
+            FrankenError::Internal(format!("virtual table not found: {table_name}"))
+        })?;
+        let mut vtab_guard = TakenLiveVtabRestoreGuard::new(self, key, taken);
+        let streamed_result = self
             .with_pager_write_txn(async |cx, txn| {
                 let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-                let mut instances = self.vtab_instances.borrow_mut();
-                let instance = instances.get_mut(&key).ok_or_else(|| {
-                    FrankenError::Internal(format!("virtual table not found: {table_name}"))
+                let instance = vtab_guard.instance_mut();
+                self.invoke_live_vtab_callback("xBegin", || {
+                    self.begin_live_vtab_transaction_if_needed(table_name, instance, cx)
                 })?;
-                self.begin_live_vtab_transaction_if_needed(table_name, instance.as_mut(), cx)?;
                 #[cfg(feature = "ext-fts5")]
                 if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>()
                     && fts5.is_empty()
@@ -35546,7 +36654,7 @@ impl Connection {
                     .await?;
                     return Ok(true);
                 }
-                let patch_first_column_with_rowid = is_rtree_instance(instance.as_ref());
+                let patch_first_column_with_rowid = is_rtree_instance(instance);
                 self.emit_prepared_simple_join_rows(&prepared, async |source_values| {
                     source_row_count = source_row_count.saturating_add(1);
                     let row = self
@@ -35568,11 +36676,13 @@ impl Connection {
                     };
                     args.push(new_rowid);
                     args.extend(row.values.iter().cloned());
-                    let rowid = instance.update(cx, &args)?.ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "virtual table {table_name} did not return a rowid for INSERT",
-                        ))
-                    })?;
+                    let rowid = self
+                        .invoke_live_vtab_callback("xUpdate", || instance.update(cx, &args))?
+                        .ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "virtual table {table_name} did not return a rowid for INSERT",
+                            ))
+                        })?;
                     let mut persisted_values = row.values;
                     if patch_first_column_with_rowid
                         && persisted_values.first().is_some_and(SqliteValue::is_null)
@@ -35591,7 +36701,31 @@ impl Connection {
                 .await?;
                 Ok(true)
             })
-            .await?;
+            .await;
+        let table_key = table_name.to_ascii_uppercase();
+        let invalidate_after_callback = self
+            .live_vtab_failed_begin_cleanup
+            .borrow_mut()
+            .remove(&table_key);
+        let restore_result = if invalidate_after_callback {
+            vtab_guard.cleanup(&prep_cx, LiveVtabCleanupAction::Disconnect)
+        } else {
+            vtab_guard.restore(&prep_cx)
+        };
+        let streamed = match streamed_result {
+            Ok(streamed) => {
+                restore_result?;
+                streamed
+            }
+            Err(error) => {
+                if let Err(restore_error) = restore_result {
+                    return Err(FrankenError::Internal(format!(
+                        "streaming virtual-table INSERT failed: {error}; registry restore failed: {restore_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
         if !streamed {
             return Ok(None);
         }
@@ -35604,6 +36738,7 @@ impl Connection {
         rows: &[LiveVtabInsertRow],
     ) -> Result<Vec<i64>> {
         let cx = self.op_cx()?;
+        #[cfg(feature = "ext-fts5")]
         let key = table_name.to_ascii_uppercase();
         #[cfg(feature = "ext-fts5")]
         let lazy_contentless = {
@@ -35649,36 +36784,39 @@ impl Connection {
             }
             contentless
         };
-        let mut instances = self.vtab_instances.borrow_mut();
-        let instance = instances.get_mut(&key).ok_or_else(|| {
-            FrankenError::Internal(format!("virtual table not found: {table_name}"))
-        })?;
-        self.begin_live_vtab_transaction_if_needed(table_name, instance.as_mut(), &cx)?;
-        let patch_first_column_with_rowid = is_rtree_instance(instance.as_ref());
-
-        let mut inserted_rowids = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut args = Vec::with_capacity(row.values.len() + 2);
-            args.push(SqliteValue::Null);
-            let new_rowid = if is_rtree_instance(instance.as_ref()) {
-                row.explicit_rowid
-                    .clone()
-                    .or_else(|| row.values.first().cloned())
-                    .unwrap_or(SqliteValue::Null)
-            } else {
-                row.explicit_rowid.clone().unwrap_or(SqliteValue::Null)
-            };
-            args.push(new_rowid);
-            args.extend(row.values.iter().cloned());
-            let rowid = instance.update(&cx, &args)?.ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "virtual table {table_name} did not return a rowid for INSERT",
-                ))
-            })?;
-            inserted_rowids.push(rowid);
-            self.record_last_insert_rowid(rowid);
-        }
-        drop(instances);
+        let (inserted_rowids, patch_first_column_with_rowid) = self
+            .with_active_live_vtab_instance(
+                &cx,
+                table_name,
+                "xBegin/xUpdate",
+                |instance| {
+                    self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)?;
+                    let patch_first_column_with_rowid = is_rtree_instance(instance);
+                    let mut inserted_rowids = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let mut args = Vec::with_capacity(row.values.len() + 2);
+                        args.push(SqliteValue::Null);
+                        let new_rowid = if patch_first_column_with_rowid {
+                            row.explicit_rowid
+                                .clone()
+                                .or_else(|| row.values.first().cloned())
+                                .unwrap_or(SqliteValue::Null)
+                        } else {
+                            row.explicit_rowid.clone().unwrap_or(SqliteValue::Null)
+                        };
+                        args.push(new_rowid);
+                        args.extend(row.values.iter().cloned());
+                        let rowid = instance.update(&cx, &args)?.ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "virtual table {table_name} did not return a rowid for INSERT",
+                            ))
+                        })?;
+                        inserted_rowids.push(rowid);
+                        self.record_last_insert_rowid(rowid);
+                    }
+                    Ok((inserted_rowids, patch_first_column_with_rowid))
+                },
+            )?;
 
         #[cfg(feature = "ext-fts5")]
         if self
@@ -35786,6 +36924,7 @@ impl Connection {
             return Ok(0);
         }
 
+        #[cfg(feature = "ext-fts5")]
         let key = table_name.to_ascii_uppercase();
         let root_page = {
             let schema = self.schema.borrow();
@@ -35811,20 +36950,21 @@ impl Connection {
         #[cfg(feature = "ext-fts5")]
         if root_page == 0 && self.is_live_fts5_instance(table_name) {
             let cx = self.op_cx()?;
-            let deleted = {
-                let mut instances = self.vtab_instances.borrow_mut();
-                let instance = instances.get_mut(&key).ok_or_else(|| {
-                    FrankenError::Internal(format!("virtual table not found: {table_name}"))
-                })?;
-                self.begin_live_vtab_transaction_if_needed(table_name, instance.as_mut(), &cx)?;
+            let deleted = self.with_active_live_vtab_instance(
+                &cx,
+                table_name,
+                "xBegin/xUpdate",
+                |instance| {
+                    self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)?;
                 let mut count = 0usize;
                 for rowid in rowids {
                     // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
                     instance.update(&cx, &[SqliteValue::Integer(*rowid)])?;
                     count = count.saturating_add(1);
                 }
-                count
-            };
+                    Ok(count)
+                },
+            )?;
             self.persist_rootpage_zero_fts5_deleted_rowids(table_name, rowids)
                 .await?;
             return Ok(deleted);
@@ -35838,15 +36978,18 @@ impl Connection {
         let deleted = self
             .with_pager_write_txn(async |cx, txn| {
                 let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-                let mut instances = self.vtab_instances.borrow_mut();
-                let instance = instances.get_mut(&key).ok_or_else(|| {
-                    FrankenError::Internal(format!("virtual table not found: {table_name}"))
+                self.with_active_live_vtab_instance(cx, table_name, "xBegin", |instance| {
+                    self.begin_live_vtab_transaction_if_needed(table_name, instance, cx)
                 })?;
-                self.begin_live_vtab_transaction_if_needed(table_name, instance.as_mut(), cx)?;
                 let mut count = 0usize;
                 for rowid in rowids {
                     // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
-                    instance.update(cx, &[SqliteValue::Integer(*rowid)])?;
+                    self.with_active_live_vtab_instance(
+                        cx,
+                        table_name,
+                        "xUpdate",
+                        |instance| instance.update(cx, &[SqliteValue::Integer(*rowid)]),
+                    )?;
                     if cursor.table_move_to(cx, *rowid).await?.is_found() {
                         cursor.delete(cx).await?;
                     }
@@ -36794,10 +37937,16 @@ impl Connection {
         table_name: &str,
         col_infos: Vec<ColumnInfo>,
         create_sql: &str,
-        instance: Box<dyn ErasedVtabInstance>,
+        mut pending_instance: PendingLiveVtabGuard<'_>,
         args: &[String],
     ) -> Result<()> {
         self.preflight_fts5_shadow_table_names(table_name, args)?;
+        let table_key = table_name.to_ascii_uppercase();
+        if self.vtab_instances.borrow().contains_key(&table_key) {
+            return Err(FrankenError::Internal(format!(
+                "live virtual table registry already contains {table_name}"
+            )));
+        }
         self.schema.borrow_mut().push(TableSchema {
             name: table_name.to_owned(),
             root_page: 0,
@@ -36810,14 +37959,14 @@ impl Connection {
             check_constraints: Vec::new(),
         });
         self.rebuild_schema_indices();
-        let replaced = self
-            .vtab_instances
-            .borrow_mut()
-            .insert(table_name.to_ascii_uppercase(), instance);
-        if replaced.is_some() {
-            return Err(FrankenError::Internal(format!(
-                "live virtual table registry already contains {table_name}"
-            )));
+        {
+            let mut registry = self.vtab_instances.borrow_mut();
+            if registry.contains_key(&table_key) {
+                return Err(FrankenError::Internal(format!(
+                    "live virtual table registry already contains {table_name}"
+                )));
+            }
+            registry.insert(table_key, pending_instance.take_instance());
         }
         self.note_live_vtab_created(table_name);
         self.insert_sqlite_master_row("table", table_name, table_name, 0, create_sql)
@@ -38486,6 +39635,12 @@ impl Connection {
 
     // ── autocommit pager transaction wrapping (bd-14dj / 5B.5) ──────────
 
+    #[inline]
+    fn note_autocommit_txn_started(&self) {
+        self.autocommit_txn_begin_schema_generation
+            .set(Some(self.schema_generation()));
+    }
+
     /// Ensure a pager transaction is active.  If the connection is NOT
     /// inside an explicit `BEGIN`, an implicit (autocommit) transaction is
     /// created.  Returns `true` when an implicit transaction was started
@@ -38561,6 +39716,7 @@ impl Connection {
             })?;
             self.cached_write_txn_memdb_row_mirror_exact.set(false);
             *self.active_txn.borrow_mut() = Some(txn);
+            self.note_autocommit_txn_started();
             self.concurrent_txn.set(false);
             *self.concurrent_session_id.borrow_mut() = None;
             self.txn_metrics_mark_started();
@@ -38593,6 +39749,7 @@ impl Connection {
                     )
                 })?;
             *self.active_txn.borrow_mut() = Some(txn);
+            self.note_autocommit_txn_started();
             // Retained autocommit always uses serialized mode (not concurrent)
             // to simplify conflict handling within the retained batch.
             self.concurrent_txn.set(false);
@@ -38640,6 +39797,7 @@ impl Connection {
                     )
                 })?;
             *self.active_txn.borrow_mut() = Some(txn);
+            self.note_autocommit_txn_started();
             self.concurrent_txn.set(false);
             *self.concurrent_session_id.borrow_mut() = None;
             self.txn_metrics_mark_started();
@@ -38680,6 +39838,7 @@ impl Connection {
                 .await?;
             let concurrent_session: Option<u64> = None;
             *self.active_txn.borrow_mut() = Some(txn);
+            self.note_autocommit_txn_started();
             *self.concurrent_session_id.borrow_mut() = concurrent_session;
             // :memory: fast path uses serialized mode internally — set
             // concurrent_txn=false so VDBE dispatch skips ConcurrentExecContext
@@ -38781,6 +39940,7 @@ impl Connection {
         };
 
         *self.active_txn.borrow_mut() = Some(txn);
+        self.note_autocommit_txn_started();
         self.clear_memory_concurrent_synced_write_roots();
         self.clear_cached_concurrent_handle();
         *self.concurrent_session_id.borrow_mut() = concurrent_session;
@@ -40560,22 +41720,27 @@ impl Connection {
         let mut txn = {
             let mut guard = self.active_txn.borrow_mut();
             let Some(txn) = guard.take() else {
+                drop(guard);
+                self.autocommit_txn_begin_schema_generation.set(None);
                 self.live_vtab_transactions.borrow_mut().clear();
+                self.concurrent_txn.set(false);
+                *self.concurrent_session_id.borrow_mut() = None;
+                self.txn_metrics_mark_finished();
                 if ok {
                     self.finalize_live_vtab_registry_commit(cx);
                 } else {
                     self.restore_live_vtab_registry_to(cx, 0)?;
                 }
-                self.concurrent_txn.set(false);
-                *self.concurrent_session_id.borrow_mut() = None;
-                self.txn_metrics_mark_finished();
                 return Ok(());
             };
             txn
         };
 
+        let txn_begin_schema_generation = self.autocommit_txn_begin_schema_generation.take();
         let txn_has_pending_writes = txn.has_pending_writes();
-        let had_live_vtab_txn = !self.live_vtab_transactions.borrow().is_empty();
+        let txn_begin_visible_commit_seq = txn.published_visible_commit_seq_hint();
+        let live_vtab_commit_keys: HashSet<String> =
+            self.active_live_vtab_names().into_iter().collect();
 
         // Persistent read-only snapshot: if the autocommit transaction was
         // read-only and succeeded, park it for reuse by the next autocommit
@@ -40869,10 +42034,14 @@ impl Connection {
                         if retained_reload_error.is_none() && hot_path_profile_enabled() {
                             FSQLITE_CACHED_WRITE_TXN_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
                         }
-                        // Finalize vtab registry: clear dropped instances without
-                        // calling destroy() — the commit_and_retain fast path
-                        // must not re-enter the connection through vtab callbacks.
-                        self.dropped_vtab_instances.borrow_mut().clear();
+                        // Finalize the registry without calling the virtual-table
+                        // destroy hook. Rust destructors may still re-enter, so
+                        // take ownership under a short borrow and defer their Drop
+                        // until the rest of the committed state is published.
+                        let displaced_dropped_live_vtabs = {
+                            let mut registry = self.dropped_vtab_instances.borrow_mut();
+                            std::mem::take(&mut *registry)
+                        };
                         self.live_vtab_registry_undo.borrow_mut().clear();
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_HANDLE_FINALIZE_TIME_NS,
@@ -40908,6 +42077,7 @@ impl Connection {
                                 "retained commit succeeded but memdb reload from retained txn failed: {error}"
                             );
                         }
+                        drop(displaced_dropped_live_vtabs);
                         return Ok(());
                     }
                     Ok(false) => {} // Not retained — fall through to normal commit
@@ -41076,18 +42246,30 @@ impl Connection {
         }
         let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         let commit_handle_finalize_start = hot_path_profile_enabled().then(Instant::now);
-        self.live_vtab_commit_all_best_effort(cx);
-        self.finalize_live_vtab_registry_commit(cx);
+        let (live_vtab_commit_succeeded, invalidated_live_vtabs) =
+            self.live_vtab_commit_all_best_effort(cx);
+        let committed_dropped_live_vtabs = self.take_committed_dropped_live_vtabs();
         record_hot_path_duration(
             &FSQLITE_COMMIT_HANDLE_FINALIZE_TIME_NS,
             commit_handle_finalize_start,
         );
-        if committed_write && had_live_vtab_txn {
-            self.pending_local_live_vtab_preserve_once.set(true);
-        }
         if committed_write && !self.pager.is_memory() {
             self.sync_filebacked_post_commit_visibility_floor();
         }
+        if committed_write {
+            self.arm_pending_local_live_vtab_preservation(
+                txn_begin_visible_commit_seq,
+                live_vtab_commit_keys,
+                !schema_change_boundary
+                    && txn_begin_schema_generation == Some(self.schema_generation()),
+                live_vtab_commit_succeeded,
+            );
+        }
+        // A failed post-durable xCommit leaves that user object suspect. It was
+        // removed from both registries above; run its Rust destructor only after
+        // the commit receipt and visibility state are final and unborrowed.
+        self.cleanup_failed_live_vtab_commits(cx, invalidated_live_vtabs);
+        self.cleanup_committed_dropped_live_vtabs(cx, committed_dropped_live_vtabs);
 
         if committed_write {
             self.discard_cached_vdbe_engine();
@@ -43057,10 +44239,10 @@ impl Connection {
                 // Detect INTEGER PRIMARY KEY column (rowid alias) and whether
                 // it carries AUTOINCREMENT.
                 let mut is_autoincrement = false;
-                let table_pk_rowid_col_idx = constraints.iter().find_map(|constraint| {
+                let table_pk_rowid = constraints.iter().find_map(|constraint| {
                     let TableConstraintKind::PrimaryKey {
                         columns: pk_columns,
-                        ..
+                        conflict,
                     } = &constraint.kind
                     else {
                         return None;
@@ -43072,8 +44254,9 @@ impl Connection {
                     let index = columns
                         .iter()
                         .position(|col| col.name.eq_ignore_ascii_case(&column_name))?;
-                    column_def_is_exact_integer(&columns[index]).then_some(index)
+                    column_def_is_exact_integer(&columns[index]).then_some((index, *conflict))
                 });
+                let table_pk_rowid_col_idx = table_pk_rowid.map(|(index, _)| index);
                 let rowid_col_idx = columns
                     .iter()
                     .enumerate()
@@ -43223,10 +44406,17 @@ impl Connection {
                         // NOT NULL clause governs the null check. UNIQUE-column
                         // conflicts live on the backing index instead.
                         let conflict_action = if is_ipk {
-                            col.constraints.iter().find_map(|c| match &c.kind {
-                                ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                                _ => None,
-                            })
+                            col.constraints
+                                .iter()
+                                .find_map(|c| match &c.kind {
+                                    ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                                    _ => None,
+                                })
+                                .or_else(|| {
+                                    table_pk_rowid.and_then(|(pk_index, conflict)| {
+                                        (pk_index == i).then_some(conflict).flatten()
+                                    })
+                                })
                         } else {
                             col.constraints.iter().find_map(|c| match &c.kind {
                                 ColumnConstraintKind::NotNull { conflict } => *conflict,
@@ -43268,10 +44458,9 @@ impl Connection {
                 // key" (bd-1sgq2).
                 let column_pk_count = columns
                     .iter()
-                    .filter(|col| {
-                        col.constraints
-                            .iter()
-                            .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }))
+                    .flat_map(|column| &column.constraints)
+                    .filter(|constraint| {
+                        matches!(constraint.kind, ColumnConstraintKind::PrimaryKey { .. })
                     })
                     .count();
                 let table_pk_count = constraints
@@ -43354,11 +44543,8 @@ impl Connection {
                 // allocate roots only for materialized slots. A WITHOUT ROWID
                 // PRIMARY KEY still owns an ordinal even though its B-tree is
                 // the table root and no sqlite_schema index row is persisted.
-                let implicit_autoindex_slots = implicit_autoindex_layout(
-                    columns,
-                    constraints,
-                    create.without_rowid,
-                )?;
+                let implicit_autoindex_slots =
+                    implicit_autoindex_layout(columns, constraints, create.without_rowid)?;
                 // All validation that can reject the canonical layout must run
                 // before mutating connection-local schema maps.
                 if !create.without_rowid
@@ -43605,8 +44791,11 @@ impl Connection {
         }
 
         // Try the registered module registry first, then fall back to FTS5.
-        let modules = self.vtab_modules.borrow();
-        if let Some(factory) = modules.get(&module_key) {
+        let factory = {
+            let modules = self.vtab_modules.borrow();
+            modules.get(&module_key).cloned()
+        };
+        if let Some(factory) = factory {
             // Build the args vector following the SQLite convention:
             //   args[0] = module name
             //   args[1] = database name ("main")
@@ -43616,47 +44805,34 @@ impl Connection {
                 vec![create.module.clone(), "main".to_owned(), table_name.clone()];
             full_args.extend(create.args.iter().cloned());
             let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
-            let module_arg_refs: Vec<&str> = create.args.iter().map(String::as_str).collect();
             let cx = self.op_cx()?;
-            let (instance, used_module_only_args) = match factory.create(&cx, &full_arg_refs) {
-                Ok(instance) => (instance, false),
-                Err(full_error) => {
-                    if module_arg_refs.is_empty() {
-                        return Err(full_error);
-                    }
-                    match factory.create(&cx, &module_arg_refs) {
-                        Ok(instance) => {
-                            tracing::debug!(
-                                table = %table_name,
-                                module = %create.module,
-                                "virtual table module created using module-only arguments"
-                            );
-                            (instance, true)
-                        }
-                        Err(_) => return Err(full_error),
-                    }
-                }
-            };
-            let col_infos = resolve_virtual_table_column_infos(
-                factory.as_ref(),
-                &create.args,
-                if used_module_only_args {
-                    &module_arg_refs
-                } else {
-                    &full_arg_refs
-                },
-            );
-            drop(modules);
+            let declared_columns = parse_declared_virtual_table_column_infos(&create.args);
+            let factory_columns = self.invoke_live_vtab_callback("xColumnInfo", || {
+                Ok(factory.column_info(&full_arg_refs))
+            })?;
+            let col_infos =
+                resolve_virtual_table_column_infos(declared_columns, factory_columns);
+            let instance = self.invoke_live_vtab_callback("xCreate", || {
+                factory.create(&cx, &full_arg_refs)
+            })?;
+            let mut pending_instance =
+                PendingLiveVtabGuard::created(self, &cx, &table_name, instance);
             #[cfg(feature = "ext-fts5")]
-            if module_key.eq_ignore_ascii_case("FTS5")
-                && instance.as_any().downcast_ref::<Fts5Table>().is_some()
-            {
+            let is_fts5_instance = self.invoke_live_vtab_callback("asAny", || {
+                Ok(pending_instance
+                    .instance()
+                    .as_any()
+                    .downcast_ref::<Fts5Table>()
+                    .is_some())
+            })?;
+            #[cfg(feature = "ext-fts5")]
+            if module_key.eq_ignore_ascii_case("FTS5") && is_fts5_instance {
                 return self
                     .create_rootpage_zero_fts5_virtual_table(
                         &table_name,
                         col_infos,
                         &create.to_string(),
-                        instance,
+                        pending_instance,
                         &create.args,
                     )
                     .await;
@@ -43677,16 +44853,24 @@ impl Connection {
                 check_constraints: Vec::new(),
             });
             self.rebuild_schema_indices();
-            let replaced = self
-                .vtab_instances
-                .borrow_mut()
-                .insert(table_name.to_ascii_uppercase(), instance);
-            if replaced.is_some() {
-                return Err(FrankenError::Internal(format!(
-                    "live virtual table registry already contains {table_name}"
-                )));
+            let table_key = table_name.to_ascii_uppercase();
+            {
+                let mut registry = self.vtab_instances.borrow_mut();
+                if registry.contains_key(&table_key) {
+                    return Err(FrankenError::Internal(format!(
+                        "live virtual table registry already contains {table_name}"
+                    )));
+                }
+                registry.insert(table_key, pending_instance.take_instance());
             }
             self.note_live_vtab_created(&table_name);
+
+            #[cfg(test)]
+            if self.fail_live_vtab_create_after_registry_once.replace(false) {
+                return Err(FrankenError::Internal(
+                    "injected CREATE VIRTUAL TABLE failure after registry publication".to_owned(),
+                ));
+            }
 
             self.insert_sqlite_master_row(
                 "table",
@@ -43699,8 +44883,6 @@ impl Connection {
             self.increment_schema_cookie().await?;
             return Ok(());
         }
-        drop(modules);
-
         // Legacy FTS5 fallback path.
         if !module_key.eq_ignore_ascii_case("FTS5") {
             return Err(FrankenError::NotImplemented(format!(
@@ -43829,8 +45011,7 @@ impl Connection {
                 Some(_) => unreachable!("attached DROP targets are delegated before execution"),
                 None => PragmaSchemaScope::Unqualified,
             };
-            let temp_object_exists = self
-                .table_exists_for_scope(obj_name, PragmaSchemaScope::Temp)
+            let temp_object_exists = self.table_exists_for_scope(obj_name, PragmaSchemaScope::Temp)
                 || self
                     .view_index_for_scope(obj_name, PragmaSchemaScope::Temp)
                     .is_some();
@@ -43976,12 +45157,20 @@ impl Connection {
                             swallow_missing_master(err)?;
                         }
                     }
-                    if let Some(instance) = self
-                        .vtab_instances
-                        .borrow_mut()
-                        .remove(&obj_name.to_ascii_uppercase())
-                    {
+                    let removed_vtab = {
+                        self.vtab_instances
+                            .borrow_mut()
+                            .remove(&obj_name.to_ascii_uppercase())
+                    };
+                    if let Some(instance) = removed_vtab {
                         self.stage_dropped_live_vtab(obj_name, instance, &cx)?;
+                        #[cfg(test)]
+                        if self.fail_live_vtab_drop_after_stage_once.replace(false) {
+                            return Err(FrankenError::Internal(
+                                "injected DROP VIRTUAL TABLE failure after registry staging"
+                                    .to_owned(),
+                            ));
+                        }
                     }
 
                     if let Err(err) = self.delete_sqlite_master_typed_row("table", obj_name).await {
@@ -44063,12 +45252,8 @@ impl Connection {
             }
             DropObjectType::View => {
                 let requested_scope = match drop_stmt.name.schema.as_deref() {
-                    Some(schema) if schema.eq_ignore_ascii_case("main") => {
-                        PragmaSchemaScope::Main
-                    }
-                    Some(schema) if schema.eq_ignore_ascii_case("temp") => {
-                        PragmaSchemaScope::Temp
-                    }
+                    Some(schema) if schema.eq_ignore_ascii_case("main") => PragmaSchemaScope::Main,
+                    Some(schema) if schema.eq_ignore_ascii_case("temp") => PragmaSchemaScope::Temp,
                     Some(_) => unreachable!("attached DROP targets are delegated before execution"),
                     None => PragmaSchemaScope::Unqualified,
                 };
@@ -44121,9 +45306,8 @@ impl Connection {
                     }
 
                     if !dropped_view.temporary
-                        && let Err(err) = self
-                            .delete_sqlite_master_typed_row("view", obj_name)
-                            .await
+                        && let Err(err) =
+                            self.delete_sqlite_master_typed_row("view", obj_name).await
                     {
                         swallow_missing_master(err)?;
                     }
@@ -44373,6 +45557,147 @@ impl Connection {
             return Err(FrankenError::Unsupported);
         }
         let old_name = table_name.clone();
+        let targets_main_explicit = alter
+            .table
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
+        let alters_temp_table = !targets_main_explicit
+            && self
+                .temp_table_names
+                .borrow()
+                .contains(&old_name.to_ascii_lowercase());
+
+        // Keep the established semantic error precedence ahead of the
+        // original-DDL safety preflight below. In particular, a missing table
+        // or source column must not be reported as a schema-rewrite/cache
+        // failure merely because there is no CREATE TABLE text to rewrite.
+        {
+            let schema = self.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&old_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: old_name.clone(),
+                })?;
+            match &alter.action {
+                AlterTableAction::RenameColumn { old, .. } | AlterTableAction::DropColumn(old)
+                    if !table
+                        .columns
+                        .iter()
+                        .any(|column| column.name.eq_ignore_ascii_case(old)) =>
+                {
+                    return Err(FrankenError::Internal(format!("no such column: {old}")));
+                }
+                AlterTableAction::AddColumn(column)
+                    if table
+                        .columns
+                        .iter()
+                        .any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) =>
+                {
+                    return Err(FrankenError::Internal(format!(
+                        "duplicate column name: {}",
+                        column.name
+                    )));
+                }
+                AlterTableAction::RenameTo(_)
+                | AlterTableAction::RenameColumn { .. }
+                | AlterTableAction::AddColumn(_)
+                | AlterTableAction::DropColumn(_) => {}
+            }
+        }
+
+        // Preserve the parsed CREATE TABLE constraint vectors instead of
+        // reconstructing them from lossy TableSchema metadata. Autoindex names
+        // bind to declaration slots, so reordering a UNIQUE and PRIMARY KEY
+        // while handling ALTER would make the next reload attach each physical
+        // root to the wrong definition. Parse and rewrite before mutating any
+        // in-memory schema so unsupported legacy DDL fails without residue.
+        let rewritten_target_create_sql = if alters_temp_table {
+            None
+        } else {
+            let original_sql = self
+                .original_ddl_sql
+                .borrow()
+                .get(&old_name.to_ascii_lowercase())
+                .cloned()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "cannot safely ALTER `{old_name}` without its original CREATE TABLE SQL"
+                    ))
+                })?;
+            Some(rewrite_create_table_sql_for_alter(
+                &original_sql,
+                &old_name,
+                &alter.action,
+            )?)
+        };
+
+        let dependent_table_names = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .filter(|table| !table.name.eq_ignore_ascii_case(&old_name))
+                .filter(|table| {
+                    table.foreign_keys.iter().any(|foreign_key| {
+                        if !foreign_key.parent_table.eq_ignore_ascii_case(&old_name) {
+                            return false;
+                        }
+                        match &alter.action {
+                            AlterTableAction::RenameTo(_) => true,
+                            AlterTableAction::RenameColumn { old, .. } => foreign_key
+                                .parent_columns
+                                .iter()
+                                .any(|column| column.eq_ignore_ascii_case(old)),
+                            AlterTableAction::AddColumn(_) | AlterTableAction::DropColumn(_) => {
+                                false
+                            }
+                        }
+                    })
+                })
+                .map(|table| table.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let rewritten_dependent_create_sql = {
+            let original_ddl = self.original_ddl_sql.borrow();
+            dependent_table_names
+                .iter()
+                .map(|dependent_table_name| {
+                    let original_sql = original_ddl
+                        .get(&dependent_table_name.to_ascii_lowercase())
+                        .ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "cannot safely rewrite foreign key in `{dependent_table_name}` \
+                                 without its original CREATE TABLE SQL"
+                            ))
+                        })?;
+                    let rewritten = match &alter.action {
+                        AlterTableAction::RenameTo(new_name) => {
+                            rewrite_create_table_foreign_key_parent_sql(
+                                original_sql,
+                                dependent_table_name,
+                                &old_name,
+                                Some(new_name),
+                                None,
+                            )?
+                        }
+                        AlterTableAction::RenameColumn { old, new } => {
+                            rewrite_create_table_foreign_key_parent_sql(
+                                original_sql,
+                                dependent_table_name,
+                                &old_name,
+                                None,
+                                Some((old, new)),
+                            )?
+                        }
+                        AlterTableAction::AddColumn(_) | AlterTableAction::DropColumn(_) => {
+                            unreachable!("only rename actions rewrite dependent table DDL")
+                        }
+                    };
+                    Ok((dependent_table_name.to_ascii_lowercase(), rewritten))
+                })
+                .collect::<Result<HashMap<_, _>>>()?
+        };
         let mut dependent_table_schema_updates = Vec::new();
         let mut dependent_view_sql_updates = Vec::new();
         let mut dependent_trigger_sql_updates = Vec::new();
@@ -45027,16 +46352,6 @@ impl Connection {
             ));
         }
 
-        let targets_main_explicit = alter
-            .table
-            .schema
-            .as_deref()
-            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
-        let alters_temp_table = !targets_main_explicit
-            && self
-                .temp_table_names
-                .borrow()
-                .contains(&old_name.to_ascii_lowercase());
         if alters_temp_table && matches!(alter.action, AlterTableAction::DropColumn(_)) {
             // TEMP schema and rows are connection-local. There is deliberately
             // no sqlite_master row to update; trying the main-catalog path is
@@ -45072,11 +46387,13 @@ impl Connection {
             }
         }
 
-        let create_sql = render_create_table_sql(
-            &new_schema,
-            self.is_autoincrement_table(&new_schema.name),
-            |index| self.index_is_implicit_autoindex(&index.name, &new_schema.name),
-        );
+        let create_sql = rewritten_target_create_sql.unwrap_or_else(|| {
+            render_create_table_sql(
+                &new_schema,
+                self.is_autoincrement_table(&new_schema.name),
+                |index| self.index_is_implicit_autoindex(&index.name, &new_schema.name),
+            )
+        });
 
         if matches!(alter.action, AlterTableAction::RenameTo(_)) {
             // Preserve the table rowid while changing name/tbl_name/sql.
@@ -45140,12 +46457,10 @@ impl Connection {
             }
         }
         for (_, dependent_table) in &dependent_table_schema_updates {
-            let create_sql = render_create_table_sql(
-                dependent_table,
-                self.is_autoincrement_table(&dependent_table.name),
-                |index| self.index_is_implicit_autoindex(&index.name, &dependent_table.name),
-            );
-            self.update_sqlite_master_typed_sql("table", &dependent_table.name, &create_sql)
+            let create_sql = rewritten_dependent_create_sql
+                .get(&dependent_table.name.to_ascii_lowercase())
+                .expect("dependent CREATE TABLE SQL was preflighted before schema mutation");
+            self.update_sqlite_master_typed_sql("table", &dependent_table.name, create_sql)
                 .await?;
         }
         for (view_name, view_sql) in &dependent_view_sql_updates {
@@ -46660,25 +47975,20 @@ impl Connection {
     async fn execute_create_view(&self, stmt: &fsqlite_ast::CreateViewStatement) -> Result<()> {
         let view_name = &stmt.name.name;
         let qualifier = stmt.name.schema.as_deref();
-        if stmt.temporary
-            && qualifier.is_some_and(|schema| !schema.eq_ignore_ascii_case("temp"))
-        {
+        if stmt.temporary && qualifier.is_some_and(|schema| !schema.eq_ignore_ascii_case("temp")) {
             return Err(FrankenError::FunctionError(
                 "temporary table name must be unqualified".to_owned(),
             ));
         }
-        let target_is_temp = stmt.temporary
-            || qualifier.is_some_and(|schema| schema.eq_ignore_ascii_case("temp"));
+        let target_is_temp =
+            stmt.temporary || qualifier.is_some_and(|schema| schema.eq_ignore_ascii_case("temp"));
         let target_scope = if target_is_temp {
             PragmaSchemaScope::Temp
         } else {
             PragmaSchemaScope::Main
         };
 
-        if self
-            .view_index_for_scope(view_name, target_scope)
-            .is_some()
-        {
+        if self.view_index_for_scope(view_name, target_scope).is_some() {
             if stmt.if_not_exists {
                 return Ok(());
             }
@@ -48577,13 +49887,11 @@ impl Connection {
 
                 // Materialize each referenced view as a temp table.
                 for (view_index, materialized_name) in &referenced {
-                    let view = view_defs
-                        .get(*view_index)
-                        .ok_or_else(|| {
-                            FrankenError::internal(format!(
-                                "view index {view_index} not found in definitions"
-                            ))
-                        })?;
+                    let view = view_defs.get(*view_index).ok_or_else(|| {
+                        FrankenError::internal(format!(
+                            "view index {view_index} not found in definitions"
+                        ))
+                    })?;
                     let mut executable_view_query = view.query.clone();
                     if !view.temporary {
                         qualify_persistent_view_relations(&mut executable_view_query);
@@ -50051,7 +51359,8 @@ impl Connection {
         // application must ROLLBACK or resolve the violation and COMMIT again).
         self.recheck_deferred_fk_at_commit().await?;
         let commit_pre_txn_start = hot_path_profile_enabled().then(Instant::now);
-        let had_live_vtab_txn = !self.live_vtab_transactions.borrow().is_empty();
+        let live_vtab_commit_keys: HashSet<String> =
+            self.active_live_vtab_names().into_iter().collect();
         if !self.live_vtab_transactions.borrow().is_empty() {
             if let Err(sync_error) = self.live_vtab_sync_all(cx) {
                 let txn_has_pending_writes = self
@@ -50118,13 +51427,21 @@ impl Connection {
         }
 
         let is_concurrent_txn = self.concurrent_txn.get();
-        let schema_cookie_to_publish = {
+        let txn_begin_visible_commit_seq = self
+            .active_txn
+            .borrow()
+            .as_ref()
+            .and_then(|txn| txn.published_visible_commit_seq_hint());
+        let (schema_cookie_to_publish, txn_begin_schema_generation) = {
             let current_schema_cookie = self.schema_cookie();
-            self.txn_snapshot
-                .borrow()
+            let snapshot = self.txn_snapshot.borrow();
+            let schema_cookie_changed = snapshot
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.schema_cookie != current_schema_cookie)
-                .then_some(current_schema_cookie)
+                .is_some_and(|snapshot| snapshot.schema_cookie != current_schema_cookie);
+            (
+                schema_cookie_changed.then_some(current_schema_cookie),
+                snapshot.as_ref().map(|snapshot| snapshot.schema_generation),
+            )
         };
         let (txn_has_pending_writes, pending_conflict_pages) = {
             let txn_guard = self.active_txn.borrow();
@@ -50343,14 +51660,20 @@ impl Connection {
         let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         let commit_handle_finalize_start = hot_path_profile_enabled().then(Instant::now);
         *self.active_txn.borrow_mut() = None;
-        self.live_vtab_commit_all_best_effort(cx);
-        self.finalize_live_vtab_registry_commit(cx);
+        let (live_vtab_commit_succeeded, invalidated_live_vtabs) =
+            self.live_vtab_commit_all_best_effort(cx);
+        let committed_dropped_live_vtabs = self.take_committed_dropped_live_vtabs();
         self.txn_metrics_mark_finished();
-        if committed_write && had_live_vtab_txn {
-            self.pending_local_live_vtab_preserve_once.set(true);
-        }
         if committed_write && !self.pager.is_memory() {
             self.sync_filebacked_post_commit_visibility_floor();
+        }
+        if committed_write {
+            self.arm_pending_local_live_vtab_preservation(
+                txn_begin_visible_commit_seq,
+                live_vtab_commit_keys,
+                txn_begin_schema_generation == Some(self.schema_generation()),
+                live_vtab_commit_succeeded,
+            );
         }
         if committed_write && let Some(schema_cookie) = schema_cookie_to_publish {
             self.publish_committed_schema_cookie(schema_cookie);
@@ -50395,6 +51718,12 @@ impl Connection {
             self.clear_compilation_reuse_caches_after_write_commit();
         }
         self.db.borrow_mut().commit_undo();
+        // Failed post-durable xCommit instances were removed from both
+        // registries. Their destructors may re-enter, so defer them until the
+        // explicit transaction and every connection-local commit field are
+        // fully finalized and unborrowed.
+        self.cleanup_failed_live_vtab_commits(cx, invalidated_live_vtabs);
+        self.cleanup_committed_dropped_live_vtabs(cx, committed_dropped_live_vtabs);
         record_hot_path_duration(
             &FSQLITE_COMMIT_HANDLE_FINALIZE_TIME_NS,
             commit_handle_finalize_start,
@@ -50509,6 +51838,24 @@ impl Connection {
         self.execute_rollback_with_cx(&cx, rb).await
     }
 
+    async fn rollback_after_savepoint_boundary_failure(
+        &self,
+        cx: &Cx,
+        context: &str,
+        primary_error: FrankenError,
+    ) -> FrankenError {
+        if !self.in_transaction.get() {
+            return primary_error;
+        }
+        let full_rollback = fsqlite_ast::RollbackStatement { to_savepoint: None };
+        match Box::pin(self.execute_rollback_with_cx(cx, &full_rollback)).await {
+            Ok(()) => primary_error,
+            Err(rollback_error) => FrankenError::Internal(format!(
+                "{context}: {primary_error}; full transaction rollback failed: {rollback_error}"
+            )),
+        }
+    }
+
     async fn execute_rollback_with_cx(
         &self,
         cx: &Cx,
@@ -50563,33 +51910,75 @@ impl Connection {
 
             // ROLLBACK TO SAVEPOINT: restore to the named savepoint's snapshot
             // but keep the savepoint (don't pop it).
-            if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                txn.rollback_to_savepoint(cx, &canonical_name)?;
+            let pager_rollback_result = {
+                let mut active_txn = self.active_txn.borrow_mut();
+                active_txn.as_mut().map_or(Ok(()), |txn| {
+                    txn.rollback_to_savepoint(cx, &canonical_name)
+                })
+            };
+            if let Err(error) = pager_rollback_result {
+                return Err(self
+                    .rollback_after_savepoint_boundary_failure(
+                        cx,
+                        &format!("ROLLBACK TO {sp_name} pager boundary failed"),
+                        error,
+                    )
+                    .await);
             }
 
             // MVCC concurrent-writer rollback (bd-14zc / 5E.1):
             // Restore concurrent write set state if in concurrent mode.
             if let Some(concurrent_snap) = concurrent_snap {
                 let session_id = concurrent_session_id.expect("validated above");
-                {
+                let concurrent_rollback_result = {
                     let registry = lock_unpoisoned(&self.concurrent_registry);
-                    let mut handle = registry.get_mut(session_id).ok_or_else(|| {
-                        FrankenError::Internal("concurrent session handle not found".to_owned())
-                    })?;
-                    concurrent_rollback_to_savepoint(
-                        &mut handle,
-                        &self.concurrent_lock_table,
-                        session_id,
-                        &concurrent_snap,
-                    )
-                    .map_err(|e| {
-                        FrankenError::Internal(format!("concurrent rollback failed: {e}"))
-                    })?;
+                    match registry.get_mut(session_id) {
+                        Some(mut handle) => concurrent_rollback_to_savepoint(
+                            &mut handle,
+                            &self.concurrent_lock_table,
+                            session_id,
+                            &concurrent_snap,
+                        )
+                        .map_err(|e| {
+                            FrankenError::Internal(format!("concurrent rollback failed: {e}"))
+                        }),
+                        None => Err(FrankenError::Internal(
+                            "concurrent session handle not found".to_owned(),
+                        )),
+                    }
+                };
+                if let Err(error) = concurrent_rollback_result {
+                    return Err(self
+                        .rollback_after_savepoint_boundary_failure(
+                            cx,
+                            &format!("ROLLBACK TO {sp_name} concurrent boundary failed"),
+                            error,
+                        )
+                        .await);
                 }
                 self.clear_memory_concurrent_synced_write_roots();
             }
-            let live_vtab_level = Self::savepoint_level_from_depth(idx)?;
-            let live_vtab_result = self.live_vtab_rollback_to_all(cx, live_vtab_level);
+            let live_vtab_level = match Self::savepoint_level_from_depth(idx) {
+                Ok(level) => level,
+                Err(error) => {
+                    return Err(self
+                        .rollback_after_savepoint_boundary_failure(
+                            cx,
+                            &format!("ROLLBACK TO {sp_name} level calculation failed"),
+                            error,
+                        )
+                        .await);
+                }
+            };
+            if let Err(error) = self.live_vtab_rollback_to_all(cx, live_vtab_level) {
+                return Err(self
+                    .rollback_after_savepoint_boundary_failure(
+                        cx,
+                        &format!("ROLLBACK TO {sp_name} virtual-table boundary failed"),
+                        error,
+                    )
+                    .await);
+            }
 
             {
                 let mut savepoints = self.savepoints.borrow_mut();
@@ -50615,7 +52004,6 @@ impl Connection {
             self.restore_snapshot(cx, &snap).await?;
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
-            live_vtab_result?;
         } else {
             // Full ROLLBACK: restore to transaction start.
             // 5D.2 (bd-1ene): Use pager rollback and reload from committed state.
@@ -50783,20 +52171,13 @@ impl Connection {
             }
         };
         if let Err(error) = pager_savepoint_result {
-            let mut cleanup_errors = Vec::new();
-            if started_implicit_txn
-                && let Some(cleanup_error) =
-                    self.rollback_failed_implicit_savepoint_transaction().await
-            {
-                cleanup_errors.push(cleanup_error);
-            }
-            if !cleanup_errors.is_empty() {
-                return Err(FrankenError::Internal(format!(
-                    "SAVEPOINT {name} setup failed: {error}; cleanup failed: {}",
-                    cleanup_errors.join("; ")
-                )));
-            }
-            return Err(error);
+            return Err(self
+                .rollback_after_savepoint_boundary_failure(
+                    cx,
+                    &format!("SAVEPOINT {name} pager setup failed"),
+                    error,
+                )
+                .await);
         }
 
         // MVCC concurrent-writer savepoint (bd-14zc / 5E.1):
@@ -50822,49 +52203,38 @@ impl Connection {
             match concurrent_result {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    let mut cleanup_errors = if started_implicit_txn {
-                        Vec::new()
-                    } else {
-                        self.cleanup_failed_savepoint_setup(cx, name, None)
-                    };
-                    if started_implicit_txn
-                        && let Some(cleanup_error) =
-                            self.rollback_failed_implicit_savepoint_transaction().await
-                    {
-                        cleanup_errors.push(cleanup_error);
-                    }
-                    if !cleanup_errors.is_empty() {
-                        return Err(FrankenError::Internal(format!(
-                            "SAVEPOINT {name} setup failed: {error}; cleanup failed: {}",
-                            cleanup_errors.join("; ")
-                        )));
-                    }
-                    return Err(error);
+                    return Err(self
+                        .rollback_after_savepoint_boundary_failure(
+                            cx,
+                            &format!("SAVEPOINT {name} concurrent setup failed"),
+                            error,
+                        )
+                        .await);
                 }
             }
         } else {
             None
         };
-        let live_vtab_level = self.next_live_vtab_savepoint_level()?;
+        let live_vtab_level = match self.next_live_vtab_savepoint_level() {
+            Ok(level) => level,
+            Err(error) => {
+                return Err(self
+                    .rollback_after_savepoint_boundary_failure(
+                        cx,
+                        "SAVEPOINT level calculation failed",
+                        error,
+                    )
+                    .await);
+            }
+        };
         if let Err(error) = self.live_vtab_savepoint_all(cx, live_vtab_level) {
-            let mut cleanup_errors = if started_implicit_txn {
-                Vec::new()
-            } else {
-                self.cleanup_failed_savepoint_setup(cx, name, concurrent_snapshot.as_ref())
-            };
-            if started_implicit_txn
-                && let Some(cleanup_error) =
-                    self.rollback_failed_implicit_savepoint_transaction().await
-            {
-                cleanup_errors.push(cleanup_error);
-            }
-            if !cleanup_errors.is_empty() {
-                return Err(FrankenError::Internal(format!(
-                    "SAVEPOINT {name} setup failed: {error}; cleanup failed: {}",
-                    cleanup_errors.join("; ")
-                )));
-            }
-            return Err(error);
+            return Err(self
+                .rollback_after_savepoint_boundary_failure(
+                    cx,
+                    &format!("SAVEPOINT {name} virtual-table setup failed"),
+                    error,
+                )
+                .await);
         }
 
         self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
@@ -50899,11 +52269,42 @@ impl Connection {
             return self.execute_commit_with_cx(cx).await;
         }
 
-        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            txn.release_savepoint(cx, &canonical_name)?;
+        let pager_release_result = {
+            let mut active_txn = self.active_txn.borrow_mut();
+            active_txn
+                .as_mut()
+                .map_or(Ok(()), |txn| txn.release_savepoint(cx, &canonical_name))
+        };
+        if let Err(error) = pager_release_result {
+            return Err(self
+                .rollback_after_savepoint_boundary_failure(
+                    cx,
+                    &format!("RELEASE {name} pager boundary failed"),
+                    error,
+                )
+                .await);
         }
-        let live_vtab_level = Self::savepoint_level_from_depth(idx)?;
-        self.live_vtab_release_all(cx, live_vtab_level)?;
+        let live_vtab_level = match Self::savepoint_level_from_depth(idx) {
+            Ok(level) => level,
+            Err(error) => {
+                return Err(self
+                    .rollback_after_savepoint_boundary_failure(
+                        cx,
+                        &format!("RELEASE {name} level calculation failed"),
+                        error,
+                    )
+                    .await);
+            }
+        };
+        if let Err(error) = self.live_vtab_release_all(cx, live_vtab_level) {
+            return Err(self
+                .rollback_after_savepoint_boundary_failure(
+                    cx,
+                    &format!("RELEASE {name} virtual-table boundary failed"),
+                    error,
+                )
+                .await);
+        }
 
         let mut savepoints = self.savepoints.borrow_mut();
         // RELEASE removes the named savepoint and all savepoints created after it.
@@ -52062,7 +53463,7 @@ impl Connection {
         let mut without_rowid_tables = HashSet::new();
         for row in master_rows {
             let (entry_type, name, _, _) = sqlite_master_signature(row)?;
-            if entry_type == "table"
+            if entry_type.eq_ignore_ascii_case("table")
                 && sqlite_master_sql_text(row)?.is_some_and(is_without_rowid_table_sql)
             {
                 without_rowid_tables.insert(name.to_ascii_lowercase());
@@ -56058,7 +57459,7 @@ impl Connection {
                                 column.collation.as_deref(),
                             )
                         })
-                    },
+                    }
                     PlannerSelectAccessKind::IndexRange => leading_column.is_some_and(|column| {
                         planner_collation_is_binary(index.key_term_collation(0))
                             && planner_collation_is_binary(column.collation.as_deref())
@@ -56698,10 +58099,7 @@ impl Connection {
                             for r in group_rows.iter() {
                                 let keep = self
                                     .eval_row_expr_allowing_subqueries_with_using(
-                                        filt,
-                                        r,
-                                        &col_map,
-                                        using_skip,
+                                        filt, r, &col_map, using_skip,
                                     )
                                     .await?;
                                 if is_sqlite_truthy(&keep) {
@@ -56743,10 +58141,7 @@ impl Connection {
                                     row.get(idx).cloned().unwrap_or(SqliteValue::Null)
                                 } else if let Some(expr) = arg_expr {
                                     self.eval_row_expr_allowing_subqueries_with_using(
-                                        expr,
-                                        row,
-                                        &col_map,
-                                        using_skip,
+                                        expr, row, &col_map, using_skip,
                                     )
                                     .await?
                                 } else {
@@ -56761,10 +58156,7 @@ impl Connection {
                                         Some(expr) => {
                                             let sv = self
                                                 .eval_row_expr_allowing_subqueries_with_using(
-                                                    expr,
-                                                    row,
-                                                    &col_map,
-                                                    using_skip,
+                                                    expr, row, &col_map, using_skip,
                                                 )
                                                 .await?;
                                             Some(if sv.is_null() {
@@ -56781,10 +58173,7 @@ impl Connection {
                                 for term in order_by {
                                     keys.push(
                                         self.eval_row_expr_allowing_subqueries_with_using(
-                                            &term.expr,
-                                            row,
-                                            &col_map,
-                                            using_skip,
+                                            &term.expr, row, &col_map, using_skip,
                                         )
                                         .await?,
                                     );
@@ -56848,10 +58237,7 @@ impl Connection {
                                     row.get(idx).cloned().unwrap_or(SqliteValue::Null)
                                 } else if let Some(expr) = arg_expr {
                                     self.eval_row_expr_allowing_subqueries_with_using(
-                                        expr,
-                                        row,
-                                        &col_map,
-                                        using_skip,
+                                        expr, row, &col_map, using_skip,
                                     )
                                     .await?
                                 } else {
@@ -56863,10 +58249,7 @@ impl Connection {
                                 for term in order_by {
                                     keys.push(
                                         self.eval_row_expr_allowing_subqueries_with_using(
-                                            &term.expr,
-                                            row,
-                                            &col_map,
-                                            using_skip,
+                                            &term.expr, row, &col_map, using_skip,
                                         )
                                         .await?,
                                     );
@@ -56902,10 +58285,7 @@ impl Connection {
                                         (Some(expr), Some(r)) => {
                                             let value = self
                                                 .eval_row_expr_allowing_subqueries_with_using(
-                                                    expr,
-                                                    r,
-                                                    &col_map,
-                                                    using_skip,
+                                                    expr, r, &col_map, using_skip,
                                                 )
                                                 .await?;
                                             (!matches!(value, SqliteValue::Null))
@@ -57805,9 +59185,7 @@ impl Connection {
             SelectCore::Select { columns, .. } => bound
                 .order_by
                 .iter()
-                .map(|term| {
-                    self.resolve_fromless_aliases(&term.expr, columns, false, "ORDER BY")
-                })
+                .map(|term| self.resolve_fromless_aliases(&term.expr, columns, false, "ORDER BY"))
                 .collect::<Result<Vec<_>>>()?,
             SelectCore::Values(_) => bound
                 .order_by
@@ -57819,8 +59197,7 @@ impl Connection {
             validate_function_call_modifiers_in_expr(expr)?;
             validate_used_window_specs_in_expr(expr, &resolved_order_named_windows)?;
         }
-        let collation_registry =
-            lock_unpoisoned(self.collation_registry.as_ref()).clone();
+        let collation_registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
         validate_fromless_used_window_scopes(
             self,
             &bound,
@@ -57863,10 +59240,7 @@ impl Connection {
         if !is_aggregate_query {
             for term in &bound_order_by {
                 if self.with_fallback_function_registry(|| {
-                    expr_uses_fromless_group_stage_aggregate(
-                        &term.expr,
-                        &named_windows,
-                    )
+                    expr_uses_fromless_group_stage_aggregate(&term.expr, &named_windows)
                 })? {
                     return Err(FrankenError::FunctionError(
                         "misuse of aggregate in ORDER BY".to_owned(),
@@ -57940,14 +59314,9 @@ impl Connection {
                     None => true,
                     Some(predicate) => is_sqlite_truthy(
                         &self
-                            .eval_expr_with_subqueries(
-                                predicate,
-                                &empty_row,
-                                &empty_col_map,
-                                None,
-                            )
+                            .eval_expr_with_subqueries(predicate, &empty_row, &empty_col_map, None)
                             .await?,
-                        ),
+                    ),
                 };
                 if !group_by.is_empty() {
                     if !row_included {
@@ -58006,10 +59375,7 @@ impl Connection {
         if !rows.is_empty()
             && let SelectCore::Select { columns, .. } = &bound.body.select
         {
-            for (term, effective) in bound_order_by
-                .iter()
-                .zip(&resolved_order_expressions)
-            {
+            for (term, effective) in bound_order_by.iter().zip(&resolved_order_expressions) {
                 if resolve_order_term_idx(&term.expr, columns).is_some() {
                     continue;
                 }
@@ -58040,10 +59406,10 @@ impl Connection {
                 window,
                 filter,
             } = extract_inner_window_function(&rewritten).ok_or_else(|| {
-                    FrankenError::Internal(
-                        "window expression could not expose its first window call".to_owned(),
-                    )
-                })?;
+                FrankenError::Internal(
+                    "window expression could not expose its first window call".to_owned(),
+                )
+            })?;
             let value = self
                 .eval_fromless_window_call(
                     &name,
@@ -58055,8 +59421,7 @@ impl Connection {
                 )
                 .await?;
             let mut replaced = false;
-            rewritten =
-                replace_first_window_with_literal(&rewritten, &value, &mut replaced);
+            rewritten = replace_first_window_with_literal(&rewritten, &value, &mut replaced);
             if !replaced {
                 return Err(FrankenError::Internal(
                     "window expression replacement made no progress".to_owned(),
@@ -58123,11 +59488,10 @@ impl Connection {
             FunctionArgs::List(values) => values.as_slice(),
             FunctionArgs::Star => &[],
         };
-        let num_args = i32::try_from(arg_exprs.len()).map_err(|_| {
-            FrankenError::TooManyArguments {
+        let num_args =
+            i32::try_from(arg_exprs.len()).map_err(|_| FrankenError::TooManyArguments {
                 name: name.to_owned(),
-            }
-        })?;
+            })?;
         let registry = self.func_registry.borrow().clone();
         let function = find_window_function_checked(&registry, name, num_args)?;
         if self.is_custom_window_function(&function) {
@@ -58201,8 +59565,7 @@ impl Connection {
                 .iter()
                 .map(|term| extract_collation(&term.expr).map(str::to_owned))
                 .collect::<Vec<_>>();
-            let collation_registry =
-                lock_unpoisoned(self.collation_registry.as_ref()).clone();
+            let collation_registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
             let peer_groups = vec![vec![0]];
             let frame_rows = window_frame_rows_for_current(
                 0,
@@ -58234,8 +59597,7 @@ impl Connection {
             }
             _ => {
                 let mut state = function.initial_state();
-                if (included
-                    || matches!(upper.as_str(), "NTILE" | "LAG" | "LEAD"))
+                if (included || matches!(upper.as_str(), "NTILE" | "LAG" | "LEAD"))
                     && filter_matches
                 {
                     function.step(&mut state, &arg_values)?;
@@ -58654,8 +60016,8 @@ impl Connection {
     ) -> Result<Vec<ResolvedOrderTerm>> {
         let mut resolved = Vec::with_capacity(order_by.len());
         for term in order_by {
-            let column_index = if let Some(column_index) = output_columns
-                .and_then(|columns| resolve_order_term_idx(&term.expr, columns))
+            let column_index = if let Some(column_index) =
+                output_columns.and_then(|columns| resolve_order_term_idx(&term.expr, columns))
             {
                 column_index
             } else {
@@ -59656,34 +61018,62 @@ impl Connection {
             );
         }
 
-        let column_names = self.table_function_result_column_names(name).map_or_else(
-            || {
-                Err(FrankenError::NotImplemented(format!(
-                    "table-valued function {name} is not supported",
-                )))
-            },
-            Ok,
-        )?;
-        let column_count = column_names.len();
-
         let module_key = name.to_ascii_uppercase();
         let cx = self.op_cx()?;
-        let instance = {
+        let factory = {
             let modules = self.vtab_modules.borrow();
-            let factory = modules.get(&module_key).ok_or_else(|| {
-                FrankenError::NotImplemented(format!(
-                    "table-valued function {name} is not supported — no module registered",
-                ))
-            })?;
-            factory.connect(&cx, &[])?
+            modules.get(&module_key).cloned()
         };
-
-        self.scan_erased_table_function_vtab(
-            instance.as_ref(),
+        let factory = factory.ok_or_else(|| {
+            FrankenError::NotImplemented(format!(
+                "table-valued function {name} is not supported — no module registered",
+            ))
+        })?;
+        let factory_args = [name.to_owned(), "main".to_owned(), name.to_owned()];
+        let factory_arg_refs = factory_args.iter().map(String::as_str).collect::<Vec<_>>();
+        // Metadata and instance construction must come from one factory
+        // snapshot. `column_info` is user code and may replace its own module
+        // registration reentrantly; re-reading the map afterward would combine
+        // the old factory's column shape with the replacement's instance.
+        let factory_columns = self
+            .invoke_live_vtab_callback("xColumnInfo", || {
+                Ok(factory.column_info(&factory_arg_refs))
+            })?
+            .into_iter()
+            .map(|(column_name, _)| column_name)
+            .collect::<Vec<_>>();
+        let column_names = if factory_columns.is_empty() {
+            table_function_column_names(name).map_or_else(
+                || {
+                    Err(FrankenError::NotImplemented(format!(
+                        "table-valued function {name} is not supported",
+                    )))
+                },
+                |columns| Ok(columns.iter().map(|column| (*column).to_owned()).collect()),
+            )?
+        } else {
+            factory_columns
+        };
+        let column_count = column_names.len();
+        let instance = self.invoke_live_vtab_callback("xConnect", || {
+            factory.connect(&cx, &factory_arg_refs)
+        })?;
+        let pending_instance = PendingLiveVtabGuard::connected(self, &cx, name, instance);
+        let scan_result = self.scan_erased_table_function_vtab(
+            pending_instance.instance(),
             &arg_values,
             column_count,
             include_hidden_rowid,
-        )
+        );
+        let cleanup_result = pending_instance.cleanup();
+        match (scan_result, cleanup_result) {
+            (Ok(rows), Ok(())) => Ok(rows),
+            (Err(scan_error), Ok(())) => Err(scan_error),
+            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(scan_error), Err(cleanup_error)) => Err(FrankenError::Internal(format!(
+                "table-valued function {name} scan failed: {scan_error}; disconnect failed: {cleanup_error}"
+            ))),
+        }
     }
 
     /// bd-1hn48: execute a `pragma_<name>(arg)` table-valued function by
@@ -59751,11 +61141,17 @@ impl Connection {
         include_hidden_rowid: bool,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let cx = self.op_cx()?;
-        let mut cursor = vtab.open_cursor()?;
-        cursor.erased_filter(&cx, 0, None, args)?;
+        let mut cursor = self.invoke_live_vtab_callback("xOpen", || {
+            vtab.open_cursor().map(|cursor| {
+                LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor)
+            })
+        })?;
+        self.invoke_live_vtab_callback("xFilter", || {
+            cursor.erased_filter(&cx, 0, None, args)
+        })?;
 
         let mut rows = Vec::new();
-        while !cursor.erased_eof() {
+        while !self.invoke_live_vtab_callback("xEof", || Ok(cursor.erased_eof()))? {
             let mut row = Vec::with_capacity(column_count + usize::from(include_hidden_rowid));
             for col in 0..column_count {
                 let mut ctx = ColumnContext::new();
@@ -59764,14 +61160,18 @@ impl Connection {
                         "table-valued function column index overflow: {col}",
                     ))
                 })?;
-                cursor.erased_column(&mut ctx, col_idx)?;
+                self.invoke_live_vtab_callback("xColumn", || {
+                    cursor.erased_column(&mut ctx, col_idx)
+                })?;
                 row.push(ctx.take_value().unwrap_or(SqliteValue::Null));
             }
             if include_hidden_rowid {
-                row.push(SqliteValue::Integer(cursor.erased_rowid()?));
+                row.push(SqliteValue::Integer(
+                    self.invoke_live_vtab_callback("xRowid", || cursor.erased_rowid())?,
+                ));
             }
             rows.push(row);
-            cursor.erased_next(&cx)?;
+            self.invoke_live_vtab_callback("xNext", || cursor.erased_next(&cx))?;
         }
 
         Ok(rows)
@@ -61247,12 +62647,11 @@ impl Connection {
                         window: raw_inner_spec,
                         filter: inner_filter,
                     } = extract_inner_window_function(expr).ok_or_else(|| {
-                            FrankenError::Internal(
-                                "expr_has_window_function=true but cannot extract".to_owned(),
-                            )
-                        })?;
-                    let inner_spec =
-                        resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
+                        FrankenError::Internal(
+                            "expr_has_window_function=true but cannot extract".to_owned(),
+                        )
+                    })?;
+                    let inner_spec = resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
                     let args_are_star = matches!(&inner_args, FunctionArgs::Star);
                     let arg_exprs = match &inner_args {
                         FunctionArgs::List(exprs) => exprs
@@ -62144,12 +63543,11 @@ impl Connection {
                         window: raw_inner_spec,
                         filter: inner_filter,
                     } = extract_inner_window_function(expr).ok_or_else(|| {
-                            FrankenError::Internal(
-                                "expr_has_window_function=true but cannot extract".to_owned(),
-                            )
-                        })?;
-                    let inner_spec =
-                        resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
+                        FrankenError::Internal(
+                            "expr_has_window_function=true but cannot extract".to_owned(),
+                        )
+                    })?;
+                    let inner_spec = resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
                     let args_are_star = matches!(&inner_args, FunctionArgs::Star);
                     let arg_exprs = match &inner_args {
                         FunctionArgs::List(exprs) => exprs.clone(),
@@ -66073,10 +67471,7 @@ impl Connection {
                         if has_subqueries && expr_has_any_subquery(expr) {
                             let inlined = self
                                 .inline_subqueries_in_expr_with_using(
-                                    expr,
-                                    row,
-                                    &col_map,
-                                    using_skip,
+                                    expr, row, &col_map, using_skip,
                                 )
                                 .await?;
                             values.push(self.eval_join_expr_with_using_registry(
@@ -66093,12 +67488,7 @@ impl Connection {
             for expr in &extra_order_exprs {
                 if has_subqueries && expr_has_any_subquery(expr) {
                     let inlined = self
-                        .inline_subqueries_in_expr_with_using(
-                            expr,
-                            row,
-                            &col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(expr, row, &col_map, using_skip)
                         .await?;
                     values.push(
                         self.eval_join_expr_with_using_registry(
@@ -66295,10 +67685,7 @@ impl Connection {
                     not,
                     span,
                 } => {
-                    if !is_correlated_subquery_with_schema(
-                        subquery,
-                        &self.schema.borrow(),
-                    ) {
+                    if !is_correlated_subquery_with_schema(subquery, &self.schema.borrow()) {
                         let rows = self
                             .execute_statement(&Statement::Select((**subquery).clone()), params)
                             .await?;
@@ -66323,10 +67710,7 @@ impl Connection {
                         .await?;
                     let resolved_set = match set {
                         InSet::Subquery(sub)
-                            if !is_correlated_subquery_with_schema(
-                                sub,
-                                &self.schema.borrow(),
-                            ) =>
+                            if !is_correlated_subquery_with_schema(sub, &self.schema.borrow()) =>
                         {
                             let rows = self
                                 .execute_statement(&Statement::Select((**sub).clone()), params)
@@ -66814,20 +68198,10 @@ impl Connection {
                     span,
                 } => {
                     let l = self
-                        .inline_subqueries_in_expr_with_using(
-                            left,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(left, row, outer_col_map, using_skip)
                         .await?;
                     let r = self
-                        .inline_subqueries_in_expr_with_using(
-                            right,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(right, row, outer_col_map, using_skip)
                         .await?;
                     Ok(Expr::BinaryOp {
                         left: Box::new(l),
@@ -66842,12 +68216,7 @@ impl Connection {
                     span,
                 } => {
                     let inlined = self
-                        .inline_subqueries_in_expr_with_using(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
                         .await?;
                     Ok(Expr::UnaryOp {
                         op: *op,
@@ -66861,12 +68230,7 @@ impl Connection {
                     span,
                 } => {
                     let inlined = self
-                        .inline_subqueries_in_expr_with_using(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
                         .await?;
                     Ok(Expr::IsNull {
                         expr: Box::new(inlined),
@@ -66880,12 +68244,7 @@ impl Connection {
                     span,
                 } => {
                     let inlined = self
-                        .inline_subqueries_in_expr_with_using(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
                         .await?;
                     Ok(Expr::Cast {
                         expr: Box::new(inlined),
@@ -66899,12 +68258,7 @@ impl Connection {
                     span,
                 } => {
                     let inlined = self
-                        .inline_subqueries_in_expr_with_using(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
                         .await?;
                     Ok(Expr::Collate {
                         expr: Box::new(inlined),
@@ -66920,28 +68274,13 @@ impl Connection {
                     span,
                 } => {
                     let inlined = self
-                        .inline_subqueries_in_expr_with_using(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
                         .await?;
                     let low = self
-                        .inline_subqueries_in_expr_with_using(
-                            low,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(low, row, outer_col_map, using_skip)
                         .await?;
                     let high = self
-                        .inline_subqueries_in_expr_with_using(
-                            high,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(high, row, outer_col_map, using_skip)
                         .await?;
                     Ok(Expr::Between {
                         expr: Box::new(inlined),
@@ -66961,12 +68300,7 @@ impl Connection {
                         return Ok(expr.clone());
                     }
                     let new_inner = self
-                        .inline_subqueries_in_expr_with_using(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
                         .await?;
                     let new_set = match set {
                         InSet::Subquery(subquery) => {
@@ -67102,20 +68436,10 @@ impl Connection {
                     let mut new_whens = Vec::with_capacity(whens.len());
                     for (w, t) in whens {
                         let nw = self
-                            .inline_subqueries_in_expr_with_using(
-                                w,
-                                row,
-                                outer_col_map,
-                                using_skip,
-                            )
+                            .inline_subqueries_in_expr_with_using(w, row, outer_col_map, using_skip)
                             .await?;
                         let nt = self
-                            .inline_subqueries_in_expr_with_using(
-                                t,
-                                row,
-                                outer_col_map,
-                                using_skip,
-                            )
+                            .inline_subqueries_in_expr_with_using(t, row, outer_col_map, using_skip)
                             .await?;
                         new_whens.push((nw, nt));
                     }
@@ -67147,12 +68471,7 @@ impl Connection {
                     span,
                 } => {
                     let inlined_expr = self
-                        .inline_subqueries_in_expr_with_using(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
                         .await?;
                     let inlined_pattern = self
                         .inline_subqueries_in_expr_with_using(
@@ -67190,20 +68509,10 @@ impl Connection {
                     span,
                 } => {
                     let inlined_expr = self
-                        .inline_subqueries_in_expr_with_using(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
                         .await?;
                     let inlined_path = self
-                        .inline_subqueries_in_expr_with_using(
-                            path,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                        )
+                        .inline_subqueries_in_expr_with_using(path, row, outer_col_map, using_skip)
                         .await?;
                     Ok(Expr::JsonAccess {
                         expr: Box::new(inlined_expr),
@@ -67269,22 +68578,12 @@ impl Connection {
     ) -> Result<FrameBound> {
         match bound {
             FrameBound::Preceding(expr) => Ok(FrameBound::Preceding(Box::new(
-                self.inline_subqueries_in_expr_with_using(
-                    expr,
-                    row,
-                    outer_col_map,
-                    using_skip,
-                )
-                .await?,
+                self.inline_subqueries_in_expr_with_using(expr, row, outer_col_map, using_skip)
+                    .await?,
             ))),
             FrameBound::Following(expr) => Ok(FrameBound::Following(Box::new(
-                self.inline_subqueries_in_expr_with_using(
-                    expr,
-                    row,
-                    outer_col_map,
-                    using_skip,
-                )
-                .await?,
+                self.inline_subqueries_in_expr_with_using(expr, row, outer_col_map, using_skip)
+                    .await?,
             ))),
             FrameBound::UnboundedPreceding => Ok(FrameBound::UnboundedPreceding),
             FrameBound::CurrentRow => Ok(FrameBound::CurrentRow),
@@ -67300,21 +68599,11 @@ impl Connection {
         using_skip: Option<&HashSet<usize>>,
     ) -> Result<FrameSpec> {
         let start = self
-            .inline_subqueries_in_frame_bound(
-                &frame.start,
-                row,
-                outer_col_map,
-                using_skip,
-            )
+            .inline_subqueries_in_frame_bound(&frame.start, row, outer_col_map, using_skip)
             .await?;
         let end = match frame.end.as_ref() {
             Some(bound) => Some(
-                self.inline_subqueries_in_frame_bound(
-                    bound,
-                    row,
-                    outer_col_map,
-                    using_skip,
-                )
+                self.inline_subqueries_in_frame_bound(bound, row, outer_col_map, using_skip)
                     .await?,
             ),
             None => None,
@@ -67337,31 +68626,16 @@ impl Connection {
         let mut partition_by = Vec::with_capacity(window.partition_by.len());
         for expr in &window.partition_by {
             partition_by.push(
-                self.inline_subqueries_in_expr_with_using(
-                    expr,
-                    row,
-                    outer_col_map,
-                    using_skip,
-                )
-                .await?,
+                self.inline_subqueries_in_expr_with_using(expr, row, outer_col_map, using_skip)
+                    .await?,
             );
         }
         let order_by = self
-            .inline_subqueries_in_ordering_terms(
-                &window.order_by,
-                row,
-                outer_col_map,
-                using_skip,
-            )
+            .inline_subqueries_in_ordering_terms(&window.order_by, row, outer_col_map, using_skip)
             .await?;
         let frame = match window.frame.as_ref() {
             Some(frame) => Some(
-                self.inline_subqueries_in_frame_spec(
-                    frame,
-                    row,
-                    outer_col_map,
-                    using_skip,
-                )
+                self.inline_subqueries_in_frame_spec(frame, row, outer_col_map, using_skip)
                     .await?,
             ),
             None => None,
@@ -68340,12 +69614,29 @@ impl Connection {
         hydrate_rows: bool,
     ) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        let bound_visible_commit_seq = publication.snapshot.visible_commit_seq;
         let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+        let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
+            let _ = txn.rollback(cx).await;
+            return Err(FrankenError::Internal(
+                "pager reload transaction did not expose its bound visibility sequence".to_owned(),
+            ));
+        };
+        if txn_visible_commit_seq != publication.snapshot.visible_commit_seq {
+            // The prebound publication escapes this function and is reused by
+            // prepared-DML admission. If begin observed a newer snapshot, using
+            // either identity would mix two visibility epochs; fail transiently
+            // so the caller can restart from a fresh bind.
+            let _ = txn.rollback(cx).await;
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages:
+                    "pager publication advanced between metadata bind and reload transaction"
+                        .to_owned(),
+            });
+        }
         self.reload_memdb_from_txn_with_mode(
             cx,
             &mut txn,
-            bound_visible_commit_seq,
+            txn_visible_commit_seq,
             hydrate_rows,
             true,
         )
@@ -68358,14 +69649,26 @@ impl Connection {
     async fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         let bound_publication = self.bind_pager_publication(cx, "memdb_reload").await?;
-        let bound_visible_commit_seq = bound_publication.snapshot.visible_commit_seq;
 
         // Open a read transaction to see the committed state.
         let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+        let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
+            let _ = txn.rollback(cx).await;
+            return Err(FrankenError::Internal(
+                "pager reload transaction did not expose its bound visibility sequence".to_owned(),
+            ));
+        };
+        if txn_visible_commit_seq < bound_publication.snapshot.visible_commit_seq {
+            let _ = txn.rollback(cx).await;
+            return Err(FrankenError::Internal(
+                "pager reload transaction observed an older visibility sequence than its prior publication bind"
+                    .to_owned(),
+            ));
+        }
         self.reload_memdb_from_txn_with_mode(
             cx,
             &mut txn,
-            bound_visible_commit_seq,
+            txn_visible_commit_seq,
             hydrate_rows,
             true,
         )
@@ -68785,8 +70088,8 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    async fn rebuild_rootpage_zero_live_vtab_instances_from_reload(
-        &self,
+    async fn rebuild_rootpage_zero_live_vtab_instances_from_reload<'a>(
+        &'a self,
         cx: &Cx,
         txn: &mut TransactionKind,
         page_size: PageSize,
@@ -68794,99 +70097,66 @@ impl Connection {
         schema: &[TableSchema],
         rowid_alias_columns: &HashMap<String, usize>,
         specs: &[(String, String, Vec<ColumnInfo>)],
-        preserve_existing_live_vtabs: bool,
-    ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
-        let mut reloaded = HashMap::new();
+        preserved_live_vtab_keys: &HashSet<String>,
+    ) -> Result<PendingConnectedLiveVtabRegistryGuard<'a>> {
+        let mut reloaded = PendingConnectedLiveVtabRegistryGuard::new(self, cx);
 
-        for (spec_index, (table_name, create_sql, _)) in specs.iter().enumerate() {
-            let has_reloadable_duplicate_fts5_schema_row = specs.iter().enumerate().any(
-                |(candidate_index, (candidate_name, candidate_sql, _))| {
-                    if candidate_index == spec_index
-                        || !candidate_name.eq_ignore_ascii_case(table_name)
-                    {
-                        return false;
-                    }
-                    let Ok(Statement::CreateVirtualTable(candidate_stmt)) =
-                        parse_single_statement(candidate_sql)
-                    else {
-                        return false;
-                    };
-                    if !candidate_stmt.module.eq_ignore_ascii_case("fts5") {
-                        return false;
-                    }
-                    match virtual_table_option_value(&candidate_stmt.args, "content") {
-                        Some(content_table) if content_table.is_empty() => true,
-                        Some(content_table) => schema
-                            .iter()
-                            .any(|candidate| candidate.name.eq_ignore_ascii_case(&content_table)),
-                        None => {
-                            let content_table_name = format!("{candidate_name}_content");
-                            schema.iter().any(|candidate| {
-                                candidate.name.eq_ignore_ascii_case(&content_table_name)
-                            })
-                        }
-                    }
-                },
-            );
+        for (table_name, create_sql, _) in specs {
             let table_key = table_name.to_ascii_uppercase();
-            if preserve_existing_live_vtabs {
-                if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
-                    reloaded.insert(table_key, instance);
-                    continue;
-                }
+            if preserved_live_vtab_keys.contains(&table_key) {
+                continue;
             }
             let create_stmt = match parse_single_statement(create_sql) {
                 Ok(Statement::CreateVirtualTable(stmt)) => stmt,
-                Ok(_) => continue,
+                Ok(_) => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "validated virtual table `{table_name}` reparsed as a different statement kind"
+                        ),
+                    });
+                }
                 Err(error) => {
-                    tracing::debug!(
-                        table = %table_name,
-                        error = %error,
-                        "skipping rootpage=0 virtual table connect during schema reload; CREATE VIRTUAL TABLE SQL did not reparse"
-                    );
-                    continue;
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "validated virtual table `{table_name}` could not be reparsed during schema reload: {error}"
+                        ),
+                    });
                 }
             };
             let module_key = create_stmt.module.to_ascii_uppercase();
-            if create_stmt.module.eq_ignore_ascii_case("fts5")
-                && has_reloadable_duplicate_fts5_schema_row
-                && virtual_table_option_value(&create_stmt.args, "content").is_none()
-            {
-                let content_table_name = format!("{table_name}_content");
-                if !schema
-                    .iter()
-                    .any(|candidate| candidate.name.eq_ignore_ascii_case(&content_table_name))
-                {
-                    tracing::debug!(
-                        table = %table_name,
-                        missing_shadow = %content_table_name,
-                        "skipping stale duplicate rootpage=0 FTS5 schema row during reload"
-                    );
-                    continue;
-                }
-            }
-            let mut instance = {
+            let factory = {
                 let modules = self.vtab_modules.borrow();
-                let Some(factory) = modules.get(&module_key) else {
-                    tracing::debug!(
-                        table = %table_name,
-                        module = %create_stmt.module,
-                        "skipping rootpage=0 virtual table connect during schema reload; module is unavailable"
-                    );
-                    continue;
-                };
-                let mut full_args = vec![
-                    create_stmt.module.clone(),
-                    "main".to_owned(),
-                    table_name.clone(),
-                ];
-                full_args.extend(create_stmt.args.iter().cloned());
-                let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
-                factory.connect(cx, &full_arg_refs)?
+                modules.get(&module_key).cloned()
             };
+            let Some(factory) = factory else {
+                tracing::debug!(
+                    table = %table_name,
+                    module = %create_stmt.module,
+                    "skipping rootpage=0 virtual table connect during schema reload; module is unavailable"
+                );
+                continue;
+            };
+            let mut full_args = vec![
+                create_stmt.module.clone(),
+                "main".to_owned(),
+                table_name.clone(),
+            ];
+            full_args.extend(create_stmt.args.iter().cloned());
+            let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
+            let instance = self.invoke_live_vtab_callback("xConnect", || {
+                factory.connect(cx, &full_arg_refs)
+            })?;
+            let mut pending_instance =
+                PendingLiveVtabGuard::connected(self, cx, table_name, instance);
 
-            #[cfg(feature = "ext-fts5")]
-            if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
+            let is_fts5 = self.invoke_live_vtab_callback("asAny", || {
+                Ok(pending_instance
+                    .instance()
+                    .as_any()
+                    .downcast_ref::<Fts5Table>()
+                    .is_some())
+            })?;
+            if is_fts5 {
                 if Self::fts5_table_is_lazy_capable(
                     schema,
                     table_name,
@@ -68915,8 +70185,20 @@ impl Connection {
                             column_count,
                         )
                         .await?;
-                    fts5.mark_lazy_on_disk(doc_count);
-                    reloaded.insert(table_key, instance);
+                    self.invoke_live_vtab_callback("asAnyMut", || {
+                        let fts5 = pending_instance
+                            .instance_mut()
+                            .as_any_mut()
+                            .downcast_mut::<Fts5Table>()
+                            .ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "virtual table {table_name} changed type during schema reload"
+                                ))
+                            })?;
+                        fts5.mark_lazy_on_disk(doc_count);
+                        Ok(())
+                    })?;
+                    reloaded.insert_pending(table_key, &mut pending_instance)?;
                     continue;
                 }
 
@@ -68932,8 +70214,19 @@ impl Connection {
                         &create_stmt.args,
                     )
                     .await?;
-                fts5.apply_shadow_rows(&rows)?;
-                reloaded.insert(table_key, instance);
+                self.invoke_live_vtab_callback("asAnyMut", || {
+                    let fts5 = pending_instance
+                        .instance_mut()
+                        .as_any_mut()
+                        .downcast_mut::<Fts5Table>()
+                        .ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "virtual table {table_name} changed type during schema reload"
+                            ))
+                        })?;
+                    fts5.apply_shadow_rows(&rows)
+                })?;
+                reloaded.insert_pending(table_key, &mut pending_instance)?;
                 continue;
             }
 
@@ -68948,23 +70241,22 @@ impl Connection {
     }
 
     #[cfg(not(feature = "ext-fts5"))]
-    async fn rebuild_rootpage_zero_live_vtab_instances_from_reload(
-        &self,
-        _cx: &Cx,
+    async fn rebuild_rootpage_zero_live_vtab_instances_from_reload<'a>(
+        &'a self,
+        cx: &Cx,
         _txn: &mut TransactionKind,
         _page_size: PageSize,
         _reserved_per_page: u8,
         _schema: &[TableSchema],
         _rowid_alias_columns: &HashMap<String, usize>,
         _specs: &[(String, String, Vec<ColumnInfo>)],
-        _preserve_existing_live_vtabs: bool,
-    ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
-        let _ = self;
-        Ok(HashMap::new())
+        _preserved_live_vtab_keys: &HashSet<String>,
+    ) -> Result<PendingConnectedLiveVtabRegistryGuard<'a>> {
+        Ok(PendingConnectedLiveVtabRegistryGuard::new(self, cx))
     }
 
-    async fn rebuild_materialized_live_vtab_instances_from_reload(
-        &self,
+    async fn rebuild_materialized_live_vtab_instances_from_reload<'a>(
+        &'a self,
         cx: &Cx,
         txn: &mut TransactionKind,
         page_size: PageSize,
@@ -68972,10 +70264,8 @@ impl Connection {
         schema: &[TableSchema],
         rowid_alias_columns: &HashMap<String, usize>,
         specs: &[(String, String)],
-        preserve_existing_live_vtabs: bool,
-    ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
-        let mut reloaded = HashMap::new();
-
+        preserved_live_vtab_keys: &HashSet<String>,
+    ) -> Result<PendingConnectedLiveVtabRegistryGuard<'a>> {
         #[cfg(not(any(feature = "ext-fts5", feature = "ext-rtree")))]
         {
             let _ = (
@@ -68985,83 +70275,64 @@ impl Connection {
                 reserved_per_page,
                 schema,
                 rowid_alias_columns,
+                specs,
+                preserved_live_vtab_keys,
             );
-            if preserve_existing_live_vtabs {
-                for (table_name, _) in specs {
-                    let table_key = table_name.to_ascii_uppercase();
-                    if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
-                        reloaded.insert(table_key, instance);
-                    }
-                }
-            }
-            Ok(reloaded)
+            Ok(PendingConnectedLiveVtabRegistryGuard::new(self, cx))
         }
 
         #[cfg(any(feature = "ext-fts5", feature = "ext-rtree"))]
         {
+            let mut reloaded = PendingConnectedLiveVtabRegistryGuard::new(self, cx);
             for (table_name, create_sql) in specs {
                 let table_key = table_name.to_ascii_uppercase();
-                if preserve_existing_live_vtabs {
-                    if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
-                        reloaded.insert(table_key, instance);
-                        continue;
-                    }
+                if preserved_live_vtab_keys.contains(&table_key) {
+                    continue;
                 }
 
                 let create_stmt = match parse_single_statement(create_sql) {
                     Ok(Statement::CreateVirtualTable(stmt)) => stmt,
-                    Ok(_) => continue,
+                    Ok(_) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "validated materialized virtual table `{table_name}` reparsed as a different statement kind"
+                            ),
+                        });
+                    }
                     Err(error) => {
-                        tracing::debug!(
-                            table = %table_name,
-                            error = %error,
-                            "skipping live virtual table rebind during schema reload; CREATE VIRTUAL TABLE SQL did not reparse"
-                        );
-                        continue;
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "validated materialized virtual table `{table_name}` could not be reparsed during schema reload: {error}"
+                            ),
+                        });
                     }
                 };
 
                 let module_key = create_stmt.module.to_ascii_uppercase();
-                let mut instance = {
+                let factory = {
                     let modules = self.vtab_modules.borrow();
-                    let Some(factory) = modules.get(&module_key) else {
-                        tracing::debug!(
-                            table = %table_name,
-                            module = %create_stmt.module,
-                            "skipping live virtual table rebind during schema reload; module is unavailable"
-                        );
-                        continue;
-                    };
-                    let mut full_args = vec![
-                        create_stmt.module.clone(),
-                        "main".to_owned(),
-                        table_name.clone(),
-                    ];
-                    full_args.extend(create_stmt.args.iter().cloned());
-                    let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
-                    let module_arg_refs: Vec<&str> =
-                        create_stmt.args.iter().map(String::as_str).collect();
-
-                    match factory.connect(cx, &full_arg_refs) {
-                        Ok(instance) => instance,
-                        Err(full_error) => {
-                            if module_arg_refs.is_empty() {
-                                return Err(full_error);
-                            }
-                            match factory.connect(cx, &module_arg_refs) {
-                                Ok(instance) => {
-                                    tracing::debug!(
-                                        table = %table_name,
-                                        module = %create_stmt.module,
-                                        "schema reload reconnected virtual table module using module-only arguments"
-                                    );
-                                    instance
-                                }
-                                Err(_) => return Err(full_error),
-                            }
-                        }
-                    }
+                    modules.get(&module_key).cloned()
                 };
+                let Some(factory) = factory else {
+                    tracing::debug!(
+                        table = %table_name,
+                        module = %create_stmt.module,
+                        "skipping live virtual table rebind during schema reload; module is unavailable"
+                    );
+                    continue;
+                };
+                let mut full_args = vec![
+                    create_stmt.module.clone(),
+                    "main".to_owned(),
+                    table_name.clone(),
+                ];
+                full_args.extend(create_stmt.args.iter().cloned());
+                let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
+                let instance = self.invoke_live_vtab_callback("xConnect", || {
+                    factory.connect(cx, &full_arg_refs)
+                })?;
+                let mut pending_instance =
+                    PendingLiveVtabGuard::connected(self, cx, table_name, instance);
 
                 let table = schema
                     .iter()
@@ -69082,7 +70353,15 @@ impl Connection {
                     )
                     .await?;
                 #[cfg(feature = "ext-fts5")]
-                if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
+                let is_fts5 = self.invoke_live_vtab_callback("asAny", || {
+                    Ok(pending_instance
+                        .instance()
+                        .as_any()
+                        .downcast_ref::<Fts5Table>()
+                        .is_some())
+                })?;
+                #[cfg(feature = "ext-fts5")]
+                if is_fts5 {
                     let documents = rows
                         .iter()
                         .map(|(rowid, values)| {
@@ -69090,15 +70369,46 @@ impl Connection {
                             (*rowid, columns)
                         })
                         .collect::<Vec<_>>();
-                    fts5.rebuild_documents(documents);
-                    reloaded.insert(table_key.clone(), instance);
+                    self.invoke_live_vtab_callback("asAnyMut", || {
+                        let fts5 = pending_instance
+                            .instance_mut()
+                            .as_any_mut()
+                            .downcast_mut::<Fts5Table>()
+                            .ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "virtual table {table_name} changed type during schema reload"
+                                ))
+                            })?;
+                        fts5.rebuild_documents(documents);
+                        Ok(())
+                    })?;
+                    reloaded.insert_pending(table_key.clone(), &mut pending_instance)?;
                     continue;
                 }
 
                 #[cfg(feature = "ext-rtree")]
-                if let Some(rtree) = instance.as_any_mut().downcast_mut::<RtreeVirtualTable>() {
-                    rtree.rebuild_rows(&rows)?;
-                    reloaded.insert(table_key, instance);
+                let is_rtree = self.invoke_live_vtab_callback("asAny", || {
+                    Ok(pending_instance
+                        .instance()
+                        .as_any()
+                        .downcast_ref::<RtreeVirtualTable>()
+                        .is_some())
+                })?;
+                #[cfg(feature = "ext-rtree")]
+                if is_rtree {
+                    self.invoke_live_vtab_callback("asAnyMut", || {
+                        let rtree = pending_instance
+                            .instance_mut()
+                            .as_any_mut()
+                            .downcast_mut::<RtreeVirtualTable>()
+                            .ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "virtual table {table_name} changed type during schema reload"
+                                ))
+                            })?;
+                        rtree.rebuild_rows(&rows)
+                    })?;
+                    reloaded.insert_pending(table_key, &mut pending_instance)?;
                     continue;
                 }
 
@@ -69132,12 +70442,14 @@ impl Connection {
             // ACTIVE txn binds at the pre-transaction snapshot seq — so drop them
             // explicitly (bd-md5pf).
             self.clear_prepared_indexed_equality_caches();
-            // bd-xvv8f: one-shot request (consumed here regardless of path) to take
-            // the full sqlite_master rebuild below instead of the schema-only fast
-            // path. Set on autocommit DDL rollback recovery, where the
-            // connection-local schema Vec holds a rolled-back object whose eager
-            // `schema_cookie` bump can coincidentally match the committed header.
-            let force_full_schema_reload = self.force_full_schema_reload_once.replace(false);
+            // bd-xvv8f: one-shot request to take the full sqlite_master rebuild
+            // below instead of the schema-only fast path. Autocommit DDL rollback
+            // recovery sets it when the connection-local schema Vec holds a
+            // rolled-back object whose eager `schema_cookie` bump can
+            // coincidentally match the committed header. Consume it only after a
+            // successful empty/full publication: a corrupt page or cancelled
+            // read must leave the required retry armed.
+            let force_full_schema_reload = self.force_full_schema_reload_once.get();
             if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
                 self.discard_cached_vdbe_engine();
             }
@@ -69173,20 +70485,49 @@ impl Connection {
                 self.autoincrement_tables.borrow_mut().clear();
                 self.sqlite_sequence_cache.borrow_mut().clear();
                 self.original_ddl_sql.borrow_mut().clear();
-                self.vtab_instances.borrow_mut().clear();
-                self.dropped_vtab_instances.borrow_mut().clear();
+                let displaced_live_vtabs = {
+                    let mut registry = self.vtab_instances.borrow_mut();
+                    std::mem::take(&mut *registry)
+                };
+                let displaced_dropped_live_vtabs = {
+                    let mut registry = self.dropped_vtab_instances.borrow_mut();
+                    std::mem::take(&mut *registry)
+                };
                 self.live_vtab_transactions.borrow_mut().clear();
                 self.live_vtab_registry_undo.borrow_mut().clear();
+                self.live_vtab_failed_begin_cleanup.borrow_mut().clear();
                 *self.next_master_rowid.borrow_mut() = 1;
                 *self.schema_cookie.borrow_mut() = 0;
-                self.schema_generation.set(0);
+                self.schema_generation
+                    .set(self.schema_generation.get().wrapping_add(1));
                 *self.change_counter.borrow_mut() = 0;
                 // bd-#70 wedge extension: raise the finalized commit clock floor.
                 self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
                 self.memdb_rows_loaded.set(hydrate_rows);
                 self.memdb_requires_active_txn_reload.set(false);
                 self.memdb_storage_count_shortcuts_safe.set(hydrate_rows);
-                self.pending_local_live_vtab_preserve_once.set(false);
+                self.clear_pending_local_live_vtab_preservation();
+                if force_full_schema_reload {
+                    self.force_full_schema_reload_once.set(false);
+                }
+                // User vtab callbacks and destructors may re-enter this
+                // connection. Disconnect them only after the empty schema,
+                // registries, identity, and visibility state have all been
+                // published. A staged DROP still present during recovery is
+                // not known durable, so it is disconnected rather than
+                // destroying backing storage.
+                self.cleanup_live_vtab_instances_best_effort(
+                    cx,
+                    displaced_live_vtabs,
+                    LiveVtabCleanupAction::Disconnect,
+                    "empty schema reload displacement",
+                );
+                self.cleanup_live_vtab_instances_best_effort(
+                    cx,
+                    displaced_dropped_live_vtabs,
+                    LiveVtabCleanupAction::Disconnect,
+                    "empty schema reload staged-drop displacement",
+                );
                 return Ok(());
             }
 
@@ -69252,7 +70593,14 @@ impl Connection {
                 && (!self.memdb_requires_active_txn_reload.get()
                     || allow_dirty_schema_only_fast_path)
                 && self.pending_memdb_direct_upserts.borrow().is_empty()
-                && !self.pending_local_live_vtab_preserve_once.get()
+                && self.pending_local_live_vtab_preservation.borrow().is_none()
+                // A same-cookie peer commit can still change a virtual table's
+                // persisted content. If visibility advanced while any live
+                // instance exists, take the full rebuild path so the instance
+                // cannot survive with a stale in-memory index. The exact local
+                // preservation receipt above already forces this path too.
+                && (self.vtab_instances.borrow().is_empty()
+                    || bound_visible_commit_seq == *self.memdb_visible_commit_seq.borrow())
             {
                 // Autoincrement tables track their next-rowid high-water-mark in
                 // sqlite_sequence. `INSERT` on an AUTOINCREMENT column doesn't bump
@@ -69296,10 +70644,8 @@ impl Connection {
             } else {
                 0
             };
-            let preserve_existing_live_vtabs = self.can_preserve_existing_live_vtabs_after_reload(
-                bound_visible_commit_seq,
-                schema_cookie,
-            );
+            let eligible_preserved_live_vtab_keys = self
+                .pending_local_live_vtab_keys_for_reload(bound_visible_commit_seq, schema_cookie);
 
             // Read sqlite_master entries from page 1's B-tree.
             let (master_entries, max_master_rowid) = {
@@ -69333,6 +70679,26 @@ impl Connection {
                 }
                 (entries, max_rowid)
             };
+            let visible_page_bound = txn.visible_db_size_bound();
+            let max_root_page = if visible_page_bound == 0 {
+                if header.is_page_count_stale() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "schema reload cannot validate root pages against a stale header without a pager snapshot bound"
+                            .to_owned(),
+                    });
+                }
+                header.page_count
+            } else {
+                visible_page_bound
+            };
+            let free_pages = txn.live_freelist_pages().into_iter().collect();
+            let bound_implicit_autoindexes =
+                crate::compat_persist::bind_implicit_autoindex_catalog(
+                    &master_entries,
+                    max_root_page,
+                    &header,
+                    &free_pages,
+                )?;
 
             // Parse each sqlite_master row and rebuild schema + MemDatabase.
             // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
@@ -69382,7 +70748,7 @@ impl Connection {
             let mut new_sqlite_sequence_cache = HashMap::new();
             let mut new_original_ddl_sql = HashMap::new();
 
-            for entry in &master_entries {
+            for (row_index, entry) in master_entries.iter().enumerate() {
                 if entry.len() < 5 {
                     continue;
                 }
@@ -69396,17 +70762,36 @@ impl Connection {
                         SqliteValue::Text(s) => s.clone(),
                         _ => continue,
                     };
-                    match &entry[1] {
-                        SqliteValue::Text(_) => {}
-                        _ => continue,
-                    }
-                    if let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql)
+                    let trigger_name = match &entry[1] {
+                        SqliteValue::Text(name) => name,
+                        _ => unreachable!("sqlite_master binder validates trigger names"),
+                    };
+                    let table_name = match &entry[2] {
+                        SqliteValue::Text(name) => name,
+                        _ => unreachable!("sqlite_master binder validates trigger parents"),
+                    };
+                    let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql)
+                    else {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "schema reload cannot reconstruct trigger `{trigger_name}`"
+                            ),
+                        });
+                    };
+                    if stmt.temporary
+                        || !stmt.name.name.eq_ignore_ascii_case(trigger_name)
+                        || !stmt.table.eq_ignore_ascii_case(table_name)
                     {
-                        new_triggers.push(TriggerDef::from_create_statement(
-                            &stmt,
-                            create_sql.to_string(),
-                        ));
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master trigger `{trigger_name}` does not match its stored CREATE TRIGGER identity"
+                            ),
+                        });
                     }
+                    new_triggers.push(TriggerDef::from_create_statement(
+                        &stmt,
+                        create_sql.to_string(),
+                    ));
                     continue;
                 }
 
@@ -69423,76 +70808,71 @@ impl Connection {
                         SqliteValue::Integer(n) => *n,
                         _ => continue,
                     };
-                    let root_page = i32::try_from(root_page_num).unwrap_or(0);
-                    if root_page <= 0 {
-                        continue;
-                    }
-                    let maybe_index_definition = match &entry[4] {
-                        SqliteValue::Text(create_sql) => {
-                            new_original_ddl_sql
-                                .insert(index_name.to_ascii_lowercase(), create_sql.to_string());
-                            let table_columns = new_schema
-                                .iter()
-                                .find(|table| table.name.eq_ignore_ascii_case(&table_name))
-                                .map(|table| table.columns.clone())
-                                .or_else(|| {
-                                    master_entries.iter().find_map(|candidate| {
-                                        if candidate.len() < 5 {
-                                            return None;
-                                        }
-                                        let entry_type = match &candidate[0] {
-                                            SqliteValue::Text(s) => s,
-                                            _ => return None,
-                                        };
-                                        if !entry_type.eq_ignore_ascii_case("table") {
-                                            return None;
-                                        }
-                                        let entry_name = match &candidate[1] {
-                                            SqliteValue::Text(s) => s,
-                                            _ => return None,
-                                        };
-                                        if !entry_name.eq_ignore_ascii_case(&table_name) {
-                                            return None;
-                                        }
-                                        let create_sql = match &candidate[4] {
-                                            SqliteValue::Text(sql) => sql,
-                                            _ => return None,
-                                        };
-                                        Some(
-                                        crate::compat_persist::parse_columns_from_sqlite_master_sql(
-                                            create_sql,
-                                        ),
-                                    )
-                                    })
-                                });
-                            parse_index_definition_from_create_sql(
-                                create_sql,
-                                table_columns.as_deref(),
-                            )
-                        }
-                        SqliteValue::Null => infer_implicit_index_definition_from_master_entries(
-                            &master_entries,
-                            &table_name,
-                            &index_name,
-                        ),
-                        _ => None,
+                    let root_page_u32 = crate::compat_persist::validate_sqlite_master_root_page(
+                        &index_name,
+                        root_page_num,
+                    )?;
+                    let root_page = i32::try_from(root_page_u32)
+                        .expect("validated index root page must fit MemDatabase");
+                    let create_sql = match &entry[4] {
+                        SqliteValue::Text(create_sql) => create_sql,
+                        // The catalog binder has already validated and bound
+                        // every NULL-sql implicit index. Ordinary-table replay
+                        // attaches those physical schemas as a complete set.
+                        SqliteValue::Null => continue,
+                        _ => unreachable!("sqlite_master binder validates sql storage class"),
                     };
+                    new_original_ddl_sql
+                        .insert(index_name.to_ascii_lowercase(), create_sql.to_string());
+                    let table_columns = new_schema
+                        .iter()
+                        .find(|table| table.name.eq_ignore_ascii_case(&table_name))
+                        .map(|table| table.columns.clone())
+                        .or_else(|| {
+                            master_entries.iter().find_map(|candidate| {
+                                if candidate.len() < 5 {
+                                    return None;
+                                }
+                                let entry_type = match &candidate[0] {
+                                    SqliteValue::Text(s) => s,
+                                    _ => return None,
+                                };
+                                if !entry_type.eq_ignore_ascii_case("table") {
+                                    return None;
+                                }
+                                let entry_name = match &candidate[1] {
+                                    SqliteValue::Text(s) => s,
+                                    _ => return None,
+                                };
+                                if !entry_name.eq_ignore_ascii_case(&table_name) {
+                                    return None;
+                                }
+                                let create_sql = match &candidate[4] {
+                                    SqliteValue::Text(sql) => sql,
+                                    _ => return None,
+                                };
+                                Some(crate::compat_persist::parse_columns_from_sqlite_master_sql(
+                                    create_sql,
+                                ))
+                            })
+                        });
+                    let maybe_index_definition = parse_index_definition_from_create_sql(
+                        create_sql,
+                        table_columns.as_deref(),
+                    );
                     let Some(index_definition) = maybe_index_definition else {
-                        let reason = match &entry[4] {
-                            SqliteValue::Null => {
-                                "implicit index has NULL sql and could not be inferred from table schema"
-                            }
-                            SqliteValue::Text(_) => {
-                                "index SQL could not be parsed into executable index metadata"
-                            }
-                            _ => "index SQL has unsupported sqlite_master representation",
-                        };
-                        return Err(FrankenError::Internal(format!(
-                            "schema reload cannot safely proceed: failed to reconstruct index `{index_name}` on table `{table_name}` ({reason})"
-                        )));
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "schema reload cannot reconstruct explicit index `{index_name}` on table `{table_name}`"
+                            ),
+                        });
                     };
                     if index_definition.key_term_count() == 0 {
-                        continue;
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "schema reload reconstructed explicit index `{index_name}` on table `{table_name}` without any key terms"
+                            ),
+                        });
                     }
                     pending_indexes.push((
                         index_name.to_string(),
@@ -69515,14 +70895,32 @@ impl Connection {
                     };
                     new_original_ddl_sql
                         .insert(view_name.to_ascii_lowercase(), create_sql.to_string());
-                    if let Ok(Statement::CreateView(stmt)) = parse_single_statement(&create_sql) {
-                        new_views.push(ViewDef {
-                            name: stmt.name.name.clone(),
-                            columns: stmt.columns.clone(),
-                            query: stmt.query.clone(),
-                            temporary: false,
+                    let view_table_name = match &entry[2] {
+                        SqliteValue::Text(name) => name,
+                        _ => unreachable!("sqlite_master binder validates view parents"),
+                    };
+                    let Ok(Statement::CreateView(stmt)) = parse_single_statement(&create_sql)
+                    else {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("schema reload cannot reconstruct view `{view_name}`"),
+                        });
+                    };
+                    if stmt.temporary
+                        || !stmt.name.name.eq_ignore_ascii_case(&view_name)
+                        || !view_table_name.eq_ignore_ascii_case(&view_name)
+                    {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master view `{view_name}` does not match its stored CREATE VIEW identity"
+                            ),
                         });
                     }
+                    new_views.push(ViewDef {
+                        name: stmt.name.name.clone(),
+                        columns: stmt.columns.clone(),
+                        query: stmt.query.clone(),
+                        temporary: false,
+                    });
                     continue;
                 }
 
@@ -69543,39 +70941,17 @@ impl Connection {
                     _ => continue,
                 };
                 let is_virtual_sql = is_virtual_table_sql(&create_sql);
-                let ddl_key = name.to_ascii_lowercase();
-                let implicit_content_shadow = format!("{name}_content");
-                let replacement_is_stale_implicit_fts5 = root_page_num == 0
-                    && is_virtual_sql
-                    && matches!(
-                        parse_single_statement(&create_sql),
-                        Ok(Statement::CreateVirtualTable(ref stmt))
-                            if stmt.module.eq_ignore_ascii_case("fts5")
-                                && virtual_table_option_value(&stmt.args, "content").is_none()
-                    )
-                    && !master_entries.iter().any(|candidate| {
-                        candidate.len() >= 2
-                            && matches!(
-                                &candidate[1],
-                                SqliteValue::Text(candidate_name)
-                                    if candidate_name.eq_ignore_ascii_case(&implicit_content_shadow)
-                            )
-                    });
-                let existing_is_reloadable_contentless_fts5 = new_original_ddl_sql
-                    .get(&ddl_key)
-                    .is_some_and(|existing_sql| {
-                        matches!(
-                            parse_single_statement(existing_sql),
-                            Ok(Statement::CreateVirtualTable(ref stmt))
-                                if stmt.module.eq_ignore_ascii_case("fts5")
-                                    && virtual_table_option_value(&stmt.args, "content")
-                                        .is_some_and(|content| content.is_empty())
-                        )
-                    });
-                if !(replacement_is_stale_implicit_fts5 && existing_is_reloadable_contentless_fts5)
+                if is_virtual_sql
+                    && !bound_implicit_autoindexes.is_canonical_virtual_table_row(row_index)
                 {
-                    new_original_ddl_sql.insert(ddl_key, create_sql.to_string());
+                    tracing::debug!(
+                        table = %name,
+                        row_index,
+                        "skipping non-canonical duplicate virtual-table catalog row"
+                    );
+                    continue;
                 }
+                new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.to_string());
 
                 if root_page_num == 0 && is_virtual_sql {
                     let shadowed_by_materialized =
@@ -69616,6 +70992,17 @@ impl Connection {
                     Ok(Statement::CreateTable(create_stmt)) => Some(create_stmt),
                     _ => None,
                 };
+                let bound_table_autoindexes = if is_virtual_sql {
+                    None
+                } else {
+                    Some(bound_implicit_autoindexes.table(&name).ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "validated ordinary table `{name}` has no bound autoindex layout"
+                            ),
+                        }
+                    })?)
+                };
                 let columns = parsed_create_table
                     .as_ref()
                     .and_then(crate::compat_persist::columns_from_create_table_statement)
@@ -69647,6 +71034,11 @@ impl Connection {
                 let real_root_page =
                     i32::try_from(root_page_u32).expect("validated root page must fit MemDatabase");
                 new_db.create_table_at(real_root_page, num_columns);
+                let implicit_indexes = bound_table_autoindexes
+                    .map_or_else(Vec::new, |bound| bound.physical_index_schemas(&name));
+                for index in &implicit_indexes {
+                    new_db.create_table_at(index.root_page, 0);
+                }
 
                 // Parse FK definitions and UNIQUE column groups from the CREATE TABLE AST.
                 let mut fk_defs = Vec::new();
@@ -69692,58 +71084,36 @@ impl Connection {
                             }
                         }
 
-                        // UNIQUE column groups for in-memory constraint enforcement.
+                        // Use the same canonical, deduplicated slot vector as
+                        // direct CREATE and implicit-index reload. Re-deriving
+                        // groups from raw constraints would revive duplicate
+                        // slots and apply a discarded WR INTEGER-PK term
+                        // collation instead of the column's effective collation.
                         if let Some(mem_table) = new_db.get_table_mut(real_root_page) {
-                            // Column-level UNIQUE/non-IPK PRIMARY KEY.
-                            for (i, col_info) in columns.iter().enumerate() {
-                                if col_info.unique && !col_info.is_ipk {
-                                    mem_table.add_unique_column_group_with_collations(
-                                        vec![i],
-                                        vec![col_info.collation.clone()],
-                                    );
-                                }
-                            }
-                            // Table-level UNIQUE/PRIMARY KEY constraints.
-                            for tc in constraints {
-                                if let TableConstraintKind::Unique {
-                                    columns: idx_cols, ..
-                                }
-                                | TableConstraintKind::PrimaryKey {
-                                    columns: idx_cols, ..
-                                } = &tc.kind
-                                {
-                                    let Some(normalized_terms) =
-                                        collect_effective_index_terms_for_column_infos(
-                                            idx_cols, &columns,
-                                        )
-                                    else {
-                                        continue;
-                                    };
-                                    let Some(col_indices) = normalized_terms
-                                        .iter()
-                                        .map(|term| {
-                                            columns.iter().position(|c| {
-                                                c.name.eq_ignore_ascii_case(&term.column_name)
-                                            })
+                            for slot in bound_table_autoindexes.into_iter().flat_map(
+                                crate::compat_persist::BoundTableAutoindexes::implicit_slots,
+                            ) {
+                                let Some(column_indices) = slot
+                                    .columns()
+                                    .iter()
+                                    .map(|column_name| {
+                                        columns.iter().position(|column| {
+                                            column.name.eq_ignore_ascii_case(column_name)
                                         })
-                                        .collect::<Option<Vec<_>>>()
-                                    else {
-                                        continue;
-                                    };
-                                    if !col_indices.is_empty() {
-                                        let all_ipk =
-                                            col_indices.iter().all(|&i| columns[i].is_ipk);
-                                        if !all_ipk {
-                                            let collations = normalized_terms
-                                                .into_iter()
-                                                .map(|term| term.collation)
-                                                .collect();
-                                            mem_table.add_unique_column_group_with_collations(
-                                                col_indices,
-                                                collations,
-                                            );
-                                        }
-                                    }
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                                else {
+                                    return Err(FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "canonical autoindex layout for `{name}` references a missing column"
+                                        ),
+                                    });
+                                };
+                                if !column_indices.is_empty() {
+                                    mem_table.add_unique_column_group_with_collations(
+                                        column_indices,
+                                        slot.key_collations().to_vec(),
+                                    );
                                 }
                             }
                         }
@@ -69767,7 +71137,7 @@ impl Connection {
                     name: name.to_string(),
                     root_page: real_root_page,
                     columns,
-                    indexes: Vec::new(),
+                    indexes: implicit_indexes,
                     strict: parsed_create_table.as_ref().map_or_else(
                         || crate::compat_persist::is_strict_table_sql(&create_sql),
                         |create| create.strict,
@@ -69880,31 +71250,40 @@ impl Connection {
 
             // Attach indexes after all table schemas are available.
             for (index_name, table_name, root_page, index_definition) in pending_indexes {
-                if let Some(table) = new_schema
+                let Some(table) = new_schema
                     .iter_mut()
                     .find(|t| t.name.eq_ignore_ascii_case(&table_name))
-                {
-                    if table
-                        .indexes
-                        .iter()
-                        .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
-                    {
-                        continue;
-                    }
-                    table.indexes.push(IndexSchema {
-                        name: index_name,
-                        root_page,
-                        columns: index_definition.columns,
-                        key_expressions: index_definition.key_expressions,
-                        key_sort_directions: index_definition.key_sort_directions,
-                        key_collations: index_definition.key_collations,
-                        where_clause: index_definition.where_clause,
-                        is_unique: index_definition.is_unique,
-                        conflict_action: index_definition.conflict_action,
+                else {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "validated explicit index `{index_name}` lost parent table `{table_name}` during schema reload"
+                        ),
                     });
-                    if !new_db.tables.contains_key(&root_page) {
-                        new_db.create_table_at(root_page, 0);
-                    }
+                };
+                if table
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "validated explicit index `{index_name}` duplicates an existing index on table `{table_name}` during schema reload"
+                        ),
+                    });
+                }
+                table.indexes.push(IndexSchema {
+                    name: index_name,
+                    root_page,
+                    columns: index_definition.columns,
+                    key_expressions: index_definition.key_expressions,
+                    key_sort_directions: index_definition.key_sort_directions,
+                    key_collations: index_definition.key_collations,
+                    where_clause: index_definition.where_clause,
+                    is_unique: index_definition.is_unique,
+                    conflict_action: index_definition.conflict_action,
+                });
+                if !new_db.tables.contains_key(&root_page) {
+                    new_db.create_table_at(root_page, 0);
                 }
             }
 
@@ -69931,6 +71310,48 @@ impl Connection {
             let reloaded_live_vtabs = if self.transactional_live_vtab_registry_active() {
                 None
             } else {
+                let existing_live_vtabs = self.vtab_instances.borrow();
+                let mut preserved_live_vtab_keys: HashSet<String> = pending_materialized_live_vtabs
+                    .iter()
+                    .map(|(table_name, _)| table_name.to_ascii_uppercase())
+                    .filter(|key| {
+                        eligible_preserved_live_vtab_keys.contains(key)
+                            && existing_live_vtabs.contains_key(key)
+                    })
+                    .collect();
+                #[cfg(feature = "ext-fts5")]
+                preserved_live_vtab_keys.extend(
+                    pending_rootpage_zero_virtual_tables
+                        .iter()
+                        .map(|(table_name, _, _)| table_name.to_ascii_uppercase())
+                        .filter(|key| {
+                            eligible_preserved_live_vtab_keys.contains(key)
+                                && existing_live_vtabs.contains_key(key)
+                        }),
+                );
+                let isolated_memory_fallback_keys = if self.pager.is_memory() {
+                    // A custom materialized vtab may have no persisted-row
+                    // hydrator. On an isolated :memory: pager there is no peer
+                    // writer to make its in-process object stale. Record exact
+                    // SQL-identity candidates now, but let supported FTS/RTree
+                    // hydrators rebuild first; only truly unsupported keys may
+                    // fall back to their old object below.
+                    let original_ddl_sql = self.original_ddl_sql.borrow();
+                    pending_materialized_live_vtabs
+                        .iter()
+                        .filter_map(|(table_name, create_sql)| {
+                            let key = table_name.to_ascii_uppercase();
+                            (existing_live_vtabs.contains_key(&key)
+                                && original_ddl_sql
+                                    .get(&table_name.to_ascii_lowercase())
+                                    .is_some_and(|old_sql| old_sql == create_sql))
+                            .then_some(key)
+                        })
+                        .collect::<HashSet<_>>()
+                } else {
+                    HashSet::new()
+                };
+                drop(existing_live_vtabs);
                 let mut reloaded = self
                     .rebuild_materialized_live_vtab_instances_from_reload(
                         cx,
@@ -69940,7 +71361,7 @@ impl Connection {
                         &new_schema,
                         &new_alias_map,
                         &pending_materialized_live_vtabs,
-                        preserve_existing_live_vtabs,
+                        &preserved_live_vtab_keys,
                     )
                     .await?;
                 let rootpage_zero_live_vtabs = self
@@ -69952,11 +71373,16 @@ impl Connection {
                         &new_schema,
                         &new_alias_map,
                         &pending_rootpage_zero_virtual_tables,
-                        preserve_existing_live_vtabs,
+                        &preserved_live_vtab_keys,
                     )
                     .await?;
-                reloaded.extend(rootpage_zero_live_vtabs);
-                Some(reloaded)
+                reloaded.merge(rootpage_zero_live_vtabs)?;
+                preserved_live_vtab_keys.extend(
+                    isolated_memory_fallback_keys
+                        .into_iter()
+                        .filter(|key| !reloaded.contains_key(key)),
+                );
+                Some((reloaded.into_instances(), preserved_live_vtab_keys))
             };
 
             // Capture structural fingerprints of old and new schemas BEFORE the
@@ -70069,29 +71495,32 @@ impl Connection {
             *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
             *self.sqlite_sequence_cache.borrow_mut() = new_sqlite_sequence_cache;
             *self.original_ddl_sql.borrow_mut() = new_original_ddl_sql;
-            if let Some(mut reloaded_live_vtabs) = reloaded_live_vtabs {
-                let mut existing_live_vtabs = self.vtab_instances.borrow_mut();
-                if self.pager.is_memory() {
-                    // Preserve connection-local live VTAB instances for modules
-                    // that do not yet support persisted-row hydration during
-                    // MemDatabase reload. This is only safe for `:memory:`
-                    // connections, where no external writer can invalidate the
-                    // in-process live VTAB object between reloads.
-                    for (table_name, _) in &pending_materialized_live_vtabs {
-                        let key = table_name.to_ascii_uppercase();
-                        if reloaded_live_vtabs.contains_key(&key) {
-                            continue;
-                        }
-                        if let Some(instance) = existing_live_vtabs.remove(&key) {
-                            reloaded_live_vtabs.insert(key, instance);
-                        }
+            let displaced_vtab_instances =
+                if let Some((mut reloaded_live_vtabs, preserved_live_vtab_keys)) =
+                    reloaded_live_vtabs
+                {
+                    let mut existing_live_vtabs = self.vtab_instances.borrow_mut();
+                    for key in preserved_live_vtab_keys {
+                        debug_assert!(!reloaded_live_vtabs.contains_key(&key));
+                        let instance = existing_live_vtabs.remove(&key).expect(
+                            "preserved live-vtab key must remain present until publication",
+                        );
+                        reloaded_live_vtabs.insert(key, instance);
                     }
-                }
-                *existing_live_vtabs = reloaded_live_vtabs;
-                self.dropped_vtab_instances.borrow_mut().clear();
-                self.live_vtab_transactions.borrow_mut().clear();
-                self.live_vtab_registry_undo.borrow_mut().clear();
-            }
+                    let displaced =
+                        std::mem::replace(&mut *existing_live_vtabs, reloaded_live_vtabs);
+                    drop(existing_live_vtabs);
+                    let displaced_dropped = {
+                        let mut registry = self.dropped_vtab_instances.borrow_mut();
+                        std::mem::take(&mut *registry)
+                    };
+                    self.live_vtab_transactions.borrow_mut().clear();
+                    self.live_vtab_registry_undo.borrow_mut().clear();
+                    self.live_vtab_failed_begin_cleanup.borrow_mut().clear();
+                    Some((displaced, displaced_dropped))
+                } else {
+                    None
+                };
             #[allow(clippy::cast_possible_wrap)]
             {
                 *self.next_master_rowid.borrow_mut() = max_master_rowid.saturating_add(1).max(1);
@@ -70124,7 +71553,33 @@ impl Connection {
             self.memdb_rows_loaded.set(hydrate_rows);
             self.memdb_requires_active_txn_reload.set(false);
             self.memdb_storage_count_shortcuts_safe.set(hydrate_rows);
-            self.pending_local_live_vtab_preserve_once.set(false);
+            self.clear_pending_local_live_vtab_preservation();
+            if force_full_schema_reload {
+                self.force_full_schema_reload_once.set(false);
+            }
+
+            // User-defined vtab callbacks and destructors may re-enter the
+            // connection. Disconnect displaced xConnect instances only after
+            // every replacement schema/registry/cookie field is published and
+            // no live-vtab RefCell borrow is held. Durably committed DROP
+            // instances are consumed by the commit finalizer before reload;
+            // any staged entry still present here is therefore disconnected,
+            // never destroyed, so a rollback/recovery reload cannot erase its
+            // backing storage.
+            if let Some((displaced_live, displaced_dropped)) = displaced_vtab_instances {
+                self.cleanup_live_vtab_instances_best_effort(
+                    cx,
+                    displaced_live,
+                    LiveVtabCleanupAction::Disconnect,
+                    "schema reload displacement",
+                );
+                self.cleanup_live_vtab_instances_best_effort(
+                    cx,
+                    displaced_dropped,
+                    LiveVtabCleanupAction::Disconnect,
+                    "schema reload staged-drop displacement",
+                );
+            }
 
             Ok(())
         })
@@ -70148,6 +71603,25 @@ impl Drop for Connection {
         //   * `close_in_place()` / `close_without_checkpoint_in_place()`
         //   * `close_best_effort_in_place()`
         if !*self.closed.get_mut() {
+            let cx = self.teardown_cx();
+            let live_vtab_instances = std::mem::take(self.vtab_instances.get_mut());
+            let staged_dropped_vtab_instances =
+                std::mem::take(self.dropped_vtab_instances.get_mut());
+            self.live_vtab_transactions.get_mut().clear();
+            self.live_vtab_registry_undo.get_mut().clear();
+            self.live_vtab_failed_begin_cleanup.get_mut().clear();
+            self.cleanup_live_vtab_instances_best_effort(
+                &cx,
+                live_vtab_instances,
+                LiveVtabCleanupAction::Disconnect,
+                "unawaited connection drop",
+            );
+            self.cleanup_live_vtab_instances_best_effort(
+                &cx,
+                staged_dropped_vtab_instances,
+                LiveVtabCleanupAction::Disconnect,
+                "unawaited connection drop staged drop",
+            );
             // Cancellation is SYNCHRONOUS and therefore legal here, even though
             // draining is not. Without it, every task spawned into this
             // connection's region outlives the connection with a live `Cx`: a
@@ -70219,9 +71693,9 @@ fn expression_only_has_subquery(select: &SelectStatement) -> bool {
             }) || where_clause.as_deref().is_some_and(expr_has_any_subquery)
                 || group_by.iter().any(expr_has_any_subquery)
                 || having.as_deref().is_some_and(expr_has_any_subquery)
-                || windows.iter().any(|window| {
-                    window_spec_contains_subquery_match(&window.spec, &mut |_| true)
-                })
+                || windows
+                    .iter()
+                    .any(|window| window_spec_contains_subquery_match(&window.spec, &mut |_| true))
         }
     };
     core_has_subquery
@@ -70689,10 +72163,9 @@ fn select_expr_collation_candidate(
             expr,
             ..
         } => select_expr_collation_candidate(expr, from_lookup, schemas),
-        Expr::RowValue(values, _) => values.first().map_or(
-            CollationCandidate::Absent,
-            |expr| select_expr_collation_candidate(expr, from_lookup, schemas),
-        ),
+        Expr::RowValue(values, _) => values.first().map_or(CollationCandidate::Absent, |expr| {
+            select_expr_collation_candidate(expr, from_lookup, schemas)
+        }),
         _ => CollationCandidate::Absent,
     }
 }
@@ -71648,9 +73121,7 @@ fn validate_function_call_modifiers_in_source(source: &TableOrSubquery) -> Resul
             }
             Ok(())
         }
-        TableOrSubquery::ParenJoin(from) => {
-            validate_function_call_modifiers_in_from_clause(from)
-        }
+        TableOrSubquery::ParenJoin(from) => validate_function_call_modifiers_in_from_clause(from),
     }
 }
 
@@ -71738,9 +73209,7 @@ fn validate_used_window_specs_in_expr(
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::Collate { expr, .. } => {
-            validate_used_window_specs_in_expr(expr, named_windows)
-        }
+        | Expr::Collate { expr, .. } => validate_used_window_specs_in_expr(expr, named_windows),
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -71800,9 +73269,9 @@ fn validate_used_window_specs_in_expr(
             name,
             ..
         } => {
-            let is_aggregate =
-                (is_current_aggregate_fn(name, args) || is_builtin_json_aggregate(name))
-                    && !is_scalar_max_min(name, args);
+            let is_aggregate = (is_current_aggregate_fn(name, args)
+                || is_builtin_json_aggregate(name))
+                && !is_scalar_max_min(name, args);
             if over.is_none()
                 && is_aggregate
                 && (matches!(
@@ -71972,25 +73441,23 @@ fn validate_dead_empty_in_window_modifiers(expr: &Expr) -> Result<()> {
             }
             Ok(())
         }
-        Expr::Subquery(select, _) | Expr::Exists { subquery: select, .. } => {
-            validate_dead_empty_in_window_modifiers_in_select(select)
-        }
+        Expr::Subquery(select, _)
+        | Expr::Exists {
+            subquery: select, ..
+        } => validate_dead_empty_in_window_modifiers_in_select(select),
         Expr::RowValue(values, _) => {
             for value in values {
                 validate_dead_empty_in_window_modifiers(value)?;
             }
             Ok(())
         }
-        Expr::Literal(_, _)
-        | Expr::Column(_, _)
-        | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => Ok(()),
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+            Ok(())
+        }
     }
 }
 
-fn validate_dead_empty_in_window_modifiers_in_select(
-    select: &SelectStatement,
-) -> Result<()> {
+fn validate_dead_empty_in_window_modifiers_in_select(select: &SelectStatement) -> Result<()> {
     if let Some(with) = &select.with {
         for cte in &with.ctes {
             validate_dead_empty_in_window_modifiers_in_select(&cte.query)?;
@@ -72064,9 +73531,7 @@ fn validate_dead_empty_in_window_modifiers_in_from(from: &FromClause) -> Result<
     Ok(())
 }
 
-fn validate_dead_empty_in_window_modifiers_in_source(
-    source: &TableOrSubquery,
-) -> Result<()> {
+fn validate_dead_empty_in_window_modifiers_in_source(source: &TableOrSubquery) -> Result<()> {
     match source {
         TableOrSubquery::Table { .. } => Ok(()),
         TableOrSubquery::Subquery { query, .. } => {
@@ -72078,9 +73543,7 @@ fn validate_dead_empty_in_window_modifiers_in_source(
             }
             Ok(())
         }
-        TableOrSubquery::ParenJoin(from) => {
-            validate_dead_empty_in_window_modifiers_in_from(from)
-        }
+        TableOrSubquery::ParenJoin(from) => validate_dead_empty_in_window_modifiers_in_from(from),
     }
 }
 
@@ -72128,9 +73591,7 @@ fn window_spec_has_window_function(window: &WindowSpec) -> bool {
 
 fn frame_bound_has_window_function(bound: &FrameBound) -> bool {
     match bound {
-        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-            expr_has_window_function(expr)
-        }
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => expr_has_window_function(expr),
         FrameBound::UnboundedPreceding
         | FrameBound::CurrentRow
         | FrameBound::UnboundedFollowing => false,
@@ -72229,11 +73690,7 @@ fn validate_named_window_definitions(named_windows: &NamedWindowSpecs<'_>) -> Re
             let base_name = window_ref.name();
             let key = base_name.to_ascii_uppercase();
             if let Some(base_index) = latest_definition.get(&key).copied() {
-                merge_derived_window(
-                    window,
-                    resolved_definitions[base_index].clone(),
-                    base_name,
-                )?
+                merge_derived_window(window, resolved_definitions[base_index].clone(), base_name)?
             } else if definition_index == 0 {
                 WindowSpec {
                     window_ref: None,
@@ -72270,8 +73727,7 @@ fn resolve_used_window_spec(
         .rev()
         .find(|(_, (name, _))| name == &key)
         .ok_or_else(|| FrankenError::FunctionError(format!("no such window: {base_name}")))?;
-    let resolved_base =
-        resolve_named_window_definition(base, base_index, named_windows)?;
+    let resolved_base = resolve_named_window_definition(base, base_index, named_windows)?;
     match window_ref {
         WindowReference::Direct(_)
             if window.partition_by.is_empty()
@@ -72320,9 +73776,8 @@ fn validate_function_call_resolution(
     over: Option<&WindowSpec>,
 ) -> Result<()> {
     let num_args = aggregate_args_len_for_lookup(args);
-    let is_aggregate =
-        (is_current_aggregate_fn(name, args) || is_builtin_json_aggregate(name))
-            && !is_scalar_max_min(name, args);
+    let is_aggregate = (is_current_aggregate_fn(name, args) || is_builtin_json_aggregate(name))
+        && !is_scalar_max_min(name, args);
     let accepted = if over.is_some() {
         with_current_sync_function_registry(|registry| {
             registry
@@ -72373,9 +73828,8 @@ fn validate_function_call_header(
     filter: Option<&Expr>,
     over: Option<&WindowSpec>,
 ) -> Result<()> {
-    let is_aggregate =
-        (is_current_aggregate_fn(name, args) || is_builtin_json_aggregate(name))
-            && !is_scalar_max_min(name, args);
+    let is_aggregate = (is_current_aggregate_fn(name, args) || is_builtin_json_aggregate(name))
+        && !is_scalar_max_min(name, args);
     if filter.is_some() && !is_aggregate {
         return Err(FrankenError::FunctionError(format!(
             "FILTER may not be used with non-aggregate {name}()"
@@ -72427,9 +73881,7 @@ fn validate_function_call_modifiers_in_expr(expr: &Expr) -> Result<()> {
                     }
                     Ok(())
                 }
-                InSet::Subquery(subquery) => {
-                    validate_function_call_modifiers_in_select(subquery)
-                }
+                InSet::Subquery(subquery) => validate_function_call_modifiers_in_select(subquery),
                 InSet::Table(_) => Ok(()),
             }
         }
@@ -72848,9 +74300,7 @@ fn expr_has_window_function(expr: &Expr) -> bool {
         } => {
             expr_has_window_function(inner)
                 || expr_has_window_function(pattern)
-                || escape
-                    .as_deref()
-                    .is_some_and(expr_has_window_function)
+                || escape.as_deref().is_some_and(expr_has_window_function)
         }
         Expr::JsonAccess { expr, path, .. } => {
             expr_has_window_function(expr) || expr_has_window_function(path)
@@ -72919,9 +74369,7 @@ fn extract_inner_window_function(expr: &Expr) -> Option<ExtractedWindowFunction>
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Cast { expr: inner, .. }
-        | Expr::Collate { expr: inner, .. } => {
-            extract_inner_window_function(inner)
-        }
+        | Expr::Collate { expr: inner, .. } => extract_inner_window_function(inner),
         Expr::Between {
             expr: inner,
             low,
@@ -72948,11 +74396,7 @@ fn extract_inner_window_function(expr: &Expr) -> Option<ExtractedWindowFunction>
             ..
         } => extract_inner_window_function(inner)
             .or_else(|| extract_inner_window_function(pattern))
-            .or_else(|| {
-                escape
-                    .as_deref()
-                    .and_then(extract_inner_window_function)
-            }),
+            .or_else(|| escape.as_deref().and_then(extract_inner_window_function)),
         Expr::Case {
             operand,
             whens,
@@ -73019,9 +74463,7 @@ fn replace_first_window_with_literal(
                     let mut rewritten = Vec::with_capacity(values.len());
                     for value_expr in values {
                         rewritten.push(replace_first_window_with_literal(
-                            value_expr,
-                            value,
-                            replaced,
+                            value_expr, value, replaced,
                         ));
                     }
                     FunctionArgs::List(rewritten)
@@ -73031,15 +74473,12 @@ fn replace_first_window_with_literal(
             let mut new_order_by = Vec::with_capacity(order_by.len());
             for term in order_by {
                 let mut term = term.clone();
-                term.expr =
-                    replace_first_window_with_literal(&term.expr, value, replaced);
+                term.expr = replace_first_window_with_literal(&term.expr, value, replaced);
                 new_order_by.push(term);
             }
             let new_filter = filter.as_ref().map(|predicate| {
                 Box::new(replace_first_window_with_literal(
-                    predicate,
-                    value,
-                    replaced,
+                    predicate, value, replaced,
                 ))
             });
             Expr::FunctionCall {
@@ -73058,13 +74497,9 @@ fn replace_first_window_with_literal(
             right,
             span,
         } => Expr::BinaryOp {
-            left: Box::new(replace_first_window_with_literal(
-                left, value, replaced,
-            )),
+            left: Box::new(replace_first_window_with_literal(left, value, replaced)),
             op: *op,
-            right: Box::new(replace_first_window_with_literal(
-                right, value, replaced,
-            )),
+            right: Box::new(replace_first_window_with_literal(right, value, replaced)),
             span: *span,
         },
         Expr::UnaryOp {
@@ -73073,9 +74508,7 @@ fn replace_first_window_with_literal(
             span,
         } => Expr::UnaryOp {
             op: *op,
-            expr: Box::new(replace_first_window_with_literal(
-                inner, value, replaced,
-            )),
+            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
             span: *span,
         },
         Expr::Between {
@@ -73085,13 +74518,9 @@ fn replace_first_window_with_literal(
             not,
             span,
         } => Expr::Between {
-            expr: Box::new(replace_first_window_with_literal(
-                inner, value, replaced,
-            )),
+            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
             low: Box::new(replace_first_window_with_literal(low, value, replaced)),
-            high: Box::new(replace_first_window_with_literal(
-                high, value, replaced,
-            )),
+            high: Box::new(replace_first_window_with_literal(high, value, replaced)),
             not: *not,
             span: *span,
         },
@@ -73104,16 +74533,13 @@ fn replace_first_window_with_literal(
             if matches!(set, InSet::List(values) if values.is_empty()) {
                 return expr.clone();
             }
-            let new_inner =
-                Box::new(replace_first_window_with_literal(inner, value, replaced));
+            let new_inner = Box::new(replace_first_window_with_literal(inner, value, replaced));
             let new_set = match set {
                 InSet::List(values) => {
                     let mut rewritten = Vec::with_capacity(values.len());
                     for value_expr in values {
                         rewritten.push(replace_first_window_with_literal(
-                            value_expr,
-                            value,
-                            replaced,
+                            value_expr, value, replaced,
                         ));
                     }
                     InSet::List(rewritten)
@@ -73135,17 +74561,11 @@ fn replace_first_window_with_literal(
             not,
             span,
         } => Expr::Like {
-            expr: Box::new(replace_first_window_with_literal(
-                inner, value, replaced,
-            )),
-            pattern: Box::new(replace_first_window_with_literal(
-                pattern, value, replaced,
-            )),
-            escape: escape.as_ref().map(|escape| {
-                Box::new(replace_first_window_with_literal(
-                    escape, value, replaced,
-                ))
-            }),
+            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
+            pattern: Box::new(replace_first_window_with_literal(pattern, value, replaced)),
+            escape: escape
+                .as_ref()
+                .map(|escape| Box::new(replace_first_window_with_literal(escape, value, replaced))),
             op: *op,
             not: *not,
             span: *span,
@@ -73157,9 +74577,7 @@ fn replace_first_window_with_literal(
             span,
         } => {
             let new_operand = operand.as_ref().map(|operand| {
-                Box::new(replace_first_window_with_literal(
-                    operand, value, replaced,
-                ))
+                Box::new(replace_first_window_with_literal(operand, value, replaced))
             });
             let mut new_whens = Vec::with_capacity(whens.len());
             for (condition, result) in whens {
@@ -73185,9 +74603,7 @@ fn replace_first_window_with_literal(
             type_name,
             span,
         } => Expr::Cast {
-            expr: Box::new(replace_first_window_with_literal(
-                inner, value, replaced,
-            )),
+            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
             type_name: type_name.clone(),
             span: *span,
         },
@@ -73196,9 +74612,7 @@ fn replace_first_window_with_literal(
             collation,
             span,
         } => Expr::Collate {
-            expr: Box::new(replace_first_window_with_literal(
-                inner, value, replaced,
-            )),
+            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
             collation: collation.clone(),
             span: *span,
         },
@@ -73207,9 +74621,7 @@ fn replace_first_window_with_literal(
             not,
             span,
         } => Expr::IsNull {
-            expr: Box::new(replace_first_window_with_literal(
-                inner, value, replaced,
-            )),
+            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
             not: *not,
             span: *span,
         },
@@ -73219,12 +74631,8 @@ fn replace_first_window_with_literal(
             arrow,
             span,
         } => Expr::JsonAccess {
-            expr: Box::new(replace_first_window_with_literal(
-                inner, value, replaced,
-            )),
-            path: Box::new(replace_first_window_with_literal(
-                path, value, replaced,
-            )),
+            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
+            path: Box::new(replace_first_window_with_literal(path, value, replaced)),
             arrow: *arrow,
             span: *span,
         },
@@ -73232,9 +74640,7 @@ fn replace_first_window_with_literal(
             let mut rewritten = Vec::with_capacity(values.len());
             for value_expr in values {
                 rewritten.push(replace_first_window_with_literal(
-                    value_expr,
-                    value,
-                    replaced,
+                    value_expr, value, replaced,
                 ));
             }
             Expr::RowValue(rewritten, *span)
@@ -73920,10 +75326,7 @@ fn qualify_persistent_view_name(name: &mut QualifiedName, scopes: &[HashSet<Stri
     }
 }
 
-fn qualify_persistent_view_select(
-    select: &mut SelectStatement,
-    scopes: &mut Vec<HashSet<String>>,
-) {
+fn qualify_persistent_view_select(select: &mut SelectStatement, scopes: &mut Vec<HashSet<String>>) {
     let scope_depth = scopes.len();
     if let Some(with) = &mut select.with {
         // SQLite makes every CTE name in a WITH clause visible to every CTE
@@ -74008,10 +75411,7 @@ fn qualify_persistent_view_from(from: &mut FromClause, scopes: &mut Vec<HashSet<
     }
 }
 
-fn qualify_persistent_view_source(
-    source: &mut TableOrSubquery,
-    scopes: &mut Vec<HashSet<String>>,
-) {
+fn qualify_persistent_view_source(source: &mut TableOrSubquery, scopes: &mut Vec<HashSet<String>>) {
     match source {
         TableOrSubquery::Table { name, .. } => qualify_persistent_view_name(name, scopes),
         TableOrSubquery::Subquery { query, .. } => {
@@ -74028,8 +75428,10 @@ fn qualify_persistent_view_source(
 
 fn qualify_persistent_view_expr(expr: &mut Expr, scopes: &mut Vec<HashSet<String>>) {
     match expr {
-        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {}
-        Expr::BinaryOp { left, right, .. } | Expr::JsonAccess {
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
             expr: left,
             path: right,
             ..
@@ -74089,7 +75491,10 @@ fn qualify_persistent_view_expr(expr: &mut Expr, scopes: &mut Vec<HashSet<String
                 qualify_persistent_view_expr(else_expr, scopes);
             }
         }
-        Expr::Subquery(query, _) | Expr::Exists { subquery: query, .. } => {
+        Expr::Subquery(query, _)
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
             qualify_persistent_view_select(query, scopes);
         }
         Expr::FunctionCall {
@@ -74122,10 +75527,7 @@ fn qualify_persistent_view_expr(expr: &mut Expr, scopes: &mut Vec<HashSet<String
     }
 }
 
-fn qualify_persistent_view_window(
-    window: &mut WindowSpec,
-    scopes: &mut Vec<HashSet<String>>,
-) {
+fn qualify_persistent_view_window(window: &mut WindowSpec, scopes: &mut Vec<HashSet<String>>) {
     for term in &mut window.order_by {
         qualify_persistent_view_expr(&mut term.expr, scopes);
     }
@@ -75461,17 +76863,10 @@ fn default_virtual_table_column_info() -> ColumnInfo {
 }
 
 fn resolve_virtual_table_column_infos(
-    factory: &dyn VtabModuleFactory,
-    args: &[String],
-    factory_args: &[&str],
+    declared: Vec<ColumnInfo>,
+    factory_columns: Vec<(String, char)>,
 ) -> Vec<ColumnInfo> {
-    let declared = parse_declared_virtual_table_column_infos(args);
-    if !declared.is_empty() {
-        return declared;
-    }
-
-    let from_factory = factory
-        .column_info(factory_args)
+    let from_factory = factory_columns
         .into_iter()
         .map(|(name, affinity)| ColumnInfo {
             name,
@@ -75490,6 +76885,10 @@ fn resolve_virtual_table_column_infos(
         .collect::<Vec<_>>();
     if !from_factory.is_empty() {
         return from_factory;
+    }
+
+    if !declared.is_empty() {
+        return declared;
     }
 
     vec![default_virtual_table_column_info()]
@@ -75761,6 +77160,214 @@ pub(crate) fn maybe_quote_ident(name: &str) -> String {
     } else {
         name.to_owned()
     }
+}
+
+fn parse_create_table_for_schema_rewrite(
+    original_sql: &str,
+    expected_table_name: &str,
+) -> Result<fsqlite_ast::CreateTableStatement> {
+    let statement = parse_single_statement(original_sql).map_err(|error| {
+        FrankenError::Internal(format!(
+            "cannot safely rewrite CREATE TABLE for `{expected_table_name}`: {error}"
+        ))
+    })?;
+    let Statement::CreateTable(create) = statement else {
+        return Err(FrankenError::Internal(format!(
+            "cannot safely rewrite `{expected_table_name}`: cached schema SQL is not CREATE TABLE"
+        )));
+    };
+    if !create.name.name.eq_ignore_ascii_case(expected_table_name) {
+        return Err(FrankenError::Internal(format!(
+            "cannot safely rewrite `{expected_table_name}`: cached CREATE TABLE names `{}`",
+            create.name.name
+        )));
+    }
+    Ok(create)
+}
+
+fn create_table_columns_and_constraints_mut(
+    create: &mut fsqlite_ast::CreateTableStatement,
+) -> Result<(
+    &mut Vec<fsqlite_ast::ColumnDef>,
+    &mut Vec<fsqlite_ast::TableConstraint>,
+)> {
+    let CreateTableBody::Columns {
+        columns,
+        constraints,
+    } = &mut create.body
+    else {
+        return Err(FrankenError::Internal(format!(
+            "cannot safely rewrite CREATE TABLE AS SELECT for `{}`",
+            create.name.name
+        )));
+    };
+    Ok((columns, constraints))
+}
+
+fn visit_create_table_foreign_key_clauses_mut(
+    columns: &mut [fsqlite_ast::ColumnDef],
+    constraints: &mut [fsqlite_ast::TableConstraint],
+    mut visit: impl FnMut(&mut fsqlite_ast::ForeignKeyClause),
+) {
+    for column in columns {
+        for constraint in &mut column.constraints {
+            if let ColumnConstraintKind::ForeignKey(clause) = &mut constraint.kind {
+                visit(clause);
+            }
+        }
+    }
+    for constraint in constraints {
+        if let TableConstraintKind::ForeignKey { clause, .. } = &mut constraint.kind {
+            visit(clause);
+        }
+    }
+}
+
+fn rename_identifier_if_matches(value: &mut String, old: &str, new: &str) -> bool {
+    if !value.eq_ignore_ascii_case(old) {
+        return false;
+    }
+    value.clear();
+    value.push_str(new);
+    true
+}
+
+fn rename_indexed_column_identifier(
+    indexed: &mut fsqlite_ast::IndexedColumn,
+    old: &str,
+    new: &str,
+) -> bool {
+    fn rename_indexed_expr(expr: &mut Expr, old: &str, new: &str) -> bool {
+        match expr {
+            // SQLite's indexed-column grammar historically treats a
+            // single-quoted token as a column identifier. Preserve that
+            // interpretation while rewriting table constraints, including
+            // when the token is wrapped in one or more COLLATE nodes.
+            Expr::Literal(Literal::String(name), _) => rename_identifier_if_matches(name, old, new),
+            Expr::Collate { expr, .. } => rename_indexed_expr(expr, old, new),
+            _ => rename_column_refs_in_expr(expr, old, new),
+        }
+    }
+
+    rename_indexed_expr(&mut indexed.expr, old, new)
+}
+
+fn rewrite_create_table_sql_for_alter(
+    original_sql: &str,
+    expected_table_name: &str,
+    action: &AlterTableAction,
+) -> Result<String> {
+    let mut create = parse_create_table_for_schema_rewrite(original_sql, expected_table_name)?;
+    let self_table_name = create.name.name.clone();
+
+    match action {
+        AlterTableAction::RenameTo(new_name) => {
+            let (columns, constraints) = create_table_columns_and_constraints_mut(&mut create)?;
+            visit_create_table_foreign_key_clauses_mut(columns, constraints, |clause| {
+                let _ =
+                    rename_identifier_if_matches(&mut clause.table, expected_table_name, new_name);
+            });
+            create.name.name.clone_from(new_name);
+        }
+        AlterTableAction::RenameColumn { old, new } => {
+            let (columns, constraints) = create_table_columns_and_constraints_mut(&mut create)?;
+            let Some(column) = columns
+                .iter_mut()
+                .find(|column| column.name.eq_ignore_ascii_case(old))
+            else {
+                return Err(FrankenError::Internal(format!(
+                    "cannot safely rewrite `{expected_table_name}`: no such column `{old}`"
+                )));
+            };
+            column.name.clone_from(new);
+
+            for column in columns {
+                for constraint in &mut column.constraints {
+                    match &mut constraint.kind {
+                        ColumnConstraintKind::Check(expr)
+                        | ColumnConstraintKind::Generated { expr, .. } => {
+                            let _ = rename_column_refs_in_expr(expr, old, new);
+                        }
+                        ColumnConstraintKind::ForeignKey(clause)
+                            if clause.table.eq_ignore_ascii_case(&self_table_name) =>
+                        {
+                            for parent_column in &mut clause.columns {
+                                let _ = rename_identifier_if_matches(parent_column, old, new);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for constraint in constraints {
+                match &mut constraint.kind {
+                    TableConstraintKind::PrimaryKey { columns, .. }
+                    | TableConstraintKind::Unique { columns, .. } => {
+                        for indexed in columns {
+                            let _ = rename_indexed_column_identifier(indexed, old, new);
+                        }
+                    }
+                    TableConstraintKind::Check(expr) => {
+                        let _ = rename_column_refs_in_expr(expr, old, new);
+                    }
+                    TableConstraintKind::ForeignKey { columns, clause } => {
+                        for child_column in columns {
+                            let _ = rename_identifier_if_matches(child_column, old, new);
+                        }
+                        if clause.table.eq_ignore_ascii_case(&self_table_name) {
+                            for parent_column in &mut clause.columns {
+                                let _ = rename_identifier_if_matches(parent_column, old, new);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        AlterTableAction::AddColumn(column) => {
+            let (columns, _) = create_table_columns_and_constraints_mut(&mut create)?;
+            columns.push(column.clone());
+        }
+        AlterTableAction::DropColumn(column_name) => {
+            let (columns, _) = create_table_columns_and_constraints_mut(&mut create)?;
+            let Some(column_index) = columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(column_name))
+            else {
+                return Err(FrankenError::Internal(format!(
+                    "cannot safely rewrite `{expected_table_name}`: no such column `{column_name}`"
+                )));
+            };
+            columns.remove(column_index);
+        }
+    }
+
+    Ok(create.to_string())
+}
+
+fn rewrite_create_table_foreign_key_parent_sql(
+    original_sql: &str,
+    expected_table_name: &str,
+    parent_table: &str,
+    renamed_parent_table: Option<&str>,
+    renamed_parent_column: Option<(&str, &str)>,
+) -> Result<String> {
+    let mut create = parse_create_table_for_schema_rewrite(original_sql, expected_table_name)?;
+    let (columns, constraints) = create_table_columns_and_constraints_mut(&mut create)?;
+    visit_create_table_foreign_key_clauses_mut(columns, constraints, |clause| {
+        if !clause.table.eq_ignore_ascii_case(parent_table) {
+            return;
+        }
+        if let Some((old, new)) = renamed_parent_column {
+            for parent_column in &mut clause.columns {
+                let _ = rename_identifier_if_matches(parent_column, old, new);
+            }
+        }
+        if let Some(new_parent_table) = renamed_parent_table {
+            clause.table.clear();
+            clause.table.push_str(new_parent_table);
+        }
+    });
+    Ok(create.to_string())
 }
 
 fn render_create_table_sql<F>(
@@ -77607,8 +79214,7 @@ fn select_contains_subquery_matching(
     predicate: fn(SubqueryExprRef<'_>, &Connection) -> bool,
 ) -> bool {
     select.with.as_ref().is_some_and(|with| {
-        with
-            .ctes
+        with.ctes
             .iter()
             .any(|cte| select_contains_subquery_matching(&cte.query, conn, predicate))
     }) || select_core_contains_subquery_matching(&select.body.select, conn, predicate)
@@ -77617,9 +79223,10 @@ fn select_contains_subquery_matching(
             .compounds
             .iter()
             .any(|(_, core)| select_core_contains_subquery_matching(core, conn, predicate))
-        || select.order_by.iter().any(|term| {
-            expr_contains_subquery_matching_deep(&term.expr, conn, predicate)
-        })
+        || select
+            .order_by
+            .iter()
+            .any(|term| expr_contains_subquery_matching_deep(&term.expr, conn, predicate))
         || select.limit.as_ref().is_some_and(|limit| {
             expr_contains_subquery_matching_deep(&limit.limit, conn, predicate)
                 || limit.offset.as_ref().is_some_and(|offset| {
@@ -77634,9 +79241,10 @@ fn select_core_contains_subquery_matching(
     predicate: fn(SubqueryExprRef<'_>, &Connection) -> bool,
 ) -> bool {
     match core {
-        SelectCore::Values(rows) => rows.iter().flatten().any(|expr| {
-            expr_contains_subquery_matching_deep(expr, conn, predicate)
-        }),
+        SelectCore::Values(rows) => rows
+            .iter()
+            .flatten()
+            .any(|expr| expr_contains_subquery_matching_deep(expr, conn, predicate)),
         SelectCore::Select {
             columns,
             from,
@@ -77652,26 +79260,34 @@ fn select_core_contains_subquery_matching(
                     ResultColumn::Expr { expr, .. }
                         if expr_contains_subquery_matching_deep(expr, conn, predicate)
                 )
-            }) || from.as_ref().is_some_and(|from| {
-                from_clause_contains_subquery_matching(from, conn, predicate)
-            }) || where_clause.as_deref().is_some_and(|expr| {
-                expr_contains_subquery_matching_deep(expr, conn, predicate)
-            }) || group_by.iter().any(|expr| {
-                expr_contains_subquery_matching_deep(expr, conn, predicate)
-            }) || having.as_deref().is_some_and(|expr| {
-                expr_contains_subquery_matching_deep(expr, conn, predicate)
-            }) || windows.iter().any(|window| {
-                window.spec.partition_by.iter().any(|expr| {
-                    expr_contains_subquery_matching_deep(expr, conn, predicate)
-                }) || window.spec.order_by.iter().any(|term| {
-                    expr_contains_subquery_matching_deep(&term.expr, conn, predicate)
-                }) || window.spec.frame.as_ref().is_some_and(|frame| {
-                    frame_bound_contains_subquery_matching(&frame.start, conn, predicate)
-                        || frame.end.as_ref().is_some_and(|end| {
-                            frame_bound_contains_subquery_matching(end, conn, predicate)
+            }) || from
+                .as_ref()
+                .is_some_and(|from| from_clause_contains_subquery_matching(from, conn, predicate))
+                || where_clause
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_subquery_matching_deep(expr, conn, predicate))
+                || group_by
+                    .iter()
+                    .any(|expr| expr_contains_subquery_matching_deep(expr, conn, predicate))
+                || having
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_subquery_matching_deep(expr, conn, predicate))
+                || windows.iter().any(|window| {
+                    window
+                        .spec
+                        .partition_by
+                        .iter()
+                        .any(|expr| expr_contains_subquery_matching_deep(expr, conn, predicate))
+                        || window.spec.order_by.iter().any(|term| {
+                            expr_contains_subquery_matching_deep(&term.expr, conn, predicate)
+                        })
+                        || window.spec.frame.as_ref().is_some_and(|frame| {
+                            frame_bound_contains_subquery_matching(&frame.start, conn, predicate)
+                                || frame.end.as_ref().is_some_and(|end| {
+                                    frame_bound_contains_subquery_matching(end, conn, predicate)
+                                })
                         })
                 })
-            })
         }
     }
 }
@@ -78047,10 +79663,7 @@ fn scalar_in_operand_expr_contains_function_call(expr: &Expr) -> bool {
             .iter()
             .any(scalar_in_operand_expr_contains_function_call),
         Expr::Subquery(..) | Expr::Exists { .. } => true,
-        Expr::Literal(..)
-        | Expr::Column(..)
-        | Expr::Raise { .. }
-        | Expr::Placeholder(..) => false,
+        Expr::Literal(..) | Expr::Column(..) | Expr::Raise { .. } | Expr::Placeholder(..) => false,
     }
 }
 
@@ -78148,12 +79761,7 @@ fn scalar_in_operand_supported_by_complex_vdbe(
     let table_label = alias.as_deref().unwrap_or(&name.name);
     let output_is_local = match columns.as_slice() {
         [ResultColumn::Expr { expr, .. }] => {
-            !scalar_expr_has_invalid_local_binding(
-                expr,
-                table,
-                table_label,
-                &HashSet::new(),
-            )
+            !scalar_expr_has_invalid_local_binding(expr, table, table_label, &HashSet::new())
         }
         [ResultColumn::Star] => table.columns.len() == 1,
         [ResultColumn::TableStar(qualifier)] => {
@@ -78163,12 +79771,7 @@ fn scalar_in_operand_supported_by_complex_vdbe(
     };
     output_is_local
         && where_clause.as_deref().is_none_or(|expr| {
-            !scalar_expr_has_invalid_local_binding(
-                expr,
-                table,
-                table_label,
-                &HashSet::new(),
-            )
+            !scalar_expr_has_invalid_local_binding(expr, table, table_label, &HashSet::new())
         })
 }
 
@@ -78177,22 +79780,17 @@ fn select_has_in_subquery_operand_requiring_semantic_fallback(
     conn: &Connection,
 ) -> bool {
     select.with.as_ref().is_some_and(|with| {
-        with
-            .ctes
+        with.ctes
             .iter()
-            .any(|cte| {
-                select_has_in_subquery_operand_requiring_semantic_fallback(&cte.query, conn)
-            })
-    }) || select_core_has_in_subquery_operand_requiring_semantic_fallback(
-        &select.body.select,
-        conn,
-    )
+            .any(|cte| select_has_in_subquery_operand_requiring_semantic_fallback(&cte.query, conn))
+    }) || select_core_has_in_subquery_operand_requiring_semantic_fallback(&select.body.select, conn)
         || select.body.compounds.iter().any(|(_, core)| {
             select_core_has_in_subquery_operand_requiring_semantic_fallback(core, conn)
         })
-        || select.order_by.iter().any(|term| {
-            expr_has_in_subquery_operand_requiring_semantic_fallback(&term.expr, conn)
-        })
+        || select
+            .order_by
+            .iter()
+            .any(|term| expr_has_in_subquery_operand_requiring_semantic_fallback(&term.expr, conn))
         || select.limit.as_ref().is_some_and(|limit| {
             expr_has_in_subquery_operand_requiring_semantic_fallback(&limit.limit, conn)
                 || limit.offset.as_ref().is_some_and(|offset| {
@@ -78209,9 +79807,7 @@ fn select_core_has_in_subquery_operand_requiring_semantic_fallback(
         SelectCore::Values(rows) => rows
             .iter()
             .flatten()
-            .any(|expr| {
-                expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)
-            }),
+            .any(|expr| expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)),
         SelectCore::Select {
             columns,
             from,
@@ -78229,16 +79825,14 @@ fn select_core_has_in_subquery_operand_requiring_semantic_fallback(
                 )
             }) || from.as_ref().is_some_and(|from| {
                 from_clause_has_in_subquery_operand_requiring_semantic_fallback(from, conn)
-            }) || where_clause.as_deref().is_some_and(
-                |expr| expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn),
-            ) || group_by
+            }) || where_clause.as_deref().is_some_and(|expr| {
+                expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)
+            }) || group_by
                 .iter()
-                .any(|expr| {
+                .any(|expr| expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn))
+                || having.as_deref().is_some_and(|expr| {
                     expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)
                 })
-                || having.as_deref().is_some_and(
-                    |expr| expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn),
-                )
                 || windows.iter().any(|window| {
                     window_spec_has_in_subquery_operand_requiring_semantic_fallback(
                         &window.spec,
@@ -78275,9 +79869,7 @@ fn source_has_in_subquery_operand_requiring_semantic_fallback(
         }
         TableOrSubquery::TableFunction { args, .. } => args
             .iter()
-            .any(|expr| {
-                expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)
-            }),
+            .any(|expr| expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)),
         TableOrSubquery::ParenJoin(from) => {
             from_clause_has_in_subquery_operand_requiring_semantic_fallback(from, conn)
         }
@@ -78292,9 +79884,10 @@ fn window_spec_has_in_subquery_operand_requiring_semantic_fallback(
         .partition_by
         .iter()
         .any(|expr| expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn))
-        || window.order_by.iter().any(|term| {
-            expr_has_in_subquery_operand_requiring_semantic_fallback(&term.expr, conn)
-        })
+        || window
+            .order_by
+            .iter()
+            .any(|term| expr_has_in_subquery_operand_requiring_semantic_fallback(&term.expr, conn))
         || window.frame.as_ref().is_some_and(|frame| {
             frame_bound_has_in_subquery_operand_requiring_semantic_fallback(&frame.start, conn)
                 || frame.end.as_ref().is_some_and(|end| {
@@ -78356,11 +79949,9 @@ fn expr_has_in_subquery_operand_requiring_semantic_fallback(
                 ))
                 || expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)
                 || match set {
-                    InSet::List(values) => values
-                        .iter()
-                        .any(|value| {
-                            expr_has_in_subquery_operand_requiring_semantic_fallback(value, conn)
-                        }),
+                    InSet::List(values) => values.iter().any(|value| {
+                        expr_has_in_subquery_operand_requiring_semantic_fallback(value, conn)
+                    }),
                     InSet::Subquery(subquery) => {
                         select_has_in_subquery_operand_requiring_semantic_fallback(subquery, conn)
                     }
@@ -78422,19 +80013,17 @@ fn expr_has_in_subquery_operand_requiring_semantic_fallback(
         }
         Expr::RowValue(values, _) => values
             .iter()
-            .any(|value| {
-                expr_has_in_subquery_operand_requiring_semantic_fallback(value, conn)
-            }),
+            .any(|value| expr_has_in_subquery_operand_requiring_semantic_fallback(value, conn)),
     }
 }
 
 fn expr_requires_prepared_select_dispatch(expr: &Expr, conn: &Connection) -> bool {
     expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)
         || expr_contains_subquery_match(expr, &mut |subquery| match subquery {
-        SubqueryExprRef::Scalar(subquery) => !scalar_subquery_supported_by_vdbe(subquery, conn),
-        SubqueryExprRef::Exists(subquery) => !exists_subquery_supported_by_vdbe(subquery, conn),
-        SubqueryExprRef::In(subquery) => !in_subquery_supported_by_vdbe(subquery, conn),
-    })
+            SubqueryExprRef::Scalar(subquery) => !scalar_subquery_supported_by_vdbe(subquery, conn),
+            SubqueryExprRef::Exists(subquery) => !exists_subquery_supported_by_vdbe(subquery, conn),
+            SubqueryExprRef::In(subquery) => !in_subquery_supported_by_vdbe(subquery, conn),
+        })
 }
 
 fn exists_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -> bool {
@@ -78598,11 +80187,7 @@ fn correlated_exists_matches_count_semijoin_shape(
         // Any non-probe term must be a NON-correlated, inner-only residual
         // bound. A correlated residual (e.g. `t2.id <> t.id`) is exactly the
         // shape the VDBE mishandles — reject it.
-        if expr_has_external_column_ref_with_schema_in_core(
-            term,
-            &sub.body.select,
-            schema,
-        ) {
+        if expr_has_external_column_ref_with_schema_in_core(term, &sub.body.select, schema) {
             return false;
         }
         residual_terms += 1;
@@ -78654,8 +80239,7 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
                 // emit_scalar_subquery returns the result expression
                 // immediately for a no-FROM SELECT. It therefore cannot
                 // enforce WHERE cardinality, nor run aggregate finalization.
-                return where_clause.is_none()
-                    && !expr_has_external_column_ref(expr, &[]);
+                return where_clause.is_none() && !expr_has_external_column_ref(expr, &[]);
             };
             if !from_clause.joins.is_empty() {
                 return false;
@@ -78733,12 +80317,7 @@ fn scalar_expr_has_invalid_local_binding(
         }
         Expr::BinaryOp { left, right, .. } => {
             scalar_expr_has_invalid_local_binding(left, table, table_label, output_aliases)
-                || scalar_expr_has_invalid_local_binding(
-                    right,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                || scalar_expr_has_invalid_local_binding(right, table, table_label, output_aliases)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
@@ -78750,18 +80329,8 @@ fn scalar_expr_has_invalid_local_binding(
             expr, low, high, ..
         } => {
             scalar_expr_has_invalid_local_binding(expr, table, table_label, output_aliases)
-                || scalar_expr_has_invalid_local_binding(
-                    low,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
-                || scalar_expr_has_invalid_local_binding(
-                    high,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                || scalar_expr_has_invalid_local_binding(low, table, table_label, output_aliases)
+                || scalar_expr_has_invalid_local_binding(high, table, table_label, output_aliases)
         }
         Expr::In { expr, set, .. } => {
             scalar_expr_has_invalid_local_binding(expr, table, table_label, output_aliases)
@@ -78805,31 +80374,17 @@ fn scalar_expr_has_invalid_local_binding(
             ..
         } => {
             operand.as_deref().is_some_and(|operand| {
-                scalar_expr_has_invalid_local_binding(
-                    operand,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                scalar_expr_has_invalid_local_binding(operand, table, table_label, output_aliases)
             }) || whens.iter().any(|(when_expr, then_expr)| {
-                scalar_expr_has_invalid_local_binding(
-                    when_expr,
-                    table,
-                    table_label,
-                    output_aliases,
-                ) || scalar_expr_has_invalid_local_binding(
-                    then_expr,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                scalar_expr_has_invalid_local_binding(when_expr, table, table_label, output_aliases)
+                    || scalar_expr_has_invalid_local_binding(
+                        then_expr,
+                        table,
+                        table_label,
+                        output_aliases,
+                    )
             }) || else_expr.as_deref().is_some_and(|else_expr| {
-                scalar_expr_has_invalid_local_binding(
-                    else_expr,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                scalar_expr_has_invalid_local_binding(else_expr, table, table_label, output_aliases)
             })
         }
         Expr::FunctionCall {
@@ -78855,22 +80410,12 @@ fn scalar_expr_has_invalid_local_binding(
                     output_aliases,
                 )
             }) || filter.as_deref().is_some_and(|filter| {
-                scalar_expr_has_invalid_local_binding(
-                    filter,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                scalar_expr_has_invalid_local_binding(filter, table, table_label, output_aliases)
             })
         }
         Expr::JsonAccess { expr, path, .. } => {
             scalar_expr_has_invalid_local_binding(expr, table, table_label, output_aliases)
-                || scalar_expr_has_invalid_local_binding(
-                    path,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                || scalar_expr_has_invalid_local_binding(path, table, table_label, output_aliases)
         }
         Expr::RowValue(_, _) | Expr::Raise { .. } => true,
         Expr::Exists { .. }
@@ -78964,12 +80509,7 @@ fn in_subquery_has_ordered_distinct_function_fallback_hazard(sub: &SelectStateme
             return true;
         }
         let Some(FromClause {
-            source:
-                TableOrSubquery::Table {
-                    name,
-                    alias,
-                    ..
-                },
+            source: TableOrSubquery::Table { name, alias, .. },
             joins,
         }) = from.as_ref()
         else {
@@ -79038,14 +80578,17 @@ fn in_subquery_contains_semantic_fallback_expr(sub: &SelectStatement) -> bool {
                         .partition_by
                         .iter()
                         .any(in_probe_expr_requires_semantic_fallback)
-                        || window.spec.order_by.iter().any(|term| {
-                            in_probe_expr_requires_semantic_fallback(&term.expr)
-                        })
+                        || window
+                            .spec
+                            .order_by
+                            .iter()
+                            .any(|term| in_probe_expr_requires_semantic_fallback(&term.expr))
                         || window.spec.frame.as_ref().is_some_and(|frame| {
                             in_probe_frame_bound_requires_semantic_fallback(&frame.start)
-                                || frame.end.as_ref().is_some_and(
-                                    in_probe_frame_bound_requires_semantic_fallback,
-                                )
+                                || frame
+                                    .end
+                                    .as_ref()
+                                    .is_some_and(in_probe_frame_bound_requires_semantic_fallback)
                         })
                 })
         }
@@ -79084,10 +80627,7 @@ fn in_probe_frame_bound_requires_semantic_fallback(bound: &FrameBound) -> bool {
 /// `no such column`/`no such table` error. Bare SELECT aliases are accepted in
 /// WHERE and ORDER BY only as a fallback after a real RHS table column; result
 /// expressions themselves cannot refer to their own aliases.
-fn in_subquery_has_unresolved_local_name(
-    sub: &SelectStatement,
-    conn: &Connection,
-) -> bool {
+fn in_subquery_has_unresolved_local_name(sub: &SelectStatement, conn: &Connection) -> bool {
     let SelectCore::Select {
         columns,
         from: Some(from),
@@ -79127,8 +80667,7 @@ fn in_subquery_has_unresolved_local_name(
     let result_names_valid = columns.iter().all(|column| match column {
         ResultColumn::Star => true,
         ResultColumn::TableStar(qualifier) => {
-            qualifier.schema.is_none()
-                && qualifier.name.eq_ignore_ascii_case(table_label)
+            qualifier.schema.is_none() && qualifier.name.eq_ignore_ascii_case(table_label)
         }
         ResultColumn::Expr { expr, .. } => {
             in_subquery_expr_names_resolve(expr, table, table_label, &HashSet::new())
@@ -79154,12 +80693,7 @@ fn in_subquery_has_unresolved_local_name(
                 ..
             } if matches!(expr.as_ref(), Expr::Literal(Literal::Integer(_), _))
         ) || (resolve_order_term_idx(&term.expr, columns).is_none()
-            && !in_subquery_expr_names_resolve(
-                &term.expr,
-                table,
-                table_label,
-                &output_aliases,
-            ))
+            && !in_subquery_expr_names_resolve(&term.expr, table, table_label, &output_aliases))
     }) {
         return true;
     }
@@ -79194,12 +80728,7 @@ fn in_subquery_expr_names_resolve(
         }
         Expr::BinaryOp { left, right, .. } => {
             in_subquery_expr_names_resolve(left, table, table_label, output_aliases)
-                && in_subquery_expr_names_resolve(
-                    right,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                && in_subquery_expr_names_resolve(right, table, table_label, output_aliases)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
@@ -79218,12 +80747,7 @@ fn in_subquery_expr_names_resolve(
             in_subquery_expr_names_resolve(expr, table, table_label, output_aliases)
                 && match set {
                     InSet::List(values) => values.iter().all(|value| {
-                        in_subquery_expr_names_resolve(
-                            value,
-                            table,
-                            table_label,
-                            output_aliases,
-                        )
+                        in_subquery_expr_names_resolve(value, table, table_label, output_aliases)
                     }),
                     // Nested SELECTs introduce their own name scope. Their
                     // dispatch eligibility is checked by the general recursive
@@ -79238,19 +80762,9 @@ fn in_subquery_expr_names_resolve(
             ..
         } => {
             in_subquery_expr_names_resolve(expr, table, table_label, output_aliases)
-                && in_subquery_expr_names_resolve(
-                    pattern,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                && in_subquery_expr_names_resolve(pattern, table, table_label, output_aliases)
                 && escape.as_deref().is_none_or(|escape| {
-                    in_subquery_expr_names_resolve(
-                        escape,
-                        table,
-                        table_label,
-                        output_aliases,
-                    )
+                    in_subquery_expr_names_resolve(escape, table, table_label, output_aliases)
                 })
         }
         Expr::Case {
@@ -79260,31 +80774,12 @@ fn in_subquery_expr_names_resolve(
             ..
         } => {
             operand.as_deref().is_none_or(|operand| {
-                in_subquery_expr_names_resolve(
-                    operand,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                in_subquery_expr_names_resolve(operand, table, table_label, output_aliases)
             }) && whens.iter().all(|(when_expr, then_expr)| {
-                in_subquery_expr_names_resolve(
-                    when_expr,
-                    table,
-                    table_label,
-                    output_aliases,
-                ) && in_subquery_expr_names_resolve(
-                    then_expr,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                in_subquery_expr_names_resolve(when_expr, table, table_label, output_aliases)
+                    && in_subquery_expr_names_resolve(then_expr, table, table_label, output_aliases)
             }) && else_expr.as_deref().is_none_or(|else_expr| {
-                in_subquery_expr_names_resolve(
-                    else_expr,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                in_subquery_expr_names_resolve(else_expr, table, table_label, output_aliases)
             })
         }
         Expr::FunctionCall {
@@ -79295,28 +80790,13 @@ fn in_subquery_expr_names_resolve(
         } => {
             (match args {
                 FunctionArgs::List(args) => args.iter().all(|arg| {
-                    in_subquery_expr_names_resolve(
-                        arg,
-                        table,
-                        table_label,
-                        output_aliases,
-                    )
+                    in_subquery_expr_names_resolve(arg, table, table_label, output_aliases)
                 }),
                 FunctionArgs::Star => true,
             }) && order_by.iter().all(|term| {
-                in_subquery_expr_names_resolve(
-                    &term.expr,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                in_subquery_expr_names_resolve(&term.expr, table, table_label, output_aliases)
             }) && filter.as_deref().is_none_or(|filter| {
-                in_subquery_expr_names_resolve(
-                    filter,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+                in_subquery_expr_names_resolve(filter, table, table_label, output_aliases)
             })
         }
         Expr::JsonAccess { expr, path, .. } => {
@@ -79341,8 +80821,7 @@ fn in_subquery_limit_expr_is_vdbe_safe(expr: &Expr) -> bool {
     match expr {
         Expr::Column(_, _) | Expr::Subquery(_, _) | Expr::Exists { .. } => false,
         Expr::BinaryOp { left, right, .. } => {
-            in_subquery_limit_expr_is_vdbe_safe(left)
-                && in_subquery_limit_expr_is_vdbe_safe(right)
+            in_subquery_limit_expr_is_vdbe_safe(left) && in_subquery_limit_expr_is_vdbe_safe(right)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
@@ -79414,8 +80893,7 @@ fn in_subquery_limit_expr_is_vdbe_safe(expr: &Expr) -> bool {
                     .is_none_or(in_subquery_limit_expr_is_vdbe_safe)
         }
         Expr::JsonAccess { expr, path, .. } => {
-            in_subquery_limit_expr_is_vdbe_safe(expr)
-                && in_subquery_limit_expr_is_vdbe_safe(path)
+            in_subquery_limit_expr_is_vdbe_safe(expr) && in_subquery_limit_expr_is_vdbe_safe(path)
         }
         Expr::RowValue(_, _) | Expr::Raise { .. } => false,
         Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
@@ -79458,11 +80936,7 @@ fn in_subquery_has_forbidden_outer_reference_position(
                 &sub.body.select,
                 &schema,
             ) || limit.offset.as_ref().is_some_and(|offset| {
-                expr_has_external_column_ref_with_schema_in_core(
-                    offset,
-                    &sub.body.select,
-                    &schema,
-                )
+                expr_has_external_column_ref_with_schema_in_core(offset, &sub.body.select, &schema)
             })
         })
 }
@@ -79472,9 +80946,7 @@ fn ordering_term_resolves_to_any_select_output(
     select: &SelectStatement,
 ) -> bool {
     let resolves_in_core = |core: &SelectCore| match core {
-        SelectCore::Select { columns, .. } => {
-            resolve_order_term_idx(&term.expr, columns).is_some()
-        }
+        SelectCore::Select { columns, .. } => resolve_order_term_idx(&term.expr, columns).is_some(),
         SelectCore::Values(_) => false,
     };
     resolves_in_core(&select.body.select)
@@ -79545,10 +81017,7 @@ fn in_subquery_needs_eager_eval(sub: &SelectStatement, conn: &Connection) -> boo
 /// the bd-2dgf5 kl17o carve-out — only shapes the compiled path consumes
 /// natively (residual WHERE evaluated per execution) may carry placeholders
 /// past the dispatch routing.
-fn in_subquery_matches_probe_source_shape(
-    sub: &SelectStatement,
-    conn: &Connection,
-) -> bool {
+fn in_subquery_matches_probe_source_shape(sub: &SelectStatement, conn: &Connection) -> bool {
     if sub.with.is_some()
         || !sub.body.compounds.is_empty()
         || !sub.order_by.is_empty()
@@ -80993,10 +82462,7 @@ fn is_correlated_subquery(subquery: &SelectStatement) -> bool {
 /// Probe-mode substitution mirrors the runtime scope walker exactly: known
 /// base-table inventories protect their real columns, while opaque inventories
 /// conservatively leave the subquery on the correlated path.
-fn is_correlated_subquery_with_schema(
-    subquery: &SelectStatement,
-    schema: &[TableSchema],
-) -> bool {
+fn is_correlated_subquery_with_schema(subquery: &SelectStatement, schema: &[TableSchema]) -> bool {
     if is_correlated_subquery(subquery) {
         return true;
     }
@@ -81027,12 +82493,7 @@ fn expr_has_external_column_ref_with_schema_in_core(
     core: &SelectCore,
     schema: &[TableSchema],
 ) -> bool {
-    expr_has_external_column_ref_with_schema_in_core_and_locals(
-        expr,
-        core,
-        schema,
-        &HashSet::new(),
-    )
+    expr_has_external_column_ref_with_schema_in_core_and_locals(expr, core, schema, &HashSet::new())
 }
 
 fn expr_has_external_column_ref_with_schema_in_core_and_locals(
@@ -81077,9 +82538,9 @@ fn select_statement_has_external_column_ref(
     ancestor_tables: &[String],
 ) -> bool {
     select.with.as_ref().is_some_and(|with| {
-        with.ctes.iter().any(|cte| {
-            select_statement_has_external_column_ref(&cte.query, ancestor_tables)
-        })
+        with.ctes
+            .iter()
+            .any(|cte| select_statement_has_external_column_ref(&cte.query, ancestor_tables))
     }) || select_core_has_external_column_ref(&select.body.select, ancestor_tables)
         || select
             .body
@@ -81114,29 +82575,15 @@ fn select_core_has_external_column_ref(core: &SelectCore, ancestor_tables: &[Str
                 || from
                     .as_ref()
                     .is_some_and(|from| from_clause_has_external_column_ref(from, &inner_tables))
-                || where_clause
-                    .as_deref()
-                    .is_some_and(|wh| {
-                        expr_has_external_column_ref_with_locals(
-                            wh,
-                            &inner_tables,
-                            &output_aliases,
-                        )
-                    })
-                || having
-                    .as_deref()
-                    .is_some_and(|expr| {
-                        expr_has_external_column_ref_with_locals(
-                            expr,
-                            &inner_tables,
-                            &output_aliases,
-                        )
-                    })
+                || where_clause.as_deref().is_some_and(|wh| {
+                    expr_has_external_column_ref_with_locals(wh, &inner_tables, &output_aliases)
+                })
+                || having.as_deref().is_some_and(|expr| {
+                    expr_has_external_column_ref_with_locals(expr, &inner_tables, &output_aliases)
+                })
                 || windows
                     .iter()
-                    .any(|window| {
-                        window_spec_has_external_column_ref(&window.spec, &inner_tables)
-                    })
+                    .any(|window| window_spec_has_external_column_ref(&window.spec, &inner_tables))
         }
     }
 }
@@ -81506,11 +82953,7 @@ fn expr_has_external_column_ref_with_locals(
         }
         Expr::BinaryOp { left, right, .. } => {
             expr_has_external_column_ref_with_locals(left, inner_tables, local_output_names)
-                || expr_has_external_column_ref_with_locals(
-                    right,
-                    inner_tables,
-                    local_output_names,
-                )
+                || expr_has_external_column_ref_with_locals(right, inner_tables, local_output_names)
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
@@ -81525,16 +82968,8 @@ fn expr_has_external_column_ref_with_locals(
             ..
         } => {
             expr_has_external_column_ref_with_locals(inner, inner_tables, local_output_names)
-                || expr_has_external_column_ref_with_locals(
-                    low,
-                    inner_tables,
-                    local_output_names,
-                )
-                || expr_has_external_column_ref_with_locals(
-                    high,
-                    inner_tables,
-                    local_output_names,
-                )
+                || expr_has_external_column_ref_with_locals(low, inner_tables, local_output_names)
+                || expr_has_external_column_ref_with_locals(high, inner_tables, local_output_names)
         }
         Expr::In {
             expr: inner, set, ..
@@ -81584,11 +83019,7 @@ fn expr_has_external_column_ref_with_locals(
                     )
                 })
                 || filter.as_ref().is_some_and(|expr| {
-                    expr_has_external_column_ref_with_locals(
-                        expr,
-                        inner_tables,
-                        local_output_names,
-                    )
+                    expr_has_external_column_ref_with_locals(expr, inner_tables, local_output_names)
                 })
                 || over
                     .as_ref()
@@ -81601,30 +83032,17 @@ fn expr_has_external_column_ref_with_locals(
             ..
         } => {
             operand.as_ref().is_some_and(|operand| {
+                expr_has_external_column_ref_with_locals(operand, inner_tables, local_output_names)
+            }) || whens.iter().any(|(c, t)| {
+                expr_has_external_column_ref_with_locals(c, inner_tables, local_output_names)
+                    || expr_has_external_column_ref_with_locals(t, inner_tables, local_output_names)
+            }) || else_expr.as_ref().is_some_and(|else_expr| {
                 expr_has_external_column_ref_with_locals(
-                    operand,
+                    else_expr,
                     inner_tables,
                     local_output_names,
                 )
             })
-                || whens.iter().any(|(c, t)| {
-                    expr_has_external_column_ref_with_locals(
-                        c,
-                        inner_tables,
-                        local_output_names,
-                    ) || expr_has_external_column_ref_with_locals(
-                        t,
-                        inner_tables,
-                        local_output_names,
-                    )
-                })
-                || else_expr.as_ref().is_some_and(|else_expr| {
-                    expr_has_external_column_ref_with_locals(
-                        else_expr,
-                        inner_tables,
-                        local_output_names,
-                    )
-                })
         }
         Expr::Like {
             expr: inner,
@@ -81653,18 +83071,10 @@ fn expr_has_external_column_ref_with_locals(
             expr: inner, path, ..
         } => {
             expr_has_external_column_ref_with_locals(inner, inner_tables, local_output_names)
-                || expr_has_external_column_ref_with_locals(
-                    path,
-                    inner_tables,
-                    local_output_names,
-                )
+                || expr_has_external_column_ref_with_locals(path, inner_tables, local_output_names)
         }
         Expr::RowValue(values, _) => values.iter().any(|value| {
-            expr_has_external_column_ref_with_locals(
-                value,
-                inner_tables,
-                local_output_names,
-            )
+            expr_has_external_column_ref_with_locals(value, inner_tables, local_output_names)
         }),
         _ => false,
     }
@@ -81986,10 +83396,7 @@ fn expr_has_correlated_join_subquery(expr: &Expr) -> bool {
 }
 
 /// Check if a SELECT's WHERE clause contains a correlated EXISTS subquery.
-fn select_has_correlated_exists_in_where(
-    select: &SelectStatement,
-    schema: &[TableSchema],
-) -> bool {
+fn select_has_correlated_exists_in_where(select: &SelectStatement, schema: &[TableSchema]) -> bool {
     let SelectCore::Select { where_clause, .. } = &select.body.select else {
         return false;
     };
@@ -82033,10 +83440,7 @@ fn select_correlated_exists_in_where_all_match_count_semijoin_shape(
 /// subqueries intact (`is_correlated_subquery`), but the VDBE codegen IN path
 /// then materializes the candidate set once with no outer binding, so without
 /// this gate the predicate matches nothing.
-fn select_has_correlated_in_subquery(
-    select: &SelectStatement,
-    schema: &[TableSchema],
-) -> bool {
+fn select_has_correlated_in_subquery(select: &SelectStatement, schema: &[TableSchema]) -> bool {
     select.with.as_ref().is_some_and(|with| {
         with.ctes
             .iter()
@@ -82060,10 +83464,7 @@ fn select_has_correlated_in_subquery(
         })
 }
 
-fn select_core_has_correlated_in_subquery(
-    core: &SelectCore,
-    schema: &[TableSchema],
-) -> bool {
+fn select_core_has_correlated_in_subquery(core: &SelectCore, schema: &[TableSchema]) -> bool {
     match core {
         SelectCore::Values(rows) => rows
             .iter()
@@ -82102,9 +83503,11 @@ fn select_core_has_correlated_in_subquery(
                         .partition_by
                         .iter()
                         .any(|expr| expr_has_correlated_in_subquery(expr, schema))
-                        || window.spec.order_by.iter().any(|term| {
-                            expr_has_correlated_in_subquery(&term.expr, schema)
-                        })
+                        || window
+                            .spec
+                            .order_by
+                            .iter()
+                            .any(|term| expr_has_correlated_in_subquery(&term.expr, schema))
                         || window.spec.frame.as_ref().is_some_and(|frame| {
                             frame_bound_has_correlated_in_subquery(&frame.start, schema)
                                 || frame.end.as_ref().is_some_and(|end| {
@@ -82116,10 +83519,7 @@ fn select_core_has_correlated_in_subquery(
     }
 }
 
-fn from_clause_has_correlated_in_subquery(
-    from: &FromClause,
-    schema: &[TableSchema],
-) -> bool {
+fn from_clause_has_correlated_in_subquery(from: &FromClause, schema: &[TableSchema]) -> bool {
     table_or_subquery_has_correlated_in_subquery(&from.source, schema)
         || from.joins.iter().any(|join| {
             table_or_subquery_has_correlated_in_subquery(&join.table, schema)
@@ -82137,22 +83537,15 @@ fn table_or_subquery_has_correlated_in_subquery(
 ) -> bool {
     match source {
         TableOrSubquery::Table { .. } => false,
-        TableOrSubquery::Subquery { query, .. } => {
-            select_has_correlated_in_subquery(query, schema)
-        }
+        TableOrSubquery::Subquery { query, .. } => select_has_correlated_in_subquery(query, schema),
         TableOrSubquery::TableFunction { args, .. } => args
             .iter()
             .any(|expr| expr_has_correlated_in_subquery(expr, schema)),
-        TableOrSubquery::ParenJoin(from) => {
-            from_clause_has_correlated_in_subquery(from, schema)
-        }
+        TableOrSubquery::ParenJoin(from) => from_clause_has_correlated_in_subquery(from, schema),
     }
 }
 
-fn frame_bound_has_correlated_in_subquery(
-    bound: &FrameBound,
-    schema: &[TableSchema],
-) -> bool {
+fn frame_bound_has_correlated_in_subquery(bound: &FrameBound, schema: &[TableSchema]) -> bool {
     match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
             expr_has_correlated_in_subquery(expr, schema)
@@ -82183,12 +83576,9 @@ fn expr_has_correlated_in_subquery(expr: &Expr, schema: &[TableSchema]) -> bool 
 /// separately by `select_correlated_exists_where_can_use_indexed_count_probe`.
 fn expr_has_correlated_exists(expr: &Expr, schema: &[TableSchema]) -> bool {
     match expr {
-        Expr::Exists { subquery, .. } => {
-            is_correlated_subquery_with_schema(subquery, schema)
-        }
+        Expr::Exists { subquery, .. } => is_correlated_subquery_with_schema(subquery, schema),
         Expr::BinaryOp { left, right, .. } => {
-            expr_has_correlated_exists(left, schema)
-                || expr_has_correlated_exists(right, schema)
+            expr_has_correlated_exists(left, schema) || expr_has_correlated_exists(right, schema)
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
@@ -82251,8 +83641,7 @@ fn expr_has_correlated_exists(expr: &Expr, schema: &[TableSchema]) -> bool {
             .iter()
             .any(|value| expr_has_correlated_exists(value, schema)),
         Expr::JsonAccess { expr, path, .. } => {
-            expr_has_correlated_exists(expr, schema)
-                || expr_has_correlated_exists(path, schema)
+            expr_has_correlated_exists(expr, schema) || expr_has_correlated_exists(path, schema)
         }
         Expr::Subquery(_, _) | Expr::Raise { .. } => false,
         _ => false,
@@ -82297,21 +83686,19 @@ fn expr_has_self_referencing_correlated_exists(
         } => {
             expr_has_self_referencing_correlated_exists(inner, outer_table, schema)
                 || matches!(set, InSet::List(items) if items
-                    .iter()
-                    .any(|item| expr_has_self_referencing_correlated_exists(
-                        item,
-                        outer_table,
-                        schema,
-                    )))
+                .iter()
+                .any(|item| expr_has_self_referencing_correlated_exists(
+                    item,
+                    outer_table,
+                    schema,
+                )))
         }
         Expr::FunctionCall {
             args: FunctionArgs::List(args),
             ..
         } => args
             .iter()
-            .any(|arg| {
-                expr_has_self_referencing_correlated_exists(arg, outer_table, schema)
-            }),
+            .any(|arg| expr_has_self_referencing_correlated_exists(arg, outer_table, schema)),
         Expr::Case {
             operand,
             whens,
@@ -82322,11 +83709,7 @@ fn expr_has_self_referencing_correlated_exists(
                 expr_has_self_referencing_correlated_exists(inner, outer_table, schema)
             }) || whens.iter().any(|(condition, value)| {
                 expr_has_self_referencing_correlated_exists(condition, outer_table, schema)
-                    || expr_has_self_referencing_correlated_exists(
-                        value,
-                        outer_table,
-                        schema,
-                    )
+                    || expr_has_self_referencing_correlated_exists(value, outer_table, schema)
             }) || else_expr.as_deref().is_some_and(|inner| {
                 expr_has_self_referencing_correlated_exists(inner, outer_table, schema)
             })
@@ -82345,9 +83728,7 @@ fn expr_has_self_referencing_correlated_exists(
         }
         Expr::RowValue(values, _) => values
             .iter()
-            .any(|value| {
-                expr_has_self_referencing_correlated_exists(value, outer_table, schema)
-            }),
+            .any(|value| expr_has_self_referencing_correlated_exists(value, outer_table, schema)),
         Expr::JsonAccess { expr, path, .. } => {
             expr_has_self_referencing_correlated_exists(expr, outer_table, schema)
                 || expr_has_self_referencing_correlated_exists(path, outer_table, schema)
@@ -82487,12 +83868,7 @@ fn protected_unqualified_columns_for_core(
     else {
         return Some(columns);
     };
-    collect_known_source_columns(
-        &from.source,
-        lookup,
-        opaque_cte_names,
-        &mut columns,
-    )?;
+    collect_known_source_columns(&from.source, lookup, opaque_cte_names, &mut columns)?;
     for join in &from.joins {
         collect_known_source_columns(&join.table, lookup, opaque_cte_names, &mut columns)?;
     }
@@ -82580,18 +83956,8 @@ fn resolve_outer_column_value(
     if table.is_none() && lookup.probe_unqualified_external_ref {
         return Some(SqliteValue::Null);
     }
-    let index = find_col_in_map(
-        lookup.col_map,
-        table,
-        &column.column,
-        lookup.using_skip,
-    )
-    .ok()?;
-    let value = lookup
-        .row
-        .get(index)
-        .cloned()
-        .unwrap_or(SqliteValue::Null);
+    let index = find_col_in_map(lookup.col_map, table, &column.column, lookup.using_skip).ok()?;
+    let value = lookup.row.get(index).cloned().unwrap_or(SqliteValue::Null);
     if !value.is_null() || table.is_some() {
         return Some(value);
     }
@@ -82666,13 +84032,11 @@ fn substitute_outer_refs_in_expr_mut(
             });
             let is_local_output = column.table.is_none()
                 && local_output_names.contains(&column.column.to_ascii_lowercase())
-                && protected_unqualified_columns.is_some_and(|columns| {
-                    !columns.contains(&column.column.to_ascii_lowercase())
-                });
+                && protected_unqualified_columns
+                    .is_some_and(|columns| !columns.contains(&column.column.to_ascii_lowercase()));
             let may_resolve_unqualified = column.table.is_some()
-                || protected_unqualified_columns.is_some_and(|columns| {
-                    !columns.contains(&column.column.to_ascii_lowercase())
-                })
+                || protected_unqualified_columns
+                    .is_some_and(|columns| !columns.contains(&column.column.to_ascii_lowercase()))
                 || (protected_unqualified_columns.is_none()
                     && lookup.probe_unqualified_external_ref);
             if !is_protected
@@ -86005,6 +87369,16 @@ impl ImplicitAutoindexSlot {
     }
 
     #[must_use]
+    pub(crate) fn columns(&self) -> &[String] {
+        &self.definition.columns
+    }
+
+    #[must_use]
+    pub(crate) fn key_collations(&self) -> &[Option<String>] {
+        &self.definition.key_collations
+    }
+
+    #[must_use]
     pub(crate) fn into_index_schema(
         self,
         table_name: &str,
@@ -86037,44 +87411,6 @@ fn parse_index_definition_from_create_sql(
     }
 }
 
-fn infer_implicit_index_definition_from_master_entries(
-    master_entries: &[Vec<SqliteValue>],
-    table_name: &str,
-    index_name: &str,
-) -> Option<ReconstructedIndexDefinition> {
-    let ordinal = parse_autoindex_ordinal(index_name, table_name)?;
-    let table_create_sql = master_entries.iter().find_map(|entry| {
-        if entry.len() < 5 {
-            return None;
-        }
-        let entry_type = match &entry[0] {
-            SqliteValue::Text(s) => s,
-            _ => return None,
-        };
-        if !entry_type.eq_ignore_ascii_case("table") {
-            return None;
-        }
-        let entry_table_name = match &entry[1] {
-            SqliteValue::Text(s) => s,
-            _ => return None,
-        };
-        if !entry_table_name.eq_ignore_ascii_case(table_name) {
-            return None;
-        }
-        match &entry[4] {
-            SqliteValue::Text(sql) => Some(sql),
-            _ => None,
-        }
-    })?;
-    let slots = implicit_autoindex_layout_from_create_table_sql(table_create_sql)?;
-    let definition_index = ordinal.checked_sub(1)?;
-    let slot = slots.get(definition_index)?;
-    if slot.is_hidden_without_rowid_primary_key() {
-        return None;
-    }
-    Some(slot.definition.clone())
-}
-
 fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> {
     let index_name_lower = index_name.to_ascii_lowercase();
     let prefix = format!("sqlite_autoindex_{}_", table_name.to_ascii_lowercase());
@@ -86085,25 +87421,6 @@ fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> 
     }
     let ordinal = suffix.parse::<usize>().ok()?;
     (ordinal.to_string() == suffix).then_some(ordinal)
-}
-
-fn implicit_autoindex_layout_from_create_table_sql(
-    create_table_sql: &str,
-) -> Option<Vec<ImplicitAutoindexSlot>> {
-    let statement = parse_single_statement(create_table_sql).ok()?;
-    let Statement::CreateTable(create_stmt) = statement else {
-        return None;
-    };
-    let without_rowid = create_stmt.without_rowid;
-    let CreateTableBody::Columns {
-        columns: column_defs,
-        constraints,
-    } = create_stmt.body
-    else {
-        return Some(Vec::new());
-    };
-
-    implicit_autoindex_layout(&column_defs, &constraints, without_rowid).ok()
 }
 
 fn index_definition_from_create_index_statement(
@@ -86286,6 +87603,21 @@ pub(crate) fn implicit_autoindex_layout(
     constraints: &[fsqlite_ast::TableConstraint],
     without_rowid: bool,
 ) -> Result<Vec<ImplicitAutoindexSlot>> {
+    let primary_key_count = columns
+        .iter()
+        .flat_map(|column| &column.constraints)
+        .filter(|constraint| matches!(constraint.kind, ColumnConstraintKind::PrimaryKey { .. }))
+        .count()
+        + constraints
+            .iter()
+            .filter(|constraint| matches!(constraint.kind, TableConstraintKind::PrimaryKey { .. }))
+            .count();
+    if primary_key_count > 1 {
+        return Err(FrankenError::FunctionError(
+            "table has more than one primary key".to_owned(),
+        ));
+    }
+
     let mut slots = Vec::new();
     let mut deferred_integer_primary_keys = Vec::new();
 
@@ -90910,7 +92242,14 @@ fn normalize_indexed_column_term(
 ) -> Option<NormalizedIndexedColumnTerm> {
     fn extract(expr: &Expr) -> Option<(&str, Option<&str>)> {
         match expr {
-            Expr::Column(col_ref, _) => Some((col_ref.column.as_ref(), None)),
+            Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+                Some((col_ref.column.as_ref(), None))
+            }
+            // SQLite's indexed-term grammar historically accepts a
+            // single-quoted identifier token here (index3.test). It converts
+            // the string token back to an identifier before resolving the
+            // constrained column.
+            Expr::Literal(Literal::String(name), _) => Some((name.as_str(), None)),
             Expr::Collate {
                 expr, collation, ..
             } => {
@@ -94660,9 +95999,9 @@ fn expr_contains_explicit_collate(expr: &Expr) -> bool {
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_explicit_collate(left) || expr_contains_explicit_collate(right)
         }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull { expr, .. } => expr_contains_explicit_collate(expr),
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_contains_explicit_collate(expr)
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -94787,12 +96126,9 @@ fn expr_contains_function_call(expr: &Expr) -> bool {
             else_expr,
             ..
         } => {
-            operand
-                .as_deref()
-                .is_some_and(expr_contains_function_call)
+            operand.as_deref().is_some_and(expr_contains_function_call)
                 || whens.iter().any(|(when, then)| {
-                    expr_contains_function_call(when)
-                        || expr_contains_function_call(then)
+                    expr_contains_function_call(when) || expr_contains_function_call(then)
                 })
                 || else_expr
                     .as_deref()
@@ -94803,10 +96139,9 @@ fn expr_contains_function_call(expr: &Expr) -> bool {
         }
         Expr::RowValue(values, _) => values.iter().any(expr_contains_function_call),
         Expr::Exists { .. } | Expr::Subquery(..) => true,
-        Expr::Literal(_, _)
-        | Expr::Column(_, _)
-        | Expr::Placeholder(_, _)
-        | Expr::Raise { .. } => false,
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => {
+            false
+        }
     }
 }
 
@@ -96180,8 +97515,7 @@ fn validate_fromless_used_window_scopes(
     resolved_order_expressions: &[Expr],
     collation_registry: &CollationRegistry,
 ) -> Result<()> {
-    let validate_expr =
-        |expr: &Expr, visible_windows: &NamedWindowSpecs<'_>| -> Result<()> {
+    let validate_expr = |expr: &Expr, visible_windows: &NamedWindowSpecs<'_>| -> Result<()> {
         if expr_folds_to_integer_zero_via_and(expr) {
             return Ok(());
         }
@@ -96194,10 +97528,10 @@ fn validate_fromless_used_window_scopes(
                 window,
                 filter,
             } = extract_inner_window_function(&remaining).ok_or_else(|| {
-                    FrankenError::Internal(
-                        "window scope validation could not expose a window call".to_owned(),
-                    )
-                })?;
+                FrankenError::Internal(
+                    "window scope validation could not expose a window call".to_owned(),
+                )
+            })?;
             let resolved = resolve_used_window_spec(&window, visible_windows)?;
             if window_spec_has_external_column_ref(&resolved, &[]) {
                 return Err(FrankenError::FunctionError(
@@ -96205,39 +97539,20 @@ fn validate_fromless_used_window_scopes(
                 ));
             }
             if let Some(filter) = &filter {
-                validate_window_key_expr_collations(
-                    connection,
-                    filter,
-                    collation_registry,
-                )?;
+                validate_window_key_expr_collations(connection, filter, collation_registry)?;
             }
             if let FunctionArgs::List(values) = &args {
                 for value in values.iter().rev() {
-                    validate_window_key_expr_collations(
-                        connection,
-                        value,
-                        collation_registry,
-                    )?;
+                    validate_window_key_expr_collations(connection, value, collation_registry)?;
                 }
             }
             for term in call_order_by.iter().rev() {
-                validate_window_key_expr_collations(
-                    connection,
-                    &term.expr,
-                    collation_registry,
-                )?;
+                validate_window_key_expr_collations(connection, &term.expr, collation_registry)?;
             }
-            validate_used_window_key_collations(
-                connection,
-                &resolved,
-                collation_registry,
-            )?;
+            validate_used_window_key_collations(connection, &resolved, collation_registry)?;
             let mut replaced = false;
-            remaining = replace_first_window_with_literal(
-                &remaining,
-                &SqliteValue::Null,
-                &mut replaced,
-            );
+            remaining =
+                replace_first_window_with_literal(&remaining, &SqliteValue::Null, &mut replaced);
             if !replaced {
                 return Err(FrankenError::Internal(
                     "window scope validation replacement made no progress".to_owned(),
@@ -96311,13 +97626,8 @@ fn validate_fromless_used_window_scopes(
     } = &select.body.select
     {
         for expr in group_by.iter().rev() {
-            let resolved =
-                connection.resolve_fromless_group_expr_with_aliases(expr, columns)?;
-            validate_expr_collation_boundary(
-                connection,
-                &resolved,
-                collation_registry,
-            )?;
+            let resolved = connection.resolve_fromless_group_expr_with_aliases(expr, columns)?;
+            validate_expr_collation_boundary(connection, &resolved, collation_registry)?;
         }
     }
     if let SelectCore::Select {
@@ -96327,55 +97637,28 @@ fn validate_fromless_used_window_scopes(
     } = &select.body.select
     {
         if let Some(predicate) = where_clause {
-            validate_expr_collation_consumers(
-                connection,
-                predicate,
-                collation_registry,
-            )?;
+            validate_expr_collation_consumers(connection, predicate, collation_registry)?;
         }
         if let Some(predicate) = having {
-            validate_expr_collation_consumers(
-                connection,
-                predicate,
-                collation_registry,
-            )?;
+            validate_expr_collation_consumers(connection, predicate, collation_registry)?;
         }
     }
     if let Some(limit) = &select.limit {
-        validate_expr_collation_consumers(
-            connection,
-            &limit.limit,
-            collation_registry,
-        )?;
+        validate_expr_collation_consumers(connection, &limit.limit, collation_registry)?;
         if let Some(offset) = &limit.offset {
-            validate_expr_collation_consumers(
-                connection,
-                offset,
-                collation_registry,
-            )?;
+            validate_expr_collation_consumers(connection, offset, collation_registry)?;
         }
     }
     match &select.body.select {
         SelectCore::Values(rows) => {
             for expr in rows.iter().flatten() {
-                validate_expr_collation_consumers(
-                    connection,
-                    expr,
-                    collation_registry,
-                )?;
+                validate_expr_collation_consumers(connection, expr, collation_registry)?;
             }
         }
-        SelectCore::Select {
-            columns,
-            ..
-        } => {
+        SelectCore::Select { columns, .. } => {
             for column in columns {
                 if let ResultColumn::Expr { expr, .. } = column {
-                    validate_expr_collation_consumers(
-                        connection,
-                        expr,
-                        collation_registry,
-                    )?;
+                    validate_expr_collation_consumers(connection, expr, collation_registry)?;
                 }
             }
         }
@@ -96418,10 +97701,7 @@ fn validate_window_key_expr_collations(
     validate_expr_collation_boundary(connection, expr, registry)
 }
 
-fn validate_registered_collation(
-    collation: &str,
-    registry: &CollationRegistry,
-) -> Result<()> {
+fn validate_registered_collation(collation: &str, registry: &CollationRegistry) -> Result<()> {
     if registry.contains(collation) {
         Ok(())
     } else {
@@ -96444,10 +97724,7 @@ fn expr_folds_to_integer_zero_via_and(expr: &Expr) -> bool {
             op: BinaryOp::And,
             right,
             ..
-        } => {
-            expr_folds_to_integer_zero_via_and(left)
-                || expr_folds_to_integer_zero_via_and(right)
-        }
+        } => expr_folds_to_integer_zero_via_and(left) || expr_folds_to_integer_zero_via_and(right),
         _ => false,
     }
 }
@@ -96468,11 +97745,12 @@ fn first_explicit_collation_name(expr: &Expr) -> Option<&str> {
         | Expr::Placeholder(_, _)
         | Expr::Subquery(_, _)
         | Expr::Exists { .. } => None,
-        Expr::BinaryOp { left, right, .. } => first_explicit_collation_name(left)
-            .or_else(|| first_explicit_collation_name(right)),
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull { expr, .. }
-        | Expr::Cast { expr, .. } => first_explicit_collation_name(expr),
+        Expr::BinaryOp { left, right, .. } => {
+            first_explicit_collation_name(left).or_else(|| first_explicit_collation_name(right))
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            first_explicit_collation_name(expr)
+        }
         Expr::Collate { collation, .. } => Some(collation),
         Expr::Between {
             expr, low, high, ..
@@ -96483,9 +97761,7 @@ fn first_explicit_collation_name(expr: &Expr) -> Option<&str> {
             InSet::List(values) if values.is_empty() => None,
             InSet::List(values) => first_explicit_collation_name(expr)
                 .or_else(|| values.iter().find_map(first_explicit_collation_name)),
-            InSet::Subquery(_) | InSet::Table(_) => {
-                first_explicit_collation_name(expr)
-            }
+            InSet::Subquery(_) | InSet::Table(_) => first_explicit_collation_name(expr),
         },
         Expr::Like {
             expr,
@@ -96494,11 +97770,7 @@ fn first_explicit_collation_name(expr: &Expr) -> Option<&str> {
             ..
         } => first_explicit_collation_name(pattern)
             .or_else(|| first_explicit_collation_name(expr))
-            .or_else(|| {
-                escape
-                    .as_deref()
-                    .and_then(first_explicit_collation_name)
-            }),
+            .or_else(|| escape.as_deref().and_then(first_explicit_collation_name)),
         Expr::Case {
             operand,
             whens,
@@ -96513,22 +97785,15 @@ fn first_explicit_collation_name(expr: &Expr) -> Option<&str> {
                         .or_else(|| first_explicit_collation_name(value))
                 })
             })
-            .or_else(|| {
-                else_expr
-                    .as_deref()
-                    .and_then(first_explicit_collation_name)
-            }),
+            .or_else(|| else_expr.as_deref().and_then(first_explicit_collation_name)),
         Expr::FunctionCall { args, .. } => match args {
             FunctionArgs::Star => None,
-            FunctionArgs::List(values) => {
-                values.iter().find_map(first_explicit_collation_name)
-            }
+            FunctionArgs::List(values) => values.iter().find_map(first_explicit_collation_name),
         },
-        Expr::JsonAccess { expr, path, .. } => first_explicit_collation_name(expr)
-            .or_else(|| first_explicit_collation_name(path)),
-        Expr::RowValue(values, _) => {
-            values.first().and_then(first_explicit_collation_name)
+        Expr::JsonAccess { expr, path, .. } => {
+            first_explicit_collation_name(expr).or_else(|| first_explicit_collation_name(path))
         }
+        Expr::RowValue(values, _) => values.first().and_then(first_explicit_collation_name),
     }
 }
 
@@ -96541,10 +97806,7 @@ fn validate_expr_collation_boundary(
     validate_expr_collation_consumers(connection, expr, registry)
 }
 
-fn validate_expr_collation_winner(
-    expr: &Expr,
-    registry: &CollationRegistry,
-) -> Result<()> {
+fn validate_expr_collation_winner(expr: &Expr, registry: &CollationRegistry) -> Result<()> {
     if let Some(collation) = first_explicit_collation_name(expr) {
         validate_registered_collation(collation, registry)?;
     }
@@ -96663,24 +97925,15 @@ fn validate_expr_collation_consumers(
         return Ok(());
     }
     match expr {
-        Expr::Literal(_, _)
-        | Expr::Column(_, _)
-        | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => Ok(()),
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+            Ok(())
+        }
         Expr::BinaryOp {
             left, op, right, ..
         } => {
             if binary_op_consumes_collation(*op) {
-                validate_direct_subquery_collation_consumers(
-                    connection,
-                    left,
-                    registry,
-                )?;
-                validate_direct_subquery_collation_consumers(
-                    connection,
-                    right,
-                    registry,
-                )?;
+                validate_direct_subquery_collation_consumers(connection, left, registry)?;
+                validate_direct_subquery_collation_consumers(connection, right, registry)?;
                 validate_binary_comparison_collation(left, right, registry)?;
             }
             validate_expr_collation_consumers(connection, left, registry)?;
@@ -96696,24 +97949,12 @@ fn validate_expr_collation_consumers(
         Expr::Between {
             expr, low, high, ..
         } => {
-            validate_direct_subquery_collation_consumers(
-                connection,
-                expr,
-                registry,
-            )?;
-            validate_direct_subquery_collation_consumers(
-                connection,
-                low,
-                registry,
-            )?;
+            validate_direct_subquery_collation_consumers(connection, expr, registry)?;
+            validate_direct_subquery_collation_consumers(connection, low, registry)?;
             validate_binary_comparison_collation(expr, low, registry)?;
             validate_expr_collation_consumers(connection, expr, registry)?;
             validate_expr_collation_consumers(connection, low, registry)?;
-            validate_direct_subquery_collation_consumers(
-                connection,
-                high,
-                registry,
-            )?;
+            validate_direct_subquery_collation_consumers(connection, high, registry)?;
             validate_binary_comparison_collation(expr, high, registry)?;
             validate_expr_collation_consumers(connection, high, registry)?;
             Ok(())
@@ -96782,35 +98023,21 @@ fn validate_expr_collation_consumers(
         } => {
             if let Some(operand) = operand {
                 if let Some((first_condition, _)) = whens.first() {
-                    validate_direct_subquery_collation_consumers(
-                        connection,
-                        operand,
-                        registry,
-                    )?;
+                    validate_direct_subquery_collation_consumers(connection, operand, registry)?;
                     validate_direct_subquery_collation_consumers(
                         connection,
                         first_condition,
                         registry,
                     )?;
-                    validate_binary_comparison_collation(
-                        operand,
-                        first_condition,
-                        registry,
-                    )?;
+                    validate_binary_comparison_collation(operand, first_condition, registry)?;
                 }
                 validate_expr_collation_consumers(connection, operand, registry)?;
                 for (index, (condition, value)) in whens.iter().enumerate() {
                     if index != 0 {
                         validate_direct_subquery_collation_consumers(
-                            connection,
-                            condition,
-                            registry,
+                            connection, condition, registry,
                         )?;
-                        validate_binary_comparison_collation(
-                            operand,
-                            condition,
-                            registry,
-                        )?;
+                        validate_binary_comparison_collation(operand, condition, registry)?;
                     }
                     validate_expr_collation_consumers(connection, condition, registry)?;
                     validate_expr_collation_consumers(connection, value, registry)?;
@@ -96849,12 +98076,7 @@ fn validate_expr_collation_consumers(
                         validate_expr_collation_boundary(connection, value, registry)?;
                     }
                 }
-                if function_consumes_argument_collation(
-                    connection,
-                    name,
-                    args,
-                    over.as_ref(),
-                ) {
+                if function_consumes_argument_collation(connection, name, args, over.as_ref()) {
                     validate_function_argument_collation(values, registry)?;
                 }
             }
@@ -96934,10 +98156,7 @@ fn validate_in_list_membership_collations(
     }
 }
 
-fn validate_in_lhs_collations(
-    lhs: &Expr,
-    registry: &CollationRegistry,
-) -> Result<()> {
+fn validate_in_lhs_collations(lhs: &Expr, registry: &CollationRegistry) -> Result<()> {
     if let Expr::RowValue(values, _) = lhs {
         for value in values {
             if let Some(collation) = first_explicit_collation_name(value) {
@@ -97041,13 +98260,12 @@ fn sqlite_ordinal(position: usize) -> String {
 
 fn nested_order_column_error(error: FrankenError) -> FrankenError {
     match error {
-        FrankenError::Internal(detail) => detail
-            .strip_prefix("column not found: ")
-            .map_or(FrankenError::Internal(detail.clone()), |name| {
-                FrankenError::NoSuchColumn {
-                    name: name.to_owned(),
-                }
-            }),
+        FrankenError::Internal(detail) => detail.strip_prefix("column not found: ").map_or(
+            FrankenError::Internal(detail.clone()),
+            |name| FrankenError::NoSuchColumn {
+                name: name.to_owned(),
+            },
+        ),
         other => other,
     }
 }
@@ -97061,9 +98279,7 @@ fn values_column_order_output_index(expr: &Expr, output_width: usize) -> Option<
     }
     let name = column.column.as_ref();
     let suffix = name.get("column".len()..)?;
-    if !name
-        .get(.."column".len())?
-        .eq_ignore_ascii_case("column")
+    if !name.get(.."column".len())?.eq_ignore_ascii_case("column")
         || suffix.is_empty()
         || suffix.starts_with('0')
         || !suffix.bytes().all(|byte| byte.is_ascii_digit())
@@ -97114,20 +98330,14 @@ fn compound_source_qualifier(source: &TableOrSubquery) -> Option<CompoundSourceQ
     match source {
         TableOrSubquery::Table { name, alias, .. } => alias.as_ref().map_or_else(
             || Some(CompoundSourceQualifier::Table(name.clone())),
-            |alias| {
-                Some(CompoundSourceQualifier::Unqualified(
-                    alias.clone(),
-                ))
-            },
+            |alias| Some(CompoundSourceQualifier::Unqualified(alias.clone())),
         ),
         TableOrSubquery::Subquery { alias, .. } => alias
             .as_ref()
             .map(|alias| CompoundSourceQualifier::Unqualified(alias.clone())),
-        TableOrSubquery::TableFunction { name, alias, .. } => {
-            Some(CompoundSourceQualifier::Unqualified(
-                alias.clone().unwrap_or_else(|| name.clone()),
-            ))
-        }
+        TableOrSubquery::TableFunction { name, alias, .. } => Some(
+            CompoundSourceQualifier::Unqualified(alias.clone().unwrap_or_else(|| name.clone())),
+        ),
         TableOrSubquery::ParenJoin(_) => None,
     }
 }
@@ -97201,9 +98411,7 @@ fn collect_compound_from_output_slots(
                 .filter(|right_slot| {
                     visible.iter().any(|left_index| {
                         slots.get(*left_index).is_some_and(|left_slot| {
-                            left_slot
-                                .column
-                                .eq_ignore_ascii_case(&right_slot.column)
+                            left_slot.column.eq_ignore_ascii_case(&right_slot.column)
                         })
                     })
                 })
@@ -97277,12 +98485,7 @@ impl<'a> CompoundSelectOrderProjection<'a> {
                     });
                 }
                 ResultColumn::Star => {
-                    outputs.extend(
-                        star_slots
-                            .iter()
-                            .copied()
-                            .map(CompoundOrderOutput::Source),
-                    );
+                    outputs.extend(star_slots.iter().copied().map(CompoundOrderOutput::Source));
                 }
                 ResultColumn::TableStar(qualifier) => {
                     outputs.extend(
@@ -97343,19 +98546,15 @@ impl<'a> CompoundSelectOrderProjection<'a> {
                     let Expr::Column(result_column, _) = result_expr else {
                         return false;
                     };
-                    result_column
-                        .column
-                        .eq_ignore_ascii_case(&column.column)
+                    result_column.column.eq_ignore_ascii_case(&column.column)
                         && column.table.as_deref().is_none_or(|table| {
-                            result_column.table.as_deref().is_some_and(
-                                |result_table| result_table.eq_ignore_ascii_case(table),
-                            )
+                            result_column.table.as_deref().is_some_and(|result_table| {
+                                result_table.eq_ignore_ascii_case(table)
+                            })
                         })
                 }
-                CompoundOrderOutput::Source(slot_index) => self
-                    .source_slots
-                    .get(*slot_index)
-                    .is_some_and(|slot| {
+                CompoundOrderOutput::Source(slot_index) => {
+                    self.source_slots.get(*slot_index).is_some_and(|slot| {
                         slot.column.eq_ignore_ascii_case(&column.column)
                             && column.table.as_deref().is_none_or(|table| {
                                 self.sources
@@ -97365,7 +98564,8 @@ impl<'a> CompoundSelectOrderProjection<'a> {
                                         qualifier.binding().eq_ignore_ascii_case(table)
                                     })
                             })
-                    }),
+                    })
+                }
             })
         {
             return Some(index);
@@ -97406,9 +98606,7 @@ impl CompoundCoreOrderProjection<'_> {
         match self {
             Self::Values(rows) => {
                 let values = rows.first()?;
-                if let Some(index) =
-                    values_column_order_output_index(expr, values.len())
-                {
+                if let Some(index) = values_column_order_output_index(expr, values.len()) {
                     return Some(index);
                 }
                 if rows.len() != 1 {
@@ -97442,15 +98640,13 @@ fn resolve_compound_order_output_indices(
         .map(|core| match core {
             SelectCore::Values(rows) => CompoundCoreOrderProjection::Values(rows),
             SelectCore::Select { columns, from, .. } => {
-                CompoundCoreOrderProjection::Select(
-                    CompoundSelectOrderProjection::new(
-                        connection,
-                        select,
-                        columns,
-                        from.as_ref(),
-                        outer_ctes,
-                    ),
-                )
+                CompoundCoreOrderProjection::Select(CompoundSelectOrderProjection::new(
+                    connection,
+                    select,
+                    columns,
+                    from.as_ref(),
+                    outer_ctes,
+                ))
             }
         })
         .collect::<Vec<_>>();
@@ -97510,9 +98706,7 @@ fn compound_order_expr_for_resolved_index(expr: &Expr, index: usize) -> Expr {
             span: *span,
         },
         _ => Expr::Literal(
-            Literal::Integer(
-                i64::try_from(index.saturating_add(1)).unwrap_or(i64::MAX),
-            ),
+            Literal::Integer(i64::try_from(index.saturating_add(1)).unwrap_or(i64::MAX)),
             Span::ZERO,
         ),
     }
@@ -97527,12 +98721,7 @@ fn resolved_window_spec_chain<'a>(
     };
     let named_specs = named_windows
         .iter()
-        .map(|definition| {
-            (
-                definition.name.to_ascii_uppercase(),
-                &definition.spec,
-            )
-        })
+        .map(|definition| (definition.name.to_ascii_uppercase(), &definition.spec))
         .collect::<Vec<_>>();
     // Keep semantic base lookup and derived-clause legality identical to the
     // canonical window resolver. The borrowed chain below exists only to
@@ -97563,11 +98752,7 @@ fn resolved_window_spec_chain<'a>(
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, candidate)| {
-                candidate
-                    .name
-                    .eq_ignore_ascii_case(current_base_name)
-            })
+            .find(|(_, candidate)| candidate.name.eq_ignore_ascii_case(current_base_name))
         else {
             // SQLite treats an unresolved, self, or forward base spelling on
             // the first WINDOW definition as an empty base. Later definitions
@@ -97707,12 +98892,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         };
         let named_windows = windows
             .iter()
-            .map(|definition| {
-                (
-                    definition.name.to_ascii_uppercase(),
-                    &definition.spec,
-                )
-            })
+            .map(|definition| (definition.name.to_ascii_uppercase(), &definition.spec))
             .collect::<Vec<_>>();
         validate_named_window_definitions(&named_windows)
     }
@@ -97982,17 +99162,12 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
     }
 
     fn validate_used_window(&mut self, window: &'select WindowSpec) -> Result<()> {
-        let named_windows = self
-            .current_named_windows()
-            .unwrap_or_default();
+        let named_windows = self.current_named_windows().unwrap_or_default();
         match resolved_window_spec_chain(window, named_windows) {
             Ok(_) => {}
             Err(FrankenError::FunctionError(message))
                 if message.starts_with("cannot override ")
-                    && matches!(
-                        window.window_ref.as_ref(),
-                        Some(WindowReference::Direct(_))
-                    ) =>
+                    && matches!(window.window_ref.as_ref(), Some(WindowReference::Direct(_))) =>
             {
                 self.suppress_used_window_chain(window, named_windows);
                 return Ok(());
@@ -98014,11 +99189,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, definition)| {
-                definition
-                    .name
-                    .eq_ignore_ascii_case(window_ref.name())
-            })
+            .find(|(_, definition)| definition.name.eq_ignore_ascii_case(window_ref.name()))
         else {
             return;
         };
@@ -98034,11 +99205,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(_, candidate)| {
-                    candidate
-                        .name
-                        .eq_ignore_ascii_case(current_ref.name())
-                })
+                .find(|(_, candidate)| candidate.name.eq_ignore_ascii_case(current_ref.name()))
             else {
                 break;
             };
@@ -98061,10 +99228,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         self.named_window_scopes.last().copied()
     }
 
-    fn visible_cte(
-        &self,
-        name: &QualifiedName,
-    ) -> Option<(usize, &'select fsqlite_ast::Cte)> {
+    fn visible_cte(&self, name: &QualifiedName) -> Option<(usize, &'select fsqlite_ast::Cte)> {
         if name.schema.is_some() {
             return None;
         }
@@ -98147,10 +99311,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                     self.connection
                         .with_attached_connection(&attached_schema, |attached| {
                             let mut resolver =
-                                SelectRelationResolver::with_active_views(
-                                    attached,
-                                    active_views,
-                                );
+                                SelectRelationResolver::with_active_views(attached, active_views);
                             resolver.validate_local_catalog_relation(
                                 &name.name,
                                 PragmaSchemaScope::Main,
@@ -98237,9 +99398,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         };
         if self.local_table_exists(relation_name, resolved_scope)
             || (resolved_scope == PragmaSchemaScope::Main
-                && self
-                    .connection
-                    .has_live_vtab_instance(relation_name))
+                && self.connection.has_live_vtab_instance(relation_name))
         {
             return Ok(());
         }
@@ -98247,13 +99406,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         let view = self
             .connection
             .view_index_for_scope(relation_name, resolved_scope)
-            .and_then(|index| {
-                self.connection
-                    .views
-                    .borrow()
-                    .get(index)
-                    .cloned()
-            });
+            .and_then(|index| self.connection.views.borrow().get(index).cloned());
         let Some(view) = view else {
             return Err(FrankenError::NoSuchTable {
                 name: relation_error_name(),
@@ -98310,30 +99463,25 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             return Ok(TableFunctionCatalogMatch::Ordinary);
         }
         if self.persistent_owner_label.is_some() {
-            return Ok(self.local_table_function_catalog_match(
-                relation_name,
-                PragmaSchemaScope::Main,
-            ));
+            return Ok(
+                self.local_table_function_catalog_match(relation_name, PragmaSchemaScope::Main)
+            );
         }
-        let local = self.local_table_function_catalog_match(
-            relation_name,
-            PragmaSchemaScope::Unqualified,
-        );
+        let local =
+            self.local_table_function_catalog_match(relation_name, PragmaSchemaScope::Unqualified);
         if local != TableFunctionCatalogMatch::Missing {
             return Ok(local);
         }
         for attached_schema in self.attached_schema_names() {
-            let attached_match = self
-                .connection
-                .with_attached_connection(&attached_schema, |attached| {
-                    Ok(
-                        SelectRelationResolver::new(attached)
+            let attached_match =
+                self.connection
+                    .with_attached_connection(&attached_schema, |attached| {
+                        Ok(SelectRelationResolver::new(attached)
                             .local_table_function_catalog_match(
                                 relation_name,
                                 PragmaSchemaScope::Main,
-                            ),
-                    )
-                })?;
+                            ))
+                    })?;
             if attached_match != TableFunctionCatalogMatch::Missing {
                 return Ok(attached_match);
             }
@@ -98371,9 +99519,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         }
         if self.local_table_exists(relation_name, resolved_scope) {
             return if resolved_scope == PragmaSchemaScope::Main
-                && self
-                    .connection
-                    .has_live_vtab_instance(relation_name)
+                && self.connection.has_live_vtab_instance(relation_name)
             {
                 TableFunctionCatalogMatch::CallableVirtual
             } else {
@@ -98381,9 +99527,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             };
         }
         if resolved_scope == PragmaSchemaScope::Main
-            && self
-                .connection
-                .has_live_vtab_instance(relation_name)
+            && self.connection.has_live_vtab_instance(relation_name)
         {
             TableFunctionCatalogMatch::CallableVirtual
         } else {
@@ -98399,17 +99543,12 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         if is_sqlite_schema_name(relation_name) {
             return true;
         }
-        (scope == PragmaSchemaScope::Unqualified
-            || scope == PragmaSchemaScope::Temp)
+        (scope == PragmaSchemaScope::Unqualified || scope == PragmaSchemaScope::Temp)
             && (relation_name.eq_ignore_ascii_case("sqlite_temp_schema")
                 || relation_name.eq_ignore_ascii_case("sqlite_temp_master"))
     }
 
-    fn local_table_exists(
-        &self,
-        relation_name: &str,
-        scope: PragmaSchemaScope,
-    ) -> bool {
+    fn local_table_exists(&self, relation_name: &str, scope: PragmaSchemaScope) -> bool {
         self.connection.table_exists_for_scope(relation_name, scope)
     }
 }
@@ -98461,9 +99600,8 @@ impl<'a> SelectStructureResolver<'a> {
         let semantic_depth = self.semantic_depth;
         self.semantic_depth = self.semantic_depth.saturating_add(1);
         let scope_depth = self.scopes.len();
-        let outer_ctes = (!select.body.compounds.is_empty()
-            || !select.order_by.is_empty())
-        .then(|| self.visible_ctes());
+        let outer_ctes = (!select.body.compounds.is_empty() || !select.order_by.is_empty())
+            .then(|| self.visible_ctes());
         if let Some(with) = &select.with {
             self.scopes.push(&with.ctes);
         }
@@ -98609,12 +99747,7 @@ impl<'a> SelectStructureResolver<'a> {
             }
             let named_specs = named_windows
                 .iter()
-                .map(|definition| {
-                    (
-                        definition.name.to_ascii_uppercase(),
-                        &definition.spec,
-                    )
-                })
+                .map(|definition| (definition.name.to_ascii_uppercase(), &definition.spec))
                 .collect::<Vec<_>>();
             validate_named_window_definitions(&named_specs)?;
         }
@@ -98634,11 +99767,7 @@ impl<'a> SelectStructureResolver<'a> {
 
         let SelectCore::Select { columns, from, .. } = &select.body.select else {
             for (index, term) in select.order_by.iter().enumerate() {
-                if self.order_term_records_ordinal(
-                    term,
-                    index,
-                    output_width,
-                )? {
+                if self.order_term_records_ordinal(term, index, output_width)? {
                     continue;
                 }
                 self.validate_expr(&term.expr, named_windows)?;
@@ -98655,17 +99784,11 @@ impl<'a> SelectStructureResolver<'a> {
             self.connection
                 .build_join_using_skip_indices_with_outer_ctes(select, outer_ctes)
         });
-        let using_skip = using_skip
-            .as_ref()
-            .filter(|indices| !indices.is_empty());
+        let using_skip = using_skip.as_ref().filter(|indices| !indices.is_empty());
         let output_aliases = collect_select_core_result_aliases(&select.body.select);
 
         for (index, term) in select.order_by.iter().enumerate() {
-            if self.order_term_records_ordinal(
-                term,
-                index,
-                output_width,
-            )? {
+            if self.order_term_records_ordinal(term, index, output_width)? {
                 continue;
             }
             if resolve_order_term_idx(&term.expr, columns).is_some() {
@@ -98753,67 +99876,27 @@ impl<'a> SelectStructureResolver<'a> {
                 path: right,
                 ..
             } => {
-                self.validate_order_expr(
-                    left,
-                    named_windows,
-                    col_map,
-                    using_skip,
-                    output_aliases,
-                )?;
-                self.validate_order_expr(
-                    right,
-                    named_windows,
-                    col_map,
-                    using_skip,
-                    output_aliases,
-                )
+                self.validate_order_expr(left, named_windows, col_map, using_skip, output_aliases)?;
+                self.validate_order_expr(right, named_windows, col_map, using_skip, output_aliases)
             }
             Expr::UnaryOp { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Cast { expr, .. }
-            | Expr::Collate { expr, .. } => self.validate_order_expr(
-                expr,
-                named_windows,
-                col_map,
-                using_skip,
-                output_aliases,
-            ),
+            | Expr::Collate { expr, .. } => {
+                self.validate_order_expr(expr, named_windows, col_map, using_skip, output_aliases)
+            }
             Expr::Between {
                 expr, low, high, ..
             } => {
-                self.validate_order_expr(
-                    expr,
-                    named_windows,
-                    col_map,
-                    using_skip,
-                    output_aliases,
-                )?;
-                self.validate_order_expr(
-                    low,
-                    named_windows,
-                    col_map,
-                    using_skip,
-                    output_aliases,
-                )?;
-                self.validate_order_expr(
-                    high,
-                    named_windows,
-                    col_map,
-                    using_skip,
-                    output_aliases,
-                )
+                self.validate_order_expr(expr, named_windows, col_map, using_skip, output_aliases)?;
+                self.validate_order_expr(low, named_windows, col_map, using_skip, output_aliases)?;
+                self.validate_order_expr(high, named_windows, col_map, using_skip, output_aliases)
             }
             Expr::In { expr, set, .. } => {
                 if matches!(set, InSet::List(values) if values.is_empty()) {
                     return Ok(());
                 }
-                self.validate_order_expr(
-                    expr,
-                    named_windows,
-                    col_map,
-                    using_skip,
-                    output_aliases,
-                )?;
+                self.validate_order_expr(expr, named_windows, col_map, using_skip, output_aliases)?;
                 match set {
                     InSet::List(values) => {
                         for value in values {
@@ -98837,13 +99920,7 @@ impl<'a> SelectStructureResolver<'a> {
                 escape,
                 ..
             } => {
-                self.validate_order_expr(
-                    expr,
-                    named_windows,
-                    col_map,
-                    using_skip,
-                    output_aliases,
-                )?;
+                self.validate_order_expr(expr, named_windows, col_map, using_skip, output_aliases)?;
                 self.validate_order_expr(
                     pattern,
                     named_windows,
@@ -99013,13 +100090,7 @@ impl<'a> SelectStructureResolver<'a> {
         output_aliases: &HashSet<String>,
     ) -> Result<()> {
         for expr in &window.partition_by {
-            self.validate_order_expr(
-                expr,
-                named_windows,
-                col_map,
-                using_skip,
-                output_aliases,
-            )?;
+            self.validate_order_expr(expr, named_windows, col_map, using_skip, output_aliases)?;
         }
         for term in &window.order_by {
             self.validate_order_expr(
@@ -99076,9 +100147,7 @@ impl<'a> SelectStructureResolver<'a> {
     fn validate_source(&mut self, source: &'a TableOrSubquery) -> Result<()> {
         match source {
             TableOrSubquery::Table { name, .. } => self.validate_relation(name),
-            TableOrSubquery::Subquery { query, .. } => {
-                self.validate_select(query)
-            }
+            TableOrSubquery::Subquery { query, .. } => self.validate_select(query),
             TableOrSubquery::TableFunction { .. } => Ok(()),
             TableOrSubquery::ParenJoin(from) => self.validate_from_sources(from),
         }
@@ -99089,15 +100158,9 @@ impl<'a> SelectStructureResolver<'a> {
         from: &'a FromClause,
         named_windows: &'a [fsqlite_ast::WindowDef],
     ) -> Result<()> {
-        self.validate_source_table_function_args(
-            &from.source,
-            named_windows,
-        )?;
+        self.validate_source_table_function_args(&from.source, named_windows)?;
         for join in &from.joins {
-            self.validate_source_table_function_args(
-                &join.table,
-                named_windows,
-            )?;
+            self.validate_source_table_function_args(&join.table, named_windows)?;
         }
         Ok(())
     }
@@ -99117,8 +100180,7 @@ impl<'a> SelectStructureResolver<'a> {
             TableOrSubquery::ParenJoin(from) => {
                 self.validate_table_function_args(from, named_windows)
             }
-            TableOrSubquery::Table { .. }
-            | TableOrSubquery::Subquery { .. } => Ok(()),
+            TableOrSubquery::Table { .. } | TableOrSubquery::Subquery { .. } => Ok(()),
         }
     }
 
@@ -99148,9 +100210,7 @@ impl<'a> SelectStructureResolver<'a> {
             Expr::UnaryOp { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Cast { expr, .. }
-            | Expr::Collate { expr, .. } => {
-                self.validate_expr(expr, named_windows)
-            }
+            | Expr::Collate { expr, .. } => self.validate_expr(expr, named_windows),
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -99272,10 +100332,7 @@ impl<'a> SelectStructureResolver<'a> {
             self.validate_expr(&term.expr, named_windows)?;
         }
         if let Some(frame) = &window.frame {
-            self.validate_frame_bound(
-                &frame.start,
-                named_windows,
-            )?;
+            self.validate_frame_bound(&frame.start, named_windows)?;
             if let Some(end) = &frame.end {
                 self.validate_frame_bound(end, named_windows)?;
             }
@@ -99298,10 +100355,7 @@ impl<'a> SelectStructureResolver<'a> {
         }
     }
 
-    fn visible_cte(
-        &self,
-        name: &QualifiedName,
-    ) -> Option<(usize, &'a fsqlite_ast::Cte)> {
+    fn visible_cte(&self, name: &QualifiedName) -> Option<(usize, &'a fsqlite_ast::Cte)> {
         if name.schema.is_some() {
             return None;
         }
@@ -99363,9 +100417,7 @@ impl<'a> SelectStructureResolver<'a> {
     }
 }
 
-fn select_core_named_windows(
-    core: &SelectCore,
-) -> &[fsqlite_ast::WindowDef] {
+fn select_core_named_windows(core: &SelectCore) -> &[fsqlite_ast::WindowDef] {
     match core {
         SelectCore::Select { windows, .. } => windows,
         SelectCore::Values(_) => &[],
@@ -99380,10 +100432,7 @@ struct CteCollationResolver<'a, 'r> {
 }
 
 impl<'a, 'r> CteCollationResolver<'a, 'r> {
-    fn new(
-        connection: &'a Connection,
-        registry: &'r CollationRegistry,
-    ) -> Self {
+    fn new(connection: &'a Connection, registry: &'r CollationRegistry) -> Self {
         Self {
             connection,
             registry,
@@ -99475,11 +100524,7 @@ impl<'a, 'r> CteCollationResolver<'a, 'r> {
         match source {
             TableOrSubquery::Table { name, .. } => self.validate_relation(name),
             TableOrSubquery::Subquery { query, .. } => {
-                validate_select_result_collation_metadata(
-                    self.connection,
-                    query,
-                    self.registry,
-                )?;
+                validate_select_result_collation_metadata(self.connection, query, self.registry)?;
                 self.validate_select(query)?;
                 validate_select_collation_consumers_body(
                     self.connection,
@@ -99653,19 +100698,14 @@ impl<'a, 'r> CteCollationResolver<'a, 'r> {
 
     fn validate_frame_bound(&mut self, bound: &'a FrameBound) -> Result<()> {
         match bound {
-            FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-                self.validate_expr(expr)
-            }
+            FrameBound::Preceding(expr) | FrameBound::Following(expr) => self.validate_expr(expr),
             FrameBound::UnboundedPreceding
             | FrameBound::CurrentRow
             | FrameBound::UnboundedFollowing => Ok(()),
         }
     }
 
-    fn visible_cte(
-        &self,
-        name: &QualifiedName,
-    ) -> Option<(usize, &'a fsqlite_ast::Cte)> {
+    fn visible_cte(&self, name: &QualifiedName) -> Option<(usize, &'a fsqlite_ast::Cte)> {
         if name.schema.is_some() {
             return None;
         }
@@ -99704,11 +100744,7 @@ impl<'a, 'r> CteCollationResolver<'a, 'r> {
             return Ok(());
         }
         self.visits.insert(key, CteCollationVisit::Active);
-        validate_select_result_collation_metadata(
-            self.connection,
-            &cte.query,
-            self.registry,
-        )?;
+        validate_select_result_collation_metadata(self.connection, &cte.query, self.registry)?;
         self.validate_select(&cte.query)?;
         validate_select_collation_consumers_body(
             self.connection,
@@ -99738,12 +100774,7 @@ fn validate_select_collation_consumers_body(
     use_kind: SubqueryCollationUse,
     registry: &CollationRegistry,
 ) -> Result<()> {
-    validate_select_core_collation_boundaries(
-        connection,
-        &select.body.select,
-        use_kind,
-        registry,
-    )?;
+    validate_select_core_collation_boundaries(connection, &select.body.select, use_kind, registry)?;
     for (_, core) in &select.body.compounds {
         validate_select_core_collation_boundaries(connection, core, use_kind, registry)?;
     }
@@ -99775,12 +100806,8 @@ fn validate_select_collation_consumers_body(
             for term in select.order_by.iter().rev() {
                 let resolved_expr;
                 let expr = if from.is_none() {
-                    resolved_expr = connection.resolve_fromless_aliases(
-                        &term.expr,
-                        columns,
-                        false,
-                        "ORDER BY",
-                    )?;
+                    resolved_expr = connection
+                        .resolve_fromless_aliases(&term.expr, columns, false, "ORDER BY")?;
                     &resolved_expr
                 } else {
                     select_order_collation_expr(&term.expr, columns)
@@ -99799,12 +100826,7 @@ fn validate_select_collation_consumers_body(
         {
             for term in select.order_by.iter().rev() {
                 validate_expr_collation_boundary(connection, &term.expr, registry)?;
-                validate_used_window_collation_boundaries(
-                    connection,
-                    &term.expr,
-                    &[],
-                    registry,
-                )?;
+                validate_used_window_collation_boundaries(connection, &term.expr, &[], registry)?;
             }
         }
         (SelectCore::Select { windows, .. }, SubqueryCollationUse::Exists) => {
@@ -99823,12 +100845,7 @@ fn validate_select_collation_consumers_body(
         }
         (SelectCore::Values(_), SubqueryCollationUse::Exists) => {
             for term in &select.order_by {
-                validate_used_window_collation_boundaries(
-                    connection,
-                    &term.expr,
-                    &[],
-                    registry,
-                )?;
+                validate_used_window_collation_boundaries(connection, &term.expr, &[], registry)?;
             }
         }
         (
@@ -99836,12 +100853,7 @@ fn validate_select_collation_consumers_body(
             SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs,
         ) => {}
     }
-    validate_select_core_collation_consumers(
-        connection,
-        &select.body.select,
-        use_kind,
-        registry,
-    )?;
+    validate_select_core_collation_consumers(connection, &select.body.select, use_kind, registry)?;
     for (_, core) in &select.body.compounds {
         validate_select_core_collation_consumers(connection, core, use_kind, registry)?;
     }
@@ -99961,12 +100973,7 @@ fn validate_exists_projection_collation_machinery(
     named_windows: &NamedWindowSpecs<'_>,
     registry: &CollationRegistry,
 ) -> Result<()> {
-    validate_used_window_collation_boundaries(
-        connection,
-        expr,
-        named_windows,
-        registry,
-    )?;
+    validate_used_window_collation_boundaries(connection, expr, named_windows, registry)?;
     validate_exists_projection_aggregate_collations(connection, expr, registry)
 }
 
@@ -99989,38 +100996,21 @@ fn validate_exists_projection_aggregate_collations(
             ..
         } => {
             let is_aggregate = over.is_none()
-                && (is_current_aggregate_fn(name, args)
-                    || is_builtin_json_aggregate(name))
+                && (is_current_aggregate_fn(name, args) || is_builtin_json_aggregate(name))
                 && !is_scalar_max_min(name, args);
             if is_aggregate {
-                return validate_expr_collation_consumers(
-                    connection,
-                    expr,
-                    registry,
-                );
+                return validate_expr_collation_consumers(connection, expr, registry);
             }
             if let FunctionArgs::List(values) = args {
                 for value in values {
-                    validate_exists_projection_aggregate_collations(
-                        connection,
-                        value,
-                        registry,
-                    )?;
+                    validate_exists_projection_aggregate_collations(connection, value, registry)?;
                 }
             }
             for term in order_by {
-                validate_exists_projection_aggregate_collations(
-                    connection,
-                    &term.expr,
-                    registry,
-                )?;
+                validate_exists_projection_aggregate_collations(connection, &term.expr, registry)?;
             }
             if let Some(filter) = filter {
-                validate_exists_projection_aggregate_collations(
-                    connection,
-                    filter,
-                    registry,
-                )?;
+                validate_exists_projection_aggregate_collations(connection, filter, registry)?;
             }
             Ok(())
         }
@@ -100030,62 +101020,30 @@ fn validate_exists_projection_aggregate_collations(
             path: right,
             ..
         } => {
-            validate_exists_projection_aggregate_collations(
-                connection,
-                left,
-                registry,
-            )?;
-            validate_exists_projection_aggregate_collations(
-                connection,
-                right,
-                registry,
-            )
+            validate_exists_projection_aggregate_collations(connection, left, registry)?;
+            validate_exists_projection_aggregate_collations(connection, right, registry)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. } => {
-            validate_exists_projection_aggregate_collations(
-                connection,
-                expr,
-                registry,
-            )
+            validate_exists_projection_aggregate_collations(connection, expr, registry)
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            validate_exists_projection_aggregate_collations(
-                connection,
-                expr,
-                registry,
-            )?;
-            validate_exists_projection_aggregate_collations(
-                connection,
-                low,
-                registry,
-            )?;
-            validate_exists_projection_aggregate_collations(
-                connection,
-                high,
-                registry,
-            )
+            validate_exists_projection_aggregate_collations(connection, expr, registry)?;
+            validate_exists_projection_aggregate_collations(connection, low, registry)?;
+            validate_exists_projection_aggregate_collations(connection, high, registry)
         }
         Expr::In { expr, set, .. } => {
             if matches!(set, InSet::List(values) if values.is_empty()) {
                 return Ok(());
             }
-            validate_exists_projection_aggregate_collations(
-                connection,
-                expr,
-                registry,
-            )?;
+            validate_exists_projection_aggregate_collations(connection, expr, registry)?;
             if let InSet::List(values) = set {
                 for value in values {
-                    validate_exists_projection_aggregate_collations(
-                        connection,
-                        value,
-                        registry,
-                    )?;
+                    validate_exists_projection_aggregate_collations(connection, value, registry)?;
                 }
             }
             Ok(())
@@ -100096,22 +101054,10 @@ fn validate_exists_projection_aggregate_collations(
             escape,
             ..
         } => {
-            validate_exists_projection_aggregate_collations(
-                connection,
-                pattern,
-                registry,
-            )?;
-            validate_exists_projection_aggregate_collations(
-                connection,
-                expr,
-                registry,
-            )?;
+            validate_exists_projection_aggregate_collations(connection, pattern, registry)?;
+            validate_exists_projection_aggregate_collations(connection, expr, registry)?;
             if let Some(escape) = escape {
-                validate_exists_projection_aggregate_collations(
-                    connection,
-                    escape,
-                    registry,
-                )?;
+                validate_exists_projection_aggregate_collations(connection, escape, registry)?;
             }
             Ok(())
         }
@@ -100122,40 +101068,20 @@ fn validate_exists_projection_aggregate_collations(
             ..
         } => {
             if let Some(operand) = operand {
-                validate_exists_projection_aggregate_collations(
-                    connection,
-                    operand,
-                    registry,
-                )?;
+                validate_exists_projection_aggregate_collations(connection, operand, registry)?;
             }
             for (condition, value) in whens {
-                validate_exists_projection_aggregate_collations(
-                    connection,
-                    condition,
-                    registry,
-                )?;
-                validate_exists_projection_aggregate_collations(
-                    connection,
-                    value,
-                    registry,
-                )?;
+                validate_exists_projection_aggregate_collations(connection, condition, registry)?;
+                validate_exists_projection_aggregate_collations(connection, value, registry)?;
             }
             if let Some(else_expr) = else_expr {
-                validate_exists_projection_aggregate_collations(
-                    connection,
-                    else_expr,
-                    registry,
-                )?;
+                validate_exists_projection_aggregate_collations(connection, else_expr, registry)?;
             }
             Ok(())
         }
         Expr::RowValue(values, _) => {
             for value in values {
-                validate_exists_projection_aggregate_collations(
-                    connection,
-                    value,
-                    registry,
-                )?;
+                validate_exists_projection_aggregate_collations(connection, value, registry)?;
             }
             Ok(())
         }
@@ -100178,12 +101104,7 @@ fn validate_select_core_collation_consumers(
         SelectCore::Values(rows) => {
             if use_kind != SubqueryCollationUse::Exists {
                 for expr in rows.iter().flatten() {
-                    validate_used_window_collation_boundaries(
-                        connection,
-                        expr,
-                        &[],
-                        registry,
-                    )?;
+                    validate_used_window_collation_boundaries(connection, expr, &[], registry)?;
                     validate_expr_collation_consumers(connection, expr, registry)?;
                 }
                 if rows.len() > 1
@@ -100204,9 +101125,7 @@ fn validate_select_core_collation_consumers(
             windows,
             ..
         } => {
-            if use_kind != SubqueryCollationUse::Exists
-                && *distinct != Distinctness::Distinct
-            {
+            if use_kind != SubqueryCollationUse::Exists && *distinct != Distinctness::Distinct {
                 let named_windows = windows
                     .iter()
                     .map(|window| (window.name.to_ascii_uppercase(), &window.spec))
@@ -100335,8 +101254,7 @@ fn validate_compound_set_collations(
         return Ok(());
     };
     for index in (0..width).rev() {
-        let _ =
-            resolve_compound_column_collation_candidate(&candidate_rows, index, registry)?;
+        let _ = resolve_compound_column_collation_candidate(&candidate_rows, index, registry)?;
     }
     Ok(())
 }
@@ -100346,8 +101264,7 @@ fn validate_compound_order_collations(
     select: &SelectStatement,
     registry: &CollationRegistry,
 ) -> Result<()> {
-    let resolved_indices =
-        resolve_compound_order_output_indices(connection, select, &[])?;
+    let resolved_indices = resolve_compound_order_output_indices(connection, select, &[])?;
     let mut cores = Vec::with_capacity(select.body.compounds.len() + 1);
     cores.push(&select.body.select);
     cores.extend(select.body.compounds.iter().map(|(_, core)| core));
@@ -100366,20 +101283,11 @@ fn validate_compound_order_collations(
             .collect::<Vec<_>>(),
         SelectCore::Values(_) => Vec::new(),
     };
-    for (term, index) in select
-        .order_by
-        .iter()
-        .zip(resolved_indices)
-        .rev()
-    {
+    for (term, index) in select.order_by.iter().zip(resolved_indices).rev() {
         if matches!(&term.expr, Expr::Collate { .. }) {
             validate_expr_collation_boundary(connection, &term.expr, registry)?;
         } else {
-            let _ = resolve_compound_column_collation_candidate(
-                &candidate_rows,
-                index,
-                registry,
-            )?;
+            let _ = resolve_compound_column_collation_candidate(&candidate_rows, index, registry)?;
         }
         validate_used_window_collation_boundaries(
             connection,
@@ -100425,10 +101333,7 @@ fn select_core_result_exprs(core: &SelectCore) -> Option<Vec<&Expr>> {
     }
 }
 
-fn select_order_collation_expr<'a>(
-    order_expr: &'a Expr,
-    columns: &'a [ResultColumn],
-) -> &'a Expr {
+fn select_order_collation_expr<'a>(order_expr: &'a Expr, columns: &'a [ResultColumn]) -> &'a Expr {
     if matches!(order_expr, Expr::Collate { .. }) {
         return order_expr;
     }
@@ -100496,11 +101401,7 @@ fn validate_window_frame_collation_consumers(
 ) -> Result<()> {
     let validate_bound = |bound: &FrameBound| match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-            validate_window_frame_expr_collation_consumers(
-                connection,
-                expr,
-                registry,
-            )
+            validate_window_frame_expr_collation_consumers(connection, expr, registry)
         }
         FrameBound::UnboundedPreceding
         | FrameBound::CurrentRow
@@ -100528,10 +101429,9 @@ fn validate_window_frame_expr_collation_consumers(
     }
     match expr {
         Expr::FunctionCall { .. } | Expr::Subquery(_, _) | Expr::Exists { .. } => Ok(()),
-        Expr::Literal(_, _)
-        | Expr::Column(_, _)
-        | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => Ok(()),
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+            Ok(())
+        }
         Expr::BinaryOp {
             left, op, right, ..
         } => {
@@ -100567,29 +101467,13 @@ fn validate_window_frame_expr_collation_consumers(
             }
             if let InSet::List(values) = set {
                 if let [value] = values.as_slice() {
-                    validate_window_frame_binary_comparison_collation(
-                        expr,
-                        value,
-                        registry,
-                    )?;
+                    validate_window_frame_binary_comparison_collation(expr, value, registry)?;
                 } else {
-                    validate_window_frame_in_list_membership_collations(
-                        expr,
-                        values,
-                        registry,
-                    )?;
+                    validate_window_frame_in_list_membership_collations(expr, values, registry)?;
                 }
-                validate_window_frame_expr_collation_consumers(
-                    connection,
-                    expr,
-                    registry,
-                )?;
+                validate_window_frame_expr_collation_consumers(connection, expr, registry)?;
                 for value in values {
-                    validate_window_frame_expr_collation_consumers(
-                        connection,
-                        value,
-                        registry,
-                    )?;
+                    validate_window_frame_expr_collation_consumers(connection, value, registry)?;
                 }
             }
             Ok(())
@@ -100603,11 +101487,7 @@ fn validate_window_frame_expr_collation_consumers(
             validate_window_frame_expr_collation_consumers(connection, pattern, registry)?;
             validate_window_frame_expr_collation_consumers(connection, expr, registry)?;
             if let Some(escape) = escape {
-                validate_window_frame_expr_collation_consumers(
-                    connection,
-                    escape,
-                    registry,
-                )?;
+                validate_window_frame_expr_collation_consumers(connection, escape, registry)?;
             }
             Ok(())
         }
@@ -100618,48 +101498,26 @@ fn validate_window_frame_expr_collation_consumers(
             ..
         } => {
             if let Some(operand) = operand {
-                validate_window_frame_expr_collation_consumers(
-                    connection,
-                    operand,
-                    registry,
-                )?;
+                validate_window_frame_expr_collation_consumers(connection, operand, registry)?;
                 for (condition, value) in whens {
                     validate_window_frame_expr_collation_consumers(
-                        connection,
-                        condition,
-                        registry,
+                        connection, condition, registry,
                     )?;
                     validate_window_frame_binary_comparison_collation(
-                        operand,
-                        condition,
-                        registry,
+                        operand, condition, registry,
                     )?;
-                    validate_window_frame_expr_collation_consumers(
-                        connection,
-                        value,
-                        registry,
-                    )?;
+                    validate_window_frame_expr_collation_consumers(connection, value, registry)?;
                 }
             } else {
                 for (condition, value) in whens {
                     validate_window_frame_expr_collation_consumers(
-                        connection,
-                        condition,
-                        registry,
+                        connection, condition, registry,
                     )?;
-                    validate_window_frame_expr_collation_consumers(
-                        connection,
-                        value,
-                        registry,
-                    )?;
+                    validate_window_frame_expr_collation_consumers(connection, value, registry)?;
                 }
             }
             if let Some(else_expr) = else_expr {
-                validate_window_frame_expr_collation_consumers(
-                    connection,
-                    else_expr,
-                    registry,
-                )?;
+                validate_window_frame_expr_collation_consumers(connection, else_expr, registry)?;
             }
             Ok(())
         }
@@ -100669,11 +101527,7 @@ fn validate_window_frame_expr_collation_consumers(
         }
         Expr::RowValue(values, _) => {
             for value in values {
-                validate_window_frame_expr_collation_consumers(
-                    connection,
-                    value,
-                    registry,
-                )?;
+                validate_window_frame_expr_collation_consumers(connection, value, registry)?;
             }
             Ok(())
         }
@@ -100687,11 +101541,7 @@ fn validate_window_frame_binary_comparison_collation(
 ) -> Result<()> {
     if let (Expr::RowValue(left_values, _), Expr::RowValue(right_values, _)) = (left, right) {
         for (left_value, right_value) in left_values.iter().zip(right_values) {
-            validate_window_frame_binary_comparison_collation(
-                left_value,
-                right_value,
-                registry,
-            )?;
+            validate_window_frame_binary_comparison_collation(left_value, right_value, registry)?;
         }
         return Ok(());
     }
@@ -100712,11 +101562,7 @@ fn validate_window_frame_in_list_membership_collations(
         && let Some(Expr::RowValue(rhs_values, _)) = values.last()
     {
         for (lhs_value, rhs_value) in lhs_values.iter().zip(rhs_values) {
-            validate_window_frame_binary_comparison_collation(
-                lhs_value,
-                rhs_value,
-                registry,
-            )?;
+            validate_window_frame_binary_comparison_collation(lhs_value, rhs_value, registry)?;
         }
         Ok(())
     } else if let Some(collation) = window_frame_explicit_collation_name(lhs) {
@@ -100729,15 +101575,14 @@ fn validate_window_frame_in_list_membership_collations(
 fn window_frame_explicit_collation_name(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::FunctionCall { .. } | Expr::Subquery(_, _) | Expr::Exists { .. } => None,
-        Expr::Literal(_, _)
-        | Expr::Column(_, _)
-        | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => None,
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+            None
+        }
         Expr::BinaryOp { left, right, .. } => window_frame_explicit_collation_name(left)
             .or_else(|| window_frame_explicit_collation_name(right)),
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull { expr, .. }
-        | Expr::Cast { expr, .. } => window_frame_explicit_collation_name(expr),
+        Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            window_frame_explicit_collation_name(expr)
+        }
         Expr::Collate { collation, .. } => Some(collation),
         Expr::Between {
             expr, low, high, ..
@@ -100746,11 +101591,8 @@ fn window_frame_explicit_collation_name(expr: &Expr) -> Option<&str> {
             .or_else(|| window_frame_explicit_collation_name(high)),
         Expr::In { expr, set, .. } => match set {
             InSet::List(values) if values.is_empty() => None,
-            InSet::List(values) => window_frame_explicit_collation_name(expr).or_else(|| {
-                values
-                    .iter()
-                    .find_map(window_frame_explicit_collation_name)
-            }),
+            InSet::List(values) => window_frame_explicit_collation_name(expr)
+                .or_else(|| values.iter().find_map(window_frame_explicit_collation_name)),
             InSet::Subquery(_) | InSet::Table(_) => None,
         },
         Expr::Like {
@@ -100801,8 +101643,8 @@ fn expr_uses_fromless_group_stage_aggregate(
     }
     let mut remaining = expr.clone();
     while expr_has_window_function(&remaining) {
-        let ExtractedWindowFunction { window, .. } =
-            extract_inner_window_function(&remaining).ok_or_else(|| {
+        let ExtractedWindowFunction { window, .. } = extract_inner_window_function(&remaining)
+            .ok_or_else(|| {
                 FrankenError::Internal(
                     "aggregate-stage detection could not expose a window call".to_owned(),
                 )
@@ -100911,9 +101753,7 @@ fn expr_has_fromless_group_stage_aggregate(expr: &Expr) -> bool {
             expr_has_fromless_group_stage_aggregate(expr)
                 || expr_has_fromless_group_stage_aggregate(path)
         }
-        Expr::RowValue(values, _) => values
-            .iter()
-            .any(expr_has_fromless_group_stage_aggregate),
+        Expr::RowValue(values, _) => values.iter().any(expr_has_fromless_group_stage_aggregate),
         Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
@@ -100944,9 +101784,9 @@ fn expr_has_fromless_outside_window_aggregate(expr: &Expr) -> bool {
                             .iter()
                             .any(expr_has_fromless_outside_window_aggregate)
                 )
-                || order_by.iter().any(|term| {
-                    expr_has_fromless_outside_window_aggregate(&term.expr)
-                })
+                || order_by
+                    .iter()
+                    .any(|term| expr_has_fromless_outside_window_aggregate(&term.expr))
                 || filter
                     .as_deref()
                     .is_some_and(expr_has_fromless_outside_window_aggregate)
@@ -100958,9 +101798,7 @@ fn expr_has_fromless_outside_window_aggregate(expr: &Expr) -> bool {
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::Collate { expr, .. } => {
-            expr_has_fromless_outside_window_aggregate(expr)
-        }
+        | Expr::Collate { expr, .. } => expr_has_fromless_outside_window_aggregate(expr),
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -101127,10 +101965,9 @@ fn build_expression_postprocess(select: &SelectStatement) -> ExpressionPostproce
 fn expression_only_order_expr_can_be_skipped_under_zero_limit(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
-        Expr::Column(_, _)
-        | Expr::Raise { .. }
-        | Expr::Subquery(_, _)
-        | Expr::Exists { .. } => false,
+        Expr::Column(_, _) | Expr::Raise { .. } | Expr::Subquery(_, _) | Expr::Exists { .. } => {
+            false
+        }
         Expr::BinaryOp { left, right, .. } => {
             expression_only_order_expr_can_be_skipped_under_zero_limit(left)
                 && expression_only_order_expr_can_be_skipped_under_zero_limit(right)
@@ -101169,9 +102006,9 @@ fn expression_only_order_expr_can_be_skipped_under_zero_limit(expr: &Expr) -> bo
         } => {
             expression_only_order_expr_can_be_skipped_under_zero_limit(expr)
                 && expression_only_order_expr_can_be_skipped_under_zero_limit(pattern)
-                && escape.as_deref().is_none_or(
-                    expression_only_order_expr_can_be_skipped_under_zero_limit,
-                )
+                && escape
+                    .as_deref()
+                    .is_none_or(expression_only_order_expr_can_be_skipped_under_zero_limit)
         }
         Expr::Case {
             operand,
@@ -101179,14 +102016,16 @@ fn expression_only_order_expr_can_be_skipped_under_zero_limit(expr: &Expr) -> bo
             else_expr,
             ..
         } => {
-            operand.as_deref().is_none_or(
-                expression_only_order_expr_can_be_skipped_under_zero_limit,
-            ) && whens.iter().all(|(when_expr, then_expr)| {
-                expression_only_order_expr_can_be_skipped_under_zero_limit(when_expr)
-                    && expression_only_order_expr_can_be_skipped_under_zero_limit(then_expr)
-            }) && else_expr.as_deref().is_none_or(
-                expression_only_order_expr_can_be_skipped_under_zero_limit,
-            )
+            operand
+                .as_deref()
+                .is_none_or(expression_only_order_expr_can_be_skipped_under_zero_limit)
+                && whens.iter().all(|(when_expr, then_expr)| {
+                    expression_only_order_expr_can_be_skipped_under_zero_limit(when_expr)
+                        && expression_only_order_expr_can_be_skipped_under_zero_limit(then_expr)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(expression_only_order_expr_can_be_skipped_under_zero_limit)
         }
         Expr::FunctionCall {
             args,
@@ -101200,22 +102039,28 @@ fn expression_only_order_expr_can_be_skipped_under_zero_limit(expr: &Expr) -> bo
                 FunctionArgs::List(values) => values
                     .iter()
                     .all(expression_only_order_expr_can_be_skipped_under_zero_limit),
-            }) && order_by.iter().all(|term| {
-                expression_only_order_expr_can_be_skipped_under_zero_limit(&term.expr)
-            }) && filter.as_deref().is_none_or(
-                expression_only_order_expr_can_be_skipped_under_zero_limit,
-            ) && over.as_ref().is_none_or(|window| {
-                window.partition_by.iter().all(
-                    expression_only_order_expr_can_be_skipped_under_zero_limit,
-                ) && window.order_by.iter().all(|term| {
-                    expression_only_order_expr_can_be_skipped_under_zero_limit(&term.expr)
-                }) && window.frame.as_ref().is_none_or(|frame| {
-                    expression_only_order_frame_bound_can_be_skipped(&frame.start)
-                        && frame.end.as_ref().is_none_or(
-                            expression_only_order_frame_bound_can_be_skipped,
-                        )
+            }) && order_by
+                .iter()
+                .all(|term| expression_only_order_expr_can_be_skipped_under_zero_limit(&term.expr))
+                && filter
+                    .as_deref()
+                    .is_none_or(expression_only_order_expr_can_be_skipped_under_zero_limit)
+                && over.as_ref().is_none_or(|window| {
+                    window
+                        .partition_by
+                        .iter()
+                        .all(expression_only_order_expr_can_be_skipped_under_zero_limit)
+                        && window.order_by.iter().all(|term| {
+                            expression_only_order_expr_can_be_skipped_under_zero_limit(&term.expr)
+                        })
+                        && window.frame.as_ref().is_none_or(|frame| {
+                            expression_only_order_frame_bound_can_be_skipped(&frame.start)
+                                && frame
+                                    .end
+                                    .as_ref()
+                                    .is_none_or(expression_only_order_frame_bound_can_be_skipped)
+                        })
                 })
-            })
         }
         Expr::JsonAccess { expr, path, .. } => {
             expression_only_order_expr_can_be_skipped_under_zero_limit(expr)
@@ -102633,13 +103478,13 @@ fn is_without_rowid_table_sql(sql: &str) -> bool {
 
 fn should_ignore_expected_master_row_for_integrity(row: &[SqliteValue]) -> Result<bool> {
     let (entry_type, name, table_name, _) = sqlite_master_signature(row)?;
-    Ok(entry_type == "index"
+    Ok(entry_type.eq_ignore_ascii_case("index")
         && is_implicit_autoindex_entry(&name, &table_name, sqlite_master_sql_text(row)?))
 }
 
 fn should_ignore_actual_master_row_for_integrity(row: &[SqliteValue]) -> Result<bool> {
     let (entry_type, name, table_name, _) = sqlite_master_signature(row)?;
-    Ok(entry_type == "index"
+    Ok(entry_type.eq_ignore_ascii_case("index")
         && is_implicit_autoindex_entry(&name, &table_name, sqlite_master_sql_text(row)?))
 }
 
@@ -110270,14 +111115,14 @@ mod tests {
         FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
         FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, ImplicitAutoindexSlot, InProcessPageLockTable,
-        IoPollStrategy, MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope,
-        Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
-        arm_trigger_stack_probe, bind_placeholders_in_select_for_fallback,
-        canonicalize_select_placeholders, implicit_autoindex_layout, init_global_runtime,
-        is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
-        join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
-        memdb_row_matches_like_fast_path, parse_single_statement,
-        qualify_persistent_view_relations, resolve_used_window_spec,
+        IoPollStrategy, LiveVtabRegistryUndo, MAX_TRIGGER_DEPTH, PagerBackend,
+        PagerPublishedSnapshot, PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch,
+        SharedRuntimeState, SimplePager, Snapshot, arm_trigger_stack_probe,
+        bind_placeholders_in_select_for_fallback, canonicalize_select_placeholders,
+        implicit_autoindex_layout, init_global_runtime, is_correlated_subquery,
+        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
+        join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
+        parse_single_statement, qualify_persistent_view_relations, resolve_used_window_spec,
         select_contains_any_placeholder, set_trigger_depth_limit_override,
         statement_contains_rewritable_subquery, substitute_outer_refs_in_select,
         take_trigger_stack_probe, validate_named_window_definitions, visit_select_qualified_names,
@@ -110311,8 +111156,9 @@ mod tests {
     use fsqlite_vfs::traits::{Vfs, VfsFile};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     struct WindowLengthFirstCollation;
 
@@ -110340,18 +111186,25 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default)]
-    struct TxnAwareTestVtab {
+    pub(super) struct TxnAwareTestVtab {
+        table_name: String,
         rows: Vec<(i64, String)>,
         next_rowid: i64,
         txn_state: TransactionalVtabState<TxnAwareVtabSnapshot>,
         hook_log: Vec<String>,
+        lifecycle_events: Option<Arc<std::sync::Mutex<Vec<String>>>>,
         fail_sync: bool,
+        fail_commit: bool,
+        panic_commit: bool,
+        fail_rollback: bool,
+        panic_rollback: bool,
         fail_savepoint_at: Option<i32>,
+        fail_release_at: Option<i32>,
         fail_rollback_to_at: Option<i32>,
     }
 
     #[derive(Debug, Clone, Default)]
-    struct TxnAwareTestCursor {
+    pub(super) struct TxnAwareTestCursor {
         rows: Vec<(i64, String)>,
         pos: usize,
     }
@@ -110364,7 +111217,628 @@ mod tests {
         emitted: bool,
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct ReplacementSchemaAwareVtab;
+
+    #[derive(Debug, Clone, Default)]
+    struct ReplacementSchemaAwareCursor {
+        emitted: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct BestIndexContractTestVtab {
+        table_name: String,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct BestIndexContractTestCursor {
+        table_name: String,
+        pos: usize,
+        filter_args_valid: bool,
+    }
+
+    #[derive(Debug, Default)]
+    struct CursorDropProbe {
+        drops: AtomicUsize,
+        guarded_drops: AtomicUsize,
+        recursive_sql_rejections: AtomicUsize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CursorDropTestVtab {
+        probe: Arc<CursorDropProbe>,
+    }
+
+    #[derive(Debug)]
+    struct CursorDropTestCursor {
+        probe: Arc<CursorDropProbe>,
+        emitted: bool,
+    }
+
     struct SchemaAwareTestFactory;
+
+    struct BestIndexContractTestFactory;
+
+    struct CursorDropTestFactory {
+        probe: Arc<CursorDropProbe>,
+    }
+
+    struct TxnAwareTestFactory {
+        lifecycle_events: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    thread_local! {
+        static REENTRANT_VTAB_CONNECTION: std::cell::RefCell<Option<std::rc::Weak<Connection>>> =
+            const { std::cell::RefCell::new(None) };
+        static REENTRANT_VTAB_CALLBACK_COUNT: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+        static REENTRANT_VTAB_CALLBACK_BORROW_OK: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(true) };
+        static DROP_REENTRANT_VTAB_OBSERVATION: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+        static DESTROY_REENTRANT_VTAB_OBSERVATION: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+        static DROP_REENTRANT_MODULE_OBSERVATION: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    struct ReentrantVtabConnectionGuard;
+
+    impl ReentrantVtabConnectionGuard {
+        fn install(connection: &Rc<Connection>) -> Self {
+            REENTRANT_VTAB_CONNECTION.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                assert!(
+                    slot.is_none(),
+                    "reentrant vtab test connection already installed"
+                );
+                *slot = Some(Rc::downgrade(connection));
+            });
+            REENTRANT_VTAB_CALLBACK_COUNT.with(|count| count.set(0));
+            REENTRANT_VTAB_CALLBACK_BORROW_OK.with(|ok| ok.set(true));
+            DROP_REENTRANT_VTAB_OBSERVATION.with(|observation| observation.set(None));
+            DESTROY_REENTRANT_VTAB_OBSERVATION.with(|observation| observation.set(None));
+            DROP_REENTRANT_MODULE_OBSERVATION.with(|observation| observation.set(None));
+            Self
+        }
+    }
+
+    impl Drop for ReentrantVtabConnectionGuard {
+        fn drop(&mut self) {
+            REENTRANT_VTAB_CONNECTION.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+
+    fn reentrant_vtab_connection() -> Rc<Connection> {
+        REENTRANT_VTAB_CONNECTION.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(std::rc::Weak::upgrade)
+                .expect("reentrant vtab test connection is installed and live")
+        })
+    }
+
+    fn reenter_vtab_module_registry() -> Result<()> {
+        let connection = reentrant_vtab_connection();
+        let borrow_available = {
+            let borrow = connection.vtab_modules.try_borrow_mut();
+            borrow.is_ok()
+        };
+        REENTRANT_VTAB_CALLBACK_BORROW_OK.with(|ok| ok.set(ok.get() && borrow_available));
+        if !borrow_available {
+            return Err(FrankenError::Internal(
+                "vtab module callback observed a borrowed module registry".to_owned(),
+            ));
+        }
+        REENTRANT_VTAB_CALLBACK_COUNT.with(|count| {
+            let callback_index = count.get();
+            connection.register_module(
+                &format!("NESTED_{callback_index}"),
+                Box::new(SchemaAwareTestFactory),
+            );
+            count.set(callback_index + 1);
+        });
+        Ok(())
+    }
+
+    fn reentrant_vtab_registries_are_published_and_unborrowed() -> bool {
+        REENTRANT_VTAB_CONNECTION.with(|slot| {
+            let Some(connection) = slot.borrow().as_ref().and_then(std::rc::Weak::upgrade) else {
+                return false;
+            };
+            let live_registry_ready =
+                connection
+                    .vtab_instances
+                    .try_borrow()
+                    .is_ok_and(|instances| {
+                        !instances.contains_key("STALE") && !instances.contains_key("DROPPED")
+                    });
+            let dropped_registry_ready =
+                connection
+                    .dropped_vtab_instances
+                    .try_borrow()
+                    .is_ok_and(|instances| {
+                        !instances.contains_key("STALE") && !instances.contains_key("DROPPED")
+                    });
+            let undo_registry_ready = connection
+                .live_vtab_registry_undo
+                .try_borrow()
+                .is_ok_and(|undo| undo.is_empty());
+            live_registry_ready && dropped_registry_ready && undo_registry_ready
+        })
+    }
+
+    struct ReentrantConnectFactory;
+
+    struct SelfReplacingTableFunctionFactory;
+
+    struct ReplacementTableFunctionFactory;
+
+    struct DropReentrantModuleFactory {
+        minimum_published_generation: Arc<AtomicU64>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum DropReentrantUdfKind {
+        Scalar,
+        Aggregate,
+        Window,
+    }
+
+    struct DropReentrantUdfProbe {
+        minimum_published_generation: Arc<AtomicU64>,
+        observation: Arc<AtomicUsize>,
+        nested_module_name: &'static str,
+        kind: DropReentrantUdfKind,
+    }
+
+    impl Drop for DropReentrantUdfProbe {
+        fn drop(&mut self) {
+            let observed_safe_publication = REENTRANT_VTAB_CONNECTION.with(|slot| {
+                let Some(connection) = slot.borrow().as_ref().and_then(std::rc::Weak::upgrade)
+                else {
+                    return false;
+                };
+                let registry_borrow_available = connection.func_registry.try_borrow_mut().is_ok();
+                let generation_was_published = connection.function_registry_generation()
+                    >= self
+                        .minimum_published_generation
+                        .load(AtomicOrdering::Acquire);
+                let auxiliary_state_was_published = match self.kind {
+                    DropReentrantUdfKind::Scalar => connection.scalar_function_overridden.get(),
+                    DropReentrantUdfKind::Aggregate => connection
+                        .custom_aggregate_keys
+                        .try_borrow()
+                        .is_ok_and(|keys| {
+                            keys.contains(&("drop_reentrant_aggregate".to_owned(), 1))
+                        }),
+                    DropReentrantUdfKind::Window => {
+                        let registry_entry = connection
+                            .func_registry
+                            .try_borrow()
+                            .ok()
+                            .and_then(|registry| registry.find_window("drop_reentrant_window", 0));
+                        connection.custom_window_functions.try_borrow().is_ok_and(
+                            |custom_windows| {
+                                custom_windows
+                                    .get(&("drop_reentrant_window".to_owned(), 0))
+                                    .zip(registry_entry.as_ref())
+                                    .is_some_and(|(custom, registered)| {
+                                        Arc::ptr_eq(custom, registered)
+                                    })
+                            },
+                        )
+                    }
+                };
+                if registry_borrow_available {
+                    connection
+                        .register_module(self.nested_module_name, Box::new(SchemaAwareTestFactory));
+                }
+                registry_borrow_available
+                    && generation_was_published
+                    && auxiliary_state_was_published
+            });
+            self.observation.store(
+                if observed_safe_publication { 1 } else { 2 },
+                AtomicOrdering::Release,
+            );
+        }
+    }
+
+    struct DropReentrantScalarFunction {
+        _probe: DropReentrantUdfProbe,
+    }
+
+    impl fsqlite_func::ScalarFunction for DropReentrantScalarFunction {
+        fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(1))
+        }
+
+        fn num_args(&self) -> i32 {
+            0
+        }
+
+        fn name(&self) -> &str {
+            "drop_reentrant_scalar"
+        }
+    }
+
+    struct PlainScalarFunction;
+
+    impl fsqlite_func::ScalarFunction for PlainScalarFunction {
+        fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(2))
+        }
+
+        fn num_args(&self) -> i32 {
+            0
+        }
+
+        fn name(&self) -> &str {
+            "drop_reentrant_scalar"
+        }
+    }
+
+    struct DropReentrantAggregateFunction {
+        _probe: DropReentrantUdfProbe,
+    }
+
+    impl fsqlite_func::AggregateFunction for DropReentrantAggregateFunction {
+        type State = i64;
+
+        fn initial_state(&self) -> Self::State {
+            0
+        }
+
+        fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state += 1;
+            Ok(())
+        }
+
+        fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(state))
+        }
+
+        fn num_args(&self) -> i32 {
+            1
+        }
+
+        fn name(&self) -> &str {
+            "drop_reentrant_aggregate"
+        }
+    }
+
+    struct PlainAggregateFunction;
+
+    impl fsqlite_func::AggregateFunction for PlainAggregateFunction {
+        type State = i64;
+
+        fn initial_state(&self) -> Self::State {
+            0
+        }
+
+        fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state += 2;
+            Ok(())
+        }
+
+        fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(state))
+        }
+
+        fn num_args(&self) -> i32 {
+            1
+        }
+
+        fn name(&self) -> &str {
+            "drop_reentrant_aggregate"
+        }
+    }
+
+    struct DropReentrantWindowFunction {
+        _probe: DropReentrantUdfProbe,
+    }
+
+    impl fsqlite_func::WindowFunction for DropReentrantWindowFunction {
+        type State = i64;
+
+        fn initial_state(&self) -> Self::State {
+            0
+        }
+
+        fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state += 1;
+            Ok(())
+        }
+
+        fn inverse(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state -= 1;
+            Ok(())
+        }
+
+        fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(*state))
+        }
+
+        fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(state))
+        }
+
+        fn num_args(&self) -> i32 {
+            0
+        }
+
+        fn name(&self) -> &str {
+            "drop_reentrant_window"
+        }
+    }
+
+    struct PlainWindowFunction;
+
+    impl fsqlite_func::WindowFunction for PlainWindowFunction {
+        type State = i64;
+
+        fn initial_state(&self) -> Self::State {
+            0
+        }
+
+        fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state += 2;
+            Ok(())
+        }
+
+        fn inverse(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state -= 2;
+            Ok(())
+        }
+
+        fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(*state))
+        }
+
+        fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(state))
+        }
+
+        fn num_args(&self) -> i32 {
+            0
+        }
+
+        fn name(&self) -> &str {
+            "drop_reentrant_window"
+        }
+    }
+
+    struct MetadataNestedScalarFunction {
+        function_name: &'static str,
+    }
+
+    impl fsqlite_func::ScalarFunction for MetadataNestedScalarFunction {
+        fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(17))
+        }
+
+        fn num_args(&self) -> i32 {
+            0
+        }
+
+        fn name(&self) -> &str {
+            self.function_name
+        }
+    }
+
+    struct MetadataReentrantWindowFunction {
+        name_calls: Arc<AtomicUsize>,
+        arity_calls: Arc<AtomicUsize>,
+    }
+
+    struct MetadataReentrantScalarFunction {
+        name_calls: Arc<AtomicUsize>,
+        arity_calls: Arc<AtomicUsize>,
+        deterministic_calls: Arc<AtomicUsize>,
+    }
+
+    impl fsqlite_func::ScalarFunction for MetadataReentrantScalarFunction {
+        fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(23))
+        }
+
+        fn is_deterministic(&self) -> bool {
+            self.deterministic_calls
+                .fetch_add(1, AtomicOrdering::SeqCst);
+            reentrant_vtab_connection().register_scalar_function(MetadataNestedScalarFunction {
+                function_name: "metadata_scalar_nested_deterministic",
+            });
+            true
+        }
+
+        fn num_args(&self) -> i32 {
+            self.arity_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            reentrant_vtab_connection().register_scalar_function(MetadataNestedScalarFunction {
+                function_name: "metadata_scalar_nested_arity",
+            });
+            0
+        }
+
+        fn name(&self) -> &str {
+            self.name_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            reentrant_vtab_connection().register_scalar_function(MetadataNestedScalarFunction {
+                function_name: "metadata_scalar_nested_name",
+            });
+            "metadata_reentrant_scalar"
+        }
+    }
+
+    struct MetadataReentrantAggregateFunction {
+        name_calls: Arc<AtomicUsize>,
+        arity_calls: Arc<AtomicUsize>,
+    }
+
+    impl fsqlite_func::AggregateFunction for MetadataReentrantAggregateFunction {
+        type State = i64;
+
+        fn initial_state(&self) -> Self::State {
+            0
+        }
+
+        fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state += 1;
+            Ok(())
+        }
+
+        fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(state))
+        }
+
+        fn num_args(&self) -> i32 {
+            self.arity_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            reentrant_vtab_connection().register_scalar_function(MetadataNestedScalarFunction {
+                function_name: "metadata_aggregate_nested_arity",
+            });
+            1
+        }
+
+        fn name(&self) -> &str {
+            self.name_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            reentrant_vtab_connection().register_scalar_function(MetadataNestedScalarFunction {
+                function_name: "metadata_aggregate_nested_name",
+            });
+            "metadata_reentrant_aggregate"
+        }
+    }
+
+    impl fsqlite_func::WindowFunction for MetadataReentrantWindowFunction {
+        type State = i64;
+
+        fn initial_state(&self) -> Self::State {
+            0
+        }
+
+        fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state += 1;
+            Ok(())
+        }
+
+        fn inverse(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+            *state -= 1;
+            Ok(())
+        }
+
+        fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(*state))
+        }
+
+        fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(state))
+        }
+
+        fn num_args(&self) -> i32 {
+            let callback_index = self.arity_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let nested_name = if callback_index == 0 {
+                "metadata_nested_0"
+            } else {
+                "metadata_nested_1"
+            };
+            reentrant_vtab_connection().register_scalar_function(MetadataNestedScalarFunction {
+                function_name: nested_name,
+            });
+            0
+        }
+
+        fn name(&self) -> &str {
+            self.name_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            "metadata_reentrant_window"
+        }
+    }
+
+    impl VtabModuleFactory for DropReentrantModuleFactory {
+        fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(SchemaAwareTestVtab::create(cx, args)?))
+        }
+
+        fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(SchemaAwareTestVtab::connect(cx, args)?))
+        }
+
+        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+            vec![("label".to_owned(), 'T'), ("score".to_owned(), 'I')]
+        }
+    }
+
+    impl Drop for DropReentrantModuleFactory {
+        fn drop(&mut self) {
+            let observation = REENTRANT_VTAB_CONNECTION.with(|slot| {
+                let Some(connection) = slot.borrow().as_ref().and_then(std::rc::Weak::upgrade)
+                else {
+                    return false;
+                };
+                if connection.vtab_modules.try_borrow_mut().is_err() {
+                    return false;
+                }
+                let generation_was_published = connection.function_registry_generation()
+                    >= self
+                        .minimum_published_generation
+                        .load(AtomicOrdering::Acquire);
+                connection.register_module("FROM_FACTORY_DROP", Box::new(SchemaAwareTestFactory));
+                generation_was_published
+            });
+            DROP_REENTRANT_MODULE_OBSERVATION.with(|recorded| recorded.set(Some(observation)));
+        }
+    }
+
+    impl VtabModuleFactory for ReentrantConnectFactory {
+        fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            reenter_vtab_module_registry()?;
+            Ok(Box::new(SchemaAwareTestVtab::create(cx, args)?))
+        }
+
+        fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            reenter_vtab_module_registry()?;
+            Ok(Box::new(SchemaAwareTestVtab::connect(cx, args)?))
+        }
+
+        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+            if reenter_vtab_module_registry().is_err() {
+                return Vec::new();
+            }
+            vec![("label".to_owned(), 'T'), ("score".to_owned(), 'I')]
+        }
+    }
+
+    impl VtabModuleFactory for SelfReplacingTableFunctionFactory {
+        fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(SchemaAwareTestVtab::create(cx, args)?))
+        }
+
+        fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(SchemaAwareTestVtab::connect(cx, args)?))
+        }
+
+        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+            reentrant_vtab_connection()
+                .register_module("SELF_REPLACE", Box::new(ReplacementTableFunctionFactory));
+            vec![("label".to_owned(), 'T'), ("score".to_owned(), 'I')]
+        }
+    }
+
+    impl VtabModuleFactory for ReplacementTableFunctionFactory {
+        fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(ReplacementSchemaAwareVtab::create(cx, args)?))
+        }
+
+        fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(ReplacementSchemaAwareVtab::connect(cx, args)?))
+        }
+
+        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+            vec![("replacement".to_owned(), 'T')]
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct DropReentrantSchemaAwareVtab;
 
     impl TxnAwareTestVtab {
         fn snapshot_state(&self) -> TxnAwareVtabSnapshot {
@@ -110380,7 +111854,31 @@ mod tests {
         }
 
         fn record_hook(&mut self, hook: impl Into<String>) {
-            self.hook_log.push(hook.into());
+            let hook = hook.into();
+            self.hook_log.push(hook.clone());
+            if let Some(events) = self.lifecycle_events.as_ref() {
+                lock_unpoisoned(events).push(format!("{}:{hook}", self.table_name));
+            }
+        }
+    }
+
+    impl VtabModuleFactory for TxnAwareTestFactory {
+        fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            let mut instance = TxnAwareTestVtab::connect(cx, args)?;
+            instance.lifecycle_events = Some(Arc::clone(&self.lifecycle_events));
+            instance.record_hook("create");
+            Ok(Box::new(instance))
+        }
+
+        fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            let mut instance = TxnAwareTestVtab::connect(cx, args)?;
+            instance.lifecycle_events = Some(Arc::clone(&self.lifecycle_events));
+            instance.record_hook("connect");
+            Ok(Box::new(instance))
+        }
+
+        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+            vec![("value".to_owned(), 'T')]
         }
     }
 
@@ -110401,17 +111899,39 @@ mod tests {
         f(vtab)
     }
 
+    fn register_txn_test_factory(
+        conn: &Connection,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let lifecycle_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        conn.register_module(
+            "txn_test",
+            Box::new(TxnAwareTestFactory {
+                lifecycle_events: Arc::clone(&lifecycle_events),
+            }),
+        );
+        lifecycle_events
+    }
+
     impl VirtualTable for TxnAwareTestVtab {
         type Cursor = TxnAwareTestCursor;
 
-        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+        fn connect(_cx: &Cx, args: &[&str]) -> Result<Self> {
             Ok(Self {
+                table_name: args
+                    .get(2)
+                    .map_or_else(String::new, |name| name.to_ascii_uppercase()),
                 rows: Vec::new(),
                 next_rowid: 1,
                 txn_state: TransactionalVtabState::default(),
                 hook_log: Vec::new(),
+                lifecycle_events: None,
                 fail_sync: false,
+                fail_commit: false,
+                panic_commit: false,
+                fail_rollback: false,
+                panic_rollback: false,
                 fail_savepoint_at: None,
+                fail_release_at: None,
                 fail_rollback_to_at: None,
             })
         }
@@ -110478,12 +111998,27 @@ mod tests {
 
         fn commit(&mut self, _cx: &Cx) -> Result<()> {
             self.record_hook("commit");
+            assert!(!self.panic_commit, "txn-aware test vtab forced commit panic");
+            if self.fail_commit {
+                return Err(FrankenError::Internal(
+                    "txn-aware test vtab forced commit failure".to_owned(),
+                ));
+            }
             self.txn_state.commit();
             Ok(())
         }
 
         fn rollback(&mut self, _cx: &Cx) -> Result<()> {
             self.record_hook("rollback");
+            assert!(
+                !self.panic_rollback,
+                "txn-aware test vtab forced rollback panic"
+            );
+            if self.fail_rollback {
+                return Err(FrankenError::Internal(
+                    "txn-aware test vtab forced rollback failure".to_owned(),
+                ));
+            }
             if let Some(snapshot) = self.txn_state.rollback() {
                 self.restore_state(snapshot);
             }
@@ -110503,6 +112038,11 @@ mod tests {
 
         fn release(&mut self, _cx: &Cx, n: i32) -> Result<()> {
             self.record_hook(format!("release:{n}"));
+            if self.fail_release_at == Some(n) {
+                return Err(FrankenError::Internal(format!(
+                    "txn-aware test vtab forced release failure at level {n}",
+                )));
+            }
             self.txn_state.release(n);
             Ok(())
         }
@@ -110522,6 +112062,11 @@ mod tests {
 
         fn destroy(&mut self, _cx: &Cx) -> Result<()> {
             self.record_hook("destroy");
+            Ok(())
+        }
+
+        fn disconnect(&mut self, _cx: &Cx) -> Result<()> {
+            self.record_hook("disconnect");
             Ok(())
         }
     }
@@ -110620,6 +112165,327 @@ mod tests {
 
         fn rowid(&self) -> Result<i64> {
             Ok(if self.eof() { 0 } else { 1 })
+        }
+    }
+
+    impl VirtualTable for ReplacementSchemaAwareVtab {
+        type Cursor = ReplacementSchemaAwareCursor;
+
+        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+            Ok(Self)
+        }
+
+        fn best_index(&self, info: &mut VtabIndexInfo) -> Result<()> {
+            info.estimated_cost = 1.0;
+            info.estimated_rows = 1;
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Self::Cursor> {
+            Ok(ReplacementSchemaAwareCursor::default())
+        }
+    }
+
+    impl VirtualTableCursor for ReplacementSchemaAwareCursor {
+        fn filter(
+            &mut self,
+            _cx: &Cx,
+            _idx_num: i32,
+            _idx_str: Option<&str>,
+            _args: &[SqliteValue],
+        ) -> Result<()> {
+            self.emitted = false;
+            Ok(())
+        }
+
+        fn next(&mut self, _cx: &Cx) -> Result<()> {
+            self.emitted = true;
+            Ok(())
+        }
+
+        fn eof(&self) -> bool {
+            self.emitted
+        }
+
+        fn column(&self, ctx: &mut VtabColumnContext, col: i32) -> Result<()> {
+            if self.eof() {
+                ctx.set_value(SqliteValue::Null);
+            } else if col == 0 {
+                ctx.set_value(SqliteValue::Text("replacement".into()));
+            } else {
+                ctx.set_value(SqliteValue::Null);
+            }
+            Ok(())
+        }
+
+        fn rowid(&self) -> Result<i64> {
+            Ok(if self.eof() { 0 } else { 2 })
+        }
+    }
+
+    impl VirtualTable for BestIndexContractTestVtab {
+        type Cursor = BestIndexContractTestCursor;
+
+        fn connect(_cx: &Cx, args: &[&str]) -> Result<Self> {
+            Ok(Self {
+                table_name: args
+                    .get(2)
+                    .map_or_else(String::new, |name| name.to_ascii_uppercase()),
+            })
+        }
+
+        fn best_index(&self, info: &mut VtabIndexInfo) -> Result<()> {
+            match self.table_name.as_str() {
+                "VT_EXTEND" => info.constraint_usage.push(Default::default()),
+                "VT_TRUNCATE" => {
+                    info.constraint_usage.pop();
+                }
+                "VT_NEGATIVE" => {
+                    if let Some(usage) = info.constraint_usage.first_mut() {
+                        usage.argv_index = -1;
+                        usage.omit = true;
+                    }
+                }
+                "VT_ZERO_OMIT" => {
+                    if let Some(usage) = info.constraint_usage.first_mut() {
+                        usage.omit = true;
+                    }
+                }
+                "VT_GAP" => {
+                    if info.constraint_usage.len() >= 3 {
+                        info.constraint_usage[0].argv_index = 1;
+                        info.constraint_usage[1].argv_index = 3;
+                    }
+                }
+                "VT_DUPLICATE" => {
+                    for usage in &mut info.constraint_usage {
+                        usage.argv_index = 1;
+                    }
+                }
+                "VT_RESIDUAL" => {
+                    if let Some(usage) = info.constraint_usage.first_mut() {
+                        usage.argv_index = 1;
+                        usage.omit = false;
+                    }
+                }
+                "VT_OUT_OF_RANGE" => {
+                    if let Some(usage) = info.constraint_usage.first_mut() {
+                        usage.argv_index = i32::MAX;
+                    }
+                }
+                "VT_REORDER_INPUT" => info.constraints.reverse(),
+                "VT_PERMUTE" => {
+                    if info.constraint_usage.len() >= 2 {
+                        info.constraint_usage[0].argv_index = 2;
+                        info.constraint_usage[0].omit = true;
+                        info.constraint_usage[1].argv_index = 1;
+                        info.constraint_usage[1].omit = true;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Self::Cursor> {
+            Ok(BestIndexContractTestCursor {
+                table_name: self.table_name.clone(),
+                pos: 0,
+                filter_args_valid: true,
+            })
+        }
+    }
+
+    impl VirtualTableCursor for BestIndexContractTestCursor {
+        fn filter(
+            &mut self,
+            _cx: &Cx,
+            _idx_num: i32,
+            _idx_str: Option<&str>,
+            args: &[SqliteValue],
+        ) -> Result<()> {
+            self.pos = 0;
+            self.filter_args_valid = match self.table_name.as_str() {
+                "VT_PERMUTE" => matches!(
+                    args,
+                    [SqliteValue::Integer(7), SqliteValue::Text(value)]
+                        if value.as_ref() == "match"
+                ),
+                "VT_RESIDUAL" => matches!(
+                    args,
+                    [SqliteValue::Text(value)] if value.as_ref() == "match"
+                ),
+                "VT_ZERO_OMIT" | "VT_NEGATIVE" => args.is_empty(),
+                _ => true,
+            };
+            Ok(())
+        }
+
+        fn next(&mut self, _cx: &Cx) -> Result<()> {
+            self.pos = self.pos.saturating_add(1);
+            Ok(())
+        }
+
+        fn eof(&self) -> bool {
+            !self.filter_args_valid
+                || self.pos >= if self.table_name == "VT_PERMUTE" { 1 } else { 2 }
+        }
+
+        fn column(&self, ctx: &mut VtabColumnContext, col: i32) -> Result<()> {
+            if col == 0 && !self.eof() {
+                let value = if self.pos == 0 { "match" } else { "other" };
+                ctx.set_value(SqliteValue::Text(value.into()));
+            } else {
+                ctx.set_value(SqliteValue::Null);
+            }
+            Ok(())
+        }
+
+        fn rowid(&self) -> Result<i64> {
+            if self.table_name == "VT_PERMUTE" {
+                return Ok(7);
+            }
+            i64::try_from(self.pos.saturating_add(1)).map_err(|_| {
+                FrankenError::Internal("best-index test cursor rowid overflow".to_owned())
+            })
+        }
+    }
+
+    impl VtabModuleFactory for BestIndexContractTestFactory {
+        fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(BestIndexContractTestVtab::create(cx, args)?))
+        }
+
+        fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(BestIndexContractTestVtab::connect(cx, args)?))
+        }
+
+        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+            vec![("value".to_owned(), 'T')]
+        }
+    }
+
+    impl VirtualTable for CursorDropTestVtab {
+        type Cursor = CursorDropTestCursor;
+
+        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+            Err(FrankenError::Internal(
+                "cursor-drop probe requires its stateful factory".to_owned(),
+            ))
+        }
+
+        fn best_index(&self, _info: &mut VtabIndexInfo) -> Result<()> {
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Self::Cursor> {
+            Ok(CursorDropTestCursor {
+                probe: Arc::clone(&self.probe),
+                emitted: false,
+            })
+        }
+    }
+
+    impl VirtualTableCursor for CursorDropTestCursor {
+        fn filter(
+            &mut self,
+            _cx: &Cx,
+            _idx_num: i32,
+            _idx_str: Option<&str>,
+            _args: &[SqliteValue],
+        ) -> Result<()> {
+            self.emitted = false;
+            Ok(())
+        }
+
+        fn next(&mut self, _cx: &Cx) -> Result<()> {
+            self.emitted = true;
+            Ok(())
+        }
+
+        fn eof(&self) -> bool {
+            self.emitted
+        }
+
+        fn column(&self, ctx: &mut VtabColumnContext, col: i32) -> Result<()> {
+            if col == 0 && !self.emitted {
+                ctx.set_value(SqliteValue::Text("probe".into()));
+            } else {
+                ctx.set_value(SqliteValue::Null);
+            }
+            Ok(())
+        }
+
+        fn rowid(&self) -> Result<i64> {
+            Ok(1)
+        }
+    }
+
+    impl Drop for CursorDropTestCursor {
+        fn drop(&mut self) {
+            self.probe.drops.fetch_add(1, AtomicOrdering::SeqCst);
+            let connection = reentrant_vtab_connection();
+            if connection.live_vtab_callback_depth.get() != 0 {
+                self.probe
+                    .guarded_drops
+                    .fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            if connection.background_status().is_err() {
+                self.probe
+                    .recursive_sql_rejections
+                    .fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+    }
+
+    impl VtabModuleFactory for CursorDropTestFactory {
+        fn create(&self, _cx: &Cx, _args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(CursorDropTestVtab {
+                probe: Arc::clone(&self.probe),
+            }))
+        }
+
+        fn connect(&self, _cx: &Cx, _args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(CursorDropTestVtab {
+                probe: Arc::clone(&self.probe),
+            }))
+        }
+
+        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+            vec![("value".to_owned(), 'T')]
+        }
+    }
+
+    impl VirtualTable for DropReentrantSchemaAwareVtab {
+        type Cursor = SchemaAwareTestCursor;
+
+        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+            Ok(Self)
+        }
+
+        fn best_index(&self, info: &mut VtabIndexInfo) -> Result<()> {
+            info.estimated_cost = 1.0;
+            info.estimated_rows = 1;
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Self::Cursor> {
+            Ok(SchemaAwareTestCursor::default())
+        }
+
+        fn destroy(&mut self, _cx: &Cx) -> Result<()> {
+            let observation = reentrant_vtab_registries_are_published_and_unborrowed();
+            DESTROY_REENTRANT_VTAB_OBSERVATION.with(|recorded| recorded.set(Some(observation)));
+            Ok(())
+        }
+    }
+
+    impl Drop for DropReentrantSchemaAwareVtab {
+        fn drop(&mut self) {
+            let observation = reentrant_vtab_registries_are_published_and_unborrowed();
+            DROP_REENTRANT_VTAB_OBSERVATION.with(|recorded| {
+                recorded.set(Some(recorded.get().unwrap_or(true) && observation));
+            });
         }
     }
 
@@ -110859,6 +112725,29 @@ mod tests {
             "the final column COLLATE clause determines the autoindex collation"
         );
         assert_eq!(
+            signature(
+                "CREATE TABLE t(a TEXT, b TEXT, \
+                 PRIMARY KEY('a'), UNIQUE('b' COLLATE nocase DESC))",
+            ),
+            vec![
+                (
+                    true,
+                    false,
+                    vec!["a".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+                (
+                    false,
+                    false,
+                    vec!["b".to_owned()],
+                    vec![SortDirection::Desc],
+                    vec![Some("nocase".to_owned())],
+                ),
+            ],
+            "legacy single-quoted indexed terms bind column identifiers"
+        );
+        assert_eq!(
             signature("CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE)"),
             vec![(
                 false,
@@ -110927,11 +112816,28 @@ mod tests {
             FrankenError::FunctionError(message)
                 if message == "expressions prohibited in PRIMARY KEY and UNIQUE constraints"
         ));
+        let qualified = layout("CREATE TABLE t(a, UNIQUE(t.a))").unwrap_err();
+        assert!(matches!(
+            qualified,
+            FrankenError::FunctionError(message)
+                if message == "expressions prohibited in PRIMARY KEY and UNIQUE constraints"
+        ));
         let missing = layout("CREATE TABLE t(a, PRIMARY KEY(missing))").unwrap_err();
         assert!(matches!(
             missing,
             FrankenError::FunctionError(message) if message == "no such column: missing"
         ));
+        for duplicate_primary_key in [
+            "CREATE TABLE t(a TEXT PRIMARY KEY PRIMARY KEY)",
+            "CREATE TABLE t(a INTEGER PRIMARY KEY PRIMARY KEY)",
+        ] {
+            let error = layout(duplicate_primary_key).unwrap_err();
+            assert!(matches!(
+                error,
+                FrankenError::FunctionError(message)
+                    if message == "table has more than one primary key"
+            ));
+        }
     }
 
     #[test]
@@ -114475,10 +116381,7 @@ mod tests {
                             partition_by: Vec::new(),
                             order_by: if index == 0 {
                                 vec![OrderingTerm {
-                                    expr: Expr::Literal(
-                                        Literal::Integer(1),
-                                        Span::new(0, 0),
-                                    ),
+                                    expr: Expr::Literal(Literal::Integer(1), Span::new(0, 0)),
                                     direction: None,
                                     nulls: None,
                                 }]
@@ -114497,9 +116400,7 @@ mod tests {
                         .expect("a deep prior-only window chain must validate iteratively");
                     let last_index = depth - 1;
                     let used = WindowSpec {
-                        window_ref: Some(WindowReference::Direct(format!(
-                            "w{last_index}"
-                        ))),
+                        window_ref: Some(WindowReference::Direct(format!("w{last_index}"))),
                         partition_by: Vec::new(),
                         order_by: Vec::new(),
                         frame: None,
@@ -114513,11 +116414,7 @@ mod tests {
             .join()
             .expect("deep named-window resolution must not overflow its requested 1 MiB stack");
 
-        async fn assert_direct_and_prepared_error(
-            conn: &Connection,
-            sql: &str,
-            expected: &str,
-        ) {
+        async fn assert_direct_and_prepared_error(conn: &Connection, sql: &str, expected: &str) {
             let direct_error = conn
                 .query(sql)
                 .await
@@ -114579,13 +116476,10 @@ mod tests {
                 order_by: vec![ordering_term(2)],
                 frame: None,
             };
-            let programmatic_windows =
-                vec![("W".to_owned(), &programmatic_base)];
-            let programmatic_error = resolve_used_window_spec(
-                &programmatic_direct_with_clause,
-                &programmatic_windows,
-            )
-            .expect_err("a public Direct+clauses AST must not discard its clauses");
+            let programmatic_windows = vec![("W".to_owned(), &programmatic_base)];
+            let programmatic_error =
+                resolve_used_window_spec(&programmatic_direct_with_clause, &programmatic_windows)
+                    .expect_err("a public Direct+clauses AST must not discard its clauses");
             assert!(
                 matches!(
                     &programmatic_error,
@@ -114678,12 +116572,7 @@ mod tests {
                 "SELECT 1 WINDOW a AS (a), b AS ();",
                 "SELECT 1 WINDOW a AS (b), b AS ();",
             ] {
-                assert_direct_and_prepared_rows(
-                    &conn,
-                    sql,
-                    &[vec![SqliteValue::Integer(1)]],
-                )
-                .await;
+                assert_direct_and_prepared_rows(&conn, sql, &[vec![SqliteValue::Integer(1)]]).await;
             }
 
             assert_direct_and_prepared_rows(
@@ -114845,10 +116734,7 @@ mod tests {
                 ),
                 (
                     "VALUES (row_number() OVER ()), (row_number() OVER ());",
-                    vec![
-                        vec![SqliteValue::Integer(1)],
-                        vec![SqliteValue::Integer(1)],
-                    ],
+                    vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(1)]],
                 ),
                 (
                     "VALUES (2, row_number() OVER ()), \
@@ -114860,10 +116746,7 @@ mod tests {
                 ),
                 (
                     "SELECT 7 AS keep, row_number() OVER () WHERE keep;",
-                    vec![vec![
-                        SqliteValue::Integer(7),
-                        SqliteValue::Integer(1),
-                    ]],
+                    vec![vec![SqliteValue::Integer(7), SqliteValue::Integer(1)]],
                 ),
                 (
                     "SELECT 1 AS x ORDER BY sum(x) OVER ();",
@@ -114897,28 +116780,16 @@ mod tests {
                 ),
                 (
                     "SELECT sum(1), row_number() OVER () HAVING 1;",
-                    vec![vec![
-                        SqliteValue::Integer(1),
-                        SqliteValue::Integer(1),
-                    ]],
+                    vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(1)]],
                 ),
                 (
                     "SELECT sum(1) OVER (), count(*) HAVING 1;",
-                    vec![vec![
-                        SqliteValue::Integer(1),
-                        SqliteValue::Integer(1),
-                    ]],
+                    vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(1)]],
                 ),
-                (
-                    "SELECT sum(1), row_number() OVER () HAVING 0;",
-                    Vec::new(),
-                ),
+                ("SELECT sum(1), row_number() OVER () HAVING 0;", Vec::new()),
                 (
                     "SELECT count(*), row_number() OVER () WHERE 0;",
-                    vec![vec![
-                        SqliteValue::Integer(0),
-                        SqliteValue::Integer(1),
-                    ]],
+                    vec![vec![SqliteValue::Integer(0), SqliteValue::Integer(1)]],
                 ),
                 (
                     "SELECT row_number() OVER (ORDER BY sum(1)) WHERE 0;",
@@ -114976,10 +116847,7 @@ mod tests {
                 .await
                 .unwrap();
             let projected_rows = projected
-                .query_with_params(&[
-                    SqliteValue::Integer(7),
-                    SqliteValue::Integer(11),
-                ])
+                .query_with_params(&[SqliteValue::Integer(7), SqliteValue::Integer(11)])
                 .await
                 .unwrap();
             assert_eq!(
@@ -115105,7 +116973,14 @@ mod tests {
                 &[SqliteValue::Integer(1)]
             );
             assert_eq!(
-                builtin.prepare(builtin_sql).await.unwrap().query().await.unwrap()[0].values(),
+                builtin
+                    .prepare(builtin_sql)
+                    .await
+                    .unwrap()
+                    .query()
+                    .await
+                    .unwrap()[0]
+                    .values(),
                 &[SqliteValue::Integer(1)]
             );
 
@@ -115514,8 +117389,7 @@ mod tests {
                 );
             }
 
-            let unused_collation =
-                "SELECT row_number() OVER () \
+            let unused_collation = "SELECT row_number() OVER () \
                  WINDOW unused AS (ORDER BY 1 COLLATE nope) LIMIT 0;";
             assert!(conn.query(unused_collation).await.unwrap().is_empty());
             assert!(
@@ -115607,8 +117481,7 @@ mod tests {
                 );
             }
 
-            lock_unpoisoned(conn.collation_registry.as_ref())
-                .register(WindowLengthFirstCollation);
+            lock_unpoisoned(conn.collation_registry.as_ref()).register(WindowLengthFirstCollation);
             for (sql, expected) in [
                 (
                     "SELECT row_number() OVER (ORDER BY 'x' COLLATE NOCASE) LIMIT 0;",
@@ -115673,11 +117546,7 @@ mod tests {
                 self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             }
 
-            fn step(
-                &self,
-                _state: &mut Self::State,
-                _args: &[SqliteValue],
-            ) -> Result<()> {
+            fn step(&self, _state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
                 self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 Ok(())
             }
@@ -115722,9 +117591,14 @@ mod tests {
 
         async fn expect_limit_zero(conn: &Connection, sql: &str) {
             assert!(
-                conn.query(sql).await.unwrap_or_else(|error| {
-                    panic!("custom override should leave raw collation opaque for `{sql}`: {error}")
-                }).is_empty()
+                conn.query(sql)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "custom override should leave raw collation opaque for `{sql}`: {error}"
+                        )
+                    })
+                    .is_empty()
             );
             assert!(
                 conn.prepare(sql)
@@ -115772,11 +117646,7 @@ mod tests {
             ] {
                 expect_limit_zero(&scalar, sql).await;
             }
-            expect_missing_collation(
-                &scalar,
-                "SELECT min(1 COLLATE missing, 2, 3) LIMIT 0;",
-            )
-            .await;
+            expect_missing_collation(&scalar, "SELECT min(1 COLLATE missing, 2, 3) LIMIT 0;").await;
             assert_eq!(scalar_calls.load(AtomicOrdering::SeqCst), 0);
 
             let variadic_calls = Arc::new(AtomicUsize::new(0));
@@ -115857,8 +117727,7 @@ mod tests {
             }
             let sql = "SELECT sum(record_arg()) FILTER (WHERE record_filter()) \
                        OVER (PARTITION BY record_part() ORDER BY record_order());";
-            let expected_order =
-                ["record_part", "record_order", "record_arg", "record_filter"];
+            let expected_order = ["record_part", "record_order", "record_arg", "record_filter"];
 
             let direct = conn.query(sql).await.unwrap();
             assert_eq!(direct[0].values(), &[SqliteValue::Integer(1)]);
@@ -115999,10 +117868,7 @@ mod tests {
                 &[SqliteValue::Integer(11), SqliteValue::Integer(12)]
             );
 
-            let prepared = conn
-                .prepare("SELECT ?, ? LIMIT ? OFFSET ?;")
-                .await
-                .unwrap();
+            let prepared = conn.prepare("SELECT ?, ? LIMIT ? OFFSET ?;").await.unwrap();
             let prepared_rows = prepared.query_with_params(&params).await.unwrap();
             assert_eq!(
                 prepared_rows[0].values(),
@@ -116023,18 +117889,12 @@ mod tests {
                 .unwrap();
             assert_eq!(values_rows[0].values(), &[SqliteValue::Integer(3)]);
 
-            let literal_text = conn
-                .query("SELECT 42 LIMIT '1' OFFSET '0';")
-                .await
-                .unwrap();
+            let literal_text = conn.query("SELECT 42 LIMIT '1' OFFSET '0';").await.unwrap();
             assert_eq!(literal_text[0].values(), &[SqliteValue::Integer(42)]);
             let bound_text = conn
                 .query_with_params(
                     "SELECT 42 LIMIT ? OFFSET ?;",
-                    &[
-                        SqliteValue::Text("1".into()),
-                        SqliteValue::Text("0".into()),
-                    ],
+                    &[SqliteValue::Text("1".into()), SqliteValue::Text("0".into())],
                 )
                 .await
                 .unwrap();
@@ -116045,10 +117905,7 @@ mod tests {
                     "SELECT 42 LIMIT ?;",
                     vec![SqliteValue::Text("not-an-integer".into())],
                 ),
-                (
-                    "SELECT 42 LIMIT ?;",
-                    vec![SqliteValue::Float(1.5)],
-                ),
+                ("SELECT 42 LIMIT ?;", vec![SqliteValue::Float(1.5)]),
                 ("SELECT 42 LIMIT ?;", vec![SqliteValue::Null]),
             ] {
                 let error = conn
@@ -116226,9 +118083,7 @@ mod tests {
             invalid_order
                 .query_with_params(&[SqliteValue::Integer(0)])
                 .await
-                .expect_err(
-                    "prepared LIMIT zero must not suppress ORDER BY shape validation",
-                );
+                .expect_err("prepared LIMIT zero must not suppress ORDER BY shape validation");
         });
     }
 
@@ -116238,7 +118093,12 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
 
-            assert!(conn.query("SELECT count(*) HAVING 0;").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT count(*) HAVING 0;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             let having_true = conn.query("SELECT count(*) HAVING 1;").await.unwrap();
             assert_eq!(having_true[0].values(), &[SqliteValue::Integer(1)]);
 
@@ -116304,8 +118164,8 @@ mod tests {
                 if let Ok(prepared) = conn.prepare(sql).await {
                     prepared
                         .query()
-                    .await
-                    .expect_err("prepared signed GROUP BY ordinal must be range-checked");
+                        .await
+                        .expect_err("prepared signed GROUP BY ordinal must be range-checked");
                 }
             }
             for sql in [
@@ -116316,19 +118176,13 @@ mod tests {
                     .await
                     .expect_err("COLLATE-wrapped ORDER BY ordinal must be range-checked");
                 if let Ok(prepared) = conn.prepare(sql).await {
-                    prepared
-                        .query()
-                        .await
-                        .expect_err(
-                            "prepared COLLATE-wrapped ORDER BY ordinal must be range-checked",
-                        );
+                    prepared.query().await.expect_err(
+                        "prepared COLLATE-wrapped ORDER BY ordinal must be range-checked",
+                    );
                 }
             }
 
-            let empty_aggregate = conn
-                .query("SELECT 5, count(*) WHERE 0;")
-                .await
-                .unwrap();
+            let empty_aggregate = conn.query("SELECT 5, count(*) WHERE 0;").await.unwrap();
             assert_eq!(
                 empty_aggregate[0].values(),
                 &[SqliteValue::Integer(5), SqliteValue::Integer(0)]
@@ -116367,8 +118221,7 @@ mod tests {
                     .await
                     .expect_err("GROUP BY must not resolve to an aggregate result");
             }
-            let aggregate_alias_in_where =
-                conn.prepare("SELECT count(*) AS c WHERE c = 1;").await;
+            let aggregate_alias_in_where = conn.prepare("SELECT count(*) AS c WHERE c = 1;").await;
             if let Ok(prepared) = aggregate_alias_in_where {
                 prepared
                     .query()
@@ -116428,10 +118281,7 @@ mod tests {
                     "SELECT (SELECT 1) AS x, (SELECT 2) AS x WHERE 1;",
                     Some(vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]),
                 ),
-                (
-                    "SELECT (SELECT 0) AS x, (SELECT 1) AS x WHERE x;",
-                    None,
-                ),
+                ("SELECT (SELECT 0) AS x, (SELECT 1) AS x WHERE x;", None),
                 (
                     "SELECT (SELECT 1) AS x, (SELECT 0) AS x WHERE x;",
                     Some(vec![SqliteValue::Integer(1), SqliteValue::Integer(0)]),
@@ -116450,9 +118300,7 @@ mod tests {
                 let prepared = conn.prepare(sql).await.unwrap();
                 let prepared_rows = prepared.query().await.unwrap();
                 assert_eq!(
-                    prepared_rows
-                        .first()
-                        .map(|row| row.values().to_vec()),
+                    prepared_rows.first().map(|row| row.values().to_vec()),
                     expected,
                     "prepared duplicate aliases must bind leftmost for `{sql}`"
                 );
@@ -116520,10 +118368,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                syntactic_ordinal
-                    .iter()
-                    .map(row_values)
-                    .collect::<Vec<_>>(),
+                syntactic_ordinal.iter().map(row_values).collect::<Vec<_>>(),
                 vec![
                     vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
                     vec![SqliteValue::Integer(1), SqliteValue::Integer(2)],
@@ -116570,10 +118415,7 @@ mod tests {
             }
 
             let values_sql = "VALUES ((SELECT 1)), ((SELECT 2));";
-            let expected = vec![
-                vec![SqliteValue::Integer(1)],
-                vec![SqliteValue::Integer(2)],
-            ];
+            let expected = vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]];
             let direct = conn.query(values_sql).await.unwrap();
             assert_eq!(direct.iter().map(row_values).collect::<Vec<_>>(), expected);
             let prepared = conn.prepare(values_sql).await.unwrap();
@@ -119362,8 +121204,7 @@ mod tests {
         let Statement::Select(select) = parse_single_statement(
             "SELECT group_concat(v ORDER BY ?), ? FROM aggregate_bind_order",
         )
-        .unwrap()
-        else {
+        .unwrap() else {
             panic!("expected SELECT statement");
         };
         assert!(
@@ -125710,6 +127551,350 @@ mod tests {
                 .await
                 .expect_err("unsupported STRICT type must fail");
             assert!(matches!(err, FrankenError::Internal(msg) if msg.contains("invalid type")));
+        });
+    }
+
+    #[test]
+    fn test_alter_table_preserves_implicit_autoindex_slots_across_reopen() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("alter-autoindex-slots.db");
+            let path_str = path.to_string_lossy().into_owned();
+
+            {
+                let conn = Connection::open(&path_str).await.unwrap();
+                conn.execute(
+                    "CREATE TABLE ordered(a TEXT, b TEXT, PRIMARY KEY(b), UNIQUE(a));
+                     CREATE TABLE wr(pk TEXT PRIMARY KEY, u TEXT UNIQUE) WITHOUT ROWID;
+                     CREATE TABLE legacy(
+                         old_col TEXT,
+                         payload TEXT,
+                         PRIMARY KEY('old_col' COLLATE NOCASE),
+                         UNIQUE(payload)
+                     );
+                     INSERT INTO ordered(a, b) VALUES ('a-1', 'b-1');
+                     INSERT INTO wr(pk, u) VALUES ('pk-1', 'u-1');
+                     INSERT INTO legacy(old_col, payload) VALUES ('legacy-key', 'legacy-value');
+                     ALTER TABLE ordered ADD COLUMN extra TEXT;
+                     ALTER TABLE wr ADD COLUMN extra TEXT;
+                     ALTER TABLE legacy RENAME COLUMN old_col TO new_col;",
+                )
+                .await
+                .unwrap();
+
+                let rows = conn
+                    .query(
+                        "SELECT name, sql FROM sqlite_schema
+                         WHERE type = 'table' AND name IN ('legacy', 'ordered', 'wr')
+                         ORDER BY name;",
+                    )
+                    .await
+                    .unwrap();
+                for row in &rows {
+                    let values = row_values(row);
+                    let sql = values[1].to_text();
+                    let primary_key_offset = sql.find("PRIMARY KEY").unwrap();
+                    let unique_offset = sql.find("UNIQUE").unwrap();
+                    assert!(
+                        primary_key_offset < unique_offset,
+                        "ALTER must preserve the original constraint order: {sql}"
+                    );
+                }
+                conn.close().await.unwrap();
+            }
+
+            {
+                let conn = Connection::open(&path_str).await.unwrap();
+                for (sql, expected) in [
+                    (
+                        "SELECT a FROM ordered INDEXED BY sqlite_autoindex_ordered_1 WHERE b = 'b-1';",
+                        SqliteValue::Text("a-1".into()),
+                    ),
+                    (
+                        "SELECT b FROM ordered INDEXED BY sqlite_autoindex_ordered_2 WHERE a = 'a-1';",
+                        SqliteValue::Text("b-1".into()),
+                    ),
+                    (
+                        "SELECT pk FROM wr INDEXED BY sqlite_autoindex_wr_2 WHERE u = 'u-1';",
+                        SqliteValue::Text("pk-1".into()),
+                    ),
+                    (
+                        "SELECT payload FROM legacy INDEXED BY sqlite_autoindex_legacy_1 \
+                         WHERE new_col = 'legacy-key';",
+                        SqliteValue::Text("legacy-value".into()),
+                    ),
+                    (
+                        "SELECT new_col FROM legacy INDEXED BY sqlite_autoindex_legacy_2 \
+                         WHERE payload = 'legacy-value';",
+                        SqliteValue::Text("legacy-key".into()),
+                    ),
+                ] {
+                    let row = conn.query_row(sql).await.unwrap();
+                    assert_eq!(row.values(), &[expected], "forced lookup: {sql}");
+                }
+                conn.close().await.unwrap();
+            }
+
+            let sqlite = rusqlite::Connection::open(&path).unwrap();
+            let integrity: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            for (index_name, expected_column) in [
+                ("sqlite_autoindex_ordered_1", "b"),
+                ("sqlite_autoindex_ordered_2", "a"),
+                ("sqlite_autoindex_wr_2", "u"),
+                ("sqlite_autoindex_legacy_1", "new_col"),
+                ("sqlite_autoindex_legacy_2", "payload"),
+            ] {
+                let column: String = sqlite
+                    .query_row(&format!("PRAGMA index_info('{index_name}');"), [], |row| {
+                        row.get(2)
+                    })
+                    .unwrap();
+                assert_eq!(column, expected_column, "index definition: {index_name}");
+            }
+        });
+    }
+
+    #[test]
+    fn test_alter_parent_rename_preserves_dependent_implicit_autoindex_order() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("alter-dependent-autoindex-order.db");
+            let path_str = path.to_string_lossy().into_owned();
+
+            {
+                let conn = Connection::open(&path_str).await.unwrap();
+                conn.execute(
+                    "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE child_pk_first(
+                         pk TEXT,
+                         u TEXT,
+                         parent_id INTEGER,
+                         PRIMARY KEY(pk),
+                         UNIQUE(u),
+                         FOREIGN KEY(parent_id) REFERENCES parent(id)
+                     );
+                     CREATE TABLE child_unique_first(
+                         pk TEXT,
+                         u TEXT,
+                         parent_id INTEGER,
+                         UNIQUE(u),
+                         PRIMARY KEY(pk),
+                         FOREIGN KEY(parent_id) REFERENCES parent(id)
+                     );
+                     INSERT INTO parent(id) VALUES (7);
+                     INSERT INTO child_pk_first VALUES ('pk-a', 'u-a', 7);
+                     INSERT INTO child_unique_first VALUES ('pk-b', 'u-b', 7);
+                     ALTER TABLE parent RENAME COLUMN id TO new_id;",
+                )
+                .await
+                .unwrap();
+
+                for (table_name, primary_key_first) in
+                    [("child_pk_first", true), ("child_unique_first", false)]
+                {
+                    let sql = conn
+                        .query_row(&format!(
+                            "SELECT sql FROM sqlite_schema \
+                             WHERE type = 'table' AND name = '{table_name}';"
+                        ))
+                        .await
+                        .unwrap()
+                        .values()[0]
+                        .to_text();
+                    let primary_key_offset = sql.find("PRIMARY KEY").unwrap();
+                    let unique_offset = sql.find("UNIQUE").unwrap();
+                    assert_eq!(
+                        primary_key_offset < unique_offset,
+                        primary_key_first,
+                        "dependent table constraint order changed: {sql}"
+                    );
+                    assert!(sql.contains("REFERENCES parent (new_id)"), "{sql}");
+                }
+                conn.close().await.unwrap();
+            }
+
+            {
+                let conn = Connection::open(&path_str).await.unwrap();
+                for (sql, expected) in [
+                    (
+                        "SELECT u FROM child_pk_first \
+                         INDEXED BY sqlite_autoindex_child_pk_first_1 WHERE pk = 'pk-a';",
+                        SqliteValue::Text("u-a".into()),
+                    ),
+                    (
+                        "SELECT pk FROM child_pk_first \
+                         INDEXED BY sqlite_autoindex_child_pk_first_2 WHERE u = 'u-a';",
+                        SqliteValue::Text("pk-a".into()),
+                    ),
+                    (
+                        "SELECT pk FROM child_unique_first \
+                         INDEXED BY sqlite_autoindex_child_unique_first_1 WHERE u = 'u-b';",
+                        SqliteValue::Text("pk-b".into()),
+                    ),
+                    (
+                        "SELECT u FROM child_unique_first \
+                         INDEXED BY sqlite_autoindex_child_unique_first_2 WHERE pk = 'pk-b';",
+                        SqliteValue::Text("u-b".into()),
+                    ),
+                ] {
+                    let row = conn.query_row(sql).await.unwrap();
+                    assert_eq!(row.values(), &[expected], "forced lookup: {sql}");
+                }
+                conn.close().await.unwrap();
+            }
+
+            let sqlite = rusqlite::Connection::open(&path).unwrap();
+            let integrity: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            for (index_name, expected_column) in [
+                ("sqlite_autoindex_child_pk_first_1", "pk"),
+                ("sqlite_autoindex_child_pk_first_2", "u"),
+                ("sqlite_autoindex_child_unique_first_1", "u"),
+                ("sqlite_autoindex_child_unique_first_2", "pk"),
+            ] {
+                let column: String = sqlite
+                    .query_row(&format!("PRAGMA index_info('{index_name}');"), [], |row| {
+                        row.get(2)
+                    })
+                    .unwrap();
+                assert_eq!(column, expected_column, "index definition: {index_name}");
+            }
+            for table_name in ["child_pk_first", "child_unique_first"] {
+                let parent_column: String = sqlite
+                    .query_row(
+                        &format!("PRAGMA foreign_key_list('{table_name}');"),
+                        [],
+                        |row| row.get(4),
+                    )
+                    .unwrap();
+                assert_eq!(parent_column, "new_id", "foreign key: {table_name}");
+            }
+        });
+    }
+
+    #[test]
+    fn test_autoindex_followup_alter_schema_rewrite_preflight_preserves_lookup_error_precedence() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let missing_table = conn
+                .execute("ALTER TABLE missing ADD COLUMN x TEXT;")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                missing_table,
+                FrankenError::NoSuchTable { name } if name == "missing"
+            ));
+
+            conn.execute("CREATE TABLE t(a TEXT);").await.unwrap();
+            for sql in [
+                "ALTER TABLE t RENAME COLUMN missing TO renamed;",
+                "ALTER TABLE t DROP COLUMN missing;",
+            ] {
+                let error = conn.execute(sql).await.unwrap_err();
+                assert!(
+                    matches!(&error, FrankenError::Internal(message) if message == "no such column: missing"),
+                    "unexpected error for {sql}: {error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_autoindex_followup_table_level_integer_primary_key_conflicts_survive_reopen() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("table-level-ipk-conflicts.db");
+            let path_str = path.to_string_lossy().into_owned();
+
+            {
+                let conn = Connection::open(&path_str).await.unwrap();
+                conn.execute(
+                    "CREATE TABLE ignore_t(
+                         id INTEGER,
+                         payload TEXT,
+                         PRIMARY KEY(id) ON CONFLICT IGNORE
+                     );
+                     CREATE TABLE replace_t(
+                         id INTEGER,
+                         payload TEXT,
+                         PRIMARY KEY(id) ON CONFLICT REPLACE
+                     );
+                     INSERT INTO ignore_t VALUES (1, 'ignore-original');
+                     INSERT INTO ignore_t VALUES (1, 'ignore-direct-duplicate');
+                     INSERT INTO replace_t VALUES (1, 'replace-original');
+                     INSERT INTO replace_t VALUES (1, 'replace-direct-duplicate');",
+                )
+                .await
+                .unwrap();
+
+                let ignored = conn
+                    .query_row("SELECT payload FROM ignore_t WHERE id = 1;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ignored.values(),
+                    &[SqliteValue::Text("ignore-original".into())]
+                );
+                let replaced = conn
+                    .query_row("SELECT payload FROM replace_t WHERE id = 1;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    replaced.values(),
+                    &[SqliteValue::Text("replace-direct-duplicate".into())]
+                );
+                conn.close().await.unwrap();
+            }
+
+            {
+                let conn = Connection::open(&path_str).await.unwrap();
+                conn.execute(
+                    "INSERT INTO ignore_t VALUES (1, 'ignore-reopen-duplicate');
+                     INSERT INTO replace_t VALUES (1, 'replace-reopen-duplicate');",
+                )
+                .await
+                .unwrap();
+                let ignored = conn
+                    .query_row("SELECT payload FROM ignore_t WHERE id = 1;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ignored.values(),
+                    &[SqliteValue::Text("ignore-original".into())]
+                );
+                let replaced = conn
+                    .query_row("SELECT payload FROM replace_t WHERE id = 1;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    replaced.values(),
+                    &[SqliteValue::Text("replace-reopen-duplicate".into())]
+                );
+                conn.close().await.unwrap();
+            }
+
+            let sqlite = rusqlite::Connection::open(&path).unwrap();
+            let integrity: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            let ignored: String = sqlite
+                .query_row("SELECT payload FROM ignore_t WHERE id = 1;", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(ignored, "ignore-original");
+            let replaced: String = sqlite
+                .query_row("SELECT payload FROM replace_t WHERE id = 1;", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(replaced, "replace-reopen-duplicate");
         });
     }
 
@@ -133300,10 +135485,8 @@ mod tests {
             assert_eq!(temporary[0].values(), &[SqliteValue::Integer(2)]);
 
             let error = conn.execute("DROP VIEW base;").await.unwrap_err();
-            assert!(
-                matches!(error, FrankenError::Internal(message)
-                    if message == "use DROP TABLE to delete table base")
-            );
+            assert!(matches!(error, FrankenError::Internal(message)
+                    if message == "use DROP TABLE to delete table base"));
             assert!(conn.table_exists_for_scope("base", PragmaSchemaScope::Temp));
             assert!(conn.table_exists_for_scope("base", PragmaSchemaScope::Main));
 
@@ -133354,11 +135537,9 @@ mod tests {
 
             // Object lookup precedes the cross-schema definition check for an
             // existing IF NOT EXISTS target, matching SQLite's no-op behavior.
-            conn.execute(
-                "CREATE VIEW IF NOT EXISTS main.owner_view AS SELECT * FROM aux.missing;",
-            )
-            .await
-            .unwrap();
+            conn.execute("CREATE VIEW IF NOT EXISTS main.owner_view AS SELECT * FROM aux.missing;")
+                .await
+                .unwrap();
         });
     }
 
@@ -134799,8 +136980,7 @@ mod tests {
         // A native stack overflow aborts the process rather than unwinding.
         // Keep the ordinary test runner alive by placing the pinned-stack
         // workload in a dedicated helper process and asserting on its exit.
-        let helper_name =
-            "connection::tests::helper_recursive_trigger_depth_limit_on_pinned_stack";
+        let helper_name = "connection::tests::helper_recursive_trigger_depth_limit_on_pinned_stack";
         let mut child = std::process::Command::new(
             std::env::current_exe().expect("test binary path should be available"),
         )
@@ -134914,9 +137094,7 @@ mod tests {
                         "the failed trigger statement must leave no user-visible savepoint"
                     );
                     let rows = conn
-                        .query(
-                            "SELECT (SELECT n FROM a), (SELECT n FROM b);",
-                        )
+                        .query("SELECT (SELECT n FROM a), (SELECT n FROM b);")
                         .await
                         .expect("the connection must remain reusable after trigger-depth failure");
                     assert_eq!(
@@ -143890,11 +146068,9 @@ mod tests {
             conn.execute("CREATE TABLE rhs_semantics (y INTEGER, z INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "INSERT INTO rhs_semantics VALUES (1, 30), (3, 10), (2, 20);",
-            )
-            .await
-            .unwrap();
+            conn.execute("INSERT INTO rhs_semantics VALUES (1, 30), (3, 10), (2, 20);")
+                .await
+                .unwrap();
             conn.execute("CREATE TABLE outer_semantics (x INTEGER);")
                 .await
                 .unwrap();
@@ -143966,7 +146142,11 @@ mod tests {
                 ),
             ] {
                 let rows = conn.query(sql).await.unwrap();
-                assert_eq!(rows[0].values(), &[expected], "unexpected result for `{sql}`");
+                assert_eq!(
+                    rows[0].values(),
+                    &[expected],
+                    "unexpected result for `{sql}`"
+                );
             }
 
             let correlated_sql = "SELECT x, \
@@ -143998,10 +146178,7 @@ mod tests {
                 ],
             ];
             let direct = conn.query(correlated_sql).await.unwrap();
-            assert_eq!(
-                direct.iter().map(row_values).collect::<Vec<_>>(),
-                expected
-            );
+            assert_eq!(direct.iter().map(row_values).collect::<Vec<_>>(), expected);
             let prepared = conn.prepare(correlated_sql).await.unwrap();
             let prepared_rows = prepared.query().await.unwrap();
             assert_eq!(
@@ -144032,23 +146209,24 @@ mod tests {
                 prepared_scalar_lhs_rows[0].values(),
                 &[SqliteValue::Integer(1)]
             );
-            let native_scalar_lhs_sql =
-                "SELECT (SELECT x FROM lhs_affinity) IN \
+            let native_scalar_lhs_sql = "SELECT (SELECT x FROM lhs_affinity) IN \
                  (SELECT v FROM rhs_affinity ORDER BY v LIMIT 1) \
                  FROM outer_semantics;";
             let native_scalar_lhs = conn.query(native_scalar_lhs_sql).await.unwrap();
             assert_eq!(native_scalar_lhs.len(), 2);
-            assert!(native_scalar_lhs
-                .iter()
-                .all(|row| row.values() == &[SqliteValue::Integer(1)]));
-            let prepared_native_scalar_lhs =
-                conn.prepare(native_scalar_lhs_sql).await.unwrap();
-            let prepared_native_scalar_lhs_rows =
-                prepared_native_scalar_lhs.query().await.unwrap();
+            assert!(
+                native_scalar_lhs
+                    .iter()
+                    .all(|row| row.values() == &[SqliteValue::Integer(1)])
+            );
+            let prepared_native_scalar_lhs = conn.prepare(native_scalar_lhs_sql).await.unwrap();
+            let prepared_native_scalar_lhs_rows = prepared_native_scalar_lhs.query().await.unwrap();
             assert_eq!(prepared_native_scalar_lhs_rows.len(), 2);
-            assert!(prepared_native_scalar_lhs_rows
-                .iter()
-                .all(|row| row.values() == &[SqliteValue::Integer(1)]));
+            assert!(
+                prepared_native_scalar_lhs_rows
+                    .iter()
+                    .all(|row| row.values() == &[SqliteValue::Integer(1)])
+            );
 
             conn.execute("CREATE TABLE rhs_collation (v TEXT);")
                 .await
@@ -144076,7 +146254,10 @@ mod tests {
                     SqliteValue::Integer(0),
                 ),
             ] {
-                assert_eq!(conn.query(sql).await.unwrap()[0].values(), &[expected.clone()]);
+                assert_eq!(
+                    conn.query(sql).await.unwrap()[0].values(),
+                    &[expected.clone()]
+                );
                 let prepared = conn.prepare(sql).await.unwrap();
                 assert_eq!(prepared.query().await.unwrap()[0].values(), &[expected]);
             }
@@ -144087,23 +146268,25 @@ mod tests {
             conn.execute("INSERT INTO lhs_nocase VALUES ('a');")
                 .await
                 .unwrap();
-            let scalar_inner_collation_sql =
-                "SELECT (SELECT v FROM lhs_nocase) IN \
+            let scalar_inner_collation_sql = "SELECT (SELECT v FROM lhs_nocase) IN \
                  (SELECT v FROM rhs_collation ORDER BY v LIMIT 1) \
                  FROM outer_semantics;";
-            let scalar_inner_collation_rows =
-                conn.query(scalar_inner_collation_sql).await.unwrap();
-            assert!(scalar_inner_collation_rows
-                .iter()
-                .all(|row| row.values() == &[SqliteValue::Integer(0)]));
+            let scalar_inner_collation_rows = conn.query(scalar_inner_collation_sql).await.unwrap();
+            assert!(
+                scalar_inner_collation_rows
+                    .iter()
+                    .all(|row| row.values() == &[SqliteValue::Integer(0)])
+            );
             let prepared_scalar_inner_collation =
                 conn.prepare(scalar_inner_collation_sql).await.unwrap();
-            assert!(prepared_scalar_inner_collation
-                .query()
-                .await
-                .unwrap()
-                .iter()
-                .all(|row| row.values() == &[SqliteValue::Integer(0)]));
+            assert!(
+                prepared_scalar_inner_collation
+                    .query()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.values() == &[SqliteValue::Integer(0)])
+            );
 
             // Native complex-IN lowering retains the representative source row
             // and reprojects at SQLite's second stage.
@@ -144291,10 +146474,7 @@ mod tests {
                 ],
             ];
             let direct = conn.query(sql).await.unwrap();
-            assert_eq!(
-                direct.iter().map(row_values).collect::<Vec<_>>(),
-                expected
-            );
+            assert_eq!(direct.iter().map(row_values).collect::<Vec<_>>(), expected);
             let prepared = conn.prepare(sql).await.unwrap();
             let prepared_rows = prepared.query().await.unwrap();
             assert_eq!(
@@ -145057,6 +147237,724 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_live_vtab_cursor_drop_is_guarded_on_every_scan_route() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let probe = Arc::new(CursorDropProbe::default());
+            connection.register_module(
+                "CURSOR_DROP_PROBE",
+                Box::new(CursorDropTestFactory {
+                    probe: Arc::clone(&probe),
+                }),
+            );
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            connection
+                .execute(
+                    "CREATE VIRTUAL TABLE cursor_drop_table USING cursor_drop_probe(value);",
+                )
+                .await
+                .unwrap();
+
+            let projected = connection
+                .query("SELECT value FROM cursor_drop_table;")
+                .await
+                .unwrap();
+            assert_eq!(
+                projected.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Text("probe".into())]]
+            );
+            assert_eq!(probe.drops.load(AtomicOrdering::SeqCst), 1);
+
+            let counted = connection
+                .query("SELECT count(*) FROM cursor_drop_table;")
+                .await
+                .unwrap();
+            assert_eq!(row_values(&counted[0]), vec![SqliteValue::Integer(1)]);
+            assert_eq!(probe.drops.load(AtomicOrdering::SeqCst), 2);
+
+            let table_function = connection
+                .query("SELECT value FROM cursor_drop_probe();")
+                .await
+                .unwrap();
+            assert_eq!(
+                table_function.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Text("probe".into())]]
+            );
+            assert_eq!(probe.drops.load(AtomicOrdering::SeqCst), 3);
+            assert_eq!(probe.guarded_drops.load(AtomicOrdering::SeqCst), 3);
+            assert_eq!(
+                probe
+                    .recursive_sql_rejections
+                    .load(AtomicOrdering::SeqCst),
+                3,
+                "cursor destructors must observe recursive SQL as rejected"
+            );
+            assert_eq!(connection.live_vtab_callback_depth.get(), 0);
+            assert!(connection.background_status().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_vtab_module_callbacks_can_reregister_modules() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            connection.register_module("REENTER", Box::new(ReentrantConnectFactory));
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+
+            connection
+                .execute("CREATE VIRTUAL TABLE probe USING reenter")
+                .await
+                .expect("CREATE callback should run without a module-registry borrow");
+            let prepared = connection
+                .prepare("SELECT label, score FROM reenter()")
+                .await
+                .expect("reentrant metadata should still produce a prepared statement");
+            let rows = prepared
+                .query()
+                .await
+                .expect("a statement prepared through reentrant metadata must not be born stale");
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![
+                    SqliteValue::Text("alpha".into()),
+                    SqliteValue::Integer(7)
+                ]]
+            );
+            #[cfg(feature = "ext-fts5")]
+            {
+                let callback_count_before =
+                    REENTRANT_VTAB_CALLBACK_COUNT.with(std::cell::Cell::get);
+                let cx = connection.op_cx().unwrap();
+                let mut txn = connection
+                    .pager
+                    .begin(&cx, TransactionMode::ReadOnly)
+                    .await
+                    .unwrap();
+                connection
+                    .rebuild_rootpage_zero_live_vtab_instances_from_reload(
+                        &cx,
+                        &mut txn,
+                        PageSize::DEFAULT,
+                        0,
+                        &[],
+                        &HashMap::new(),
+                        &[(
+                            "reload_probe".to_owned(),
+                            "CREATE VIRTUAL TABLE reload_probe USING reenter".to_owned(),
+                            Vec::new(),
+                        )],
+                        &HashSet::new(),
+                    )
+                    .await
+                    .expect("schema-reload connect callback should permit re-registration");
+                txn.rollback(&cx).await.unwrap();
+                REENTRANT_VTAB_CALLBACK_COUNT.with(|count| {
+                    assert!(
+                        count.get() > callback_count_before,
+                        "schema reload must exercise the reentrant connect callback"
+                    );
+                });
+            }
+            assert!(
+                connection.vtab_modules.borrow().contains_key("NESTED_0"),
+                "a reentrant callback should be able to register another module"
+            );
+            REENTRANT_VTAB_CALLBACK_BORROW_OK.with(|ok| {
+                assert!(
+                    ok.get(),
+                    "no user module callback may observe the registry already borrowed"
+                );
+            });
+            REENTRANT_VTAB_CALLBACK_COUNT.with(|count| {
+                assert!(
+                    count.get() >= 3,
+                    "CREATE, metadata, and connect callbacks should all exercise re-registration"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn test_table_function_metadata_and_connect_use_one_factory_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            connection.register_module("SELF_REPLACE", Box::new(SelfReplacingTableFunctionFactory));
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+
+            let first = connection
+                .execute_table_function_rows("SELF_REPLACE", &[], None, false)
+                .await
+                .expect("the first execution should stay on the selected original factory");
+            assert_eq!(
+                first,
+                vec![vec![
+                    SqliteValue::Text("alpha".into()),
+                    SqliteValue::Integer(7),
+                ]],
+                "column_info and connect must use the same original factory Arc"
+            );
+
+            let second = connection
+                .execute_table_function_rows("SELF_REPLACE", &[], None, false)
+                .await
+                .expect("the next execution should observe the replacement factory");
+            assert_eq!(second, vec![vec![SqliteValue::Text("replacement".into())]],);
+        });
+    }
+
+    #[test]
+    fn test_custom_builtin_module_override_uses_factory_metadata() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Connection::open(":memory:").await.unwrap();
+            connection.register_module("JSON_EACH", Box::new(ReplacementTableFunctionFactory));
+
+            let rows = connection
+                .execute_table_function_rows("JSON_EACH", &[], None, false)
+                .await
+                .expect("registered override should execute as the selected module");
+            assert_eq!(
+                rows,
+                vec![vec![SqliteValue::Text("replacement".into())]],
+                "a custom built-in-name override must not inherit hard-coded builtin columns"
+            );
+        });
+    }
+
+    #[test]
+    fn test_register_module_drops_replaced_factory_after_registry_publication() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            let minimum_published_generation = Arc::new(AtomicU64::new(u64::MAX));
+            connection.register_module(
+                "REPLACED",
+                Box::new(DropReentrantModuleFactory {
+                    minimum_published_generation: Arc::clone(&minimum_published_generation),
+                }),
+            );
+            let prepared = connection
+                .prepare("SELECT label, score FROM replaced()")
+                .await
+                .unwrap();
+            minimum_published_generation.store(
+                connection.function_registry_generation().wrapping_add(1),
+                AtomicOrdering::Release,
+            );
+
+            connection.register_module("REPLACED", Box::new(SchemaAwareTestFactory));
+
+            DROP_REENTRANT_MODULE_OBSERVATION.with(|observation| {
+                assert_eq!(
+                    observation.get(),
+                    Some(true),
+                    "a displaced factory Drop must be able to register after the module map borrow ends"
+                );
+            });
+            assert!(
+                connection
+                    .vtab_modules
+                    .borrow()
+                    .contains_key("FROM_FACTORY_DROP"),
+                "the reentrant factory destructor should publish its nested module"
+            );
+            assert!(
+                matches!(prepared.query().await, Err(FrankenError::SchemaChanged)),
+                "prepared table-function metadata must invalidate when its module is replaced"
+            );
+            let rows = connection
+                .query("SELECT label, score FROM replaced()")
+                .await
+                .expect("a freshly prepared query should bind the replacement factory");
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![
+                    SqliteValue::Text("alpha".into()),
+                    SqliteValue::Integer(7),
+                ]]
+            );
+        });
+    }
+
+    #[test]
+    fn test_udf_replacement_drops_after_registry_and_auxiliary_publication() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+
+            let scalar_generation = Arc::new(AtomicU64::new(u64::MAX));
+            let scalar_observation = Arc::new(AtomicUsize::new(0));
+            connection.register_scalar_function(DropReentrantScalarFunction {
+                _probe: DropReentrantUdfProbe {
+                    minimum_published_generation: Arc::clone(&scalar_generation),
+                    observation: Arc::clone(&scalar_observation),
+                    nested_module_name: "FROM_SCALAR_DROP",
+                    kind: DropReentrantUdfKind::Scalar,
+                },
+            });
+            scalar_generation.store(
+                connection.function_registry_generation().wrapping_add(1),
+                AtomicOrdering::Release,
+            );
+            connection.register_scalar_function(PlainScalarFunction);
+            assert_eq!(
+                scalar_observation.load(AtomicOrdering::Acquire),
+                1,
+                "scalar Drop must observe an unborrowed, generation-published replacement"
+            );
+
+            let aggregate_generation = Arc::new(AtomicU64::new(u64::MAX));
+            let aggregate_observation = Arc::new(AtomicUsize::new(0));
+            connection.register_aggregate_function(DropReentrantAggregateFunction {
+                _probe: DropReentrantUdfProbe {
+                    minimum_published_generation: Arc::clone(&aggregate_generation),
+                    observation: Arc::clone(&aggregate_observation),
+                    nested_module_name: "FROM_AGGREGATE_DROP",
+                    kind: DropReentrantUdfKind::Aggregate,
+                },
+            });
+            aggregate_generation.store(
+                connection.function_registry_generation().wrapping_add(1),
+                AtomicOrdering::Release,
+            );
+            connection.register_aggregate_function(PlainAggregateFunction);
+            assert_eq!(
+                aggregate_observation.load(AtomicOrdering::Acquire),
+                1,
+                "aggregate Drop must observe published custom-key state and generation"
+            );
+
+            let window_generation = Arc::new(AtomicU64::new(u64::MAX));
+            let window_observation = Arc::new(AtomicUsize::new(0));
+            connection.register_window_function(DropReentrantWindowFunction {
+                _probe: DropReentrantUdfProbe {
+                    minimum_published_generation: Arc::clone(&window_generation),
+                    observation: Arc::clone(&window_observation),
+                    nested_module_name: "FROM_WINDOW_DROP",
+                    kind: DropReentrantUdfKind::Window,
+                },
+            });
+            window_generation.store(
+                connection.function_registry_generation().wrapping_add(1),
+                AtomicOrdering::Release,
+            );
+            connection.register_window_function(PlainWindowFunction);
+            assert_eq!(
+                window_observation.load(AtomicOrdering::Acquire),
+                1,
+                "window Drop must observe the exact published custom-window Arc and generation"
+            );
+
+            for nested_module in [
+                "FROM_SCALAR_DROP",
+                "FROM_AGGREGATE_DROP",
+                "FROM_WINDOW_DROP",
+            ] {
+                assert!(
+                    connection.vtab_modules.borrow().contains_key(nested_module),
+                    "reentrant Drop must retain nested module {nested_module}"
+                );
+            }
+
+            let scalar_rows = connection
+                .query("SELECT drop_reentrant_scalar();")
+                .await
+                .unwrap();
+            assert_eq!(scalar_rows[0].values(), &[SqliteValue::Integer(2)]);
+            let aggregate_rows = connection
+                .query("SELECT drop_reentrant_aggregate(1);")
+                .await
+                .unwrap();
+            assert_eq!(aggregate_rows[0].values(), &[SqliteValue::Integer(2)]);
+            let window_rows = connection
+                .query("SELECT drop_reentrant_window() OVER ();")
+                .await
+                .unwrap();
+            assert_eq!(window_rows[0].values(), &[SqliteValue::Integer(2)]);
+        });
+    }
+
+    #[test]
+    fn test_udf_metadata_is_captured_once_before_registry_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            let name_calls = Arc::new(AtomicUsize::new(0));
+            let arity_calls = Arc::new(AtomicUsize::new(0));
+
+            connection.register_window_function(MetadataReentrantWindowFunction {
+                name_calls: Arc::clone(&name_calls),
+                arity_calls: Arc::clone(&arity_calls),
+            });
+
+            assert_eq!(
+                name_calls.load(AtomicOrdering::SeqCst),
+                1,
+                "window registration must capture name exactly once"
+            );
+            assert_eq!(
+                arity_calls.load(AtomicOrdering::SeqCst),
+                1,
+                "window registration must capture arity exactly once"
+            );
+            assert!(
+                connection
+                    .func_registry
+                    .borrow()
+                    .find_scalar("metadata_nested_0", 0)
+                    .is_some(),
+                "registration published by the metadata callback must survive the outer snapshot"
+            );
+            assert!(
+                connection
+                    .func_registry
+                    .borrow()
+                    .find_scalar("metadata_nested_1", 0)
+                    .is_none(),
+                "there must not be a second user metadata callback"
+            );
+
+            let nested_rows = connection
+                .query("SELECT metadata_nested_0();")
+                .await
+                .unwrap();
+            assert_eq!(nested_rows[0].values(), &[SqliteValue::Integer(17)]);
+            let window_rows = connection
+                .query("SELECT metadata_reentrant_window() OVER ();")
+                .await
+                .unwrap();
+            assert_eq!(window_rows[0].values(), &[SqliteValue::Integer(1)]);
+        });
+    }
+
+    #[test]
+    fn test_scalar_udf_metadata_reentrancy_is_captured_before_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            let name_calls = Arc::new(AtomicUsize::new(0));
+            let arity_calls = Arc::new(AtomicUsize::new(0));
+            let deterministic_calls = Arc::new(AtomicUsize::new(0));
+
+            connection.register_scalar_function(MetadataReentrantScalarFunction {
+                name_calls: Arc::clone(&name_calls),
+                arity_calls: Arc::clone(&arity_calls),
+                deterministic_calls: Arc::clone(&deterministic_calls),
+            });
+
+            assert_eq!(name_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(arity_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(deterministic_calls.load(AtomicOrdering::SeqCst), 1);
+            for nested_name in [
+                "metadata_scalar_nested_name",
+                "metadata_scalar_nested_arity",
+                "metadata_scalar_nested_deterministic",
+            ] {
+                assert!(
+                    connection
+                        .func_registry
+                        .borrow()
+                        .find_scalar(nested_name, 0)
+                        .is_some(),
+                    "nested metadata registration {nested_name} must survive outer publication"
+                );
+            }
+
+            let rows = connection
+                .query("SELECT metadata_reentrant_scalar();")
+                .await
+                .unwrap();
+            assert_eq!(rows[0].values(), &[SqliteValue::Integer(23)]);
+            assert_eq!(name_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(arity_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(deterministic_calls.load(AtomicOrdering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn test_aggregate_udf_metadata_reentrancy_is_captured_before_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            let name_calls = Arc::new(AtomicUsize::new(0));
+            let arity_calls = Arc::new(AtomicUsize::new(0));
+
+            connection.register_aggregate_function(MetadataReentrantAggregateFunction {
+                name_calls: Arc::clone(&name_calls),
+                arity_calls: Arc::clone(&arity_calls),
+            });
+
+            assert_eq!(name_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(arity_calls.load(AtomicOrdering::SeqCst), 1);
+            for nested_name in [
+                "metadata_aggregate_nested_name",
+                "metadata_aggregate_nested_arity",
+            ] {
+                assert!(
+                    connection
+                        .func_registry
+                        .borrow()
+                        .find_scalar(nested_name, 0)
+                        .is_some(),
+                    "nested metadata registration {nested_name} must survive outer publication"
+                );
+            }
+
+            let rows = connection
+                .query("SELECT metadata_reentrant_aggregate(1) FROM (VALUES (1), (2));")
+                .await
+                .unwrap();
+            assert_eq!(rows[0].values(), &[SqliteValue::Integer(2)]);
+            assert_eq!(name_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(arity_calls.load(AtomicOrdering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn test_scalar_udf_destructor_can_register_nested_udf() {
+        asupersync::test_utils::run_test(|| async {
+            struct DropRegistersNestedScalar {
+                observation: Arc<AtomicUsize>,
+            }
+
+            impl fsqlite_func::ScalarFunction for DropRegistersNestedScalar {
+                fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+                    Ok(SqliteValue::Integer(1))
+                }
+
+                fn num_args(&self) -> i32 {
+                    0
+                }
+
+                fn name(&self) -> &str {
+                    "drop_registers_nested_scalar"
+                }
+            }
+
+            impl Drop for DropRegistersNestedScalar {
+                fn drop(&mut self) {
+                    let connection = reentrant_vtab_connection();
+                    let registry_was_unborrowed = connection.func_registry.try_borrow_mut().is_ok();
+                    connection.register_scalar_function(MetadataNestedScalarFunction {
+                        function_name: "nested_from_scalar_drop",
+                    });
+                    let nested_was_published = connection
+                        .func_registry
+                        .borrow()
+                        .find_scalar("nested_from_scalar_drop", 0)
+                        .is_some();
+                    self.observation.store(
+                        if registry_was_unborrowed && nested_was_published {
+                            1
+                        } else {
+                            2
+                        },
+                        AtomicOrdering::SeqCst,
+                    );
+                }
+            }
+
+            struct ReplacementScalar;
+
+            impl fsqlite_func::ScalarFunction for ReplacementScalar {
+                fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+                    Ok(SqliteValue::Integer(2))
+                }
+
+                fn num_args(&self) -> i32 {
+                    0
+                }
+
+                fn name(&self) -> &str {
+                    "drop_registers_nested_scalar"
+                }
+            }
+
+            let _serial = super::fsqlite_core_test_serializer();
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            let observation = Arc::new(AtomicUsize::new(0));
+            connection.register_scalar_function(DropRegistersNestedScalar {
+                observation: Arc::clone(&observation),
+            });
+            connection.register_scalar_function(ReplacementScalar);
+
+            assert_eq!(observation.load(AtomicOrdering::SeqCst), 1);
+            let rows = connection
+                .query("SELECT drop_registers_nested_scalar(), nested_from_scalar_drop();")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows[0].values(),
+                &[SqliteValue::Integer(2), SqliteValue::Integer(17)]
+            );
+        });
+    }
+
+    #[test]
+    fn test_vtab_destroy_callback_runs_after_registry_commit_publication() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            connection
+                .dropped_vtab_instances
+                .borrow_mut()
+                .insert("DROPPED".to_owned(), Box::new(DropReentrantSchemaAwareVtab));
+            connection
+                .live_vtab_registry_undo
+                .borrow_mut()
+                .push(LiveVtabRegistryUndo::Dropped {
+                    table_name: "DROPPED".to_owned(),
+                });
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            let cx = connection.op_cx().unwrap();
+
+            connection.finalize_live_vtab_registry_commit(&cx);
+
+            DESTROY_REENTRANT_VTAB_OBSERVATION.with(|observation| {
+                assert_eq!(
+                    observation.get(),
+                    Some(true),
+                    "destroy must observe empty, published, unborrowed live-vtab registries"
+                );
+            });
+            DROP_REENTRANT_VTAB_OBSERVATION.with(|observation| {
+                assert_eq!(
+                    observation.get(),
+                    Some(true),
+                    "Rust Drop after destroy must also run outside every registry borrow"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn test_schema_reload_drops_displaced_vtab_outside_registry_borrow() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            connection
+                .execute("CREATE TABLE anchor(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            connection
+                .vtab_instances
+                .borrow_mut()
+                .insert("STALE".to_owned(), Box::new(DropReentrantSchemaAwareVtab));
+            connection
+                .dropped_vtab_instances
+                .borrow_mut()
+                .insert("DROPPED".to_owned(), Box::new(DropReentrantSchemaAwareVtab));
+            connection
+                .live_vtab_registry_undo
+                .borrow_mut()
+                .push(LiveVtabRegistryUndo::Dropped {
+                    table_name: "DROPPED".to_owned(),
+                });
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            connection.force_full_schema_reload_once.set(true);
+
+            let reload_cx = connection.op_cx().unwrap();
+            connection
+                .reload_memdb_from_pager(&reload_cx)
+                .await
+                .expect("full schema reload should publish before dropping displaced vtabs");
+
+            assert!(
+                !connection.vtab_instances.borrow().contains_key("STALE"),
+                "the stale test instance must be displaced by the rebuilt registry"
+            );
+            assert!(
+                connection.dropped_vtab_instances.borrow().is_empty(),
+                "staged dropped instances must be displaced by the rebuilt registry"
+            );
+            DROP_REENTRANT_VTAB_OBSERVATION.with(|observation| {
+                assert_eq!(
+                    observation.get(),
+                    Some(true),
+                    "a displaced vtab Drop must re-enter after the new registry is published and unborrowed"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn test_empty_schema_reload_defers_vtab_drop_and_preserves_generation_monotonicity() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            connection
+                .execute("CREATE TABLE anchor(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            let prepared = connection.prepare("SELECT id FROM anchor").await.unwrap();
+            let prepared_generation = connection.schema_generation();
+            connection
+                .vtab_instances
+                .borrow_mut()
+                .insert("STALE".to_owned(), Box::new(DropReentrantSchemaAwareVtab));
+            connection
+                .dropped_vtab_instances
+                .borrow_mut()
+                .insert("DROPPED".to_owned(), Box::new(DropReentrantSchemaAwareVtab));
+            connection
+                .live_vtab_registry_undo
+                .borrow_mut()
+                .push(LiveVtabRegistryUndo::Dropped {
+                    table_name: "DROPPED".to_owned(),
+                });
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+
+            let cx = connection.op_cx().unwrap();
+            connection.invalidate_cached_write_txn(&cx).await;
+            connection.invalidate_cached_read_snapshot(&cx).await;
+            let mut txn = connection
+                .pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .unwrap();
+            let page_one_len = txn
+                .get_page(&cx, PageNumber::ONE)
+                .await
+                .unwrap()
+                .as_ref()
+                .len();
+            let zero_page_one = vec![0_u8; page_one_len];
+            txn.write_page(&cx, PageNumber::ONE, &zero_page_one)
+                .await
+                .unwrap();
+            txn.commit(&cx).await.unwrap();
+
+            connection
+                .reload_memdb_from_pager(&cx)
+                .await
+                .expect("zero page one should publish the empty-database reset");
+
+            assert!(connection.vtab_instances.borrow().is_empty());
+            assert!(connection.dropped_vtab_instances.borrow().is_empty());
+            DROP_REENTRANT_VTAB_OBSERVATION.with(|observation| {
+                assert_eq!(
+                    observation.get(),
+                    Some(true),
+                    "empty reload must publish all reset state before user vtab destructors run"
+                );
+            });
+            assert!(
+                connection.schema_generation() > prepared_generation,
+                "empty reset must advance rather than reset the local schema generation"
+            );
+
+            connection
+                .execute("CREATE TABLE anchor(replacement TEXT)")
+                .await
+                .unwrap();
+            assert!(
+                matches!(prepared.query().await, Err(FrankenError::SchemaChanged)),
+                "a prepared statement from the pre-reset schema must not regain an ABA-matching identity"
+            );
+        });
+    }
+
     // ── Function registry wiring tests ──────────────────────────────────
 
     #[test]
@@ -145287,6 +148185,46 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_live_vtab_commit_invalidates_suspect_instance() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.register_module(
+                "txn_test",
+                Box::new(module_factory_from::<TxnAwareTestVtab>()),
+            );
+            conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .unwrap();
+            with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_commit = true);
+
+            conn.execute("INSERT INTO vt(value) VALUES ('suspect');")
+                .await
+                .expect("pager commit remains durable even when the post-commit vtab hook fails");
+
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a failed xCommit must never arm a preservation receipt"
+            );
+            assert!(
+                !conn.vtab_instances.borrow().contains_key("VT"),
+                "the failed-hook instance must be removed before later statements can use suspect state"
+            );
+            assert!(
+                conn.query("SELECT * FROM vt").await.is_err(),
+                "the connection must fail closed until the vtab can be rebuilt"
+            );
+
+            conn.force_full_schema_reload_once.set(true);
+            let cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&cx).await.unwrap();
+            assert!(
+                conn.query("SELECT * FROM vt").await.is_err(),
+                "an unsupported custom vtab must remain unavailable rather than resurrecting the failed instance"
+            );
+        });
+    }
+
+    #[test]
     fn test_live_vtab_create_rollback_unregisters_instance() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -145313,7 +148251,7 @@ mod tests {
                 "rolled-back CREATE VIRTUAL TABLE must not leave a staged drop"
             );
             assert!(
-                !conn.live_vtab_transactions.borrow().contains("VT"),
+                !conn.live_vtab_transactions.borrow().contains_key("VT"),
                 "rolled-back CREATE VIRTUAL TABLE must clear enlisted VTAB state"
             );
             assert!(
@@ -145809,7 +148747,7 @@ mod tests {
                 "committed DROP TABLE must destroy staged VTAB instances"
             );
             assert!(
-                !conn.live_vtab_transactions.borrow().contains("VT"),
+                !conn.live_vtab_transactions.borrow().contains_key("VT"),
                 "committed DROP TABLE must clear VTAB transaction enlistment"
             );
             assert!(
@@ -145897,13 +148835,11 @@ mod tests {
     }
 
     #[test]
-    fn test_live_vtab_savepoint_failure_rolls_back_prior_vtab_savepoint_state() {
+    fn test_live_vtab_savepoint_failure_forces_full_transaction_rollback() {
         asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.register_module(
-                "txn_test",
-                Box::new(module_factory_from::<TxnAwareTestVtab>()),
-            );
+            let lifecycle_events = register_txn_test_factory(&conn);
             conn.execute("CREATE VIRTUAL TABLE vt1 USING txn_test(value);")
                 .await
                 .unwrap();
@@ -145919,6 +148855,7 @@ mod tests {
                 .await
                 .unwrap();
             with_txn_test_vtab(&conn, "vt2", |vtab| vtab.fail_savepoint_at = Some(0));
+            lock_unpoisoned(&lifecycle_events).clear();
 
             let err = conn
                 .execute("SAVEPOINT sp_fail;")
@@ -145928,33 +148865,31 @@ mod tests {
                 err.to_string().contains("savepoint"),
                 "unexpected SAVEPOINT error: {err}",
             );
-
-            let hook_log = with_txn_test_vtab(&conn, "vt1", |vtab| vtab.hook_log.clone());
-            assert!(
-                hook_log.contains(&"savepoint:0".to_owned()),
-                "expected vt1 savepoint hook before sibling failure: {hook_log:?}",
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                [
+                    "VT1:savepoint:0",
+                    "VT2:savepoint:0",
+                    "VT1:rollback",
+                    "VT2:rollback",
+                ],
+                "failed xSavepoint must escalate directly to full xRollback fanout"
             );
-            assert!(
-                hook_log.contains(&"rollback_to:0".to_owned()),
-                "failed savepoint setup must roll back earlier VTAB savepoints: {hook_log:?}",
-            );
-            assert!(
-                hook_log.contains(&"release:0".to_owned()),
-                "failed savepoint setup must release earlier VTAB savepoints after rollback: {hook_log:?}",
-            );
-
-            conn.execute("ROLLBACK;").await.unwrap();
+            assert!(!conn.in_transaction(), "fatal savepoint failure must close the transaction");
+            assert!(conn.savepoints.borrow().is_empty());
+            assert!(conn.live_vtab_transactions.borrow().is_empty());
+            assert!(conn.background_status().is_ok());
+            assert!(conn.query("SELECT value FROM vt1;").await.unwrap().is_empty());
+            assert!(conn.query("SELECT value FROM vt2;").await.unwrap().is_empty());
         });
     }
 
     #[test]
-    fn test_live_vtab_savepoint_failure_surfaces_cleanup_failure() {
+    fn test_live_vtab_savepoint_failure_poison_on_final_rollback_failure() {
         asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.register_module(
-                "txn_test",
-                Box::new(module_factory_from::<TxnAwareTestVtab>()),
-            );
+            let lifecycle_events = register_txn_test_factory(&conn);
             conn.execute("CREATE VIRTUAL TABLE vt1 USING txn_test(value);")
                 .await
                 .unwrap();
@@ -145969,49 +148904,138 @@ mod tests {
             conn.execute("INSERT INTO vt2(value) VALUES ('right');")
                 .await
                 .unwrap();
-            with_txn_test_vtab(&conn, "vt1", |vtab| vtab.fail_rollback_to_at = Some(0));
+            with_txn_test_vtab(&conn, "vt1", |vtab| vtab.fail_rollback = true);
             with_txn_test_vtab(&conn, "vt2", |vtab| vtab.fail_savepoint_at = Some(0));
+            lock_unpoisoned(&lifecycle_events).clear();
 
             let err = conn
                 .execute("SAVEPOINT sp_fail;")
                 .await
-                .expect_err("savepoint failure should surface rollback cleanup failure");
+                .expect_err("savepoint failure should surface final rollback failure");
             let err_text = err.to_string();
             assert!(
-                err_text.contains("cleanup failed"),
-                "savepoint error should mention cleanup failure details: {err_text}",
+                err_text.contains("full transaction rollback failed"),
+                "savepoint error should report failed full rollback: {err_text}",
             );
             assert!(
-                err_text.contains("rollback_to(0)"),
-                "savepoint error should include the failing VTAB rollback_to hook: {err_text}",
+                err_text.contains("VT1 rollback failed"),
+                "savepoint error should identify the failing VTAB finalizer: {err_text}",
             );
-            let vt1_hook_log = with_txn_test_vtab(&conn, "vt1", |vtab| vtab.hook_log.clone());
-            let failing_attempt_start = vt1_hook_log
-                .iter()
-                .rposition(|entry| entry == "savepoint:0")
-                .expect("failing savepoint attempt should be logged");
-            let failing_attempt_log = &vt1_hook_log[failing_attempt_start..];
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                [
+                    "VT1:savepoint:0",
+                    "VT2:savepoint:0",
+                    "VT1:rollback",
+                    "VT1:disconnect",
+                    "VT2:rollback",
+                ],
+                "all participants must receive xRollback and only the failed instance is detached"
+            );
+            assert!(!conn.in_transaction());
+            assert!(conn.live_vtab_transactions.borrow().is_empty());
             assert!(
-                failing_attempt_log.contains(&"rollback_to:0".to_owned()),
-                "cleanup must attempt VTAB rollback_to for the failing savepoint: {vt1_hook_log:?}",
+                conn.background_status()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("virtual-table rollback finalizer failed"),
+                "failed final xRollback must permanently fail the connection closed"
             );
-            assert!(
-                !failing_attempt_log.contains(&"release:0".to_owned()),
-                "cleanup must not release a VTAB savepoint after rollback_to failure: {vt1_hook_log:?}",
-            );
-
-            conn.execute("ROLLBACK;").await.unwrap();
         });
     }
 
     #[test]
-    fn test_statement_savepoint_vtab_cleanup_skips_release_after_rollback_failure() {
+    fn test_live_vtab_rollback_panic_is_contained_and_fans_out() {
         asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.register_module(
-                "txn_test",
-                Box::new(module_factory_from::<TxnAwareTestVtab>()),
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("CREATE VIRTUAL TABLE vt1 USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIRTUAL TABLE vt2 USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO vt1(value) VALUES ('left');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO vt2(value) VALUES ('right');")
+                .await
+                .unwrap();
+            with_txn_test_vtab(&conn, "vt1", |vtab| vtab.panic_rollback = true);
+            lock_unpoisoned(&lifecycle_events).clear();
+
+            let err = conn
+                .execute("ROLLBACK;")
+                .await
+                .expect_err("panicking xRollback must become a fail-closed SQL error");
+            assert!(
+                err.to_string().contains("xRollback panicked"),
+                "unexpected contained panic error: {err}"
             );
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                ["VT1:rollback", "VT1:disconnect", "VT2:rollback"],
+                "a panicking first participant must not skip sibling xRollback"
+            );
+            assert!(!conn.in_transaction());
+            assert!(conn.live_vtab_transactions.borrow().is_empty());
+            assert!(!conn.vtab_instances.borrow().contains_key("VT1"));
+            assert!(conn.vtab_instances.borrow().contains_key("VT2"));
+            assert!(conn.background_status().is_err());
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_commit_panic_is_contained_after_durable_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("CREATE VIRTUAL TABLE vt1 USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIRTUAL TABLE vt2 USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO vt1(value) VALUES ('left');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO vt2(value) VALUES ('right');")
+                .await
+                .unwrap();
+            with_txn_test_vtab(&conn, "vt1", |vtab| vtab.panic_commit = true);
+            lock_unpoisoned(&lifecycle_events).clear();
+
+            conn.execute("COMMIT;").await.unwrap();
+
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                [
+                    "VT1:sync",
+                    "VT2:sync",
+                    "VT1:commit",
+                    "VT2:commit",
+                    "VT1:disconnect",
+                ],
+                "post-durable xCommit panic must not skip sibling commit or final cleanup"
+            );
+            assert!(!conn.in_transaction());
+            assert!(conn.live_vtab_transactions.borrow().is_empty());
+            assert!(!conn.vtab_instances.borrow().contains_key("VT1"));
+            assert!(conn.vtab_instances.borrow().contains_key("VT2"));
+            assert_eq!(conn.live_vtab_callback_depth.get(), 0);
+        });
+    }
+
+    #[test]
+    fn test_statement_savepoint_vtab_rollback_failure_forces_full_transaction_rollback() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
             conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
                 .await
                 .unwrap();
@@ -146019,6 +149043,7 @@ mod tests {
             conn.execute("INSERT INTO vt(value) VALUES ('left');")
                 .await
                 .unwrap();
+            lock_unpoisoned(&lifecycle_events).clear();
 
             let err = conn
                 .with_internal_statement_savepoint(
@@ -146041,23 +149066,353 @@ mod tests {
                 !err_text.contains("virtual-table release(0) failed"),
                 "statement cleanup must not attempt VTAB release after rollback failure: {err_text}",
             );
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                ["VT:savepoint:0", "VT:rollback_to:0", "VT:rollback"],
+                "failed statement xRollbackTo must skip xRelease and escalate to full xRollback"
+            );
+            assert!(!conn.in_transaction());
+            assert!(conn.live_vtab_transactions.borrow().is_empty());
+            assert!(conn.background_status().is_ok());
+            assert!(conn.query("SELECT value FROM vt;").await.unwrap().is_empty());
+        });
+    }
 
-            let hook_log = with_txn_test_vtab(&conn, "vt", |vtab| vtab.hook_log.clone());
-            let failing_attempt_start = hook_log
-                .iter()
-                .rposition(|entry| entry == "savepoint:0")
-                .expect("statement savepoint should be logged");
-            let failing_attempt_log = &hook_log[failing_attempt_start..];
+    #[test]
+    fn test_live_vtab_release_failure_fans_out_then_rolls_back_every_participant() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("CREATE VIRTUAL TABLE vt1 USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIRTUAL TABLE vt2 USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO vt1(value) VALUES ('left');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO vt2(value) VALUES ('right');")
+                .await
+                .unwrap();
+            conn.execute("SAVEPOINT release_target;").await.unwrap();
+            with_txn_test_vtab(&conn, "vt1", |vtab| vtab.fail_release_at = Some(0));
+            lock_unpoisoned(&lifecycle_events).clear();
+
+            let err = conn
+                .execute("RELEASE release_target;")
+                .await
+                .expect_err("failed xRelease must abort the full transaction");
             assert!(
-                failing_attempt_log.contains(&"rollback_to:0".to_owned()),
-                "statement cleanup must attempt VTAB rollback_to before surfacing the failure: {hook_log:?}",
+                err.to_string().contains("VT1 release(0) failed"),
+                "unexpected RELEASE error: {err}"
             );
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                [
+                    "VT1:release:0",
+                    "VT2:release:0",
+                    "VT1:rollback",
+                    "VT2:rollback",
+                ],
+                "xRelease failure must not skip sibling release or final rollback hooks"
+            );
+            assert!(!conn.in_transaction());
+            assert!(conn.savepoints.borrow().is_empty());
+            assert!(conn.query("SELECT value FROM vt1;").await.unwrap().is_empty());
+            assert!(conn.query("SELECT value FROM vt2;").await.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_rollback_to_failure_fans_out_then_rolls_back_every_participant() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("CREATE VIRTUAL TABLE vt1 USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIRTUAL TABLE vt2 USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO vt1(value) VALUES ('left');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO vt2(value) VALUES ('right');")
+                .await
+                .unwrap();
+            conn.execute("SAVEPOINT rollback_target;").await.unwrap();
+            with_txn_test_vtab(&conn, "vt1", |vtab| {
+                vtab.fail_rollback_to_at = Some(0);
+            });
+            lock_unpoisoned(&lifecycle_events).clear();
+
+            let err = conn
+                .execute("ROLLBACK TO rollback_target;")
+                .await
+                .expect_err("failed xRollbackTo must abort the full transaction");
             assert!(
-                !failing_attempt_log.contains(&"release:0".to_owned()),
-                "statement cleanup must not release a VTAB savepoint after rollback_to failure: {hook_log:?}",
+                err.to_string().contains("VT1 rollback_to(0) failed"),
+                "unexpected ROLLBACK TO error: {err}"
             );
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                [
+                    "VT1:rollback_to:0",
+                    "VT2:rollback_to:0",
+                    "VT1:rollback",
+                    "VT2:rollback",
+                ],
+                "xRollbackTo failure must not skip sibling rollback-to or final rollback hooks"
+            );
+            assert!(!conn.in_transaction());
+            assert!(conn.savepoints.borrow().is_empty());
+            assert!(conn.query("SELECT value FROM vt1;").await.unwrap().is_empty());
+            assert!(conn.query("SELECT value FROM vt2;").await.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_created_inside_savepoint_skips_unpaired_boundary_hooks() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("SAVEPOINT before_create;").await.unwrap();
+            lock_unpoisoned(&lifecycle_events).clear();
+
+            conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("ROLLBACK TO before_create;").await.unwrap();
+
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                ["VT:create", "VT:destroy"],
+                "xCreate enlistment at watermark zero must skip xRelease/xRollbackTo for older savepoints"
+            );
+            assert!(conn.in_transaction());
+            assert!(!conn.vtab_instances.borrow().contains_key("VT"));
+            assert!(conn.query("SELECT value FROM vt;").await.is_err());
+            conn.execute("RELEASE before_create;").await.unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_create_receives_sync_and_commit_without_begin() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("BEGIN;").await.unwrap();
+
+            conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                ["VT:create", "VT:sync", "VT:commit"],
+                "xCreate substitutes for xBegin but must still receive the two-phase commit hooks"
+            );
+            assert!(conn.vtab_instances.borrow().contains_key("VT"));
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_created_then_rolled_back_receives_destroy() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .unwrap();
 
             conn.execute("ROLLBACK;").await.unwrap();
+
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                ["VT:create", "VT:rollback", "VT:destroy"],
+                "rolled-back xCreate must pair final rollback with xDestroy"
+            );
+            assert!(!conn.vtab_instances.borrow().contains_key("VT"));
+            assert!(conn.background_status().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_created_rollback_failure_still_destroys_and_poison_connection() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .unwrap();
+            with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_rollback = true);
+
+            let err = conn
+                .execute("ROLLBACK;")
+                .await
+                .expect_err("failed final xRollback must be surfaced");
+            assert!(
+                err.to_string().contains("VT rollback failed"),
+                "unexpected ROLLBACK error: {err}"
+            );
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                ["VT:create", "VT:rollback", "VT:destroy"],
+                "failed rollback of a transaction-created VTAB must use xDestroy, not xDisconnect"
+            );
+            assert!(!conn.vtab_instances.borrow().contains_key("VT"));
+            assert!(!conn.in_transaction());
+            assert!(conn.background_status().is_err());
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_create_sync_failure_rolls_back_and_destroys() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .unwrap();
+            with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_sync = true);
+
+            let err = conn
+                .execute("COMMIT;")
+                .await
+                .expect_err("failed xSync must roll back the full transaction");
+            assert!(
+                err.to_string().contains("sync failed"),
+                "unexpected COMMIT error: {err}"
+            );
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                ["VT:create", "VT:sync", "VT:rollback", "VT:destroy"],
+                "failed xSync for xCreate must pair xRollback with xDestroy"
+            );
+            assert!(!conn.vtab_instances.borrow().contains_key("VT"));
+            assert!(!conn.in_transaction());
+            assert!(conn.background_status().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_create_post_registry_failure_is_statement_atomic() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("CREATE TABLE keeper(value TEXT);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO keeper(value) VALUES ('survives');")
+                .await
+                .unwrap();
+            conn.fail_live_vtab_create_after_registry_once.set(true);
+
+            let err = conn
+                .execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .expect_err("injected post-registry failure must abort only CREATE");
+            assert!(
+                err.to_string().contains("after registry publication"),
+                "unexpected CREATE error: {err}"
+            );
+            assert_eq!(
+                lock_unpoisoned(&lifecycle_events).as_slice(),
+                ["VT:create", "VT:destroy"],
+                "failed CREATE must xDestroy the transaction-local instance"
+            );
+            assert!(conn.in_transaction());
+            assert!(!conn.vtab_instances.borrow().contains_key("VT"));
+            assert!(!conn.dropped_vtab_instances.borrow().contains_key("VT"));
+            assert!(!conn.live_vtab_transactions.borrow().contains_key("VT"));
+            assert!(
+                conn.query("SELECT sql FROM sqlite_master WHERE name = 'vt';")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "failed CREATE must not leave a catalog row"
+            );
+
+            conn.execute("COMMIT;").await.unwrap();
+            let rows = conn
+                .query("SELECT value FROM keeper;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values(), &[SqliteValue::Text("survives".into())]);
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_drop_post_stage_failure_is_statement_atomic() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lifecycle_events = register_txn_test_factory(&conn);
+            conn.execute("CREATE TABLE keeper(value TEXT);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO vt(value) VALUES ('still-live');")
+                .await
+                .unwrap();
+            lock_unpoisoned(&lifecycle_events).clear();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO keeper(value) VALUES ('survives');")
+                .await
+                .unwrap();
+            conn.fail_live_vtab_drop_after_stage_once.set(true);
+
+            let err = conn
+                .execute("DROP TABLE vt;")
+                .await
+                .expect_err("injected post-stage failure must abort only DROP");
+            assert!(
+                err.to_string().contains("after registry staging"),
+                "unexpected DROP error: {err}"
+            );
+            assert!(
+                lock_unpoisoned(&lifecycle_events).is_empty(),
+                "rolled-back DROP must restore the existing instance without finalizing it"
+            );
+            assert!(conn.in_transaction());
+            assert!(conn.vtab_instances.borrow().contains_key("VT"));
+            assert!(!conn.dropped_vtab_instances.borrow().contains_key("VT"));
+            let rows = conn.query("SELECT value FROM vt;").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values(),
+                &[SqliteValue::Text("still-live".into())]
+            );
+
+            conn.execute("COMMIT;").await.unwrap();
+            let rows = conn
+                .query("SELECT value FROM keeper;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values(), &[SqliteValue::Text("survives".into())]);
+            assert!(conn.vtab_instances.borrow().contains_key("VT"));
         });
     }
 
@@ -146140,6 +149495,128 @@ mod tests {
             assert_eq!(
                 rows.iter().map(row_values).collect::<Vec<_>>(),
                 vec![vec![SqliteValue::Integer(3)]]
+            );
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_best_index_rejects_malformed_constraint_usage() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.register_module(
+                "best_index_contract",
+                Box::new(BestIndexContractTestFactory),
+            );
+            for table_name in [
+                "vt_extend",
+                "vt_truncate",
+                "vt_gap",
+                "vt_duplicate",
+                "vt_out_of_range",
+                "vt_reorder_input",
+            ] {
+                conn.execute(&format!(
+                    "CREATE VIRTUAL TABLE {table_name} USING best_index_contract(value);"
+                ))
+                .await
+                .unwrap();
+            }
+
+            let cases = [
+                (
+                    "SELECT value FROM vt_extend WHERE value = 'match';",
+                    "vt_extend",
+                ),
+                (
+                    "SELECT value FROM vt_truncate WHERE value = 'match';",
+                    "vt_truncate",
+                ),
+                (
+                    "SELECT value FROM vt_gap WHERE value >= 'a' AND value <= 'z' AND value = 'match';",
+                    "vt_gap",
+                ),
+                (
+                    "SELECT value FROM vt_out_of_range WHERE value = 'match';",
+                    "vt_out_of_range",
+                ),
+                (
+                    "SELECT value FROM vt_duplicate WHERE value >= 'a' AND value <= 'z';",
+                    "vt_duplicate",
+                ),
+                (
+                    "SELECT value FROM vt_reorder_input WHERE value >= 'a' AND value <= 'z';",
+                    "vt_reorder_input",
+                ),
+            ];
+            for (sql, table_name) in cases {
+                let err = conn
+                    .query(sql)
+                    .await
+                    .expect_err("malformed xBestIndex output must fail closed");
+                assert!(
+                    matches!(
+                        &err,
+                        FrankenError::FunctionError(message)
+                            if message == &format!("{table_name}.xBestIndex malfunction")
+                    ),
+                    "unexpected error for {sql}: {err:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_best_index_omit_false_retains_residual_predicate() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.register_module(
+                "best_index_contract",
+                Box::new(BestIndexContractTestFactory),
+            );
+            for table_name in ["vt_residual", "vt_zero_omit", "vt_negative"] {
+                conn.execute(&format!(
+                    "CREATE VIRTUAL TABLE {table_name} USING best_index_contract(value);"
+                ))
+                .await
+                .unwrap();
+                let rows = conn
+                    .query(&format!(
+                        "SELECT value FROM {table_name} WHERE value = 'match';"
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows.iter().map(row_values).collect::<Vec<_>>(),
+                    vec![vec![SqliteValue::Text("match".into())]],
+                    "non-consumed constraints and omit=false constraints require core rechecking"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_best_index_valid_permutation_orders_filter_arguments() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.register_module(
+                "best_index_contract",
+                Box::new(BestIndexContractTestFactory),
+            );
+            conn.execute("CREATE VIRTUAL TABLE vt_permute USING best_index_contract(value);")
+                .await
+                .unwrap();
+
+            let rows = conn
+                .query("SELECT value FROM vt_permute WHERE value = 'match' AND rowid = 7;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Text("match".into())]],
+                "valid out-of-order argv_index values must be packed in 1-based filter order"
             );
         });
     }
@@ -146248,6 +149725,89 @@ mod tests {
                 rows.iter().map(row_values).collect::<Vec<_>>(),
                 vec![vec![SqliteValue::Integer(2)]],
             );
+        });
+    }
+
+    #[test]
+    fn test_rtree_geometry_replacement_drops_callback_under_vtab_guard() {
+        asupersync::test_utils::run_test(|| async {
+            struct ReentrantDropGeometry {
+                observation: Arc<AtomicUsize>,
+            }
+
+            impl fsqlite_ext_rtree::RtreeGeometry for ReentrantDropGeometry {
+                fn query_func(&self, _bbox: &[f64]) -> fsqlite_ext_rtree::RtreeQueryResult {
+                    fsqlite_ext_rtree::RtreeQueryResult::Include
+                }
+            }
+
+            impl Drop for ReentrantDropGeometry {
+                fn drop(&mut self) {
+                    struct NestedGeometry;
+
+                    impl fsqlite_ext_rtree::RtreeGeometry for NestedGeometry {
+                        fn query_func(
+                            &self,
+                            _bbox: &[f64],
+                        ) -> fsqlite_ext_rtree::RtreeQueryResult {
+                            fsqlite_ext_rtree::RtreeQueryResult::Include
+                        }
+                    }
+
+                    let result = reentrant_vtab_connection().register_rtree_geometry(
+                        "spatial",
+                        "nested",
+                        Box::new(NestedGeometry),
+                    );
+                    let safely_rejected = result.is_err_and(|error| {
+                        error.to_string().contains("recursive SQL is not allowed")
+                    });
+                    self.observation.store(
+                        if safely_rejected { 1 } else { 2 },
+                        AtomicOrdering::SeqCst,
+                    );
+                }
+            }
+
+            struct ReplacementGeometry;
+
+            impl fsqlite_ext_rtree::RtreeGeometry for ReplacementGeometry {
+                fn query_func(&self, _bbox: &[f64]) -> fsqlite_ext_rtree::RtreeQueryResult {
+                    fsqlite_ext_rtree::RtreeQueryResult::Exclude
+                }
+            }
+
+            let _serial = super::fsqlite_core_test_serializer();
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            connection
+                .execute(
+                    "CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x, min_y, max_y);",
+                )
+                .await
+                .unwrap();
+            let observation = Arc::new(AtomicUsize::new(0));
+            connection
+                .register_rtree_geometry(
+                    "spatial",
+                    "replace_me",
+                    Box::new(ReentrantDropGeometry {
+                        observation: Arc::clone(&observation),
+                    }),
+                )
+                .unwrap();
+
+            connection
+                .register_rtree_geometry(
+                    "spatial",
+                    "replace_me",
+                    Box::new(ReplacementGeometry),
+                )
+                .unwrap();
+
+            assert_eq!(observation.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(connection.live_vtab_callback_depth.get(), 0);
+            assert!(connection.background_status().is_ok());
         });
     }
 
@@ -154499,11 +158059,9 @@ mod tests {
             conn.execute("CREATE TABLE inner_without (inner_only INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE TABLE inner_with (inner_only INTEGER, outer_only INTEGER);",
-            )
-            .await
-            .unwrap();
+            conn.execute("CREATE TABLE inner_with (inner_only INTEGER, outer_only INTEGER);")
+                .await
+                .unwrap();
             conn.execute("INSERT INTO outer_t VALUES (7);")
                 .await
                 .unwrap();
@@ -154530,10 +158088,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                fully_unqualified[0].values(),
-                &[SqliteValue::Integer(7)]
-            );
+            assert_eq!(fully_unqualified[0].values(), &[SqliteValue::Integer(7)]);
 
             let shadowed = conn
                 .query(
@@ -154636,9 +158191,7 @@ mod tests {
                      FROM outer_t;",
                 )
                 .await
-                .expect(
-                    "explicit main/TEMP sources must still resolve missing bare names outward",
-                );
+                .expect("explicit main/TEMP sources must still resolve missing bare names outward");
             assert_eq!(
                 qualified_scope_outer_fallback[0].values(),
                 &[
@@ -155901,6 +159454,373 @@ mod transaction_lifecycle_tests {
         });
     }
 
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_schema_changing_commit_rebuilds_incompatible_live_vtab_instance() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("schema-changing-vtab-commit.db");
+            let db_str = db_path.to_str().unwrap();
+
+            let conn = Connection::open(db_str).await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
+                .await
+                .unwrap();
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "schema-changing autocommit must not arm live-vtab preservation"
+            );
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (1, 'alpha term')")
+                .await
+                .unwrap();
+            assert!(
+                conn.pending_local_live_vtab_preservation
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|receipt| {
+                        receipt.table_keys.len() == 1 && receipt.table_keys.contains("DOCS")
+                    }),
+                "schema-stable live-vtab DML should arm one-shot preservation"
+            );
+
+            // A later schema-only write supersedes that one-shot receipt even
+            // though writable_schema deliberately skips the usual pre-edit
+            // MemDatabase refresh that would otherwise consume it.
+            conn.execute("PRAGMA writable_schema = ON").await.unwrap();
+            conn.execute(
+                "UPDATE sqlite_master \
+                 SET sql = 'CREATE VIRTUAL TABLE docs USING fts5(body) ' \
+                 WHERE type = 'table' AND name = 'docs'",
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA writable_schema = OFF").await.unwrap();
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a later schema-changing commit must clear a stale preservation receipt"
+            );
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            let before_ptr = live_vtab_instance_ptr(&conn, "docs");
+            let original_schema_cookie = conn.schema_cookie();
+
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (2, 'beta term')")
+                .await
+                .unwrap();
+            conn.execute("PRAGMA writable_schema = ON").await.unwrap();
+            conn.execute(
+                "UPDATE sqlite_master \
+                 SET sql = 'CREATE VIRTUAL TABLE docs USING fts5(body, content='''')' \
+                 WHERE type = 'table' AND name = 'docs'",
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA writable_schema = OFF").await.unwrap();
+            conn.execute(&format!("PRAGMA schema_version = {original_schema_cookie}"))
+                .await
+                .unwrap();
+            conn.execute("COMMIT").await.unwrap();
+
+            assert_eq!(
+                conn.schema_cookie(),
+                original_schema_cookie,
+                "the regression must restore the BEGIN-time cookie to exercise the identity ABA"
+            );
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a commit that changes canonical vtab DDL must not preserve the old instance even when schema_version restores the original cookie"
+            );
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert_ne!(
+                live_vtab_instance_ptr(&conn, "docs"),
+                before_ptr,
+                "schema reload must replace the instance built from the old stored-content DDL"
+            );
+            {
+                let instances = conn.vtab_instances.borrow();
+                let fts5 = instances
+                    .get("DOCS")
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .expect("reloaded docs instance should be FTS5");
+                assert_eq!(
+                    fts5.config().content_mode(),
+                    fsqlite_ext_fts5::ContentMode::Contentless,
+                    "live instance must match the newly canonical contentless DDL"
+                );
+            }
+            let rows = conn
+                .query("SELECT rowid FROM docs WHERE docs MATCH 'term' ORDER BY rowid")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]],
+                "rebuilding for the repaired DDL must retain all committed postings"
+            );
+        });
+    }
+
+    #[test]
+    fn test_live_vtab_preservation_receipt_fails_closed_without_exact_successor() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let table_keys = HashSet::from(["DOCS".to_owned()]);
+
+            *conn.last_local_commit_seq.borrow_mut() = Some(CommitSeq::new(7));
+            conn.arm_pending_local_live_vtab_preservation(None, table_keys.clone(), true, true);
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a missing BEGIN visibility hint must fail closed"
+            );
+
+            conn.arm_pending_local_live_vtab_preservation(
+                Some(CommitSeq::new(5)),
+                table_keys.clone(),
+                true,
+                true,
+            );
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a commit that is not the exact BEGIN successor must fail closed"
+            );
+
+            *conn.last_local_commit_seq.borrow_mut() = Some(CommitSeq::new(u64::MAX));
+            conn.arm_pending_local_live_vtab_preservation(
+                Some(CommitSeq::new(u64::MAX)),
+                table_keys,
+                true,
+                true,
+            );
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "commit-sequence overflow must fail closed"
+            );
+        });
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_live_vtab_preservation_receipt_is_exact_and_rejects_intervening_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("exact-vtab-preservation.db");
+            let db_str = db_path.to_str().unwrap();
+
+            let conn_a = Connection::open(db_str).await.unwrap();
+            conn_a
+                .execute("CREATE VIRTUAL TABLE docs_a USING fts5(body)")
+                .await
+                .unwrap();
+            conn_a
+                .execute("CREATE VIRTUAL TABLE docs_b USING fts5(body)")
+                .await
+                .unwrap();
+            let conn_b = Connection::open(db_str).await.unwrap();
+
+            conn_a.execute("BEGIN").await.unwrap();
+            conn_a
+                .execute("INSERT INTO docs_a(rowid, body) VALUES (1, 'alpha')")
+                .await
+                .unwrap();
+            conn_b
+                .execute("INSERT INTO docs_b(rowid, body) VALUES (1, 'beta')")
+                .await
+                .unwrap();
+            conn_a.execute("COMMIT").await.unwrap();
+            assert!(
+                conn_a
+                    .pending_local_live_vtab_preservation
+                    .borrow()
+                    .is_none(),
+                "an intervening peer commit must invalidate preservation even for the locally enlisted vtab"
+            );
+
+            let reload_cx = conn_a.op_cx().unwrap();
+            conn_a.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            let beta_rows = conn_a
+                .query("SELECT rowid FROM docs_b WHERE docs_b MATCH 'beta'")
+                .await
+                .unwrap();
+            assert_eq!(
+                beta_rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)]],
+                "rebuild after an intervening commit must observe the peer's postings"
+            );
+
+            let docs_a_before = live_vtab_instance_ptr(&conn_a, "docs_a");
+            let docs_b_before = live_vtab_instance_ptr(&conn_a, "docs_b");
+            conn_a.execute("BEGIN").await.unwrap();
+            conn_a
+                .execute("INSERT INTO docs_a(rowid, body) VALUES (2, 'gamma')")
+                .await
+                .unwrap();
+            conn_a.execute("COMMIT").await.unwrap();
+            {
+                let receipt = conn_a.pending_local_live_vtab_preservation.borrow();
+                let receipt = receipt
+                    .as_ref()
+                    .expect("schema-stable isolated live-vtab commit should arm a receipt");
+                assert_eq!(receipt.table_keys.len(), 1);
+                assert!(receipt.table_keys.contains("DOCS_A"));
+                assert!(!receipt.table_keys.contains("DOCS_B"));
+            }
+
+            let reload_cx = conn_a.op_cx().unwrap();
+            conn_a.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert_eq!(
+                live_vtab_instance_ptr(&conn_a, "docs_a"),
+                docs_a_before,
+                "the exact locally enlisted vtab may use its validated one-shot receipt"
+            );
+            assert_ne!(
+                live_vtab_instance_ptr(&conn_a, "docs_b"),
+                docs_b_before,
+                "an uninvolved vtab must be rebuilt even when another local vtab is preserved"
+            );
+        });
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_non_vtab_write_paths_clear_prior_preservation_receipt() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("clear-vtab-preservation.db");
+            let db_str = db_path.to_str().unwrap();
+            let conn = Connection::open(db_str).await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE ordinary(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (1, 'first')")
+                .await
+                .unwrap();
+            assert!(conn.pending_local_live_vtab_preservation.borrow().is_some());
+            conn.execute("PRAGMA application_id = 42").await.unwrap();
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a low-level pager metadata commit must clear the prior vtab receipt"
+            );
+
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (2, 'second')")
+                .await
+                .unwrap();
+            assert!(conn.pending_local_live_vtab_preservation.borrow().is_some());
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO ordinary VALUES (1)")
+                .await
+                .unwrap();
+            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            let cx = conn.op_cx().unwrap();
+            conn.flush_retained_autocommit_txn(&cx).await.unwrap();
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a retained ordinary-write flush must clear the prior vtab receipt"
+            );
+
+            conn.execute("PRAGMA fsqlite.autocommit_retain = OFF")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (3, 'third')")
+                .await
+                .unwrap();
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_some(),
+                "serialized file autocommit should arm a receipt for its enlisted vtab"
+            );
+            conn.execute("INSERT INTO ordinary VALUES (2)")
+                .await
+                .unwrap();
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a non-retained serialized file autocommit must clear the prior vtab receipt"
+            );
+        });
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_close_flush_clears_receipt_before_returning_closed_handle() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("close-clears-vtab-preservation.db");
+            let db_str = db_path.to_str().unwrap();
+            let mut conn = Connection::open(db_str).await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE ordinary(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (1, 'first')")
+                .await
+                .unwrap();
+            assert!(conn.pending_local_live_vtab_preservation.borrow().is_some());
+
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO ordinary VALUES (1)")
+                .await
+                .unwrap();
+            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_some(),
+                "the prior receipt remains until the retained ordinary write is committed"
+            );
+
+            conn.close_without_checkpoint_in_place().await.unwrap();
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "close-time retained commit must clear the older vtab receipt before returning"
+            );
+
+            let reopened = Connection::open(db_str).await.unwrap();
+            let rows = reopened.query("SELECT id FROM ordinary").await.unwrap();
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)]],
+                "close-time receipt clearing must not discard the retained ordinary commit"
+            );
+        });
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_memory_commit_and_retain_clears_prior_preservation_receipt() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE ordinary(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (1, 'first')")
+                .await
+                .unwrap();
+            assert!(conn.pending_local_live_vtab_preservation.borrow().is_some());
+
+            conn.execute("INSERT INTO ordinary VALUES (1)")
+                .await
+                .unwrap();
+
+            assert!(conn.cached_write_txn.borrow().is_some());
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a memory commit_and_retain write must clear the prior vtab receipt"
+            );
+        });
+    }
+
     #[test]
     fn test_reload_memdb_from_pager_preserves_live_vtab_instance_after_local_memory_commit() {
         asupersync::test_utils::run_test(|| async {
@@ -155922,6 +159842,13 @@ mod transaction_lifecycle_tests {
                 "schema-stable reload after a local :memory: commit should preserve the existing live vtab instance"
             );
 
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert_ne!(
+                live_vtab_instance_ptr(&conn, "docs"),
+                after_ptr,
+                "after the one-shot receipt is consumed, supported FTS hydration must rebuild instead of using the custom-vtab fallback"
+            );
+
             let rows = conn
                 .query("SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rowid;")
                 .await
@@ -155934,6 +159861,96 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn test_memory_reload_repeatedly_preserves_identical_custom_vtab_without_hydrator() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.register_module(
+                "txn_test",
+                Box::new(module_factory_from::<super::tests::TxnAwareTestVtab>()),
+            );
+            conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+                .await
+                .unwrap();
+            let original_ptr = live_vtab_instance_ptr(&conn, "vt");
+            let reload_cx = conn.op_cx().unwrap();
+
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "vt"),
+                original_ptr,
+                "isolated memory reload should retain an identical custom vtab without a hydrator"
+            );
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "vt"),
+                original_ptr,
+                "the SQL-identity fallback must remain valid after its one-shot receipt is gone"
+            );
+            assert!(conn.query("SELECT * FROM vt;").await.unwrap().is_empty());
+        });
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_rootpage_zero_rebind_failure_does_not_remove_preserved_live_vtab() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE keep USING fts5(body)")
+                .await
+                .unwrap();
+            let before_ptr = live_vtab_instance_ptr(&conn, "keep");
+            let schema = conn.schema.borrow().clone();
+            let rowid_alias_columns = conn.rowid_alias_columns.borrow().clone();
+            let specs = vec![
+                (
+                    "keep".to_owned(),
+                    "CREATE VIRTUAL TABLE keep USING fts5(body)".to_owned(),
+                    Vec::new(),
+                ),
+                (
+                    "fail".to_owned(),
+                    "CREATE VIRTUAL TABLE fail USING fts5(body, contentless_delete=1)".to_owned(),
+                    Vec::new(),
+                ),
+            ];
+            let preserved = HashSet::from(["KEEP".to_owned()]);
+            let cx = Cx::new();
+            let mut txn = conn
+                .pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .unwrap();
+
+            let error = match conn
+                .rebuild_rootpage_zero_live_vtab_instances_from_reload(
+                    &cx,
+                    &mut txn,
+                    PageSize::DEFAULT,
+                    0,
+                    &schema,
+                    &rowid_alias_columns,
+                    &specs,
+                    &preserved,
+                )
+                .await
+            {
+                Ok(_) => panic!("the later invalid FTS5 spec must fail reconnect"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("contentless_delete=1"),
+                "unexpected reconnect error: {error}"
+            );
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "keep"),
+                before_ptr,
+                "a later reconnect failure must leave the preserved registry untouched"
+            );
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_reload_memdb_from_pager_rebuilds_live_vtab_instance_after_external_commit() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
@@ -155941,13 +159958,32 @@ mod transaction_lifecycle_tests {
             let db_str = db_path.to_str().unwrap();
 
             let conn = Connection::open(db_str).await.unwrap();
+            conn.execute("CREATE TABLE anchor(id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO anchor(id) VALUES (1);")
+                .await
+                .unwrap();
             conn.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body, tokenize='porter')")
                 .await
                 .unwrap();
             conn.execute("INSERT INTO docs(rowid, title, body) VALUES (1, 'hello', 'rust world');")
                 .await
                 .unwrap();
-            let before_ptr = live_vtab_instance_ptr(&conn, "docs");
+            let locally_committed_ptr = live_vtab_instance_ptr(&conn, "docs");
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "docs"),
+                locally_committed_ptr,
+                "the exact local commit receipt should preserve its enlisted live instance once"
+            );
+            assert!(
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "a successful reload must consume the one-shot local preservation receipt"
+            );
+            let before_external_commit_ptr = live_vtab_instance_ptr(&conn, "docs");
+            let prepared_anchor = conn.prepare("SELECT id FROM anchor;").await.unwrap();
 
             let other = Connection::open(db_str).await.unwrap();
             other
@@ -155955,17 +159991,99 @@ mod transaction_lifecycle_tests {
                 .await
                 .unwrap();
 
-            let reload_cx = conn.op_cx().unwrap();
-            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            let anchor_rows = prepared_anchor
+                .query()
+                .await
+                .expect("prepared metadata refresh should remain usable after peer DML");
+            assert_eq!(
+                anchor_rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)]],
+            );
             let after_ptr = live_vtab_instance_ptr(&conn, "docs");
 
             assert_ne!(
-                before_ptr, after_ptr,
-                "reload must rebuild the live vtab instance when another connection commits new rows"
+                before_external_commit_ptr, after_ptr,
+                "prepared refresh must fully rebuild live vtabs when another connection commits new rows"
             );
 
             let rows = conn
                 .query("SELECT rowid FROM docs WHERE docs MATCH 'beta' ORDER BY rowid;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(2)]],
+            );
+        });
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_stale_prebound_reload_fails_closed_before_live_vtab_preservation() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("stale-prebound-vtab-reload.db");
+            let db_str = db_path.to_str().unwrap();
+            let conn_a = Connection::open(db_str).await.unwrap();
+            conn_a
+                .execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
+                .await
+                .unwrap();
+            conn_a
+                .execute("INSERT INTO docs(rowid, body) VALUES (1, 'alpha')")
+                .await
+                .unwrap();
+            assert!(
+                conn_a
+                    .pending_local_live_vtab_preservation
+                    .borrow()
+                    .is_some()
+            );
+            let before_ptr = live_vtab_instance_ptr(&conn_a, "docs");
+            let before_visible_seq = *conn_a.memdb_visible_commit_seq.borrow();
+            let reload_cx = conn_a.op_cx().unwrap();
+            let stale_publication = conn_a
+                .bind_pager_publication(&reload_cx, "stale_prebound_vtab_test")
+                .await
+                .unwrap();
+
+            let conn_b = Connection::open(db_str).await.unwrap();
+            conn_b
+                .execute("INSERT INTO docs(rowid, body) VALUES (2, 'beta')")
+                .await
+                .unwrap();
+
+            let error = conn_a
+                .reload_memdb_from_pager_with_prebound_publication(&reload_cx, &stale_publication)
+                .await
+                .expect_err("a stale prebind must not label a newer read transaction");
+            assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+            assert_eq!(
+                *conn_a.memdb_visible_commit_seq.borrow(),
+                before_visible_seq,
+                "failed prebound reload must not publish the stale visibility identity"
+            );
+            assert_eq!(
+                live_vtab_instance_ptr(&conn_a, "docs"),
+                before_ptr,
+                "failed prebound reload must not partially replace or preserve the registry"
+            );
+
+            conn_a.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert_ne!(
+                live_vtab_instance_ptr(&conn_a, "docs"),
+                before_ptr,
+                "a fresh authoritative reload must rebuild after the peer commit"
+            );
+            assert!(
+                conn_a
+                    .pending_local_live_vtab_preservation
+                    .borrow()
+                    .is_none(),
+                "the successful authoritative reload must consume the stale receipt"
+            );
+            let rows = conn_a
+                .query("SELECT rowid FROM docs WHERE docs MATCH 'beta'")
                 .await
                 .unwrap();
             assert_eq!(
@@ -158621,7 +162739,6 @@ mod without_rowid_runtime_tests {
                      CREATE TABLE wr_table(pk TEXT, u TEXT, PRIMARY KEY(pk), UNIQUE(u)) WITHOUT ROWID;
                      CREATE TABLE wr_integer(pk INTEGER PRIMARY KEY, u TEXT UNIQUE) WITHOUT ROWID;
                      INSERT INTO wr_col VALUES ('pk-1', 'u-1');
-                     INSERT INTO wr_reversed VALUES ('u-1', 'pk-1');
                      INSERT INTO wr_table VALUES ('pk-1', 'u-1');
                      INSERT INTO wr_integer VALUES (1, 'u-1');",
                 )
@@ -158653,13 +162770,29 @@ mod without_rowid_runtime_tests {
 
             {
                 let conn = Connection::open(db_str).await.unwrap();
+                for (table, expected_name) in [
+                    ("wr_col", "sqlite_autoindex_wr_col_2"),
+                    ("wr_reversed", "sqlite_autoindex_wr_reversed_1"),
+                    ("wr_table", "sqlite_autoindex_wr_table_2"),
+                    ("wr_integer", "sqlite_autoindex_wr_integer_1"),
+                ] {
+                    let rows = conn
+                        .query(&format!(
+                            "SELECT name FROM sqlite_schema \
+                             WHERE type = 'index' AND tbl_name = '{table}' \
+                             ORDER BY name;"
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        rows.iter().map(row_values).collect::<Vec<_>>(),
+                        vec![vec![SqliteValue::Text(expected_name.into())]],
+                        "reloaded physical autoindex rows for {table}"
+                    );
+                }
                 for (sql, expected) in [
                     (
                         "SELECT pk FROM wr_col INDEXED BY sqlite_autoindex_wr_col_2 WHERE u = 'u-1';",
-                        SqliteValue::Text("pk-1".into()),
-                    ),
-                    (
-                        "SELECT pk FROM wr_reversed INDEXED BY sqlite_autoindex_wr_reversed_1 WHERE u = 'u-1';",
                         SqliteValue::Text("pk-1".into()),
                     ),
                     (
@@ -158677,7 +162810,6 @@ mod without_rowid_runtime_tests {
 
                 conn.execute(
                     "INSERT INTO wr_col VALUES ('pk-2', 'u-2');
-                     INSERT INTO wr_reversed VALUES ('u-2', 'pk-2');
                      INSERT INTO wr_table VALUES ('pk-2', 'u-2');
                      INSERT INTO wr_integer VALUES (2, 'u-2');",
                 )
@@ -158685,7 +162817,6 @@ mod without_rowid_runtime_tests {
                 .unwrap();
                 for sql in [
                     "INSERT INTO wr_col VALUES ('pk-3', 'u-2');",
-                    "INSERT INTO wr_reversed VALUES ('u-2', 'pk-3');",
                     "INSERT INTO wr_table VALUES ('pk-3', 'u-2');",
                     "INSERT INTO wr_integer VALUES (3, 'u-2');",
                 ] {
@@ -158745,10 +162876,6 @@ mod without_rowid_runtime_tests {
             for (sql, expected) in [
                 (
                     "SELECT pk FROM wr_col INDEXED BY sqlite_autoindex_wr_col_2 WHERE u = 'u-2';",
-                    rusqlite::types::Value::Text("pk-2".to_owned()),
-                ),
-                (
-                    "SELECT pk FROM wr_reversed INDEXED BY sqlite_autoindex_wr_reversed_1 WHERE u = 'u-2';",
                     rusqlite::types::Value::Text("pk-2".to_owned()),
                 ),
                 (
@@ -160994,38 +165121,6 @@ mod schema_cookie_tests {
     }
 
     #[test]
-    fn test_cleanup_failed_savepoint_setup_skips_pager_release_after_rollback_failure() {
-        asupersync::test_utils::run_test(|| async {
-            let conn = Connection::open(":memory:").await.unwrap();
-            let cx = conn.op_cx().unwrap();
-            let pager = fsqlite_pager::traits::MockMvccPager;
-            let txn = fsqlite_pager::MvccPager::begin(
-                &pager,
-                &cx,
-                fsqlite_pager::TransactionMode::Deferred,
-            )
-            .await
-            .unwrap();
-            *conn.active_txn.borrow_mut() = Some(txn.into());
-
-            let cleanup_errors = conn.cleanup_failed_savepoint_setup(&cx, "missing_sp", None);
-            assert_eq!(
-                cleanup_errors.len(),
-                1,
-                "unexpected cleanup errors: {cleanup_errors:?}"
-            );
-            assert!(
-                cleanup_errors[0].contains("rollback_to_savepoint('missing_sp') failed"),
-                "unexpected cleanup error: {cleanup_errors:?}",
-            );
-            assert!(
-                !cleanup_errors[0].contains("release_savepoint"),
-                "cleanup must not release a pager savepoint after rollback failure: {cleanup_errors:?}",
-            );
-        });
-    }
-
-    #[test]
     fn test_statement_savepoint_cleanup_skips_pager_release_after_rollback_failure() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -163224,6 +167319,7 @@ SELECT x FROM t;
         });
     }
 
+    #[cfg(feature = "ext-fts5")]
     #[test]
     fn test_reopen_duplicate_fts5_rootpage_zero_allows_authoritative_repair() {
         asupersync::test_utils::run_test(|| async {
@@ -163243,7 +167339,19 @@ SELECT x FROM t;
                     );
                     INSERT INTO docs_fts(rowid, title, body)
                     VALUES(1, 'rust', 'persisted repair');
+                    CREATE TABLE leftover_content(
+                        id INTEGER PRIMARY KEY,
+                        c0 TEXT,
+                        c1 TEXT
+                    );
+                    INSERT INTO leftover_content(id, c0, c1)
+                    VALUES(99, 'sentinel', 'must remain untouched');
                     PRAGMA writable_schema = ON;
+                    UPDATE sqlite_master
+                    SET name = 'docs_fts_content',
+                        tbl_name = 'docs_fts_content',
+                        sql = 'CREATE TABLE docs_fts_content(id INTEGER PRIMARY KEY, c0 TEXT, c1 TEXT)'
+                    WHERE type = 'table' AND name = 'leftover_content';
                     INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
                     VALUES(
                         'table',
@@ -163268,6 +167376,34 @@ SELECT x FROM t;
                     .unwrap();
                 assert_eq!(schema_rows.len(), 1);
                 assert_eq!(schema_rows[0].values()[0], SqliteValue::Integer(1));
+                {
+                    let instances = conn.vtab_instances.borrow();
+                    let fts5 = instances
+                        .get("DOCS_FTS")
+                        .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                        .expect("authoritative repair row should reconnect as FTS5");
+                    assert_eq!(
+                        fts5.config().content_mode(),
+                        fsqlite_ext_fts5::ContentMode::Contentless,
+                        "a leftover _content table must not make the stale default row authoritative"
+                    );
+                }
+                let cached_ddl = conn
+                    .original_ddl_sql
+                    .borrow()
+                    .get("docs_fts")
+                    .cloned()
+                    .expect("canonical virtual-table DDL should be cached");
+                let Statement::CreateVirtualTable(cached_create) =
+                    parse_single_statement(&cached_ddl).unwrap()
+                else {
+                    panic!("cached canonical DDL is not CREATE VIRTUAL TABLE: {cached_ddl}");
+                };
+                assert_eq!(
+                    virtual_table_option_value(&cached_create.args, "content"),
+                    Some(String::new()),
+                    "cached DDL must retain the authoritative contentless declaration"
+                );
                 let persisted = conn
                     .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'persisted';")
                     .await
@@ -163286,6 +167422,22 @@ SELECT x FROM t;
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
                 assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+                let sentinel = conn
+                    .query("SELECT id, c0, c1 FROM docs_fts_content ORDER BY id;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    sentinel
+                        .iter()
+                        .map(|row| row.values().to_vec())
+                        .collect::<Vec<_>>(),
+                    vec![vec![
+                        SqliteValue::Integer(99),
+                        SqliteValue::Text("sentinel".into()),
+                        SqliteValue::Text("must remain untouched".into()),
+                    ]],
+                    "contentless inserts must not mutate a leftover/user _content table"
+                );
             }
 
             let reopened = Connection::open(&db_str)
@@ -163304,6 +167456,21 @@ SELECT x FROM t;
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
             assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+            let sentinel = reopened
+                .query("SELECT id, c0, c1 FROM docs_fts_content ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(
+                sentinel
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![
+                    SqliteValue::Integer(99),
+                    SqliteValue::Text("sentinel".into()),
+                    SqliteValue::Text("must remain untouched".into()),
+                ]]
+            );
         });
     }
 
@@ -189787,10 +193954,7 @@ mod pager_routing_tests {
             ] {
                 let explicit = conn.query(sql).await.unwrap();
                 assert_eq!(explicit.len(), 1, "unexpected rows for `{sql}`");
-                assert_eq!(
-                    explicit[0].values(),
-                    &[SqliteValue::Text("X".into())]
-                );
+                assert_eq!(explicit[0].values(), &[SqliteValue::Text("X".into())]);
             }
 
             conn.execute("CREATE TABLE plan_range_collation (a TEXT);")
@@ -197476,10 +201640,7 @@ mod pager_routing_tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
 
-            async fn direct_and_prepared_errors(
-                conn: &Connection,
-                sql: &str,
-            ) -> Vec<FrankenError> {
+            async fn direct_and_prepared_errors(conn: &Connection, sql: &str) -> Vec<FrankenError> {
                 let direct = conn
                     .query(sql)
                     .await
@@ -197591,9 +201752,7 @@ mod pager_routing_tests {
                 );
             }
 
-            for error in
-                direct_and_prepared_errors(&conn, "SELECT 1 ORDER BY 65535, nope;").await
-            {
+            for error in direct_and_prepared_errors(&conn, "SELECT 1 ORDER BY 65535, nope;").await {
                 assert!(
                     matches!(
                         &error,
@@ -197807,7 +201966,10 @@ mod pager_routing_tests {
                 let direct = conn.query(sql).await.unwrap();
                 assert_eq!(direct[0].values(), &[expected]);
                 let prepared = conn.prepare(sql).await.unwrap().query().await.unwrap();
-                assert_eq!(prepared, direct, "dead relation subtree changed for `{sql}`");
+                assert_eq!(
+                    prepared, direct,
+                    "dead relation subtree changed for `{sql}`"
+                );
             }
 
             conn.execute(
@@ -197816,11 +201978,8 @@ mod pager_routing_tests {
             )
             .await
             .unwrap();
-            for error in direct_and_prepared_errors(
-                &conn,
-                "SELECT * FROM deferred_relation_view;",
-            )
-            .await
+            for error in
+                direct_and_prepared_errors(&conn, "SELECT * FROM deferred_relation_view;").await
             {
                 assert!(
                     matches!(
@@ -197833,11 +201992,8 @@ mod pager_routing_tests {
                 );
             }
 
-            for error in direct_and_prepared_errors(
-                &conn,
-                "SELECT * FROM missing_table_function(1);",
-            )
-            .await
+            for error in
+                direct_and_prepared_errors(&conn, "SELECT * FROM missing_table_function(1);").await
             {
                 assert!(
                     matches!(
@@ -197849,11 +202005,8 @@ mod pager_routing_tests {
                 );
             }
 
-            for error in direct_and_prepared_errors(
-                &conn,
-                "SELECT * FROM relation_scope_t(1);",
-            )
-            .await
+            for error in
+                direct_and_prepared_errors(&conn, "SELECT * FROM relation_scope_t(1);").await
             {
                 assert!(
                     matches!(
@@ -197872,11 +202025,8 @@ mod pager_routing_tests {
             )
             .await
             .unwrap();
-            for error in direct_and_prepared_errors(
-                &conn,
-                "SELECT * FROM circular_relation_view;",
-            )
-            .await
+            for error in
+                direct_and_prepared_errors(&conn, "SELECT * FROM circular_relation_view;").await
             {
                 assert!(
                     matches!(
@@ -198003,8 +202153,7 @@ mod pager_routing_tests {
             }
 
             for prepared in [false, true] {
-                let sql =
-                    "VALUES (2), (1) UNION ALL SELECT 3 ORDER BY column1;";
+                let sql = "VALUES (2), (1) UNION ALL SELECT 3 ORDER BY column1;";
                 let rows = if prepared {
                     conn.prepare(sql).await.unwrap().query().await.unwrap()
                 } else {
@@ -198021,17 +202170,14 @@ mod pager_routing_tests {
                 );
             }
 
-            conn.execute(
-                "CREATE TABLE compound_star_layout (a INTEGER, b INTEGER);",
-            )
-            .await
-            .unwrap();
+            conn.execute("CREATE TABLE compound_star_layout (a INTEGER, b INTEGER);")
+                .await
+                .unwrap();
             conn.execute("INSERT INTO compound_star_layout VALUES (2, 20);")
                 .await
                 .unwrap();
             for prepared in [false, true] {
-                let sql =
-                    "SELECT *, a AS marker FROM compound_star_layout \
+                let sql = "SELECT *, a AS marker FROM compound_star_layout \
                      UNION ALL SELECT 1, 10, 1 ORDER BY marker;";
                 let rows = if prepared {
                     conn.prepare(sql).await.unwrap().query().await.unwrap()
@@ -198114,10 +202260,7 @@ mod pager_routing_tests {
                     };
                     assert_eq!(
                         rows.iter().map(row_values).collect::<Vec<_>>(),
-                        vec![
-                            vec![SqliteValue::Integer(1)],
-                            vec![SqliteValue::Integer(2)],
-                        ],
+                        vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)],],
                         "derived-table star output must retain only real qualifiers for `{sql}`"
                     );
                 }
@@ -198151,8 +202294,7 @@ mod pager_routing_tests {
                 conn.execute(sql).await.unwrap();
             }
             for prepared in [false, true] {
-                let sql =
-                    "SELECT * \
+                let sql = "SELECT * \
                      FROM compound_star_left AS left_source \
                      JOIN compound_star_right AS right_source USING (a) \
                      UNION ALL SELECT 1, 10, 100 ORDER BY left_source.a;";
@@ -198198,8 +202340,7 @@ mod pager_routing_tests {
                 );
             }
             for prepared in [false, true] {
-                let sql =
-                    "SELECT right_source.* \
+                let sql = "SELECT right_source.* \
                      FROM compound_star_left AS left_source \
                      JOIN compound_star_right AS right_source USING (a) \
                      UNION ALL SELECT 1, 100 ORDER BY right_source.a;";
@@ -198291,10 +202432,7 @@ mod pager_routing_tests {
                 .unwrap();
             assert_eq!(
                 rows.iter().map(row_values).collect::<Vec<_>>(),
-                vec![
-                    vec![SqliteValue::Integer(1)],
-                    vec![SqliteValue::Integer(2)],
-                ]
+                vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)],]
             );
 
             let rows = conn
