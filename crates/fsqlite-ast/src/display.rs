@@ -285,6 +285,94 @@ fn write_operand(f: &mut fmt::Formatter<'_>, expr: &crate::Expr) -> fmt::Result 
     }
 }
 
+/// Binding power of an AST binary operator.
+///
+/// These levels deliberately mirror `fsqlite-parser`'s Pratt binding powers.
+/// Only their relative ordering matters here.
+const fn binary_operator_precedence(op: BinaryOp) -> u8 {
+    match op {
+        BinaryOp::Or => 1,
+        BinaryOp::And => 3,
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Is | BinaryOp::IsNot => 7,
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => 9,
+        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::ShiftLeft | BinaryOp::ShiftRight => 13,
+        BinaryOp::Add | BinaryOp::Subtract => 15,
+        BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo => 17,
+        BinaryOp::Concat => 19,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BinaryChildSide {
+    Left,
+    Right,
+}
+
+enum BinaryWriteAction<'a> {
+    Expr {
+        expr: &'a crate::Expr,
+        parent: Option<(u8, BinaryChildSide)>,
+    },
+    Operator(BinaryOp),
+    CloseParenthesis,
+}
+
+/// Write an arbitrarily deep binary-expression tree without using the process
+/// stack and without serializing a left-associative parser spine as a
+/// parenthesis spine.
+///
+/// SQLite's binary operators are left-associative. A child therefore needs
+/// parentheses exactly when it binds more weakly than its parent, or when it
+/// is the right child at the same precedence. This preserves an explicitly
+/// right-nested tree such as `a OR (b OR c)` while rendering the ordinary
+/// left-deep parse of `a OR b OR c` flat. Applying the same rule to every
+/// binary precedence class also prevents large arithmetic or comparison
+/// expressions from acquiring one new physical parser frame per schema
+/// round-trip.
+fn write_binary_expression(f: &mut fmt::Formatter<'_>, root: &crate::Expr) -> fmt::Result {
+    let mut pending = vec![BinaryWriteAction::Expr {
+        expr: root,
+        parent: None,
+    }];
+
+    while let Some(action) = pending.pop() {
+        match action {
+            BinaryWriteAction::Expr { expr, parent } => {
+                let crate::Expr::BinaryOp {
+                    left, op, right, ..
+                } = expr
+                else {
+                    write_operand(f, expr)?;
+                    continue;
+                };
+
+                let precedence = binary_operator_precedence(*op);
+                let needs_parentheses = parent.is_some_and(|(parent_precedence, side)| {
+                    precedence < parent_precedence
+                        || (precedence == parent_precedence
+                            && matches!(side, BinaryChildSide::Right))
+                });
+                if needs_parentheses {
+                    f.write_str("(")?;
+                    pending.push(BinaryWriteAction::CloseParenthesis);
+                }
+                pending.push(BinaryWriteAction::Expr {
+                    expr: right,
+                    parent: Some((precedence, BinaryChildSide::Right)),
+                });
+                pending.push(BinaryWriteAction::Operator(*op));
+                pending.push(BinaryWriteAction::Expr {
+                    expr: left,
+                    parent: Some((precedence, BinaryChildSide::Left)),
+                });
+            }
+            BinaryWriteAction::Operator(op) => write!(f, " {op} ")?,
+            BinaryWriteAction::CloseParenthesis => f.write_str(")")?,
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Literal
 // ---------------------------------------------------------------------------
@@ -327,6 +415,10 @@ impl fmt::Display for Literal {
 
 impl fmt::Display for ColumnRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ref schema) = self.schema {
+            write_ident(f, schema)?;
+            f.write_str(".")?;
+        }
         if let Some(ref t) = self.table {
             write_ident(f, t)?;
             f.write_str(".")?;
@@ -406,13 +498,7 @@ impl fmt::Display for Expr {
         match self {
             Self::Literal(lit, _) => write!(f, "{lit}"),
             Self::Column(col, _) => write!(f, "{col}"),
-            Self::BinaryOp {
-                left, op, right, ..
-            } => {
-                write_operand(f, left)?;
-                write!(f, " {op} ")?;
-                write_operand(f, right)
-            }
+            Self::BinaryOp { .. } => write_binary_expression(f, self),
             Self::UnaryOp { op, expr, .. } => {
                 if matches!(op, UnaryOp::Not) {
                     write!(f, "NOT ")?;
@@ -1429,7 +1515,13 @@ impl fmt::Display for TableConstraintKind {
                 }
                 Ok(())
             }
-            Self::Check(expr) => write!(f, "CHECK ({expr})"),
+            Self::Check { expr, conflict } => {
+                write!(f, "CHECK ({expr})")?;
+                if let Some(action) = conflict {
+                    write!(f, " ON CONFLICT {action}")?;
+                }
+                Ok(())
+            }
             Self::ForeignKey { columns, clause } => {
                 f.write_str("FOREIGN KEY (")?;
                 comma_list_fn(f, columns, |col, f| write_ident(f, col))?;
@@ -1820,5 +1912,105 @@ impl fmt::Display for Statement {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(name: &str) -> Expr {
+        Expr::Column(ColumnRef::bare(name), Span::ZERO)
+    }
+
+    fn binary(left: Expr, op: BinaryOp, right: Expr) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+            span: Span::ZERO,
+        }
+    }
+
+    #[test]
+    fn binary_display_preserves_associativity_and_precedence() {
+        let left_deep_or = binary(
+            binary(column("a"), BinaryOp::Or, column("b")),
+            BinaryOp::Or,
+            column("c"),
+        );
+        assert_eq!(left_deep_or.to_string(), "a OR b OR c");
+
+        let right_nested_or = binary(
+            column("a"),
+            BinaryOp::Or,
+            binary(column("b"), BinaryOp::Or, column("c")),
+        );
+        assert_eq!(right_nested_or.to_string(), "a OR (b OR c)");
+
+        let weaker_left_child = binary(
+            binary(column("a"), BinaryOp::Or, column("b")),
+            BinaryOp::And,
+            column("c"),
+        );
+        assert_eq!(weaker_left_child.to_string(), "(a OR b) AND c");
+
+        let stronger_right_child = binary(
+            column("a"),
+            BinaryOp::Or,
+            binary(column("b"), BinaryOp::And, column("c")),
+        );
+        assert_eq!(stronger_right_child.to_string(), "a OR b AND c");
+
+        let same_precedence_right_child = binary(
+            column("a"),
+            BinaryOp::Subtract,
+            binary(column("b"), BinaryOp::Add, column("c")),
+        );
+        assert_eq!(same_precedence_right_child.to_string(), "a - (b + c)");
+
+        let same_precedence_left_child = binary(
+            binary(column("a"), BinaryOp::Add, column("b")),
+            BinaryOp::Subtract,
+            column("c"),
+        );
+        assert_eq!(same_precedence_left_child.to_string(), "a + b - c");
+    }
+
+    #[test]
+    fn binary_display_is_iterative_on_a_small_stack() {
+        std::thread::Builder::new()
+            .name("ast-binary-display-stack-canary".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                const TERM_COUNT: usize = 999;
+                let mut expression = Expr::Literal(Literal::Integer(0), Span::ZERO);
+                for value in 1..TERM_COUNT {
+                    expression = binary(
+                        expression,
+                        BinaryOp::Or,
+                        Expr::Literal(Literal::Integer(i64::try_from(value).unwrap()), Span::ZERO),
+                    );
+                }
+
+                let rendered = expression.to_string();
+                assert_eq!(rendered.matches(" OR ").count(), TERM_COUNT - 1);
+                assert_eq!(rendered.matches('(').count(), 0);
+
+                // This test isolates the formatter's native-stack behavior.
+                // Consume this synthetic binary-only tree iteratively so its
+                // recursive drop glue cannot turn a formatter regression into
+                // a process-aborting test.
+                let mut drop_stack = vec![expression];
+                while let Some(node) = drop_stack.pop() {
+                    if let Expr::BinaryOp { left, right, .. } = node {
+                        drop_stack.push(*right);
+                        drop_stack.push(*left);
+                    }
+                }
+            })
+            .expect("spawn binary-display stack canary")
+            .join()
+            .expect("binary-display stack canary panicked");
     }
 }

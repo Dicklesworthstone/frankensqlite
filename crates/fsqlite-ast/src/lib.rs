@@ -216,6 +216,11 @@ pub enum Literal {
 /// A reference to a column, possibly qualified with a table name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnRef {
+    /// Optional database-schema qualifier.
+    ///
+    /// This is distinct from [`Self::table`]: a quoted identifier containing
+    /// a dot is one table component, not a schema/table pair.
+    pub schema: Option<Arc<str>>,
     /// Optional table (or alias) qualifier.
     pub table: Option<Arc<str>>,
     /// Column name.
@@ -227,6 +232,7 @@ impl ColumnRef {
     #[must_use]
     pub fn bare(column: impl Into<Arc<str>>) -> Self {
         Self {
+            schema: None,
             table: None,
             column: column.into(),
         }
@@ -236,6 +242,21 @@ impl ColumnRef {
     #[must_use]
     pub fn qualified(table: impl Into<Arc<str>>, column: impl Into<Arc<str>>) -> Self {
         Self {
+            schema: None,
+            table: Some(table.into()),
+            column: column.into(),
+        }
+    }
+
+    /// Create a schema-and-table-qualified column reference.
+    #[must_use]
+    pub fn schema_qualified(
+        schema: impl Into<Arc<str>>,
+        table: impl Into<Arc<str>>,
+        column: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            schema: Some(schema.into()),
             table: Some(table.into()),
             column: column.into(),
         }
@@ -1337,7 +1358,13 @@ pub enum TableConstraintKind {
         columns: Vec<IndexedColumn>,
         conflict: Option<ConflictAction>,
     },
-    Check(Expr),
+    Check {
+        expr: Expr,
+        /// Accepted by SQLite for historical compatibility. SQLite does not
+        /// apply this conflict policy when evaluating the CHECK constraint,
+        /// but preserving it keeps stored schema SQL round-trippable.
+        conflict: Option<ConflictAction>,
+    },
     ForeignKey {
         columns: Vec<String>,
         clause: ForeignKeyClause,
@@ -1761,6 +1788,17 @@ impl ResolverScope {
     /// For unqualified refs (`col`): search all tables; error if ambiguous.
     /// If not found in this scope, search parent scopes (correlated subquery).
     pub fn resolve(&self, col: &ColumnRef, span: Span) -> Result<ResolvedColumn, ResolveError> {
+        if let Some(schema) = &col.schema {
+            // This legacy resolver has no database identity in `TableSchema`.
+            // Fail closed instead of silently treating a three-part reference
+            // as its two-part suffix. The execution layer has the equivalent
+            // guard until VDBE table metadata can distinguish main and TEMP.
+            let table = col.table.as_deref().unwrap_or_default();
+            return Err(ResolveError::NoSuchTable {
+                name: format!("{schema}.{table}"),
+                span,
+            });
+        }
         match &col.table {
             Some(table_name) => self.resolve_qualified(table_name, &col.column, span),
             None => self.resolve_unqualified(&col.column, span),
@@ -3012,12 +3050,23 @@ mod tests {
     #[test]
     fn test_column_ref_constructors() {
         let bare = ColumnRef::bare("col");
+        assert!(bare.schema.is_none());
         assert!(bare.table.is_none());
         assert_eq!(bare.column.as_ref(), "col");
 
         let qual = ColumnRef::qualified("tbl", "col");
+        assert!(qual.schema.is_none());
         assert_eq!(qual.table.as_deref(), Some("tbl"));
         assert_eq!(qual.column.as_ref(), "col");
+
+        let schema_qual = ColumnRef::schema_qualified("main", "tbl", "col");
+        assert_eq!(schema_qual.schema.as_deref(), Some("main"));
+        assert_eq!(schema_qual.table.as_deref(), Some("tbl"));
+        assert_eq!(schema_qual.column.as_ref(), "col");
+        assert_eq!(schema_qual.to_string(), "main.tbl.col");
+
+        let dotted = ColumnRef::qualified("main.tbl", "col");
+        assert_eq!(dotted.to_string(), "\"main.tbl\".col");
     }
 
     #[test]

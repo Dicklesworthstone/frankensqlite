@@ -158,3 +158,87 @@ fn test_issue_122_null_test_precedence_matches_c_sqlite() {
         }
     });
 }
+
+#[test]
+fn test_wide_boolean_check_schema_stays_flat_and_reopenable() {
+    asupersync::test_utils::run_test(|| async {
+        const TERM_COUNT: usize = 512;
+        let predicate = (0..TERM_COUNT)
+            .map(|value| format!("kind = {value}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let create_sql =
+            format!("CREATE TABLE wide(kind INTEGER CHECK ({predicate}), payload TEXT) STRICT");
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let path = tmp.path().to_str().expect("utf-8 temp path");
+
+        {
+            let conn = Connection::open(path).await.expect("open file db");
+            conn.execute(&create_sql).await.expect("create wide table");
+        }
+
+        let conn = Connection::open(path)
+            .await
+            .expect("wide flat CHECK must reopen without recursive parser exhaustion");
+        let rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'wide'",
+            )
+            .await
+            .expect("read stored schema text");
+        let stored_sql = match rows.as_slice() {
+            [row] => match &row.values()[0] {
+                SqliteValue::Text(sql) => sql,
+                other => panic!("expected stored schema TEXT, got {other:?}"),
+            },
+            other => panic!("expected exactly one schema row, got {other:?}"),
+        };
+
+        assert_eq!(
+            stored_sql.matches(" OR ").count(),
+            TERM_COUNT - 1,
+            "every logical term must survive schema serialization"
+        );
+        assert!(
+            stored_sql.matches('(').count() < 16,
+            "flat OR chain must not become a parser-stack-sized parenthesis spine: {stored_sql}"
+        );
+        conn.execute("INSERT INTO wide VALUES (511, 'accepted')")
+            .await
+            .expect("last predicate term must remain reachable");
+        assert!(
+            conn.execute("INSERT INTO wide VALUES (512, 'rejected')")
+                .await
+                .is_err(),
+            "out-of-domain value must still violate the CHECK"
+        );
+    });
+}
+
+#[test]
+fn test_deep_parentheses_fail_closed_on_small_stack() {
+    let worker = std::thread::Builder::new()
+        .name("fsqlite-parser-small-stack".to_owned())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let nested = format!("SELECT {}1{}", "(".repeat(2_000), ")".repeat(2_000));
+            let mut parser = fsqlite_parser::Parser::from_sql(&nested);
+            let (statements, errors) = parser.parse_all();
+            assert!(
+                statements.is_empty(),
+                "over-depth SQL must not publish a partial statement"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message.contains("expression tree is too deep")),
+                "expected deterministic depth error, got {errors:?}"
+            );
+        })
+        .expect("spawn 2 MiB parser thread");
+
+    worker
+        .join()
+        .expect("deep nesting must return an error instead of aborting the process");
+}

@@ -9,7 +9,7 @@ use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
     WAL_TOTAL_LOCKS,
 };
-use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion};
+use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
@@ -564,6 +564,71 @@ impl MemoryFile {
         Ok(())
     }
 
+    fn write_batch_into_storage(
+        inner: &mut MemoryVfsInner,
+        storage: &mut FileStorage,
+        writes: &[(u64, &[u8])],
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        if writes.len() == 1 {
+            let (offset, data) = writes[0];
+            return Self::write_into_storage(inner, storage, data, offset);
+        }
+
+        let mut normalized_writes = Vec::with_capacity(writes.len());
+        let mut required_len = storage.data.len();
+        for &(offset, data) in writes {
+            if data.is_empty() {
+                continue;
+            }
+            let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
+            required_len = required_len.max(end);
+            normalized_writes.push((offset, data));
+        }
+
+        if normalized_writes.is_empty() {
+            return Ok(());
+        }
+
+        let old_len = storage.data.len();
+        let old_reserved = storage.data.capacity();
+        if required_len > old_reserved {
+            let proposed_reserved = next_growth_target(
+                old_reserved,
+                required_len,
+                inner.config.initial_reserve_bytes,
+                inner.config.growth_chunk_bytes,
+            );
+            ensure_total_reserved_within_limit(
+                &inner.usage,
+                old_reserved,
+                proposed_reserved,
+                inner.config.max_bytes,
+            )?;
+            storage
+                .data
+                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
+                .map_err(|_| FrankenError::OutOfMemory)?;
+        }
+
+        if required_len > storage.data.len() {
+            storage.data.resize(required_len, 0);
+        }
+        for (offset, data) in normalized_writes {
+            let end = offset + data.len();
+            storage.data[offset..end].copy_from_slice(data);
+        }
+        inner.usage.apply_file_change(
+            old_len,
+            old_reserved,
+            storage.data.len(),
+            storage.data.capacity(),
+        );
+        Ok(())
+    }
+
     fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<MemoryShmInfo>>> {
         if let Some(info) = &self.shm_info {
             return Ok(Arc::clone(info));
@@ -860,98 +925,66 @@ impl VfsFile for MemoryFile {
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    #[allow(clippy::unused_async_trait_impl)] // lazy future required by the trait; body is synchronous
-    async fn write_tracked(
-        &self,
-        cx: &Cx,
-        buf: &[u8],
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> Result<()> {
-        let result = (|| {
-            checkpoint_or_abort(cx)?;
-            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-            Self::write_into_storage(&mut inner, &mut storage, buf, offset)
-        })();
-        if result.is_ok() {
-            completion.complete_success();
-        } else {
-            completion.complete_error();
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            let result = (|| {
+                checkpoint_or_abort(cx)?;
+                let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+                let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+                Self::write_into_storage(&mut inner, &mut storage, buf, offset)
+            })();
+            if result.is_ok() {
+                source_completion.complete_success();
+            } else {
+                source_completion.complete_error();
+            }
+            result
         }
-        result
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    #[allow(clippy::unused_async_trait_impl)] // lazy future required by the trait; body is synchronous
-    async fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        if writes.is_empty() {
-            return Ok(());
+    fn write_page_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+            Self::write_batch_into_storage(&mut inner, &mut storage, writes)
         }
-        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+    }
 
-        if writes.len() == 1 {
-            let (offset, data) = writes[0];
-            return Self::write_into_storage(&mut inner, &mut storage, data, offset);
-        }
-
-        let mut normalized_writes = Vec::with_capacity(writes.len());
-        let mut required_len = storage.data.len();
-        for &(offset, data) in writes {
-            if data.is_empty() {
-                continue;
-            }
-            let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
-            required_len = required_len.max(end);
-            normalized_writes.push((offset, data));
-        }
-
-        if normalized_writes.is_empty() {
-            return Ok(());
-        }
-
-        let old_len = storage.data.len();
-        let old_reserved = storage.data.capacity();
-        if required_len > old_reserved {
-            let proposed_reserved = next_growth_target(
-                old_reserved,
-                required_len,
-                inner.config.initial_reserve_bytes,
-                inner.config.growth_chunk_bytes,
-            );
-            ensure_total_reserved_within_limit(
-                &inner.usage,
-                old_reserved,
-                proposed_reserved,
-                inner.config.max_bytes,
-            )?;
-            storage
-                .data
-                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
-                .map_err(|_| FrankenError::OutOfMemory)?;
-        }
-
-        if required_len > storage.data.len() {
-            storage.data.resize(required_len, 0);
-        }
-
-        for (offset, data) in normalized_writes {
-            let end = offset + data.len();
-            if end == storage.data.len() && offset == storage.data.len() - data.len() {
-                storage.data[offset..].copy_from_slice(data);
+    #[allow(clippy::significant_drop_tightening)]
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            let result = (|| {
+                checkpoint_or_abort(cx)?;
+                let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+                let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+                Self::write_batch_into_storage(&mut inner, &mut storage, writes)
+            })();
+            if result.is_ok() {
+                source_completion.complete_success();
             } else {
-                storage.data[offset..end].copy_from_slice(data);
+                source_completion.complete_error();
             }
+            result
         }
-        inner.usage.apply_file_change(
-            old_len,
-            old_reserved,
-            storage.data.len(),
-            storage.data.capacity(),
-        );
-        Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -2160,9 +2193,15 @@ mod tests {
             .open(&cx, Some(Path::new("batch_write.db")), flags)
             .unwrap();
 
+        crate::traits::reset_write_completion_creation_count();
         file.write(&cx, b"01234567", 0).unwrap();
         file.write_page_batch(&cx, &[(2, &b"AB"[..]), (8, &b"XYZ"[..])])
             .unwrap();
+        assert_eq!(
+            crate::traits::write_completion_creation_count(),
+            0,
+            "ordinary memory writes must not allocate completion tracking"
+        );
 
         let mut buf = [0_u8; 11];
         file.read(&cx, &mut buf, 0).unwrap();

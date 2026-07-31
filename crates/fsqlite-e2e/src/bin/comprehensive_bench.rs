@@ -12546,9 +12546,9 @@ fn bridge_sample_insert_worker(
     );
     bridge_worker_command(&mut worker_commands, result, "worker arm create schema")?;
     let result = conn.begin_transaction_sync();
-    bridge_worker_command(&mut worker_commands, result, "worker arm begin")?;
+    let mut transaction = bridge_worker_command(&mut worker_commands, result, "worker arm begin")?;
 
-    let result = conn.execute_with_params_sync(
+    let result = transaction.execute_with_params_sync(
         BRIDGE_INSERT_SQL,
         &[
             fsqlite::SqliteValue::Integer(-1),
@@ -12557,7 +12557,7 @@ fn bridge_sample_insert_worker(
     );
     let warm_affected = bridge_worker_command(&mut worker_commands, result, "worker raw warmup")?;
     bridge_verify_affected_rows(warm_affected, "worker raw warmup")?;
-    let result = conn.execute_sync("DELETE FROM bridge_probe WHERE id = -1");
+    let result = transaction.execute_sync("DELETE FROM bridge_probe WHERE id = -1");
     let deleted = bridge_worker_command(&mut worker_commands, result, "worker raw warmup cleanup")?;
     bridge_verify_affected_rows(deleted, "worker raw warmup cleanup")?;
 
@@ -12566,7 +12566,7 @@ fn bridge_sample_insert_worker(
     for value in 0..operation_count {
         let value =
             i64::try_from(value).map_err(|_| "worker-insert value exceeds i64::MAX".to_owned())?;
-        let result = conn.execute_with_params_sync(
+        let result = transaction.execute_with_params_sync(
             BRIDGE_INSERT_SQL,
             &[
                 fsqlite::SqliteValue::Integer(value),
@@ -12587,8 +12587,9 @@ fn bridge_sample_insert_worker(
         ));
     }
 
-    let result = conn.commit_transaction_sync();
+    let result = transaction.commit_sync();
     bridge_worker_command(&mut worker_commands, result, "worker arm commit")?;
+    drop(transaction);
     let result = conn.query_row_with_params_sync(
         BRIDGE_EXACT_ORACLE_SQL,
         &[fsqlite::SqliteValue::Integer(

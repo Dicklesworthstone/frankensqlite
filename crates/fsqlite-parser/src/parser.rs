@@ -181,12 +181,28 @@ impl StatementParseScratch {
 // Parser
 // ---------------------------------------------------------------------------
 
-/// Maximum expression nesting depth.
+/// Maximum nested parser call depth.
 ///
-/// Matches C SQLite's default `SQLITE_MAX_EXPR_DEPTH` (1000). C SQLite
-/// allows compile-time override; this constant could be made generic or
-/// builder-configurable if needed.
-pub const MAX_PARSE_DEPTH: u32 = 1000;
+/// This physical-stack guard is deliberately independent of
+/// [`fsqlite_types::limits::MAX_EXPR_DEPTH`], which limits logical [`Expr`]
+/// height. Rust parser frames are substantially larger than C parser frames,
+/// especially in debug and async-integrated builds. Allowing 1000 physical
+/// calls let hostile or accidentally re-parenthesized schema text exhaust an
+/// ordinary 2 MiB worker stack before the configured error boundary could run.
+/// Wide, flat expression chains are parsed iteratively and are not constrained
+/// by this physical limit.
+///
+/// Keep this below the process-abort boundary proven by the dedicated
+/// small-stack regression test. Supporting deeper semantic expression trees
+/// requires an explicit-stack parser, not raising this physical recursion
+/// limit.
+pub const MAX_PHYSICAL_PARSE_DEPTH: u32 = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorRecoveryDisposition {
+    Statement,
+    Trigger,
+}
 
 pub struct Parser {
     pub(crate) tokens: Vec<Token>,
@@ -207,9 +223,11 @@ impl Parser {
     }
 
     pub(crate) fn enter_recursion(&mut self) -> Result<(), ParseError> {
-        if self.depth >= MAX_PARSE_DEPTH {
+        if self.depth >= MAX_PHYSICAL_PARSE_DEPTH {
             return Err(self.err_msg(format!(
-                "expression tree is too deep (maximum depth {MAX_PARSE_DEPTH})"
+                "expression tree is too deep: parser recursion limit exceeded \
+                 (maximum nested calls \
+                 {MAX_PHYSICAL_PARSE_DEPTH})"
             )));
         }
         self.depth += 1;
@@ -258,6 +276,8 @@ impl Parser {
                 self.advance();
                 continue;
             }
+            let statement_start = self.pos;
+            let recovery_disposition = self.error_recovery_disposition(statement_start);
             match self.parse_statement() {
                 Ok(s) => {
                     if collect_parse_metrics {
@@ -275,8 +295,17 @@ impl Parser {
                         error = %e,
                         "parse recovery: skipping malformed statement"
                     );
+                    let depth_limit_error = Self::is_depth_limit_error(&e);
                     self.errors.push(e);
-                    self.synchronize();
+                    match recovery_disposition {
+                        ErrorRecoveryDisposition::Trigger => {
+                            self.synchronize_trigger_after_error(statement_start);
+                        }
+                        ErrorRecoveryDisposition::Statement if depth_limit_error => {
+                            self.synchronize_after_depth_error(statement_start);
+                        }
+                        ErrorRecoveryDisposition::Statement => self.synchronize(),
+                    }
                 }
             }
         }
@@ -403,33 +432,180 @@ impl Parser {
         }
     }
 
-    fn recover_trigger_body_after_error(&mut self) {
-        let mut case_depth = 0_usize;
+    fn is_depth_limit_error(error: &ParseError) -> bool {
+        error.message.contains("expression AST is too deep")
+            || error.message.contains("parser recursion limit exceeded")
+    }
+
+    fn error_recovery_disposition(&self, statement_start: usize) -> ErrorRecoveryDisposition {
+        let mut index = statement_start;
+        if self
+            .tokens
+            .get(index)
+            .is_some_and(|token| token.kind == TokenKind::KwExplain)
+        {
+            index = index.saturating_add(1);
+            if self
+                .tokens
+                .get(index)
+                .is_some_and(|token| token.kind == TokenKind::KwQuery)
+            {
+                index = index.saturating_add(1);
+                if !self
+                    .tokens
+                    .get(index)
+                    .is_some_and(|token| token.kind == TokenKind::KwPlan)
+                {
+                    return ErrorRecoveryDisposition::Statement;
+                }
+                index = index.saturating_add(1);
+            }
+        }
+        if !self
+            .tokens
+            .get(index)
+            .is_some_and(|token| token.kind == TokenKind::KwCreate)
+        {
+            return ErrorRecoveryDisposition::Statement;
+        }
+        index = index.saturating_add(1);
+        if self
+            .tokens
+            .get(index)
+            .is_some_and(|token| matches!(&token.kind, TokenKind::KwTemp | TokenKind::KwTemporary))
+        {
+            index = index.saturating_add(1);
+        }
+        if self
+            .tokens
+            .get(index)
+            .is_some_and(|token| token.kind == TokenKind::KwTrigger)
+        {
+            ErrorRecoveryDisposition::Trigger
+        } else {
+            ErrorRecoveryDisposition::Statement
+        }
+    }
+
+    /// Recover a rejected overheight statement without mistaking a nested
+    /// SELECT for the next top-level statement.
+    ///
+    /// The ordinary recovery path deliberately stops at any statement-start
+    /// token so inputs such as `XYZZY VALUES (1)` can salvage the VALUES
+    /// statement. That is unsafe after a depth failure: the current token can
+    /// be a SELECT nested under dozens of still-open parentheses. Reconstruct
+    /// the delimiter depth from this statement's consumed prefix, then skip to
+    /// its top-level semicolon.
+    fn synchronize_after_depth_error(&mut self, statement_start: usize) {
+        let mut paren_depth = 0_usize;
+        for token in &self.tokens[statement_start..self.pos] {
+            match &token.kind {
+                TokenKind::LeftParen => paren_depth = paren_depth.saturating_add(1),
+                TokenKind::RightParen => paren_depth = paren_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
 
         loop {
             match self.peek() {
                 TokenKind::Eof => return,
-                TokenKind::KwCase => {
-                    case_depth = case_depth.saturating_add(1);
+                TokenKind::LeftParen => {
+                    paren_depth = paren_depth.saturating_add(1);
                     self.advance();
                 }
-                TokenKind::KwEnd if case_depth > 0 => {
-                    case_depth = case_depth.saturating_sub(1);
+                TokenKind::RightParen => {
+                    paren_depth = paren_depth.saturating_sub(1);
                     self.advance();
                 }
-                // Once CASE nesting is balanced, treat END as the trigger-body
-                // terminator even if the malformed statement left parentheses
-                // unbalanced. Recovery should prefer the enclosing trigger
-                // boundary over swallowing subsequent top-level SQL.
-                TokenKind::KwEnd => {
+                TokenKind::Semicolon if paren_depth == 0 => {
                     self.advance();
-                    let _ = self.eat(&TokenKind::Semicolon);
                     return;
                 }
                 _ => {
                     self.advance();
                 }
             }
+        }
+    }
+
+    fn synchronize_trigger_after_error(&mut self, statement_start: usize) {
+        let mut index = statement_start;
+        let mut in_body = false;
+        let mut at_body_statement_boundary = false;
+        let mut case_depth = 0_usize;
+        let mut paren_depth = 0_usize;
+
+        while let Some(token) = self.tokens.get(index) {
+            let follows_dot = index > statement_start
+                && self
+                    .tokens
+                    .get(index - 1)
+                    .is_some_and(|previous| previous.kind == TokenKind::Dot);
+            match &token.kind {
+                TokenKind::Eof => {
+                    self.pos = index;
+                    return;
+                }
+                TokenKind::LeftParen if !in_body => {
+                    paren_depth = paren_depth.saturating_add(1);
+                }
+                TokenKind::RightParen if !in_body => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+                TokenKind::KwCase if !follows_dot => {
+                    case_depth = case_depth.saturating_add(1);
+                    if in_body {
+                        at_body_statement_boundary = false;
+                    }
+                }
+                TokenKind::KwEnd if case_depth > 0 && !follows_dot => {
+                    case_depth = case_depth.saturating_sub(1);
+                    if in_body {
+                        at_body_statement_boundary = false;
+                    }
+                }
+                TokenKind::KwBegin
+                    if !in_body && paren_depth == 0 && case_depth == 0 && !follows_dot =>
+                {
+                    in_body = true;
+                    at_body_statement_boundary = true;
+                }
+                // The trigger terminator is an END at the start of a body
+                // statement, immediately after BEGIN or a statement-ending
+                // semicolon. END can otherwise be an identifier, including
+                // `SELECT 1 AS end`; stopping there would publish the
+                // remaining trigger steps as top-level SQL. Parenthesis depth
+                // is intentionally ignored here so a malformed body can still
+                // recover at its actual terminator.
+                TokenKind::KwEnd
+                    if in_body && at_body_statement_boundary && case_depth == 0 && !follows_dot =>
+                {
+                    index = index.saturating_add(1);
+                    if self
+                        .tokens
+                        .get(index)
+                        .is_some_and(|next| next.kind == TokenKind::Semicolon)
+                    {
+                        index = index.saturating_add(1);
+                    }
+                    self.pos = index.min(self.tokens.len().saturating_sub(1));
+                    return;
+                }
+                TokenKind::Semicolon if in_body && case_depth == 0 => {
+                    at_body_statement_boundary = true;
+                }
+                TokenKind::Semicolon if !in_body => {
+                    self.pos = index
+                        .saturating_add(1)
+                        .min(self.tokens.len().saturating_sub(1));
+                    return;
+                }
+                _ if in_body => {
+                    at_body_statement_boundary = false;
+                }
+                _ => {}
+            }
+            index = index.saturating_add(1);
         }
     }
 
@@ -837,21 +1013,6 @@ impl Parser {
                 self.expect_token(&TokenKind::Dot)?;
                 self.expect_token(&TokenKind::Star)?;
                 return Ok(ResultColumn::TableStar(QualifiedName::bare(table)));
-            }
-            if matches!(
-                self.peek_nth(2),
-                TokenKind::Id(_) | TokenKind::QuotedId(_, _)
-            ) && self.peek_nth(3) == &TokenKind::Dot
-                && self.peek_nth(4) == &TokenKind::Star
-            {
-                let schema = self.parse_identifier()?;
-                self.expect_token(&TokenKind::Dot)?;
-                let table = self.parse_identifier()?;
-                self.expect_token(&TokenKind::Dot)?;
-                self.expect_token(&TokenKind::Star)?;
-                return Ok(ResultColumn::TableStar(QualifiedName::qualified(
-                    schema, table,
-                )));
             }
         }
         let expr = self.parse_expr()?;
@@ -1302,18 +1463,33 @@ impl Parser {
         let unique = self.eat_kw(&TokenKind::KwUnique);
 
         if self.eat_kw(&TokenKind::KwTable) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_table(temporary);
         }
         if self.eat_kw(&TokenKind::KwIndex) {
+            if temporary {
+                return Err(self.err_expected("TABLE, VIEW, or TRIGGER after TEMP"));
+            }
             return self.parse_create_index(unique);
         }
         if self.eat_kw(&TokenKind::KwView) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_view(temporary);
         }
         if self.eat_kw(&TokenKind::KwTrigger) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_trigger(temporary);
         }
         if self.eat_kw(&TokenKind::KwVirtual) {
+            if temporary || unique {
+                return Err(self.err_expected("TABLE, INDEX, VIEW, or TRIGGER"));
+            }
             self.expect_kw(&TokenKind::KwTable)?;
             return self.parse_create_virtual_table();
         }
@@ -1696,7 +1872,8 @@ impl Parser {
             self.expect_token(&TokenKind::LeftParen)?;
             let expr = self.parse_expr()?;
             self.expect_token(&TokenKind::RightParen)?;
-            TableConstraintKind::Check(expr)
+            let conflict = self.parse_on_conflict()?;
+            TableConstraintKind::Check { expr, conflict }
         } else if self.eat_kw(&TokenKind::KwForeign) {
             self.expect_kw(&TokenKind::KwKey)?;
             self.expect_token(&TokenKind::LeftParen)?;
@@ -1828,13 +2005,7 @@ impl Parser {
             if self.check_kw(&TokenKind::KwEnd) {
                 break;
             }
-            let stmt = match self.parse_statement_inner() {
-                Ok(stmt) => stmt,
-                Err(err) => {
-                    self.recover_trigger_body_after_error();
-                    return Err(err);
-                }
-            };
+            let stmt = self.parse_statement_inner()?;
             body.push(stmt);
             let _ = self.eat(&TokenKind::Semicolon);
         }
@@ -2326,6 +2497,53 @@ pub fn parse_first_statement_with_tail(
     Ok(Some((statement, tail_offset)))
 }
 
+/// Parse every top-level statement and retain its syntax-token span.
+///
+/// The span begins at the first token of the statement and ends immediately
+/// after its final token. Leading whitespace/comments, statement separators,
+/// and trailing whitespace/comments are intentionally excluded. Interior
+/// whitespace and comments remain part of the source slice.
+///
+/// These lexer-delimited spans are not normalized SQLite schema text and must
+/// not be treated as canonical `sqlite_schema.sql` capture. Catalog storage
+/// requires a separate normalization contract.
+///
+/// This helper is deliberately separate from [`parse_statements_with_scratch`]
+/// so ordinary parsing does not allocate or retain token-span metadata.
+pub fn parse_statements_with_syntax_token_spans(
+    sql: &str,
+) -> Result<Vec<(Statement, Span)>, ParseError> {
+    let mut parser = Parser::from_sql(sql);
+    let mut statements = Vec::new();
+
+    while !parser.at_eof() {
+        while parser.eat(&TokenKind::Semicolon) {}
+        if parser.at_eof() {
+            break;
+        }
+
+        let start = parser.current().map_or(0, |token| token.span.start);
+        let statement = parser.parse_statement()?;
+        let end = parser
+            .tokens
+            .get(parser.pos.saturating_sub(1))
+            .map_or(start, |token| token.span.end);
+
+        if !parser.at_eof() && !parser.eat(&TokenKind::Semicolon) {
+            return Err(ParseError::at(
+                "unexpected token after end of statement; expected ';' separator",
+                parser.current(),
+            ));
+        }
+        statements.push((statement, Span::new(start, end)));
+    }
+
+    if statements.is_empty() {
+        return Err(ParseError::at("no SQL statement provided", None));
+    }
+    Ok(statements)
+}
+
 // ---------------------------------------------------------------------------
 // Keyword classification helper
 // ---------------------------------------------------------------------------
@@ -2470,6 +2688,34 @@ mod tests {
         stmts.into_iter().next().unwrap()
     }
 
+    fn left_deep_or_sql(term_count: usize) -> String {
+        (0..term_count)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
+    fn assert_single_select_literal(statements: &[Statement], expected: i64) {
+        assert!(
+            matches!(
+                statements,
+                [Statement::Select(select)]
+                    if matches!(
+                        &select.body.select,
+                        SelectCore::Select { columns, .. }
+                            if matches!(
+                                columns.as_slice(),
+                                [ResultColumn::Expr {
+                                    expr: Expr::Literal(Literal::Integer(value), _),
+                                    alias: None,
+                                }] if *value == expected
+                            )
+                    )
+            ),
+            "expected only SELECT {expected}, got {statements:?}"
+        );
+    }
+
     #[test]
     fn test_parse_metrics_emitted_when_enabled() {
         let _guard = PARSE_OBSERVABILITY_LOCK
@@ -2513,17 +2759,26 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_depth_overflow_does_not_poison_following_statement() {
+    fn test_physical_parse_depth_overflow_does_not_poison_following_statement() {
         let mut parser = Parser::from_sql("SELECT 1; SELECT 42;");
-        parser.depth = MAX_PARSE_DEPTH - 1;
+        parser.depth = MAX_PHYSICAL_PARSE_DEPTH - 1;
 
-        // First statement overflows in nested parse entry (statement -> select)
-        // and should unwind depth cleanly back to MAX_PARSE_DEPTH - 1.
+        // This directly exercises the physical parser-call guard. Logical AST
+        // height is tracked independently while expressions are reduced.
+        //
+        // The first statement overflows in nested parse entry
+        // (statement -> select) and should unwind depth cleanly.
         let first = parser.parse_statement();
         assert!(first.is_err(), "first statement should hit depth guard");
+        assert!(
+            first
+                .as_ref()
+                .is_err_and(|error| error.message.contains("parser recursion limit exceeded")),
+            "physical-depth errors must not masquerade as logical AST-height errors: {first:?}"
+        );
         assert_eq!(
             parser.depth,
-            MAX_PARSE_DEPTH - 1,
+            MAX_PHYSICAL_PARSE_DEPTH - 1,
             "depth must not leak upward on recursion-limit error"
         );
 
@@ -2538,8 +2793,93 @@ mod tests {
         );
         assert_eq!(
             parser.depth,
-            MAX_PARSE_DEPTH - 1,
+            MAX_PHYSICAL_PARSE_DEPTH - 1,
             "depth must remain stable across repeated recursion-limit errors"
+        );
+    }
+
+    #[test]
+    fn test_logical_height_recovery_skips_only_rejected_statement() {
+        let overheight = left_deep_or_sql(1_001);
+        let mut parser = Parser::from_sql(&format!("SELECT {overheight}; SELECT 42;"));
+        let (statements, errors) = parser.parse_all();
+
+        let [error] = errors.as_slice() else {
+            panic!("expected exactly one logical-height error, got {errors:?}");
+        };
+        assert!(
+            error.message.contains("expression AST is too deep")
+                && error.message.contains("maximum height 1000"),
+            "unexpected logical-height error: {error:?}"
+        );
+        assert_single_select_literal(&statements, 42);
+        assert_eq!(parser.depth, 0, "logical-height recovery leaked depth");
+    }
+
+    #[test]
+    fn test_naturally_nested_select_depth_recovery_does_not_publish_inner_select() {
+        let nesting = usize::try_from(MAX_PHYSICAL_PARSE_DEPTH)
+            .expect("physical-depth limit must fit usize")
+            .saturating_add(16);
+        let sql = format!(
+            "SELECT {}1{}; SELECT 42;",
+            "(SELECT ".repeat(nesting),
+            ")".repeat(nesting)
+        );
+        let mut parser = Parser::from_sql(&sql);
+        let (statements, errors) = parser.parse_all();
+
+        let [error] = errors.as_slice() else {
+            panic!("expected exactly one physical-depth error, got {errors:?}");
+        };
+        assert!(
+            error.message.contains("parser recursion limit exceeded"),
+            "unexpected physical-depth error: {error:?}"
+        );
+        assert_single_select_literal(&statements, 42);
+        assert_eq!(parser.depth, 0, "physical-depth recovery leaked depth");
+    }
+
+    #[test]
+    fn test_wide_flat_logical_chain_round_trips_without_parenthesis_spine() {
+        // Each equality has height 2. The 999-term left-deep OR chain
+        // therefore has canonical SQLite height exactly 1000.
+        const TERM_COUNT: usize = 999;
+        let predicate = (0..TERM_COUNT)
+            .map(|value| format!("x = {value}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!("SELECT 1 WHERE {predicate}");
+
+        let mut parser = Parser::from_sql(&sql);
+        let (statements, errors) = parser.parse_all();
+        assert!(errors.is_empty(), "flat source must parse: {errors:?}");
+        let [statement] = statements.as_slice() else {
+            panic!("expected one statement, got {statements:?}");
+        };
+
+        let rendered = statement.to_string();
+        assert_eq!(
+            rendered.matches(" OR ").count(),
+            TERM_COUNT - 1,
+            "every logical term must survive display"
+        );
+        assert!(
+            rendered.matches('(').count() < 8,
+            "display must not encode the iterative Pratt-parser spine as nested parentheses"
+        );
+
+        let mut reparsed = Parser::from_sql(&rendered);
+        let (round_trip, round_trip_errors) = reparsed.parse_all();
+        assert!(
+            round_trip_errors.is_empty(),
+            "flat rendered SQL must reparse: {round_trip_errors:?}"
+        );
+        assert_eq!(round_trip.len(), 1);
+        assert_eq!(
+            round_trip[0].to_string(),
+            rendered,
+            "logical-chain serialization must be idempotent"
         );
     }
 
@@ -2564,6 +2904,29 @@ mod tests {
         assert!(
             error.message.contains("expected ';' separator"),
             "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_statement_syntax_token_spans_preserve_only_interior_source() {
+        let sql = " /* leading */ ; CREATE /* prefix */ TABLE main.t  \
+                   (x CHECK (x = 1 OR x = 2)) /* trailing */ ; \
+                   CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+                   SELECT 1; SELECT 2; END; -- tail\n";
+        let statements =
+            parse_statements_with_syntax_token_spans(sql).expect("syntax-token-span parse");
+        assert_eq!(statements.len(), 2);
+
+        let first_span = statements[0].1;
+        assert_eq!(
+            &sql[first_span.start as usize..first_span.end as usize],
+            "CREATE /* prefix */ TABLE main.t  (x CHECK (x = 1 OR x = 2))"
+        );
+
+        let second_span = statements[1].1;
+        assert_eq!(
+            &sql[second_span.start as usize..second_span.end as usize],
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; SELECT 2; END"
         );
     }
 
@@ -2610,6 +2973,149 @@ mod tests {
             ),
             "parser must skip the malformed trigger instead of reinterpreting body tokens as top-level SQL: {stmts:?}"
         );
+    }
+
+    #[test]
+    fn test_trigger_header_error_consumes_exactly_one_trigger() {
+        let mut parser =
+            Parser::from_sql("CREATE TRIGGER trg AFTER INSERT t BEGIN SELECT 1; END; SELECT 42;");
+        let (statements, errors) = parser.parse_all();
+
+        let [error] = errors.as_slice() else {
+            panic!("expected one trigger-header error, got {errors:?}");
+        };
+        assert!(
+            error.message.contains("expected KwOn"),
+            "unexpected trigger-header diagnostic: {error:?}"
+        );
+        assert_single_select_literal(&statements, 42);
+        assert_eq!(parser.depth, 0, "trigger-header recovery leaked depth");
+    }
+
+    fn assert_trigger_recovery_does_not_stop_at_end_alias(prefix: &str) {
+        let sql = format!(
+            "{prefix}CREATE TRIGGER trg AFTER INSERT t BEGIN \
+             SELECT 1 AS end; DELETE FROM t; END; SELECT 42;"
+        );
+        let mut parser = Parser::from_sql(&sql);
+        let (statements, errors) = parser.parse_all();
+
+        let [error] = errors.as_slice() else {
+            panic!("expected one trigger-header error for {prefix:?}, got {errors:?}");
+        };
+        assert!(
+            error.message.contains("expected KwOn"),
+            "unexpected trigger-header diagnostic for {prefix:?}: {error:?}"
+        );
+        assert_single_select_literal(&statements, 42);
+        assert_eq!(
+            parser.depth, 0,
+            "END-alias trigger recovery leaked depth for {prefix:?}"
+        );
+    }
+
+    #[test]
+    fn test_trigger_recovery_does_not_treat_end_alias_as_terminator() {
+        assert_trigger_recovery_does_not_stop_at_end_alias("");
+    }
+
+    #[test]
+    fn test_explain_trigger_recovery_does_not_treat_end_alias_as_terminator() {
+        assert_trigger_recovery_does_not_stop_at_end_alias("EXPLAIN ");
+    }
+
+    #[test]
+    fn test_explain_query_plan_trigger_recovery_does_not_treat_end_alias_as_terminator() {
+        assert_trigger_recovery_does_not_stop_at_end_alias("EXPLAIN QUERY PLAN ");
+    }
+
+    #[test]
+    fn test_trigger_when_depth_error_consumes_exactly_one_trigger() {
+        let overheight = left_deep_or_sql(1_001);
+        let sql = format!(
+            "CREATE TRIGGER trg AFTER INSERT ON t WHEN {overheight} BEGIN \
+             SELECT 1; SELECT CASE WHEN 1 THEN 2 END; END; SELECT 42;"
+        );
+        let mut parser = Parser::from_sql(&sql);
+        let (statements, errors) = parser.parse_all();
+
+        let [error] = errors.as_slice() else {
+            panic!("expected one trigger-WHEN depth error, got {errors:?}");
+        };
+        assert!(
+            error.message.contains("expression AST is too deep"),
+            "unexpected trigger-WHEN diagnostic: {error:?}"
+        );
+        assert_single_select_literal(&statements, 42);
+        assert_eq!(parser.depth, 0, "trigger-WHEN recovery leaked depth");
+    }
+
+    #[test]
+    fn test_trigger_body_physical_depth_error_consumes_exactly_one_trigger() {
+        let nesting = usize::try_from(MAX_PHYSICAL_PARSE_DEPTH)
+            .expect("physical-depth limit must fit usize")
+            .saturating_add(16);
+        let nested = format!("{}1{}", "(SELECT ".repeat(nesting), ")".repeat(nesting));
+        let sql = format!(
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+             SELECT {nested}; SELECT 7; END; SELECT 42;"
+        );
+        let mut parser = Parser::from_sql(&sql);
+        let (statements, errors) = parser.parse_all();
+
+        let [error] = errors.as_slice() else {
+            panic!("expected one trigger-body depth error, got {errors:?}");
+        };
+        assert!(
+            error.message.contains("parser recursion limit exceeded"),
+            "unexpected trigger-body diagnostic: {error:?}"
+        );
+        assert_single_select_literal(&statements, 42);
+        assert_eq!(parser.depth, 0, "trigger-body recovery leaked depth");
+    }
+
+    #[test]
+    fn test_explain_trigger_body_error_consumes_exactly_one_trigger() {
+        for prefix in ["EXPLAIN ", "EXPLAIN QUERY PLAN "] {
+            let sql = format!(
+                "{prefix}CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                 XYZZY; SELECT 7; END; SELECT 42;"
+            );
+            let mut parser = Parser::from_sql(&sql);
+            let (statements, errors) = parser.parse_all();
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "expected one explained trigger-body error for {prefix:?}: {errors:?}"
+            );
+            assert_single_select_literal(&statements, 42);
+            assert_eq!(
+                parser.depth, 0,
+                "explained trigger recovery leaked depth for {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_explain_trigger_when_depth_error_consumes_exactly_one_trigger() {
+        let overheight = left_deep_or_sql(1_001);
+        let sql = format!(
+            "EXPLAIN QUERY PLAN CREATE TRIGGER trg AFTER INSERT ON t \
+             WHEN {overheight} BEGIN SELECT 7; END; SELECT 42;"
+        );
+        let mut parser = Parser::from_sql(&sql);
+        let (statements, errors) = parser.parse_all();
+
+        let [error] = errors.as_slice() else {
+            panic!("expected one explained trigger-WHEN error, got {errors:?}");
+        };
+        assert!(
+            error.message.contains("expression AST is too deep"),
+            "unexpected explained trigger-WHEN diagnostic: {error:?}"
+        );
+        assert_single_select_literal(&statements, 42);
+        assert_eq!(parser.depth, 0, "explained trigger recovery leaked depth");
     }
 
     #[test]
@@ -3260,20 +3766,26 @@ mod tests {
     }
 
     #[test]
-    fn test_select_schema_table_star() {
-        let stmt = parse_one("SELECT aux.t1.* FROM aux.t1");
-        if let Statement::Select(s) = stmt {
-            if let SelectCore::Select { columns, .. } = &s.body.select {
-                assert!(
-                    matches!(&columns[0], ResultColumn::TableStar(t) if t == &QualifiedName::qualified("aux", "t1")),
-                    "expected TableStar(aux.t1), got {:?}",
-                    columns[0]
-                );
-            } else {
-                unreachable!("expected Select core");
-            }
-        } else {
-            unreachable!("expected Select");
+    fn test_select_schema_table_star_is_rejected() {
+        for sql in [
+            "SELECT main.t1.* FROM main.t1",
+            "SELECT aux.t1.* FROM aux.t1",
+        ] {
+            let mut parser = Parser::from_sql(sql);
+            let (statements, errors) = parser.parse_all();
+            assert!(
+                statements.is_empty(),
+                "invalid three-part star must not publish a statement: {statements:?}"
+            );
+            let [error] = errors.as_slice() else {
+                panic!("expected one three-part-star error for {sql}, got {errors:?}");
+            };
+            assert!(
+                error
+                    .message
+                    .contains("expected column name after second '.'"),
+                "unexpected three-part-star diagnostic for {sql}: {error:?}"
+            );
         }
     }
 
@@ -5395,13 +5907,51 @@ mod tests {
             if let CreateTableBody::Columns { constraints, .. } = &ct.body {
                 let chk = constraints
                     .iter()
-                    .find(|c| matches!(c.kind, TableConstraintKind::Check(_)));
+                    .find(|c| matches!(c.kind, TableConstraintKind::Check { .. }));
                 assert!(chk.is_some(), "table CHECK constraint missing");
             } else {
                 unreachable!("expected Columns body");
             }
         } else {
             unreachable!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_table_constraint_check_on_conflict_is_preserved() {
+        let stmt = parse_one("CREATE TABLE t (value INTEGER, CHECK (value > 0) ON CONFLICT FAIL)");
+        let Statement::CreateTable(create) = stmt else {
+            unreachable!("expected CREATE TABLE");
+        };
+        let CreateTableBody::Columns { constraints, .. } = &create.body else {
+            unreachable!("expected column-list CREATE TABLE");
+        };
+        let check = constraints
+            .iter()
+            .find_map(|constraint| match &constraint.kind {
+                TableConstraintKind::Check { conflict, .. } => *conflict,
+                _ => None,
+            });
+        assert_eq!(check, Some(ConflictAction::Fail));
+        assert_eq!(
+            create.to_string(),
+            "CREATE TABLE t (value INTEGER, CHECK (value > 0) ON CONFLICT FAIL)"
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_modifiers_for_incompatible_object_kinds() {
+        for sql in [
+            "CREATE UNIQUE TABLE t(value INTEGER)",
+            "CREATE UNIQUE VIEW v AS SELECT 1",
+            "CREATE UNIQUE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "CREATE UNIQUE VIRTUAL TABLE vt USING fts5(content)",
+            "CREATE TEMP INDEX i ON t(value)",
+            "CREATE TEMP VIRTUAL TABLE vt USING fts5(content)",
+        ] {
+            Parser::from_sql(sql)
+                .parse_statement()
+                .expect_err("CREATE modifiers must not be discarded for incompatible objects");
         }
     }
 

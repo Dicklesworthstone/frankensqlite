@@ -22,6 +22,7 @@ use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
 use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind};
 use fsqlite_types::value::classify_sql_like_fast_path;
 use fsqlite_types::{SmallText, SqliteValue, StrictColumnType, TypeAffinity};
+use smallvec::SmallVec;
 
 // ---------------------------------------------------------------------------
 // Thread-local extra aggregate function names for UDF support (bd-2wt.3)
@@ -34,6 +35,8 @@ use fsqlite_types::{SmallText, SqliteValue, StrictColumnType, TypeAffinity};
 
 thread_local! {
     static EXTRA_AGG_NAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static WITHOUT_ROWID_IMPLICIT_INDEX_PROVENANCE:
+        RefCell<Option<Vec<(String, String)>>> = const { RefCell::new(None) };
 }
 
 /// Set extra aggregate function names for the current codegen invocation.
@@ -47,6 +50,25 @@ pub fn set_extra_aggregate_names(names: Vec<String>) {
 /// Clear extra aggregate function names after codegen completes.
 pub fn clear_extra_aggregate_names() {
     EXTRA_AGG_NAMES.with(|n| n.borrow_mut().clear());
+}
+
+struct WithoutRowidProvenanceGuard(Option<Vec<(String, String)>>);
+
+impl Drop for WithoutRowidProvenanceGuard {
+    fn drop(&mut self) {
+        WITHOUT_ROWID_IMPLICIT_INDEX_PROVENANCE
+            .with(|current| *current.borrow_mut() = self.0.take());
+    }
+}
+
+fn enter_without_rowid_provenance(ctx: &CodegenContext) -> WithoutRowidProvenanceGuard {
+    let previous = WITHOUT_ROWID_IMPLICIT_INDEX_PROVENANCE.with(|current| {
+        std::mem::replace(
+            &mut *current.borrow_mut(),
+            ctx.implicit_without_rowid_indexes.clone(),
+        )
+    });
+    WithoutRowidProvenanceGuard(previous)
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +103,83 @@ fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
         Some(ConflictAction::Ignore) => OE_IGNORE,
         Some(ConflictAction::Replace) => OE_REPLACE,
     }
+}
+
+fn conflict_action_preserves_prior_rows(action: Option<ConflictAction>) -> bool {
+    matches!(action, Some(ConflictAction::Fail | ConflictAction::Ignore))
+}
+
+fn conflict_action_needs_without_rowid_insert_quarantine(action: Option<ConflictAction>) -> bool {
+    matches!(
+        action,
+        Some(ConflictAction::Fail | ConflictAction::Ignore | ConflictAction::Replace)
+    )
+}
+
+fn insert_has_do_update(stmt: &InsertStatement) -> bool {
+    stmt.upsert
+        .iter()
+        .any(|clause| matches!(clause.action, UpsertAction::Update { .. }))
+}
+
+fn insert_has_do_nothing(stmt: &InsertStatement) -> bool {
+    stmt.upsert
+        .iter()
+        .any(|clause| matches!(clause.action, UpsertAction::Nothing))
+}
+
+fn rowid_insert_has_reachable_schema_ignore(table: &TableSchema) -> bool {
+    table.columns.iter().any(|column| {
+        (column.notnull || column.is_ipk)
+            && matches!(column.conflict_action, Some(ConflictAction::Ignore))
+    }) || table.indexes.iter().any(|index| {
+        index.is_unique && matches!(index.conflict_action, Some(ConflictAction::Ignore))
+    })
+}
+
+fn rowid_update_has_reachable_schema_ignore(
+    table: &TableSchema,
+    assignment_cols: &[usize],
+    update_index_mask: &[bool],
+) -> bool {
+    table
+        .columns
+        .iter()
+        .enumerate()
+        .any(|(column_idx, column)| {
+            column.notnull
+                && matches!(column.conflict_action, Some(ConflictAction::Ignore))
+                && (assignment_cols.contains(&column_idx) || column.generated_stored.is_some())
+        })
+        || table
+            .indexes
+            .iter()
+            .zip(update_index_mask)
+            .any(|(index, maintained)| {
+                *maintained
+                    && index.is_unique
+                    && matches!(index.conflict_action, Some(ConflictAction::Ignore))
+            })
+}
+
+fn without_rowid_has_quarantined_schema_policy(table: &TableSchema) -> bool {
+    let column_policy_is_reachable = |column: &ColumnInfo| {
+        column.notnull
+            || column.is_ipk
+            || table
+                .primary_key_constraints
+                .iter()
+                .flatten()
+                .any(|pk_column| pk_column.eq_ignore_ascii_case(&column.name))
+    };
+
+    table.columns.iter().any(|column| {
+        column_policy_is_reachable(column)
+            && conflict_action_needs_without_rowid_insert_quarantine(column.conflict_action)
+    }) || table.indexes.iter().any(|index| {
+        index.is_unique
+            && conflict_action_needs_without_rowid_insert_quarantine(index.conflict_action)
+    })
 }
 
 /// Resolve the effective conflict algorithm for a single constraint.
@@ -263,6 +362,166 @@ impl IndexSchema {
     }
 }
 
+/// Exact PRIMARY KEY term metadata in declared key order.
+///
+/// SQLite's WITHOUT ROWID storage depends on the PRIMARY KEY's effective
+/// collation and direction, not merely its column names. Keeping the three
+/// vectors together prevents callers from silently reconstructing incomplete
+/// KeyInfo from column declarations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryKeyConstraint {
+    /// PRIMARY KEY columns in key order.
+    pub columns: Vec<String>,
+    /// Sort direction for every PRIMARY KEY term.
+    pub key_sort_directions: Vec<SortDirection>,
+    /// Effective collation for every PRIMARY KEY term (`None` is BINARY).
+    pub key_collations: Vec<Option<String>>,
+}
+
+impl PrimaryKeyConstraint {
+    /// Construct exact PRIMARY KEY metadata.
+    #[must_use]
+    pub fn new(
+        columns: Vec<String>,
+        key_sort_directions: Vec<SortDirection>,
+        key_collations: Vec<Option<String>>,
+    ) -> Self {
+        Self {
+            columns,
+            key_sort_directions,
+            key_collations,
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Iterate over PRIMARY KEY column names in key order.
+    #[must_use]
+    pub fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.columns.iter()
+    }
+}
+
+impl std::ops::Index<usize> for PrimaryKeyConstraint {
+    type Output = String;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.columns[index]
+    }
+}
+
+impl<'a> IntoIterator for &'a PrimaryKeyConstraint {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.columns.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut PrimaryKeyConstraint {
+    type Item = &'a mut String;
+    type IntoIter = std::slice::IterMut<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.columns.iter_mut()
+    }
+}
+
+/// Canonical physical column order for a WITHOUT ROWID table root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithoutRowidTableLayout {
+    /// Physical-record position to declared-column position.
+    ///
+    /// SQLite collapses repeated PRIMARY KEY terms only when both the column
+    /// and effective collation are equivalent. A column repeated under a
+    /// distinct collation therefore appears more than once in this map.
+    pub storage_to_declared: Vec<usize>,
+    /// Declared-column position to its first physical-record position.
+    pub declared_to_storage: Vec<usize>,
+    /// Physical PRIMARY KEY terms in PK order, expressed as declared positions.
+    ///
+    /// Distinct-collation repeats are retained; equivalent repeats are
+    /// represented once, using the first term's direction and collation.
+    pub primary_key_declared: Vec<usize>,
+    /// Exact table-root comparison directions in physical-record order.
+    pub cursor_desc_flags: Vec<bool>,
+    /// Exact table-root comparison collations in physical-record order.
+    pub cursor_collations: Vec<Option<String>>,
+}
+
+impl WithoutRowidTableLayout {
+    #[must_use]
+    pub fn storage_position(&self, declared_position: usize) -> Option<usize> {
+        self.declared_to_storage.get(declared_position).copied()
+    }
+}
+
+/// Canonical physical key layout for a WITHOUT ROWID secondary index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithoutRowidIndexLayout {
+    /// Logical index terms as declared table-column positions.
+    pub logical_declared: Vec<usize>,
+    /// Uncovered PRIMARY KEY locator terms appended in PK order.
+    pub locator_declared: Vec<usize>,
+    /// Physical index-record source position for each PRIMARY KEY term in PK
+    /// order. A source can be an arbitrary covered logical term or an appended
+    /// locator term.
+    pub primary_key_sources: Vec<usize>,
+    /// Exact comparison directions for the complete physical key.
+    pub cursor_desc_flags: Vec<bool>,
+    /// Exact comparison collations for the complete physical key.
+    pub cursor_collations: Vec<Option<String>>,
+}
+
+impl WithoutRowidIndexLayout {
+    #[must_use]
+    pub fn record_declared_columns(&self) -> impl Iterator<Item = usize> + '_ {
+        self.logical_declared
+            .iter()
+            .chain(&self.locator_declared)
+            .copied()
+    }
+
+    #[must_use]
+    pub fn record_width(&self) -> usize {
+        self.logical_declared.len() + self.locator_declared.len()
+    }
+}
+
+fn collations_equivalent(left: Option<&str>, right: Option<&str>) -> bool {
+    left.unwrap_or("BINARY")
+        .eq_ignore_ascii_case(right.unwrap_or("BINARY"))
+}
+
+/// Return the positive canonical `sqlite_autoindex_<table>_<ordinal>` ordinal.
+///
+/// Catalog SQL provenance remains authoritative: callers that know whether a
+/// stored definition is explicit must pass that classification to
+/// [`TableSchema::without_rowid_index_layout`].
+#[must_use]
+pub fn canonical_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> {
+    let lower_name = index_name.to_ascii_lowercase();
+    let prefix = format!("sqlite_autoindex_{}_", table_name.to_ascii_lowercase());
+    let suffix = lower_name.strip_prefix(&prefix)?;
+    if suffix.is_empty()
+        || suffix.starts_with('0')
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let ordinal = suffix.parse::<usize>().ok()?;
+    (ordinal.to_string() == suffix).then_some(ordinal)
+}
+
 /// Planner-selected single-table access-path family that lowering may honor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlannerSelectAccessKind {
@@ -393,7 +652,7 @@ pub struct TableSchema {
     pub name: String,
     /// Root page of the table's B-tree.
     pub root_page: i32,
-    /// Column definitions in storage order.
+    /// Column definitions in SQL declaration order.
     pub columns: Vec<ColumnInfo>,
     /// Available indexes.
     pub indexes: Vec<IndexSchema>,
@@ -401,12 +660,12 @@ pub struct TableSchema {
     pub strict: bool,
     /// Whether this table is declared WITHOUT ROWID.
     pub without_rowid: bool,
-    /// PRIMARY KEY constraints expressed as ordered column-name groups.
+    /// PRIMARY KEY constraints with exact key-term metadata.
     ///
     /// INTEGER PRIMARY KEY rowid aliases continue to use `ColumnInfo::is_ipk`;
     /// this field preserves non-rowid and composite PRIMARY KEY shape for SQL
     /// re-rendering during ALTER TABLE / persistence round-trips.
-    pub primary_key_constraints: Vec<Vec<String>>,
+    pub primary_key_constraints: Vec<PrimaryKeyConstraint>,
     /// Foreign key constraints declared on this table (child side).
     pub foreign_keys: Vec<FkDef>,
     /// CHECK constraints with durable column-vs-table ownership.
@@ -431,6 +690,203 @@ impl TableSchema {
         self.columns
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Derive SQLite's canonical PK-first physical record layout.
+    pub fn without_rowid_table_layout(&self) -> Result<WithoutRowidTableLayout, CodegenError> {
+        if !self.without_rowid {
+            return Err(CodegenError::Unsupported(format!(
+                "table {} is not WITHOUT ROWID",
+                self.name
+            )));
+        }
+        if self
+            .columns
+            .iter()
+            .any(|column| column.generated_expr.is_some())
+        {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID table {} has generated columns without complete physical-column provenance",
+                self.name
+            )));
+        }
+        let [primary_key] = self.primary_key_constraints.as_slice() else {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID table {} must have exactly one PRIMARY KEY",
+                self.name
+            )));
+        };
+        if primary_key.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID table {} has an empty PRIMARY KEY",
+                self.name
+            )));
+        }
+        if primary_key.key_sort_directions.len() != primary_key.len()
+            || primary_key.key_collations.len() != primary_key.len()
+        {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID table {} has incomplete PRIMARY KEY KeyInfo provenance",
+                self.name
+            )));
+        }
+
+        let mut primary_key_declared = Vec::with_capacity(primary_key.len());
+        let mut primary_key_sort_directions = Vec::with_capacity(primary_key.len());
+        let mut primary_key_collations: Vec<Option<String>> = Vec::with_capacity(primary_key.len());
+        for (pk_position, column_name) in primary_key.iter().enumerate() {
+            let declared =
+                self.column_index(column_name)
+                    .ok_or_else(|| CodegenError::ColumnNotFound {
+                        table: self.name.clone(),
+                        column: column_name.clone(),
+                    })?;
+            let collation = primary_key.key_collations[pk_position].clone();
+            if primary_key_declared
+                .iter()
+                .zip(&primary_key_collations)
+                .any(|(&existing_declared, existing_collation)| {
+                    existing_declared == declared
+                        && collations_equivalent(
+                            existing_collation.as_deref(),
+                            collation.as_deref(),
+                        )
+                })
+            {
+                continue;
+            }
+            primary_key_declared.push(declared);
+            primary_key_sort_directions.push(primary_key.key_sort_directions[pk_position]);
+            primary_key_collations.push(collation);
+        }
+
+        let mut storage_to_declared = primary_key_declared.clone();
+        storage_to_declared.extend(
+            (0..self.columns.len()).filter(|declared| !primary_key_declared.contains(declared)),
+        );
+        let mut declared_to_storage = vec![usize::MAX; self.columns.len()];
+        for (storage, &declared) in storage_to_declared.iter().enumerate() {
+            if declared_to_storage[declared] == usize::MAX {
+                declared_to_storage[declared] = storage;
+            }
+        }
+        if declared_to_storage.contains(&usize::MAX) {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID table {} has an incomplete physical-column map",
+                self.name
+            )));
+        }
+
+        let mut cursor_desc_flags = primary_key_sort_directions
+            .iter()
+            .map(|direction| matches!(direction, SortDirection::Desc))
+            .collect::<Vec<_>>();
+        cursor_desc_flags.resize(storage_to_declared.len(), false);
+        let mut cursor_collations = primary_key_collations;
+        cursor_collations.resize(storage_to_declared.len(), None);
+
+        Ok(WithoutRowidTableLayout {
+            storage_to_declared,
+            declared_to_storage,
+            primary_key_declared,
+            cursor_desc_flags,
+            cursor_collations,
+        })
+    }
+
+    /// Derive the complete physical key for one WITHOUT ROWID secondary index.
+    ///
+    /// A PRIMARY KEY term is covered only by the same resolved table column
+    /// under an equivalent effective collation. Direction is deliberately not
+    /// part of coverage. Uncovered PK terms are appended in PK order. Explicit
+    /// and partial indexes inherit the PK direction; implicit UNIQUE
+    /// autoindexes append locator terms ASC, matching SQLite 3.46.1.
+    pub fn without_rowid_index_layout(
+        &self,
+        index: &IndexSchema,
+        is_implicit_unique_autoindex: bool,
+    ) -> Result<WithoutRowidIndexLayout, CodegenError> {
+        let table_layout = self.without_rowid_table_layout()?;
+        let logical_count = index.key_term_count();
+        if logical_count == 0
+            || !index.key_expressions.is_empty()
+            || index.columns.len() != logical_count
+        {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID index {}.{} lacks plain-column physical-key provenance",
+                self.name, index.name
+            )));
+        }
+        if index.key_sort_directions.len() != logical_count
+            || index.key_collations.len() != logical_count
+        {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID index {}.{} has incomplete logical KeyInfo provenance",
+                self.name, index.name
+            )));
+        }
+        if is_implicit_unique_autoindex && (!index.is_unique || index.where_clause.is_some()) {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID index {}.{} has inconsistent implicit-autoindex provenance",
+                self.name, index.name
+            )));
+        }
+
+        let logical_declared = index
+            .columns
+            .iter()
+            .map(|column_name| {
+                self.column_index(column_name)
+                    .ok_or_else(|| CodegenError::ColumnNotFound {
+                        table: self.name.clone(),
+                        column: column_name.clone(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut locator_declared = Vec::new();
+        let mut locator_primary_key_positions = Vec::new();
+        let mut primary_key_sources = Vec::with_capacity(table_layout.primary_key_declared.len());
+        for (pk_position, &pk_declared) in table_layout.primary_key_declared.iter().enumerate() {
+            let pk_collation = table_layout.cursor_collations[pk_position].as_deref();
+            if let Some(logical_position) = logical_declared.iter().enumerate().find_map(
+                |(logical_position, &logical_column)| {
+                    (logical_column == pk_declared
+                        && collations_equivalent(
+                            index.key_collations[logical_position].as_deref(),
+                            pk_collation,
+                        ))
+                    .then_some(logical_position)
+                },
+            ) {
+                primary_key_sources.push(logical_position);
+            } else {
+                let physical_position = logical_count + locator_declared.len();
+                locator_declared.push(pk_declared);
+                locator_primary_key_positions.push(pk_position);
+                primary_key_sources.push(physical_position);
+            }
+        }
+
+        let mut cursor_desc_flags = index
+            .key_sort_directions
+            .iter()
+            .map(|direction| matches!(direction, SortDirection::Desc))
+            .collect::<Vec<_>>();
+        let mut cursor_collations = index.key_collations.clone();
+        for &pk_position in &locator_primary_key_positions {
+            cursor_desc_flags
+                .push(!is_implicit_unique_autoindex && table_layout.cursor_desc_flags[pk_position]);
+            cursor_collations.push(table_layout.cursor_collations[pk_position].clone());
+        }
+
+        Ok(WithoutRowidIndexLayout {
+            logical_declared,
+            locator_declared,
+            primary_key_sources,
+            cursor_desc_flags,
+            cursor_collations,
+        })
     }
 
     /// Find an index by a column name (returns first index whose leftmost
@@ -1355,6 +1811,13 @@ pub struct CodegenContext {
     /// SELECT access paths. When present, lowering either honors it or emits
     /// an explicit bypass reason before falling back to heuristic selection.
     pub planner_select_directive: Option<SelectPlannerDirective>,
+    /// Authoritative catalog-provenance set for implicit WITHOUT ROWID
+    /// autoindexes, as lowercase `(table, index)` pairs. `None` is reserved
+    /// for direct unit-codegen callers: a canonical reserved autoindex name
+    /// then fails closed instead of being guessed implicit. Connection-backed
+    /// compilation always supplies `Some`, including an authoritative empty
+    /// set.
+    pub implicit_without_rowid_indexes: Option<Vec<(String, String)>>,
 }
 
 /// Errors during code generation.
@@ -1401,6 +1864,59 @@ fn find_index_named<'a>(table: &'a TableSchema, index_name: &str) -> Option<&'a 
         .indexes
         .iter()
         .find(|index| index.name.eq_ignore_ascii_case(index_name))
+}
+
+fn index_is_implicit_autoindex_for_codegen(
+    table: &TableSchema,
+    index: &IndexSchema,
+) -> Result<bool, CodegenError> {
+    WITHOUT_ROWID_IMPLICIT_INDEX_PROVENANCE.with(|provenance| {
+        if let Some(implicit_indexes) = provenance.borrow().as_ref() {
+            let table_name = table.name.to_ascii_lowercase();
+            let index_name = index.name.to_ascii_lowercase();
+            return Ok(implicit_indexes
+                .iter()
+                .any(|(table, index)| table == &table_name && index == &index_name));
+        }
+        if canonical_autoindex_ordinal(&index.name, &table.name).is_some() {
+            return Err(CodegenError::Unsupported(format!(
+                "WITHOUT ROWID index {}.{} has reserved-name but no catalog SQL provenance",
+                table.name, index.name
+            )));
+        }
+        Ok(false)
+    })
+}
+
+fn without_rowid_index_layout_for_codegen(
+    table: &TableSchema,
+    index: &IndexSchema,
+) -> Result<WithoutRowidIndexLayout, CodegenError> {
+    table.without_rowid_index_layout(
+        index,
+        index_is_implicit_autoindex_for_codegen(table, index)?,
+    )
+}
+
+fn validate_without_rowid_physical_layouts(schema: &[TableSchema]) -> Result<(), CodegenError> {
+    for table in schema.iter().filter(|table| table.without_rowid) {
+        table.without_rowid_table_layout()?;
+        for index in &table.indexes {
+            without_rowid_index_layout_for_codegen(table, index)?;
+        }
+    }
+    Ok(())
+}
+
+fn table_record_position(table: &TableSchema, declared_position: usize) -> usize {
+    if !table.without_rowid {
+        return declared_position;
+    }
+    table
+        .without_rowid_table_layout()
+        .expect("WITHOUT ROWID layout was validated before bytecode emission")
+        .storage_position(declared_position)
+        .expect("declared column must have a validated physical position")
 }
 
 fn directive_index_contract_bypass_reason(
@@ -1686,6 +2202,390 @@ fn count_anon_placeholders_in_frame_bound(bound: &fsqlite_ast::FrameBound) -> u3
     }
 }
 
+enum CodegenAstRoot<'a> {
+    Select(&'a SelectStatement),
+    Insert(&'a InsertStatement),
+    Update(&'a UpdateStatement),
+    Delete(&'a DeleteStatement),
+}
+
+enum SchemaQualifiedAstWork<'a> {
+    Expr(&'a Expr),
+    Select(&'a SelectStatement),
+    Core(&'a SelectCore),
+    From(&'a FromClause),
+    Table(&'a TableOrSubquery),
+    Relation(&'a fsqlite_ast::QualifiedName),
+    Window(&'a fsqlite_ast::WindowSpec),
+}
+
+fn push_result_column_validation_work<'a>(
+    columns: &'a [ResultColumn],
+    pending: &mut SmallVec<[SchemaQualifiedAstWork<'a>; 16]>,
+) {
+    for column in columns {
+        match column {
+            ResultColumn::Expr { expr, .. } => {
+                pending.push(SchemaQualifiedAstWork::Expr(expr));
+            }
+            ResultColumn::TableStar(name) => {
+                pending.push(SchemaQualifiedAstWork::Relation(name));
+            }
+            ResultColumn::Star => {}
+        }
+    }
+}
+
+/// Reject database-qualified columns and relations at every public codegen
+/// boundary until `TableSchema` carries database identity.
+///
+/// Direct callers can bypass connection-level validation. Without this guard,
+/// `main.t.c`, `FROM temp.t`, or a `temp.t` DML target can silently
+/// suffix-bind to the only `TableSchema` named `t`. The explicit worklist
+/// covers the recursive SELECT/DML AST without consuming the process stack.
+#[allow(clippy::too_many_lines)]
+fn validate_no_schema_qualified_references(root: CodegenAstRoot<'_>) -> Result<(), CodegenError> {
+    let mut pending: SmallVec<[SchemaQualifiedAstWork<'_>; 16]> = SmallVec::new();
+
+    match root {
+        CodegenAstRoot::Select(select) => {
+            pending.push(SchemaQualifiedAstWork::Select(select));
+        }
+        CodegenAstRoot::Insert(insert) => {
+            pending.push(SchemaQualifiedAstWork::Relation(&insert.table));
+            if let Some(with) = &insert.with {
+                pending.extend(
+                    with.ctes
+                        .iter()
+                        .map(|cte| SchemaQualifiedAstWork::Select(&cte.query)),
+                );
+            }
+            match &insert.source {
+                InsertSource::Values(rows) => {
+                    pending.extend(rows.iter().flatten().map(SchemaQualifiedAstWork::Expr));
+                }
+                InsertSource::Select(select) => {
+                    pending.push(SchemaQualifiedAstWork::Select(select));
+                }
+                InsertSource::DefaultValues => {}
+            }
+            for upsert in &insert.upsert {
+                if let Some(target) = &upsert.target {
+                    pending.extend(
+                        target
+                            .columns
+                            .iter()
+                            .map(|column| SchemaQualifiedAstWork::Expr(&column.expr)),
+                    );
+                    if let Some(where_clause) = &target.where_clause {
+                        pending.push(SchemaQualifiedAstWork::Expr(where_clause));
+                    }
+                }
+                if let UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &upsert.action
+                {
+                    pending.extend(
+                        assignments
+                            .iter()
+                            .map(|assignment| SchemaQualifiedAstWork::Expr(&assignment.value)),
+                    );
+                    if let Some(where_clause) = where_clause {
+                        pending.push(SchemaQualifiedAstWork::Expr(where_clause));
+                    }
+                }
+            }
+            push_result_column_validation_work(&insert.returning, &mut pending);
+        }
+        CodegenAstRoot::Update(update) => {
+            pending.push(SchemaQualifiedAstWork::Relation(&update.table.name));
+            if let Some(with) = &update.with {
+                pending.extend(
+                    with.ctes
+                        .iter()
+                        .map(|cte| SchemaQualifiedAstWork::Select(&cte.query)),
+                );
+            }
+            pending.extend(
+                update
+                    .assignments
+                    .iter()
+                    .map(|assignment| SchemaQualifiedAstWork::Expr(&assignment.value)),
+            );
+            if let Some(from) = &update.from {
+                pending.push(SchemaQualifiedAstWork::From(from));
+            }
+            if let Some(where_clause) = &update.where_clause {
+                pending.push(SchemaQualifiedAstWork::Expr(where_clause));
+            }
+            push_result_column_validation_work(&update.returning, &mut pending);
+            pending.extend(
+                update
+                    .order_by
+                    .iter()
+                    .map(|term| SchemaQualifiedAstWork::Expr(&term.expr)),
+            );
+            if let Some(limit) = &update.limit {
+                pending.push(SchemaQualifiedAstWork::Expr(&limit.limit));
+                if let Some(offset) = &limit.offset {
+                    pending.push(SchemaQualifiedAstWork::Expr(offset));
+                }
+            }
+        }
+        CodegenAstRoot::Delete(delete) => {
+            pending.push(SchemaQualifiedAstWork::Relation(&delete.table.name));
+            if let Some(with) = &delete.with {
+                pending.extend(
+                    with.ctes
+                        .iter()
+                        .map(|cte| SchemaQualifiedAstWork::Select(&cte.query)),
+                );
+            }
+            if let Some(where_clause) = &delete.where_clause {
+                pending.push(SchemaQualifiedAstWork::Expr(where_clause));
+            }
+            push_result_column_validation_work(&delete.returning, &mut pending);
+            pending.extend(
+                delete
+                    .order_by
+                    .iter()
+                    .map(|term| SchemaQualifiedAstWork::Expr(&term.expr)),
+            );
+            if let Some(limit) = &delete.limit {
+                pending.push(SchemaQualifiedAstWork::Expr(&limit.limit));
+                if let Some(offset) = &limit.offset {
+                    pending.push(SchemaQualifiedAstWork::Expr(offset));
+                }
+            }
+        }
+    }
+
+    while let Some(work) = pending.pop() {
+        match work {
+            SchemaQualifiedAstWork::Select(select) => {
+                if let Some(with) = &select.with {
+                    pending.extend(
+                        with.ctes
+                            .iter()
+                            .map(|cte| SchemaQualifiedAstWork::Select(&cte.query)),
+                    );
+                }
+                pending.push(SchemaQualifiedAstWork::Core(&select.body.select));
+                pending.extend(
+                    select
+                        .body
+                        .compounds
+                        .iter()
+                        .map(|(_, core)| SchemaQualifiedAstWork::Core(core)),
+                );
+                pending.extend(
+                    select
+                        .order_by
+                        .iter()
+                        .map(|term| SchemaQualifiedAstWork::Expr(&term.expr)),
+                );
+                if let Some(limit) = &select.limit {
+                    pending.push(SchemaQualifiedAstWork::Expr(&limit.limit));
+                    if let Some(offset) = &limit.offset {
+                        pending.push(SchemaQualifiedAstWork::Expr(offset));
+                    }
+                }
+            }
+            SchemaQualifiedAstWork::Core(core) => match core {
+                SelectCore::Select {
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    having,
+                    windows,
+                    ..
+                } => {
+                    push_result_column_validation_work(columns, &mut pending);
+                    if let Some(from) = from {
+                        pending.push(SchemaQualifiedAstWork::From(from));
+                    }
+                    if let Some(where_clause) = where_clause {
+                        pending.push(SchemaQualifiedAstWork::Expr(where_clause));
+                    }
+                    pending.extend(group_by.iter().map(SchemaQualifiedAstWork::Expr));
+                    if let Some(having) = having {
+                        pending.push(SchemaQualifiedAstWork::Expr(having));
+                    }
+                    pending.extend(
+                        windows
+                            .iter()
+                            .map(|window| SchemaQualifiedAstWork::Window(&window.spec)),
+                    );
+                }
+                SelectCore::Values(rows) => {
+                    pending.extend(rows.iter().flatten().map(SchemaQualifiedAstWork::Expr));
+                }
+            },
+            SchemaQualifiedAstWork::From(from) => {
+                pending.push(SchemaQualifiedAstWork::Table(&from.source));
+                for join in &from.joins {
+                    pending.push(SchemaQualifiedAstWork::Table(&join.table));
+                    if let Some(fsqlite_ast::JoinConstraint::On(expr)) = &join.constraint {
+                        pending.push(SchemaQualifiedAstWork::Expr(expr));
+                    }
+                }
+            }
+            SchemaQualifiedAstWork::Table(table) => match table {
+                TableOrSubquery::Table { name, .. } => {
+                    pending.push(SchemaQualifiedAstWork::Relation(name));
+                }
+                TableOrSubquery::Subquery { query, .. } => {
+                    pending.push(SchemaQualifiedAstWork::Select(query));
+                }
+                TableOrSubquery::TableFunction { args, .. } => {
+                    pending.extend(args.iter().map(SchemaQualifiedAstWork::Expr));
+                }
+                TableOrSubquery::ParenJoin(from) => {
+                    pending.push(SchemaQualifiedAstWork::From(from));
+                }
+            },
+            SchemaQualifiedAstWork::Relation(name) => {
+                if name.schema.is_some() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "schema-qualified relation `{name}` is not executable until VDBE table \
+                         metadata carries database identity"
+                    )));
+                }
+            }
+            SchemaQualifiedAstWork::Window(window) => {
+                pending.extend(window.partition_by.iter().map(SchemaQualifiedAstWork::Expr));
+                pending.extend(
+                    window
+                        .order_by
+                        .iter()
+                        .map(|term| SchemaQualifiedAstWork::Expr(&term.expr)),
+                );
+                if let Some(frame) = &window.frame {
+                    if let fsqlite_ast::FrameBound::Preceding(expr)
+                    | fsqlite_ast::FrameBound::Following(expr) = &frame.start
+                    {
+                        pending.push(SchemaQualifiedAstWork::Expr(expr));
+                    }
+                    if let Some(
+                        fsqlite_ast::FrameBound::Preceding(expr)
+                        | fsqlite_ast::FrameBound::Following(expr),
+                    ) = &frame.end
+                    {
+                        pending.push(SchemaQualifiedAstWork::Expr(expr));
+                    }
+                }
+            }
+            SchemaQualifiedAstWork::Expr(expr) => match expr {
+                Expr::Column(column, _) => {
+                    if column.schema.is_some() {
+                        return Err(CodegenError::Unsupported(format!(
+                            "schema-qualified column reference `{column}` is not executable until \
+                             VDBE table metadata carries database identity"
+                        )));
+                    }
+                }
+                Expr::BinaryOp { left, right, .. } => {
+                    pending.push(SchemaQualifiedAstWork::Expr(left));
+                    pending.push(SchemaQualifiedAstWork::Expr(right));
+                }
+                Expr::UnaryOp { expr, .. }
+                | Expr::Cast { expr, .. }
+                | Expr::Collate { expr, .. }
+                | Expr::IsNull { expr, .. } => {
+                    pending.push(SchemaQualifiedAstWork::Expr(expr));
+                }
+                Expr::Between {
+                    expr, low, high, ..
+                } => {
+                    pending.push(SchemaQualifiedAstWork::Expr(expr));
+                    pending.push(SchemaQualifiedAstWork::Expr(low));
+                    pending.push(SchemaQualifiedAstWork::Expr(high));
+                }
+                Expr::In { expr, set, .. } => {
+                    pending.push(SchemaQualifiedAstWork::Expr(expr));
+                    match set {
+                        InSet::List(items) => {
+                            pending.extend(items.iter().map(SchemaQualifiedAstWork::Expr));
+                        }
+                        InSet::Subquery(select) => {
+                            pending.push(SchemaQualifiedAstWork::Select(select));
+                        }
+                        InSet::Table(name) => {
+                            pending.push(SchemaQualifiedAstWork::Relation(name));
+                        }
+                    }
+                }
+                Expr::Like {
+                    expr,
+                    pattern,
+                    escape,
+                    ..
+                } => {
+                    pending.push(SchemaQualifiedAstWork::Expr(expr));
+                    pending.push(SchemaQualifiedAstWork::Expr(pattern));
+                    if let Some(escape) = escape {
+                        pending.push(SchemaQualifiedAstWork::Expr(escape));
+                    }
+                }
+                Expr::Case {
+                    operand,
+                    whens,
+                    else_expr,
+                    ..
+                } => {
+                    if let Some(operand) = operand {
+                        pending.push(SchemaQualifiedAstWork::Expr(operand));
+                    }
+                    for (when, then) in whens {
+                        pending.push(SchemaQualifiedAstWork::Expr(when));
+                        pending.push(SchemaQualifiedAstWork::Expr(then));
+                    }
+                    if let Some(else_expr) = else_expr {
+                        pending.push(SchemaQualifiedAstWork::Expr(else_expr));
+                    }
+                }
+                Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+                    pending.push(SchemaQualifiedAstWork::Select(subquery));
+                }
+                Expr::FunctionCall {
+                    args,
+                    order_by,
+                    filter,
+                    over,
+                    ..
+                } => {
+                    if let FunctionArgs::List(args) = args {
+                        pending.extend(args.iter().map(SchemaQualifiedAstWork::Expr));
+                    }
+                    pending.extend(
+                        order_by
+                            .iter()
+                            .map(|term| SchemaQualifiedAstWork::Expr(&term.expr)),
+                    );
+                    if let Some(filter) = filter {
+                        pending.push(SchemaQualifiedAstWork::Expr(filter));
+                    }
+                    if let Some(over) = over {
+                        pending.push(SchemaQualifiedAstWork::Window(over));
+                    }
+                }
+                Expr::JsonAccess { expr, path, .. } => {
+                    pending.push(SchemaQualifiedAstWork::Expr(expr));
+                    pending.push(SchemaQualifiedAstWork::Expr(path));
+                }
+                Expr::RowValue(items, _) => {
+                    pending.extend(items.iter().map(SchemaQualifiedAstWork::Expr));
+                }
+                Expr::Literal(..) | Expr::Raise { .. } | Expr::Placeholder(..) => {}
+            },
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // SELECT codegen
 // ---------------------------------------------------------------------------
@@ -1704,6 +2604,9 @@ pub fn codegen_select(
     schema: &[TableSchema],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    validate_no_schema_qualified_references(CodegenAstRoot::Select(stmt))?;
+    let _without_rowid_provenance = enter_without_rowid_provenance(ctx);
+    validate_without_rowid_physical_layouts(schema)?;
     if stmt.with.is_some() {
         return Err(CodegenError::Unsupported(
             "WITH clauses require connection-level CTE lowering or an explicit fallback boundary"
@@ -3330,9 +4233,10 @@ fn codegen_select_index_equality_scan(
             r
         })
     });
-    // WITHOUT ROWID index entries carry a PK suffix instead of a trailing
-    // rowid (bd-rjaff): covering resolution is rowid-table shaped, so route
-    // WITHOUT ROWID through the table-lookup path below.
+    // WITHOUT ROWID index entries carry PK locator values instead of a
+    // trailing rowid (bd-rjaff). A locator value may reuse any equivalent
+    // logical term or occupy an appended field, so route the rowid-shaped
+    // covering resolution through the canonical table-lookup path below.
     let wr_pk_indices = if table.without_rowid {
         Some(without_rowid_pk_indices(table)?)
     } else {
@@ -3374,8 +4278,12 @@ fn codegen_select_index_equality_scan(
         emit_limit_zero_guard(b, lim_r, fast_path_done_label);
     }
 
-    let probe_key_regs = b.alloc_regs((idx_schema.key_term_count() + 1) as i32);
-    let min_rowid_reg = probe_key_regs + idx_schema.key_term_count() as i32;
+    let probe_width = if table.without_rowid {
+        1
+    } else {
+        idx_schema.key_term_count() + 1
+    };
+    let probe_key_regs = b.alloc_regs(probe_width as i32);
     emit_expr(b, target_expr, probe_key_regs, None);
     b.emit_jump_to_label(
         Opcode::IsNull,
@@ -3385,35 +4293,37 @@ fn codegen_select_index_equality_scan(
         P4::None,
         0,
     );
-    for offset in 1..idx_schema.key_term_count() {
-        b.emit_op(
-            Opcode::Null,
-            0,
-            probe_key_regs + offset as i32,
-            0,
-            P4::None,
-            0,
-        );
-    }
-
     let saw_index_match_reg = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
 
     // Ascending seeks to `(val, i64::MIN)` (lowest rowid of the value) then walks up; descending seeks to
     // `(val, i64::MAX)` (highest rowid) then walks down with `Prev`.
-    b.emit_op(
-        Opcode::Int64,
-        0,
-        min_rowid_reg,
-        0,
-        P4::Int64(if descending { i64::MAX } else { i64::MIN }),
-        0,
-    );
+    if !table.without_rowid {
+        for offset in 1..idx_schema.key_term_count() {
+            b.emit_op(
+                Opcode::Null,
+                0,
+                probe_key_regs + offset as i32,
+                0,
+                P4::None,
+                0,
+            );
+        }
+        let rowid_bound_reg = probe_key_regs + idx_schema.key_term_count() as i32;
+        b.emit_op(
+            Opcode::Int64,
+            0,
+            rowid_bound_reg,
+            0,
+            P4::Int64(if descending { i64::MAX } else { i64::MIN }),
+            0,
+        );
+    }
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         probe_key_regs,
-        (idx_schema.key_term_count() + 1) as i32,
+        probe_width as i32,
         probe_record_reg,
         P4::None,
         0,
@@ -3475,18 +4385,17 @@ fn codegen_select_index_equality_scan(
 
     let idx_skip_label = b.emit_label();
     b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
-    if let Some(pk_indices) = wr_pk_indices.as_ref() {
-        // WITHOUT ROWID: read the PK suffix stored after the index key terms
-        // and position the table b-tree on it (prefix probe; fall-through
-        // leaves the cursor on the matching row).
+    if wr_pk_indices.is_some() {
+        // WITHOUT ROWID: reconstruct the PK from its exact logical/appended
+        // locator sources and position the table b-tree on it.
         emit_without_rowid_index_to_table_seek(
             b,
+            table,
             cursor,
             idx_cursor,
             idx_schema,
-            pk_indices,
             idx_skip_label,
-        );
+        )?;
         if let Some(off_r) = offset_reg {
             b.emit_jump_to_label(Opcode::IfPos, off_r, 1, idx_skip_label, P4::None, 0);
         }
@@ -4485,7 +5394,8 @@ fn codegen_select_index_range_scan(
         .map(|idx| table.columns[idx].affinity)
         .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
     let lower_probe = index_range.lower.as_ref().map(|bound| {
-        let base = b.alloc_regs(2);
+        let probe_width = if table.without_rowid { 1 } else { 2 };
+        let base = b.alloc_regs(probe_width);
         emit_expr(b, &bound.expr, base, None);
         if let Some(aff) = bound_affinity
             && !bound_matches_affinity(aff, &bound.expr)
@@ -4500,7 +5410,9 @@ fn codegen_select_index_range_scan(
             );
         }
         b.emit_jump_to_label(Opcode::IsNull, base, 0, done_label, P4::None, 0);
-        b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
+        if !table.without_rowid {
+            b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
+        }
         (base, bound.clone())
     });
     let upper_reg = index_range.upper.as_ref().map(|bound| {
@@ -4526,9 +5438,10 @@ fn codegen_select_index_range_scan(
             .as_ref()
             .is_some_and(|(_, bound)| !bound.inclusive))
     .then(|| b.alloc_reg());
-    // WITHOUT ROWID index entries carry a PK suffix instead of a trailing
-    // rowid (bd-rjaff): covering resolution is rowid-table shaped, so route
-    // WITHOUT ROWID through the table-lookup path below.
+    // WITHOUT ROWID index entries carry PK locator values instead of a
+    // trailing rowid (bd-rjaff). A locator value may reuse any equivalent
+    // logical term or occupy an appended field, so route the rowid-shaped
+    // covering resolution through the canonical table-lookup path below.
     let wr_pk_indices = if table.without_rowid {
         Some(without_rowid_pk_indices(table)?)
     } else {
@@ -4565,7 +5478,7 @@ fn codegen_select_index_range_scan(
         b.emit_op(
             Opcode::MakeRecord,
             *lower_reg,
-            2,
+            if table.without_rowid { 1 } else { 2 },
             probe_record_reg,
             P4::None,
             0,
@@ -4621,13 +5534,12 @@ fn codegen_select_index_range_scan(
         );
     }
 
-    if let Some(pk_indices) = wr_pk_indices.as_ref() {
-        // WITHOUT ROWID: read the PK suffix stored after the index key terms
-        // and position the table b-tree on it (prefix probe; fall-through
-        // leaves the cursor on the matching row).
+    if wr_pk_indices.is_some() {
+        // WITHOUT ROWID: reconstruct the PK from its exact logical/appended
+        // locator sources and position the table b-tree on it.
         emit_without_rowid_index_to_table_seek(
-            b, cursor, idx_cursor, idx_schema, pk_indices, skip_label,
-        );
+            b, table, cursor, idx_cursor, idx_schema, skip_label,
+        )?;
         if let Some(off_r) = offset_reg {
             b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
         }
@@ -6209,13 +7121,14 @@ fn codegen_select_count_star_plus_sum(
     if plan.sum_is_rowid {
         b.emit_op(Opcode::Rowid, cursor, arg_reg, 0, P4::None, 0);
     } else {
-        b.emit_op(
-            Opcode::Column,
+        emit_table_column_read(
+            b,
             cursor,
-            i32::try_from(plan.sum_col_idx.unwrap_or_default()).unwrap_or_default(),
+            table,
+            None,
+            None,
+            plan.sum_col_idx.unwrap_or_default(),
             arg_reg,
-            P4::None,
-            0,
         );
     }
     b.emit_op(
@@ -6345,14 +7258,7 @@ fn codegen_select_group_by_rowid_bucket_sum(
 
     b.resolve_label(same_group_label);
     b.emit_op(Opcode::Copy, cur_key_reg, prev_key_reg, 0, P4::None, 0);
-    b.emit_op(
-        Opcode::Column,
-        cursor,
-        i32::try_from(plan.sum_col_idx).unwrap_or_default(),
-        sum_arg_reg,
-        P4::None,
-        0,
-    );
+    emit_table_column_read(b, cursor, table, None, None, plan.sum_col_idx, sum_arg_reg);
     b.emit_op(
         Opcode::AggStep,
         0,
@@ -7048,7 +7954,12 @@ fn codegen_select_index_ordered_scan(
     index_plan: &OrderByIndexPlan,
 ) -> Result<(), CodegenError> {
     let index_cursor = cursor + 1;
-    let needs_table_lookup = index_plan.covering_output.is_none() || where_clause.is_some();
+    let covering_output = if table.without_rowid {
+        None
+    } else {
+        index_plan.covering_output.as_ref()
+    };
+    let needs_table_lookup = covering_output.is_none() || where_clause.is_some();
     let where_placeholder_base = b.current_anon_placeholder();
     let equality_prefix_exprs = if index_plan.equality_prefix_len == 0 {
         Vec::new()
@@ -7099,7 +8010,12 @@ fn codegen_select_index_ordered_scan(
     );
 
     let loop_start = if use_bounded_prefix_scan {
-        let probe_key_regs = b.alloc_regs((index_plan.index.key_term_count() + 1) as i32);
+        let probe_width = if table.without_rowid {
+            index_plan.equality_prefix_len
+        } else {
+            index_plan.index.key_term_count() + 1
+        };
+        let probe_key_regs = b.alloc_regs(probe_width as i32);
         for (offset, expr) in equality_prefix_exprs
             .iter()
             .take(index_plan.equality_prefix_len)
@@ -7109,29 +8025,31 @@ fn codegen_select_index_ordered_scan(
             emit_expr(b, expr, reg, None);
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
         }
-        for offset in index_plan.equality_prefix_len..index_plan.index.key_term_count() {
+        if !table.without_rowid {
+            for offset in index_plan.equality_prefix_len..index_plan.index.key_term_count() {
+                b.emit_op(
+                    Opcode::Null,
+                    0,
+                    probe_key_regs + offset as i32,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
             b.emit_op(
-                Opcode::Null,
+                Opcode::Int64,
                 0,
-                probe_key_regs + offset as i32,
+                probe_key_regs + index_plan.index.key_term_count() as i32,
                 0,
-                P4::None,
+                P4::Int64(i64::MIN),
                 0,
             );
         }
-        b.emit_op(
-            Opcode::Int64,
-            0,
-            probe_key_regs + index_plan.index.key_term_count() as i32,
-            0,
-            P4::Int64(i64::MIN),
-            0,
-        );
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             probe_key_regs,
-            (index_plan.index.key_term_count() + 1) as i32,
+            probe_width as i32,
             probe_record_reg,
             P4::None,
             0,
@@ -7166,26 +8084,25 @@ fn codegen_select_index_ordered_scan(
 
     let skip_row = b.emit_label();
     let rowid_reg = b.alloc_reg();
-    // WITHOUT ROWID index entries carry a PK suffix instead of a trailing
-    // rowid (bd-rjaff): seek the table b-tree by the PK columns read from the
-    // index entry. Covering reads on WITHOUT ROWID never resolve a Rowid
-    // source (rowid aliases do not resolve on WITHOUT ROWID tables), so
-    // `rowid_reg` staying unwritten is safe there.
+    // WITHOUT ROWID index entries carry PK locator values instead of a
+    // trailing rowid (bd-rjaff). Reconstruct the PK from the canonical
+    // logical/appended sources. Covering reads on WITHOUT ROWID never resolve
+    // a Rowid source, so `rowid_reg` staying unwritten is safe there.
     let wr_pk_indices = if table.without_rowid {
         Some(without_rowid_pk_indices(table)?)
     } else {
         None
     };
-    if let Some(pk_indices) = wr_pk_indices.as_ref() {
+    if wr_pk_indices.is_some() {
         if needs_table_lookup {
             emit_without_rowid_index_to_table_seek(
                 b,
+                table,
                 cursor,
                 index_cursor,
                 &index_plan.index,
-                pk_indices,
                 skip_row,
-            );
+            )?;
         }
     } else {
         b.emit_op(Opcode::IdxRowid, index_cursor, rowid_reg, 0, P4::None, 0);
@@ -7200,7 +8117,7 @@ fn codegen_select_index_ordered_scan(
         emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
     }
 
-    if let Some(covering_output) = &index_plan.covering_output {
+    if let Some(covering_output) = covering_output {
         emit_covering_output_reads(b, index_cursor, rowid_reg, covering_output, out_regs);
     } else {
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
@@ -7729,8 +8646,15 @@ fn codegen_select_ordered_scan(
         for (reg, key) in (sorter_base..).zip(sort_keys.iter()) {
             match key {
                 SortKeySource::Column(col_idx) => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
+                    emit_table_column_read(
+                        b,
+                        cursor,
+                        table,
+                        table_alias,
+                        Some(schema),
+                        *col_idx,
+                        reg,
+                    );
                 }
                 SortKeySource::Rowid => {
                     b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
@@ -8434,8 +9358,8 @@ fn grouped_inner_join_count_sum_plan<'a>(
     let left_table = find_table(schema, &left_name.name)?;
     let right_table = find_table(schema, &right_name.name)?;
     // The lookup lane fetches rows via IdxRowid + SeekRowid, which assumes
-    // rowid-table index format; WITHOUT ROWID index entries carry a PK suffix
-    // instead (bd-rjaff), so fall back to the generic join path.
+    // rowid-table index format. WITHOUT ROWID entries require canonical PK
+    // locator reconstruction instead, so fall back to the generic join path.
     if left_table.without_rowid || right_table.without_rowid {
         return Ok(None);
     }
@@ -8820,8 +9744,8 @@ fn resolve_single_join_lookup_plan<'a>(
     on_expr: Option<&'a Expr>,
 ) -> Option<SingleJoinLookupPlan<'a>> {
     // The lookup lane fetches rows via IdxRowid + SeekRowid, which assumes
-    // rowid-table index format; WITHOUT ROWID index entries carry a PK suffix
-    // instead (bd-rjaff), so fall back to the generic join path.
+    // rowid-table index format. WITHOUT ROWID entries require canonical PK
+    // locator reconstruction instead, so fall back to the generic join path.
     if left_table.without_rowid || right_table.without_rowid {
         return None;
     }
@@ -9334,8 +10258,8 @@ fn resolve_multi_join_lookup_plan<'a>(
     }
 
     // The lookup lane fetches rows via IdxRowid + SeekRowid, which assumes
-    // rowid-table index format; WITHOUT ROWID index entries carry a PK suffix
-    // instead (bd-rjaff), so fall back to the generic join path.
+    // rowid-table index format. WITHOUT ROWID entries require canonical PK
+    // locator reconstruction instead, so fall back to the generic join path.
     if left_table.without_rowid || join_tables.iter().any(|(table, ..)| table.without_rowid) {
         return None;
     }
@@ -10287,7 +11211,10 @@ fn emit_join_expr(
                     b.emit_op(Opcode::Rowid, cursor, target, 0, P4::None, 0);
                 }
                 JoinColumnResolution::Column(cursor, col_idx) => {
-                    b.emit_op(Opcode::Column, cursor, col_idx as i32, target, P4::None, 0);
+                    let (table, table_alias) = tables
+                        .get(cursor as usize)
+                        .expect("resolved JOIN cursor must name an input table");
+                    emit_table_column_read(b, cursor, table, *table_alias, None, col_idx, target);
                 }
             }
             Ok(())
@@ -10583,16 +11510,17 @@ fn emit_join_result_columns(
         match col {
             ResultColumn::Star => {
                 // Emit all columns from all tables.
-                for (cursor_idx, (table, _)) in tables.iter().enumerate() {
+                for (cursor_idx, (table, table_alias)) in tables.iter().enumerate() {
                     for col_idx in 0..table.columns.len() {
                         let dst = out_regs + reg_offset;
-                        b.emit_op(
-                            Opcode::Column,
+                        emit_table_column_read(
+                            b,
                             cursor_idx as i32,
-                            col_idx as i32,
+                            table,
+                            *table_alias,
+                            None,
+                            col_idx,
                             dst,
-                            P4::None,
-                            0,
                         );
                         reg_offset += 1;
                     }
@@ -10605,13 +11533,14 @@ fn emit_join_result_columns(
                         matched = true;
                         for col_idx in 0..table.columns.len() {
                             let dst = out_regs + reg_offset;
-                            b.emit_op(
-                                Opcode::Column,
+                            emit_table_column_read(
+                                b,
                                 cursor_idx as i32,
-                                col_idx as i32,
+                                table,
+                                *alias,
+                                None,
+                                col_idx,
                                 dst,
-                                P4::None,
-                                0,
                             );
                             reg_offset += 1;
                         }
@@ -13375,14 +14304,14 @@ fn emit_aggregate_accumulate_body(
                 emit_expr(b, expr, arg_base, Some(&scan_ctx));
             } else {
                 let col_idx = agg.arg_col_index.unwrap_or(0);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                b.emit_op(
-                    Opcode::Column,
+                emit_table_column_read(
+                    b,
                     cursor,
-                    col_idx as i32,
+                    table,
+                    table_alias,
+                    Some(schema),
+                    col_idx,
                     arg_base,
-                    P4::None,
-                    0,
                 );
             }
 
@@ -16305,11 +17234,12 @@ fn rewrite_aggregates_recursive(
 // GROUP BY aggregate codegen
 // ---------------------------------------------------------------------------
 
-/// A GROUP BY key that is either a simple column reference or an arbitrary
-/// expression (e.g. `length(name)`, `substr(city, 1, 1)`).
+/// A GROUP BY key that is either a simple declared table-column reference or
+/// an arbitrary expression (e.g. `length(name)`, `substr(city, 1, 1)`).
 #[derive(Debug)]
 enum GroupByKey {
-    /// Direct table column — read via `Opcode::Column`.
+    /// Declared table column — translated through the table's physical layout
+    /// when read from the storage cursor.
     Column(usize),
     /// Arbitrary expression — evaluated via `emit_expr` during the scan phase.
     Expression(Expr),
@@ -17246,8 +18176,8 @@ fn codegen_select_group_by_aggregate(
     }
 
     // Read group-key values + agg-arg columns into consecutive registers.
-    // For column-based keys, use Opcode::Column; for expression-based keys,
-    // evaluate the expression via emit_expr.
+    // Declared column positions are translated through the table's physical
+    // layout; expression-based keys are evaluated via emit_expr.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let sorter_base = b.alloc_regs(total_sorter_cols as i32);
     {
@@ -17263,8 +18193,15 @@ fn codegen_select_group_by_aggregate(
         for key in &group_by_keys {
             match key {
                 GroupByKey::Column(col_idx) => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
+                    emit_table_column_read(
+                        b,
+                        cursor,
+                        table,
+                        table_alias,
+                        Some(schema),
+                        *col_idx,
+                        reg,
+                    );
                 }
                 GroupByKey::Expression(expr) => {
                     emit_expr(b, expr, reg, Some(&scan_ctx));
@@ -17273,8 +18210,7 @@ fn codegen_select_group_by_aggregate(
             reg += 1;
         }
         for &col_idx in &agg_arg_table_cols {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            emit_table_column_read(b, cursor, table, table_alias, Some(schema), col_idx, reg);
             reg += 1;
         }
         // Expression-arg aggregates: evaluate each expression into its sorter slot.
@@ -17309,13 +18245,14 @@ fn codegen_select_group_by_aggregate(
                 if *is_ipk {
                     b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
                 } else {
-                    b.emit_op(
-                        Opcode::Column,
+                    emit_table_column_read(
+                        b,
                         cursor,
-                        *table_col_index as i32,
+                        table,
+                        table_alias,
+                        Some(schema),
+                        *table_col_index,
                         reg,
-                        P4::None,
-                        0,
                     );
                 }
                 reg += 1;
@@ -17755,9 +18692,35 @@ pub fn codegen_insert(
     schema: &[TableSchema],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    validate_no_schema_qualified_references(CodegenAstRoot::Insert(stmt))?;
+    let _without_rowid_provenance = enter_without_rowid_provenance(ctx);
+    validate_without_rowid_physical_layouts(schema)?;
     let table = find_table(schema, &stmt.table.name)?;
     if table.without_rowid {
         return codegen_insert_without_rowid(b, stmt, table, schema, ctx);
+    }
+    if !stmt.returning.is_empty()
+        && (matches!(stmt.or_conflict, Some(ConflictAction::Ignore))
+            || insert_has_do_nothing(stmt)
+            || (stmt.or_conflict.is_none() && rowid_insert_has_reachable_schema_ignore(table)))
+    {
+        return Err(CodegenError::Unsupported(
+            "INSERT ... RETURNING with a reachable IGNORE / DO NOTHING path requires mutation \
+             outcome transport before a result row can be emitted"
+                .to_owned(),
+        ));
+    }
+    if insert_has_do_update(stmt)
+        && matches!(
+            stmt.or_conflict,
+            Some(ConflictAction::Fail | ConflictAction::Rollback)
+        )
+    {
+        return Err(CodegenError::Unsupported(
+            "UPSERT DO UPDATE with an outer OR FAIL/ROLLBACK policy on a rowid table requires \
+             exact statement-boundary rollback semantics"
+                .to_owned(),
+        ));
     }
     let target_alias = stmt.alias.as_deref();
     let table_cursor = 0_i32;
@@ -17972,8 +18935,8 @@ pub fn codegen_insert(
 
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
-            emit_check_constraints(b, table, col_regs, None);
-            emit_not_null_constraints(b, table, col_regs, stmt_level, None);
+            emit_check_constraints(b, table, col_regs, stmt_level, None);
+            emit_not_null_constraints(b, table, col_regs, stmt_level, None)?;
             let pk_oe = effective_oe(
                 stmt_level,
                 table
@@ -18293,8 +19256,8 @@ fn codegen_insert_values(
         } else {
             None
         };
-        emit_check_constraints(b, table, val_regs, check_ignore);
-        emit_not_null_constraints(b, table, val_regs, stmt_level, ignore_skip);
+        emit_check_constraints(b, table, val_regs, stmt_level, check_ignore);
+        emit_not_null_constraints(b, table, val_regs, stmt_level, ignore_skip)?;
 
         // Apply column type affinities before packing the record.
         let aff_str = table.affinity_string();
@@ -18583,8 +19546,23 @@ fn codegen_insert_values(
                     // UPDATE path). Previously missing — UPSERT DO UPDATE
                     // could write data violating STRICT, CHECK, or NOT NULL.
                     emit_strict_type_check(b, table, existing_regs);
-                    emit_check_constraints(b, table, existing_regs, None);
-                    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
+                    emit_check_constraints(
+                        b,
+                        table,
+                        existing_regs,
+                        Some(ConflictAction::Abort),
+                        None,
+                    );
+                    // SQLite specifies ABORT for every constraint violation
+                    // raised by the DO UPDATE arm, regardless of an outer
+                    // INSERT OR IGNORE/REPLACE policy.
+                    emit_not_null_constraints(
+                        b,
+                        table,
+                        existing_regs,
+                        Some(ConflictAction::Abort),
+                        None,
+                    )?;
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
                     emit_index_deletes(b, table, cursor);
@@ -18612,7 +19590,7 @@ fn codegen_insert_values(
                         cursor,
                         existing_regs,
                         update_rowid_reg,
-                        Some(ConflictAction::Replace),
+                        Some(ConflictAction::Abort),
                     );
                     if !returning.is_empty() {
                         emit_returning(b, cursor, table, returning, table_alias, update_rowid_reg)?;
@@ -18632,8 +19610,20 @@ fn codegen_insert_values(
                     )?;
                     // Constraint checks (same as WHERE branch above).
                     emit_strict_type_check(b, table, existing_regs);
-                    emit_check_constraints(b, table, existing_regs, None);
-                    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
+                    emit_check_constraints(
+                        b,
+                        table,
+                        existing_regs,
+                        Some(ConflictAction::Abort),
+                        None,
+                    );
+                    emit_not_null_constraints(
+                        b,
+                        table,
+                        existing_regs,
+                        Some(ConflictAction::Abort),
+                        None,
+                    )?;
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
                     emit_index_deletes(b, table, cursor);
@@ -18660,7 +19650,7 @@ fn codegen_insert_values(
                         cursor,
                         existing_regs,
                         update_rowid_reg,
-                        Some(ConflictAction::Replace),
+                        Some(ConflictAction::Abort),
                     );
                     if !returning.is_empty() {
                         emit_returning(b, cursor, table, returning, table_alias, update_rowid_reg)?;
@@ -19105,8 +20095,8 @@ fn codegen_insert_select(
     } else {
         None
     };
-    emit_check_constraints(b, target_table, final_regs, check_ignore);
-    emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
+    emit_check_constraints(b, target_table, final_regs, stmt_level, check_ignore);
+    emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target)?;
     let pk_oe = effective_oe(
         stmt_level,
         target_table
@@ -19344,8 +20334,8 @@ fn codegen_insert_select_without_from(
 
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
-    emit_check_constraints(b, target_table, final_regs, check_ignore);
-    emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
+    emit_check_constraints(b, target_table, final_regs, stmt_level, check_ignore);
+    emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target)?;
 
     // Apply column type affinities before packing the record.
     let aff_str = target_table.affinity_string();
@@ -19417,19 +20407,53 @@ pub fn codegen_update(
     schema: &[TableSchema],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    validate_no_schema_qualified_references(CodegenAstRoot::Update(stmt))?;
+    let _without_rowid_provenance = enter_without_rowid_provenance(ctx);
+    validate_without_rowid_physical_layouts(schema)?;
     let table_name = table_name_from_qualified(&stmt.table);
     let table = find_table(schema, table_name)?;
+    if stmt.from.is_some() {
+        return Err(CodegenError::Unsupported(
+            "UPDATE ... FROM is disabled until target rows are deduplicated and validated before \
+             mutation"
+                .to_owned(),
+        ));
+    }
+
+    let statement_needs_exact_conflict_restore =
+        conflict_action_preserves_prior_rows(stmt.or_conflict);
     if table.without_rowid {
+        let statement_needs_quarantine =
+            conflict_action_needs_without_rowid_insert_quarantine(stmt.or_conflict);
+        let schema_needs_quarantine =
+            stmt.or_conflict.is_none() && without_rowid_has_quarantined_schema_policy(table);
+        if statement_needs_quarantine || schema_needs_quarantine {
+            return Err(CodegenError::Unsupported(
+                "UPDATE with effective FAIL/IGNORE/REPLACE conflict handling on WITHOUT ROWID \
+                 tables requires complete primary-key victim deletion and exact per-row table and \
+                 index restoration"
+                    .to_owned(),
+            ));
+        }
         return codegen_update_without_rowid(b, stmt, table, schema, ctx);
     }
-    let cursor = 0_i32;
-    let n_cols = table.columns.len();
-
-    let end_label = b.emit_label();
-    let done_label = b.emit_label();
-
-    if let Some(from_clause) = &stmt.from {
-        return codegen_update_from(b, stmt, from_clause, schema, ctx);
+    let rowid_primary_key_can_preserve_prior_rows = stmt.or_conflict.is_none()
+        && table.columns.iter().any(|column| {
+            column.is_ipk && conflict_action_preserves_prior_rows(column.conflict_action)
+        });
+    if rowid_primary_key_can_preserve_prior_rows {
+        return Err(CodegenError::Unsupported(
+            "UPDATE with schema-level FAIL/IGNORE on an INTEGER PRIMARY KEY requires the exact \
+             primary-key conflict policy and row restoration to be carried together"
+                .to_owned(),
+        ));
+    }
+    if !stmt.returning.is_empty() && matches!(stmt.or_conflict, Some(ConflictAction::Ignore)) {
+        return Err(CodegenError::Unsupported(
+            "UPDATE OR IGNORE ... RETURNING requires mutation outcome transport before a result \
+             row can be emitted"
+                .to_owned(),
+        ));
     }
     if !stmt.order_by.is_empty() || stmt.limit.is_some() {
         return Err(CodegenError::Unsupported(
@@ -19444,15 +20468,57 @@ pub fn codegen_update(
     }
     validate_single_table_result_columns(&stmt.returning, table, stmt.table.alias.as_deref())?;
 
+    // Resolve assignment targets before emitting any bytecode so conflict
+    // policies whose rollback obligations are not representable fail closed
+    // without leaving a partially-built program behind.
+    let assignment_cols = collect_update_assignment_columns(table, &stmt.assignments)?;
+    let update_index_mask = update_index_maintenance_mask(table, &assignment_cols);
+    if !stmt.returning.is_empty()
+        && stmt.or_conflict.is_none()
+        && rowid_update_has_reachable_schema_ignore(table, &assignment_cols, &update_index_mask)
+    {
+        return Err(CodegenError::Unsupported(
+            "UPDATE ... RETURNING with a reachable schema-level IGNORE path requires mutation \
+             outcome transport before a result row can be emitted"
+                .to_owned(),
+        ));
+    }
+    let maintained_index_can_preserve_prior_rows = stmt.or_conflict.is_none()
+        && table
+            .indexes
+            .iter()
+            .zip(&update_index_mask)
+            .any(|(index, maintained)| {
+                *maintained
+                    && index.is_unique
+                    && conflict_action_preserves_prior_rows(index.conflict_action)
+            });
+    let needs_exact_conflict_restore =
+        statement_needs_exact_conflict_restore || maintained_index_can_preserve_prior_rows;
+    if needs_exact_conflict_restore
+        && !table
+            .indexes
+            .iter()
+            .zip(&update_index_mask)
+            .all(|(index, maintained)| *maintained && index.supports_replace_cleanup_meta())
+    {
+        return Err(CodegenError::Unsupported(
+            "UPDATE with effective FAIL/IGNORE conflict handling requires every table index to be \
+             maintained with an exactly reconstructible current-row key"
+                .to_owned(),
+        ));
+    }
+
+    let cursor = 0_i32;
+    let n_cols = table.columns.len();
+    let end_label = b.emit_label();
+    let done_label = b.emit_label();
+
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
 
     // Transaction (write).
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
-
-    // Resolve assignment targets to column indices.
-    let assignment_cols = collect_update_assignment_columns(table, &stmt.assignments)?;
-    let update_index_mask = update_index_maintenance_mask(table, &assignment_cols);
 
     // OpenWrite for table.
     let table_cursor = cursor;
@@ -19828,14 +20894,20 @@ pub fn codegen_update(
             None
         };
     emit_strict_type_check(b, table, col_regs);
-    emit_check_constraints(b, table, col_regs, constraint_ignore_label);
-    emit_not_null_constraints(
+    emit_check_constraints(
         b,
         table,
         col_regs,
         stmt.or_conflict,
         constraint_ignore_label,
     );
+    emit_not_null_constraints(
+        b,
+        table,
+        col_regs,
+        stmt.or_conflict,
+        constraint_ignore_label,
+    )?;
 
     // Constraints passed: now perform the destructive delete+insert rewrite.
     // Index maintenance (bd-2f9t): Delete OLD index entries. The indexed key
@@ -20225,7 +21297,14 @@ fn emit_column_from_cursor(
             b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
         } else {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            b.emit_op(
+                Opcode::Column,
+                cursor,
+                table_record_position(table, col_idx) as i32,
+                reg,
+                P4::None,
+                0,
+            );
         }
     } else if table.resolves_to_hidden_rowid(col_name) {
         b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
@@ -20234,6 +21313,9 @@ fn emit_column_from_cursor(
     }
 }
 
+// Quarantined behind `codegen_update`'s fail-closed guard until this lowering
+// deduplicates target identities and validates every candidate before mutation.
+#[allow(dead_code)]
 /// Generate VDBE bytecode for `UPDATE target SET ... FROM source WHERE ...`.
 ///
 /// Uses a nested-loop join: outer loop scans the FROM table, inner loop scans
@@ -20539,8 +21621,8 @@ fn codegen_update_from(
 
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, target, col_regs);
-    emit_check_constraints(b, target, col_regs, None);
-    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, None);
+    emit_check_constraints(b, target, col_regs, stmt.or_conflict, None);
+    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, None)?;
     let aff_str = target.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -20927,12 +22009,15 @@ pub fn codegen_delete(
     b: &mut ProgramBuilder,
     stmt: &DeleteStatement,
     schema: &[TableSchema],
-    _ctx: &CodegenContext,
+    ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    validate_no_schema_qualified_references(CodegenAstRoot::Delete(stmt))?;
+    let _without_rowid_provenance = enter_without_rowid_provenance(ctx);
+    validate_without_rowid_physical_layouts(schema)?;
     let table_name = table_name_from_qualified(&stmt.table);
     let table = find_table(schema, table_name)?;
     if table.without_rowid {
-        return codegen_delete_without_rowid(b, stmt, table, schema, _ctx);
+        return codegen_delete_without_rowid(b, stmt, table, schema, ctx);
     }
     let table_cursor = 0_i32;
 
@@ -21293,46 +22378,44 @@ pub fn codegen_delete(
 // ---------------------------------------------------------------------------
 //
 // A WITHOUT ROWID table is physically an index b-tree (root page type 0x0A)
-// keyed by its PRIMARY KEY. The full row record (in declared column order) is
-// the b-tree key; the leading `pk_count` columns are compared as the primary
-// key (the connection registers per-root-page index ordering metadata so the
-// table cursor compares on the PK). There is no integer rowid, so the normal
-// `NewRowid`/`Insert`/`SeekRowid`/`Delete` opcodes do not apply — DML is lowered
-// to `IdxInsert`/`IdxDelete` against the table's own (index) b-tree cursor.
-//
-// The current storage model stores the record in declared column order, which
-// matches the read paths (`cursor_column` and reload hydration), and compares a
-// leading prefix as the key. This requires the PRIMARY KEY to be exactly the
-// leading declared columns in declared order; other shapes are rejected with a
-// clear "not yet supported" error rather than silently mis-ordering.
+// keyed by its PRIMARY KEY. The full row record is the b-tree key and is
+// stored in canonical SQLite order:
+// `(PRIMARY KEY terms in PK order, remaining columns in declaration order)`.
+// The connection registers the complete physical comparison metadata (exact
+// PK directions/collations followed by non-key payload fields), while SQL
+// expressions and result rows continue to address columns in declaration
+// order through `table_record_position`. There is no integer rowid, so the
+// normal `NewRowid`/`Insert`/`SeekRowid`/`Delete` opcodes do not apply — DML is
+// lowered to `IdxInsert`/`IdxDelete` against the table's own index cursor.
 
 /// Position a WITHOUT ROWID table cursor on the row referenced by the current
 /// entry of a secondary-index cursor (bd-rjaff).
 ///
-/// WITHOUT ROWID secondary-index entries are `(key terms..., PK cols...)` —
-/// there is no trailing rowid. This reads the PK suffix columns from the index
-/// entry, packs them into a record, and probes the table b-tree with
-/// `NoConflict` (prefix match over the leading PK columns). On a match the
-/// table cursor is positioned on the row (fall-through); a missing row —
-/// index/table inconsistency — jumps to `miss_label`.
+/// WITHOUT ROWID secondary-index entries contain their logical key terms plus
+/// only PRIMARY KEY terms not already covered by the same column and effective
+/// collation. There is no trailing rowid. Each PK source may therefore be an
+/// arbitrary logical-key position or an appended locator position. This reads
+/// those exact sources in PK order, packs the table-root probe, and uses
+/// `NoConflict` to position the table cursor. A missing row — index/table
+/// inconsistency — jumps to `miss_label`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_without_rowid_index_to_table_seek(
     b: &mut ProgramBuilder,
+    table: &TableSchema,
     table_cursor: i32,
     idx_cursor: i32,
     idx_schema: &IndexSchema,
-    pk_indices: &[usize],
     miss_label: crate::Label,
-) {
-    let n_idx_key = idx_schema.key_term_count();
-    let n_pk = pk_indices.len();
+) -> Result<(), CodegenError> {
+    let index_layout = without_rowid_index_layout_for_codegen(table, idx_schema)?;
+    let n_pk = index_layout.primary_key_sources.len();
     let pk_regs = b.alloc_regs(n_pk as i32);
-    for j in 0..n_pk {
+    for (pk_position, &source_position) in index_layout.primary_key_sources.iter().enumerate() {
         b.emit_op(
             Opcode::Column,
             idx_cursor,
-            (n_idx_key + j) as i32,
-            pk_regs + j as i32,
+            source_position as i32,
+            pk_regs + pk_position as i32,
             P4::None,
             0,
         );
@@ -21354,49 +22437,16 @@ fn emit_without_rowid_index_to_table_seek(
         P4::None,
         0,
     );
+    Ok(())
 }
 
 /// Resolve the WITHOUT ROWID primary-key column indices, in PRIMARY KEY order.
 ///
-/// Returns the declared table-column index of each PK column. Errors if the
-/// table has no PRIMARY KEY, or if the PK is not the leading declared columns
-/// (a shape the declared-order storage model cannot represent today).
+/// Returns the declaration-order table-column index of each PK term. The
+/// canonical physical table record may place those columns anywhere in SQL
+/// declaration order; [`WithoutRowidTableLayout`] performs that translation.
 pub fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
-    let pk_group = table.primary_key_constraints.first().ok_or_else(|| {
-        CodegenError::Unsupported(format!(
-            "WITHOUT ROWID table {} has no PRIMARY KEY",
-            table.name
-        ))
-    })?;
-    if pk_group.is_empty() {
-        return Err(CodegenError::Unsupported(format!(
-            "WITHOUT ROWID table {} has an empty PRIMARY KEY",
-            table.name
-        )));
-    }
-    let mut indices = Vec::with_capacity(pk_group.len());
-    for name in pk_group {
-        let idx = table
-            .column_index(name)
-            .ok_or_else(|| CodegenError::ColumnNotFound {
-                table: table.name.clone(),
-                column: name.clone(),
-            })?;
-        indices.push(idx);
-    }
-    // Declared-order storage compares the leading `pk_count` columns as the
-    // b-tree key, so the PK must be exactly the leading declared columns.
-    let is_leading = indices
-        .iter()
-        .enumerate()
-        .all(|(pos, &col_idx)| pos == col_idx);
-    if !is_leading {
-        return Err(CodegenError::Unsupported(format!(
-            "WITHOUT ROWID table {} with a non-leading PRIMARY KEY is not yet supported",
-            table.name
-        )));
-    }
-    Ok(indices)
+    Ok(table.without_rowid_table_layout()?.primary_key_declared)
 }
 
 /// Human-readable PK label for UNIQUE-violation error messages.
@@ -21411,20 +22461,20 @@ fn without_rowid_pk_label(table: &TableSchema, pk_indices: &[usize]) -> String {
 
 /// Emit secondary-index inserts for a WITHOUT ROWID table row.
 ///
-/// Index entries are keyed by `(index key terms..., primary-key columns...)`
-/// — the PK columns take the place of the trailing rowid used by rowid tables.
-/// Key terms and PK columns are read from `col_regs` (declared-order row image).
+/// Index entries contain `(logical key terms..., uncovered PK locators...)`.
+/// Logical terms that cover a PK column under the same effective collation are
+/// reused as the locator; direction does not affect coverage. All values are
+/// read from `col_regs`, which remains in SQL declaration order.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_without_rowid_index_inserts(
     b: &mut ProgramBuilder,
     table: &TableSchema,
     table_cursor: i32,
     col_regs: i32,
-    pk_indices: &[usize],
     stmt_conflict: Option<ConflictAction>,
-) {
-    let n_pk = pk_indices.len();
+) -> Result<(), CodegenError> {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
+        let index_layout = without_rowid_index_layout_for_codegen(table, index)?;
         let oe_flag = effective_oe(stmt_conflict, index.conflict_action);
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
@@ -21439,15 +22489,15 @@ fn emit_without_rowid_index_inserts(
         };
         emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
 
-        let idx_key_regs = b.alloc_regs((n_idx_cols + n_pk) as i32);
+        let idx_key_regs = b.alloc_regs(index_layout.record_width() as i32);
         for key_pos in 0..n_idx_cols {
             emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
         }
-        for (j, &pk_col) in pk_indices.iter().enumerate() {
+        for (locator_position, &pk_col) in index_layout.locator_declared.iter().enumerate() {
             b.emit_op(
                 Opcode::Copy,
                 col_regs + pk_col as i32,
-                idx_key_regs + (n_idx_cols + j) as i32,
+                idx_key_regs + (n_idx_cols + locator_position) as i32,
                 0,
                 P4::None,
                 0,
@@ -21457,7 +22507,7 @@ fn emit_without_rowid_index_inserts(
         b.emit_op(
             Opcode::MakeRecord,
             idx_key_regs,
-            (n_idx_cols + n_pk) as i32,
+            index_layout.record_width() as i32,
             idx_rec_reg,
             P4::None,
             0,
@@ -21482,23 +22532,23 @@ fn emit_without_rowid_index_inserts(
         );
         b.resolve_label(skip_label);
     }
+    Ok(())
 }
 
 /// Emit secondary-index deletes for a WITHOUT ROWID table row.
 ///
-/// When `col_regs` is `Some`, key terms and PK columns are read from the
-/// register image; when `None`, they are read from the row at the current
-/// `table_cursor` position (via `Opcode::Column`).
+/// When `col_regs` is `Some`, key terms and uncovered PK locators are read from
+/// the declaration-order register image; when `None`, they are translated to
+/// canonical physical positions and read from the current table row.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_without_rowid_index_deletes(
     b: &mut ProgramBuilder,
     table: &TableSchema,
     table_cursor: i32,
     col_regs: Option<i32>,
-    pk_indices: &[usize],
-) {
-    let n_pk = pk_indices.len();
+) -> Result<(), CodegenError> {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
+        let index_layout = without_rowid_index_layout_for_codegen(table, index)?;
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
         let skip_label = b.emit_label();
@@ -21512,35 +22562,64 @@ fn emit_without_rowid_index_deletes(
         };
         emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
 
-        let idx_key_regs = b.alloc_regs((n_idx_cols + n_pk) as i32);
+        let idx_key_regs = b.alloc_regs(index_layout.record_width() as i32);
         for key_pos in 0..n_idx_cols {
             emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
         }
-        for (j, &pk_col) in pk_indices.iter().enumerate() {
-            let dst = idx_key_regs + (n_idx_cols + j) as i32;
+        for (locator_position, &pk_col) in index_layout.locator_declared.iter().enumerate() {
+            let dst = idx_key_regs + (n_idx_cols + locator_position) as i32;
             if let Some(cr) = col_regs {
                 b.emit_op(Opcode::Copy, cr + pk_col as i32, dst, 0, P4::None, 0);
             } else {
-                b.emit_op(
-                    Opcode::Column,
-                    table_cursor,
-                    pk_col as i32,
-                    dst,
-                    P4::None,
-                    0,
-                );
+                emit_table_column_read(b, table_cursor, table, None, None, pk_col, dst);
             }
         }
         b.emit_op(
             Opcode::IdxDelete,
             idx_cursor,
             idx_key_regs,
-            (n_idx_cols + n_pk) as i32,
+            index_layout.record_width() as i32,
             P4::Table(index.name.clone()),
             0,
         );
         b.resolve_label(skip_label);
     }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_without_rowid_table_record(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    declared_regs: i32,
+) -> Result<i32, CodegenError> {
+    let layout = table.without_rowid_table_layout()?;
+    let storage_regs = b.alloc_regs(layout.storage_to_declared.len() as i32);
+    for (storage_position, &declared_position) in layout.storage_to_declared.iter().enumerate() {
+        b.emit_op(
+            Opcode::Copy,
+            declared_regs + declared_position as i32,
+            storage_regs + storage_position as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+    let storage_affinity = layout
+        .storage_to_declared
+        .iter()
+        .map(|&declared_position| table.columns[declared_position].affinity)
+        .collect();
+    let record_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        storage_regs,
+        layout.storage_to_declared.len() as i32,
+        record_reg,
+        P4::Affinity(storage_affinity),
+        0,
+    );
+    Ok(record_reg)
 }
 
 /// Emit the per-row insert for a WITHOUT ROWID table.
@@ -21603,8 +22682,8 @@ fn emit_without_rowid_row_insert(
     } else {
         None
     };
-    emit_check_constraints(b, table, val_regs, ignore_skip);
-    emit_not_null_constraints(b, table, val_regs, stmt_level, ignore_skip);
+    emit_check_constraints(b, table, val_regs, stmt_level, ignore_skip);
+    emit_not_null_constraints(b, table, val_regs, stmt_level, ignore_skip)?;
 
     // Apply column affinities before packing the record (matches stored format).
     let aff_str = table.affinity_string();
@@ -21613,7 +22692,7 @@ fn emit_without_rowid_row_insert(
         val_regs,
         n_cols as i32,
         0,
-        P4::Affinity(aff_str.clone()),
+        P4::Affinity(aff_str),
         0,
     );
 
@@ -21658,20 +22737,12 @@ fn emit_without_rowid_row_insert(
         } else {
             // REPLACE: delete the conflicting row's secondary index entries and
             // the old table row, then fall through to insert the new row.
-            emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
+            emit_without_rowid_index_deletes(b, table, table_cursor, None)?;
             b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
         }
         b.resolve_label(do_insert);
         // Any conflicting row has been removed, so insert cannot conflict.
-        let rec_reg = b.alloc_reg();
-        b.emit_op(
-            Opcode::MakeRecord,
-            val_regs,
-            n_cols as i32,
-            rec_reg,
-            P4::Affinity(aff_str),
-            0,
-        );
+        let rec_reg = emit_without_rowid_table_record(b, table, val_regs)?;
         b.emit_op(
             Opcode::IdxInsert,
             table_cursor,
@@ -21683,15 +22754,7 @@ fn emit_without_rowid_row_insert(
     } else {
         // ABORT / FAIL / ROLLBACK: rely on the engine's UNIQUE check on the
         // leading `n_pk` (primary-key) columns of the record.
-        let rec_reg = b.alloc_reg();
-        b.emit_op(
-            Opcode::MakeRecord,
-            val_regs,
-            n_cols as i32,
-            rec_reg,
-            P4::Affinity(aff_str),
-            0,
-        );
+        let rec_reg = emit_without_rowid_table_record(b, table, val_regs)?;
         b.emit_op(
             Opcode::IdxInsert,
             table_cursor,
@@ -21704,7 +22767,7 @@ fn emit_without_rowid_row_insert(
 
     // Secondary-index maintenance (skipped by the IGNORE conflict path, which
     // jumps straight to `row_done`).
-    emit_without_rowid_index_inserts(b, table, table_cursor, val_regs, pk_indices, stmt_level);
+    emit_without_rowid_index_inserts(b, table, table_cursor, val_regs, stmt_level)?;
 
     // RETURNING: emit the inserted row image. Placed on the insert path so an
     // IGNORE conflict (which jumps to `row_done`) produces no RETURNING row,
@@ -21784,13 +22847,14 @@ fn emit_without_rowid_upsert_row(
     // --- Conflict path: DO UPDATE against the existing row ---
     let existing_regs = b.alloc_regs(n_cols as i32);
     for i in 0..n_cols {
-        b.emit_op(
-            Opcode::Column,
+        emit_table_column_read(
+            b,
             table_cursor,
-            i as i32,
+            table,
+            target_alias,
+            Some(schema),
+            i,
             existing_regs + i as i32,
-            P4::None,
-            0,
         );
     }
 
@@ -21848,12 +22912,12 @@ fn emit_without_rowid_upsert_row(
     )?;
     emit_stored_generated_columns(b, table, existing_regs);
     emit_strict_type_check(b, table, existing_regs);
-    emit_check_constraints(b, table, existing_regs, None);
-    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
+    emit_check_constraints(b, table, existing_regs, Some(ConflictAction::Abort), None);
+    emit_not_null_constraints(b, table, existing_regs, stmt_level, None)?;
 
     // Remove the OLD secondary-index entries (read from the cursor's old row)
     // and the OLD table row, then insert the rewritten row + new index entries.
-    emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
+    emit_without_rowid_index_deletes(b, table, table_cursor, None)?;
     b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
 
     let aff_str = table.affinity_string();
@@ -21862,18 +22926,10 @@ fn emit_without_rowid_upsert_row(
         existing_regs,
         n_cols as i32,
         0,
-        P4::Affinity(aff_str.clone()),
-        0,
-    );
-    let rec_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        existing_regs,
-        n_cols as i32,
-        rec_reg,
         P4::Affinity(aff_str),
         0,
     );
+    let rec_reg = emit_without_rowid_table_record(b, table, existing_regs)?;
     b.emit_op(
         Opcode::IdxInsert,
         table_cursor,
@@ -21886,14 +22942,7 @@ fn emit_without_rowid_upsert_row(
         )),
         1u16 | (OE_ABORT << 1),
     );
-    emit_without_rowid_index_inserts(
-        b,
-        table,
-        table_cursor,
-        existing_regs,
-        pk_indices,
-        stmt_level,
-    );
+    emit_without_rowid_index_inserts(b, table, table_cursor, existing_regs, stmt_level)?;
 
     if !returning.is_empty() {
         emit_returning_from_regs(b, table, returning, target_alias, schema, existing_regs)?;
@@ -21962,6 +23011,38 @@ fn codegen_insert_without_rowid(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    if insert_has_do_update(stmt) {
+        return Err(CodegenError::Unsupported(
+            "UPSERT DO UPDATE on WITHOUT ROWID tables requires exact table and secondary-index \
+             restoration"
+                .to_owned(),
+        ));
+    }
+    if !stmt.upsert.is_empty() {
+        return Err(CodegenError::Unsupported(
+            "UPSERT DO NOTHING on WITHOUT ROWID tables has effective IGNORE semantics and \
+             requires exact table and secondary-index restoration"
+                .to_owned(),
+        ));
+    }
+    if conflict_action_needs_without_rowid_insert_quarantine(stmt.or_conflict) {
+        return Err(CodegenError::Unsupported(
+            "INSERT OR FAIL/IGNORE/REPLACE on WITHOUT ROWID tables requires exact table and \
+             secondary-index restoration"
+                .to_owned(),
+        ));
+    }
+    if stmt.upsert.is_empty()
+        && stmt.or_conflict.is_none()
+        && without_rowid_has_quarantined_schema_policy(table)
+    {
+        return Err(CodegenError::Unsupported(
+            "INSERT with a schema-level FAIL/IGNORE/REPLACE policy on a WITHOUT ROWID table \
+             requires exact table and secondary-index restoration"
+                .to_owned(),
+        ));
+    }
+
     let pk_indices = without_rowid_pk_indices(table)?;
     let table_cursor = 0_i32;
     let n_cols = table.columns.len();
@@ -22445,13 +23526,14 @@ fn emit_without_rowid_collect_matches(
     }
     let row_regs = b.alloc_regs(n_cols as i32);
     for i in 0..n_cols {
-        b.emit_op(
-            Opcode::Column,
+        emit_table_column_read(
+            b,
             table_cursor,
-            i as i32,
+            table,
+            table_alias,
+            Some(schema),
+            i,
             row_regs + i as i32,
-            P4::None,
-            0,
         );
     }
     let rec_reg = b.alloc_reg();
@@ -22574,7 +23656,7 @@ fn codegen_delete_without_rowid(
         P4::None,
         0,
     );
-    emit_without_rowid_index_deletes(b, table, table_cursor, Some(row_regs), &pk_indices);
+    emit_without_rowid_index_deletes(b, table, table_cursor, Some(row_regs))?;
     b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 1);
     // RETURNING: emit the deleted row image (row_regs holds the OLD values read
     // from the sorter). Only reached when the row was actually found+deleted.
@@ -22717,7 +23799,7 @@ fn codegen_update_without_rowid(
 
     // Remove the OLD secondary index entries (keys from the old image) and the
     // OLD table row (delete at the cursor position located by NoConflict).
-    emit_without_rowid_index_deletes(b, table, table_cursor, Some(col_regs), &pk_indices);
+    emit_without_rowid_index_deletes(b, table, table_cursor, Some(col_regs))?;
     b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
 
     // Compute the NEW image in place, then validate constraints.
@@ -22732,8 +23814,8 @@ fn codegen_update_without_rowid(
     emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
     emit_stored_generated_columns(b, table, col_regs);
     emit_strict_type_check(b, table, col_regs);
-    emit_check_constraints(b, table, col_regs, None);
-    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, None);
+    emit_check_constraints(b, table, col_regs, stmt.or_conflict, None);
+    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, None)?;
 
     // Insert the rewritten row.
     let aff_str = table.affinity_string();
@@ -22742,18 +23824,10 @@ fn codegen_update_without_rowid(
         col_regs,
         n_cols as i32,
         0,
-        P4::Affinity(aff_str.clone()),
-        0,
-    );
-    let rec_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        col_regs,
-        n_cols as i32,
-        rec_reg,
         P4::Affinity(aff_str),
         0,
     );
+    let rec_reg = emit_without_rowid_table_record(b, table, col_regs)?;
     b.emit_op(
         Opcode::IdxInsert,
         table_cursor,
@@ -22766,14 +23840,7 @@ fn codegen_update_without_rowid(
         )),
         1u16 | (oe_flag << 1),
     );
-    emit_without_rowid_index_inserts(
-        b,
-        table,
-        table_cursor,
-        col_regs,
-        &pk_indices,
-        stmt.or_conflict,
-    );
+    emit_without_rowid_index_inserts(b, table, table_cursor, col_regs, stmt.or_conflict)?;
 
     // RETURNING: emit the NEW row image (col_regs now holds the rewritten row).
     if !stmt.returning.is_empty() {
@@ -23028,13 +24095,14 @@ fn codegen_update_from_without_rowid(
     let old_regs = row_regs;
     let new_regs = row_regs + n_cols as i32;
     for i in 0..n_cols {
-        b.emit_op(
-            Opcode::Column,
+        emit_table_column_read(
+            b,
             target_cursor,
-            i as i32,
+            table,
+            stmt.table.alias.as_deref(),
+            Some(schema),
+            i,
             old_regs + i as i32,
-            P4::None,
-            0,
         );
         b.emit_op(
             Opcode::Copy,
@@ -23049,8 +24117,8 @@ fn codegen_update_from_without_rowid(
     emit_update_assignments(b, &stmt.assignments, table, new_regs, &scan)?;
     emit_stored_generated_columns(b, table, new_regs);
     emit_strict_type_check(b, table, new_regs);
-    emit_check_constraints(b, table, new_regs, None);
-    emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None);
+    emit_check_constraints(b, table, new_regs, stmt.or_conflict, None);
+    emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None)?;
     let stash_rec = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
@@ -23159,7 +24227,7 @@ fn codegen_update_from_without_rowid(
     );
 
     // Remove the OLD secondary-index entries + OLD table row.
-    emit_without_rowid_index_deletes(b, table, target_cursor, Some(old_img), &pk_indices);
+    emit_without_rowid_index_deletes(b, table, target_cursor, Some(old_img))?;
     b.emit_op(Opcode::IdxDelete, target_cursor, 0, 0, P4::None, 0);
 
     // Insert the NEW row + NEW index entries.
@@ -23169,18 +24237,10 @@ fn codegen_update_from_without_rowid(
         new_img,
         n_cols as i32,
         0,
-        P4::Affinity(aff_str.clone()),
-        0,
-    );
-    let rec_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        new_img,
-        n_cols as i32,
-        rec_reg,
         P4::Affinity(aff_str),
         0,
     );
+    let rec_reg = emit_without_rowid_table_record(b, table, new_img)?;
     b.emit_op(
         Opcode::IdxInsert,
         target_cursor,
@@ -23193,14 +24253,7 @@ fn codegen_update_from_without_rowid(
         )),
         1u16 | (oe_flag << 1),
     );
-    emit_without_rowid_index_inserts(
-        b,
-        table,
-        target_cursor,
-        new_img,
-        &pk_indices,
-        stmt.or_conflict,
-    );
+    emit_without_rowid_index_inserts(b, table, target_cursor, new_img, stmt.or_conflict)?;
 
     // RETURNING: the NEW image.
     if !stmt.returning.is_empty() {
@@ -23511,7 +24564,14 @@ fn emit_table_column_read(
         emit_expr(b, &gen_expr, reg, Some(&scan));
         emit_single_column_affinity(b, reg, col.affinity);
     } else {
-        b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+        b.emit_op(
+            Opcode::Column,
+            cursor,
+            table_record_position(table, col_idx) as i32,
+            reg,
+            P4::None,
+            0,
+        );
     }
 }
 
@@ -23530,6 +24590,7 @@ fn emit_check_constraints(
     b: &mut ProgramBuilder,
     table: &TableSchema,
     val_regs: i32,
+    stmt_level: Option<ConflictAction>,
     ignore_label: Option<Label>,
 ) {
     const SQLITE_CONSTRAINT: i32 = 19;
@@ -23564,14 +24625,21 @@ fn emit_check_constraints(
             // OR IGNORE: skip this row silently.
             b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
         } else {
-            // Default: halt with constraint error.
+            // A statement-level conflict action applies to CHECK constraints,
+            // but REPLACE has ABORT semantics for CHECK failures in SQLite.
+            // Carry the resolved policy in p5 so the connection can distinguish
+            // FAIL/ROLLBACK from the default ABORT after execution.
+            let oe = match effective_oe(stmt_level, None) {
+                OE_REPLACE => OE_ABORT,
+                action => action,
+            };
             b.emit_op(
                 Opcode::Halt,
                 SQLITE_CONSTRAINT,
                 0,
                 0,
                 P4::Str(format!("CHECK constraint failed: {}", check.expr)),
-                0,
+                oe,
             );
         }
 
@@ -23590,14 +24658,14 @@ fn emit_not_null_constraints(
     val_regs: i32,
     stmt_level: Option<ConflictAction>,
     ignore_label: Option<Label>,
-) {
+) -> Result<(), CodegenError> {
     const SQLITE_CONSTRAINT: i32 = 19;
 
     // In a WITHOUT ROWID table the PRIMARY KEY columns are implicitly NOT NULL
     // even when NOT NULL is not declared (C SQLite enforces this). For rowid
     // tables this set is empty, so behavior is unchanged.
     let wr_pk: Vec<usize> = if table.without_rowid {
-        without_rowid_pk_indices(table).unwrap_or_default()
+        without_rowid_pk_indices(table)?
     } else {
         Vec::new()
     };
@@ -23609,13 +24677,28 @@ fn emit_not_null_constraints(
             b.emit_jump_to_label(Opcode::NotNull, reg, 0, ok_label, P4::None, 0);
             // A statement-level `INSERT OR <algo>` overrides the column's
             // declared `NOT NULL ON CONFLICT <algo>`. Only IGNORE skips the
-            // row; every other action (incl. the default ABORT) errors.
+            // row. REPLACE substitutes the column default when one exists;
+            // without a usable non-NULL default SQLite falls back to ABORT.
             let oe = effective_oe(stmt_level, col.conflict_action);
-            match (oe == OE_IGNORE, ignore_label) {
-                (true, Some(skip)) => {
+            match (oe, ignore_label) {
+                (OE_IGNORE, Some(skip)) => {
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
                 }
-                _ => {
+                (OE_REPLACE, _) if col.default_value.is_some() => {
+                    emit_default_value(b, col, reg)?;
+                    b.emit_op(
+                        Opcode::HaltIfNull,
+                        SQLITE_CONSTRAINT,
+                        0,
+                        reg,
+                        P4::Str(format!(
+                            "NOT NULL constraint failed: {}.{}",
+                            table.name, col.name
+                        )),
+                        OE_ABORT,
+                    );
+                }
+                (OE_REPLACE, _) => {
                     b.emit_op(
                         Opcode::Halt,
                         SQLITE_CONSTRAINT,
@@ -23625,13 +24708,27 @@ fn emit_not_null_constraints(
                             "NOT NULL constraint failed: {}.{}",
                             table.name, col.name
                         )),
+                        OE_ABORT,
+                    );
+                }
+                (resolved_oe, _) => {
+                    b.emit_op(
+                        Opcode::Halt,
+                        SQLITE_CONSTRAINT,
                         0,
+                        0,
+                        P4::Str(format!(
+                            "NOT NULL constraint failed: {}.{}",
+                            table.name, col.name
+                        )),
+                        resolved_oe,
                     );
                 }
             }
             b.resolve_label(ok_label);
         }
     }
+    Ok(())
 }
 
 /// Emit `IdxInsert` opcodes for all indexes on the table (bd-so1h: Phase 5I.3).
@@ -27162,7 +28259,7 @@ fn try_emit_column_substr_prefix(
     if prefix_len < 0 {
         return false;
     }
-    let Ok(col_idx) = i32::try_from(col_idx) else {
+    let Ok(col_idx) = i32::try_from(table_record_position(ctx.table, col_idx)) else {
         return false;
     };
 
@@ -27204,7 +28301,7 @@ fn try_emit_column_octet_length(
     {
         return false;
     }
-    let Ok(col_idx) = i32::try_from(col_idx) else {
+    let Ok(col_idx) = i32::try_from(table_record_position(ctx.table, col_idx)) else {
         return false;
     };
     b.emit_op(
@@ -27241,7 +28338,15 @@ fn emit_in_probe_value(
     match probe_source.value {
         InProbeValue::Expr(expr) => emit_expr(b, expr, reg, Some(probe_scan)),
         InProbeValue::FirstColumn => {
-            b.emit_op(Opcode::Column, source_cursor, 0, reg, P4::None, 0);
+            emit_table_column_read(
+                b,
+                source_cursor,
+                probe_source.table,
+                probe_source.table_alias,
+                probe_scan.schema,
+                0,
+                reg,
+            );
         }
         InProbeValue::Rowid => {
             b.emit_op(Opcode::Rowid, source_cursor, reg, 0, P4::None, 0);
@@ -27565,13 +28670,14 @@ fn try_emit_complex_in_subquery(
             let key_source = resolve_sort_key(&term.expr, table, table_alias, columns);
             match key_source {
                 SortKeySource::Column(col_idx) => {
-                    b.emit_op(
-                        Opcode::Column,
+                    emit_table_column_read(
+                        b,
                         subq_cursor,
-                        col_idx as i32,
+                        table,
+                        table_alias,
+                        Some(schema),
+                        col_idx,
                         sorter_base + i as i32,
-                        P4::None,
-                        0,
                     );
                 }
                 SortKeySource::Rowid => {
@@ -27596,7 +28702,15 @@ fn try_emit_complex_in_subquery(
             Some(expr) => emit_expr(b, expr, value_reg, Some(&subq_scan)),
             None => {
                 // First column.
-                b.emit_op(Opcode::Column, subq_cursor, 0, value_reg, P4::None, 0);
+                emit_table_column_read(
+                    b,
+                    subq_cursor,
+                    table,
+                    table_alias,
+                    Some(schema),
+                    0,
+                    value_reg,
+                );
             }
         }
 
@@ -27740,7 +28854,15 @@ fn try_emit_complex_in_subquery(
         match value_expr {
             Some(expr) => emit_expr(b, expr, r_probe, Some(&subq_scan)),
             None => {
-                b.emit_op(Opcode::Column, subq_cursor, 0, r_probe, P4::None, 0);
+                emit_table_column_read(
+                    b,
+                    subq_cursor,
+                    table,
+                    table_alias,
+                    Some(schema),
+                    0,
+                    r_probe,
+                );
             }
         }
         b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
@@ -28351,7 +29473,14 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     emit_expr(b, &gen_expr, reg, Some(sc));
                     emit_single_column_affinity(b, reg, sc.table.columns[col_idx].affinity);
                 } else {
-                    b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
+                    b.emit_op(
+                        Opcode::Column,
+                        sc.cursor,
+                        table_record_position(sc.table, col_idx) as i32,
+                        reg,
+                        P4::None,
+                        0,
+                    );
                 }
             } else if sc.table.resolves_to_hidden_rowid(&col_ref.column) {
                 b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
@@ -28420,7 +29549,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
 }
 
 fn current_time_literal_text(literal: &Literal) -> Option<String> {
-    use std::time::SystemTime;
+    use fsqlite_types::sync_primitives::SystemTime;
 
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -29623,14 +30752,14 @@ fn emit_scalar_aggregate_subquery(
             } else if let Some(expr) = &agg.arg_expr {
                 emit_expr_with_fallback(b, expr, arg_base, sub_ctx, Some(outer_ctx));
             } else if let Some(col_idx) = agg.arg_col_index {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                b.emit_op(
-                    Opcode::Column,
+                emit_table_column_read(
+                    b,
                     sub_ctx.cursor,
-                    col_idx as i32,
+                    sub_ctx.table,
+                    sub_ctx.table_alias,
+                    sub_ctx.schema,
+                    col_idx,
                     arg_base,
-                    P4::None,
-                    0,
                 );
             }
             for (j, extra_expr) in agg.extra_args.iter().enumerate() {
@@ -31387,6 +32516,40 @@ mod tests {
         }
     }
 
+    fn statement_sql(sql: &str) -> Statement {
+        let Some((statement, tail)) =
+            parse_first_statement_with_tail(sql).expect("test SQL should parse")
+        else {
+            unreachable!("expected parsed statement");
+        };
+        assert_eq!(
+            tail,
+            sql.len(),
+            "parser should consume the whole SQL string"
+        );
+        statement
+    }
+
+    fn assert_schema_qualified_codegen_rejection(
+        result: Result<(), CodegenError>,
+        builder: &ProgramBuilder,
+    ) {
+        assert!(
+            matches!(
+                &result,
+                Err(CodegenError::Unsupported(message))
+                    if message.contains("schema-qualified")
+                        && message.contains("database identity")
+            ),
+            "unexpected codegen result: {result:?}"
+        );
+        assert_eq!(
+            builder.current_addr(),
+            0,
+            "schema-qualified validation must run before emitting bytecode"
+        );
+    }
+
     fn fuzz_literal() -> impl Strategy<Value = String> {
         prop_oneof![
             any::<i16>().prop_map(|n| {
@@ -32542,16 +33705,368 @@ mod tests {
             name: "t".to_owned(),
             root_page: 2,
             columns: vec![
-                ColumnInfo::basic("a", 'd', true),
+                ColumnInfo::basic("a", 'd', false),
                 ColumnInfo::basic("b", 'C', false),
             ],
             indexes: vec![],
             strict: false,
             without_rowid: true,
-            primary_key_constraints: Vec::new(),
+            primary_key_constraints: vec![PrimaryKeyConstraint::new(
+                vec!["a".to_owned()],
+                vec![SortDirection::Asc],
+                vec![None],
+            )],
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    fn schema_with_nonleading_composite_without_rowid_pk() -> Vec<TableSchema> {
+        let mut payload = ColumnInfo::basic("payload", 'B', false);
+        payload.collation = None;
+        let mut tenant = ColumnInfo::basic("tenant", 'B', false);
+        tenant.collation = Some("NOCASE".to_owned());
+        let mut id = ColumnInfo::basic("id", 'B', false);
+        id.collation = Some("RTRIM".to_owned());
+        let note = ColumnInfo::basic("note", 'B', false);
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![payload, tenant, id, note],
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: true,
+            primary_key_constraints: vec![PrimaryKeyConstraint::new(
+                vec!["id".to_owned(), "tenant".to_owned()],
+                vec![SortDirection::Desc, SortDirection::Asc],
+                vec![Some("RTRIM".to_owned()), Some("NOCASE".to_owned())],
+            )],
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    fn plain_index(
+        name: &str,
+        root_page: i32,
+        columns: &[&str],
+        directions: Vec<SortDirection>,
+        collations: Vec<Option<&str>>,
+        is_unique: bool,
+    ) -> IndexSchema {
+        IndexSchema {
+            name: name.to_owned(),
+            root_page,
+            columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+            key_expressions: Vec::new(),
+            key_sort_directions: directions,
+            where_clause: None,
+            is_unique,
+            key_collations: collations
+                .into_iter()
+                .map(|collation| collation.map(str::to_owned))
+                .collect(),
+            conflict_action: None,
+        }
+    }
+
+    #[test]
+    fn without_rowid_layout_is_pk_first_but_keeps_declared_sql_positions() {
+        let schema = schema_with_nonleading_composite_without_rowid_pk();
+        let layout = schema[0].without_rowid_table_layout().unwrap();
+
+        assert_eq!(layout.storage_to_declared, vec![2, 1, 0, 3]);
+        assert_eq!(layout.declared_to_storage, vec![2, 1, 0, 3]);
+        assert_eq!(layout.primary_key_declared, vec![2, 1]);
+        assert_eq!(layout.cursor_desc_flags, vec![true, false, false, false]);
+        assert_eq!(
+            layout.cursor_collations,
+            vec![
+                Some("RTRIM".to_owned()),
+                Some("NOCASE".to_owned()),
+                None,
+                None,
+            ]
+        );
+
+        let stmt = simple_select(&["payload", "id", "tenant"], "t", None);
+        let mut builder = ProgramBuilder::new();
+        codegen_select(
+            &mut builder,
+            &stmt,
+            &schema,
+            &CodegenContext {
+                implicit_without_rowid_indexes: Some(Vec::new()),
+                ..CodegenContext::default()
+            },
+        )
+        .unwrap();
+        let program = builder.finish().unwrap();
+        let physical_reads = program
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Column && op.p1 == 0)
+            .take(3)
+            .map(|op| op.p2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            physical_reads,
+            vec![2, 0, 1],
+            "SQL declaration-order projection must read canonical physical positions"
+        );
+    }
+
+    #[test]
+    fn without_rowid_layout_collapses_only_equivalent_repeated_pk_terms() {
+        let mut schema = schema_with_nonleading_composite_without_rowid_pk();
+        schema[0].primary_key_constraints = vec![PrimaryKeyConstraint::new(
+            vec![
+                "id".to_owned(),
+                "id".to_owned(),
+                "id".to_owned(),
+                "tenant".to_owned(),
+            ],
+            vec![
+                SortDirection::Desc,
+                SortDirection::Asc,
+                SortDirection::Desc,
+                SortDirection::Asc,
+            ],
+            vec![
+                Some("RTRIM".to_owned()),
+                Some("rtrim".to_owned()),
+                Some("BINARY".to_owned()),
+                Some("NOCASE".to_owned()),
+            ],
+        )];
+
+        let table = &schema[0];
+        let layout = table.without_rowid_table_layout().unwrap();
+        assert_eq!(layout.storage_to_declared, vec![2, 2, 1, 0, 3]);
+        assert_eq!(layout.declared_to_storage, vec![3, 2, 0, 4]);
+        assert_eq!(layout.primary_key_declared, vec![2, 2, 1]);
+        assert_eq!(
+            layout.cursor_desc_flags,
+            vec![true, true, false, false, false]
+        );
+        assert_eq!(
+            layout.cursor_collations,
+            vec![
+                Some("RTRIM".to_owned()),
+                Some("BINARY".to_owned()),
+                Some("NOCASE".to_owned()),
+                None,
+                None,
+            ]
+        );
+
+        let id_rtrim = plain_index(
+            "idx_id_rtrim",
+            3,
+            &["id"],
+            vec![SortDirection::Asc],
+            vec![Some("rtrim")],
+            false,
+        );
+        let secondary = table.without_rowid_index_layout(&id_rtrim, false).unwrap();
+        assert_eq!(secondary.logical_declared, vec![2]);
+        assert_eq!(secondary.locator_declared, vec![2, 1]);
+        assert_eq!(secondary.primary_key_sources, vec![0, 1, 2]);
+        assert_eq!(secondary.cursor_desc_flags, vec![false, true, false]);
+        assert_eq!(
+            secondary.cursor_collations,
+            vec![
+                Some("rtrim".to_owned()),
+                Some("BINARY".to_owned()),
+                Some("NOCASE".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_rowid_secondary_layout_reuses_pk_terms_by_column_and_collation() {
+        let schema = schema_with_nonleading_composite_without_rowid_pk();
+        let table = &schema[0];
+
+        let tenant_covered = plain_index(
+            "idx_payload_tenant",
+            3,
+            &["payload", "tenant"],
+            vec![SortDirection::Asc, SortDirection::Desc],
+            vec![None, Some("nocase")],
+            false,
+        );
+        let layout = table
+            .without_rowid_index_layout(&tenant_covered, false)
+            .unwrap();
+        assert_eq!(layout.logical_declared, vec![0, 1]);
+        assert_eq!(layout.locator_declared, vec![2]);
+        assert_eq!(
+            layout.primary_key_sources,
+            vec![2, 1],
+            "a covered PK term may come from a non-leading logical key position"
+        );
+        assert_eq!(layout.cursor_desc_flags, vec![false, true, true]);
+        assert_eq!(
+            layout.cursor_collations,
+            vec![None, Some("nocase".to_owned()), Some("RTRIM".to_owned()),]
+        );
+
+        let id_covered = plain_index(
+            "idx_payload_id",
+            4,
+            &["payload", "id"],
+            vec![SortDirection::Asc, SortDirection::Asc],
+            vec![None, Some("rtrim")],
+            false,
+        );
+        let layout = table
+            .without_rowid_index_layout(&id_covered, false)
+            .unwrap();
+        assert_eq!(layout.locator_declared, vec![1]);
+        assert_eq!(layout.primary_key_sources, vec![1, 2]);
+
+        let wrong_collation = plain_index(
+            "idx_id_binary",
+            5,
+            &["id"],
+            vec![SortDirection::Desc],
+            vec![Some("BINARY")],
+            false,
+        );
+        let layout = table
+            .without_rowid_index_layout(&wrong_collation, false)
+            .unwrap();
+        assert_eq!(
+            layout.locator_declared,
+            vec![2, 1],
+            "the same column under a different effective collation is not coverage"
+        );
+        assert_eq!(layout.primary_key_sources, vec![1, 2]);
+
+        let mut binary_schema = schema_with_nonleading_composite_without_rowid_pk();
+        binary_schema[0].primary_key_constraints = vec![PrimaryKeyConstraint::new(
+            vec!["payload".to_owned()],
+            vec![SortDirection::Desc],
+            vec![None],
+        )];
+        let explicit_binary = plain_index(
+            "idx_payload_binary",
+            6,
+            &["payload"],
+            vec![SortDirection::Asc],
+            vec![Some("binary")],
+            false,
+        );
+        let layout = binary_schema[0]
+            .without_rowid_index_layout(&explicit_binary, false)
+            .unwrap();
+        assert!(
+            layout.locator_declared.is_empty(),
+            "None and case-insensitive BINARY name spellings are equivalent coverage"
+        );
+        assert_eq!(layout.primary_key_sources, vec![0]);
+    }
+
+    #[test]
+    fn without_rowid_implicit_autoindex_locators_are_asc_but_explicit_inherit_pk_direction() {
+        let schema = schema_with_nonleading_composite_without_rowid_pk();
+        let table = &schema[0];
+        let index = plain_index(
+            "sqlite_autoindex_t_2",
+            3,
+            &["payload"],
+            vec![SortDirection::Desc],
+            vec![None],
+            true,
+        );
+
+        let implicit = table.without_rowid_index_layout(&index, true).unwrap();
+        assert_eq!(implicit.locator_declared, vec![2, 1]);
+        assert_eq!(implicit.cursor_desc_flags, vec![true, false, false]);
+
+        let explicit = table.without_rowid_index_layout(&index, false).unwrap();
+        assert_eq!(explicit.locator_declared, vec![2, 1]);
+        assert_eq!(explicit.cursor_desc_flags, vec![true, true, false]);
+    }
+
+    #[test]
+    fn without_rowid_unique_covering_primary_key_does_not_duplicate_locator() {
+        let mut schema = schema_with_nonleading_composite_without_rowid_pk();
+        schema[0].primary_key_constraints = vec![PrimaryKeyConstraint::new(
+            vec!["id".to_owned()],
+            vec![SortDirection::Desc],
+            vec![Some("RTRIM".to_owned())],
+        )];
+        let index = plain_index(
+            "sqlite_autoindex_t_2",
+            3,
+            &["id", "payload"],
+            vec![SortDirection::Asc, SortDirection::Asc],
+            vec![Some("rtrim"), None],
+            true,
+        );
+
+        let layout = schema[0].without_rowid_index_layout(&index, true).unwrap();
+        assert!(layout.locator_declared.is_empty());
+        assert_eq!(layout.primary_key_sources, vec![0]);
+        assert_eq!(layout.record_width(), 2);
+    }
+
+    #[test]
+    fn without_rowid_reserved_autoindex_name_requires_authoritative_provenance() {
+        let mut schema = schema_with_nonleading_composite_without_rowid_pk();
+        schema[0].indexes.push(plain_index(
+            "sqlite_autoindex_t_2",
+            3,
+            &["payload"],
+            vec![SortDirection::Asc],
+            vec![None],
+            true,
+        ));
+        let stmt = simple_select(&["payload"], "t", None);
+
+        let mut missing_builder = ProgramBuilder::new();
+        let error = codegen_select(
+            &mut missing_builder,
+            &stmt,
+            &schema,
+            &CodegenContext::default(),
+        )
+        .expect_err("reserved autoindex names must not be classified heuristically");
+        assert!(matches!(error, CodegenError::Unsupported(message)
+                if message.contains("reserved-name") && message.contains("catalog SQL provenance")));
+        assert_eq!(missing_builder.current_addr(), 0);
+
+        let mut explicit_builder = ProgramBuilder::new();
+        codegen_select(
+            &mut explicit_builder,
+            &stmt,
+            &schema,
+            &CodegenContext {
+                implicit_without_rowid_indexes: Some(Vec::new()),
+                ..CodegenContext::default()
+            },
+        )
+        .expect("authoritative non-implicit provenance must compile");
+
+        let implicit_ctx = CodegenContext {
+            implicit_without_rowid_indexes: Some(vec![(
+                "t".to_owned(),
+                "sqlite_autoindex_t_2".to_owned(),
+            )]),
+            ..CodegenContext::default()
+        };
+        let guard = enter_without_rowid_provenance(&implicit_ctx);
+        let layout = without_rowid_index_layout_for_codegen(&schema[0], &schema[0].indexes[0])
+            .expect("authoritative implicit provenance must classify the locator");
+        assert_eq!(layout.cursor_desc_flags, vec![false, false, false]);
+        drop(guard);
+
+        assert!(
+            without_rowid_index_layout_for_codegen(&schema[0], &schema[0].indexes[0]).is_err(),
+            "direct helper callers must also fail closed after the provenance guard is gone"
+        );
     }
 
     fn schema_with_visible_rowid_column_and_a_indexes() -> Vec<TableSchema> {
@@ -32592,6 +34107,130 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    #[test]
+    fn test_codegen_select_rejects_schema_qualified_column_before_suffix_binding() {
+        let stmt = select_sql("SELECT main.t.a FROM t");
+        let mut builder = ProgramBuilder::new();
+        let result = codegen_select(
+            &mut builder,
+            &stmt,
+            &test_schema(),
+            &CodegenContext::default(),
+        );
+
+        assert_schema_qualified_codegen_rejection(result, &builder);
+    }
+
+    #[test]
+    fn test_codegen_validator_recurses_into_nested_selects() {
+        let stmt = select_sql("SELECT (SELECT main.t.a FROM t)");
+        let mut builder = ProgramBuilder::new();
+        let result = codegen_select(
+            &mut builder,
+            &stmt,
+            &test_schema(),
+            &CodegenContext::default(),
+        );
+
+        assert_schema_qualified_codegen_rejection(result, &builder);
+    }
+
+    #[test]
+    fn test_codegen_select_rejects_schema_qualified_from_relation_before_suffix_binding() {
+        let stmt = select_sql("SELECT a FROM temp.t");
+        let mut builder = ProgramBuilder::new();
+        let result = codegen_select(
+            &mut builder,
+            &stmt,
+            &test_schema(),
+            &CodegenContext::default(),
+        );
+
+        assert_schema_qualified_codegen_rejection(result, &builder);
+    }
+
+    #[test]
+    fn test_codegen_select_rejects_schema_qualified_join_relation() {
+        let stmt = select_sql("SELECT t.a FROM t JOIN temp.t AS other ON other.a = t.a");
+        let mut builder = ProgramBuilder::new();
+        let result = codegen_select(
+            &mut builder,
+            &stmt,
+            &test_schema(),
+            &CodegenContext::default(),
+        );
+
+        assert_schema_qualified_codegen_rejection(result, &builder);
+    }
+
+    #[test]
+    fn test_codegen_select_rejects_schema_qualified_in_table_relation() {
+        let stmt = select_sql("SELECT a FROM t WHERE a IN temp.t");
+        let mut builder = ProgramBuilder::new();
+        let result = codegen_select(
+            &mut builder,
+            &stmt,
+            &test_schema(),
+            &CodegenContext::default(),
+        );
+
+        assert_schema_qualified_codegen_rejection(result, &builder);
+    }
+
+    #[test]
+    fn test_public_dml_codegen_entry_points_reject_schema_qualified_columns() {
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+
+        let Statement::Insert(insert) = statement_sql("INSERT INTO t(a) VALUES (main.t.a)") else {
+            unreachable!("expected INSERT");
+        };
+        let mut insert_builder = ProgramBuilder::new();
+        let insert_result = codegen_insert(&mut insert_builder, &insert, &schema, &ctx);
+        assert_schema_qualified_codegen_rejection(insert_result, &insert_builder);
+
+        let Statement::Update(update) = statement_sql("UPDATE t SET a = main.t.a") else {
+            unreachable!("expected UPDATE");
+        };
+        let mut update_builder = ProgramBuilder::new();
+        let update_result = codegen_update(&mut update_builder, &update, &schema, &ctx);
+        assert_schema_qualified_codegen_rejection(update_result, &update_builder);
+
+        let Statement::Delete(delete) = statement_sql("DELETE FROM t WHERE main.t.a = 1") else {
+            unreachable!("expected DELETE");
+        };
+        let mut delete_builder = ProgramBuilder::new();
+        let delete_result = codegen_delete(&mut delete_builder, &delete, &schema, &ctx);
+        assert_schema_qualified_codegen_rejection(delete_result, &delete_builder);
+    }
+
+    #[test]
+    fn test_public_dml_codegen_entry_points_reject_schema_qualified_targets() {
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+
+        let Statement::Insert(insert) = statement_sql("INSERT INTO temp.t(a) VALUES (1)") else {
+            unreachable!("expected INSERT");
+        };
+        let mut insert_builder = ProgramBuilder::new();
+        let insert_result = codegen_insert(&mut insert_builder, &insert, &schema, &ctx);
+        assert_schema_qualified_codegen_rejection(insert_result, &insert_builder);
+
+        let Statement::Update(update) = statement_sql("UPDATE temp.t SET a = 1") else {
+            unreachable!("expected UPDATE");
+        };
+        let mut update_builder = ProgramBuilder::new();
+        let update_result = codegen_update(&mut update_builder, &update, &schema, &ctx);
+        assert_schema_qualified_codegen_rejection(update_result, &update_builder);
+
+        let Statement::Delete(delete) = statement_sql("DELETE FROM temp.t WHERE a = 1") else {
+            unreachable!("expected DELETE");
+        };
+        let mut delete_builder = ProgramBuilder::new();
+        let delete_result = codegen_delete(&mut delete_builder, &delete, &schema, &ctx);
+        assert_schema_qualified_codegen_rejection(delete_result, &delete_builder);
     }
 
     // === Test 1: SELECT by rowid ===
@@ -33241,6 +34880,431 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 1);
+    }
+
+    #[test]
+    fn test_codegen_constraint_halt_carries_resolved_conflict_action() {
+        for (action, expected_oe) in [
+            (ConflictAction::Fail, OE_FAIL),
+            (ConflictAction::Rollback, OE_ROLLBACK),
+            // SQLite applies ABORT, rather than replacement, to CHECK
+            // violations under an outer OR REPLACE clause.
+            (ConflictAction::Replace, OE_ABORT),
+        ] {
+            let mut stmt = do_update_insert_stmt(Some(action));
+            stmt.upsert.clear();
+            let mut schema = test_schema();
+            schema[0].check_constraints.push(CheckConstraint {
+                expr: "b > 0".to_owned(),
+                owner_column: None,
+            });
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+            let program = b.finish().unwrap();
+            let halt = program
+                .ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::Halt && op.p1 == 19)
+                .expect("CHECK constraint must emit a failing Halt");
+            assert_eq!(
+                halt.p5, expected_oe,
+                "CHECK failure must carry the resolved statement policy"
+            );
+        }
+
+        let mut stmt = do_update_insert_stmt(None);
+        stmt.upsert.clear();
+        let mut schema = test_schema();
+        schema[0].columns[1].notnull = true;
+        schema[0].columns[1].conflict_action = Some(ConflictAction::Fail);
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let program = b.finish().unwrap();
+        let halt = program
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Halt && op.p1 == 19)
+            .expect("NOT NULL constraint must emit a failing Halt");
+        assert_eq!(
+            halt.p5, OE_FAIL,
+            "schema-level NOT NULL FAIL must survive code generation"
+        );
+    }
+
+    #[test]
+    fn test_codegen_not_null_replace_uses_non_null_default_before_abort_fallback() {
+        let mut schema = test_schema();
+        schema[0].columns[1].notnull = true;
+        schema[0].columns[1].conflict_action = Some(ConflictAction::Replace);
+        schema[0].columns[1].default_value = Some("'fallback'".to_owned());
+        let mut builder = ProgramBuilder::new();
+
+        emit_not_null_constraints(&mut builder, &schema[0], 1, None, None).unwrap();
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().unwrap();
+        assert!(
+            program.ops().iter().any(|op| {
+                op.opcode == Opcode::String8
+                    && matches!(&op.p4, P4::Str(value) if value == "fallback")
+            }),
+            "REPLACE must write the declared default into the failing value register"
+        );
+        assert!(
+            program
+                .ops()
+                .iter()
+                .any(|op| { op.opcode == Opcode::HaltIfNull && op.p3 == 2 && op.p5 == OE_ABORT }),
+            "a default that still evaluates to NULL must fall back to ABORT"
+        );
+    }
+
+    #[test]
+    fn test_codegen_not_null_replace_without_default_falls_back_to_abort() {
+        let mut schema = test_schema();
+        schema[0].columns[1].notnull = true;
+        schema[0].columns[1].conflict_action = Some(ConflictAction::Replace);
+        schema[0].columns[1].default_value = None;
+        let mut builder = ProgramBuilder::new();
+
+        emit_not_null_constraints(&mut builder, &schema[0], 1, None, None).unwrap();
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().unwrap();
+        assert!(
+            program
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Halt && op.p1 == 19 && op.p5 == OE_ABORT),
+            "REPLACE without a usable default has SQLite ABORT semantics"
+        );
+    }
+
+    #[test]
+    fn test_codegen_not_null_replace_null_default_falls_back_to_abort() {
+        let mut schema = test_schema();
+        schema[0].columns[1].notnull = true;
+        schema[0].columns[1].conflict_action = Some(ConflictAction::Replace);
+        schema[0].columns[1].default_value = Some("NULL".to_owned());
+        let mut builder = ProgramBuilder::new();
+
+        emit_not_null_constraints(&mut builder, &schema[0], 1, None, None).unwrap();
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().unwrap();
+        assert!(
+            program
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Null && op.p2 == 2),
+            "the declared NULL default must still be evaluated"
+        );
+        assert!(
+            program
+                .ops()
+                .iter()
+                .any(|op| { op.opcode == Opcode::HaltIfNull && op.p3 == 2 && op.p5 == OE_ABORT }),
+            "a NULL default must be rejected with ABORT after replacement"
+        );
+    }
+
+    fn do_update_insert_stmt(or_conflict: Option<ConflictAction>) -> InsertStatement {
+        InsertStatement {
+            with: None,
+            or_conflict,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![UpsertClause {
+                target: None,
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::Column("b".to_owned()),
+                        value: Expr::Column(ColumnRef::qualified("excluded", "b"), Span::ZERO),
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: vec![],
+        }
+    }
+
+    fn valid_without_rowid_schema() -> Vec<TableSchema> {
+        let mut schema = schema_with_without_rowid_ipk();
+        schema[0].primary_key_constraints = vec![PrimaryKeyConstraint::new(
+            vec!["a".to_owned()],
+            vec![SortDirection::Asc],
+            vec![None],
+        )];
+        schema
+    }
+
+    #[test]
+    fn test_codegen_rowid_upsert_do_update_fail_rollback_rejected_before_emission() {
+        for action in [ConflictAction::Fail, ConflictAction::Rollback] {
+            let stmt = do_update_insert_stmt(Some(action));
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+                .expect_err("outer FAIL/ROLLBACK needs an exact statement-boundary receipt");
+
+            assert!(
+                matches!(&err, CodegenError::Unsupported(message) if message.contains("OR FAIL/ROLLBACK")),
+                "unexpected rowid UPSERT quarantine error: {err:?}"
+            );
+            assert_eq!(
+                b.current_addr(),
+                0,
+                "rowid UPSERT policy rejection must precede opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_insert_statement_returning_reachable_ignore_rejected_before_emission() {
+        let mut stmt = do_update_insert_stmt(Some(ConflictAction::Ignore));
+        stmt.upsert.clear();
+        stmt.returning = vec![ResultColumn::Star];
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect_err("INSERT OR IGNORE RETURNING cannot identify a skipped mutation");
+
+        assert!(
+            matches!(&err, CodegenError::Unsupported(message)
+                if message.contains("RETURNING") && message.contains("IGNORE")),
+            "unexpected INSERT OR IGNORE RETURNING error: {err:?}"
+        );
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "INSERT OR IGNORE RETURNING rejection must precede opcode emission"
+        );
+    }
+
+    #[test]
+    fn test_codegen_upsert_do_nothing_returning_reachable_ignore_rejected_before_emission() {
+        let mut stmt = do_update_insert_stmt(None);
+        stmt.upsert[0].action = UpsertAction::Nothing;
+        stmt.returning = vec![ResultColumn::Star];
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect_err("UPSERT DO NOTHING RETURNING cannot identify a skipped mutation");
+
+        assert!(
+            matches!(&err, CodegenError::Unsupported(message)
+                if message.contains("RETURNING") && message.contains("DO NOTHING")),
+            "unexpected UPSERT DO NOTHING RETURNING error: {err:?}"
+        );
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "UPSERT DO NOTHING RETURNING rejection must precede opcode emission"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_schema_returning_reachable_ignore_rejected_before_emission() {
+        let mut stmt = do_update_insert_stmt(None);
+        stmt.upsert.clear();
+        stmt.returning = vec![ResultColumn::Star];
+        let ctx = CodegenContext::default();
+
+        let mut not_null_schema = test_schema();
+        not_null_schema[0].columns[1].notnull = true;
+        not_null_schema[0].columns[1].conflict_action = Some(ConflictAction::Ignore);
+
+        let mut primary_key_schema = schema_with_ipk_alias();
+        primary_key_schema[0].columns[0].conflict_action = Some(ConflictAction::Ignore);
+
+        let mut unique_schema = test_schema_with_index();
+        unique_schema[0].indexes[0].is_unique = true;
+        unique_schema[0].indexes[0].conflict_action = Some(ConflictAction::Ignore);
+
+        for (constraint_kind, schema) in [
+            ("NOT NULL", not_null_schema),
+            ("INTEGER PRIMARY KEY", primary_key_schema),
+            ("UNIQUE", unique_schema),
+        ] {
+            let mut b = ProgramBuilder::new();
+            let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+                .expect_err("schema IGNORE plus RETURNING cannot identify a skipped mutation");
+
+            assert!(
+                matches!(&err, CodegenError::Unsupported(message)
+                    if message.contains("RETURNING") && message.contains("IGNORE")),
+                "unexpected {constraint_kind} IGNORE RETURNING error: {err:?}"
+            );
+            assert_eq!(
+                b.current_addr(),
+                0,
+                "{constraint_kind} IGNORE RETURNING rejection must precede opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_without_rowid_upsert_do_update_rejected_before_emission() {
+        let stmt = do_update_insert_stmt(None);
+        let schema = valid_without_rowid_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect_err("WITHOUT ROWID DO UPDATE lacks exact restoration");
+
+        assert!(
+            matches!(&err, CodegenError::Unsupported(message) if message.contains("UPSERT DO UPDATE on WITHOUT ROWID")),
+            "unexpected WITHOUT ROWID UPSERT quarantine error: {err:?}"
+        );
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "WITHOUT ROWID DO UPDATE rejection must precede opcode emission"
+        );
+    }
+
+    #[test]
+    fn test_codegen_without_rowid_upsert_do_nothing_rejected_before_emission() {
+        let mut stmt = do_update_insert_stmt(None);
+        stmt.upsert[0].action = UpsertAction::Nothing;
+        let schema = valid_without_rowid_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect_err("WITHOUT ROWID DO NOTHING has effective IGNORE semantics");
+
+        assert!(
+            matches!(&err, CodegenError::Unsupported(message) if message.contains("UPSERT DO NOTHING on WITHOUT ROWID")),
+            "unexpected WITHOUT ROWID DO NOTHING quarantine error: {err:?}"
+        );
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "WITHOUT ROWID DO NOTHING rejection must precede opcode emission"
+        );
+    }
+
+    #[test]
+    fn test_codegen_without_rowid_insert_statement_policy_rejected_before_emission() {
+        for action in [
+            ConflictAction::Fail,
+            ConflictAction::Ignore,
+            ConflictAction::Replace,
+        ] {
+            let mut stmt = do_update_insert_stmt(Some(action));
+            stmt.upsert.clear();
+            let schema = valid_without_rowid_schema();
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+                .expect_err("WITHOUT ROWID conflict policy lacks exact restoration");
+
+            assert!(
+                matches!(&err, CodegenError::Unsupported(message) if message.contains("INSERT OR FAIL/IGNORE/REPLACE")),
+                "unexpected WITHOUT ROWID statement-policy error: {err:?}"
+            );
+            assert_eq!(
+                b.current_addr(),
+                0,
+                "WITHOUT ROWID statement-policy rejection must precede opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_without_rowid_insert_schema_policies_rejected_before_emission() {
+        for action in [
+            ConflictAction::Fail,
+            ConflictAction::Ignore,
+            ConflictAction::Replace,
+        ] {
+            let mut stmt = do_update_insert_stmt(None);
+            stmt.upsert.clear();
+            let ctx = CodegenContext::default();
+
+            let mut column_schema = valid_without_rowid_schema();
+            column_schema[0].columns[1].notnull = true;
+            column_schema[0].columns[1].conflict_action = Some(action);
+            let mut column_builder = ProgramBuilder::new();
+            let column_err = codegen_insert(&mut column_builder, &stmt, &column_schema, &ctx)
+                .expect_err("WITHOUT ROWID column policy lacks exact restoration");
+            assert!(
+                matches!(&column_err, CodegenError::Unsupported(message) if message.contains("schema-level FAIL/IGNORE/REPLACE")),
+                "unexpected WITHOUT ROWID column-policy error: {column_err:?}"
+            );
+            assert_eq!(
+                column_builder.current_addr(),
+                0,
+                "WITHOUT ROWID column-policy rejection must precede opcode emission"
+            );
+
+            let mut primary_key_schema = valid_without_rowid_schema();
+            primary_key_schema[0].columns[0].is_ipk = false;
+            primary_key_schema[0].columns[0].conflict_action = Some(action);
+            let mut primary_key_builder = ProgramBuilder::new();
+            let primary_key_err =
+                codegen_insert(&mut primary_key_builder, &stmt, &primary_key_schema, &ctx)
+                    .expect_err("WITHOUT ROWID primary-key policy lacks exact restoration");
+            assert!(
+                matches!(&primary_key_err, CodegenError::Unsupported(message) if message.contains("schema-level FAIL/IGNORE/REPLACE")),
+                "unexpected WITHOUT ROWID primary-key policy error: {primary_key_err:?}"
+            );
+            assert_eq!(
+                primary_key_builder.current_addr(),
+                0,
+                "WITHOUT ROWID primary-key policy rejection must precede opcode emission"
+            );
+
+            let mut index_schema = valid_without_rowid_schema();
+            index_schema[0].indexes.push(IndexSchema {
+                name: "idx_t_b".to_owned(),
+                root_page: 3,
+                columns: vec!["b".to_owned()],
+                key_expressions: Vec::new(),
+                key_sort_directions: vec![SortDirection::Asc],
+                where_clause: None,
+                is_unique: true,
+                key_collations: vec![None],
+                conflict_action: Some(action),
+            });
+            let mut index_builder = ProgramBuilder::new();
+            let index_err = codegen_insert(&mut index_builder, &stmt, &index_schema, &ctx)
+                .expect_err("WITHOUT ROWID index policy lacks exact restoration");
+            assert!(
+                matches!(&index_err, CodegenError::Unsupported(message) if message.contains("schema-level FAIL/IGNORE/REPLACE")),
+                "unexpected WITHOUT ROWID index-policy error: {index_err:?}"
+            );
+            assert_eq!(
+                index_builder.current_addr(),
+                0,
+                "WITHOUT ROWID index-policy rejection must precede opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_without_rowid_insert_or_abort_overrides_schema_ignore() {
+        let mut stmt = do_update_insert_stmt(Some(ConflictAction::Abort));
+        stmt.upsert.clear();
+        let mut schema = valid_without_rowid_schema();
+        schema[0].columns[1].notnull = true;
+        schema[0].columns[1].conflict_action = Some(ConflictAction::Ignore);
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+
+        codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect("explicit OR ABORT makes the schema IGNORE policy unreachable");
+        let program = b.finish().expect("overridden schema policy should compile");
+
+        assert!(
+            program
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::IdxInsert),
+            "the ordinary WITHOUT ROWID ABORT insertion path should remain available"
+        );
     }
 
     #[test]
@@ -34739,6 +36803,377 @@ mod tests {
             idx_delete.p3 > 0,
             "IdxDelete must carry key register count (p3 > 0) so engine seeks by key"
         );
+    }
+
+    fn conflict_update_stmt(
+        or_conflict: Option<ConflictAction>,
+        assignment_column: &str,
+    ) -> UpdateStatement {
+        UpdateStatement {
+            with: None,
+            or_conflict,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column(assignment_column.to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn test_codegen_update_statement_returning_reachable_ignore_rejected_before_emission() {
+        let mut stmt = conflict_update_stmt(Some(ConflictAction::Ignore), "b");
+        stmt.returning = vec![ResultColumn::Star];
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+            .expect_err("UPDATE OR IGNORE RETURNING cannot identify a skipped mutation");
+
+        assert!(
+            matches!(&err, CodegenError::Unsupported(message)
+                if message.contains("RETURNING") && message.contains("IGNORE")),
+            "unexpected UPDATE OR IGNORE RETURNING error: {err:?}"
+        );
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "UPDATE OR IGNORE RETURNING rejection must precede opcode emission"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_schema_returning_reachable_ignore_rejected_before_emission() {
+        let mut stmt = conflict_update_stmt(None, "b");
+        stmt.returning = vec![ResultColumn::Star];
+        let ctx = CodegenContext::default();
+
+        let mut not_null_schema = test_schema();
+        not_null_schema[0].columns[1].notnull = true;
+        not_null_schema[0].columns[1].conflict_action = Some(ConflictAction::Ignore);
+
+        let mut unique_schema = test_schema_with_index();
+        unique_schema[0].indexes[0].is_unique = true;
+        unique_schema[0].indexes[0].conflict_action = Some(ConflictAction::Ignore);
+
+        for (constraint_kind, schema) in [("NOT NULL", not_null_schema), ("UNIQUE", unique_schema)]
+        {
+            let mut b = ProgramBuilder::new();
+            let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+                .expect_err("schema IGNORE plus RETURNING cannot identify a skipped mutation");
+
+            assert!(
+                matches!(&err, CodegenError::Unsupported(message)
+                    if message.contains("RETURNING") && message.contains("IGNORE")),
+                "unexpected UPDATE {constraint_kind} IGNORE RETURNING error: {err:?}"
+            );
+            assert_eq!(
+                b.current_addr(),
+                0,
+                "UPDATE {constraint_kind} IGNORE RETURNING rejection must precede opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_rowid_returning_or_abort_overrides_schema_ignore() {
+        let ctx = CodegenContext::default();
+
+        let mut insert_stmt = do_update_insert_stmt(Some(ConflictAction::Abort));
+        insert_stmt.upsert.clear();
+        insert_stmt.returning = vec![ResultColumn::Star];
+        let mut insert_schema = test_schema_with_index();
+        insert_schema[0].columns[1].notnull = true;
+        insert_schema[0].columns[1].conflict_action = Some(ConflictAction::Ignore);
+        insert_schema[0].indexes[0].is_unique = true;
+        insert_schema[0].indexes[0].conflict_action = Some(ConflictAction::Ignore);
+        let mut insert_builder = ProgramBuilder::new();
+        codegen_insert(&mut insert_builder, &insert_stmt, &insert_schema, &ctx)
+            .expect("INSERT OR ABORT must override schema IGNORE");
+        let insert_program = insert_builder
+            .finish()
+            .expect("overridden INSERT schema policy should compile");
+        assert!(
+            insert_program
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::ResultRow),
+            "INSERT OR ABORT RETURNING should retain result emission"
+        );
+
+        let mut update_stmt = conflict_update_stmt(Some(ConflictAction::Abort), "b");
+        update_stmt.returning = vec![ResultColumn::Star];
+        let mut update_schema = test_schema_with_index();
+        update_schema[0].columns[1].notnull = true;
+        update_schema[0].columns[1].conflict_action = Some(ConflictAction::Ignore);
+        update_schema[0].indexes[0].is_unique = true;
+        update_schema[0].indexes[0].conflict_action = Some(ConflictAction::Ignore);
+        let mut update_builder = ProgramBuilder::new();
+        codegen_update(&mut update_builder, &update_stmt, &update_schema, &ctx)
+            .expect("UPDATE OR ABORT must override schema IGNORE");
+        let update_program = update_builder
+            .finish()
+            .expect("overridden UPDATE schema policy should compile");
+        assert!(
+            update_program
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::ResultRow),
+            "UPDATE OR ABORT RETURNING should retain result emission"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_fail_ignore_accepts_exact_index_restore_shapes() {
+        for action in [ConflictAction::Fail, ConflictAction::Ignore] {
+            for schema in [test_schema(), test_schema_with_index()] {
+                let stmt = conflict_update_stmt(Some(action), "b");
+                let ctx = CodegenContext::default();
+                let mut b = ProgramBuilder::new();
+                codegen_update(&mut b, &stmt, &schema, &ctx)
+                    .expect("fully-maintained direct indexes have exact restore keys");
+                let prog = b.finish().expect("safe FAIL/IGNORE UPDATE should build");
+                assert!(
+                    prog.ops().iter().any(|op| op.opcode == Opcode::Insert),
+                    "safe FAIL/IGNORE UPDATE should retain the ordinary rowid rewrite"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_codegen_update_fail_ignore_rejects_unmaintained_index_restore() {
+        for action in [ConflictAction::Fail, ConflictAction::Ignore] {
+            let stmt = conflict_update_stmt(Some(action), "a");
+            let schema = test_schema_with_index();
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+                .expect_err("an unaffected index would be over-restored after a conflict");
+            assert!(
+                matches!(&err, CodegenError::Unsupported(message) if message.contains("every table index")),
+                "unexpected unmaintained-index error: {err:?}"
+            );
+            assert_eq!(
+                b.current_addr(),
+                0,
+                "unsafe FAIL/IGNORE UPDATE must fail before opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_update_fail_ignore_rejects_nonreconstructible_index_keys() {
+        let mut partial_index_schema = test_schema_with_index();
+        partial_index_schema[0].indexes[0].where_clause = Some("b IS NOT NULL".to_owned());
+
+        for action in [ConflictAction::Fail, ConflictAction::Ignore] {
+            for (schema, assignment_column) in [
+                (test_schema_with_expression_index(), "name"),
+                (partial_index_schema.clone(), "b"),
+            ] {
+                let stmt = conflict_update_stmt(Some(action), assignment_column);
+                let ctx = CodegenContext::default();
+                let mut b = ProgramBuilder::new();
+                let err = codegen_update(&mut b, &stmt, &schema, &ctx).expect_err(
+                    "expression and partial index keys are not exactly reconstructible",
+                );
+                assert!(
+                    matches!(&err, CodegenError::Unsupported(message) if message.contains("exactly reconstructible")),
+                    "unexpected nonreconstructible-index error: {err:?}"
+                );
+                assert_eq!(
+                    b.current_addr(),
+                    0,
+                    "unsafe index restoration must be rejected before opcode emission"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_codegen_without_rowid_update_fail_ignore_replace_rejected_before_emission() {
+        let mut schema = schema_with_without_rowid_ipk();
+        schema[0].primary_key_constraints = vec![PrimaryKeyConstraint::new(
+            vec!["a".to_owned()],
+            vec![SortDirection::Asc],
+            vec![None],
+        )];
+
+        for action in [
+            ConflictAction::Fail,
+            ConflictAction::Ignore,
+            ConflictAction::Replace,
+        ] {
+            let stmt = conflict_update_stmt(Some(action), "b");
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+                .expect_err("WITHOUT ROWID conflict handling lacks exact victim restoration");
+            assert!(
+                matches!(&err, CodegenError::Unsupported(message) if message.contains("WITHOUT ROWID")),
+                "unexpected WITHOUT ROWID conflict-policy error: {err:?}"
+            );
+            assert_eq!(
+                b.current_addr(),
+                0,
+                "WITHOUT ROWID conflict-policy rejection must precede opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_without_rowid_update_schema_replace_rejected_before_emission() {
+        let mut schema = schema_with_without_rowid_ipk();
+        schema[0].primary_key_constraints = vec![PrimaryKeyConstraint::new(
+            vec!["a".to_owned()],
+            vec![SortDirection::Asc],
+            vec![None],
+        )];
+        schema[0].columns[0].conflict_action = Some(ConflictAction::Replace);
+
+        let stmt = conflict_update_stmt(None, "b");
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+            .expect_err("schema-level WITHOUT ROWID REPLACE lacks exact victim deletion");
+        assert!(
+            matches!(&err, CodegenError::Unsupported(message) if message.contains("FAIL/IGNORE/REPLACE")),
+            "unexpected schema-level WITHOUT ROWID REPLACE error: {err:?}"
+        );
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "schema-level WITHOUT ROWID REPLACE rejection must precede opcode emission"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_schema_fail_ignore_requires_exact_full_index_restore() {
+        for action in [ConflictAction::Fail, ConflictAction::Ignore] {
+            let mut safe_schema = test_schema_with_index();
+            safe_schema[0].indexes[0].is_unique = true;
+            safe_schema[0].indexes[0].conflict_action = Some(action);
+            let stmt = conflict_update_stmt(None, "b");
+            let ctx = CodegenContext::default();
+            let mut safe_builder = ProgramBuilder::new();
+            codegen_update(&mut safe_builder, &stmt, &safe_schema, &ctx)
+                .expect("a maintained direct index has an exact schema-policy restore path");
+
+            let mut unsafe_schema = safe_schema;
+            unsafe_schema[0].indexes.push(IndexSchema {
+                name: "idx_t_a".to_owned(),
+                root_page: 4,
+                columns: vec!["a".to_owned()],
+                key_expressions: vec!["a".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: false,
+                key_collations: vec![],
+                conflict_action: None,
+            });
+            let mut unsafe_builder = ProgramBuilder::new();
+            let err = codegen_update(&mut unsafe_builder, &stmt, &unsafe_schema, &ctx)
+                .expect_err("schema FAIL/IGNORE can over-restore an unaffected index");
+            assert!(
+                matches!(&err, CodegenError::Unsupported(message) if message.contains("effective FAIL/IGNORE")),
+                "unexpected schema conflict-policy error: {err:?}"
+            );
+            assert_eq!(
+                unsafe_builder.current_addr(),
+                0,
+                "schema-level FAIL/IGNORE must be rejected before opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_rowid_primary_key_schema_fail_ignore_rejected_before_emission() {
+        for action in [ConflictAction::Fail, ConflictAction::Ignore] {
+            let mut schema = test_schema();
+            schema[0].columns[0].is_ipk = true;
+            schema[0].columns[0].conflict_action = Some(action);
+            let stmt = conflict_update_stmt(None, "a");
+            let ctx = CodegenContext::default();
+            let mut builder = ProgramBuilder::new();
+            let err = codegen_update(&mut builder, &stmt, &schema, &ctx)
+                .expect_err("schema-level rowid conflict policy is not encoded by OP_Insert");
+            assert!(
+                matches!(&err, CodegenError::Unsupported(message) if message.contains("INTEGER PRIMARY KEY")),
+                "unexpected rowid primary-key policy error: {err:?}"
+            );
+            assert_eq!(
+                builder.current_addr(),
+                0,
+                "rowid primary-key policy rejection must precede opcode emission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_without_rowid_schema_fail_ignore_rejected_before_emission() {
+        for action in [ConflictAction::Fail, ConflictAction::Ignore] {
+            let mut index_schema = schema_with_without_rowid_ipk();
+            index_schema[0].primary_key_constraints = vec![PrimaryKeyConstraint::new(
+                vec!["a".to_owned()],
+                vec![SortDirection::Asc],
+                vec![None],
+            )];
+            index_schema[0].indexes.push(IndexSchema {
+                name: "idx_t_b".to_owned(),
+                root_page: 3,
+                columns: vec!["b".to_owned()],
+                key_expressions: Vec::new(),
+                key_sort_directions: vec![SortDirection::Asc],
+                where_clause: None,
+                is_unique: true,
+                key_collations: vec![None],
+                conflict_action: Some(action),
+            });
+
+            let stmt = conflict_update_stmt(None, "b");
+            let ctx = CodegenContext::default();
+            let mut index_builder = ProgramBuilder::new();
+            let index_err = codegen_update(&mut index_builder, &stmt, &index_schema, &ctx)
+                .expect_err("WITHOUT ROWID schema index policy lacks a row restore receipt");
+            assert!(
+                matches!(&index_err, CodegenError::Unsupported(message) if message.contains("effective FAIL/IGNORE")),
+                "unexpected WITHOUT ROWID index-policy error: {index_err:?}"
+            );
+            assert_eq!(index_builder.current_addr(), 0);
+
+            let mut not_null_schema = schema_with_without_rowid_ipk();
+            not_null_schema[0].primary_key_constraints = vec![PrimaryKeyConstraint::new(
+                vec!["a".to_owned()],
+                vec![SortDirection::Asc],
+                vec![None],
+            )];
+            not_null_schema[0].columns[1].notnull = true;
+            not_null_schema[0].columns[1].conflict_action = Some(action);
+            let mut not_null_builder = ProgramBuilder::new();
+            let not_null_err = codegen_update(&mut not_null_builder, &stmt, &not_null_schema, &ctx)
+                .expect_err("WITHOUT ROWID column policy runs after the destructive delete");
+            assert!(
+                matches!(&not_null_err, CodegenError::Unsupported(message) if message.contains("effective FAIL/IGNORE")),
+                "unexpected WITHOUT ROWID NOT NULL policy error: {not_null_err:?}"
+            );
+            assert_eq!(not_null_builder.current_addr(), 0);
+        }
     }
 
     #[test]
@@ -43673,7 +46108,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_update_from_generates_nested_loop() {
+    fn test_codegen_update_from_rejected_before_opcode_emission() {
         // UPDATE t SET b = s.b FROM s WHERE t.a = s.b
         let stmt = UpdateStatement {
             with: None,
@@ -43702,38 +46137,21 @@ mod tests {
         let schema = test_schema_with_subquery_source();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
-        let prog = b.finish().unwrap();
-
-        let opcodes = opcode_sequence(&prog);
-        // Expect two Rewind opcodes (outer FROM, inner target).
-        let rewind_count = opcodes.iter().filter(|&&o| o == Opcode::Rewind).count();
-        assert_eq!(rewind_count, 2, "expected nested loop with 2 Rewind ops");
-        // Expect two Next opcodes (inner and outer).
-        let next_count = opcodes.iter().filter(|&&o| o == Opcode::Next).count();
-        assert_eq!(next_count, 2, "expected nested loop with 2 Next ops");
-        // Expect OpenWrite for target and OpenRead for FROM.
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+            .expect_err("UPDATE FROM must fail closed until target rows are deduplicated");
         assert!(
-            opcodes.contains(&Opcode::OpenWrite),
-            "expected OpenWrite for target table"
+            matches!(&err, CodegenError::Unsupported(message) if message.contains("target rows are deduplicated")),
+            "unexpected UPDATE FROM error: {err:?}"
         );
-        assert!(
-            opcodes.contains(&Opcode::OpenRead),
-            "expected OpenRead for FROM table"
-        );
-        // Expect Delete + Insert for the update-as-delete+insert pattern.
-        assert!(
-            opcodes.contains(&Opcode::Delete),
-            "expected Delete for old row"
-        );
-        assert!(
-            opcodes.contains(&Opcode::Insert),
-            "expected Insert for updated row"
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "UPDATE FROM rejection must happen before any opcode is emitted"
         );
     }
 
     #[test]
-    fn test_codegen_update_from_unknown_set_column_errors() {
+    fn test_codegen_update_from_rejection_precedes_expression_lowering() {
         let stmt = UpdateStatement {
             with: None,
             or_conflict: None,
@@ -43762,10 +46180,15 @@ mod tests {
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
         let err = codegen_update(&mut b, &stmt, &schema, &ctx)
-            .expect_err("UPDATE FROM SET expression should reject unknown columns");
+            .expect_err("UPDATE FROM must be rejected before lowering its SET expression");
         assert!(
-            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "missing"),
+            matches!(&err, CodegenError::Unsupported(message) if message.contains("target rows are deduplicated")),
             "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "rejected UPDATE FROM must not leave partial bytecode behind"
         );
     }
 
@@ -45418,6 +47841,7 @@ mod tests {
             where_clause: Some(Expr::BinaryOp {
                 left: Box::new(Expr::Column(
                     fsqlite_ast::ColumnRef {
+                        schema: None,
                         table: None,
                         column: "b".into(),
                     },

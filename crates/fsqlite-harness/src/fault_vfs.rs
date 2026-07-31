@@ -28,7 +28,9 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_vfs::shm::ShmRegion;
-use fsqlite_vfs::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion};
+use fsqlite_vfs::traits::{
+    FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource,
+};
 use tracing::{debug, debug_span};
 
 /// Bead identifier for tracing/log correlation.
@@ -676,34 +678,113 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         offset: u64,
         completion: VfsWriteCompletion,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
         async move {
             match self.state.check_write(&self.path, offset, buf.len()) {
-                WriteDecision::Allow => self.inner.write_tracked(cx, buf, offset, completion).await,
+                WriteDecision::Allow => {
+                    source_completion
+                        .delegate_exact(|lower_completion| {
+                            self.inner.write_tracked(cx, buf, offset, lower_completion)
+                        })
+                        .await
+                }
                 WriteDecision::TornWrite { valid_bytes }
                 | WriteDecision::PartialWrite { valid_bytes } => {
                     let applied = valid_bytes.min(buf.len());
                     if applied > 0 {
-                        let partial_completion = completion.error_mapped_child();
-                        self.inner
-                            .write_tracked(cx, &buf[..applied], offset, partial_completion)
+                        source_completion
+                            .delegate_error_mapped(|lower_completion| {
+                                self.inner.write_tracked(
+                                    cx,
+                                    &buf[..applied],
+                                    offset,
+                                    lower_completion,
+                                )
+                            })
                             .await?;
                     } else {
-                        completion.complete_error();
+                        source_completion.complete_error();
                     }
                     Err(io_failure_error("fault injection: partial write"))
                 }
                 WriteDecision::IoError => {
-                    completion.complete_error();
+                    source_completion.complete_error();
                     Err(io_failure_error("fault injection: write failure"))
                 }
                 WriteDecision::DiskFull => {
-                    completion.complete_error();
+                    source_completion.complete_error();
                     Err(FrankenError::DatabaseFull)
                 }
                 WriteDecision::PoweredOff => {
-                    completion.complete_error();
+                    source_completion.complete_error();
                     Err(power_cut_error())
                 }
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            let mut physical_prefix = Vec::with_capacity(writes.len());
+            let mut first_fault = None;
+
+            for &(offset, data) in writes {
+                let decision = self.state.check_write(&self.path, offset, data.len());
+                match decision {
+                    WriteDecision::Allow => physical_prefix.push((offset, data)),
+                    WriteDecision::TornWrite { valid_bytes }
+                    | WriteDecision::PartialWrite { valid_bytes } => {
+                        let applied = valid_bytes.min(data.len());
+                        if applied > 0 {
+                            physical_prefix.push((offset, &data[..applied]));
+                        }
+                        first_fault = Some(decision);
+                        break;
+                    }
+                    WriteDecision::IoError
+                    | WriteDecision::DiskFull
+                    | WriteDecision::PoweredOff => {
+                        first_fault = Some(decision);
+                        break;
+                    }
+                }
+            }
+
+            let Some(first_fault) = first_fault else {
+                return source_completion
+                    .delegate_exact(|lower_completion| {
+                        self.inner
+                            .write_page_batch_tracked(cx, &physical_prefix, lower_completion)
+                    })
+                    .await;
+            };
+
+            if !physical_prefix.is_empty() {
+                source_completion
+                    .delegate_error_mapped(|lower_completion| {
+                        self.inner
+                            .write_page_batch_tracked(cx, &physical_prefix, lower_completion)
+                    })
+                    .await?;
+            } else {
+                source_completion.complete_error();
+            }
+
+            match first_fault {
+                WriteDecision::TornWrite { .. } | WriteDecision::PartialWrite { .. } => {
+                    Err(io_failure_error("fault injection: partial write"))
+                }
+                WriteDecision::IoError => Err(io_failure_error("fault injection: write failure")),
+                WriteDecision::DiskFull => Err(FrankenError::DatabaseFull),
+                WriteDecision::PoweredOff => Err(power_cut_error()),
+                WriteDecision::Allow => unreachable!("fault branch cannot contain Allow"),
             }
         }
     }
@@ -1356,6 +1437,8 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unused_async_trait_impl)]
+
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use fsqlite_types::cx::Cx;
@@ -1364,6 +1447,8 @@ mod tests {
     use fsqlite_vfs::UnixVfs;
     #[cfg(windows)]
     use fsqlite_vfs::WindowsVfs;
+    use fsqlite_vfs::traits::VfsWriteCompletionState;
+    use std::collections::VecDeque;
     use std::path::Path;
 
     #[cfg(unix)]
@@ -1392,6 +1477,377 @@ mod tests {
     #[cfg(windows)]
     fn native_vfs() -> NativeVfs {
         WindowsVfs::new()
+    }
+
+    #[derive(Debug)]
+    struct ManualBatch {
+        source: VfsWriteCompletionSource,
+        remaining_children: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct ManualTrackedState {
+        started_single_writes: Vec<(u64, Vec<u8>)>,
+        started_batches: Vec<Vec<(u64, Vec<u8>)>>,
+        pending_single_writes: VecDeque<VfsWriteCompletionSource>,
+        pending_batches: VecDeque<ManualBatch>,
+    }
+
+    #[derive(Debug, Default)]
+    struct ManualTrackedShared {
+        state: Mutex<ManualTrackedState>,
+        ordinary_write_calls: AtomicU64,
+        tracked_write_calls: AtomicU64,
+        tracked_batch_calls: AtomicU64,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct ManualTrackedFile {
+        shared: Arc<ManualTrackedShared>,
+    }
+
+    impl ManualTrackedFile {
+        fn complete_next_single_success(&self) {
+            let mut source = self
+                .shared
+                .state
+                .lock()
+                .expect("manual tracked state")
+                .pending_single_writes
+                .pop_front()
+                .expect("pending manual single write");
+            source.complete_success();
+        }
+
+        fn complete_next_batch_child_success(&self) {
+            let completed_source = {
+                let mut state = self.shared.state.lock().expect("manual tracked state");
+                let batch = state
+                    .pending_batches
+                    .first_mut()
+                    .expect("pending manual batch");
+                assert!(batch.remaining_children > 0);
+                batch.remaining_children -= 1;
+                if batch.remaining_children == 0 {
+                    Some(
+                        state
+                            .pending_batches
+                            .pop_front()
+                            .expect("completed manual batch")
+                            .source,
+                    )
+                } else {
+                    None
+                }
+            };
+            if let Some(mut source) = completed_source {
+                source.complete_success();
+            }
+        }
+
+        fn started_single_writes(&self) -> Vec<(u64, Vec<u8>)> {
+            self.shared
+                .state
+                .lock()
+                .expect("manual tracked state")
+                .started_single_writes
+                .clone()
+        }
+
+        fn started_batches(&self) -> Vec<Vec<(u64, Vec<u8>)>> {
+            self.shared
+                .state
+                .lock()
+                .expect("manual tracked state")
+                .started_batches
+                .clone()
+        }
+
+        fn ordinary_write_calls(&self) -> u64 {
+            self.shared.ordinary_write_calls.load(Ordering::Relaxed)
+        }
+
+        fn tracked_write_calls(&self) -> u64 {
+            self.shared.tracked_write_calls.load(Ordering::Relaxed)
+        }
+
+        fn tracked_batch_calls(&self) -> u64 {
+            self.shared.tracked_batch_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl VfsFile for ManualTrackedFile {
+        fn close(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read(&self, _cx: &Cx, buf: &mut [u8], _offset: u64) -> Result<usize> {
+            buf.fill(0);
+            Ok(0)
+        }
+
+        async fn write(&self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
+            self.shared
+                .ordinary_write_calls
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn write_tracked<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+            completion: VfsWriteCompletion,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            let source = VfsWriteCompletionSource::new(completion);
+            async move {
+                self.shared
+                    .tracked_write_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut state = self.shared.state.lock().expect("manual tracked state");
+                state.started_single_writes.push((offset, buf.to_vec()));
+                state.pending_single_writes.push_back(source);
+                Ok(())
+            }
+        }
+
+        fn write_page_batch_tracked<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            writes: &'a [(u64, &'a [u8])],
+            completion: VfsWriteCompletion,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            let mut source = VfsWriteCompletionSource::new(completion);
+            async move {
+                self.shared
+                    .tracked_batch_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                let started = writes
+                    .iter()
+                    .map(|(offset, data)| (*offset, data.to_vec()))
+                    .collect::<Vec<_>>();
+                let child_count = started.len();
+                let mut state = self.shared.state.lock().expect("manual tracked state");
+                state.started_batches.push(started);
+                if child_count == 0 {
+                    drop(state);
+                    source.complete_success();
+                } else {
+                    state.pending_batches.push_back(ManualBatch {
+                        source,
+                        remaining_children: child_count,
+                    });
+                }
+                Ok(())
+            }
+        }
+
+        fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> Result<()> {
+            Ok(())
+        }
+
+        fn file_size(&self, _cx: &Cx) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn lock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn shm_map(
+            &mut self,
+            _cx: &Cx,
+            _region: u32,
+            _size: u32,
+            _extend: bool,
+        ) -> Result<ShmRegion> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_barrier(&self) {}
+
+        fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn manual_fault_file(
+        state: Arc<FaultState>,
+    ) -> (FaultInjectingFile<ManualTrackedFile>, ManualTrackedFile) {
+        let inner = ManualTrackedFile::default();
+        (
+            FaultInjectingFile {
+                inner: inner.clone(),
+                state,
+                path: PathBuf::from("fault.db"),
+            },
+            inner,
+        )
+    }
+
+    #[test]
+    fn tracked_fault_wrapper_fails_unpolled_and_delegates_exact_allow() {
+        let cx = test_cx();
+        let (file, inner) = manual_fault_file(Arc::new(FaultState::new()));
+
+        let abandoned = VfsWriteCompletion::new();
+        let unpolled = file.write_tracked(&cx, b"never started", 0, abandoned.clone());
+        assert_eq!(abandoned.state(), VfsWriteCompletionState::Pending);
+        drop(unpolled);
+        assert_eq!(abandoned.state(), VfsWriteCompletionState::Error);
+        assert_eq!(inner.tracked_write_calls(), 0);
+
+        let accepted = VfsWriteCompletion::new();
+        run_io(file.write_tracked(&cx, b"accepted", 7, accepted.clone()))
+            .expect("allow write admission");
+        assert_eq!(accepted.state(), VfsWriteCompletionState::Pending);
+        assert_eq!(
+            inner.started_single_writes(),
+            vec![(7, b"accepted".to_vec())]
+        );
+        inner.complete_next_single_success();
+        assert_eq!(accepted.state(), VfsWriteCompletionState::Success);
+    }
+
+    #[test]
+    fn tracked_fault_wrapper_maps_partial_and_immediate_faults_to_error() {
+        let cx = test_cx();
+        let partial_state = Arc::new(FaultState::new());
+        partial_state.inject_fault(
+            FaultSpec::partial_write("fault.db")
+                .bytes_written(2)
+                .build(),
+        );
+        let (partial_file, partial_inner) = manual_fault_file(partial_state);
+        let partial = VfsWriteCompletion::new();
+        run_io(partial_file.write_tracked(&cx, b"abcd", 11, partial.clone()))
+            .expect_err("injected partial write");
+        assert_eq!(partial.state(), VfsWriteCompletionState::Pending);
+        assert_eq!(
+            partial_inner.started_single_writes(),
+            vec![(11, b"ab".to_vec())]
+        );
+        partial_inner.complete_next_single_success();
+        assert_eq!(partial.state(), VfsWriteCompletionState::Error);
+
+        let immediate_state = Arc::new(FaultState::new());
+        immediate_state.inject_fault(FaultSpec::write_failure("fault.db").build());
+        let (immediate_file, immediate_inner) = manual_fault_file(immediate_state);
+        let immediate = VfsWriteCompletion::new();
+        run_io(immediate_file.write_tracked(&cx, b"blocked", 0, immediate.clone()))
+            .expect_err("injected immediate write failure");
+        assert_eq!(immediate.state(), VfsWriteCompletionState::Error);
+        assert_eq!(immediate_inner.tracked_write_calls(), 0);
+    }
+
+    #[test]
+    fn tracked_fault_batch_waits_for_every_started_child() {
+        let cx = test_cx();
+        let (file, inner) = manual_fault_file(Arc::new(FaultState::new()));
+        let writes: &[(u64, &[u8])] = &[(0, b"aaaa"), (4, b"bbbb"), (8, b"cccc")];
+
+        let abandoned = VfsWriteCompletion::new();
+        let unpolled = file.write_page_batch_tracked(&cx, writes, abandoned.clone());
+        assert_eq!(abandoned.state(), VfsWriteCompletionState::Pending);
+        drop(unpolled);
+        assert_eq!(abandoned.state(), VfsWriteCompletionState::Error);
+        assert_eq!(inner.tracked_batch_calls(), 0);
+
+        let completion = VfsWriteCompletion::new();
+
+        run_io(file.write_page_batch_tracked(&cx, writes, completion.clone()))
+            .expect("batch admission");
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        assert_eq!(inner.tracked_batch_calls(), 1);
+        assert_eq!(
+            inner.started_batches(),
+            vec![vec![
+                (0, b"aaaa".to_vec()),
+                (4, b"bbbb".to_vec()),
+                (8, b"cccc".to_vec()),
+            ]]
+        );
+
+        inner.complete_next_batch_child_success();
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        inner.complete_next_batch_child_success();
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        inner.complete_next_batch_child_success();
+        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+    }
+
+    #[test]
+    fn tracked_fault_batch_stops_after_partial_and_waits_for_prefix() {
+        let cx = test_cx();
+        let state = Arc::new(FaultState::new());
+        state.inject_fault(
+            FaultSpec::partial_write("fault.db")
+                .at_offset_bytes(4)
+                .bytes_written(2)
+                .build(),
+        );
+        let (file, inner) = manual_fault_file(state);
+        let writes: &[(u64, &[u8])] = &[(0, b"aaaa"), (4, b"bbbb"), (8, b"cccc")];
+        let completion = VfsWriteCompletion::new();
+
+        run_io(file.write_page_batch_tracked(&cx, writes, completion.clone()))
+            .expect_err("partial second batch entry");
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        assert_eq!(
+            inner.started_batches(),
+            vec![vec![(0, b"aaaa".to_vec()), (4, b"bb".to_vec())]],
+            "entry three must never start after entry two faults"
+        );
+
+        inner.complete_next_batch_child_success();
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        inner.complete_next_batch_child_success();
+        assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+
+        let immediate_state = Arc::new(FaultState::new());
+        immediate_state.inject_fault(FaultSpec::write_failure("fault.db").build());
+        let (immediate_file, immediate_inner) = manual_fault_file(immediate_state);
+        let immediate = VfsWriteCompletion::new();
+        run_io(immediate_file.write_page_batch_tracked(&cx, writes, immediate.clone()))
+            .expect_err("first-entry batch failure");
+        assert_eq!(immediate.state(), VfsWriteCompletionState::Error);
+        assert_eq!(immediate_inner.tracked_batch_calls(), 0);
+        assert!(immediate_inner.started_batches().is_empty());
+    }
+
+    #[test]
+    fn tracked_fault_batch_empty_success_and_ordinary_paths_stay_untracked() {
+        let cx = test_cx();
+        let (file, _) = manual_fault_file(Arc::new(FaultState::new()));
+
+        let empty = VfsWriteCompletion::new();
+        run_io(file.write_page_batch_tracked(&cx, &[], empty.clone())).expect("empty batch");
+        assert_eq!(empty.state(), VfsWriteCompletionState::Success);
+
+        let (ordinary_file, ordinary_inner) = manual_fault_file(Arc::new(FaultState::new()));
+        run_io(ordinary_file.write(&cx, b"ordinary", 0)).expect("ordinary write");
+        let writes: &[(u64, &[u8])] = &[(8, b"one"), (16, b"two")];
+        run_io(ordinary_file.write_page_batch(&cx, writes)).expect("ordinary batch");
+        assert_eq!(ordinary_inner.ordinary_write_calls(), 3);
+        assert_eq!(ordinary_inner.tracked_write_calls(), 0);
+        assert_eq!(ordinary_inner.tracked_batch_calls(), 0);
     }
 
     #[test]

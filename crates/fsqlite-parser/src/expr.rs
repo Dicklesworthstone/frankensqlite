@@ -18,8 +18,9 @@
 
 use fsqlite_ast::{
     BinaryOp, ColumnRef, Expr, FunctionArgs, InSet, JsonArrow, LikeOp, Literal, PlaceholderType,
-    RaiseAction, SelectStatement, Span, TypeName, UnaryOp, WindowSpec,
+    RaiseAction, ResultColumn, SelectCore, SelectStatement, Span, TypeName, UnaryOp, WindowSpec,
 };
+use fsqlite_types::limits::MAX_EXPR_DEPTH;
 use std::sync::Arc;
 
 use crate::parser::{ParseError, Parser, is_nonreserved_kw, kw_to_str};
@@ -53,19 +54,569 @@ mod bp {
     pub const JSON: (u8, u8) = (19, 20);
 }
 
+/// An expression paired with its logical AST height.
+///
+/// Height is tracked while the Pratt parser reduces nodes so a wide,
+/// left-associative chain does not need an O(n²) sequence of AST walks.
+/// Parentheses do not create an [`Expr`] node and therefore do not increase
+/// this value.
+struct ParsedExpr {
+    node: Expr,
+    height: u32,
+}
+
+impl ParsedExpr {
+    fn leaf(node: Expr) -> Self {
+        Self { node, height: 1 }
+    }
+
+    fn span(&self) -> Span {
+        self.node.span()
+    }
+
+    fn into_node(self) -> Expr {
+        self.node
+    }
+}
+
+/// Work item for the SQLite-compatible expression-height calculation.
+///
+/// This is deliberately one non-recursive worklist for both expressions and
+/// SELECTs. SQLite 3.52.0's `exprSetHeight()` delegates subqueries to
+/// `heightOfSelect()`, which walks every compound term but only its result
+/// expressions, WHERE, HAVING, LIMIT, GROUP BY, and ORDER BY. In particular it
+/// does not descend into CTE bodies or FROM-clause subqueries.
+enum HeightWork<'a> {
+    Expr(&'a Expr, u32),
+    Select(&'a SelectStatement, u32),
+}
+
+fn push_select_core_height_work<'a>(
+    core: &'a SelectCore,
+    expr_depth: u32,
+    pending: &mut Vec<HeightWork<'a>>,
+    max_height: &mut u32,
+) {
+    match core {
+        SelectCore::Select {
+            columns,
+            where_clause,
+            group_by,
+            having,
+            ..
+        } => {
+            for column in columns {
+                match column {
+                    ResultColumn::Star => *max_height = (*max_height).max(expr_depth),
+                    // Canonical SQLite represents `table.*` as TK_DOT with
+                    // TK_ID/TK_ASTERISK children, hence height 2.
+                    ResultColumn::TableStar(_) => {
+                        *max_height = (*max_height).max(expr_depth.saturating_add(1));
+                    }
+                    ResultColumn::Expr { expr, .. } => {
+                        pending.push(HeightWork::Expr(expr, expr_depth));
+                    }
+                }
+            }
+
+            pending.extend(
+                group_by
+                    .iter()
+                    .map(|expr| HeightWork::Expr(expr, expr_depth)),
+            );
+            if let Some(having) = having {
+                pending.push(HeightWork::Expr(having, expr_depth));
+            }
+
+            if let Some(where_clause) = where_clause {
+                pending.push(HeightWork::Expr(where_clause, expr_depth));
+            }
+        }
+        SelectCore::Values(rows) => {
+            for row in rows {
+                pending.extend(row.iter().map(|expr| HeightWork::Expr(expr, expr_depth)));
+            }
+        }
+    }
+}
+
+/// Return whether SQLite's parser-side `EP_HasFunc` flag is observable at the
+/// root of `expr`.
+///
+/// This is intentionally not a generic "contains a function" walk. SQLite
+/// attaches COLLATE and BETWEEN metadata after their root flags are computed,
+/// and TK_VECTOR propagates flags only from its first element. SQLite's
+/// parser-time boolean simplifier inspects this exact root flag.
+fn sqlite_expr_has_function(expr: &Expr) -> bool {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::FunctionCall { .. } | Expr::Like { .. } | Expr::JsonAccess { .. } => {
+                return true;
+            }
+            Expr::Literal(
+                Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
+                _,
+            ) => return true,
+            Expr::BinaryOp { left, right, .. } => {
+                pending.push(left);
+                pending.push(right);
+            }
+            Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+                pending.push(expr);
+            }
+            Expr::Between { expr, .. } => pending.push(expr),
+            Expr::In { expr, set, .. } => {
+                pending.push(expr);
+                if let InSet::List(items) = set {
+                    pending.extend(items);
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    pending.push(operand);
+                }
+                for (condition, result) in whens {
+                    pending.push(condition);
+                    pending.push(result);
+                }
+                if let Some(else_expr) = else_expr {
+                    pending.push(else_expr);
+                }
+            }
+            Expr::RowValue(items, _) => {
+                if let Some(first) = items.first() {
+                    pending.push(first);
+                }
+            }
+            Expr::Collate { .. }
+            | Expr::Exists { .. }
+            | Expr::Subquery(..)
+            | Expr::Literal(..)
+            | Expr::Column(..)
+            | Expr::Raise { .. }
+            | Expr::Placeholder(..) => {}
+        }
+    }
+    false
+}
+
+/// Mirror the constant-expression predicate used by SQLite's singleton-IN
+/// rewrite without recursive Rust calls.
+fn sqlite_expr_is_constant_for_in(expr: &Expr) -> bool {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::Literal(
+                Literal::Integer(_)
+                | Literal::Float(_)
+                | Literal::String(_)
+                | Literal::Blob(_)
+                | Literal::Null
+                | Literal::True
+                | Literal::False,
+                _,
+            ) => {}
+            Expr::UnaryOp { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::IsNull { expr, .. } => pending.push(expr),
+            Expr::BinaryOp { left, right, .. } => {
+                pending.push(left);
+                pending.push(right);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                pending.push(expr);
+                pending.push(low);
+                pending.push(high);
+            }
+            Expr::In { expr, set, .. } => {
+                pending.push(expr);
+                if let InSet::List(items) = set {
+                    pending.extend(items);
+                } else {
+                    return false;
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    pending.push(operand);
+                }
+                for (condition, result) in whens {
+                    pending.push(condition);
+                    pending.push(result);
+                }
+                if let Some(else_expr) = else_expr {
+                    pending.push(else_expr);
+                }
+            }
+            Expr::RowValue(items, _) => pending.extend(items),
+            Expr::Literal(
+                Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
+                _,
+            )
+            | Expr::Column(..)
+            | Expr::Exists { .. }
+            | Expr::Subquery(..)
+            | Expr::FunctionCall { .. }
+            | Expr::Like { .. }
+            | Expr::JsonAccess { .. }
+            | Expr::Raise { .. }
+            | Expr::Placeholder(..) => return false,
+        }
+    }
+    true
+}
+
+fn sqlite_null_test_fold_value(expr: &Expr, is_not_null: bool) -> Option<i64> {
+    let mut expr = expr;
+    while let Expr::UnaryOp {
+        op: UnaryOp::Plus | UnaryOp::Negate,
+        expr: inner,
+        ..
+    } = expr
+    {
+        expr = inner;
+    }
+
+    matches!(
+        expr,
+        Expr::Literal(
+            Literal::Integer(_) | Literal::Float(_) | Literal::String(_) | Literal::Blob(_),
+            _
+        )
+    )
+    .then_some(i64::from(is_not_null))
+}
+
+fn sqlite_direct_false(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Literal::Integer(0), _))
+}
+
+/// Return whether a keyword token is accepted by SQLite 3.46.1's
+/// `nm ::= idj | STRING` production for a `RAISE()` message.
+///
+/// `idj` accepts `INDEXED`, every `JOIN_KW`, and `ID`. Lemon's `%fallback ID`
+/// declaration additionally turns only the keyword classes listed below into
+/// `ID` in this parser state. Keep this separate from the parser's broader
+/// `is_nonreserved_kw` convenience predicate: that predicate both rejects
+/// valid `nm` tokens such as `BEGIN` and accepts reserved tokens such as
+/// `TABLE`, `RETURNING`, and `TRANSACTION`.
+fn is_sqlite_346_raise_nm_keyword(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        // idj ::= INDEXED | JOIN_KW (plain and quoted IDs are handled by the
+        // caller because they carry the message text directly).
+        TokenKind::KwIndexed
+            | TokenKind::KwCross
+            | TokenKind::KwFull
+            | TokenKind::KwInner
+            | TokenKind::KwLeft
+            | TokenKind::KwNatural
+            | TokenKind::KwOuter
+            | TokenKind::KwRight
+            // SQLite 3.46.1's canonical `%fallback ID` list.
+            | TokenKind::KwAbort
+            | TokenKind::KwAction
+            | TokenKind::KwAfter
+            | TokenKind::KwAlways
+            | TokenKind::KwAnalyze
+            | TokenKind::KwAsc
+            | TokenKind::KwAttach
+            | TokenKind::KwBefore
+            | TokenKind::KwBegin
+            | TokenKind::KwBy
+            | TokenKind::KwCascade
+            | TokenKind::KwCast
+            | TokenKind::KwColumn
+            | TokenKind::KwConflict
+            | TokenKind::KwCurrentDate
+            | TokenKind::KwCurrentTime
+            | TokenKind::KwCurrentTimestamp
+            | TokenKind::KwDatabase
+            | TokenKind::KwDeferred
+            | TokenKind::KwDesc
+            | TokenKind::KwDetach
+            | TokenKind::KwDo
+            | TokenKind::KwEach
+            | TokenKind::KwEnd
+            | TokenKind::KwExclude
+            | TokenKind::KwExclusive
+            | TokenKind::KwExplain
+            | TokenKind::KwFail
+            | TokenKind::KwFirst
+            | TokenKind::KwFilter
+            | TokenKind::KwFollowing
+            | TokenKind::KwFor
+            | TokenKind::KwGenerated
+            | TokenKind::KwGlob
+            | TokenKind::KwGroups
+            | TokenKind::KwIf
+            | TokenKind::KwIgnore
+            | TokenKind::KwImmediate
+            | TokenKind::KwInitially
+            | TokenKind::KwInstead
+            | TokenKind::KwKey
+            | TokenKind::KwLast
+            | TokenKind::KwLike
+            | TokenKind::KwMatch
+            | TokenKind::KwMaterialized
+            | TokenKind::KwNo
+            | TokenKind::KwNulls
+            | TokenKind::KwOf
+            | TokenKind::KwOffset
+            | TokenKind::KwOthers
+            | TokenKind::KwOver
+            | TokenKind::KwPartition
+            | TokenKind::KwPlan
+            | TokenKind::KwPragma
+            | TokenKind::KwPreceding
+            | TokenKind::KwQuery
+            | TokenKind::KwRaise
+            | TokenKind::KwRange
+            | TokenKind::KwRecursive
+            | TokenKind::KwRegexp
+            | TokenKind::KwReindex
+            | TokenKind::KwRelease
+            | TokenKind::KwRename
+            | TokenKind::KwReplace
+            | TokenKind::KwRestrict
+            | TokenKind::KwRollback
+            | TokenKind::KwRow
+            | TokenKind::KwRows
+            | TokenKind::KwSavepoint
+            | TokenKind::KwTemp
+            | TokenKind::KwTemporary
+            | TokenKind::KwTies
+            | TokenKind::KwTrigger
+            | TokenKind::KwUnbounded
+            | TokenKind::KwVacuum
+            | TokenKind::KwView
+            | TokenKind::KwVirtual
+            | TokenKind::KwWindow
+            | TokenKind::KwWith
+            | TokenKind::KwWithout
+            // FrankenSQLite tokenizes these extension/literal names as
+            // keywords, but SQLite 3.46.1 tokenizes each lexeme as ID.
+            | TokenKind::KwCommitseq
+            | TokenKind::KwConcurrent
+            | TokenKind::KwFalse
+            | TokenKind::KwStored
+            | TokenKind::KwStrict
+            | TokenKind::KwTrue
+    )
+}
+
+/// Compute observable expression height for the SQLite 3.46.1 compatibility
+/// target without recursive Rust calls.
+///
+/// The non-structural cases below are intentional parity requirements:
+///
+/// * COLLATE and row vectors attach their children after allocating a
+///   height-one node and do not recompute it.
+/// * BETWEEN recomputes from its left operand before attaching its bounds.
+/// * aggregate ORDER BY, FILTER, and OVER metadata is attached after the
+///   function node's height is set and does not recompute it.
+/// * NOT LIKE/BETWEEN/IN/EXISTS has an additional hidden `TK_NOT` node.
+/// * RAISE messages use the 3.46.1 `nm` grammar (`idj` identifier or string
+///   token), not an expression child, and therefore do not increase height.
+///   SQLite 3.47 and later expanded this grammar; that newer behavior is
+///   intentionally not modeled.
+///
+/// These rules follow `src/expr.c` and `src/parse.y` for the project's SQLite
+/// 3.46.1 target; changing this to ordinary Rust AST height breaks the public
+/// `SQLITE_LIMIT_EXPR_DEPTH` boundary.
+#[allow(clippy::too_many_lines)]
+fn sqlite_height(initial: HeightWork<'_>) -> u32 {
+    let mut max_height = 0;
+    let mut pending = vec![initial];
+
+    while let Some(work) = pending.pop() {
+        match work {
+            HeightWork::Expr(expr, depth) => {
+                max_height = max_height.max(depth);
+                let child_depth = depth.saturating_add(1);
+                match expr {
+                    Expr::BinaryOp { left, right, .. } => {
+                        pending.push(HeightWork::Expr(left, child_depth));
+                        pending.push(HeightWork::Expr(right, child_depth));
+                    }
+                    Expr::UnaryOp { expr, .. }
+                    | Expr::Cast { expr, .. }
+                    | Expr::IsNull { expr, .. } => {
+                        pending.push(HeightWork::Expr(expr, child_depth));
+                    }
+                    Expr::Collate { .. } | Expr::RowValue(..) => {}
+                    Expr::Between { expr, not, .. } => {
+                        let node_depth = depth.saturating_add(u32::from(*not));
+                        max_height = max_height.max(node_depth);
+                        pending.push(HeightWork::Expr(expr, node_depth.saturating_add(1)));
+                    }
+                    Expr::In { expr, set, not, .. } => {
+                        let node_depth = depth.saturating_add(u32::from(*not));
+                        max_height = max_height.max(node_depth);
+                        let child_depth = node_depth.saturating_add(1);
+                        pending.push(HeightWork::Expr(expr, child_depth));
+                        match set {
+                            InSet::List(items) => {
+                                if matches!(expr.as_ref(), Expr::RowValue(..)) {
+                                    // `sqlite3ExprListToValues()` lowers a
+                                    // vector RHS to VALUES rows. TK_VECTOR
+                                    // wrappers disappear, so their elements
+                                    // contribute directly to SELECT height.
+                                    for item in items {
+                                        if let Expr::RowValue(elements, _) = item {
+                                            pending.extend(elements.iter().map(|element| {
+                                                HeightWork::Expr(element, child_depth)
+                                            }));
+                                        } else {
+                                            pending.push(HeightWork::Expr(item, child_depth));
+                                        }
+                                    }
+                                } else {
+                                    pending.extend(
+                                        items
+                                            .iter()
+                                            .map(|item| HeightWork::Expr(item, child_depth)),
+                                    );
+                                }
+                            }
+                            InSet::Subquery(select) => {
+                                pending.push(HeightWork::Select(select, node_depth));
+                            }
+                            InSet::Table(_) => {}
+                        }
+                    }
+                    Expr::Like {
+                        expr,
+                        pattern,
+                        escape,
+                        not,
+                        ..
+                    } => {
+                        let node_depth = depth.saturating_add(u32::from(*not));
+                        max_height = max_height.max(node_depth);
+                        let child_depth = node_depth.saturating_add(1);
+                        pending.push(HeightWork::Expr(expr, child_depth));
+                        pending.push(HeightWork::Expr(pattern, child_depth));
+                        if let Some(escape) = escape {
+                            pending.push(HeightWork::Expr(escape, child_depth));
+                        }
+                    }
+                    Expr::Case {
+                        operand,
+                        whens,
+                        else_expr,
+                        ..
+                    } => {
+                        if let Some(operand) = operand {
+                            pending.push(HeightWork::Expr(operand, child_depth));
+                        }
+                        for (condition, result) in whens {
+                            pending.push(HeightWork::Expr(condition, child_depth));
+                            pending.push(HeightWork::Expr(result, child_depth));
+                        }
+                        if let Some(else_expr) = else_expr {
+                            pending.push(HeightWork::Expr(else_expr, child_depth));
+                        }
+                    }
+                    Expr::Exists { subquery, not, .. } => {
+                        let node_depth = depth.saturating_add(u32::from(*not));
+                        max_height = max_height.max(node_depth);
+                        pending.push(HeightWork::Select(subquery, node_depth));
+                    }
+                    Expr::Subquery(select, _) => {
+                        pending.push(HeightWork::Select(select, depth));
+                    }
+                    Expr::FunctionCall { args, .. } => {
+                        if let FunctionArgs::List(args) = args {
+                            pending
+                                .extend(args.iter().map(|arg| HeightWork::Expr(arg, child_depth)));
+                        }
+                    }
+                    Expr::JsonAccess { expr, path, .. } => {
+                        pending.push(HeightWork::Expr(expr, child_depth));
+                        pending.push(HeightWork::Expr(path, child_depth));
+                    }
+                    Expr::Column(column, _) => {
+                        let qualifier_nodes =
+                            u32::from(column.table.is_some()) + u32::from(column.schema.is_some());
+                        max_height = max_height.max(depth.saturating_add(qualifier_nodes));
+                    }
+                    Expr::Literal(..) | Expr::Raise { .. } | Expr::Placeholder(..) => {}
+                }
+            }
+            HeightWork::Select(select, parent_depth) => {
+                let expr_depth = parent_depth.saturating_add(1);
+                push_select_core_height_work(
+                    &select.body.select,
+                    expr_depth,
+                    &mut pending,
+                    &mut max_height,
+                );
+                for (_, core) in &select.body.compounds {
+                    push_select_core_height_work(core, expr_depth, &mut pending, &mut max_height);
+                }
+                pending.extend(
+                    select
+                        .order_by
+                        .iter()
+                        .map(|ordering| HeightWork::Expr(&ordering.expr, expr_depth)),
+                );
+                if let Some(limit) = &select.limit {
+                    // SQLite stores LIMIT/OFFSET beneath a synthetic TK_LIMIT
+                    // node, so both expressions are one level below pLimit.
+                    max_height = max_height.max(expr_depth);
+                    let limit_child_depth = expr_depth.saturating_add(1);
+                    pending.push(HeightWork::Expr(&limit.limit, limit_child_depth));
+                    if let Some(offset) = &limit.offset {
+                        pending.push(HeightWork::Expr(offset, limit_child_depth));
+                    }
+                }
+            }
+        }
+    }
+
+    max_height
+}
+
+fn sqlite_expr_height(root: &Expr) -> u32 {
+    sqlite_height(HeightWork::Expr(root, 1))
+}
+
+fn sqlite_select_height(select: &SelectStatement) -> u32 {
+    sqlite_height(HeightWork::Select(select, 0))
+}
+
 impl Parser {
     /// Parse a single SQL expression.
     pub fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_expr_tracked().map(ParsedExpr::into_node)
+    }
+
+    fn parse_expr_tracked(&mut self) -> Result<ParsedExpr, ParseError> {
         self.parse_expr_bp(0)
     }
 
     // ── Pratt core ──────────────────────────────────────────────────────
 
-    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<ParsedExpr, ParseError> {
         self.with_recursion_guard(|p| p.parse_expr_bp_inner(min_bp))
     }
 
-    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<ParsedExpr, ParseError> {
         let mut lhs = self.parse_prefix()?;
 
         loop {
@@ -93,6 +644,61 @@ impl Parser {
         Ok(lhs)
     }
 
+    fn checked_parent(
+        &self,
+        max_child_height: u32,
+        build: impl FnOnce() -> Expr,
+    ) -> Result<ParsedExpr, ParseError> {
+        self.checked_height(max_child_height.saturating_add(1), build)
+    }
+
+    fn checked_parent_with_hidden_not(
+        &self,
+        max_child_height: u32,
+        not: bool,
+        build: impl FnOnce() -> Expr,
+    ) -> Result<ParsedExpr, ParseError> {
+        let height = max_child_height
+            .saturating_add(1)
+            .saturating_add(u32::from(not));
+        self.checked_height(height, build)
+    }
+
+    fn checked_height(
+        &self,
+        height: u32,
+        build: impl FnOnce() -> Expr,
+    ) -> Result<ParsedExpr, ParseError> {
+        if height > MAX_EXPR_DEPTH {
+            return Err(self.err_here(format!(
+                "expression AST is too deep (maximum height {MAX_EXPR_DEPTH})"
+            )));
+        }
+        Ok(ParsedExpr {
+            node: build(),
+            height,
+        })
+    }
+
+    fn make_null_test(
+        &self,
+        lhs: ParsedExpr,
+        is_not_null: bool,
+        span: Span,
+    ) -> Result<ParsedExpr, ParseError> {
+        if let Some(value) = sqlite_null_test_fold_value(&lhs.node, is_not_null) {
+            return Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::Integer(value),
+                span,
+            )));
+        }
+        self.checked_parent(lhs.height, || Expr::IsNull {
+            expr: Box::new(lhs.node),
+            not: is_not_null,
+            span,
+        })
+    }
+
     // ── Token helpers ───────────────────────────────────────────────────
 
     fn peek_kind(&self) -> &TokenKind {
@@ -108,10 +714,6 @@ impl Parser {
 
     fn peek_token(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
-    }
-
-    fn peek_nth_token(&self, offset: usize) -> Option<&Token> {
-        self.tokens.get(self.pos + offset)
     }
 
     fn advance_token(&mut self) -> Token {
@@ -150,7 +752,7 @@ impl Parser {
     // ── Prefix (nud) ────────────────────────────────────────────────────
 
     #[allow(clippy::too_many_lines)]
-    fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
+    fn parse_prefix(&mut self) -> Result<ParsedExpr, ParseError> {
         let Token {
             kind,
             span: token_span,
@@ -159,12 +761,18 @@ impl Parser {
         } = self.advance_token();
         match kind {
             // ── Literals ────────────────────────────────────────────────
-            TokenKind::Integer(i) => Ok(Expr::Literal(Literal::Integer(i), token_span)),
+            TokenKind::Integer(i) => Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::Integer(i),
+                token_span,
+            ))),
             // An integer literal too large for i64 becomes a REAL, and a
             // magnitude beyond f64 range becomes ±Infinity — matching C
             // SQLite's text-to-real conversion (no f64::MAX clamp).
             TokenKind::OversizedInt(s) => match s.parse::<f64>() {
-                Ok(v) => Ok(Expr::Literal(Literal::Float(v), token_span)),
+                Ok(v) => Ok(ParsedExpr::leaf(Expr::Literal(
+                    Literal::Float(v),
+                    token_span,
+                ))),
                 Err(_) => Err(ParseError {
                     message: "integer out of range".to_owned(),
                     span: token_span,
@@ -172,32 +780,55 @@ impl Parser {
                     col,
                 }),
             },
-            TokenKind::Float(f) => Ok(Expr::Literal(Literal::Float(f), token_span)),
-            TokenKind::String(s) => Ok(Expr::Literal(Literal::String(s), token_span)),
-            TokenKind::Blob(b) => Ok(Expr::Literal(Literal::Blob(b), token_span)),
-            TokenKind::KwNull => Ok(Expr::Literal(Literal::Null, token_span)),
-            TokenKind::KwTrue => Ok(Expr::Literal(Literal::True, token_span)),
-            TokenKind::KwFalse => Ok(Expr::Literal(Literal::False, token_span)),
-            TokenKind::KwCurrentTime => Ok(Expr::Literal(Literal::CurrentTime, token_span)),
-            TokenKind::KwCurrentDate => Ok(Expr::Literal(Literal::CurrentDate, token_span)),
-            TokenKind::KwCurrentTimestamp => {
-                Ok(Expr::Literal(Literal::CurrentTimestamp, token_span))
-            }
+            TokenKind::Float(f) => Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::Float(f),
+                token_span,
+            ))),
+            TokenKind::String(s) => Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::String(s),
+                token_span,
+            ))),
+            TokenKind::Blob(b) => Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::Blob(b),
+                token_span,
+            ))),
+            TokenKind::KwNull => Ok(ParsedExpr::leaf(Expr::Literal(Literal::Null, token_span))),
+            TokenKind::KwTrue => Ok(ParsedExpr::leaf(Expr::Literal(Literal::True, token_span))),
+            TokenKind::KwFalse => Ok(ParsedExpr::leaf(Expr::Literal(Literal::False, token_span))),
+            TokenKind::KwCurrentTime => Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::CurrentTime,
+                token_span,
+            ))),
+            TokenKind::KwCurrentDate => Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::CurrentDate,
+                token_span,
+            ))),
+            TokenKind::KwCurrentTimestamp => Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::CurrentTimestamp,
+                token_span,
+            ))),
 
             // ── Bind parameters ─────────────────────────────────────────
-            TokenKind::Question => Ok(Expr::Placeholder(PlaceholderType::Anonymous, token_span)),
-            TokenKind::QuestionNum(n) => {
-                Ok(Expr::Placeholder(PlaceholderType::Numbered(n), token_span))
-            }
-            TokenKind::ColonParam(s) => Ok(Expr::Placeholder(
+            TokenKind::Question => Ok(ParsedExpr::leaf(Expr::Placeholder(
+                PlaceholderType::Anonymous,
+                token_span,
+            ))),
+            TokenKind::QuestionNum(n) => Ok(ParsedExpr::leaf(Expr::Placeholder(
+                PlaceholderType::Numbered(n),
+                token_span,
+            ))),
+            TokenKind::ColonParam(s) => Ok(ParsedExpr::leaf(Expr::Placeholder(
                 PlaceholderType::ColonNamed(s),
                 token_span,
-            )),
-            TokenKind::AtParam(s) => Ok(Expr::Placeholder(PlaceholderType::AtNamed(s), token_span)),
-            TokenKind::DollarParam(s) => Ok(Expr::Placeholder(
+            ))),
+            TokenKind::AtParam(s) => Ok(ParsedExpr::leaf(Expr::Placeholder(
+                PlaceholderType::AtNamed(s),
+                token_span,
+            ))),
+            TokenKind::DollarParam(s) => Ok(ParsedExpr::leaf(Expr::Placeholder(
                 PlaceholderType::DollarNamed(s),
                 token_span,
-            )),
+            ))),
 
             // ── Unary prefix: - + ~ ─────────────────────────────────────
             TokenKind::Minus => {
@@ -206,32 +837,59 @@ impl Parser {
                     if s == "9223372036854775808" {
                         let num_span = self.advance_token().span;
                         let span = token_span.merge(num_span);
-                        return Ok(Expr::Literal(Literal::Integer(i64::MIN), span));
+                        return Ok(ParsedExpr::leaf(Expr::Literal(
+                            Literal::Integer(i64::MIN),
+                            span,
+                        )));
                     }
                 }
                 let inner = self.parse_expr_bp(bp::UNARY)?;
                 let span = token_span.merge(inner.span());
-                Ok(Expr::UnaryOp {
-                    op: UnaryOp::Negate,
-                    expr: Box::new(inner),
-                    span,
-                })
+                let height = inner.height;
+                match inner.node {
+                    Expr::UnaryOp {
+                        op: UnaryOp::Plus,
+                        expr,
+                        ..
+                    } => self.checked_height(height, || Expr::UnaryOp {
+                        op: UnaryOp::Negate,
+                        expr,
+                        span,
+                    }),
+                    node => self.checked_parent(height, || Expr::UnaryOp {
+                        op: UnaryOp::Negate,
+                        expr: Box::new(node),
+                        span,
+                    }),
+                }
             }
             TokenKind::Plus => {
                 let inner = self.parse_expr_bp(bp::UNARY)?;
                 let span = token_span.merge(inner.span());
-                Ok(Expr::UnaryOp {
-                    op: UnaryOp::Plus,
-                    expr: Box::new(inner),
-                    span,
-                })
+                let height = inner.height;
+                match inner.node {
+                    Expr::UnaryOp {
+                        op: UnaryOp::Plus,
+                        expr,
+                        ..
+                    } => self.checked_height(height, || Expr::UnaryOp {
+                        op: UnaryOp::Plus,
+                        expr,
+                        span,
+                    }),
+                    node => self.checked_parent(height, || Expr::UnaryOp {
+                        op: UnaryOp::Plus,
+                        expr: Box::new(node),
+                        span,
+                    }),
+                }
             }
             TokenKind::Tilde => {
                 let inner = self.parse_expr_bp(bp::UNARY)?;
                 let span = token_span.merge(inner.span());
-                Ok(Expr::UnaryOp {
+                self.checked_parent(inner.height, || Expr::UnaryOp {
                     op: UnaryOp::BitNot,
-                    expr: Box::new(inner),
+                    expr: Box::new(inner.node),
                     span,
                 })
             }
@@ -245,17 +903,20 @@ impl Parser {
                     let subquery = self.parse_subquery_minimal()?;
                     let end = self.expect_kind(&TokenKind::RightParen)?;
                     let span = token_span.merge(end);
-                    return Ok(Expr::Exists {
-                        subquery: Box::new(subquery),
-                        not: true,
-                        span,
+                    let select_height = sqlite_select_height(&subquery);
+                    return self.checked_parent_with_hidden_not(select_height, true, || {
+                        Expr::Exists {
+                            subquery: Box::new(subquery),
+                            not: true,
+                            span,
+                        }
                     });
                 }
                 let inner = self.parse_expr_bp(bp::NOT_PREFIX)?;
                 let span = token_span.merge(inner.span());
-                Ok(Expr::UnaryOp {
+                self.checked_parent(inner.height, || Expr::UnaryOp {
                     op: UnaryOp::Not,
-                    expr: Box::new(inner),
+                    expr: Box::new(inner.node),
                     span,
                 })
             }
@@ -266,7 +927,8 @@ impl Parser {
                 let subquery = self.parse_subquery_minimal()?;
                 let end = self.expect_kind(&TokenKind::RightParen)?;
                 let span = token_span.merge(end);
-                Ok(Expr::Exists {
+                let select_height = sqlite_select_height(&subquery);
+                self.checked_parent(select_height, || Expr::Exists {
                     subquery: Box::new(subquery),
                     not: false,
                     span,
@@ -276,13 +938,13 @@ impl Parser {
             // ── CAST(expr AS type_name) ─────────────────────────────────
             TokenKind::KwCast => {
                 self.expect_kind(&TokenKind::LeftParen)?;
-                let inner = self.parse_expr()?;
+                let inner = self.parse_expr_tracked()?;
                 self.expect_kind(&TokenKind::KwAs)?;
                 let type_name = self.parse_type_name()?;
                 let end = self.expect_kind(&TokenKind::RightParen)?;
                 let span = token_span.merge(end);
-                Ok(Expr::Cast {
-                    expr: Box::new(inner),
+                self.checked_parent(inner.height, || Expr::Cast {
+                    expr: Box::new(inner.node),
                     type_name,
                     span,
                 })
@@ -297,7 +959,7 @@ impl Parser {
                 let (action, message) = self.parse_raise_args()?;
                 let end = self.expect_kind(&TokenKind::RightParen)?;
                 let span = token_span.merge(end);
-                Ok(Expr::Raise {
+                self.checked_height(1, || Expr::Raise {
                     action,
                     message,
                     span,
@@ -313,20 +975,29 @@ impl Parser {
                     let subquery = self.parse_subquery_minimal()?;
                     let end = self.expect_kind(&TokenKind::RightParen)?;
                     let span = token_span.merge(end);
-                    return Ok(Expr::Subquery(Box::new(subquery), span));
+                    let select_height = sqlite_select_height(&subquery);
+                    return self.checked_parent(select_height, || {
+                        Expr::Subquery(Box::new(subquery), span)
+                    });
                 }
-                let first = self.parse_expr()?;
+                let first = self.parse_expr_tracked()?;
                 if self.eat_kind(&TokenKind::Comma) {
                     let mut exprs = vec![first];
                     loop {
-                        exprs.push(self.parse_expr()?);
+                        exprs.push(self.parse_expr_tracked()?);
                         if !self.eat_kind(&TokenKind::Comma) {
                             break;
                         }
                     }
                     let end = self.expect_kind(&TokenKind::RightParen)?;
                     let span = token_span.merge(end);
-                    Ok(Expr::RowValue(exprs, span))
+                    // SQLite allocates TK_VECTOR at height one, then attaches
+                    // its expression list without recomputing nHeight. Each
+                    // element was already checked while it was parsed.
+                    Ok(ParsedExpr::leaf(Expr::RowValue(
+                        exprs.into_iter().map(ParsedExpr::into_node).collect(),
+                        span,
+                    )))
                 } else {
                     self.expect_kind(&TokenKind::RightParen)?;
                     Ok(first)
@@ -377,8 +1048,8 @@ impl Parser {
         }
     }
 
-    /// Parse `name`, `name.column`, or `name(args)`.
-    fn parse_ident_expr<S>(&mut self, name: S, start: Span) -> Result<Expr, ParseError>
+    /// Parse `name`, `table.column`, `schema.table.column`, or `name(args)`.
+    fn parse_ident_expr<S>(&mut self, name: S, start: Span) -> Result<ParsedExpr, ParseError>
     where
         S: AsRef<str> + Into<Arc<str>>,
     {
@@ -387,29 +1058,55 @@ impl Parser {
             return self.parse_function_call(name.as_ref().to_owned(), start);
         }
         let name = name.into();
-        // Table-qualified column: name.column
-        if matches!(self.peek_kind(), TokenKind::Dot) {
-            let Some(col_tok) = self.peek_nth_token(1) else {
-                return Err(self.err_here("expected column name after '.'"));
-            };
-            let col_name = match &col_tok.kind {
-                TokenKind::Id(c) | TokenKind::QuotedId(c, _) => Arc::clone(c),
-                TokenKind::Star => Arc::<str>::from("*"),
-                // After a dot, ANY keyword is a valid column name (SQLite
-                // allows reserved keywords in table-qualified positions).
-                k if k.keyword_str().is_some() => Arc::<str>::from(kw_to_str(k)),
-                _ => {
+        if self.eat_kind(&TokenKind::Dot) {
+            let second = self.advance_token();
+            let second_name = Self::qualified_column_component(&second)?;
+
+            if self.eat_kind(&TokenKind::Dot) {
+                if matches!(second.kind, TokenKind::Star) {
                     return Err(ParseError::at(
-                        format!("expected column name after '.', got {:?}", col_tok.kind),
-                        Some(col_tok),
+                        "expected table name before second '.'",
+                        Some(&second),
                     ));
                 }
-            };
-            let span = start.merge(col_tok.span);
-            self.pos = self.pos.saturating_add(2);
-            return Ok(Expr::Column(ColumnRef::qualified(name, col_name), span));
+                let third = self.advance_token();
+                if matches!(&third.kind, TokenKind::Star) {
+                    return Err(ParseError::at(
+                        "expected column name after second '.', got Star",
+                        Some(&third),
+                    ));
+                }
+                let third_name = Self::qualified_column_component(&third)?;
+                let span = start.merge(third.span);
+                return self.checked_height(3, || {
+                    Expr::Column(
+                        ColumnRef::schema_qualified(name, second_name, third_name),
+                        span,
+                    )
+                });
+            }
+
+            let span = start.merge(second.span);
+            return self.checked_height(2, || {
+                Expr::Column(ColumnRef::qualified(name, second_name), span)
+            });
         }
-        Ok(Expr::Column(ColumnRef::bare(name), start))
+        Ok(ParsedExpr::leaf(Expr::Column(ColumnRef::bare(name), start)))
+    }
+
+    fn qualified_column_component(token: &Token) -> Result<Arc<str>, ParseError> {
+        match &token.kind {
+            TokenKind::Id(component) | TokenKind::QuotedId(component, _) => {
+                Ok(Arc::clone(component))
+            }
+            TokenKind::Star => Ok(Arc::<str>::from("*")),
+            // After a dot, any keyword is a valid identifier.
+            kind if kind.keyword_str().is_some() => Ok(Arc::<str>::from(kw_to_str(kind))),
+            kind => Err(ParseError::at(
+                format!("expected identifier after '.', got {kind:?}"),
+                Some(token),
+            )),
+        }
     }
 
     // ── Postfix ─────────────────────────────────────────────────────────
@@ -430,7 +1127,7 @@ impl Parser {
         }
     }
 
-    fn parse_postfix(&mut self, lhs: Expr) -> Result<Expr, ParseError> {
+    fn parse_postfix(&mut self, lhs: ParsedExpr) -> Result<ParsedExpr, ParseError> {
         let tok = self.advance_token();
         match &tok.kind {
             TokenKind::KwCollate => {
@@ -442,36 +1139,27 @@ impl Parser {
                 };
                 let name_span = self.tokens[self.pos.saturating_sub(1)].span;
                 let span = lhs.span().merge(name_span);
-                Ok(Expr::Collate {
-                    expr: Box::new(lhs),
+                // `sqlite3ExprAddCollateToken()` attaches pLeft after
+                // allocating a height-one TK_COLLATE node and intentionally
+                // does not recompute nHeight. The child was already checked.
+                Ok(ParsedExpr::leaf(Expr::Collate {
+                    expr: Box::new(lhs.node),
                     collation,
                     span,
-                })
+                }))
             }
             TokenKind::KwIsnull => {
                 let span = lhs.span().merge(tok.span);
-                Ok(Expr::IsNull {
-                    expr: Box::new(lhs),
-                    not: false,
-                    span,
-                })
+                self.make_null_test(lhs, false, span)
             }
             TokenKind::KwNotnull => {
                 let span = lhs.span().merge(tok.span);
-                Ok(Expr::IsNull {
-                    expr: Box::new(lhs),
-                    not: true,
-                    span,
-                })
+                self.make_null_test(lhs, true, span)
             }
             TokenKind::KwNot => {
                 let null_tok = self.advance_token(); // we know from postfix_bp that this is KwNull
                 let span = lhs.span().merge(null_tok.span);
-                Ok(Expr::IsNull {
-                    expr: Box::new(lhs),
-                    not: true,
-                    span,
-                })
+                self.make_null_test(lhs, true, span)
             }
             other => Err(ParseError::at(
                 format!("unexpected postfix token: {other:?}"),
@@ -532,7 +1220,7 @@ impl Parser {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn parse_infix(&mut self, lhs: Expr, r_bp: u8) -> Result<Expr, ParseError> {
+    fn parse_infix(&mut self, lhs: ParsedExpr, r_bp: u8) -> Result<ParsedExpr, ParseError> {
         let tok = self.advance_token();
         match &tok.kind {
             // ── Simple binary operators ──────────────────────────────────
@@ -565,10 +1253,14 @@ impl Parser {
                     // IS DISTINCT FROM is equivalent to IS NOT
                     // IS NOT DISTINCT FROM is equivalent to IS
                     let op = if not { BinaryOp::Is } else { BinaryOp::IsNot };
-                    return Ok(Expr::BinaryOp {
-                        left: Box::new(lhs),
+                    if matches!(&rhs.node, Expr::Literal(Literal::Null, _)) {
+                        return self.make_null_test(lhs, !not, span);
+                    }
+                    let max_child_height = lhs.height.max(rhs.height);
+                    return self.checked_parent(max_child_height, || Expr::BinaryOp {
+                        left: Box::new(lhs.node),
                         op,
-                        right: Box::new(rhs),
+                        right: Box::new(rhs.node),
                         span,
                     });
                 }
@@ -581,18 +1273,15 @@ impl Parser {
                 // attached to NULL: `x IS NULL < 2` parses as
                 // `x IS (NULL < 2)`, matching C SQLite (verified against the
                 // sqlite3 CLI: `SELECT 1 IS NULL < 2` yields 0, not 1).
-                if matches!(rhs, Expr::Literal(Literal::Null, _)) {
-                    return Ok(Expr::IsNull {
-                        expr: Box::new(lhs),
-                        not,
-                        span,
-                    });
+                if matches!(&rhs.node, Expr::Literal(Literal::Null, _)) {
+                    return self.make_null_test(lhs, not, span);
                 }
                 let op = if not { BinaryOp::IsNot } else { BinaryOp::Is };
-                Ok(Expr::BinaryOp {
-                    left: Box::new(lhs),
+                let max_child_height = lhs.height.max(rhs.height);
+                self.checked_parent(max_child_height, || Expr::BinaryOp {
+                    left: Box::new(lhs.node),
                     op,
-                    right: Box::new(rhs),
+                    right: Box::new(rhs.node),
                     span,
                 })
             }
@@ -613,9 +1302,10 @@ impl Parser {
             TokenKind::Arrow => {
                 let rhs = self.parse_expr_bp(r_bp)?;
                 let span = lhs.span().merge(rhs.span());
-                Ok(Expr::JsonAccess {
-                    expr: Box::new(lhs),
-                    path: Box::new(rhs),
+                let max_child_height = lhs.height.max(rhs.height);
+                self.checked_parent(max_child_height, || Expr::JsonAccess {
+                    expr: Box::new(lhs.node),
+                    path: Box::new(rhs.node),
                     arrow: JsonArrow::Arrow,
                     span,
                 })
@@ -623,9 +1313,10 @@ impl Parser {
             TokenKind::DoubleArrow => {
                 let rhs = self.parse_expr_bp(r_bp)?;
                 let span = lhs.span().merge(rhs.span());
-                Ok(Expr::JsonAccess {
-                    expr: Box::new(lhs),
-                    path: Box::new(rhs),
+                let max_child_height = lhs.height.max(rhs.height);
+                self.checked_parent(max_child_height, || Expr::JsonAccess {
+                    expr: Box::new(lhs.node),
+                    path: Box::new(rhs.node),
                     arrow: JsonArrow::DoubleArrow,
                     span,
                 })
@@ -659,41 +1350,65 @@ impl Parser {
         }
     }
 
-    fn make_binop(&mut self, lhs: Expr, op: BinaryOp, r_bp: u8) -> Result<Expr, ParseError> {
+    fn make_binop(
+        &mut self,
+        lhs: ParsedExpr,
+        op: BinaryOp,
+        r_bp: u8,
+    ) -> Result<ParsedExpr, ParseError> {
         let rhs = self.parse_expr_bp(r_bp)?;
         let span = lhs.span().merge(rhs.span());
-        Ok(Expr::BinaryOp {
-            left: Box::new(lhs),
+        if op == BinaryOp::And
+            && (sqlite_direct_false(&lhs.node) || sqlite_direct_false(&rhs.node))
+            && !sqlite_expr_has_function(&lhs.node)
+            && !sqlite_expr_has_function(&rhs.node)
+        {
+            return Ok(ParsedExpr::leaf(Expr::Literal(Literal::Integer(0), span)));
+        }
+        let max_child_height = lhs.height.max(rhs.height);
+        self.checked_parent(max_child_height, || Expr::BinaryOp {
+            left: Box::new(lhs.node),
             op,
-            right: Box::new(rhs),
+            right: Box::new(rhs.node),
             span,
         })
     }
 
     // ── Special expression forms ────────────────────────────────────────
 
-    fn parse_like(&mut self, lhs: Expr, op: LikeOp, not: bool) -> Result<Expr, ParseError> {
+    fn parse_like(
+        &mut self,
+        lhs: ParsedExpr,
+        op: LikeOp,
+        not: bool,
+    ) -> Result<ParsedExpr, ParseError> {
         let pattern = self.parse_expr_bp(bp::EQUALITY.1)?;
         let escape = if self.eat_kind(&TokenKind::KwEscape) {
             // SQLite's grammar accepts ESCAPE for all pattern-matching operators
             // (LIKE, GLOB, MATCH, REGEXP), not just LIKE.
-            Some(Box::new(self.parse_expr_bp(bp::EQUALITY.1)?))
+            Some(self.parse_expr_bp(bp::EQUALITY.1)?)
         } else {
             None
         };
         let end = escape.as_ref().map_or_else(|| pattern.span(), |e| e.span());
         let span = lhs.span().merge(end);
-        Ok(Expr::Like {
-            expr: Box::new(lhs),
-            pattern: Box::new(pattern),
-            escape,
+        let max_child_height = lhs
+            .height
+            .max(pattern.height)
+            .max(escape.as_ref().map_or(0, |expr| expr.height));
+        // NOT LIKE/GLOB/MATCH/REGEXP is represented by an additional
+        // canonical TK_NOT node that is not explicit in our AST.
+        self.checked_parent_with_hidden_not(max_child_height, not, || Expr::Like {
+            expr: Box::new(lhs.node),
+            pattern: Box::new(pattern.node),
+            escape: escape.map(|expr| Box::new(expr.node)),
             op,
             not,
             span,
         })
     }
 
-    fn parse_between(&mut self, lhs: Expr, not: bool) -> Result<Expr, ParseError> {
+    fn parse_between(&mut self, lhs: ParsedExpr, not: bool) -> Result<ParsedExpr, ParseError> {
         // Parse low bound above AND level so AND keyword is not consumed.
         let low = self.parse_expr_bp(bp::NOT_PREFIX)?;
         if !self.eat_kind(&TokenKind::KwAnd) {
@@ -701,16 +1416,19 @@ impl Parser {
         }
         let high = self.parse_expr_bp(bp::EQUALITY.1)?;
         let span = lhs.span().merge(high.span());
-        Ok(Expr::Between {
-            expr: Box::new(lhs),
-            low: Box::new(low),
-            high: Box::new(high),
+        // SQLite computes TK_BETWEEN height from pLeft before attaching the
+        // low/high ExprList, so the bounds do not increase this node's height.
+        // They were independently checked by their own parse reductions.
+        self.checked_parent_with_hidden_not(lhs.height, not, || Expr::Between {
+            expr: Box::new(lhs.node),
+            low: Box::new(low.node),
+            high: Box::new(high.node),
             not,
             span,
         })
     }
 
-    fn parse_in(&mut self, lhs: Expr, not: bool) -> Result<Expr, ParseError> {
+    fn parse_in(&mut self, lhs: ParsedExpr, not: bool) -> Result<ParsedExpr, ParseError> {
         let start = lhs.span();
 
         // SQLite supports both "x IN ( ... )" and "x IN table_name".
@@ -718,8 +1436,8 @@ impl Parser {
             let table = self.parse_qualified_name()?;
             let end = self.tokens[self.pos.saturating_sub(1)].span;
             let span = start.merge(end);
-            return Ok(Expr::In {
-                expr: Box::new(lhs),
+            return self.checked_parent_with_hidden_not(lhs.height, not, || Expr::In {
+                expr: Box::new(lhs.node),
                 set: InSet::Table(table),
                 not,
                 span,
@@ -735,8 +1453,10 @@ impl Parser {
             let subquery = self.parse_subquery_minimal()?;
             let end = self.expect_kind(&TokenKind::RightParen)?;
             let span = start.merge(end);
-            return Ok(Expr::In {
-                expr: Box::new(lhs),
+            let select_height = sqlite_select_height(&subquery);
+            let max_child_height = lhs.height.max(select_height);
+            return self.checked_parent_with_hidden_not(max_child_height, not, || Expr::In {
+                expr: Box::new(lhs.node),
                 set: InSet::Subquery(Box::new(subquery)),
                 not,
                 span,
@@ -745,35 +1465,89 @@ impl Parser {
 
         let mut exprs = Vec::new();
         if !self.at_kind(&TokenKind::RightParen) {
-            exprs.push(self.parse_expr()?);
+            exprs.push(self.parse_expr_tracked()?);
             while self.eat_kind(&TokenKind::Comma) {
-                exprs.push(self.parse_expr()?);
+                exprs.push(self.parse_expr_tracked()?);
             }
         }
         let end = self.expect_kind(&TokenKind::RightParen)?;
         let span = start.merge(end);
-        Ok(Expr::In {
-            expr: Box::new(lhs),
-            set: InSet::List(exprs),
+
+        if exprs.is_empty() {
+            return Ok(ParsedExpr::leaf(Expr::Literal(
+                Literal::Integer(i64::from(not)),
+                span,
+            )));
+        }
+
+        if exprs.len() == 1
+            && !matches!(&lhs.node, Expr::RowValue(..))
+            && sqlite_expr_is_constant_for_in(&exprs[0].node)
+        {
+            let Some(rhs) = exprs.pop() else {
+                unreachable!("singleton expression list must contain one item");
+            };
+            let rhs_span = rhs.span();
+            let rhs_plus = self.checked_parent(rhs.height, || Expr::UnaryOp {
+                op: UnaryOp::Plus,
+                expr: Box::new(rhs.node),
+                span: rhs_span,
+            })?;
+            let eq_height = lhs.height.max(rhs_plus.height);
+            let eq = self.checked_parent(eq_height, || Expr::BinaryOp {
+                left: Box::new(lhs.node),
+                op: BinaryOp::Eq,
+                right: Box::new(rhs_plus.node),
+                span,
+            })?;
+            if not {
+                return self.checked_parent(eq.height, || Expr::UnaryOp {
+                    op: UnaryOp::Not,
+                    expr: Box::new(eq.node),
+                    span,
+                });
+            }
+            return Ok(eq);
+        }
+
+        let rhs_height = if matches!(&lhs.node, Expr::RowValue(..)) {
+            let mut height = 0;
+            for expr in &exprs {
+                if let Expr::RowValue(elements, _) = &expr.node {
+                    for element in elements {
+                        height = height.max(sqlite_expr_height(element));
+                    }
+                } else {
+                    height = height.max(expr.height);
+                }
+            }
+            height
+        } else {
+            exprs.iter().map(|expr| expr.height).max().unwrap_or(0)
+        };
+        let max_child_height = lhs.height.max(rhs_height);
+        self.checked_parent_with_hidden_not(max_child_height, not, || Expr::In {
+            expr: Box::new(lhs.node),
+            set: InSet::List(exprs.into_iter().map(ParsedExpr::into_node).collect()),
             not,
             span,
         })
     }
 
-    fn parse_case_expr(&mut self, start: Span) -> Result<Expr, ParseError> {
+    fn parse_case_expr(&mut self, start: Span) -> Result<ParsedExpr, ParseError> {
         let operand = if matches!(self.peek_kind(), TokenKind::KwWhen) {
             None
         } else {
-            Some(Box::new(self.parse_expr()?))
+            Some(self.parse_expr_tracked()?)
         };
 
         let mut whens = Vec::new();
         while self.eat_kind(&TokenKind::KwWhen) {
-            let condition = self.parse_expr()?;
+            let condition = self.parse_expr_tracked()?;
             if !self.eat_kind(&TokenKind::KwThen) {
                 return Err(self.err_here("expected THEN in CASE expression"));
             }
-            let result = self.parse_expr()?;
+            let result = self.parse_expr_tracked()?;
             whens.push((condition, result));
         }
         if whens.is_empty() {
@@ -781,7 +1555,7 @@ impl Parser {
         }
 
         let else_expr = if self.eat_kind(&TokenKind::KwElse) {
-            Some(Box::new(self.parse_expr()?))
+            Some(self.parse_expr_tracked()?)
         } else {
             None
         };
@@ -791,38 +1565,56 @@ impl Parser {
         }
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         let span = start.merge(end);
-        Ok(Expr::Case {
-            operand,
-            whens,
-            else_expr,
+        let max_child_height = operand
+            .as_ref()
+            .map_or(0, |expr| expr.height)
+            .max(
+                whens
+                    .iter()
+                    .flat_map(|(condition, result)| [condition.height, result.height])
+                    .max()
+                    .unwrap_or(0),
+            )
+            .max(else_expr.as_ref().map_or(0, |expr| expr.height));
+        self.checked_parent(max_child_height, || Expr::Case {
+            operand: operand.map(|expr| Box::new(expr.node)),
+            whens: whens
+                .into_iter()
+                .map(|(condition, result)| (condition.node, result.node))
+                .collect(),
+            else_expr: else_expr.map(|expr| Box::new(expr.node)),
             span,
         })
     }
 
-    fn parse_function_call(&mut self, name: String, start: Span) -> Result<Expr, ParseError> {
+    fn parse_function_call(&mut self, name: String, start: Span) -> Result<ParsedExpr, ParseError> {
         self.expect_kind(&TokenKind::LeftParen)?;
 
-        let (args, distinct) = if matches!(self.peek_kind(), TokenKind::Star) {
+        let (args, distinct, args_height) = if matches!(self.peek_kind(), TokenKind::Star) {
             if !name.eq_ignore_ascii_case("count") {
                 return Err(self.err_here("'*' can only be used with count() function"));
             }
             self.advance_token();
-            (FunctionArgs::Star, false)
+            (FunctionArgs::Star, false, 0)
         } else {
             let distinct = self.eat_kind(&TokenKind::KwDistinct);
-            let args = if matches!(self.peek_kind(), TokenKind::RightParen) {
+            let (args, args_height) = if matches!(self.peek_kind(), TokenKind::RightParen) {
                 if distinct {
                     return Err(self.err_here("DISTINCT requires at least one argument"));
                 }
-                FunctionArgs::List(Vec::new())
+                (FunctionArgs::List(Vec::new()), 0)
             } else {
-                let mut list = vec![self.parse_expr()?];
+                let mut list = vec![self.parse_expr_tracked()?];
                 while self.eat_kind(&TokenKind::Comma) {
-                    list.push(self.parse_expr()?);
+                    list.push(self.parse_expr_tracked()?);
                 }
-                FunctionArgs::List(list)
+                let height = list.iter().map(|expr| expr.height).max().unwrap_or(0);
+                (
+                    FunctionArgs::List(list.into_iter().map(ParsedExpr::into_node).collect()),
+                    height,
+                )
             };
-            (args, distinct)
+            (args, distinct, args_height)
         };
 
         // In-aggregate ORDER BY (SQLite 3.44+): group_concat(x, ',' ORDER BY y DESC)
@@ -845,10 +1637,10 @@ impl Parser {
             self.advance_token(); // consume FILTER
             self.expect_kind(&TokenKind::LeftParen)?;
             self.expect_kind(&TokenKind::KwWhere)?;
-            let predicate = self.parse_expr()?;
+            let predicate = self.parse_expr_tracked()?;
             let filter_end = self.expect_kind(&TokenKind::RightParen)?;
             end = end.merge(filter_end);
-            Some(Box::new(predicate))
+            Some(predicate)
         } else {
             None
         };
@@ -883,12 +1675,16 @@ impl Parser {
         };
 
         let span = start.merge(end);
-        Ok(Expr::FunctionCall {
+        // Canonical SQLite sets TK_FUNCTION height from its argument list.
+        // Aggregate ORDER BY, FILTER, and OVER are attached later without
+        // recomputing nHeight. Their expressions were checked independently
+        // while being parsed, but they do not increase the function node.
+        self.checked_parent(args_height, || Expr::FunctionCall {
             name,
             args,
             distinct,
             order_by,
-            filter,
+            filter: filter.map(|predicate| Box::new(predicate.node)),
             over,
             span,
         })
@@ -915,9 +1711,11 @@ impl Parser {
         let msg_tok = self.advance_token();
         let message = match &msg_tok.kind {
             TokenKind::String(s) => s.clone(),
+            TokenKind::Id(s) | TokenKind::QuotedId(s, _) => s.to_string(),
+            kind if is_sqlite_346_raise_nm_keyword(kind) => kw_to_str(kind),
             _ => {
                 return Err(ParseError::at(
-                    "expected string message in RAISE",
+                    "expected identifier or string message in RAISE",
                     Some(&msg_tok),
                 ));
             }
@@ -1034,6 +1832,493 @@ mod tests {
             Ok(expr) => expr,
             Err(err) => unreachable!("parse error for `{sql}`: {err}"),
         }
+    }
+
+    fn left_deep_or_sql(term_count: u32) -> String {
+        (0..term_count)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
+    fn balanced_or_sql(first_value: u32, leaf_count: u32) -> String {
+        if leaf_count == 1 {
+            return first_value.to_string();
+        }
+        let left_count = leaf_count / 2;
+        let right_count = leaf_count - left_count;
+        format!(
+            "({} OR {})",
+            balanced_or_sql(first_value, left_count),
+            balanced_or_sql(first_value + left_count, right_count)
+        )
+    }
+
+    fn repeated_or_sql(term: &str, term_count: u32) -> String {
+        (0..term_count)
+            .map(|_| term)
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
+    fn assert_sqlite_height(sql: &str, expected: u32) {
+        let expr = parse_expr(sql).unwrap_or_else(|error| {
+            panic!("height-{expected} expression must parse: {error}");
+        });
+        assert_eq!(sqlite_expr_height(&expr), expected);
+    }
+
+    fn assert_sqlite_height_rejected(sql: &str) {
+        let error = parse_expr(sql).expect_err("overheight expression must be rejected");
+        assert!(
+            error.message.contains("expression AST is too deep")
+                && error.message.contains("maximum height 1000"),
+            "unexpected logical-height diagnostic: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_left_deep_logical_height_exactly_maximum_passes() {
+        let sql = left_deep_or_sql(MAX_EXPR_DEPTH);
+        let expr = parse_expr(&sql).expect("height 1000 must remain valid");
+        assert_eq!(sqlite_expr_height(&expr), MAX_EXPR_DEPTH);
+    }
+
+    #[test]
+    fn test_left_deep_logical_height_above_maximum_does_not_publish_statement() {
+        let sql = left_deep_or_sql(MAX_EXPR_DEPTH + 1);
+        let mut parser = Parser::from_sql(&format!("SELECT {sql}"));
+        let (statements, errors) = parser.parse_all();
+        assert!(
+            statements.is_empty(),
+            "height 1001 must not publish a partial statement"
+        );
+        let [error] = errors.as_slice() else {
+            panic!("expected one deterministic height error, got {errors:?}");
+        };
+        assert!(
+            error.message.contains("expression AST is too deep")
+                && error.message.contains("maximum height 1000"),
+            "logical-height diagnostic must be distinct and deterministic: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_qualified_column_sqlite_height_boundaries() {
+        assert_sqlite_height("t.c", 2);
+        assert_sqlite_height("main.t.c", 3);
+
+        let two_part_at_limit = repeated_or_sql("t.c", MAX_EXPR_DEPTH - 1);
+        assert_sqlite_height(&two_part_at_limit, MAX_EXPR_DEPTH);
+        let two_part_over_limit = repeated_or_sql("t.c", MAX_EXPR_DEPTH);
+        assert_sqlite_height_rejected(&two_part_over_limit);
+
+        let three_part_at_limit = repeated_or_sql("main.t.c", MAX_EXPR_DEPTH - 2);
+        assert_sqlite_height(&three_part_at_limit, MAX_EXPR_DEPTH);
+        let three_part_over_limit = repeated_or_sql("main.t.c", MAX_EXPR_DEPTH - 1);
+        assert_sqlite_height_rejected(&three_part_over_limit);
+    }
+
+    #[test]
+    fn test_balanced_expression_over_one_thousand_nodes_passes() {
+        const LEAF_COUNT: u32 = 1_024;
+        let sql = balanced_or_sql(0, LEAF_COUNT);
+        let expr = parse_expr(&sql).expect("node count alone must not be limited");
+
+        // 1,024 leaves plus 1,023 OR nodes exceed 1,000 total nodes, while
+        // the balanced tree's logical height is only 11.
+        let ast_node_count = LEAF_COUNT * 2 - 1;
+        let ast_height = sqlite_expr_height(&expr);
+        assert!(ast_node_count > MAX_EXPR_DEPTH);
+        assert_eq!(ast_height, 11);
+        assert!(ast_height <= MAX_EXPR_DEPTH);
+    }
+
+    #[test]
+    fn test_scalar_subquery_sqlite_height_boundary() {
+        let at_limit = format!("(SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH - 1));
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!("(SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH));
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_exists_subquery_sqlite_height_boundary() {
+        let at_limit = format!("EXISTS (SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH - 1));
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!("EXISTS (SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH));
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_in_select_sqlite_height_boundary() {
+        let at_limit = format!("0 IN (SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH - 1));
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!("0 IN (SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH));
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_not_exists_hidden_node_sqlite_height_boundary() {
+        let at_limit = format!(
+            "NOT EXISTS (SELECT {})",
+            left_deep_or_sql(MAX_EXPR_DEPTH - 2)
+        );
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!(
+            "NOT EXISTS (SELECT {})",
+            left_deep_or_sql(MAX_EXPR_DEPTH - 1)
+        );
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_not_like_hidden_node_sqlite_height_boundary() {
+        let at_limit = format!("({}) NOT LIKE 0", left_deep_or_sql(MAX_EXPR_DEPTH - 2));
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!("({}) NOT LIKE 0", left_deep_or_sql(MAX_EXPR_DEPTH - 1));
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_not_between_hidden_node_sqlite_height_boundary() {
+        let at_limit = format!(
+            "({}) NOT BETWEEN 0 AND 0",
+            left_deep_or_sql(MAX_EXPR_DEPTH - 2)
+        );
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!(
+            "({}) NOT BETWEEN 0 AND 0",
+            left_deep_or_sql(MAX_EXPR_DEPTH - 1)
+        );
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_not_in_list_hidden_node_sqlite_height_boundary() {
+        let at_limit = format!("0 NOT IN (({}), 0)", left_deep_or_sql(MAX_EXPR_DEPTH - 2));
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!("0 NOT IN (({}), 0)", left_deep_or_sql(MAX_EXPR_DEPTH - 1));
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_not_in_select_hidden_node_sqlite_height_boundary() {
+        let at_limit = format!("0 NOT IN (SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH - 2));
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!("0 NOT IN (SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH - 1));
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_select_wrapper_scans_sqlite_352_clause_set_and_compounds() {
+        let height_998 = left_deep_or_sql(MAX_EXPR_DEPTH - 2);
+        let height_999 = left_deep_or_sql(MAX_EXPR_DEPTH - 1);
+        let height_1000 = left_deep_or_sql(MAX_EXPR_DEPTH);
+
+        let boundary_pairs = [
+            (
+                format!("(SELECT {height_999})"),
+                format!("(SELECT {height_1000})"),
+            ),
+            (
+                format!("(SELECT 1 WHERE {height_999})"),
+                format!("(SELECT 1 WHERE {height_1000})"),
+            ),
+            (
+                format!("(SELECT 1 GROUP BY {height_999})"),
+                format!("(SELECT 1 GROUP BY {height_1000})"),
+            ),
+            (
+                format!("(SELECT 1 HAVING {height_999})"),
+                format!("(SELECT 1 HAVING {height_1000})"),
+            ),
+            (
+                format!("(SELECT 1 ORDER BY {height_999})"),
+                format!("(SELECT 1 ORDER BY {height_1000})"),
+            ),
+            (
+                format!("(SELECT 1 UNION SELECT {height_999})"),
+                format!("(SELECT 1 UNION SELECT {height_1000})"),
+            ),
+            (
+                format!("(SELECT 1 LIMIT {height_998})"),
+                format!("(SELECT 1 LIMIT {height_999})"),
+            ),
+            (
+                format!("(SELECT 1 LIMIT 1 OFFSET {height_998})"),
+                format!("(SELECT 1 LIMIT 1 OFFSET {height_999})"),
+            ),
+        ];
+
+        for (at_limit, over_limit) in boundary_pairs {
+            assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+            assert_sqlite_height_rejected(&over_limit);
+        }
+    }
+
+    #[test]
+    fn test_select_wrapper_does_not_descend_excluded_sqlite_352_children() {
+        let height_1000 = left_deep_or_sql(MAX_EXPR_DEPTH);
+        let expressions = [
+            format!("(SELECT 1 FROM (SELECT {height_1000}) AS nested)"),
+            format!("(WITH c AS (SELECT {height_1000}) SELECT 1)"),
+            format!("(SELECT 1 FROM f({height_1000}))"),
+            format!("(SELECT 1 WINDOW w AS (PARTITION BY {height_1000}))"),
+            format!("(SELECT 1 FROM t JOIN u ON {height_1000})"),
+        ];
+
+        for expression in expressions {
+            assert_sqlite_height(&expression, 2);
+        }
+    }
+
+    #[test]
+    fn test_sqlite_352_non_recomputed_height_metadata() {
+        let height_1000 = left_deep_or_sql(MAX_EXPR_DEPTH);
+
+        assert_sqlite_height(&format!("({height_1000}) COLLATE binary"), 1);
+        assert_sqlite_height(&format!("1 BETWEEN ({height_1000}) AND 2"), 2);
+        assert_sqlite_height(&format!("(({height_1000}), 1)"), 1);
+        assert_sqlite_height(&format!("group_concat(1 ORDER BY {height_1000})"), 2);
+        assert_sqlite_height(&format!("count(*) FILTER (WHERE {height_1000})"), 1);
+        assert_sqlite_height(&format!("sum(1) OVER (PARTITION BY {height_1000})"), 2);
+    }
+
+    #[test]
+    fn test_sqlite_352_empty_in_rewrites_and_discards_lhs_height() {
+        let height_1000 = left_deep_or_sql(MAX_EXPR_DEPTH);
+        let in_empty = parse(&format!("({height_1000}) IN ()"));
+        assert!(matches!(&in_empty, Expr::Literal(Literal::Integer(0), _)));
+        assert_eq!(sqlite_expr_height(&in_empty), 1);
+
+        let not_in_empty = parse(&format!("({height_1000}) NOT IN ()"));
+        assert!(matches!(
+            &not_in_empty,
+            Expr::Literal(Literal::Integer(1), _)
+        ));
+        assert_eq!(sqlite_expr_height(&not_in_empty), 1);
+
+        let function_lhs = parse("f() IN ()");
+        assert!(matches!(
+            &function_lhs,
+            Expr::Literal(Literal::Integer(0), _)
+        ));
+        assert_eq!(sqlite_expr_height(&function_lhs), 1);
+    }
+
+    #[test]
+    fn test_sqlite_352_singleton_constant_in_rewrites_to_eq_with_uplus() {
+        let expr = parse("x IN (1)");
+        assert_eq!(sqlite_expr_height(&expr), 3);
+        assert!(matches!(
+            expr,
+            Expr::BinaryOp {
+                op: BinaryOp::Eq,
+                right,
+                ..
+            } if matches!(
+                right.as_ref(),
+                Expr::UnaryOp {
+                    op: UnaryOp::Plus,
+                    ..
+                }
+            )
+        ));
+
+        let not_expr = parse("x NOT IN (1)");
+        assert_eq!(sqlite_expr_height(&not_expr), 4);
+        assert!(matches!(
+            not_expr,
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr,
+                ..
+            } if matches!(
+                expr.as_ref(),
+                Expr::BinaryOp {
+                    op: BinaryOp::Eq,
+                    ..
+                }
+            )
+        ));
+
+        assert_sqlite_height("x IN (y)", 2);
+    }
+
+    #[test]
+    fn test_sqlite_352_vector_in_list_uses_values_select_height() {
+        let at_limit = format!(
+            "(a, b) IN ((1, ({})))",
+            left_deep_or_sql(MAX_EXPR_DEPTH - 1)
+        );
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+
+        let over_limit = format!("(a, b) IN ((1, ({})))", left_deep_or_sql(MAX_EXPR_DEPTH));
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_sqlite_352_literal_null_tests_fold_to_integer_leaves() {
+        let cases = [
+            ("1 IS NULL", 0),
+            ("'x' IS NOT NULL", 1),
+            ("1 ISNULL", 0),
+            ("1 NOTNULL", 1),
+            ("1 NOT NULL", 1),
+            ("1 IS DISTINCT FROM NULL", 1),
+            ("1 IS NOT DISTINCT FROM NULL", 0),
+        ];
+        for (sql, expected) in cases {
+            let expr = parse(sql);
+            assert!(
+                matches!(&expr, Expr::Literal(Literal::Integer(value), _) if *value == expected),
+                "unexpected folded form for {sql}: {expr:?}"
+            );
+            assert_eq!(sqlite_expr_height(&expr), 1, "{sql}");
+        }
+
+        assert_sqlite_height("NULL IS NULL", 2);
+    }
+
+    #[test]
+    fn test_sqlite_352_false_and_function_free_expression_folds() {
+        let height_1000 = left_deep_or_sql(MAX_EXPR_DEPTH);
+        let left_false = parse(&format!("0 AND ({height_1000})"));
+        let right_false = parse(&format!("({height_1000}) AND 0"));
+        assert!(matches!(left_false, Expr::Literal(Literal::Integer(0), _)));
+        assert!(matches!(right_false, Expr::Literal(Literal::Integer(0), _)));
+
+        assert_sqlite_height_rejected(&format!("FALSE AND ({height_1000})"));
+        let height_999 = left_deep_or_sql(MAX_EXPR_DEPTH - 1);
+        assert_sqlite_height_rejected(&format!("0 AND f(({height_999}))"));
+    }
+
+    #[test]
+    fn test_sqlite_352_repeated_unary_plus_reuses_one_node() {
+        let plus = parse("++++1");
+        assert_eq!(sqlite_expr_height(&plus), 2);
+        assert!(matches!(
+            plus,
+            Expr::UnaryOp {
+                op: UnaryOp::Plus,
+                expr,
+                ..
+            } if matches!(expr.as_ref(), Expr::Literal(Literal::Integer(1), _))
+        ));
+
+        let negate = parse("-+++1");
+        assert_eq!(sqlite_expr_height(&negate), 2);
+        assert!(matches!(
+            negate,
+            Expr::UnaryOp {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } if matches!(expr.as_ref(), Expr::Literal(Literal::Integer(1), _))
+        ));
+    }
+
+    #[test]
+    fn test_sqlite_346_raise_nm_message_is_height_one() {
+        assert_sqlite_height("RAISE(IGNORE)", 1);
+        assert_sqlite_height("RAISE(ABORT, 'message')", 1);
+        assert_sqlite_height("RAISE(ABORT, message)", 1);
+
+        for (sql, expected) in [
+            ("RAISE(ABORT, message)", "message"),
+            ("RAISE(FAIL, \"bad row\")", "bad row"),
+            ("RAISE(FAIL, 'bad row')", "bad row"),
+            ("RAISE(ABORT, indexed)", "indexed"),
+            ("RAISE(ABORT, left)", "left"),
+            ("RAISE(ABORT, begin)", "begin"),
+            ("RAISE(ABORT, cast)", "cast"),
+            ("RAISE(ABORT, filter)", "filter"),
+            ("RAISE(ABORT, over)", "over"),
+            ("RAISE(ABORT, window)", "window"),
+            ("RAISE(ABORT, strict)", "strict"),
+            ("RAISE(ABORT, concurrent)", "concurrent"),
+            ("RAISE(ROLLBACK, end)", "end"),
+        ] {
+            let expr = parse(sql);
+            assert!(
+                matches!(
+                    &expr,
+                    Expr::Raise {
+                        message: Some(message),
+                        ..
+                    } if message == expected
+                ),
+                "SQLite 3.46.1 nm message must remain a height-one token: {expr:?}"
+            );
+        }
+
+        let at_limit = repeated_or_sql("RAISE(ABORT, message)", MAX_EXPR_DEPTH);
+        assert_sqlite_height(&at_limit, MAX_EXPR_DEPTH);
+        let over_limit = repeated_or_sql("RAISE(ABORT, message)", MAX_EXPR_DEPTH.saturating_add(1));
+        assert_sqlite_height_rejected(&over_limit);
+    }
+
+    #[test]
+    fn test_sqlite_346_raise_nm_rejects_non_fallback_reserved_keywords() {
+        for sql in [
+            "RAISE(ABORT, join)",
+            "RAISE(ABORT, table)",
+            "RAISE(ABORT, returning)",
+            "RAISE(ABORT, transaction)",
+        ] {
+            let error = parse_expr(sql).expect_err("reserved keyword must not match 3.46.1 nm");
+            assert!(
+                error
+                    .message
+                    .contains("expected identifier or string message in RAISE"),
+                "unexpected RAISE nm diagnostic for `{sql}`: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_logical_height_boundary_parses_and_drops_on_two_mib_stack() {
+        std::thread::Builder::new()
+            .name("expr-height-2mib".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let rejected = left_deep_or_sql(MAX_EXPR_DEPTH + 1);
+                let mut rejected_parser = Parser::from_sql(&rejected);
+                let error = rejected_parser
+                    .parse_expr()
+                    .expect_err("height 1001 must be rejected");
+                assert!(
+                    error.message.contains("expression AST is too deep"),
+                    "unexpected logical-height diagnostic: {error:?}"
+                );
+                assert_eq!(
+                    rejected_parser.depth, 0,
+                    "height rejection must unwind the physical recursion guard"
+                );
+
+                let accepted = left_deep_or_sql(MAX_EXPR_DEPTH);
+                let expr = parse_expr(&accepted).expect("height 1000 must parse");
+                assert_eq!(sqlite_expr_height(&expr), MAX_EXPR_DEPTH);
+                drop(expr);
+
+                let scalar_subquery = format!("(SELECT {})", left_deep_or_sql(MAX_EXPR_DEPTH - 1));
+                let expr =
+                    parse_expr(&scalar_subquery).expect("height-1000 scalar subquery must parse");
+                assert_eq!(sqlite_expr_height(&expr), MAX_EXPR_DEPTH);
+                drop(expr);
+            })
+            .expect("2 MiB parser thread must spawn")
+            .join()
+            .expect("2 MiB parser thread must complete without stack overflow");
     }
 
     // ── Precedence tests (normative invariants) ─────────────────────────
@@ -1650,6 +2935,7 @@ mod tests {
         match &parse("x") {
             Expr::Column(
                 ColumnRef {
+                    schema: None,
                     table: None,
                     column,
                 },
@@ -1664,6 +2950,7 @@ mod tests {
         match &parse("t.x") {
             Expr::Column(
                 ColumnRef {
+                    schema: None,
                     table: Some(t),
                     column,
                 },
@@ -1673,6 +2960,40 @@ mod tests {
                 assert_eq!(column.as_ref(), "x");
             }
             other => unreachable!("expected qualified column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_column_schema_qualified_components_remain_distinct() {
+        match &parse("main.t.x") {
+            Expr::Column(
+                ColumnRef {
+                    schema: Some(schema),
+                    table: Some(table),
+                    column,
+                },
+                _,
+            ) => {
+                assert_eq!(schema.as_ref(), "main");
+                assert_eq!(table.as_ref(), "t");
+                assert_eq!(column.as_ref(), "x");
+            }
+            other => unreachable!("expected schema-qualified column, got {other:?}"),
+        }
+
+        match &parse("\"main.t\".x") {
+            Expr::Column(
+                ColumnRef {
+                    schema: None,
+                    table: Some(table),
+                    column,
+                },
+                _,
+            ) => {
+                assert_eq!(table.as_ref(), "main.t");
+                assert_eq!(column.as_ref(), "x");
+            }
+            other => unreachable!("quoted dotted identifier must remain one component: {other:?}"),
         }
     }
 

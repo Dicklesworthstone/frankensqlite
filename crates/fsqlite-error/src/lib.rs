@@ -149,6 +149,17 @@ pub enum FrankenError {
     #[error("transaction rolled back: {reason}")]
     TransactionRolledBack { reason: String },
 
+    /// An admitted transaction operation may have taken effect, but the engine
+    /// could not prove whether the transaction committed or rolled back.
+    ///
+    /// Callers must reconcile externally visible effects before deciding
+    /// whether it is safe to retry.
+    #[error("transaction {operation} outcome is unknown: {detail}")]
+    TransactionOutcomeUnknown {
+        operation: &'static str,
+        detail: String,
+    },
+
     // === MVCC Errors ===
     /// Page-level write conflict (another transaction modified the same page).
     #[error("write conflict on page {page}: held by transaction {holder}")]
@@ -420,6 +431,7 @@ impl FrankenError {
             | Self::VacuumWithinTransaction
             | Self::NoActiveTransaction
             | Self::TransactionRolledBack { .. }
+            | Self::TransactionOutcomeUnknown { .. }
             | Self::TooManyColumns { .. }
             | Self::SqlTooLong { .. }
             | Self::ExpressionTooDeep { .. }
@@ -506,6 +518,9 @@ impl FrankenError {
             Self::BackgroundWorkerFailed(_) => {
                 Some("Close and reopen the database; inspect the logged worker failure details")
             }
+            Self::TransactionOutcomeUnknown { .. } => Some(
+                "Do not blindly retry; reconcile externally visible effects before closing and reopening the database",
+            ),
             Self::QueryReturnedNoRows => Some("Use query() when zero rows are acceptable"),
             Self::QueryReturnedMultipleRows => {
                 Some("Use query() when multiple rows are acceptable, or tighten the query")
@@ -1538,6 +1553,27 @@ mod tests {
         assert!(!err.is_transient());
         assert!(!err.is_user_recoverable());
         assert!(err.suggestion().is_some());
+    }
+
+    #[test]
+    fn transaction_outcome_unknown_is_typed_non_transient_and_not_retryable() {
+        let err = FrankenError::TransactionOutcomeUnknown {
+            operation: "commit",
+            detail: "worker stopped after the commit effect began".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction commit outcome is unknown: worker stopped after the commit effect began"
+        );
+        assert_eq!(err.error_code(), ErrorCode::Error);
+        assert!(!err.is_transient());
+        assert!(!err.is_user_recoverable());
+        assert_eq!(
+            err.suggestion(),
+            Some(
+                "Do not blindly retry; reconcile externally visible effects before closing and reopening the database"
+            )
+        );
     }
 
     #[test]

@@ -37,6 +37,7 @@ use fsqlite_types::record::{
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
 };
+use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -1569,7 +1570,7 @@ impl TableLeafDeleteRun {
         usable_size: u32,
     ) -> Result<TableLeafDeleteRunDelete> {
         let cell_idx = if self.profile_delete_leaf_run {
-            let search_start = Some(std::time::Instant::now());
+            let search_start = Some(Instant::now());
             let search_result = self.search_table_leaf(cx, rowid);
             instrumentation::record_delete_leaf_run_search(search_start);
             search_result?
@@ -1582,7 +1583,7 @@ impl TableLeafDeleteRun {
             ));
         };
         let already_deleted = if self.profile_delete_leaf_run {
-            let duplicate_check_start = Some(std::time::Instant::now());
+            let duplicate_check_start = Some(Instant::now());
             let already_deleted = self.deleted_cell_indices.contains(&cell_idx);
             instrumentation::record_delete_leaf_run_duplicate_check(duplicate_check_start);
             already_deleted
@@ -1607,7 +1608,7 @@ impl TableLeafDeleteRun {
             }
         }
         let has_compact_cell_area = if self.profile_delete_leaf_run {
-            let compact_check_start = Some(std::time::Instant::now());
+            let compact_check_start = Some(Instant::now());
             let has_compact_cell_area = self.compact_cell_area;
             instrumentation::record_delete_leaf_run_compact_check(compact_check_start);
             has_compact_cell_area
@@ -1621,7 +1622,7 @@ impl TableLeafDeleteRun {
         }
         let cell_offset = usize::from(self.entry.cell_pointers[usize::from(cell_idx)]);
         let cell = if self.profile_delete_leaf_run {
-            let cell_parse_start = Some(std::time::Instant::now());
+            let cell_parse_start = Some(Instant::now());
             let cell = CellRef::parse(
                 self.entry.page_data.as_bytes(),
                 cell_offset,
@@ -4715,7 +4716,10 @@ impl<P: PageReader> BtCursor<P> {
 
         let mut lo = 0u16;
         let mut hi = count;
-        let parsed_target = parse_record(target);
+        let parsed_target = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            parse_record(target)
+        };
 
         while lo < hi {
             observe_cursor_cancellation(cx)?;
@@ -4768,7 +4772,10 @@ impl<P: PageReader> BtCursor<P> {
 
         let mut lo = 0u16;
         let mut hi = count;
-        let parsed_target = parse_record(target);
+        let parsed_target = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            parse_record(target)
+        };
 
         while lo < hi {
             observe_cursor_cancellation(cx)?;
@@ -11535,6 +11542,27 @@ mod tests {
                 missing_page_pages: probe.missing_page_pages.clone(),
             }
         }
+
+        fn record_page_read(&self, page_no: PageNumber) {
+            let mut probe = self.probe.borrow_mut();
+            probe.read_pages.push(page_no);
+            let mut counted_prefetch_hit = false;
+            let remove_pending = if let Some(pending) = probe.pending_hints.get_mut(&page_no.get())
+                && *pending > 0
+            {
+                *pending -= 1;
+                counted_prefetch_hit = true;
+                *pending == 0
+            } else {
+                false
+            };
+            if counted_prefetch_hit {
+                probe.prefetch_hit_count = probe.prefetch_hit_count.saturating_add(1);
+            }
+            if remove_pending {
+                probe.pending_hints.remove(&page_no.get());
+            }
+        }
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -11545,26 +11573,7 @@ mod tests {
             page_no: PageNumber,
         ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
             async move {
-                let mut probe = self.probe.borrow_mut();
-                probe.read_pages.push(page_no);
-                let mut counted_prefetch_hit = false;
-                let remove_pending = if let Some(pending) =
-                    probe.pending_hints.get_mut(&page_no.get())
-                    && *pending > 0
-                {
-                    *pending -= 1;
-                    counted_prefetch_hit = true;
-                    *pending == 0
-                } else {
-                    false
-                };
-                if counted_prefetch_hit {
-                    probe.prefetch_hit_count = probe.prefetch_hit_count.saturating_add(1);
-                }
-                if remove_pending {
-                    probe.pending_hints.remove(&page_no.get());
-                }
-                drop(probe);
+                self.record_page_read(page_no);
                 self.inner.read_page(cx, page_no).await
             }
         }
@@ -11882,13 +11891,13 @@ mod tests {
 
     #[derive(Debug)]
     struct FailingOverflowStore {
-        inner: Rc<RefCell<MemPageStore>>,
+        inner: MemPageStore,
         fail_on_write: usize,
         write_count: usize,
     }
 
     impl FailingOverflowStore {
-        fn new(inner: Rc<RefCell<MemPageStore>>, fail_on_write: usize) -> Self {
+        fn new(inner: MemPageStore, fail_on_write: usize) -> Self {
             Self {
                 inner,
                 fail_on_write,
@@ -11904,7 +11913,7 @@ mod tests {
             cx: &'a Cx,
             page_no: PageNumber,
         ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
-            async move { self.inner.borrow().read_page(cx, page_no).await }
+            async move { self.inner.read_page(cx, page_no).await }
         }
     }
 
@@ -11921,7 +11930,7 @@ mod tests {
                 if self.write_count == self.fail_on_write {
                     return Err(FrankenError::internal("injected write failure"));
                 }
-                self.inner.borrow_mut().write_page(cx, page_no, data).await
+                self.inner.write_page(cx, page_no, data).await
             }
         }
 
@@ -11929,7 +11938,7 @@ mod tests {
             &'a mut self,
             cx: &'a Cx,
         ) -> impl Future<Output = Result<PageNumber>> + 'a {
-            async move { self.inner.borrow_mut().allocate_page(cx).await }
+            async move { self.inner.allocate_page(cx).await }
         }
 
         fn free_page<'a>(
@@ -11937,7 +11946,7 @@ mod tests {
             cx: &'a Cx,
             page_no: PageNumber,
         ) -> impl Future<Output = Result<()>> + 'a {
-            async move { self.inner.borrow_mut().free_page(cx, page_no).await }
+            async move { self.inner.free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -12014,12 +12023,12 @@ mod tests {
 
     #[derive(Debug)]
     struct CancelAfterFirstOverflowFreeStore {
-        inner: Rc<RefCell<MemPageStore>>,
+        inner: MemPageStore,
         cancelled: Rc<RefCell<bool>>,
     }
 
     impl CancelAfterFirstOverflowFreeStore {
-        fn new(inner: Rc<RefCell<MemPageStore>>) -> Self {
+        fn new(inner: MemPageStore) -> Self {
             Self {
                 inner,
                 cancelled: Rc::new(RefCell::new(false)),
@@ -12036,7 +12045,7 @@ mod tests {
         ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
             async move {
                 cx.checkpoint().map_err(|_| FrankenError::Abort)?;
-                self.inner.borrow().read_page(cx, page_no).await
+                self.inner.read_page(cx, page_no).await
             }
         }
     }
@@ -12049,14 +12058,14 @@ mod tests {
             page_no: PageNumber,
             data: &'a [u8],
         ) -> impl Future<Output = Result<()>> + 'a {
-            async move { self.inner.borrow_mut().write_page(cx, page_no, data).await }
+            async move { self.inner.write_page(cx, page_no, data).await }
         }
 
         fn allocate_page<'a>(
             &'a mut self,
             cx: &'a Cx,
         ) -> impl Future<Output = Result<PageNumber>> + 'a {
-            async move { self.inner.borrow_mut().allocate_page(cx).await }
+            async move { self.inner.allocate_page(cx).await }
         }
 
         fn free_page<'a>(
@@ -12066,7 +12075,7 @@ mod tests {
         ) -> impl Future<Output = Result<()>> + 'a {
             async move {
                 cx.checkpoint().map_err(|_| FrankenError::Abort)?;
-                self.inner.borrow_mut().free_page(cx, page_no).await?;
+                self.inner.free_page(cx, page_no).await?;
 
                 let mut cancelled = self.cancelled.borrow_mut();
                 if !*cancelled {
@@ -12078,7 +12087,7 @@ mod tests {
         }
 
         fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
-            self.inner.borrow_mut().record_write_witness(cx, key);
+            self.inner.record_write_witness(cx, key);
         }
     }
 
@@ -12588,10 +12597,10 @@ mod tests {
 
     #[test]
     fn test_btree_observability_operation_totals() {
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let before = btree_metrics_snapshot();
 
@@ -12665,10 +12674,10 @@ mod tests {
 
     #[test]
     fn test_btree_observability_split_counter_and_depth_gauge() {
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let before = btree_metrics_snapshot();
 
@@ -15125,17 +15134,16 @@ mod tests {
             let root_page = pn(2);
             let mut base = MemPageStore::new(USABLE);
             base.init_leaf_table_root(root_page);
-            let shared = Rc::new(RefCell::new(base));
 
             // Force a mid-chain overflow write failure.
-            let failing = FailingOverflowStore::new(Rc::clone(&shared), 2);
+            let failing = FailingOverflowStore::new(base, 2);
             let mut cursor = BtCursor::new(failing, root_page, USABLE, true);
             let payload = vec![0xCC; 9_000];
 
             let err = cursor.table_insert(&cx, 1, &payload).await.unwrap_err();
             assert!(matches!(err, FrankenError::Internal(_)));
             assert_eq!(
-                shared.borrow().pages.len(),
+                cursor.pager.inner.pages.len(),
                 1,
                 "only the root page should remain after failed overflow write"
             );
@@ -15148,16 +15156,15 @@ mod tests {
             let root_page = pn(2);
             let mut base = MemPageStore::new(USABLE);
             base.init_leaf_table_root(root_page);
-            let shared = Rc::new(RefCell::new(base));
 
-            let store = CancelAfterFirstOverflowFreeStore::new(Rc::clone(&shared));
+            let store = CancelAfterFirstOverflowFreeStore::new(base);
             let mut cursor = BtCursor::new(store, root_page, USABLE, true);
 
             let insert_cx = Cx::new();
             let payload = vec![0xAB; 9_000];
             cursor.table_insert(&insert_cx, 7, &payload).await.unwrap();
 
-            let pages_before: BTreeSet<u32> = shared.borrow().pages.keys().copied().collect();
+            let pages_before: BTreeSet<u32> = cursor.pager.inner.pages.keys().copied().collect();
             assert!(
                 pages_before.len() > 2,
                 "test requires a multi-page overflow chain, found pages {pages_before:?}"
@@ -15183,7 +15190,7 @@ mod tests {
             let recovery_cx = Cx::new();
             assert!(!cursor.first(&recovery_cx).await.unwrap());
 
-            let remaining_pages: BTreeSet<u32> = shared.borrow().pages.keys().copied().collect();
+            let remaining_pages: BTreeSet<u32> = cursor.pager.inner.pages.keys().copied().collect();
             assert_eq!(
                 remaining_pages,
                 BTreeSet::from([root_page.get()]),
@@ -15451,7 +15458,6 @@ mod tests {
             let (old_key, old_overflow_head) = target.unwrap();
             let base_store = builder.pager;
             assert!(base_store.pages.contains_key(&old_overflow_head.get()));
-            let shared = Rc::new(RefCell::new(base_store));
 
             let overflow_payload_len = replacement_len - replacement_local_len;
             let new_overflow_pages =
@@ -15459,7 +15465,7 @@ mod tests {
             // Replacement writes: N new-overflow pages, the old-cell-free page,
             // then the first structural balance write. Fail that balance write.
             let fail_on_write = new_overflow_pages + 2;
-            let failing = FailingOverflowStore::new(Rc::clone(&shared), fail_on_write);
+            let failing = FailingOverflowStore::new(base_store, fail_on_write);
             let mut cursor = BtCursor::new(failing, root, INDEX_USABLE, false);
             assert!(
                 cursor
@@ -15483,7 +15489,11 @@ mod tests {
                 "expected the injected balance failure, got {error:?}"
             );
             assert!(
-                shared.borrow().pages.contains_key(&old_overflow_head.get()),
+                cursor
+                    .pager
+                    .inner
+                    .pages
+                    .contains_key(&old_overflow_head.get()),
                 "the old separator must retain ownership of its overflow chain until balance succeeds"
             );
         });
@@ -15835,14 +15845,14 @@ mod tests {
 
     #[test]
     fn test_balance_for_delete_defers_until_leaf_empties() {
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
             // bd-yywuv (K2 deferred delete): prove balance_for_delete (the rebalance
             // fixup) fires ONLY when a leaf empties, not per DELETE. Deleting every
             // cell of the leftmost leaf EXCEPT the last must trigger zero rebalances;
             // the final delete that empties the leaf triggers the rebalance.
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
 
             let mut store = MemPageStore::new(USABLE);
@@ -17368,10 +17378,7 @@ mod tests {
     fn test_cached_rightmost_hint_overflow_encode_error_retains_cell_buffer() {
         run_async(async {
             const SMALL_USABLE: u32 = 256;
-            let inner = Rc::new(RefCell::new(MemPageStore::with_empty_table(
-                pn(2),
-                SMALL_USABLE,
-            )));
+            let inner = MemPageStore::with_empty_table(pn(2), SMALL_USABLE);
             let cx = Cx::new();
             let mut cursor = BtCursor::new(
                 FailingOverflowStore::new(inner, usize::MAX),
@@ -17499,13 +17506,13 @@ mod tests {
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_handles_split_fallback() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             const SMALL_USABLE: u32 = 256;
 
             let cx = Cx::new();
@@ -17565,13 +17572,13 @@ mod tests {
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_split_reads_only_parent_after_root_split() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             const SMALL_USABLE: u32 = 256;
 
             let cx = Cx::new();
@@ -17791,14 +17798,13 @@ mod tests {
 
     #[test]
     fn test_table_insert_sequential_fast_path_records_append_metrics_without_reloads() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-
             crate::instrumentation::reset_btree_copy_profile();
             crate::instrumentation::set_btree_copy_profile_enabled(true);
 
@@ -18149,16 +18155,16 @@ mod tests {
 
     #[test]
     fn test_table_insert_from_current_position_reuses_leaf_state_without_reload() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let cx = Cx::new();
             let root = pn(2);
@@ -18219,10 +18225,7 @@ mod tests {
         run_async(async {
             const SMALL_USABLE: u32 = 256;
             let root = pn(2);
-            let inner = Rc::new(RefCell::new(MemPageStore::with_empty_table(
-                root,
-                SMALL_USABLE,
-            )));
+            let inner = MemPageStore::with_empty_table(root, SMALL_USABLE);
             let cx = Cx::new();
             let mut cursor = BtCursor::new(
                 FailingOverflowStore::new(inner, usize::MAX),
@@ -18262,16 +18265,16 @@ mod tests {
 
     #[test]
     fn test_index_insert_from_current_position_reuses_leaf_state_without_reload() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let cx = Cx::new();
             let root = pn(2);
@@ -18334,10 +18337,7 @@ mod tests {
         run_async(async {
             const SMALL_USABLE: u32 = 256;
             let root = pn(2);
-            let inner = Rc::new(RefCell::new(MemPageStore::with_empty_index(
-                root,
-                SMALL_USABLE,
-            )));
+            let inner = MemPageStore::with_empty_index(root, SMALL_USABLE);
             let cx = Cx::new();
             let mut cursor = BtCursor::new(
                 FailingOverflowStore::new(inner, usize::MAX),
@@ -18382,10 +18382,7 @@ mod tests {
         run_async(async {
             const SMALL_USABLE: u32 = 256;
             let root = pn(2);
-            let inner = Rc::new(RefCell::new(MemPageStore::with_empty_index(
-                root,
-                SMALL_USABLE,
-            )));
+            let inner = MemPageStore::with_empty_index(root, SMALL_USABLE);
             let cx = Cx::new();
             let mut cursor = BtCursor::new(
                 FailingOverflowStore::new(inner, usize::MAX),
@@ -18417,16 +18414,16 @@ mod tests {
 
     #[test]
     fn test_table_insert_from_current_position_after_delete_reuses_leaf_state() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let cx = Cx::new();
             let root = pn(2);
@@ -18494,16 +18491,16 @@ mod tests {
 
     #[test]
     fn test_table_insert_from_current_position_records_fallback_when_balance_needed() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             const SMALL_USABLE: u32 = 256;
 

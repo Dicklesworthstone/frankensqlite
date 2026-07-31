@@ -215,8 +215,7 @@ fn main() {
          products={PRODUCT_COUNT} categories={CATEGORY_COUNT}"
     );
 
-    let conn =
-        fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).expect("open :memory:");
+    let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).expect("open :memory:");
     setup_probe_schema(&conn);
 
     // Control 1: pure Option-gate on a placeholder-free expression statement.

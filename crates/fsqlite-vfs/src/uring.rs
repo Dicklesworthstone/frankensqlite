@@ -59,6 +59,8 @@ const IO_URING_QUEUE_ENTRIES: u32 = 256;
 const IO_URING_CANCEL_TAG: u64 = 1_u64 << 63;
 #[cfg(feature = "linux-asupersync-uring")]
 const IO_URING_DRIVER_WAIT: Duration = Duration::from_millis(1);
+#[cfg(feature = "linux-asupersync-uring")]
+const IO_URING_POISON_REAP_MAX_BACKOFF: Duration = Duration::from_millis(250);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_INIT_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
@@ -164,8 +166,10 @@ struct DriverRequest {
     file: Arc<File>,
     offset: u64,
     kind: DriverRequestKind,
-    completion: SendPermit<DriverCompletion>,
+    completion: Option<SendPermit<DriverCompletion>>,
     write_completion: Option<VfsWriteCompletionSource>,
+    #[cfg(test)]
+    _drop_sentinel: Option<DriverRequestDropSentinel>,
 }
 
 #[cfg(feature = "linux-asupersync-uring")]
@@ -222,35 +226,126 @@ impl DriverRequest {
             result,
             "io_uring request completed"
         );
-        let _ = self.completion.send(completion);
+        if let Some(observer) = self.completion.take() {
+            let _ = observer.send(completion);
+        }
     }
 
     fn fail(mut self, kind: io::ErrorKind, message: &str) {
         if let Some(write_completion) = &mut self.write_completion {
             write_completion.complete_error();
         }
-        let _ = self
-            .completion
-            .send(DriverCompletion::Failed(io::Error::new(
+        if let Some(observer) = self.completion.take() {
+            let _ = observer.send(DriverCompletion::Failed(io::Error::new(
                 kind,
                 message.to_owned(),
             )));
+        }
     }
 
     fn cancel(mut self) {
         if let Some(write_completion) = &mut self.write_completion {
             write_completion.complete_error();
         }
-        let _ = self.completion.send(DriverCompletion::Cancelled);
+        if let Some(observer) = self.completion.take() {
+            let _ = observer.send(DriverCompletion::Cancelled);
+        }
     }
+}
+
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+#[derive(Debug)]
+struct DriverRequestDropSentinel(Arc<AtomicU64>);
+
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+impl Drop for DriverRequestDropSentinel {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Owns every request whose data SQE may have become visible to the kernel
+/// after a fatal driver error.
+///
+/// Neither the driver failure nor an async-cancel CQE proves that the kernel is
+/// finished with the request's raw buffer pointer. The observer and physical
+/// source therefore remain pending together. Only the original data CQE removes
+/// a request from this map and releases both.
+#[cfg(feature = "linux-asupersync-uring")]
+#[derive(Debug, Default)]
+struct PoisonedReaper {
+    requests: HashMap<u64, DriverRequest>,
+    cancellation_queued: HashSet<u64>,
+}
+
+#[cfg(feature = "linux-asupersync-uring")]
+impl PoisonedReaper {
+    fn new(requests: HashMap<u64, DriverRequest>) -> Self {
+        Self {
+            requests,
+            cancellation_queued: HashSet::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    #[cfg(test)]
+    fn request_ids(&self) -> Vec<u64> {
+        self.requests.keys().copied().collect()
+    }
+
+    fn request_ids_needing_cancel(&self) -> Vec<u64> {
+        self.requests
+            .keys()
+            .filter(|request_id| !self.cancellation_queued.contains(*request_id))
+            .copied()
+            .collect()
+    }
+
+    fn mark_cancellation_queued(&mut self, request_id: u64) {
+        self.cancellation_queued.insert(request_id);
+    }
+
+    fn finish_data_cqes(&mut self, completed: Vec<(u64, i32)>) -> Vec<u64> {
+        let mut retired = Vec::new();
+        for (user_data, result) in completed {
+            if user_data & IO_URING_CANCEL_TAG != 0 {
+                continue;
+            }
+            let Some(request) = self.requests.remove(&user_data) else {
+                continue;
+            };
+            self.cancellation_queued.remove(&user_data);
+            retired.push(user_data);
+            request.complete(result);
+        }
+        retired
+    }
+}
+
+#[cfg(feature = "linux-asupersync-uring")]
+fn prepare_poisoned_reaper(
+    potentially_submitted: HashMap<u64, DriverRequest>,
+    never_submitted: Vec<DriverRequest>,
+    kind: io::ErrorKind,
+    message: &str,
+) -> PoisonedReaper {
+    for request in never_submitted {
+        request.fail(kind, message);
+    }
+    PoisonedReaper::new(potentially_submitted)
 }
 
 #[cfg(feature = "linux-asupersync-uring")]
 fn push_submission(ring: &mut IoUring, entry: &io_uring::squeue::Entry) -> io::Result<()> {
     loop {
         // SAFETY: every data-path entry references a heap allocation owned by
-        // the corresponding `DriverRequest` in the driver's `inflight` map.
-        // Cancellation never releases that request; only its terminal CQE does.
+        // the corresponding `DriverRequest`, either in this call's driver
+        // local before a successful push or in the driver's `inflight` map
+        // afterward. Cancellation never releases that request; only its
+        // terminal data CQE does.
         if unsafe { ring.submission().push(entry) }.is_ok() {
             return Ok(());
         }
@@ -271,18 +366,44 @@ struct DriverQueue {
 
 #[cfg(feature = "linux-asupersync-uring")]
 impl DriverQueue {
-    fn allocate_request_id(&mut self) -> u64 {
-        loop {
-            let candidate = self.next_request_id.max(1);
-            self.next_request_id = if candidate == IO_URING_CANCEL_TAG - 1 {
-                1
-            } else {
-                candidate + 1
-            };
-            if self.live.insert(candidate) {
-                return candidate;
-            }
+    fn allocate_request_id(&mut self) -> Result<u64> {
+        let candidate = self.next_request_id.checked_add(1).ok_or_else(|| {
+            FrankenError::Io(io::Error::other(
+                "io_uring request identifier counter overflowed",
+            ))
+        })?;
+        if candidate >= IO_URING_CANCEL_TAG {
+            return Err(FrankenError::Io(io::Error::other(
+                "io_uring request identifier space exhausted",
+            )));
         }
+        self.next_request_id = candidate;
+        if !self.live.insert(candidate) {
+            return Err(FrankenError::Io(io::Error::other(
+                "monotonic io_uring request identifier was already live",
+            )));
+        }
+        Ok(candidate)
+    }
+}
+
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+#[derive(Debug, Default)]
+struct DriverTestFaults {
+    fail_push_after: Option<usize>,
+    fail_final_submit: bool,
+    fail_wait_submit: bool,
+    fail_spawn: bool,
+    poison_reap_start_delay: Option<Duration>,
+}
+
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+struct PoisonedDriverOwnerGuard<'a>(&'a AtomicU64);
+
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+impl Drop for PoisonedDriverOwnerGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -330,6 +451,12 @@ struct IoUringRuntime {
     submitted_cancellations: AtomicU64,
     #[cfg(feature = "linux-asupersync-uring")]
     largest_submission_batch: AtomicU64,
+    #[cfg(all(test, feature = "linux-asupersync-uring"))]
+    test_faults: Mutex<DriverTestFaults>,
+    #[cfg(all(test, feature = "linux-asupersync-uring"))]
+    test_write_retries_after_driver_completion: AtomicU64,
+    #[cfg(all(test, feature = "linux-asupersync-uring"))]
+    test_poisoned_driver_owners: AtomicU64,
     initial_status: String,
     disabled: AtomicBool,
     disable_reason: OnceLock<&'static str>,
@@ -392,6 +519,12 @@ impl IoUringRuntime {
                 submitted_requests: AtomicU64::new(0),
                 submitted_cancellations: AtomicU64::new(0),
                 largest_submission_batch: AtomicU64::new(0),
+                #[cfg(test)]
+                test_faults: Mutex::new(DriverTestFaults::default()),
+                #[cfg(test)]
+                test_write_retries_after_driver_completion: AtomicU64::new(0),
+                #[cfg(test)]
+                test_poisoned_driver_owners: AtomicU64::new(0),
                 initial_status,
                 disabled: AtomicBool::new(forced_failure),
                 disable_reason,
@@ -529,14 +662,22 @@ impl IoUringRuntime {
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let id = queue.allocate_request_id();
+            if self.disabled.load(Ordering::Acquire) {
+                return Err(FrankenError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "shared io_uring runtime was disabled before request admission",
+                )));
+            }
+            let id = queue.allocate_request_id()?;
             queue.pending.push_back(DriverRequest {
                 id,
                 file,
                 offset,
                 kind,
-                completion,
+                completion: Some(completion),
                 write_completion: write_completion.map(VfsWriteCompletionSource::new),
+                #[cfg(test)]
+                _drop_sentinel: None,
             });
             id
         };
@@ -569,6 +710,13 @@ impl IoUringRuntime {
             return Ok(());
         }
 
+        #[cfg(test)]
+        if self.take_test_spawn_failure() {
+            let error = io::Error::other("forced shared io_uring driver spawn failure");
+            self.fail_driver_without_ring(&error);
+            return Err(error);
+        }
+
         self.driver_starts.fetch_add(1, Ordering::Relaxed);
         let runtime = Arc::clone(self);
         match native_cx.spawn_blocking(move |_driver_cx| runtime.drive_to_quiescence()) {
@@ -579,14 +727,13 @@ impl IoUringRuntime {
                 Ok(())
             }
             Err(error) => {
-                let mut queue = self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                queue.active = false;
-                Err(io::Error::other(format!(
-                    "cannot start shared io_uring driver: {error}"
-                )))
+                let error =
+                    io::Error::other(format!("cannot start shared io_uring driver: {error}"));
+                // No SQE can have been pushed before the driver task starts.
+                // Fail every admitted request at its proven-unsubmitted source
+                // boundary so concurrent observers cannot wait forever.
+                self.fail_driver_without_ring(&error);
+                Err(error)
             }
         }
     }
@@ -609,7 +756,9 @@ impl IoUringRuntime {
                     .expect("located pending request must remain present");
                 queue.live.remove(&request_id);
                 Some(request)
-            } else if queue.live.contains(&request_id) && queue.cancellation_set.insert(request_id)
+            } else if queue.active
+                && queue.live.contains(&request_id)
+                && queue.cancellation_set.insert(request_id)
             {
                 queue.cancellations.push_back(request_id);
                 None
@@ -630,10 +779,10 @@ impl IoUringRuntime {
     #[cfg(feature = "linux-asupersync-uring")]
     fn drive_to_quiescence(self: Arc<Self>) {
         let Some(ring_mutex) = &self.ring else {
-            self.fail_driver(
-                &mut HashMap::new(),
-                &io::Error::new(io::ErrorKind::Unsupported, "io_uring is unavailable"),
-            );
+            self.fail_driver_without_ring(&io::Error::new(
+                io::ErrorKind::Unsupported,
+                "io_uring is unavailable",
+            ));
             return;
         };
         let mut ring = ring_mutex
@@ -651,7 +800,7 @@ impl IoUringRuntime {
                     .expect("io_uring queue size must fit usize");
                 let requests = (0..request_limit)
                     .filter_map(|_| queue.pending.pop_front())
-                    .collect::<Vec<_>>();
+                    .collect::<VecDeque<_>>();
                 let cancellations = (0..request_limit)
                     .filter_map(|_| queue.cancellations.pop_front())
                     .collect::<Vec<_>>();
@@ -663,14 +812,27 @@ impl IoUringRuntime {
                 Ordering::Relaxed,
             );
 
-            let mut submission_error = None;
-            for request in requests {
+            let mut requests = requests;
+            #[cfg(test)]
+            let mut pushed_this_batch = 0_usize;
+            while let Some(mut request) = requests.pop_front() {
+                #[cfg(test)]
+                if self.take_test_push_failure(pushed_this_batch) {
+                    let mut never_submitted = Vec::with_capacity(requests.len() + 1);
+                    never_submitted.push(request);
+                    never_submitted.extend(requests);
+                    self.poison_driver(
+                        &mut ring,
+                        inflight,
+                        never_submitted,
+                        &io::Error::other(
+                            "forced io_uring push failure after configured request count",
+                        ),
+                    );
+                    return;
+                }
+
                 let id = request.id;
-                let previous = inflight.insert(id, request);
-                assert!(previous.is_none(), "request must only enter the ring once");
-                let request = inflight
-                    .get_mut(&id)
-                    .expect("newly inserted request must remain present");
                 let len = u32::try_from(request.kind.len())
                     .expect("VFS chunks are bounded below u32::MAX");
                 let entry = match &mut request.kind {
@@ -690,37 +852,45 @@ impl IoUringRuntime {
                     }
                 };
                 if let Err(error) = push_submission(&mut ring, &entry) {
-                    submission_error = Some(error);
-                    break;
+                    let mut never_submitted = Vec::with_capacity(requests.len() + 1);
+                    never_submitted.push(request);
+                    never_submitted.extend(requests);
+                    self.poison_driver(&mut ring, inflight, never_submitted, &error);
+                    return;
                 }
+                let previous = inflight.insert(id, request);
+                assert!(previous.is_none(), "request must only enter the ring once");
                 self.submitted_requests.fetch_add(1, Ordering::Relaxed);
-            }
-
-            if submission_error.is_none() {
-                for request_id in cancellations {
-                    if !inflight.contains_key(&request_id) {
-                        continue;
-                    }
-                    let entry = opcode::AsyncCancel::new(request_id)
-                        .build()
-                        .user_data(IO_URING_CANCEL_TAG | request_id);
-                    if let Err(error) = push_submission(&mut ring, &entry) {
-                        submission_error = Some(error);
-                        break;
-                    }
-                    self.submitted_cancellations.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                {
+                    pushed_this_batch += 1;
                 }
             }
 
-            if let Some(error) = submission_error {
-                drop(ring);
-                self.fail_driver(&mut inflight, &error);
-                return;
+            for request_id in cancellations {
+                if !inflight.contains_key(&request_id) {
+                    continue;
+                }
+                let entry = opcode::AsyncCancel::new(request_id)
+                    .build()
+                    .user_data(IO_URING_CANCEL_TAG | request_id);
+                if let Err(error) = push_submission(&mut ring, &entry) {
+                    self.poison_driver(&mut ring, inflight, Vec::new(), &error);
+                    return;
+                }
+                self.submitted_cancellations.fetch_add(1, Ordering::Relaxed);
             }
 
-            if let Err(error) = ring.submit() {
-                drop(ring);
-                self.fail_driver(&mut inflight, &error);
+            #[cfg(test)]
+            let final_submit_result = if self.take_test_final_submit_failure() {
+                Err(io::Error::other("forced io_uring final submit failure"))
+            } else {
+                ring.submit()
+            };
+            #[cfg(not(test))]
+            let final_submit_result = ring.submit();
+            if let Err(error) = final_submit_result {
+                self.poison_driver(&mut ring, inflight, Vec::new(), &error);
                 return;
             }
 
@@ -751,7 +921,15 @@ impl IoUringRuntime {
 
             let timeout = types::Timespec::from(IO_URING_DRIVER_WAIT);
             let args = types::SubmitArgs::new().timespec(&timeout);
-            match ring.submitter().submit_with_args(1, &args) {
+            #[cfg(test)]
+            let wait_submit_result = if self.take_test_wait_submit_failure() {
+                Err(io::Error::other("forced io_uring submit_with_args failure"))
+            } else {
+                ring.submitter().submit_with_args(1, &args)
+            };
+            #[cfg(not(test))]
+            let wait_submit_result = ring.submitter().submit_with_args(1, &args);
+            match wait_submit_result {
                 Ok(_) => {}
                 Err(error)
                     if matches!(
@@ -759,8 +937,7 @@ impl IoUringRuntime {
                         Some(libc::ETIME | libc::EINTR | libc::EAGAIN)
                     ) => {}
                 Err(error) => {
-                    drop(ring);
-                    self.fail_driver(&mut inflight, &error);
+                    self.poison_driver(&mut ring, inflight, Vec::new(), &error);
                     return;
                 }
             }
@@ -778,6 +955,7 @@ impl IoUringRuntime {
         inflight: &mut HashMap<u64, DriverRequest>,
         completed: Vec<(u64, i32)>,
     ) {
+        let mut retired = Vec::new();
         for (user_data, result) in completed {
             if user_data & IO_URING_CANCEL_TAG != 0 {
                 continue;
@@ -785,20 +963,29 @@ impl IoUringRuntime {
             let Some(request) = inflight.remove(&user_data) else {
                 continue;
             };
-            {
-                let mut queue = self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                queue.live.remove(&user_data);
-                queue.cancellation_set.remove(&user_data);
-            }
+            retired.push(user_data);
             request.complete(result);
+        }
+        self.retire_live_requests(&retired);
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn retire_live_requests(&self, retired: &[u64]) {
+        if retired.is_empty() {
+            return;
+        }
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for request_id in retired {
+            queue.live.remove(request_id);
+            queue.cancellation_set.remove(request_id);
         }
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
-    fn fail_driver(&self, inflight: &mut HashMap<u64, DriverRequest>, error: &io::Error) {
+    fn fail_driver_without_ring(&self, error: &io::Error) {
         self.disable(IO_URING_DRIVER_FAILED_MSG);
         let kind = error.kind();
         let message = error.to_string();
@@ -813,12 +1000,221 @@ impl IoUringRuntime {
             queue.cancellation_set.clear();
             queue.pending.drain(..).collect::<Vec<_>>()
         };
-        for (_, request) in inflight.drain() {
-            request.fail(kind, &message);
-        }
         for request in queued {
             request.fail(kind, &message);
         }
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn poison_driver(
+        self: &Arc<Self>,
+        ring: &mut IoUring,
+        potentially_submitted: HashMap<u64, DriverRequest>,
+        mut never_submitted: Vec<DriverRequest>,
+        error: &io::Error,
+    ) {
+        self.disable(IO_URING_DRIVER_FAILED_MSG);
+        let kind = error.kind();
+        let message = error.to_string();
+
+        {
+            let mut queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.active = false;
+            never_submitted.extend(queue.pending.drain(..));
+            queue
+                .live
+                .retain(|request_id| potentially_submitted.contains_key(request_id));
+            queue.cancellations.clear();
+            queue.cancellation_set.clear();
+        }
+        let mut reaper =
+            prepare_poisoned_reaper(potentially_submitted, never_submitted, kind, &message);
+        self.reap_poisoned_requests(ring, &mut reaper);
+        debug_assert!(reaper.is_empty());
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn reap_poisoned_requests(&self, ring: &mut IoUring, reaper: &mut PoisonedReaper) {
+        if reaper.is_empty() {
+            return;
+        }
+
+        #[cfg(test)]
+        let _owner_guard = {
+            self.test_poisoned_driver_owners
+                .fetch_add(1, Ordering::AcqRel);
+            PoisonedDriverOwnerGuard(&self.test_poisoned_driver_owners)
+        };
+        #[cfg(test)]
+        if let Some(delay) = self.take_test_poison_reap_start_delay() {
+            std::thread::sleep(delay);
+        }
+
+        // This driver task remains the exclusive ring owner until every data
+        // request reaches its original CQE. Async-cancel CQEs only report on
+        // the cancellation request; they do not prove that the kernel has
+        // stopped using a data buffer. There is deliberately no time cutoff:
+        // absent a separately proven synchronous ring-shutdown primitive,
+        // failing or dropping a remaining request would be unsound.
+        let mut wait = IO_URING_DRIVER_WAIT;
+        let mut warned_cancel_ids = HashSet::new();
+        let mut warned_submit_error = false;
+        let mut warned_wait_error = false;
+        loop {
+            let completed = ring
+                .completion()
+                .map(|entry| (entry.user_data(), entry.result()))
+                .collect::<Vec<_>>();
+            let retired = reaper.finish_data_cqes(completed);
+            let made_progress = !retired.is_empty();
+            self.retire_live_requests(&retired);
+            if reaper.is_empty() {
+                return;
+            }
+
+            for request_id in reaper.request_ids_needing_cancel() {
+                let entry = opcode::AsyncCancel::new(request_id)
+                    .build()
+                    .user_data(IO_URING_CANCEL_TAG | request_id);
+                match push_submission(ring, &entry) {
+                    Ok(()) => {
+                        reaper.mark_cancellation_queued(request_id);
+                        warned_cancel_ids.remove(&request_id);
+                        self.submitted_cancellations.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        if warned_cancel_ids.insert(request_id) {
+                            warn!(
+                                backend = Self::backend_name(),
+                                request_id,
+                                %error,
+                                "io_uring poisoned reaper could not queue cancellation; retaining the request and retrying"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+
+            match ring.submit() {
+                Ok(_) => warned_submit_error = false,
+                Err(error) => {
+                    if !warned_submit_error {
+                        warn!(
+                            backend = Self::backend_name(),
+                            %error,
+                            "io_uring poisoned reaper could not submit queued work; retaining requests and retrying"
+                        );
+                        warned_submit_error = true;
+                    }
+                }
+            }
+
+            let completed = ring
+                .completion()
+                .map(|entry| (entry.user_data(), entry.result()))
+                .collect::<Vec<_>>();
+            let retired = reaper.finish_data_cqes(completed);
+            let made_progress = made_progress || !retired.is_empty();
+            self.retire_live_requests(&retired);
+            if reaper.is_empty() {
+                return;
+            }
+            if made_progress {
+                wait = IO_URING_DRIVER_WAIT;
+            }
+
+            let timeout = types::Timespec::from(wait);
+            let args = types::SubmitArgs::new().timespec(&timeout);
+            let wait_result = ring.submitter().submit_with_args(1, &args);
+            let completed = ring
+                .completion()
+                .map(|entry| (entry.user_data(), entry.result()))
+                .collect::<Vec<_>>();
+            let retired = reaper.finish_data_cqes(completed);
+            let completed_data = !retired.is_empty();
+            self.retire_live_requests(&retired);
+            if reaper.is_empty() {
+                return;
+            }
+
+            match wait_result {
+                Ok(_) => warned_wait_error = false,
+                Err(error) => {
+                    let transient_timeout = error.raw_os_error() == Some(libc::ETIME);
+                    if !transient_timeout && !warned_wait_error {
+                        warn!(
+                            backend = Self::backend_name(),
+                            %error,
+                            "io_uring poisoned reaper wait failed; retaining requests and retrying"
+                        );
+                        warned_wait_error = true;
+                    }
+                    if !transient_timeout {
+                        std::thread::sleep(wait);
+                    }
+                }
+            }
+
+            if completed_data {
+                wait = IO_URING_DRIVER_WAIT;
+            } else {
+                wait = wait.saturating_mul(2).min(IO_URING_POISON_REAP_MAX_BACKOFF);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn take_test_push_failure(&self, pushed_this_batch: usize) -> bool {
+        let mut faults = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if faults.fail_push_after == Some(pushed_this_batch) {
+            faults.fail_push_after = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn take_test_final_submit_failure(&self) -> bool {
+        let mut faults = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut faults.fail_final_submit)
+    }
+
+    #[cfg(test)]
+    fn take_test_wait_submit_failure(&self) -> bool {
+        let mut faults = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut faults.fail_wait_submit)
+    }
+
+    #[cfg(test)]
+    fn take_test_poison_reap_start_delay(&self) -> Option<Duration> {
+        let mut faults = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        faults.poison_reap_start_delay.take()
+    }
+
+    #[cfg(test)]
+    fn take_test_spawn_failure(&self) -> bool {
+        let mut faults = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut faults.fail_spawn)
     }
 }
 
@@ -1051,6 +1447,15 @@ impl VfsFile for IoUringFile {
         writes: &'a [(u64, &'a [u8])],
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         self.inner.write_page_batch(cx, writes)
+    }
+
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.inner.write_page_batch_tracked(cx, writes, completion)
     }
 
     fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
@@ -1299,6 +1704,10 @@ impl IoUringFile {
                     if should_disable_runtime_on_uring_fallback(&error) {
                         self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
                     }
+                    #[cfg(test)]
+                    self.runtime
+                        .test_write_retries_after_driver_completion
+                        .fetch_add(1, Ordering::Relaxed);
                     record_io_uring_write_unix_fallback();
                     return self.inner.write(cx, buf, offset).await;
                 }
@@ -1334,140 +1743,160 @@ impl IoUringFile {
         Ok(())
     }
 
-    async fn write_data_path_tracked(
-        &self,
-        cx: &Cx,
-        buf: &[u8],
+    fn write_data_path_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> Result<()> {
-        if let Err(error) = checkpoint_or_abort(cx) {
-            completion.complete_error();
-            return Err(error);
-        }
-        if buf.is_empty() {
-            completion.complete_success();
-            return Ok(());
-        }
-        if !self.runtime.is_available() {
-            record_io_uring_write_unix_fallback();
-            return self.inner.write_tracked(cx, buf, offset, completion).await;
-        }
-        // See `read_data_path`: do not substitute `NativeCx::current()` here.
-        let Some(native_cx) = cx.attached_native_cx() else {
-            record_io_uring_write_unix_fallback();
-            return self.inner.write_tracked(cx, buf, offset, completion).await;
-        };
-        if u32::try_from(buf.len()).is_err() {
-            record_io_uring_write_unix_fallback();
-            return self.inner.write_tracked(cx, buf, offset, completion).await;
-        }
-        let write_range_is_valid = u64::try_from(buf.len())
-            .ok()
-            .and_then(|len| offset.checked_add(len))
-            .is_some();
-        if !write_range_is_valid {
-            completion.complete_error();
-            return Err(FrankenError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "offset overflow during tracked async io_uring write",
-            )));
-        }
-        let file = match self.inner.canonical_file() {
-            Ok(file) => file,
-            Err(error) => {
-                completion.complete_error();
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            if let Err(error) = checkpoint_or_abort(cx) {
+                source_completion.complete_error();
                 return Err(error);
             }
-        };
-
-        #[cfg(test)]
-        if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
-            completion.complete_error();
-            return Err(FrankenError::Abort);
-        }
-
-        #[cfg(test)]
-        if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
-            self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
-            record_io_uring_write_unix_fallback();
-            return self.inner.write_tracked(cx, buf, offset, completion).await;
-        }
-
-        let start = Instant::now();
-        let enqueue_result = self.runtime.enqueue_write(
-            cx,
-            &native_cx,
-            file,
-            buf.to_vec(),
-            offset,
-            Some(completion.clone()),
-        );
-        let (request_id, mut receiver) = match enqueue_result {
-            Ok(request) => request,
-            Err(error) => {
-                completion.complete_error();
-                return Err(error);
+            if buf.is_empty() {
+                source_completion.complete_success();
+                return Ok(());
             }
-        };
-        let mut cancel_guard = RequestCancellationGuard::new(Arc::clone(&self.runtime), request_id);
-        asupersync::runtime::yield_now().await;
-        if let Err(error) = self.runtime.ensure_driver(&native_cx) {
-            drop(cancel_guard);
-            return Err(FrankenError::Io(io::Error::other(format!(
-                "cannot start tracked shared io_uring write: {error}"
-            ))));
-        }
-
-        let driver_completion = receiver
-            .recv(&native_cx)
-            .await
-            .map_err(|error| match error {
-                oneshot::RecvError::Cancelled => FrankenError::Abort,
-                oneshot::RecvError::Closed | oneshot::RecvError::PolledAfterCompletion => {
-                    FrankenError::Io(io::Error::other(format!(
-                        "tracked shared io_uring response channel failed: {error}"
-                    )))
-                }
-            })?;
-        cancel_guard.disarm();
-
-        match driver_completion {
-            DriverCompletion::Write { bytes_written } if bytes_written == buf.len() => {}
-            DriverCompletion::Write { bytes_written } => {
+            if !self.runtime.is_available() {
+                record_io_uring_write_unix_fallback();
+                return source_completion
+                    .delegate_exact(|lower| self.inner.write_tracked(cx, buf, offset, lower))
+                    .await;
+            }
+            // See `read_data_path`: do not substitute `NativeCx::current()` here.
+            let Some(native_cx) = cx.attached_native_cx() else {
+                record_io_uring_write_unix_fallback();
+                return source_completion
+                    .delegate_exact(|lower| self.inner.write_tracked(cx, buf, offset, lower))
+                    .await;
+            };
+            if u32::try_from(buf.len()).is_err() {
+                record_io_uring_write_unix_fallback();
+                return source_completion
+                    .delegate_exact(|lower| self.inner.write_tracked(cx, buf, offset, lower))
+                    .await;
+            }
+            let write_range_is_valid = u64::try_from(buf.len())
+                .ok()
+                .and_then(|len| offset.checked_add(len))
+                .is_some();
+            if !write_range_is_valid {
+                source_completion.complete_error();
                 return Err(FrankenError::Io(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!(
-                        "tracked async io_uring write completed only {bytes_written} of {} bytes",
-                        buf.len()
-                    ),
+                    io::ErrorKind::InvalidInput,
+                    "offset overflow during tracked async io_uring write",
                 )));
             }
-            DriverCompletion::Cancelled => return Err(FrankenError::Abort),
-            DriverCompletion::Failed(error) => return Err(FrankenError::Io(error)),
-            DriverCompletion::Read { .. } => {
-                return Err(FrankenError::Io(io::Error::other(
-                    "shared io_uring returned a read completion for a tracked write request",
-                )));
+            let file = match self.inner.canonical_file() {
+                Ok(file) => file,
+                Err(error) => {
+                    source_completion.complete_error();
+                    return Err(error);
+                }
+            };
+
+            #[cfg(test)]
+            if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
+                source_completion.complete_error();
+                return Err(FrankenError::Abort);
             }
-        }
 
-        // The CQE driver has already set Success. A cancellation observed here
-        // must not erase proof that the bytes reached the completion source.
-        checkpoint_or_abort(cx)?;
+            #[cfg(test)]
+            if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
+                self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
+                record_io_uring_write_unix_fallback();
+                return source_completion
+                    .delegate_exact(|lower| self.inner.write_tracked(cx, buf, offset, lower))
+                    .await;
+            }
 
-        let elapsed = start.elapsed();
-        if record_io_uring_write_latency(elapsed) {
-            let snapshot = io_uring_latency_snapshot();
-            enforce_conformal_breach_policy(
-                &self.runtime,
-                "write",
-                elapsed,
-                snapshot.write_conformal_upper_bound_us,
-                IO_URING_WRITE_CONFORMAL_BREACH_MSG,
-            );
+            let start = Instant::now();
+            let (enqueue_result, enqueue_error_completion) =
+                source_completion.delegate_exact(|lower| {
+                    let enqueue_error_completion = lower.clone();
+                    (
+                        self.runtime.enqueue_write(
+                            cx,
+                            &native_cx,
+                            file,
+                            buf.to_vec(),
+                            offset,
+                            Some(lower),
+                        ),
+                        enqueue_error_completion,
+                    )
+                });
+            let (request_id, mut receiver) = match enqueue_result {
+                Ok(request) => request,
+                Err(error) => {
+                    enqueue_error_completion.complete_error();
+                    return Err(error);
+                }
+            };
+            let mut cancel_guard =
+                RequestCancellationGuard::new(Arc::clone(&self.runtime), request_id);
+            asupersync::runtime::yield_now().await;
+            if let Err(error) = self.runtime.ensure_driver(&native_cx) {
+                drop(cancel_guard);
+                return Err(FrankenError::Io(io::Error::other(format!(
+                    "cannot start tracked shared io_uring write: {error}"
+                ))));
+            }
+
+            let driver_completion =
+                receiver
+                    .recv(&native_cx)
+                    .await
+                    .map_err(|error| match error {
+                        oneshot::RecvError::Cancelled => FrankenError::Abort,
+                        oneshot::RecvError::Closed | oneshot::RecvError::PolledAfterCompletion => {
+                            FrankenError::Io(io::Error::other(format!(
+                                "tracked shared io_uring response channel failed: {error}"
+                            )))
+                        }
+                    })?;
+            cancel_guard.disarm();
+
+            match driver_completion {
+                DriverCompletion::Write { bytes_written } if bytes_written == buf.len() => {}
+                DriverCompletion::Write { bytes_written } => {
+                    return Err(FrankenError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!(
+                            "tracked async io_uring write completed only {bytes_written} of {} bytes",
+                            buf.len()
+                        ),
+                    )));
+                }
+                DriverCompletion::Cancelled => return Err(FrankenError::Abort),
+                DriverCompletion::Failed(error) => return Err(FrankenError::Io(error)),
+                DriverCompletion::Read { .. } => {
+                    return Err(FrankenError::Io(io::Error::other(
+                        "shared io_uring returned a read completion for a tracked write request",
+                    )));
+                }
+            }
+
+            // The CQE driver has already set Success. A cancellation observed here
+            // must not erase proof that the bytes reached the completion source.
+            checkpoint_or_abort(cx)?;
+
+            let elapsed = start.elapsed();
+            if record_io_uring_write_latency(elapsed) {
+                let snapshot = io_uring_latency_snapshot();
+                enforce_conformal_breach_policy(
+                    &self.runtime,
+                    "write",
+                    elapsed,
+                    snapshot.write_conformal_upper_bound_us,
+                    IO_URING_WRITE_CONFORMAL_BREACH_MSG,
+                );
+            }
+            Ok(())
         }
-        Ok(())
     }
 }
 
@@ -1480,6 +1909,7 @@ mod tests {
     use fsqlite_types::flags::VfsOpenFlags;
     use std::future::Future;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+    use std::task::Poll;
 
     static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -1535,17 +1965,728 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn test_tracked_driver_request(
+        native_cx: &NativeCx,
+        id: u64,
+    ) -> (
+        DriverRequest,
+        Receiver<DriverCompletion>,
+        VfsWriteCompletion,
+        Arc<AtomicU64>,
+    ) {
+        let (sender, receiver) = oneshot::channel();
+        let permit = sender
+            .reserve(native_cx)
+            .expect("reserve test driver completion");
+        let physical_completion = VfsWriteCompletion::new();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let request = DriverRequest {
+            id,
+            file: Arc::new(tempfile::tempfile().expect("create test driver file")),
+            offset: 0,
+            kind: DriverRequestKind::Write(vec![1, 2, 3, 4]),
+            completion: Some(permit),
+            write_completion: Some(VfsWriteCompletionSource::new(physical_completion.clone())),
+            _drop_sentinel: Some(DriverRequestDropSentinel(Arc::clone(&drop_count))),
+        };
+        (request, receiver, physical_completion, drop_count)
+    }
+
+    async fn assert_driver_observer_failed(
+        native_cx: &NativeCx,
+        receiver: &mut Receiver<DriverCompletion>,
+    ) {
+        let completion = receiver
+            .recv(native_cx)
+            .await
+            .expect("poisoned driver must report its logical failure");
+        assert!(
+            matches!(completion, DriverCompletion::Failed(_)),
+            "poisoned observer must receive Failed, got {completion:?}"
+        );
+    }
+
+    async fn assert_driver_observer_pending(
+        native_cx: &NativeCx,
+        receiver: &mut Receiver<DriverCompletion>,
+    ) {
+        use std::future::{Future as _, poll_fn};
+
+        let mut observation = Box::pin(receiver.recv(native_cx));
+        poll_fn(|task_cx| match observation.as_mut().poll(task_cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("kernel-owned observer completed before data CQE: {result:?}")
+            }
+        })
+        .await;
+    }
+
     #[test]
-    fn test_request_id_wrap_skips_live_requests_and_cancel_tag() {
+    fn request_ids_are_strictly_monotonic_and_never_reused() {
+        let mut queue = DriverQueue::default();
+        assert_eq!(queue.allocate_request_id().expect("allocate id 1"), 1);
+        queue.live.remove(&1);
+        assert_eq!(queue.allocate_request_id().expect("allocate id 2"), 2);
+        queue.live.remove(&2);
+        assert_eq!(queue.allocate_request_id().expect("allocate id 3"), 3);
+    }
+
+    #[test]
+    fn request_id_exhaustion_fails_without_entering_cancel_tag_space() {
         let mut queue = DriverQueue {
-            next_request_id: IO_URING_CANCEL_TAG - 1,
+            next_request_id: IO_URING_CANCEL_TAG - 2,
             ..DriverQueue::default()
         };
-        queue.live.insert(1);
 
-        assert_eq!(queue.allocate_request_id(), IO_URING_CANCEL_TAG - 1);
-        assert_eq!(queue.allocate_request_id(), 2);
+        assert_eq!(
+            queue
+                .allocate_request_id()
+                .expect("last data request id remains available"),
+            IO_URING_CANCEL_TAG - 1
+        );
+        let error = queue
+            .allocate_request_id()
+            .expect_err("63-bit request identifier space must not wrap");
+        assert!(error.to_string().contains("identifier space exhausted"));
         assert!(!queue.live.contains(&IO_URING_CANCEL_TAG));
+        assert_eq!(queue.next_request_id, IO_URING_CANCEL_TAG - 1);
+    }
+
+    #[test]
+    fn fatal_submit_after_one_request_preserves_only_kernel_owned_source() {
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let (kernel_owned, mut kernel_observer, kernel_token, kernel_drops) =
+                test_tracked_driver_request(&native_cx, 11);
+            let (queued, mut queued_observer, queued_token, queued_drops) =
+                test_tracked_driver_request(&native_cx, 12);
+            let mut potentially_submitted = HashMap::new();
+            potentially_submitted.insert(kernel_owned.id, kernel_owned);
+
+            let mut reaper = prepare_poisoned_reaper(
+                potentially_submitted,
+                vec![queued],
+                io::ErrorKind::Other,
+                "forced fatal submit after one pushed SQE",
+            );
+
+            assert_eq!(
+                kernel_token.state(),
+                crate::traits::VfsWriteCompletionState::Pending,
+                "a pushed SQE remains physically pending after submit failure"
+            );
+            assert_eq!(
+                queued_token.state(),
+                crate::traits::VfsWriteCompletionState::Error,
+                "the request whose SQE was never pushed must fail immediately"
+            );
+            assert_eq!(kernel_drops.load(Ordering::Acquire), 0);
+            assert_eq!(queued_drops.load(Ordering::Acquire), 1);
+            assert_eq!(reaper.request_ids(), vec![11]);
+            assert_driver_observer_pending(&native_cx, &mut kernel_observer).await;
+            assert_driver_observer_failed(&native_cx, &mut queued_observer).await;
+
+            assert_eq!(reaper.finish_data_cqes(vec![(11, 4)]), vec![11]);
+            let completion = kernel_observer
+                .recv(&native_cx)
+                .await
+                .expect("data CQE must complete kernel-owned observer");
+            assert!(matches!(
+                completion,
+                DriverCompletion::Write { bytes_written: 4 }
+            ));
+            assert_eq!(
+                kernel_token.state(),
+                crate::traits::VfsWriteCompletionState::Success
+            );
+            assert_eq!(kernel_drops.load(Ordering::Acquire), 1);
+        });
+    }
+
+    #[test]
+    fn fatal_wait_submit_keeps_source_pending_until_data_cqe() {
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let (request, mut observer, token, drops) = test_tracked_driver_request(&native_cx, 21);
+            let mut potentially_submitted = HashMap::new();
+            potentially_submitted.insert(request.id, request);
+            let mut reaper = prepare_poisoned_reaper(
+                potentially_submitted,
+                Vec::new(),
+                io::ErrorKind::Other,
+                "forced fatal submit_with_args",
+            );
+
+            assert_driver_observer_pending(&native_cx, &mut observer).await;
+            assert_eq!(
+                token.state(),
+                crate::traits::VfsWriteCompletionState::Pending
+            );
+            assert!(
+                reaper
+                    .finish_data_cqes(vec![(IO_URING_CANCEL_TAG | 21, 0)])
+                    .is_empty()
+            );
+            assert_eq!(
+                token.state(),
+                crate::traits::VfsWriteCompletionState::Pending,
+                "cancel CQE alone cannot release the data buffer"
+            );
+            assert_eq!(drops.load(Ordering::Acquire), 0);
+
+            assert_eq!(
+                reaper.finish_data_cqes(vec![(21, -libc::ECANCELED)]),
+                vec![21]
+            );
+            assert_eq!(token.state(), crate::traits::VfsWriteCompletionState::Error);
+            let completion = observer
+                .recv(&native_cx)
+                .await
+                .expect("cancelled data CQE must complete observer");
+            assert!(matches!(completion, DriverCompletion::Cancelled));
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+        });
+    }
+
+    #[test]
+    fn poisoned_failure_splits_queued_from_kernel_owned() {
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let (kernel_owned, mut kernel_observer, kernel_token, kernel_drops) =
+                test_tracked_driver_request(&native_cx, 31);
+            let (queued, _queued_observer, queued_token, queued_drops) =
+                test_tracked_driver_request(&native_cx, 32);
+            let mut potentially_submitted = HashMap::new();
+            potentially_submitted.insert(kernel_owned.id, kernel_owned);
+
+            let mut reaper = prepare_poisoned_reaper(
+                potentially_submitted,
+                vec![queued],
+                io::ErrorKind::BrokenPipe,
+                "forced driver failure",
+            );
+            assert_eq!(
+                queued_token.state(),
+                crate::traits::VfsWriteCompletionState::Error
+            );
+            assert_eq!(
+                kernel_token.state(),
+                crate::traits::VfsWriteCompletionState::Pending
+            );
+            assert_eq!(queued_drops.load(Ordering::Acquire), 1);
+            assert_eq!(kernel_drops.load(Ordering::Acquire), 0);
+            assert_driver_observer_pending(&native_cx, &mut kernel_observer).await;
+
+            reaper.finish_data_cqes(vec![(31, 4)]);
+            let completion = kernel_observer
+                .recv(&native_cx)
+                .await
+                .expect("data CQE must complete kernel-owned observer");
+            assert!(matches!(
+                completion,
+                DriverCompletion::Write { bytes_written: 4 }
+            ));
+            assert_eq!(
+                kernel_token.state(),
+                crate::traits::VfsWriteCompletionState::Success
+            );
+        });
+    }
+
+    #[test]
+    fn cancellation_fatal_data_cqe_race_terminalizes_exactly_once() {
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let (request, mut observer, token, drops) = test_tracked_driver_request(&native_cx, 41);
+            let mut potentially_submitted = HashMap::new();
+            potentially_submitted.insert(request.id, request);
+            let mut reaper = prepare_poisoned_reaper(
+                potentially_submitted,
+                Vec::new(),
+                io::ErrorKind::Other,
+                "fatal driver race",
+            );
+
+            assert!(
+                reaper
+                    .finish_data_cqes(vec![(IO_URING_CANCEL_TAG | 41, 0)])
+                    .is_empty()
+            );
+            assert_eq!(
+                token.state(),
+                crate::traits::VfsWriteCompletionState::Pending
+            );
+            assert_driver_observer_pending(&native_cx, &mut observer).await;
+            assert_eq!(reaper.finish_data_cqes(vec![(41, 4)]), vec![41]);
+            let completion = observer
+                .recv(&native_cx)
+                .await
+                .expect("original data CQE must complete observer");
+            assert!(matches!(
+                completion,
+                DriverCompletion::Write { bytes_written: 4 }
+            ));
+            assert_eq!(
+                token.state(),
+                crate::traits::VfsWriteCompletionState::Success
+            );
+            assert!(
+                reaper
+                    .finish_data_cqes(vec![(41, -libc::ECANCELED)])
+                    .is_empty()
+            );
+            assert_eq!(
+                token.state(),
+                crate::traits::VfsWriteCompletionState::Success,
+                "a duplicate terminal CQE must not overwrite the first data CQE"
+            );
+            assert_eq!(
+                drops.load(Ordering::Acquire),
+                1,
+                "the kernel-owned buffer must be released exactly once"
+            );
+        });
+    }
+
+    #[test]
+    fn poisoned_reaper_retains_buffer_until_data_cqe() {
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let (request, _observer, token, drops) = test_tracked_driver_request(&native_cx, 51);
+            let mut potentially_submitted = HashMap::new();
+            potentially_submitted.insert(request.id, request);
+            let mut reaper = prepare_poisoned_reaper(
+                potentially_submitted,
+                Vec::new(),
+                io::ErrorKind::Other,
+                "poisoned reaper retention proof",
+            );
+
+            assert_eq!(drops.load(Ordering::Acquire), 0);
+            assert_eq!(
+                token.state(),
+                crate::traits::VfsWriteCompletionState::Pending
+            );
+            assert_eq!(reaper.finish_data_cqes(vec![(51, 4)]), vec![51]);
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+        });
+    }
+
+    #[test]
+    fn pre_submission_failure_completes_error_immediately() {
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let (request, mut observer, token, drops) = test_tracked_driver_request(&native_cx, 61);
+            let reaper = prepare_poisoned_reaper(
+                HashMap::new(),
+                vec![request],
+                io::ErrorKind::Other,
+                "request failed before SQE push",
+            );
+
+            assert!(reaper.is_empty());
+            assert_eq!(token.state(), crate::traits::VfsWriteCompletionState::Error);
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+            assert_driver_observer_failed(&native_cx, &mut observer).await;
+        });
+    }
+
+    #[test]
+    fn driver_boundary_failure_after_one_pushed_request_splits_sources() {
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let runtime = Arc::new(IoUringRuntime::new());
+            assert!(
+                runtime.is_available(),
+                "strict pushed-request failure proof requires io_uring: {}",
+                runtime.status()
+            );
+            runtime
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fail_push_after = Some(1);
+
+            let file = Arc::new(tempfile::tempfile().expect("create driver-boundary file"));
+            let first_token = VfsWriteCompletion::new();
+            let second_token = VfsWriteCompletion::new();
+            let (_first_id, mut first_observer) = runtime
+                .enqueue_write(
+                    &cx,
+                    &native_cx,
+                    Arc::clone(&file),
+                    vec![0x11; 4],
+                    0,
+                    Some(first_token.clone()),
+                )
+                .expect("enqueue first request");
+            let (_second_id, mut second_observer) = runtime
+                .enqueue_write(
+                    &cx,
+                    &native_cx,
+                    file,
+                    vec![0x22; 4],
+                    8,
+                    Some(second_token.clone()),
+                )
+                .expect("enqueue second request");
+            runtime
+                .ensure_driver(&native_cx)
+                .expect("start injected driver");
+
+            assert_driver_observer_failed(&native_cx, &mut second_observer).await;
+            assert_eq!(
+                second_token.state(),
+                crate::traits::VfsWriteCompletionState::Error,
+                "the second SQE was never pushed"
+            );
+
+            let first_completion = first_observer
+                .recv(&native_cx)
+                .await
+                .expect("the pushed request must resolve from its data CQE");
+            if let DriverCompletion::Failed(error) = &first_completion {
+                assert!(
+                    !error.to_string().contains("forced io_uring push failure"),
+                    "driver failure must not resolve a kernel-owned observer"
+                );
+            }
+            assert!(
+                matches!(
+                    first_completion,
+                    DriverCompletion::Write { .. }
+                        | DriverCompletion::Cancelled
+                        | DriverCompletion::Failed(_)
+                ),
+                "the original data CQE must release the pushed observer"
+            );
+            assert_ne!(
+                first_token.state(),
+                crate::traits::VfsWriteCompletionState::Pending
+            );
+            assert!(runtime.is_disabled());
+        });
+    }
+
+    #[test]
+    fn final_submit_failure_does_not_retry_ordinary_write_through_unix() {
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let vfs = IoUringVfs::new();
+            assert!(
+                vfs.is_available(),
+                "strict final-submit failure proof requires io_uring: {}",
+                vfs.status()
+            );
+            vfs.runtime
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fail_final_submit = true;
+            let directory = tempfile::tempdir().expect("create final-submit tempdir");
+            let path = directory.path().join("final-submit.db");
+            let (file, _) = vfs
+                .open(&cx, Some(&path), open_flags_create_unlocked())
+                .expect("open final-submit file");
+
+            let result = file.write(&cx, b"one physical write", 0).await;
+            assert!(
+                result.is_ok() || matches!(&result, Err(FrankenError::Abort)),
+                "the observer may see the original write or cancellation CQE, not a retry signal: {result:?}"
+            );
+            assert_eq!(
+                vfs.runtime
+                    .test_write_retries_after_driver_completion
+                    .load(Ordering::Acquire),
+                0,
+                "driver failure cannot trigger a Unix retry before the data CQE"
+            );
+            assert!(vfs.runtime.is_disabled());
+        });
+    }
+
+    #[test]
+    fn late_data_cqe_beyond_old_cutoff_resolves_and_releases_poison_owner() {
+        const LATE_DATA_CQE_DELAY: Duration = Duration::from_millis(25);
+
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let runtime = Arc::new(IoUringRuntime::new());
+            assert!(
+                runtime.is_available(),
+                "strict late-CQE proof requires io_uring: {}",
+                runtime.status()
+            );
+            {
+                let mut faults = runtime
+                    .test_faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                faults.fail_final_submit = true;
+                faults.poison_reap_start_delay = Some(LATE_DATA_CQE_DELAY);
+            }
+
+            let file = Arc::new(tempfile::tempfile().expect("create late-CQE file"));
+            let token = VfsWriteCompletion::new();
+            let (_request_id, mut observer) = runtime
+                .enqueue_write(&cx, &native_cx, file, vec![0x5a; 4], 0, Some(token.clone()))
+                .expect("enqueue late-CQE write");
+            let started = Instant::now();
+            runtime
+                .ensure_driver(&native_cx)
+                .expect("start late-CQE driver");
+
+            let owner_deadline = Instant::now() + Duration::from_secs(1);
+            while runtime.test_poisoned_driver_owners.load(Ordering::Acquire) == 0 {
+                assert!(
+                    Instant::now() < owner_deadline,
+                    "poisoned driver never retained exclusive ring ownership"
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            assert_eq!(
+                runtime.test_poisoned_driver_owners.load(Ordering::Acquire),
+                1,
+                "exactly one poisoned driver must own the ring"
+            );
+            assert!(
+                !runtime
+                    .test_faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fail_final_submit,
+                "the final-submit failure seam must be consumed"
+            );
+
+            let completion = observer
+                .recv(&native_cx)
+                .await
+                .expect("late original data CQE must resolve its observer");
+            assert!(
+                started.elapsed() >= LATE_DATA_CQE_DELAY,
+                "the proof must delay data submission beyond the removed 8 ms cutoff"
+            );
+            if let DriverCompletion::Failed(error) = &completion {
+                assert!(
+                    !error
+                        .to_string()
+                        .contains("forced io_uring final submit failure"),
+                    "a synthetic driver error must not release a potentially submitted request"
+                );
+            }
+            assert!(
+                matches!(
+                    completion,
+                    DriverCompletion::Write { .. }
+                        | DriverCompletion::Cancelled
+                        | DriverCompletion::Failed(_)
+                ),
+                "only the original data CQE may resolve the observer"
+            );
+            let token_terminal = token.wait().await;
+            assert_ne!(
+                token_terminal,
+                crate::traits::VfsWriteCompletionState::Pending,
+                "the physical source must terminalize with its original data CQE"
+            );
+            assert!(
+                !token.complete_success() && !token.complete_error(),
+                "the physical source must have terminalized exactly once"
+            );
+            assert_eq!(
+                runtime.submitted_cancellations.load(Ordering::Acquire),
+                1,
+                "one poisoned data request must receive exactly one queued cancellation"
+            );
+
+            let release_deadline = Instant::now() + Duration::from_secs(1);
+            while runtime.test_poisoned_driver_owners.load(Ordering::Acquire) != 0 {
+                assert!(
+                    Instant::now() < release_deadline,
+                    "poisoned driver retained an orphan ring owner after the data CQE"
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            let queue = runtime
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(queue.live.is_empty());
+            assert!(queue.pending.is_empty());
+            assert!(queue.cancellations.is_empty());
+            assert!(queue.cancellation_set.is_empty());
+            assert!(!queue.active);
+            assert!(runtime.is_disabled());
+        });
+    }
+
+    #[test]
+    fn wait_submit_failure_resolves_pipe_read_only_from_data_cqe() {
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let runtime = Arc::new(IoUringRuntime::new());
+            assert!(
+                runtime.is_available(),
+                "strict wait-submit failure proof requires io_uring: {}",
+                runtime.status()
+            );
+            runtime
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fail_wait_submit = true;
+
+            let (read_fd, _write_fd) = nix::unistd::pipe().expect("create wait-submit pipe");
+            let read_file = Arc::new(File::from(read_fd));
+            let (_request_id, mut observer) = runtime
+                .enqueue_read(&cx, &native_cx, read_file, 1, u64::MAX)
+                .expect("enqueue blocking pipe read");
+            runtime
+                .ensure_driver(&native_cx)
+                .expect("start wait-submit driver");
+
+            let completion = observer
+                .recv(&native_cx)
+                .await
+                .expect("original pipe-read CQE must complete observer");
+            assert!(
+                matches!(
+                    completion,
+                    DriverCompletion::Read { .. }
+                        | DriverCompletion::Cancelled
+                        | DriverCompletion::Failed(_)
+                ),
+                "only the original data CQE may resolve the observer"
+            );
+            assert!(
+                !runtime
+                    .test_faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fail_wait_submit,
+                "the wait-submit failure seam must be consumed"
+            );
+            assert!(runtime.is_disabled());
+        });
+    }
+
+    #[test]
+    fn driver_spawn_failure_clears_all_admitted_requests() {
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let runtime = Arc::new(IoUringRuntime::new());
+            assert!(
+                runtime.is_available(),
+                "strict spawn-failure proof requires io_uring: {}",
+                runtime.status()
+            );
+            runtime
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fail_spawn = true;
+            let file = Arc::new(tempfile::tempfile().expect("create spawn-failure file"));
+            let first_token = VfsWriteCompletion::new();
+            let second_token = VfsWriteCompletion::new();
+            let (_first_id, mut first_observer) = runtime
+                .enqueue_write(
+                    &cx,
+                    &native_cx,
+                    Arc::clone(&file),
+                    vec![1; 4],
+                    0,
+                    Some(first_token.clone()),
+                )
+                .expect("enqueue first spawn-failure request");
+            let (_second_id, mut second_observer) = runtime
+                .enqueue_write(
+                    &cx,
+                    &native_cx,
+                    file,
+                    vec![2; 4],
+                    8,
+                    Some(second_token.clone()),
+                )
+                .expect("enqueue second spawn-failure request");
+
+            runtime
+                .ensure_driver(&native_cx)
+                .expect_err("forced spawn failure must propagate");
+            assert_driver_observer_failed(&native_cx, &mut first_observer).await;
+            assert_driver_observer_failed(&native_cx, &mut second_observer).await;
+            assert_eq!(
+                first_token.state(),
+                crate::traits::VfsWriteCompletionState::Error
+            );
+            assert_eq!(
+                second_token.state(),
+                crate::traits::VfsWriteCompletionState::Error
+            );
+            let queue = runtime
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(queue.pending.is_empty());
+            assert!(queue.live.is_empty());
+            assert!(!queue.active);
+        });
+    }
+
+    #[test]
+    fn enqueue_identifier_exhaustion_delegation_never_leaves_pending_token() {
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        block_on_test(&cx, async {
+            let vfs = IoUringVfs::new();
+            assert!(
+                vfs.is_available(),
+                "strict enqueue-error delegation proof requires io_uring: {}",
+                vfs.status()
+            );
+            vfs.runtime
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next_request_id = IO_URING_CANCEL_TAG - 1;
+            let directory = tempfile::tempdir().expect("create enqueue-error tempdir");
+            let path = directory.path().join("enqueue-error.db");
+            let (file, _) = vfs
+                .open(&cx, Some(&path), open_flags_create_unlocked())
+                .expect("open enqueue-error file");
+            let completion = VfsWriteCompletion::new();
+
+            file.write_tracked(&cx, b"must not remain pending", 0, completion.clone())
+                .await
+                .expect_err("identifier exhaustion must reject enqueue");
+            assert_eq!(
+                completion.state(),
+                crate::traits::VfsWriteCompletionState::Error
+            );
+            assert!(
+                vfs.runtime
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending
+                    .is_empty()
+            );
+        });
     }
 
     #[test]
@@ -1580,8 +2721,9 @@ mod tests {
                 file,
                 offset: 0,
                 kind: DriverRequestKind::Write(vec![1, 2, 3, 4]),
-                completion: permit,
+                completion: Some(permit),
                 write_completion: Some(VfsWriteCompletionSource::new(source_completion)),
+                _drop_sentinel: None,
             }
             .complete(4);
 
@@ -1598,6 +2740,77 @@ mod tests {
         assert_eq!(vfs.name(), "io_uring");
         assert!(!vfs.status().is_empty());
         assert_eq!(vfs.is_memory(), vfs.unix.is_memory());
+    }
+
+    #[test]
+    fn tracked_batch_forwards_exact_completion_to_unix_source() {
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        let directory = tempfile::tempdir().expect("create tracked batch tempdir");
+        let path = directory.path().join("tracked-batch-forward.db");
+        let (file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open tracked batch target");
+        let first = [0x11_u8; 32];
+        let second = [0x22_u8; 32];
+        let writes = [(0, &first[..]), (64, &second[..])];
+
+        crate::traits::reset_write_completion_creation_count();
+        block_on_test(
+            &cx,
+            <IoUringFile as VfsFile>::write_page_batch(&file, &cx, &writes),
+        )
+        .expect("ordinary forwarded batch must succeed");
+        assert_eq!(
+            crate::traits::write_completion_creation_count(),
+            0,
+            "ordinary io_uring batches must remain on the allocation-free Unix path"
+        );
+
+        let completion = VfsWriteCompletion::new();
+        block_on_test(
+            &cx,
+            <IoUringFile as VfsFile>::write_page_batch_tracked(
+                &file,
+                &cx,
+                &writes,
+                completion.clone(),
+            ),
+        )
+        .expect("forwarded batch must succeed");
+        assert_eq!(
+            completion.state(),
+            crate::traits::VfsWriteCompletionState::Success
+        );
+
+        let abandoned = VfsWriteCompletion::new();
+        let unpolled = <IoUringFile as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            abandoned.clone(),
+        );
+        drop(unpolled);
+        assert_eq!(
+            abandoned.state(),
+            crate::traits::VfsWriteCompletionState::Error,
+            "the forwarder must expose the Unix source's fail-closed drop"
+        );
+
+        let abandoned_single = VfsWriteCompletion::new();
+        let unpolled_single = <IoUringFile as VfsFile>::write_tracked(
+            &file,
+            &cx,
+            &first,
+            0,
+            abandoned_single.clone(),
+        );
+        drop(unpolled_single);
+        assert_eq!(
+            abandoned_single.state(),
+            crate::traits::VfsWriteCompletionState::Error,
+            "the io_uring single-write source must be owned before first poll"
+        );
     }
 
     #[test]
@@ -1831,7 +3044,7 @@ mod tests {
             let (read_fd, _write_fd) = nix::unistd::pipe().expect("pipe should open");
             let read_file = Arc::new(File::from(read_fd));
             let (request_id, mut receiver) = runtime
-                .enqueue_read(&request_cx, &request_native_cx, read_file, 1, 0)
+                .enqueue_read(&request_cx, &request_native_cx, read_file, 1, u64::MAX)
                 .expect("pipe read should enqueue");
             let cancel_guard = RequestCancellationGuard::new(Arc::clone(&runtime), request_id);
             runtime
@@ -1846,6 +3059,20 @@ mod tests {
                 );
                 asupersync::runtime::yield_now().await;
             }
+            assert!(
+                runtime
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .live
+                    .contains(&request_id),
+                "non-seekable pipe read must still be live when cancellation begins"
+            );
+            assert_eq!(
+                runtime.submitted_cancellations.load(Ordering::Acquire),
+                0,
+                "the cancellation seam must be untouched before the context is cancelled"
+            );
 
             let cancellation_started = Instant::now();
             request_cx.cancel();
@@ -1867,6 +3094,11 @@ mod tests {
                 cancellation_started.elapsed() < Duration::from_millis(5),
                 "IORING_OP_ASYNC_CANCEL submission exceeded 5ms"
             );
+            assert_eq!(
+                runtime.submitted_cancellations.load(Ordering::Acquire),
+                1,
+                "one cancelled request must submit exactly one IORING_OP_ASYNC_CANCEL"
+            );
 
             let completion_deadline = Instant::now() + Duration::from_secs(1);
             loop {
@@ -1885,6 +3117,13 @@ mod tests {
                 );
                 asupersync::runtime::yield_now().await;
             }
+            let queue = runtime
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!queue.cancellation_set.contains(&request_id));
+            assert!(queue.cancellations.is_empty());
+            assert!(!runtime.is_disabled());
         });
         test_runtime().block_on(proof);
     }

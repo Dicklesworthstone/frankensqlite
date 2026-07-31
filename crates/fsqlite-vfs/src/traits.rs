@@ -716,7 +716,8 @@ struct VfsWriteCompletionInner {
 /// side effect: the blocking I/O closure on Unix and Windows, the io_uring CQE
 /// driver on Linux, or the immediate in-memory mutation path. Consequently a
 /// clone remains useful even when the future returned by
-/// [`VfsFile::write_tracked`] is dropped before it can observe completion.
+/// [`VfsFile::write_tracked`] is dropped after the backend has accepted the
+/// write but before that observer can see completion.
 ///
 /// A token is single-use. The first terminal transition wins.
 #[derive(Clone, Debug)]
@@ -724,10 +725,29 @@ pub struct VfsWriteCompletion {
     inner: Arc<Mutex<VfsWriteCompletionInner>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static VFS_WRITE_COMPLETION_CREATIONS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_write_completion_creation_count() {
+    VFS_WRITE_COMPLETION_CREATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn write_completion_creation_count() -> u64 {
+    VFS_WRITE_COMPLETION_CREATIONS.with(std::cell::Cell::get)
+}
+
 impl VfsWriteCompletion {
     /// Create a pending completion token for one logical write.
     #[must_use]
     pub fn new() -> Self {
+        #[cfg(test)]
+        VFS_WRITE_COMPLETION_CREATIONS.with(|count| count.set(count.get().saturating_add(1)));
         Self {
             inner: Arc::new(Mutex::new(VfsWriteCompletionInner {
                 state: VfsWriteCompletionState::Pending,
@@ -795,27 +815,39 @@ impl VfsWriteCompletion {
 
     fn complete(&self, terminal: VfsWriteCompletionState) -> bool {
         debug_assert_ne!(terminal, VfsWriteCompletionState::Pending);
-        let (waiters, terminal_relay) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if inner.state != VfsWriteCompletionState::Pending {
-                return false;
-            }
-            inner.state = terminal;
-            (
-                std::mem::take(&mut inner.waiters),
-                inner.terminal_relay.take(),
-            )
-        };
-        for (_, waiter) in waiters {
+        let mut completion = self.clone();
+        let mut next_terminal = terminal;
+        let mut completed_source = false;
+        let mut wake_queue = Vec::new();
+
+        loop {
+            let (waiters, terminal_relay) = {
+                let mut inner = completion
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if inner.state != VfsWriteCompletionState::Pending {
+                    break;
+                }
+                inner.state = next_terminal;
+                (
+                    std::mem::take(&mut inner.waiters),
+                    inner.terminal_relay.take(),
+                )
+            };
+            completed_source = true;
+            wake_queue.extend(waiters.into_iter().map(|(_, waiter)| waiter));
+            let Some((relay, mapped_terminal)) = terminal_relay else {
+                break;
+            };
+            completion = relay;
+            next_terminal = mapped_terminal;
+        }
+
+        for waiter in wake_queue {
             waiter.wake();
         }
-        if let Some((relay, mapped_terminal)) = terminal_relay {
-            relay.complete(mapped_terminal);
-        }
-        true
+        completed_source
     }
 }
 
@@ -831,28 +863,60 @@ impl Default for VfsWriteCompletion {
 /// it, and driver teardown can discard an uncompleted request. Keeping this
 /// guard with that source ensures those paths terminate as `Error` instead of
 /// leaving a caller-retained token pending forever.
+#[doc(hidden)]
 #[derive(Debug)]
-pub(crate) struct VfsWriteCompletionSource {
+pub struct VfsWriteCompletionSource {
     completion: VfsWriteCompletion,
     armed: bool,
 }
 
 impl VfsWriteCompletionSource {
-    pub(crate) fn new(completion: VfsWriteCompletion) -> Self {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(completion: VfsWriteCompletion) -> Self {
         Self {
             completion,
             armed: true,
         }
     }
 
-    pub(crate) fn complete_success(&mut self) {
+    #[doc(hidden)]
+    pub fn complete_success(&mut self) {
         self.completion.complete_success();
         self.armed = false;
     }
 
-    pub(crate) fn complete_error(&mut self) {
+    #[doc(hidden)]
+    pub fn complete_error(&mut self) {
         self.completion.complete_error();
         self.armed = false;
+    }
+
+    /// Delegate exact terminal authority to a lower completion source.
+    ///
+    /// The outer guard remains armed while `accept` synchronously constructs
+    /// the lower operation. If construction panics, dropping this guard marks
+    /// the outer operation as `Error`. Authority transfers only after
+    /// `accept` returns.
+    #[doc(hidden)]
+    pub fn delegate_exact<T>(mut self, accept: impl FnOnce(VfsWriteCompletion) -> T) -> T {
+        let accepted = accept(self.completion.clone());
+        self.armed = false;
+        accepted
+    }
+
+    /// Delegate terminal authority to a lower source whose result maps to Error.
+    ///
+    /// Fault wrappers use this when a physical prefix is intentionally
+    /// shorter than the logical write. Any terminal state from the lower
+    /// source becomes `Error` for the outer operation. As with
+    /// [`Self::delegate_exact`], a panic during synchronous construction keeps
+    /// this guard armed and therefore fails the outer operation closed.
+    #[doc(hidden)]
+    pub fn delegate_error_mapped<T>(mut self, accept: impl FnOnce(VfsWriteCompletion) -> T) -> T {
+        let accepted = accept(self.completion.error_mapped_child());
+        self.armed = false;
+        accepted
     }
 }
 
@@ -876,47 +940,72 @@ impl std::future::Future for VfsWriteCompletionWait {
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
+        // RawWaker clone/drop callbacks are allowed to re-enter this
+        // completion. Clone before taking the mutex and move every displaced
+        // or unused waker out before dropping it.
+        let replacement_waker = cx.waker().clone();
         let completion_inner = Arc::clone(&this.completion.inner);
-        let mut inner = completion_inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if inner.state != VfsWriteCompletionState::Pending {
-            if let Some(waiter_id) = this.waiter_id.take()
-                && let Some(index) = inner
+        let (poll, waiter_id, displaced_waker, unused_waker) = {
+            let mut inner = completion_inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.state != VfsWriteCompletionState::Pending {
+                let displaced = this
+                    .waiter_id
+                    .and_then(|waiter_id| {
+                        inner
+                            .waiters
+                            .iter()
+                            .position(|(registered_id, _)| *registered_id == waiter_id)
+                    })
+                    .map(|index| inner.waiters.swap_remove(index).1);
+                (
+                    Poll::Ready(inner.state),
+                    None,
+                    displaced,
+                    Some(replacement_waker),
+                )
+            } else if let Some(waiter_id) = this.waiter_id {
+                let (_, registered_waker) = inner
                     .waiters
-                    .iter()
-                    .position(|(registered_id, _)| *registered_id == waiter_id)
-            {
-                inner.waiters.swap_remove(index);
-            }
-            return Poll::Ready(inner.state);
-        }
-
-        if let Some(waiter_id) = this.waiter_id {
-            let (_, registered_waker) = inner
-                .waiters
-                .iter_mut()
-                .find(|(registered_id, _)| *registered_id == waiter_id)
-                .expect("pending completion waiter must remain registered");
-            if !registered_waker.will_wake(cx.waker()) {
-                registered_waker.clone_from(cx.waker());
-            }
-        } else {
-            let waiter_id = loop {
-                let candidate = inner.next_waiter_id;
-                inner.next_waiter_id = inner.next_waiter_id.wrapping_add(1);
-                if inner
-                    .waiters
-                    .iter()
-                    .all(|(registered_id, _)| *registered_id != candidate)
-                {
-                    break candidate;
+                    .iter_mut()
+                    .find(|(registered_id, _)| *registered_id == waiter_id)
+                    .expect("pending completion waiter must remain registered");
+                if registered_waker.will_wake(&replacement_waker) {
+                    (
+                        Poll::Pending,
+                        Some(waiter_id),
+                        None,
+                        Some(replacement_waker),
+                    )
+                } else {
+                    (
+                        Poll::Pending,
+                        Some(waiter_id),
+                        Some(std::mem::replace(registered_waker, replacement_waker)),
+                        None,
+                    )
                 }
-            };
-            inner.waiters.push((waiter_id, cx.waker().clone()));
-            this.waiter_id = Some(waiter_id);
-        }
-        Poll::Pending
+            } else {
+                let waiter_id = loop {
+                    let candidate = inner.next_waiter_id;
+                    inner.next_waiter_id = inner.next_waiter_id.wrapping_add(1);
+                    if inner
+                        .waiters
+                        .iter()
+                        .all(|(registered_id, _)| *registered_id != candidate)
+                    {
+                        break candidate;
+                    }
+                };
+                inner.waiters.push((waiter_id, replacement_waker));
+                (Poll::Pending, Some(waiter_id), None, None)
+            }
+        };
+        this.waiter_id = waiter_id;
+        drop(displaced_waker);
+        drop(unused_waker);
+        poll
     }
 }
 
@@ -925,18 +1014,19 @@ impl Drop for VfsWriteCompletionWait {
         let Some(waiter_id) = self.waiter_id.take() else {
             return;
         };
-        let mut inner = self
-            .completion
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = inner
-            .waiters
-            .iter()
-            .position(|(registered_id, _)| *registered_id == waiter_id)
-        {
-            inner.waiters.swap_remove(index);
-        }
+        let removed_waker = {
+            let mut inner = self
+                .completion
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner
+                .waiters
+                .iter()
+                .position(|(registered_id, _)| *registered_id == waiter_id)
+                .map(|index| inner.waiters.swap_remove(index).1)
+        };
+        drop(removed_waker);
     }
 }
 
@@ -984,8 +1074,9 @@ pub trait VfsFile: Send + Sync {
     /// lets durability coordinators retain an observation handle when their
     /// caller future is externally dropped. Backends whose hidden side effect
     /// outlives their returned future must override this method and complete
-    /// the token at that hidden source. The conservative default can remain
-    /// `Pending` after such a drop; callers must treat that as in-doubt.
+    /// the token at that hidden source. The default is valid only when dropping
+    /// [`Self::write`] abandons every side effect it could have started; it
+    /// fails closed with `Error` if its observer is dropped first.
     fn write_tracked<'a>(
         &'a self,
         cx: &'a Cx,
@@ -993,12 +1084,13 @@ pub trait VfsFile: Send + Sync {
         offset: u64,
         completion: VfsWriteCompletion,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
         async move {
             let result = self.write(cx, buf, offset).await;
             if result.is_ok() {
-                completion.complete_success();
+                source_completion.complete_success();
             } else {
-                completion.complete_error();
+                source_completion.complete_error();
             }
             result
         }
@@ -1019,6 +1111,38 @@ pub trait VfsFile: Send + Sync {
                 self.write(cx, data, *offset).await?;
             }
             Ok(())
+        }
+    }
+
+    /// Write one logical page batch and expose its source-owned terminal state.
+    ///
+    /// One token covers the entire batch. `Success` means every requested byte
+    /// in every entry reached the backend's actual write-completion source.
+    /// `Error` includes preflight/admission failure, a short or partial write,
+    /// source cancellation, and any later-entry failure after an earlier entry
+    /// may already have been written.
+    ///
+    /// The default is valid only when dropping [`Self::write_page_batch`]
+    /// abandons every side effect it could have started. It completes the token
+    /// when that returned future terminates and fails closed if the future is
+    /// dropped first. A backend whose physical write can outlive its returned
+    /// future must override this method and move a
+    /// `VfsWriteCompletionSource` to the actual hidden owner.
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            let result = self.write_page_batch(cx, writes).await;
+            if result.is_ok() {
+                source_completion.complete_success();
+            } else {
+                source_completion.complete_error();
+            }
+            result
         }
     }
 
@@ -1501,12 +1625,34 @@ mod tests {
         }
 
         WRITE_COUNT.store(0, Ordering::Relaxed);
+        reset_write_completion_creation_count();
         let cx = Cx::new();
         let file = CountingFile;
         let data = [0u8; 4096];
         let writes: Vec<(u64, &[u8])> = vec![(0, &data), (4096, &data), (8192, &data)];
         poll_ready(file.write_page_batch(&cx, &writes)).unwrap();
         assert_eq!(WRITE_COUNT.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            write_completion_creation_count(),
+            0,
+            "the ordinary batch path must not allocate completion tracking"
+        );
+
+        let completion = VfsWriteCompletion::new();
+        poll_ready(file.write_page_batch_tracked(&cx, &writes, completion.clone())).unwrap();
+        assert_eq!(WRITE_COUNT.load(Ordering::Relaxed), 6);
+        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+
+        let abandoned = VfsWriteCompletion::new();
+        let unpolled = file.write_page_batch_tracked(&cx, &writes, abandoned.clone());
+        assert_eq!(abandoned.state(), VfsWriteCompletionState::Pending);
+        drop(unpolled);
+        assert_eq!(
+            abandoned.state(),
+            VfsWriteCompletionState::Error,
+            "dropping an unpolled default batch must abandon its source fail-closed"
+        );
+        assert_eq!(WRITE_COUNT.load(Ordering::Relaxed), 6);
     }
 
     #[test]
@@ -1585,6 +1731,9 @@ mod tests {
         let file = Stub;
         let writes: Vec<(u64, &[u8])> = vec![];
         poll_ready(file.write_page_batch(&cx, &writes)).unwrap();
+        let completion = VfsWriteCompletion::new();
+        poll_ready(file.write_page_batch_tracked(&cx, &writes, completion.clone())).unwrap();
+        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
     }
 
     #[test]
@@ -1672,8 +1821,10 @@ mod tests {
         let file = FailOnSecond;
         let data = [0u8; 64];
         let writes: Vec<(u64, &[u8])> = vec![(0, &data), (64, &data), (128, &data)];
-        let result = poll_ready(file.write_page_batch(&cx, &writes));
+        let completion = VfsWriteCompletion::new();
+        let result = poll_ready(file.write_page_batch_tracked(&cx, &writes, completion.clone()));
         assert!(result.is_err());
+        assert_eq!(completion.state(), VfsWriteCompletionState::Error);
         assert_eq!(
             CALL_COUNT.load(Ordering::Relaxed),
             2,
@@ -1892,6 +2043,239 @@ mod tests {
             VfsWriteCompletionState::Error,
             "a completed partial-write source must map to outer Error"
         );
+
+        let source_owned = VfsWriteCompletion::new();
+        let mut source = VfsWriteCompletionSource::new(source_owned.clone());
+        let mut observer = Box::pin(source_owned.wait());
+        assert!(matches!(
+            observer.as_mut().poll(&mut task_cx),
+            Poll::Pending
+        ));
+        drop(observer);
+        assert_eq!(
+            source_owned.state(),
+            VfsWriteCompletionState::Pending,
+            "dropping an observer must not terminalize a live source"
+        );
+        source.complete_success();
+        assert_eq!(
+            source_owned.state(),
+            VfsWriteCompletionState::Success,
+            "the actual source must retain terminal authority after observer drop"
+        );
+
+        let abandoned_source = VfsWriteCompletion::new();
+        drop(VfsWriteCompletionSource::new(abandoned_source.clone()));
+        assert_eq!(
+            abandoned_source.state(),
+            VfsWriteCompletionState::Error,
+            "dropping the actual source must fail closed"
+        );
+
+        let handed_off = VfsWriteCompletion::new();
+        let exact_token = VfsWriteCompletionSource::new(handed_off.clone())
+            .delegate_exact(std::convert::identity);
+        assert_eq!(
+            handed_off.state(),
+            VfsWriteCompletionState::Pending,
+            "a synchronous handoff must transfer rather than terminate source authority"
+        );
+        assert!(exact_token.complete_success());
+        assert_eq!(handed_off.state(), VfsWriteCompletionState::Success);
+
+        let panicked_exact = VfsWriteCompletion::new();
+        let exact_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let panicked_exact = panicked_exact.clone();
+            move || {
+                VfsWriteCompletionSource::new(panicked_exact)
+                    .delegate_exact::<()>(|_| panic!("exact acceptance panic"));
+            }
+        }));
+        assert!(exact_result.is_err());
+        assert_eq!(
+            panicked_exact.state(),
+            VfsWriteCompletionState::Error,
+            "a panic before exact lower-source acceptance must fail closed"
+        );
+
+        let panicked_mapped = VfsWriteCompletion::new();
+        let mapped_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let panicked_mapped = panicked_mapped.clone();
+            move || {
+                VfsWriteCompletionSource::new(panicked_mapped)
+                    .delegate_error_mapped::<()>(|_| panic!("mapped acceptance panic"));
+            }
+        }));
+        assert!(mapped_result.is_err());
+        assert_eq!(
+            panicked_mapped.state(),
+            VfsWriteCompletionState::Error,
+            "a panic before mapped lower-source acceptance must fail closed"
+        );
+    }
+
+    #[test]
+    fn write_completion_never_drops_reentrant_wakers_under_its_mutex() {
+        use std::future::Future as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Wake;
+
+        struct ReenterCompletionOnDrop {
+            completion: VfsWriteCompletion,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Wake for ReenterCompletionOnDrop {
+            fn wake(self: Arc<Self>) {}
+
+            fn wake_by_ref(self: &Arc<Self>) {}
+        }
+
+        impl Drop for ReenterCompletionOnDrop {
+            fn drop(&mut self) {
+                let _ = self.completion.state();
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        let completion = VfsWriteCompletion::new();
+        let replaced_waker_dropped = Arc::new(AtomicBool::new(false));
+        let mut waiter = Box::pin(completion.wait());
+        let original_waker = Waker::from(Arc::new(ReenterCompletionOnDrop {
+            completion: completion.clone(),
+            dropped: Arc::clone(&replaced_waker_dropped),
+        }));
+        let mut original_cx = Context::from_waker(&original_waker);
+        assert!(matches!(
+            waiter.as_mut().poll(&mut original_cx),
+            Poll::Pending
+        ));
+        drop(original_cx);
+        drop(original_waker);
+
+        let replacement_waker = Waker::noop();
+        let mut replacement_cx = Context::from_waker(replacement_waker);
+        assert!(matches!(
+            waiter.as_mut().poll(&mut replacement_cx),
+            Poll::Pending
+        ));
+        assert!(
+            replaced_waker_dropped.load(Ordering::Acquire),
+            "replacing a registered waker must drop it after releasing the completion mutex"
+        );
+        drop(waiter);
+
+        let completion = VfsWriteCompletion::new();
+        let removed_waker_dropped = Arc::new(AtomicBool::new(false));
+        let mut waiter = Box::pin(completion.wait());
+        let registered_waker = Waker::from(Arc::new(ReenterCompletionOnDrop {
+            completion,
+            dropped: Arc::clone(&removed_waker_dropped),
+        }));
+        let mut task_cx = Context::from_waker(&registered_waker);
+        assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
+        drop(task_cx);
+        drop(registered_waker);
+        drop(waiter);
+        assert!(
+            removed_waker_dropped.load(Ordering::Acquire),
+            "dropping a waiter must release its registered waker after unlocking"
+        );
+    }
+
+    #[test]
+    fn mapped_relay_terminalizes_before_panicking_reentrant_wake() {
+        use std::future::Future as _;
+        use std::task::Wake;
+
+        struct ReenterOuterThenPanic {
+            outer: VfsWriteCompletion,
+            observation: Arc<Mutex<Option<(VfsWriteCompletionState, bool)>>>,
+        }
+
+        impl ReenterOuterThenPanic {
+            fn reenter_then_panic(&self) -> ! {
+                let observed_state = self.outer.state();
+                let reentrant_transition_won = self.outer.complete_success();
+                *self
+                    .observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((observed_state, reentrant_transition_won));
+                panic!("mapped relay wake panic");
+            }
+        }
+
+        impl Wake for ReenterOuterThenPanic {
+            fn wake(self: Arc<Self>) {
+                self.reenter_then_panic();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.reenter_then_panic();
+            }
+        }
+
+        std::thread::Builder::new()
+            .name("vfs-write-completion-panicking-relay".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let outer = VfsWriteCompletion::new();
+                let mut source = outer.clone();
+                for _ in 0..10_000 {
+                    source = source.error_mapped_child();
+                }
+
+                let observation = Arc::new(Mutex::new(None));
+                let waker = Waker::from(Arc::new(ReenterOuterThenPanic {
+                    outer: outer.clone(),
+                    observation: Arc::clone(&observation),
+                }));
+                let mut waiter = Box::pin(source.wait());
+                let mut task_cx = Context::from_waker(&waker);
+                assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
+                drop(task_cx);
+                drop(waker);
+
+                let completion_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        source.complete_success();
+                    }));
+                assert!(completion_result.is_err());
+                assert_eq!(source.state(), VfsWriteCompletionState::Success);
+                assert_eq!(outer.state(), VfsWriteCompletionState::Error);
+                assert_eq!(
+                    *observation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    Some((VfsWriteCompletionState::Error, false)),
+                    "mapped outer state must be terminal before a source waiter can re-enter it"
+                );
+                drop(waiter);
+            })
+            .expect("spawn panicking mapped-relay stack canary")
+            .join()
+            .expect("panicking mapped-relay stack canary panicked");
+    }
+
+    #[test]
+    fn write_completion_error_mapping_is_iterative_on_a_small_stack() {
+        std::thread::Builder::new()
+            .name("vfs-write-completion-relay-depth".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let outer = VfsWriteCompletion::new();
+                let mut source = outer.clone();
+                for _ in 0..10_000 {
+                    source = source.error_mapped_child();
+                }
+                assert!(source.complete_success());
+                assert_eq!(source.state(), VfsWriteCompletionState::Success);
+                assert_eq!(outer.state(), VfsWriteCompletionState::Error);
+            })
+            .expect("spawn write-completion relay stack canary")
+            .join()
+            .expect("write-completion relay stack canary panicked");
     }
 
     #[test]
@@ -1930,6 +2314,20 @@ mod tests {
                 "the immediate memory mutation source must complete the token before Ready"
             );
         }
+        let unpolled_completion = VfsWriteCompletion::new();
+        let unpolled = <MemoryFile as VfsFile>::write_tracked(
+            &file,
+            &cx,
+            payload,
+            0,
+            unpolled_completion.clone(),
+        );
+        drop(unpolled);
+        assert_eq!(
+            unpolled_completion.state(),
+            VfsWriteCompletionState::Error,
+            "dropping an unpolled immediate write must drop its exact source fail-closed"
+        );
 
         let mut buf = [0u8; 15];
         {
@@ -1943,13 +2341,22 @@ mod tests {
 
         let writes: &[(u64, &[u8])] = &[(0, b"real"), (8, b"batch")];
         {
-            let mut batch = std::pin::pin!(<MemoryFile as VfsFile>::write_page_batch(
-                &file, &cx, writes,
+            let completion = VfsWriteCompletion::new();
+            let mut batch = std::pin::pin!(<MemoryFile as VfsFile>::write_page_batch_tracked(
+                &file,
+                &cx,
+                writes,
+                completion.clone(),
             ));
             assert!(matches!(
                 batch.as_mut().poll(&mut task_cx),
                 Poll::Ready(Ok(()))
             ));
+            assert_eq!(
+                completion.state(),
+                VfsWriteCompletionState::Success,
+                "memory batch completion must terminalize at the mutation source"
+            );
         }
 
         let mut batch_buf = [0_u8; 13];
@@ -1962,5 +2369,30 @@ mod tests {
             ));
         }
         assert_eq!(&batch_buf, b"realo asbatch");
+
+        let empty_completion = VfsWriteCompletion::new();
+        assert!(
+            poll_ready(<MemoryFile as VfsFile>::write_page_batch_tracked(
+                &file,
+                &cx,
+                &[],
+                empty_completion.clone(),
+            ))
+            .is_ok()
+        );
+        assert_eq!(empty_completion.state(), VfsWriteCompletionState::Success);
+
+        let invalid_completion = VfsWriteCompletion::new();
+        let invalid = [(u64::MAX, &[1_u8, 2_u8][..])];
+        assert!(
+            poll_ready(<MemoryFile as VfsFile>::write_page_batch_tracked(
+                &file,
+                &cx,
+                &invalid,
+                invalid_completion.clone(),
+            ))
+            .is_err()
+        );
+        assert_eq!(invalid_completion.state(), VfsWriteCompletionState::Error);
     }
 }

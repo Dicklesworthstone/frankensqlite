@@ -142,7 +142,6 @@ impl<V> CursorSlots<V> {
 }
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
 
 use fsqlite_btree::cursor::{CursorPositionStamp, FirstIndexKeyIntegerLocalRunSegment};
 use fsqlite_btree::{
@@ -177,6 +176,7 @@ use fsqlite_types::record::{
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len,
 };
+use fsqlite_types::sync_primitives::{Duration, Instant};
 use fsqlite_types::value::{
     SmallText, SqlLikeFastPathKind, SqliteValue, pool_return_reusable,
     sql_like_fast_path_matches_cased,
@@ -209,6 +209,37 @@ const VDBE_ENGINE_INLINE_SIZE_BUDGET_BYTES: usize = 3 * 1024;
 static BUILTIN_COLLATION_REGISTRY: LazyLock<CollationRegistry> =
     LazyLock::new(CollationRegistry::default);
 
+/// Effective conflict action attached to a constraint error by the VDBE.
+///
+/// This records the action of the constraint that actually failed, after
+/// statement-level and schema-level conflict policies have been resolved by
+/// code generation. `IGNORE` and `REPLACE` are reported only if their opcode
+/// path still escapes with a constraint error.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ResolvedConstraintAction {
+    Rollback = 1,
+    Abort = 2,
+    Fail = 3,
+    Ignore = 4,
+    Replace = 5,
+}
+
+impl ResolvedConstraintAction {
+    #[must_use]
+    const fn from_oe_bits(oe_bits: u16, zero_is_abort: bool) -> Option<Self> {
+        match oe_bits & 0x0F {
+            0 if zero_is_abort => Some(Self::Abort),
+            1 => Some(Self::Rollback),
+            2 => Some(Self::Abort),
+            3 => Some(Self::Fail),
+            4 => Some(Self::Ignore),
+            5 => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 struct StatementColdState(u16);
 
@@ -221,15 +252,16 @@ impl StatementColdState {
     const WINDOW_CONTEXTS: Self = Self(1 << 5);
     const REGISTER_SUBTYPES: Self = Self(1 << 6);
     const BLOOM_FILTERS: Self = Self(1 << 7);
+    const MUTATION_EVENTS: Self = Self(1 << 8);
+    const RESOLVED_CONSTRAINT_ACTION_SHIFT: u32 = 9;
+    const RESOLVED_CONSTRAINT_ACTION_MASK: u16 = 0b111 << Self::RESOLVED_CONSTRAINT_ACTION_SHIFT;
 
     #[must_use]
     const fn empty() -> Self {
         Self(0)
     }
 
-    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)]
     const fn contains(self, other: Self) -> bool {
         self.0 & other.0 != 0
     }
@@ -241,6 +273,31 @@ impl StatementColdState {
 
     fn insert(&mut self, other: Self) {
         self.0 |= other.0;
+    }
+
+    fn set_resolved_constraint_action(&mut self, action: ResolvedConstraintAction) {
+        self.0 = (self.0 & !Self::RESOLVED_CONSTRAINT_ACTION_MASK)
+            | ((action as u16) << Self::RESOLVED_CONSTRAINT_ACTION_SHIFT);
+    }
+
+    #[must_use]
+    const fn resolved_constraint_action(self) -> Option<ResolvedConstraintAction> {
+        match (self.0 & Self::RESOLVED_CONSTRAINT_ACTION_MASK)
+            >> Self::RESOLVED_CONSTRAINT_ACTION_SHIFT
+        {
+            1 => Some(ResolvedConstraintAction::Rollback),
+            2 => Some(ResolvedConstraintAction::Abort),
+            3 => Some(ResolvedConstraintAction::Fail),
+            4 => Some(ResolvedConstraintAction::Ignore),
+            5 => Some(ResolvedConstraintAction::Replace),
+            _ => None,
+        }
+    }
+
+    fn take_resolved_constraint_action(&mut self) -> Option<ResolvedConstraintAction> {
+        let action = self.resolved_constraint_action();
+        self.0 &= !Self::RESOLVED_CONSTRAINT_ACTION_MASK;
+        action
     }
 
     fn clear(&mut self) {
@@ -380,7 +437,7 @@ fn transient_mem_root_pgno(root_pgno: PageNumber) -> PageNumber {
 
 #[inline]
 fn add_vdbe_counter(counter: &AtomicU64, delta: u64) {
-    if FSQLITE_VDBE_METRICS_ENABLED.load(AtomicOrdering::Relaxed) {
+    if vdbe_metrics_enabled() {
         counter.fetch_add(delta, AtomicOrdering::Relaxed);
     }
 }
@@ -1859,9 +1916,18 @@ impl SharedTxnPageIo {
         }
     }
 
+    /// Wrap an owned non-concurrent pager transaction in shared page I/O.
+    ///
+    /// This constructor is intended for short-lived owner leases that must
+    /// give B-tree cursors cloneable access while guaranteeing that the
+    /// transaction can be returned to its owner on cancellation.
+    pub fn from_transaction(txn: impl Into<TransactionKind>) -> Self {
+        Self::from_parts(txn.into(), None)
+    }
+
     #[cfg(test)]
     fn new(txn: impl Into<TransactionKind>) -> Self {
-        Self::from_parts(txn.into(), None)
+        Self::from_transaction(txn)
     }
 
     /// Create with MVCC concurrent context (bd-kivg / 5E.2).
@@ -1915,6 +1981,18 @@ impl SharedTxnPageIo {
     /// retained cursors (they'll get a fresh txn via refill next time).
     fn drain(&self) -> TransactionKind {
         self.txn.replace(TransactionKind::Drained)
+    }
+
+    /// Return the owned transaction without requiring outstanding cursor
+    /// clones to have been dropped first.
+    ///
+    /// The shared wrapper is left in a deliberately unusable drained state.
+    /// This is the cancellation-safe handoff primitive for owner-side RAII
+    /// leases; it must not be used as a normal transaction-completion path.
+    #[doc(hidden)]
+    pub fn drain_transaction_for_owner(&self) -> TransactionKind {
+        self.concurrent.replace(None);
+        self.drain()
     }
 
     fn concurrent_context(&self) -> Option<ConcurrentContext> {
@@ -3994,6 +4072,10 @@ enum MemDbUndoOp {
         row: MemRow,
         prev_next_rowid: i64,
     },
+    ReplaceContents {
+        tables: SwissIndex<i32, MemTable>,
+        next_root_page: i32,
+    },
 }
 
 impl MemDbUndoOp {
@@ -4044,6 +4126,13 @@ impl MemDbUndoOp {
                     table.insert(row.rowid, row.values);
                     table.next_rowid = prev_next_rowid;
                 }
+            }
+            Self::ReplaceContents {
+                tables,
+                next_root_page,
+            } => {
+                db.tables = tables;
+                db.next_root_page = next_root_page;
             }
         }
     }
@@ -4191,6 +4280,35 @@ impl MemDatabase {
                 op.undo(self);
             }
         }
+    }
+
+    /// Replace the materialized table image without breaking an active undo
+    /// region.
+    ///
+    /// Pager-backed refreshes rebuild a complete compatibility mirror. A plain
+    /// assignment would discard the current undo log, so a later statement or
+    /// user-savepoint rollback could leave rows from the refreshed image
+    /// visible after the authoritative pager savepoint had rolled them back.
+    /// While undo tracking is active, retain the current log and record the
+    /// replaced image as one reversible operation. Outside an undo region this
+    /// is equivalent to assignment.
+    pub fn replace_contents_preserving_undo(&mut self, replacement: Self) {
+        if !self.undo_enabled {
+            *self = replacement;
+            return;
+        }
+
+        let Self {
+            tables,
+            next_root_page,
+            ..
+        } = replacement;
+        let previous_tables = std::mem::replace(&mut self.tables, tables);
+        let previous_next_root_page = std::mem::replace(&mut self.next_root_page, next_root_page);
+        self.push_undo(MemDbUndoOp::ReplaceContents {
+            tables: previous_tables,
+            next_root_page: previous_next_root_page,
+        });
     }
 
     /// Drop a table by root page and record undo information.
@@ -4481,6 +4599,13 @@ static FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// These counters are used only for diagnostics/tests today, so leave them
 /// disabled by default to keep shared-state bookkeeping off ordinary execute().
 static FSQLITE_VDBE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    /// Unit-test override that prevents one metrics test from enabling
+    /// collection in unrelated VDBE tests running on other harness threads.
+    static FSQLITE_VDBE_METRICS_THREAD_OVERRIDE: Cell<Option<bool>> =
+        const { Cell::new(None) };
+}
 /// Monotonic program ID counter for tracing correlation.
 static VDBE_PROGRAM_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -4924,12 +5049,21 @@ pub struct VdbeMetricsSnapshot {
 
 /// Enable/disable VDBE execution metrics collection.
 pub fn set_vdbe_metrics_enabled(enabled: bool) {
+    #[cfg(test)]
+    {
+        FSQLITE_VDBE_METRICS_THREAD_OVERRIDE.with(|override_| override_.set(Some(enabled)));
+    }
+    #[cfg(not(test))]
     FSQLITE_VDBE_METRICS_ENABLED.store(enabled, AtomicOrdering::Relaxed);
 }
 
 /// Current VDBE metrics collection flag.
 #[must_use]
 pub fn vdbe_metrics_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = FSQLITE_VDBE_METRICS_THREAD_OVERRIDE.with(Cell::get) {
+        return enabled;
+    }
     FSQLITE_VDBE_METRICS_ENABLED.load(AtomicOrdering::Relaxed)
 }
 
@@ -6122,6 +6256,29 @@ enum PendingUpdateRestore {
     },
 }
 
+/// Authoritative row-mutation disposition emitted by the VDBE write opcode.
+///
+/// Collection is opt-in because materializing OLD/NEW row images requires
+/// record decoding that ordinary DML hot paths do not need. The connection
+/// layer enables it only when it must route post-write trigger events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VdbeMutationKind {
+    Insert,
+    Update,
+}
+
+/// Logical table-row images for one successful VDBE mutation.
+///
+/// INTEGER PRIMARY KEY aliases are expanded to their logical rowid value, so
+/// consumers can bind these images directly as trigger OLD/NEW rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VdbeMutationEvent {
+    pub kind: VdbeMutationKind,
+    pub rowid: i64,
+    pub old_values: Option<MemRowValues>,
+    pub new_values: MemRowValues,
+}
+
 #[derive(Debug, Clone)]
 struct PendingInsertRollback {
     cursor_id: i32,
@@ -6129,6 +6286,7 @@ struct PendingInsertRollback {
     previous_last_insert_rowid: i64,
     previous_last_insert_rowid_valid: bool,
     update_restore: Option<PendingUpdateRestore>,
+    mutation_event_index: Option<usize>,
 }
 
 /// Per-accumulator window function context (for `AggInverse` / `AggValue`).
@@ -6163,6 +6321,9 @@ struct ColdVdbeState {
     /// opcodes either succeed or roll the row back after a secondary-index
     /// conflict.
     pending_insert_rollback: Option<PendingInsertRollback>,
+    /// Successful row mutations retained only for an opt-in connection-layer
+    /// trigger-routing consumer.
+    mutation_events: Vec<VdbeMutationEvent>,
     /// When true, a UNIQUE conflict with IGNORE was detected during an
     /// `IdxInsert`, so remaining `IdxInsert` opcodes for this row should be
     /// skipped.
@@ -6197,6 +6358,7 @@ impl ColdVdbeState {
             aggregates: SwissIndex::new(),
             pending_update_restore: None,
             pending_insert_rollback: None,
+            mutation_events: Vec::new(),
             conflict_skip_idx: false,
             pending_idx_entries: Vec::new(),
             rowsets: SwissIndex::new(),
@@ -6500,6 +6662,51 @@ impl VdbeEngine {
         }
     }
 
+    /// Enable authoritative INSERT/UPDATE mutation receipts for this
+    /// statement. Callers must opt in after resetting a reusable engine and
+    /// before execution begins.
+    pub fn enable_mutation_event_collection(&mut self) {
+        self.ensure_cold_state_for(StatementColdState::MUTATION_EVENTS);
+    }
+
+    #[inline]
+    fn mutation_event_collection_enabled(&self) -> bool {
+        self.statement_cold_state
+            .contains(StatementColdState::MUTATION_EVENTS)
+    }
+
+    #[inline]
+    fn push_mutation_event(&mut self, event: VdbeMutationEvent) -> usize {
+        let events = &mut self
+            .ensure_cold_state_for(StatementColdState::MUTATION_EVENTS)
+            .mutation_events;
+        let index = events.len();
+        events.push(event);
+        index
+    }
+
+    fn discard_mutation_event(&mut self, event_index: usize) -> Result<()> {
+        let events = &mut self
+            .cold_state_mut()
+            .ok_or_else(|| FrankenError::internal("mutation receipt state disappeared"))?
+            .mutation_events;
+        if event_index >= events.len() {
+            return Err(FrankenError::internal(
+                "mutation receipt index disappeared during conflict rollback",
+            ));
+        }
+        events.truncate(event_index);
+        Ok(())
+    }
+
+    /// Take collected mutation receipts while preserving the cold-state
+    /// allocation until normal statement teardown.
+    pub fn take_mutation_events(&mut self) -> Vec<VdbeMutationEvent> {
+        self.cold_state_mut().map_or_else(Vec::new, |cold_state| {
+            std::mem::take(&mut cold_state.mutation_events)
+        })
+    }
+
     #[inline]
     fn take_pending_idx_entries(&mut self) -> Vec<(i32, Vec<u8>)> {
         self.cold_state_mut().map_or_else(Vec::new, |cold_state| {
@@ -6535,6 +6742,43 @@ impl VdbeEngine {
         } else if let Some(cold_state) = self.cold_state_mut() {
             cold_state.conflict_skip_idx = false;
         }
+    }
+
+    fn record_resolved_constraint_action(&mut self, oe_bits: u16, zero_is_abort: bool) {
+        if let Some(action) = ResolvedConstraintAction::from_oe_bits(oe_bits, zero_is_abort) {
+            self.statement_cold_state
+                .set_resolved_constraint_action(action);
+        }
+    }
+
+    fn record_resolved_constraint_action_for_error(
+        &mut self,
+        error: &FrankenError,
+        oe_bits: u16,
+        zero_is_abort: bool,
+    ) {
+        if error.error_code() == ErrorCode::Constraint {
+            self.record_resolved_constraint_action(oe_bits, zero_is_abort);
+        }
+    }
+
+    fn record_resolved_constraint_action_for_code(&mut self, code: i32, oe_bits: u16) {
+        if oe_bits != 0 && (code & 0xFF) == ErrorCode::Constraint as i32 {
+            self.record_resolved_constraint_action(oe_bits, false);
+        }
+    }
+
+    /// Return the resolved conflict action for the constraint error emitted by
+    /// the current statement, if the failing opcode carried one.
+    #[must_use]
+    pub fn resolved_constraint_action(&self) -> Option<ResolvedConstraintAction> {
+        self.statement_cold_state.resolved_constraint_action()
+    }
+
+    /// Take the resolved conflict action for the current statement's
+    /// constraint error.
+    pub fn take_resolved_constraint_action(&mut self) -> Option<ResolvedConstraintAction> {
+        self.statement_cold_state.take_resolved_constraint_action()
     }
 
     fn clear_statement_cold_state(&mut self) {
@@ -7159,6 +7403,70 @@ impl VdbeEngine {
             })
     }
 
+    fn logical_table_payload_row(
+        &self,
+        cursor_id: i32,
+        rowid: i64,
+        payload_values: &[SqliteValue],
+    ) -> MemRowValues {
+        let table_root_page = self.table_root_page_for_cursor(cursor_id);
+        let logical_width = table_root_page
+            .and_then(|root_page| {
+                self.table_column_count_by_root_page
+                    .get(&root_page)
+                    .copied()
+            })
+            .unwrap_or(payload_values.len());
+        (0..logical_width)
+            .map(|column_index| {
+                self.logical_table_payload_value(
+                    table_root_page,
+                    payload_values,
+                    rowid,
+                    column_index,
+                )
+            })
+            .collect()
+    }
+
+    fn pending_update_restore_row(&self, restore: &PendingUpdateRestore) -> Result<MemRowValues> {
+        match restore {
+            PendingUpdateRestore::Storage {
+                cursor_id,
+                rowid,
+                payload,
+            } => {
+                let payload_values = parse_record(payload).ok_or_else(|| {
+                    FrankenError::internal(
+                        "could not decode OLD row for VDBE update mutation receipt",
+                    )
+                })?;
+                Ok(self.logical_table_payload_row(*cursor_id, *rowid, &payload_values))
+            }
+            PendingUpdateRestore::Mem {
+                root_page,
+                rowid,
+                values,
+            } => {
+                let logical_width = self
+                    .table_column_count_by_root_page
+                    .get(root_page)
+                    .copied()
+                    .unwrap_or(values.len());
+                Ok((0..logical_width)
+                    .map(|column_index| {
+                        self.logical_table_payload_value(
+                            Some(*root_page),
+                            values,
+                            *rowid,
+                            column_index,
+                        )
+                    })
+                    .collect())
+            }
+        }
+    }
+
     fn index_key_values_from_table_payload(
         &self,
         table_root_page: Option<i32>,
@@ -7365,6 +7673,9 @@ impl VdbeEngine {
         if let Some(update_restore) = rollback.update_restore {
             self.restore_pending_update_after_conflict(update_restore)
                 .await?;
+        }
+        if let Some(event_index) = rollback.mutation_event_index {
+            self.discard_mutation_event(event_index)?;
         }
         self.last_insert_rowid = rollback.previous_last_insert_rowid;
         self.last_insert_rowid_valid = rollback.previous_last_insert_rowid_valid;
@@ -7801,6 +8112,31 @@ impl VdbeEngine {
             Some(txn_page_io) => Ok(Some(txn_page_io.into_inner()?)),
             None => Ok(None),
         }
+    }
+
+    /// Infallibly suspend pager ownership for a cancellation-safe handoff.
+    ///
+    /// Unlike [`Self::take_transaction`], this does not require every
+    /// `SharedTxnPageIo` clone to have been destroyed first. All engine-owned
+    /// cursor holders and retained traversal state are invalidated, then the
+    /// shared wrapper is drained in place. The wrapper remains installed so a
+    /// later `set_transaction*` call can refill it, but no cursor may use it
+    /// while it contains the `TransactionKind::Drained` sentinel.
+    pub fn suspend_transaction_for_handoff(&mut self) -> Option<TransactionKind> {
+        self.retain_storage_cursors_on_close = false;
+        self.storage_cursors.clear();
+        self.pending_next_after_delete.clear();
+        self.cursor_root_pages.clear();
+        self.time_travel_cursors.clear();
+        let resolved_constraint_action = self.take_resolved_constraint_action();
+        self.clear_statement_cold_state();
+        if let Some(action) = resolved_constraint_action {
+            self.statement_cold_state
+                .set_resolved_constraint_action(action);
+        }
+        self.txn_page_io
+            .as_ref()
+            .map(SharedTxnPageIo::drain_transaction_for_owner)
     }
 
     /// bd-perf: Swap the inner transaction without dropping the Rc.
@@ -8350,6 +8686,7 @@ impl VdbeEngine {
                             P4::Str(s) => s.clone(),
                             _ => format!("halt with error code {}", op.p1),
                         };
+                        self.record_resolved_constraint_action_for_code(op.p1, op.p5);
                         break ExecOutcome::Error {
                             code: op.p1,
                             message: msg,
@@ -10055,7 +10392,7 @@ impl VdbeEngine {
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     let previous_last_insert_rowid = self.last_insert_rowid;
                     let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
-                    let pending_update_restore = if is_update {
+                    let mut pending_update_restore = if is_update {
                         self.take_pending_update_restore()
                     } else {
                         self.set_pending_update_restore(None);
@@ -10098,6 +10435,22 @@ impl VdbeEngine {
                     } else {
                         Vec::new()
                     };
+                    let mutation_payload_values = if self.mutation_event_collection_enabled() {
+                        let record = if let Some(record) = preformatted_record {
+                            record
+                        } else if sideband_active {
+                            &sideband_buf
+                        } else {
+                            record_blob_bytes(&record_val)
+                        };
+                        Some(parse_record(record).ok_or_else(|| {
+                            FrankenError::internal(
+                                "could not decode NEW row for VDBE mutation receipt",
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
                     let mut actually_inserted = false;
                     let mut inserted_via_storage = false;
                     let mut inserted_root_page = None;
@@ -10131,12 +10484,18 @@ impl VdbeEngine {
                                         .is_some_and(|last| rowid > last);
                                 let mut insert_seek_result = None;
                                 let exists = if append_eligible {
-                                    FSQLITE_VDBE_INSERT_APPEND_COUNT
-                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                    add_vdbe_counter_if(
+                                        collect_vdbe_metrics,
+                                        &FSQLITE_VDBE_INSERT_APPEND_COUNT,
+                                        1,
+                                    );
                                     false // Append: key is larger than anything in the table
                                 } else {
-                                    FSQLITE_VDBE_INSERT_SEEK_COUNT
-                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                    add_vdbe_counter_if(
+                                        collect_vdbe_metrics,
+                                        &FSQLITE_VDBE_INSERT_SEEK_COUNT,
+                                        1,
+                                    );
                                     let seek_result =
                                         sc.cursor.table_move_to(&sc.cx, rowid).await?;
                                     insert_seek_result = Some(seek_result);
@@ -10145,14 +10504,25 @@ impl VdbeEngine {
 
                                 if exists {
                                     if sc.last_successful_insert_rowid.take().is_some() {
-                                        FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
-                                            .fetch_add(1, AtomicOrdering::Relaxed);
+                                        add_vdbe_counter_if(
+                                            collect_vdbe_metrics,
+                                            &FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT,
+                                            1,
+                                        );
                                     }
                                     // Match on the low OE_* bits directly — p5 is
                                     // not a plain bitfield in this engine because
                                     // it also carries the custom OPFLAG_ISUPDATE
                                     // bit above the conflict-mode nibble.
                                     if oe_flag == 5 {
+                                        if is_update && pending_update_restore.is_none() {
+                                            pending_update_restore =
+                                                Some(PendingUpdateRestore::Storage {
+                                                    cursor_id,
+                                                    rowid,
+                                                    payload: sc.cursor.payload(&sc.cx).await?,
+                                                });
+                                        }
                                         // OE_REPLACE: Delete old, insert new
                                         self.native_replace_row(cursor_id, rowid).await?;
                                         let sc2 = self
@@ -10223,16 +10593,22 @@ impl VdbeEngine {
                                                 .await?;
                                             sc.last_successful_insert_rowid = Some(rowid);
                                         } else if sc.last_successful_insert_rowid.take().is_some() {
-                                            FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
-                                                .fetch_add(1, AtomicOrdering::Relaxed);
+                                            add_vdbe_counter_if(
+                                                collect_vdbe_metrics,
+                                                &FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT,
+                                                1,
+                                            );
                                         }
                                     } else {
                                         sc.cursor.table_insert(&sc.cx, rowid, blob).await?;
                                         if append_eligible {
                                             sc.last_successful_insert_rowid = Some(rowid);
                                         } else if sc.last_successful_insert_rowid.take().is_some() {
-                                            FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
-                                                .fetch_add(1, AtomicOrdering::Relaxed);
+                                            add_vdbe_counter_if(
+                                                collect_vdbe_metrics,
+                                                &FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT,
+                                                1,
+                                            );
                                         }
                                     }
                                     invalidate_storage_cursor_row_cache_with_reason(
@@ -10319,6 +10695,27 @@ impl VdbeEngine {
                                             }
                                         }
                                         5 => {
+                                            if is_update && pending_update_restore.is_none() {
+                                                let old_values = db
+                                                    .get_table(root)
+                                                    .and_then(|table| {
+                                                        table
+                                                            .find_by_rowid(rowid)
+                                                            .and_then(|index| table.rows.get(index))
+                                                            .map(|row| row.values.clone())
+                                                    })
+                                                    .ok_or_else(|| {
+                                                        FrankenError::internal(
+                                                            "VDBE update conflict lost its existing MemDatabase row",
+                                                        )
+                                                    })?;
+                                                pending_update_restore =
+                                                    Some(PendingUpdateRestore::Mem {
+                                                        root_page: root,
+                                                        rowid,
+                                                        values: old_values,
+                                                    });
+                                            }
                                             // OE_REPLACE: Delete conflicting row(s),
                                             // then insert new.
                                             for conflict_rid in unique_conflicts {
@@ -10363,7 +10760,21 @@ impl VdbeEngine {
                         sideband_buf.clear();
                         self.make_record_lookaside.replace_buf(sideband_buf);
                     }
-                    if let Some(outcome) = insert_result? {
+                    let insert_outcome = match insert_result {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            self.record_resolved_constraint_action_for_error(&error, oe_flag, true);
+                            return Err(error);
+                        }
+                    };
+                    if let Some(outcome) = insert_outcome {
+                        if matches!(
+                            outcome,
+                            ExecOutcome::Error { code, .. }
+                                if (code & 0xFF) == ErrorCode::Constraint as i32
+                        ) {
+                            self.record_resolved_constraint_action(oe_flag, true);
+                        }
                         break outcome;
                     }
                     if inserted_via_storage && let Some(root_page) = inserted_root_page {
@@ -10381,12 +10792,42 @@ impl VdbeEngine {
                             self.last_insert_rowid = rowid;
                             self.last_insert_rowid_valid = true;
                         }
+                        let mutation_event_index = if let Some(payload_values) =
+                            mutation_payload_values.as_ref()
+                        {
+                            let old_values = if is_update {
+                                Some(self.pending_update_restore_row(
+                                    pending_update_restore.as_ref().ok_or_else(|| {
+                                        FrankenError::internal(
+                                            "VDBE update mutation lost its OLD row receipt",
+                                        )
+                                    })?,
+                                )?)
+                            } else {
+                                None
+                            };
+                            let new_values =
+                                self.logical_table_payload_row(cursor_id, rowid, payload_values);
+                            Some(self.push_mutation_event(VdbeMutationEvent {
+                                kind: if is_update {
+                                    VdbeMutationKind::Update
+                                } else {
+                                    VdbeMutationKind::Insert
+                                },
+                                rowid,
+                                old_values,
+                                new_values,
+                            }))
+                        } else {
+                            None
+                        };
                         self.set_pending_insert_rollback(Some(PendingInsertRollback {
                             cursor_id,
                             rowid,
                             previous_last_insert_rowid,
                             previous_last_insert_rowid_valid,
                             update_restore: pending_update_restore,
+                            mutation_event_index,
                         }));
                     } else {
                         self.set_pending_insert_rollback(None);
@@ -10724,6 +11165,11 @@ impl VdbeEngine {
                                                         self.make_record_lookaside
                                                             .replace_cleared_buf(key_blob);
                                                     }
+                                                    self.record_resolved_constraint_action_for_error(
+                                                        &error,
+                                                        u16::from(oe_flag),
+                                                        true,
+                                                    );
                                                     return Err(error);
                                                 }
                                                 self.set_conflict_skip_idx(true);
@@ -10755,6 +11201,11 @@ impl VdbeEngine {
                                                                 self.make_record_lookaside
                                                                     .replace_cleared_buf(key_blob);
                                                             }
+                                                            self.record_resolved_constraint_action_for_error(
+                                                                &error,
+                                                                u16::from(oe_flag),
+                                                                true,
+                                                            );
                                                             return Err(error);
                                                         }
                                                     }
@@ -10772,6 +11223,11 @@ impl VdbeEngine {
                                                                 self.make_record_lookaside
                                                                     .replace_cleared_buf(key_blob);
                                                             }
+                                                            self.record_resolved_constraint_action_for_error(
+                                                                &error,
+                                                                u16::from(oe_flag),
+                                                                true,
+                                                            );
                                                             return Err(error);
                                                         }
                                                     }
@@ -10803,6 +11259,11 @@ impl VdbeEngine {
                                                         self.make_record_lookaside
                                                             .replace_cleared_buf(key_blob);
                                                     }
+                                                    self.record_resolved_constraint_action_for_error(
+                                                        &error,
+                                                        u16::from(oe_flag),
+                                                        true,
+                                                    );
                                                     return Err(error);
                                                 }
                                                 invalidate_storage_cursor_row_cache_with_reason(
@@ -10828,12 +11289,21 @@ impl VdbeEngine {
                                                         self.make_record_lookaside
                                                             .replace_cleared_buf(key_blob);
                                                     }
+                                                    self.record_resolved_constraint_action_for_error(
+                                                        &error,
+                                                        u16::from(oe_flag),
+                                                        true,
+                                                    );
                                                     return Err(error);
                                                 }
                                                 if sideband_active {
                                                     self.make_record_lookaside
                                                         .replace_cleared_buf(key_blob);
                                                 }
+                                                self.record_resolved_constraint_action(
+                                                    u16::from(oe_flag),
+                                                    true,
+                                                );
                                                 return Err(FrankenError::UniqueViolation {
                                                     columns: columns_label.to_owned(),
                                                 });
@@ -10845,6 +11315,11 @@ impl VdbeEngine {
                                             self.make_record_lookaside
                                                 .replace_cleared_buf(key_blob);
                                         }
+                                        self.record_resolved_constraint_action_for_error(
+                                            &error,
+                                            u16::from(oe_flag),
+                                            true,
+                                        );
                                         return Err(error);
                                     }
                                 }
@@ -11065,6 +11540,7 @@ impl VdbeEngine {
                             P4::Str(s) => s.clone(),
                             _ => "NOT NULL constraint failed".to_owned(),
                         };
+                        self.record_resolved_constraint_action_for_code(op.p1, op.p5);
                         break ExecOutcome::Error {
                             code: op.p1,
                             message: msg,
@@ -13423,6 +13899,7 @@ impl VdbeEngine {
                             previous_last_insert_rowid,
                             previous_last_insert_rowid_valid,
                             update_restore: None,
+                            mutation_event_index: None,
                         }));
                         self.pending_next_after_delete.remove(&cursor_id);
                         // CRITICAL FIX: Mark table dirty so MemDB fast paths
@@ -13482,6 +13959,7 @@ impl VdbeEngine {
                         previous_last_insert_rowid,
                         previous_last_insert_rowid_valid,
                         update_restore: None,
+                        mutation_event_index: None,
                     }));
                     self.pending_next_after_delete.remove(&cursor_id);
                 } else {
@@ -14000,6 +14478,7 @@ impl VdbeEngine {
             previous_last_insert_rowid,
             previous_last_insert_rowid_valid,
             update_restore: None,
+            mutation_event_index: None,
         }));
         self.clear_pending_idx_entries();
         self.pending_next_after_delete.remove(&template.cursor_id);
@@ -18300,7 +18779,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::{Label, ProgramBuilder};
+    use crate::{Label, ProgramBuilder, VDBE_OBSERVABILITY_LOCK};
     use asupersync::runtime::{Runtime, RuntimeBuilder};
     use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
     use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
@@ -19105,7 +19584,7 @@ mod tests {
     }
 
     #[test]
-    fn test_idxinsert_unique_abort_returns_make_record_sideband_buffer_on_error() {
+    fn test_idxinsert_unique_fail_returns_make_record_sideband_buffer_on_error() {
         let _guard = VDBE_OBSERVABILITY_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -19160,6 +19639,7 @@ mod tests {
             previous_last_insert_rowid: 0,
             previous_last_insert_rowid_valid: false,
             update_restore: None,
+            mutation_event_index: None,
         }));
 
         let mut builder = ProgramBuilder::new();
@@ -19176,7 +19656,7 @@ mod tests {
             r_record,
             1,
             P4::Table("idx_col".to_owned()),
-            1,
+            1 | (3 << 1),
         );
         builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         builder.resolve_label(end);
@@ -19191,6 +19671,11 @@ mod tests {
         assert!(
             matches!(error, FrankenError::UniqueViolation { .. }),
             "expected unique violation, got {error:?}"
+        );
+        assert_eq!(
+            engine.resolved_constraint_action(),
+            Some(ResolvedConstraintAction::Fail),
+            "unique IdxInsert errors must retain their resolved OE_FAIL policy"
         );
         assert_eq!(
             after - before,
@@ -21519,12 +22004,20 @@ mod tests {
         }
 
         engine.changes = 1;
+        engine.enable_mutation_event_collection();
+        let mutation_event_index = engine.push_mutation_event(VdbeMutationEvent {
+            kind: VdbeMutationKind::Insert,
+            rowid: 2,
+            old_values: None,
+            new_values: vec![SqliteValue::Integer(22)],
+        });
         engine.set_pending_insert_rollback(Some(PendingInsertRollback {
             cursor_id: 0,
             rowid: 2,
             previous_last_insert_rowid: 0,
             previous_last_insert_rowid_valid: false,
             update_restore: None,
+            mutation_event_index: Some(mutation_event_index),
         }));
         engine.push_pending_idx_entry(1, index_key.clone());
 
@@ -21549,6 +22042,10 @@ mod tests {
             .is_found()
         );
         assert_eq!(engine.changes(), 0);
+        assert!(
+            engine.take_mutation_events().is_empty(),
+            "a provisional table mutation rolled back by a later index conflict must not escape as a trigger receipt",
+        );
     }
 
     #[test]
@@ -22858,6 +23355,7 @@ mod tests {
                 where_clause: Some(Expr::BinaryOp {
                     left: Box::new(Expr::Column(
                         ColumnRef {
+                            schema: None,
                             table: None,
                             column: "rowid".into(),
                         },
@@ -22902,6 +23400,7 @@ mod tests {
                 where_clause: Some(Expr::BinaryOp {
                     left: Box::new(Expr::Column(
                         ColumnRef {
+                            schema: None,
                             table: None,
                             column: "rowid".into(),
                         },
@@ -25146,6 +25645,161 @@ mod tests {
     // ── Error Handling ─────────────────────────────────────────────────
 
     #[test]
+    fn test_halt_constraint_action_sideband_copies_takes_and_resets_on_reuse() {
+        let mut failing_builder = ProgramBuilder::new();
+        failing_builder.emit_op(
+            Opcode::Halt,
+            ErrorCode::Constraint as i32,
+            0,
+            0,
+            P4::Str("constraint failed".to_owned()),
+            3,
+        );
+        let failing_program = failing_builder
+            .finish()
+            .expect("failing program should build");
+
+        let mut successful_builder = ProgramBuilder::new();
+        successful_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let successful_program = successful_builder
+            .finish()
+            .expect("successful program should build");
+
+        let mut engine = VdbeEngine::new(
+            failing_program
+                .register_count()
+                .max(successful_program.register_count()),
+        );
+        assert!(matches!(
+            run_async(engine.execute(&failing_program)).expect("VDBE halt is an outcome"),
+            ExecOutcome::Error { .. }
+        ));
+        assert_eq!(
+            engine.resolved_constraint_action(),
+            Some(ResolvedConstraintAction::Fail)
+        );
+        assert!(engine.suspend_transaction_for_handoff().is_none());
+        assert_eq!(
+            engine.resolved_constraint_action(),
+            Some(ResolvedConstraintAction::Fail),
+            "transaction handoff cleanup must not erase an unread error sideband"
+        );
+
+        assert_eq!(
+            run_async(engine.execute(&successful_program)).expect("successful reuse"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            engine.resolved_constraint_action(),
+            None,
+            "the next statement must not inherit the prior constraint action"
+        );
+
+        assert!(matches!(
+            run_async(engine.execute(&failing_program)).expect("second VDBE halt is an outcome"),
+            ExecOutcome::Error { .. }
+        ));
+        let reset_cx = Cx::new();
+        engine.reset_for_reuse(
+            failing_program.register_count(),
+            &reset_cx,
+            PageSize::DEFAULT,
+        );
+        assert_eq!(
+            engine.resolved_constraint_action(),
+            None,
+            "explicit cached-engine reset must clear the sideband"
+        );
+
+        assert!(matches!(
+            run_async(engine.execute(&failing_program)).expect("third VDBE halt is an outcome"),
+            ExecOutcome::Error { .. }
+        ));
+        assert_eq!(
+            engine.take_resolved_constraint_action(),
+            Some(ResolvedConstraintAction::Fail)
+        );
+        assert_eq!(engine.resolved_constraint_action(), None);
+    }
+
+    #[test]
+    fn test_halt_constraint_action_sideband_ignores_missing_or_nonconstraint_policy() {
+        for (code, p5) in [(ErrorCode::Constraint as i32, 0), (1, 3)] {
+            let mut builder = ProgramBuilder::new();
+            builder.emit_op(Opcode::Halt, code, 0, 0, P4::Str("halt".to_owned()), p5);
+            let program = builder.finish().expect("program should build");
+            let mut engine = VdbeEngine::new(program.register_count());
+
+            assert!(matches!(
+                run_async(engine.execute(&program)).expect("VDBE halt is an outcome"),
+                ExecOutcome::Error { .. }
+            ));
+            assert_eq!(
+                engine.resolved_constraint_action(),
+                None,
+                "only constraint errors with explicit OE bits carry the sideband"
+            );
+        }
+    }
+
+    #[test]
+    fn test_halt_if_null_records_resolved_constraint_action_only_when_it_fires() {
+        let mut failing_builder = ProgramBuilder::new();
+        let null_reg = failing_builder.alloc_reg();
+        failing_builder.emit_op(Opcode::Null, 0, null_reg, 0, P4::None, 0);
+        failing_builder.emit_op(
+            Opcode::HaltIfNull,
+            ErrorCode::Constraint as i32,
+            0,
+            null_reg,
+            P4::Str("NOT NULL constraint failed".to_owned()),
+            1,
+        );
+        failing_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let failing_program = failing_builder
+            .finish()
+            .expect("failing program should build");
+        let mut failing_engine = VdbeEngine::new(failing_program.register_count());
+
+        assert!(matches!(
+            run_async(failing_engine.execute(&failing_program))
+                .expect("HaltIfNull failure is an outcome"),
+            ExecOutcome::Error { .. }
+        ));
+        assert_eq!(
+            failing_engine.resolved_constraint_action(),
+            Some(ResolvedConstraintAction::Rollback)
+        );
+
+        let mut passing_builder = ProgramBuilder::new();
+        let value_reg = passing_builder.alloc_reg();
+        passing_builder.emit_op(Opcode::Integer, 1, value_reg, 0, P4::None, 0);
+        passing_builder.emit_op(
+            Opcode::HaltIfNull,
+            ErrorCode::Constraint as i32,
+            0,
+            value_reg,
+            P4::Str("must not fire".to_owned()),
+            5,
+        );
+        passing_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let passing_program = passing_builder
+            .finish()
+            .expect("passing program should build");
+        let mut passing_engine = VdbeEngine::new(passing_program.register_count());
+
+        assert_eq!(
+            run_async(passing_engine.execute(&passing_program)).expect("passing execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            passing_engine.resolved_constraint_action(),
+            None,
+            "a successfully handled REPLACE-marked check must not publish an error sideband"
+        );
+    }
+
+    #[test]
     fn test_halt_if_null_triggers() {
         let mut b = ProgramBuilder::new();
         let end = b.emit_label();
@@ -27112,6 +27766,188 @@ mod tests {
     }
 
     #[test]
+    fn test_memdb_reloaded_contents_remain_reversible_inside_undo_region() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.upsert_row(root, 1, vec![SqliteValue::Text("baseline".into())]);
+
+        db.begin_undo();
+        let statement_token = db.undo_version();
+        db.upsert_row(root, 2, vec![SqliteValue::Text("before reload".into())]);
+
+        let mut reloaded = MemDatabase::new();
+        reloaded.create_table_at(root, 1);
+        reloaded.upsert_row(root, 1, vec![SqliteValue::Text("baseline".into())]);
+        reloaded.upsert_row(root, 2, vec![SqliteValue::Text("from pager".into())]);
+        reloaded.create_table_at(99, 1);
+        reloaded.upsert_row(99, 1, vec![SqliteValue::Text("transient".into())]);
+
+        db.replace_contents_preserving_undo(reloaded);
+        db.upsert_row(root, 3, vec![SqliteValue::Text("after reload".into())]);
+        assert_eq!(
+            db.get_table(root)
+                .and_then(|table| table.row_values_by_rowid(2)),
+            Some([SqliteValue::Text("from pager".into())].as_slice())
+        );
+        assert!(db.get_table(99).is_some());
+
+        db.rollback_to(statement_token);
+        let table = db
+            .get_table(root)
+            .expect("baseline table should be restored");
+        assert_eq!(
+            table.row_values_by_rowid(1),
+            Some([SqliteValue::Text("baseline".into())].as_slice())
+        );
+        assert_eq!(table.row_values_by_rowid(2), None);
+        assert_eq!(table.row_values_by_rowid(3), None);
+        assert!(
+            db.get_table(99).is_none(),
+            "the whole refreshed image must roll back"
+        );
+        assert_eq!(
+            db.create_table(1),
+            3,
+            "rollback must restore the pre-refresh root-page allocator"
+        );
+    }
+
+    #[test]
+    fn test_memdb_nested_replacements_restore_each_token_and_root_allocator() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.upsert_row(root, 1, vec![SqliteValue::Text("base".into())]);
+
+        db.begin_undo();
+        let base_token = db.undo_version();
+
+        let mut image_a = MemDatabase::new();
+        image_a.create_table_at(root, 1);
+        image_a.upsert_row(root, 1, vec![SqliteValue::Text("image-a".into())]);
+        image_a.create_table_at(40, 1);
+        db.replace_contents_preserving_undo(image_a);
+        let image_a_token = db.undo_version();
+
+        db.upsert_row(root, 2, vec![SqliteValue::Text("after-a-token".into())]);
+        let mut image_b = MemDatabase::new();
+        image_b.create_table_at(root, 1);
+        image_b.upsert_row(root, 1, vec![SqliteValue::Text("image-b".into())]);
+        image_b.create_table_at(80, 1);
+        db.replace_contents_preserving_undo(image_b);
+        db.upsert_row(root, 3, vec![SqliteValue::Text("after-b".into())]);
+
+        db.rollback_to(image_a_token);
+        let table = db.get_table(root).expect("image A should be restored");
+        assert_eq!(
+            table.row_values_by_rowid(1),
+            Some([SqliteValue::Text("image-a".into())].as_slice())
+        );
+        assert_eq!(table.row_values_by_rowid(2), None);
+        assert_eq!(table.row_values_by_rowid(3), None);
+        assert!(db.get_table(40).is_some());
+        assert!(db.get_table(80).is_none());
+        assert_eq!(
+            db.create_table(1),
+            41,
+            "rollback to the intermediate token must restore image A's allocator"
+        );
+
+        db.rollback_to(base_token);
+        let table = db.get_table(root).expect("base image should be restored");
+        assert_eq!(
+            table.row_values_by_rowid(1),
+            Some([SqliteValue::Text("base".into())].as_slice())
+        );
+        assert!(db.get_table(40).is_none());
+        assert!(db.get_table(80).is_none());
+        assert_eq!(
+            db.create_table(1),
+            3,
+            "rollback to the outer token must restore the base allocator"
+        );
+    }
+
+    #[test]
+    fn test_memdb_replacement_rollback_preserves_custom_collation_unique_state() {
+        struct DashlessNoCaseCollation;
+
+        impl fsqlite_func::collation::CollationFunction for DashlessNoCaseCollation {
+            fn name(&self) -> &str {
+                "DASHLESS_NOCASE"
+            }
+
+            fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
+                let normalize = |bytes: &[u8]| {
+                    bytes
+                        .iter()
+                        .filter(|&&byte| byte != b'-' && byte != b'_' && byte != b' ')
+                        .map(u8::to_ascii_lowercase)
+                        .collect::<Vec<_>>()
+                };
+                normalize(left).cmp(&normalize(right))
+            }
+        }
+
+        let registry = Arc::new(Mutex::new(CollationRegistry::new()));
+        registry
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .register(DashlessNoCaseCollation);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.set_collation_registry(Arc::clone(&registry));
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .add_unique_column_group_with_collations(
+                vec![0],
+                vec![Some("DASHLESS_NOCASE".to_owned())],
+            );
+        db.upsert_row(root, 1, vec![SqliteValue::Text("Alpha-Beta".into())]);
+
+        db.begin_undo();
+        let token = db.undo_version();
+        let mut replacement = MemDatabase::new();
+        replacement.create_table_at(root, 1);
+        replacement.upsert_row(root, 2, vec![SqliteValue::Text("replacement".into())]);
+        db.replace_contents_preserving_undo(replacement);
+
+        db.rollback_to(token);
+        let table = db.get_table(root).expect("base table should be restored");
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Text("alpha beta".into())]),
+            vec![1],
+            "rollback must restore the exact custom-collation unique index"
+        );
+    }
+
+    #[test]
+    fn test_memdb_commit_undo_releases_replaced_images() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.upsert_row(root, 1, vec![SqliteValue::Text("base".into())]);
+
+        db.begin_undo();
+        let base_token = db.undo_version();
+        let mut replacement = MemDatabase::new();
+        replacement.create_table_at(root, 1);
+        replacement.upsert_row(root, 1, vec![SqliteValue::Text("committed".into())]);
+        db.replace_contents_preserving_undo(replacement);
+        assert_eq!(db.undo_log.len(), 1);
+
+        db.commit_undo();
+        assert!(db.undo_log.is_empty());
+        assert!(!db.undo_enabled);
+        db.rollback_to(base_token);
+        assert_eq!(
+            db.get_table(root)
+                .and_then(|table| table.row_values_by_rowid(1)),
+            Some([SqliteValue::Text("committed".into())].as_slice()),
+            "a committed replacement must remain after historical images are released"
+        );
+    }
+
+    #[test]
     fn test_memdb_replace_secondary_unique_rollback_restores_deleted_and_replaced_rows() {
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
@@ -28435,6 +29271,11 @@ mod tests {
             }
         );
         assert_eq!(
+            engine.resolved_constraint_action(),
+            Some(ResolvedConstraintAction::Abort),
+            "an Insert with zero OE bits uses and reports the default ABORT policy"
+        );
+        assert_eq!(
             after - before,
             0,
             "duplicate Insert should consume MakeRecord sideband bytes without materializing"
@@ -28490,6 +29331,11 @@ mod tests {
                 message: "PRIMARY KEY constraint failed".to_owned(),
             }
         );
+        assert_eq!(
+            engine.resolved_constraint_action(),
+            Some(ResolvedConstraintAction::Abort),
+            "the MemDatabase Insert path must report the same default ABORT policy"
+        );
 
         let db = engine.take_database().expect("database should exist");
         let table = db.get_table(root).expect("table should exist");
@@ -28541,6 +29387,80 @@ mod tests {
         assert!(recovered.is_some());
         assert!(engine.txn_page_io.is_none());
         assert!(engine.storage_cursors.is_empty());
+    }
+
+    #[test]
+    fn test_owner_drain_recovers_transaction_with_live_or_dropped_clone() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+
+        let txn_with_live_clone = run_async(pager.begin(&cx, TransactionMode::Immediate)).unwrap();
+        let page_io = SharedTxnPageIo::from_transaction(txn_with_live_clone);
+        let live_clone = page_io.clone();
+        let recovered = page_io.drain_transaction_for_owner();
+        assert!(
+            !matches!(recovered, TransactionKind::Drained),
+            "owner drain must recover the real transaction while a cursor clone is live"
+        );
+        drop(live_clone);
+
+        let txn_after_clone_drop = run_async(pager.begin(&cx, TransactionMode::Immediate)).unwrap();
+        let page_io = SharedTxnPageIo::from_transaction(txn_after_clone_drop);
+        let clone_dropped_first = page_io.clone();
+        drop(clone_dropped_first);
+        let recovered = page_io.drain_transaction_for_owner();
+        assert!(
+            !matches!(recovered, TransactionKind::Drained),
+            "owner drain must also recover the real transaction after cursor clones drop"
+        );
+    }
+
+    #[test]
+    fn test_suspend_transaction_for_handoff_invalidates_retained_state() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = run_async(pager.begin(&cx, TransactionMode::Immediate)).unwrap();
+        let root = 256;
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(MemDatabase::new());
+        engine.set_transaction(txn);
+        engine.retain_storage_cursors_on_close = true;
+        assert!(
+            run_async(engine.open_storage_cursor(7, root, true)),
+            "handoff proof requires a real cursor-held SharedTxnPageIo clone"
+        );
+        assert!(engine.storage_cursors.contains_key(&7));
+        assert_eq!(engine.cursor_root_pages.get(&7), Some(&root));
+        let live_page_io = engine
+            .txn_page_io
+            .as_ref()
+            .expect("transaction wrapper should be installed")
+            .clone();
+        assert!(
+            Rc::strong_count(&live_page_io.txn) > 1,
+            "the live storage cursor must hold another shared transaction reference"
+        );
+        engine.pending_next_after_delete.insert(7);
+
+        let recovered = engine
+            .suspend_transaction_for_handoff()
+            .expect("handoff suspension should recover the installed transaction");
+        assert!(!matches!(recovered, TransactionKind::Drained));
+        assert!(!engine.retain_storage_cursors_on_close);
+        assert!(engine.storage_cursors.is_empty());
+        assert!(engine.pending_next_after_delete.is_empty());
+        assert!(engine.cursor_root_pages.is_empty());
+        assert!(engine.time_travel_cursors.is_empty());
+        assert!(engine.has_txn_page_io());
+        assert!(
+            matches!(&*live_page_io.txn.borrow(), TransactionKind::Drained),
+            "every previously shared wrapper must observe the drained sentinel after handoff"
+        );
     }
 
     #[test]
@@ -30931,12 +31851,6 @@ mod tests {
     }
 
     // ── External Sort Tests (bd-1rw.4) ──────────────────────────────────
-
-    /// Mutex to serialize tests that mutate global VDBE observability settings.
-    ///
-    /// JIT and metrics configuration are both process-global, so tests that
-    /// toggle them must not run concurrently.
-    static VDBE_OBSERVABILITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn run_sorter_metric_program() -> Vec<Vec<SqliteValue>> {
         run_program(|b| {

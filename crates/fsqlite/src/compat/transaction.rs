@@ -6,9 +6,12 @@
 //! obligation on the connection, which the next SQL entry point discharges
 //! before it executes anything else (see [`Drop`] on [`Transaction`]).
 //!
-//! The rollback is therefore *guaranteed* but *deferred* -- it completes at
-//! the next statement rather than inside `Drop`, because `Drop::drop` cannot
-//! await and this crate never builds its own runtime.
+//! The rollback is therefore *mandatory* but *deferred*: while the connection
+//! remains alive, the next data-bearing async entry point or awaited close
+//! settles it before admitting more work. Cancellation republishes the exact
+//! cleanup receipt for retry; a returned terminal rollback error poisons the
+//! connection so later work remains fail-closed. Dropping the connection itself
+//! cannot await cleanup because this crate never builds its own runtime.
 
 use std::future::Future;
 
@@ -58,8 +61,10 @@ impl<'a> Transaction<'a> {
 
     /// Rollback the transaction explicitly.
     ///
-    /// If `ROLLBACK` fails, the transaction remains active and drop will make a
-    /// best-effort rollback later.
+    /// Cancellation leaves a retryable cleanup receipt on the connection. A
+    /// returned terminal rollback failure poisons the connection; later
+    /// data-bearing operations are rejected rather than retrying a
+    /// partly-consumed rollback.
     pub async fn rollback(&mut self) -> Result<(), FrankenError> {
         self.conn.rollback_transaction().await?;
         self.finalized = true;
@@ -201,19 +206,18 @@ impl Drop for Transaction<'_> {
         // crate never builds its own runtime (the `Cx` flows down from the
         // consumer), so the rollback cannot be *finished* here.
         //
-        // It can still be *guaranteed*. We record the obligation on the
-        // connection; the next SQL entry point discharges it by rolling back
-        // before it runs anything else. That preserves the observable
-        // rusqlite contract -- an abandoned transaction's writes are never
-        // visible to a later statement -- without blocking in `Drop` and
-        // without owning a runtime.
+        // Record a mandatory connection-owned obligation. While the
+        // connection remains alive, its next data-bearing async entry point or
+        // awaited close settles rollback before admitting more work.
+        // Cancellation republishes the receipt; a terminal failure poisons the
+        // connection. Dropping the connection itself cannot await that work.
         if !self.finalized {
             self.conn.mark_transaction_cleanup_required();
             tracing::debug!(
                 target: "fsqlite::compat",
                 event = "transaction_drop_without_finalize",
                 msg = "Transaction dropped without an awaited commit()/rollback(); \
-                       it will be rolled back before the next statement runs"
+                       it will be rolled back before the next data-bearing operation runs"
             );
         }
     }
@@ -225,8 +229,9 @@ pub trait TransactionExt {
     ///
     /// The returned `Transaction` must be finalized by awaiting `commit()` or
     /// `rollback()`. Dropping it records a mandatory rollback obligation on
-    /// the connection; the next SQL entry point completes that rollback before
-    /// executing the caller's statement.
+    /// the connection; the next data-bearing async entry point or awaited close
+    /// completes that rollback before admitting more work. A terminal rollback
+    /// failure poisons the connection.
     fn transaction(&self) -> impl Future<Output = Result<Transaction<'_>, FrankenError>>;
 }
 

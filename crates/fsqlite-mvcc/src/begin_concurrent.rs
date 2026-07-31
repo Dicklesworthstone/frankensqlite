@@ -1896,7 +1896,7 @@ pub enum SsiResult {
 /// optimistic planning frontier, not necessarily the final published commit
 /// sequence if another commit slips in between prepare and finalize.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedConcurrentCommit {
     session_id: u64,
     planned_commit_seq: CommitSeq,
@@ -1976,6 +1976,41 @@ impl PreparedConcurrentCommit {
     #[must_use]
     pub fn write_set_pages(&self) -> &[PageNumber] {
         &self.write_set_pages
+    }
+
+    /// Whether this plan's physical write set intersects `other`'s write set.
+    ///
+    /// Prepared write-set pages are sorted, so this performs an exact
+    /// allocation-free page intersection rather than a coarse witness check.
+    #[must_use]
+    pub fn has_write_write_overlap(&self, other: &Self) -> bool {
+        let mut left = self.write_set_pages.iter();
+        let mut right = other.write_set_pages.iter();
+        let (mut left_page, mut right_page) = (left.next(), right.next());
+
+        while let (Some(left_value), Some(right_value)) = (left_page, right_page) {
+            match left_value.cmp(right_value) {
+                std::cmp::Ordering::Less => left_page = left.next(),
+                std::cmp::Ordering::Equal => return true,
+                std::cmp::Ordering::Greater => right_page = right.next(),
+            }
+        }
+
+        false
+    }
+
+    /// Whether this plan's reads overlap writes owned by `other`.
+    ///
+    /// Direction matters: callers that need to fence both rw-antidependency
+    /// directions must invoke this once in each direction.
+    #[must_use]
+    pub fn has_read_write_overlap(&self, other: &Self) -> bool {
+        self.read_keys.iter().any(|read_key| {
+            other
+                .write_keys
+                .iter()
+                .any(|write_key| crate::witness_plane::witness_keys_overlap(read_key, write_key))
+        })
     }
 
     #[must_use]
@@ -2845,48 +2880,31 @@ pub fn prepare_concurrent_commit_with_ssi(
         return Err((MvccError::BusySnapshot, FcwResult::Clean));
     }
 
-    if registry.can_use_uncontended_prepare_fast_path(session_id, begin_seq) {
-        if write_set_pages.is_empty() {
-            let Some((sorted_read_keys, read_key_summary, sorted_write_keys, write_key_summary)) =
-                hydrate_finalize_witness_state(registry, session_id)
-            else {
-                if let Some(mut handle) = registry.get_mut(session_id) {
-                    release_tracked_page_locks(lock_table, &handle, txn_id);
-                    handle.mark_aborted();
-                } else {
-                    lock_table.release_all(txn_id);
-                }
-                return Err((MvccError::InvalidState, FcwResult::Clean));
-            };
-            return Ok(PreparedConcurrentCommit {
-                session_id,
-                planned_commit_seq,
-                txn_token: txn,
-                begin_seq,
-                read_keys: sorted_read_keys,
-                read_key_summary,
-                write_keys: sorted_write_keys,
-                write_key_summary,
-                write_set_pages,
-                held_lock_pages,
-                has_in_rw: false,
-                has_out_rw: false,
-                incoming_edges: Vec::new(),
-                outgoing_edges: Vec::new(),
-                dro_t3_decision: None,
-                used_uncontended_prepare_fast_path: true,
-                used_candidate_free_prepare_fast_path: false,
-            });
+    // Every successful prepared plan must own the complete witness state.
+    // In particular, a plan can outlive removal or recycling of its live
+    // registry session while physical pager publication is in flight.
+    let Some((sorted_read_keys, read_key_summary, sorted_write_keys, write_key_summary)) =
+        hydrate_finalize_witness_state(registry, session_id)
+    else {
+        if let Some(mut handle) = registry.get_mut(session_id) {
+            release_tracked_page_locks(lock_table, &handle, txn_id);
+            handle.mark_aborted();
+        } else {
+            lock_table.release_all(txn_id);
         }
+        return Err((MvccError::InvalidState, FcwResult::Clean));
+    };
+
+    if registry.can_use_uncontended_prepare_fast_path(session_id, begin_seq) {
         return Ok(PreparedConcurrentCommit {
             session_id,
             planned_commit_seq,
             txn_token: txn,
             begin_seq,
-            read_keys: Vec::new(),
-            read_key_summary: WitnessKeySummary::default(),
-            write_keys: Vec::new(),
-            write_key_summary: WitnessKeySummary::default(),
+            read_keys: sorted_read_keys,
+            read_key_summary,
+            write_keys: sorted_write_keys,
+            write_key_summary,
             write_set_pages,
             held_lock_pages,
             has_in_rw: false,
@@ -2899,20 +2917,6 @@ pub fn prepare_concurrent_commit_with_ssi(
         });
     }
 
-    let Some((sorted_read_keys, _read_key_summary, sorted_write_keys, _write_key_summary)) =
-        hydrate_finalize_witness_state(registry, session_id)
-    else {
-        if let Some(mut handle) = registry.get_mut(session_id) {
-            release_tracked_page_locks(lock_table, &handle, txn_id);
-            handle.mark_aborted();
-        } else {
-            lock_table.release_all(txn_id);
-        }
-        return Err((MvccError::InvalidState, FcwResult::Clean));
-    };
-
-    let read_key_summary = summarize_witness_keys(&sorted_read_keys);
-    let write_key_summary = summarize_witness_keys(&sorted_write_keys);
     if sorted_read_keys.is_empty() && sorted_write_keys.is_empty() {
         return Ok(PreparedConcurrentCommit {
             session_id,
@@ -3326,36 +3330,17 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         return;
     }
 
-    let hydrated_witness_state;
     let (read_keys, read_key_summary, write_keys, write_key_summary): (
         &[WitnessKey],
         &WitnessKeySummary,
         &[WitnessKey],
         &WitnessKeySummary,
-    ) = if prepared.used_uncontended_prepare_fast_path() {
-        hydrated_witness_state = hydrate_finalize_witness_state(registry, prepared.session_id)
-            .unwrap_or_else(|| {
-                (
-                    prepared.read_keys.clone(),
-                    prepared.read_key_summary.clone(),
-                    prepared.write_keys.clone(),
-                    prepared.write_key_summary.clone(),
-                )
-            });
-        (
-            &hydrated_witness_state.0,
-            &hydrated_witness_state.1,
-            &hydrated_witness_state.2,
-            &hydrated_witness_state.3,
-        )
-    } else {
-        (
-            &prepared.read_keys,
-            &prepared.read_key_summary,
-            &prepared.write_keys,
-            &prepared.write_key_summary,
-        )
-    };
+    ) = (
+        &prepared.read_keys,
+        &prepared.read_key_summary,
+        &prepared.write_keys,
+        &prepared.write_key_summary,
+    );
 
     if prepared.incoming_edges.is_empty()
         && prepared.outgoing_edges.is_empty()
@@ -3843,10 +3828,10 @@ mod tests {
 
     use super::{
         ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
-        ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, concurrent_abort,
-        concurrent_clear_page_state, concurrent_commit, concurrent_commit_read_only,
-        concurrent_commit_with_ssi, concurrent_free_page, concurrent_is_metadata_exempt,
-        concurrent_mark_metadata_exempt, concurrent_page_is_freed,
+        ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS,
+        PreparedConcurrentCommit, concurrent_abort, concurrent_clear_page_state, concurrent_commit,
+        concurrent_commit_read_only, concurrent_commit_with_ssi, concurrent_free_page,
+        concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt, concurrent_page_is_freed,
         concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status,
         concurrent_page_state, concurrent_prepare_write_page, concurrent_read_page,
         concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
@@ -3876,6 +3861,34 @@ mod tests {
             TxnId::new(id).expect("test transaction id"),
             TxnEpoch::new(id as u32 + 1),
         )
+    }
+
+    fn test_prepared_plan(
+        session_id: u64,
+        read_keys: Vec<WitnessKey>,
+        write_keys: Vec<WitnessKey>,
+        mut write_set_pages: Vec<PageNumber>,
+    ) -> PreparedConcurrentCommit {
+        write_set_pages.sort_unstable();
+        PreparedConcurrentCommit {
+            session_id,
+            planned_commit_seq: CommitSeq::new(11),
+            txn_token: test_token(session_id),
+            begin_seq: CommitSeq::new(10),
+            read_key_summary: summarize_witness_keys(&read_keys),
+            read_keys,
+            write_key_summary: summarize_witness_keys(&write_keys),
+            write_keys,
+            held_lock_pages: write_set_pages.clone(),
+            write_set_pages,
+            has_in_rw: false,
+            has_out_rw: false,
+            incoming_edges: Vec::new(),
+            outgoing_edges: Vec::new(),
+            dro_t3_decision: None,
+            used_uncontended_prepare_fast_path: false,
+            used_candidate_free_prepare_fast_path: false,
+        }
     }
 
     const MVCC_METAMORPHIC_PROPTEST_CASES: u32 = 64;
@@ -5472,10 +5485,96 @@ mod tests {
             prepared.used_uncontended_prepare_fast_path(),
             "prepare should tag uncontended plans so finalize can re-check for the matching fast path"
         );
-        assert!(
-            prepared.read_keys().is_empty() && prepared.write_keys().is_empty(),
-            "uncontended prepare should defer witness materialization until slow finalize actually needs it"
+        assert_eq!(
+            prepared.read_keys(),
+            &[WitnessKey::Page(test_page(7))],
+            "uncontended prepare must own its exact read witnesses"
         );
+        assert_eq!(
+            prepared.write_keys(),
+            &[WitnessKey::Page(test_page(9))],
+            "uncontended prepare must own its exact write witnesses"
+        );
+    }
+
+    #[test]
+    fn test_prepared_commit_overlap_predicates_are_exact_and_directional() {
+        let baseline = test_prepared_plan(
+            1,
+            vec![
+                WitnessKey::ByteRange {
+                    page: test_page(10),
+                    start: 0,
+                    len: 4,
+                },
+                WitnessKey::Cell {
+                    btree_root: test_page(20),
+                    leaf_page: test_page(21),
+                    tag: 100,
+                },
+            ],
+            vec![WitnessKey::Page(test_page(30))],
+            vec![test_page(30), test_page(50)],
+        );
+        let physical_overlap = test_prepared_plan(
+            2,
+            Vec::new(),
+            Vec::new(),
+            vec![test_page(40), test_page(50)],
+        );
+        let forward_rw_overlap = test_prepared_plan(
+            3,
+            Vec::new(),
+            vec![WitnessKey::ByteRange {
+                page: test_page(10),
+                start: 3,
+                len: 2,
+            }],
+            vec![test_page(70)],
+        );
+        let reverse_rw_overlap = test_prepared_plan(
+            4,
+            vec![WitnessKey::Page(test_page(30))],
+            Vec::new(),
+            vec![test_page(80)],
+        );
+        let disjoint = test_prepared_plan(
+            5,
+            vec![WitnessKey::Page(test_page(31))],
+            vec![
+                WitnessKey::ByteRange {
+                    page: test_page(10),
+                    start: 4,
+                    len: 2,
+                },
+                WitnessKey::Cell {
+                    btree_root: test_page(20),
+                    leaf_page: test_page(21),
+                    tag: 101,
+                },
+            ],
+            vec![test_page(40), test_page(60)],
+        );
+
+        assert!(baseline.has_write_write_overlap(&physical_overlap));
+        assert!(physical_overlap.has_write_write_overlap(&baseline));
+        assert!(!baseline.has_write_write_overlap(&disjoint));
+
+        assert!(baseline.has_read_write_overlap(&forward_rw_overlap));
+        assert!(
+            !forward_rw_overlap.has_read_write_overlap(&baseline),
+            "read/write overlap must not silently reverse direction"
+        );
+        assert!(reverse_rw_overlap.has_read_write_overlap(&baseline));
+        assert!(
+            !baseline.has_read_write_overlap(&reverse_rw_overlap),
+            "the opposite rw direction requires an explicit second check"
+        );
+        assert!(
+            !baseline.has_read_write_overlap(&disjoint),
+            "adjacent byte ranges and distinct cell tags must remain disjoint"
+        );
+        assert!(!disjoint.has_read_write_overlap(&baseline));
     }
 
     #[test]
@@ -5559,7 +5658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_rehydrates_deferred_witnesses_when_fast_path_plan_loses_eligibility() {
+    fn test_uncontended_fast_path_plan_remains_self_contained_after_session_removal() {
         let lock_table = InProcessPageLockTable::new();
         let commit_index = CommitIndex::new();
         let mut registry = ConcurrentRegistry::new();
@@ -5591,15 +5690,38 @@ mod tests {
             prepared.used_uncontended_prepare_fast_path(),
             "setup should hit the uncontended prepare fast path"
         );
+
         assert!(
-            prepared.read_keys().is_empty() && prepared.write_keys().is_empty(),
-            "prepare should not materialize witness vectors on the uncontended path"
+            registry.remove(session_id).is_some(),
+            "remove the live session before inspecting prepared evidence"
+        );
+        assert!(
+            registry.get(session_id).is_none(),
+            "prepared evidence must not depend on a registry handle"
+        );
+        assert_eq!(
+            prepared.read_keys(),
+            &[WitnessKey::Page(test_page(7))],
+            "the plan must retain exact read evidence after session removal"
+        );
+        assert_eq!(
+            prepared.write_keys(),
+            &[WitnessKey::Page(test_page(9))],
+            "the plan must retain exact write evidence after session removal"
         );
 
         let blocker = registry.begin_concurrent(test_snapshot(11)).unwrap();
         {
-            let blocker_handle = registry.get(blocker).unwrap();
-            assert!(blocker_handle.is_active(), "blocker txn should stay active");
+            let mut blocker_handle = registry.get_mut(blocker).unwrap();
+            blocker_handle.record_read(test_page(9));
+            concurrent_write_page(
+                &mut blocker_handle,
+                &lock_table,
+                blocker,
+                test_page(7),
+                test_data(),
+            )
+            .expect("blocker writes the prepared reader's page");
         }
 
         finalize_prepared_concurrent_commit_with_ssi(
@@ -5613,12 +5735,22 @@ mod tests {
         assert_eq!(
             registry.committed_readers.len(),
             1,
-            "slow finalize fallback should rehydrate deferred read witnesses before publishing history"
+            "slow finalize must publish read history owned by the prepared plan"
         );
         assert_eq!(
             registry.committed_writers.len(),
             1,
-            "slow finalize fallback should rehydrate deferred write witnesses before publishing history"
+            "slow finalize must publish write history owned by the prepared plan"
+        );
+        assert_eq!(
+            registry.committed_readers[0].keys,
+            vec![WitnessKey::Page(test_page(7))],
+            "published read history must exactly match the detached plan"
+        );
+        assert_eq!(
+            registry.committed_writers[0].keys,
+            vec![WitnessKey::Page(test_page(9))],
+            "published write history must exactly match the detached plan"
         );
     }
 

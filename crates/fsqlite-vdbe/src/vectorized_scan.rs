@@ -517,7 +517,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::vectorized::{ColumnSpec, ColumnVectorType, DEFAULT_BATCH_ROW_CAPACITY};
+    use crate::{
+        VDBE_OBSERVABILITY_LOCK,
+        vectorized::{ColumnSpec, ColumnVectorType, DEFAULT_BATCH_ROW_CAPACITY},
+    };
 
     const PAGE_SIZE: u32 = 512;
     const ROOT_PAGE: u32 = 2;
@@ -936,6 +939,9 @@ mod tests {
 
     #[test]
     fn scan_reuses_decode_scratch_and_avoids_full_record_parse_calls() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         block_on_test(async {
             let (io, root_page) = build_fixture(257).await;
             let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();

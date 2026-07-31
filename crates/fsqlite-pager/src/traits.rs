@@ -13,13 +13,15 @@
 //! - **Open (user-implementable):** `Vfs`, `VfsFile` (in `fsqlite-vfs`)
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
 use crate::pager::SimpleTransaction;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{PageData, PageNumber, PageSize};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
 #[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::IoUringVfs;
 #[cfg(all(feature = "native", unix))]
@@ -750,6 +752,210 @@ pub enum TransactionMode {
 }
 
 // ---------------------------------------------------------------------------
+// Transaction commit disposition
+// ---------------------------------------------------------------------------
+
+/// Opaque identity for one logical pager commit attempt.
+///
+/// Real pager transactions allocate this before their first commit-time
+/// suspension point and retain it through retry, recovery, publication, and
+/// terminal exit. The identity lets upper layers correlate a persistent pager
+/// obligation with the exact MVCC publication plan prepared for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PagerCommitAttemptId(u64);
+
+impl PagerCommitAttemptId {
+    /// Construct an attempt identity from its process-local monotonic value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the process-local monotonic value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Proof that one pager commit reached shared pager visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagerCommitReceipt {
+    /// Logical attempt that produced this publication.
+    pub attempt_id: PagerCommitAttemptId,
+    /// Pager publication sequence visible after the commit.
+    pub visible_commit_seq: CommitSeq,
+}
+
+/// Persistent disposition of a pager transaction's logical commit.
+///
+/// Unlike a plain `Result<()>`, this value remains inspectable after the
+/// future returned an error or was dropped. Upper layers must treat
+/// [`Self::InDoubt`], [`Self::DurablePendingPublication`], and
+/// [`Self::PublishedPendingExit`] as commit obligations: rollback is not
+/// permitted until the pager has produced an exact non-commit verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagerCommitState {
+    /// No commit attempt owns transaction state; ordinary rollback is legal.
+    Active,
+    /// Commit preparation owns reversible transaction-local state, but no
+    /// physical mutation has begun.
+    Preparing {
+        /// Logical attempt owning the reversible preparation state.
+        attempt_id: PagerCommitAttemptId,
+    },
+    /// Physical mutation may have begun and must be reconciled before rollback.
+    InDoubt {
+        /// Logical attempt whose physical outcome is unresolved.
+        attempt_id: PagerCommitAttemptId,
+    },
+    /// Physical durability is proven; pager publication must be resumed.
+    DurablePendingPublication {
+        /// Logical attempt that became durable.
+        attempt_id: PagerCommitAttemptId,
+    },
+    /// Shared pager publication is complete; only terminal exit remains.
+    PublishedPendingExit(PagerCommitReceipt),
+    /// Commit publication and terminal exit are complete.
+    Committed(PagerCommitReceipt),
+    /// The transaction reached an exact non-commit terminal state.
+    RolledBack,
+}
+
+impl PagerCommitState {
+    /// Return the logical attempt identity, when a commit owns the transaction.
+    #[must_use]
+    pub const fn attempt_id(self) -> Option<PagerCommitAttemptId> {
+        match self {
+            Self::Active | Self::RolledBack => None,
+            Self::Preparing { attempt_id }
+            | Self::InDoubt { attempt_id }
+            | Self::DurablePendingPublication { attempt_id } => Some(attempt_id),
+            Self::PublishedPendingExit(receipt) | Self::Committed(receipt) => {
+                Some(receipt.attempt_id)
+            }
+        }
+    }
+
+    /// Whether rollback may discard this transaction without first reconciling
+    /// an irreversible commit boundary.
+    #[must_use]
+    pub const fn rollback_is_permitted(self) -> bool {
+        matches!(
+            self,
+            Self::Active | Self::Preparing { .. } | Self::RolledBack
+        )
+    }
+
+    /// Whether physical durability is already proven.
+    #[must_use]
+    pub const fn is_durable(self) -> bool {
+        matches!(
+            self,
+            Self::DurablePendingPublication { .. }
+                | Self::PublishedPendingExit(_)
+                | Self::Committed(_)
+        )
+    }
+}
+
+/// Exact logical outcome of a rollback request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagerTransactionEnd {
+    /// No commit became durable and the transaction was rolled back.
+    RolledBack,
+    /// The commit was already irreversible, so rollback completed its
+    /// publication/exit obligation instead of discarding it.
+    AlreadyCommitted(PagerCommitReceipt),
+}
+
+/// Successful terminal disposition of one logical pager commit attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagerCommitSuccess {
+    /// The commit was published and the transaction handle reached terminal
+    /// exit.
+    Finished(PagerCommitReceipt),
+    /// The commit was published while the transaction handle was reset for
+    /// immediate reuse.
+    Retained(PagerCommitReceipt),
+}
+
+impl PagerCommitSuccess {
+    /// Return the exact receipt produced by the successful attempt.
+    #[must_use]
+    pub const fn receipt(self) -> PagerCommitReceipt {
+        match self {
+            Self::Finished(receipt) | Self::Retained(receipt) => receipt,
+        }
+    }
+
+    /// Whether the transaction handle remains available for a new logical
+    /// attempt.
+    #[must_use]
+    pub const fn was_retained(self) -> bool {
+        matches!(self, Self::Retained(_))
+    }
+}
+
+/// Typed failure from one pager commit attempt.
+///
+/// The error explains why the current poll stopped; `state` is the
+/// authoritative disposition that tells upper layers whether retry,
+/// reconciliation, or rollback is legal.
+#[derive(Debug)]
+pub struct PagerCommitFailure {
+    error: FrankenError,
+    state: PagerCommitState,
+}
+
+impl PagerCommitFailure {
+    /// Pair an operational error with the persistent state left behind.
+    #[must_use]
+    pub const fn new(error: FrankenError, state: PagerCommitState) -> Self {
+        Self { error, state }
+    }
+
+    /// Return the persistent state left by the failed attempt.
+    #[must_use]
+    pub const fn state(&self) -> PagerCommitState {
+        self.state
+    }
+
+    /// Borrow the underlying operational error.
+    #[must_use]
+    pub const fn error(&self) -> &FrankenError {
+        &self.error
+    }
+
+    /// Consume the typed failure and return its operational error.
+    #[must_use]
+    pub fn into_error(self) -> FrankenError {
+        self.error
+    }
+}
+
+impl fmt::Display for PagerCommitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for PagerCommitFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<PagerCommitFailure> for FrankenError {
+    fn from(failure: PagerCommitFailure) -> Self {
+        failure.into_error()
+    }
+}
+
+/// Typed result of one pager commit attempt.
+pub type PagerCommitResult = std::result::Result<PagerCommitSuccess, PagerCommitFailure>;
+
+// ---------------------------------------------------------------------------
 // MvccPager — primary storage interface
 // ---------------------------------------------------------------------------
 
@@ -817,8 +1023,10 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
 /// A handle to an active MVCC transaction.
 ///
 /// Provides page-level read/write access scoped to the transaction's
-/// snapshot. Dropping a handle without calling [`commit`](Self::commit)
-/// implicitly rolls back.
+/// snapshot. Dropping a handle with only reversible local state abandons that
+/// state. Once a commit enters an in-doubt or durable state, however, dropping
+/// the handle must transfer the outstanding obligation to persistent recovery;
+/// it must never be interpreted as an implicit rollback.
 ///
 /// # Page resolution chain
 ///
@@ -926,6 +1134,16 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// WAL append, and version publish. Returns `SQLITE_BUSY_SNAPSHOT`
     /// (via `FrankenError::Busy`) on serialization failure.
     fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a;
+
+    /// Return the exact persistent state of this transaction's logical commit.
+    ///
+    /// Implementations must update this state before every commit-time
+    /// suspension boundary whose cancellation could otherwise make rollback
+    /// ambiguous. The state must remain valid after the corresponding future is
+    /// dropped.
+    fn commit_state(&self) -> PagerCommitState {
+        PagerCommitState::Active
+    }
 
     /// Commit dirty pages and reset for immediate reuse without destroying
     /// the transaction handle.
@@ -1064,12 +1282,24 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         Ok(true)
     }
 
-    /// Roll back this transaction, discarding the write-set.
-    ///
-    /// Rollback is infallible in the MVCC model (we simply discard the
-    /// local write-set and release page locks), but returns `Result` for
-    /// consistency with the trait surface.
+    /// Roll back this transaction, discarding the write-set when no commit
+    /// crossed an irreversible boundary.
     fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a;
+
+    /// Resolve a rollback request with an exact logical outcome.
+    ///
+    /// The default preserves simple/mock implementations. Durable pager
+    /// implementations override this so a rollback request that encounters an
+    /// irreversible commit returns [`PagerTransactionEnd::AlreadyCommitted`].
+    fn rollback_with_outcome<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<PagerTransactionEnd>> + 'a {
+        async move {
+            self.rollback(cx).await?;
+            Ok(PagerTransactionEnd::RolledBack)
+        }
+    }
 
     /// Record a granular write witness for fine-grained SSI bookkeeping.
     ///
@@ -1536,6 +1766,49 @@ impl std::fmt::Debug for TransactionKind {
 }
 
 impl TransactionKind {
+    /// Finalize a cached private-`:memory:` read snapshot without routing it
+    /// through the generic rollback state machine.
+    ///
+    /// Cached transaction cleanup is valid only for the concrete memory pager;
+    /// every other variant fails closed so a caller cannot accidentally apply
+    /// private-memory terminal semantics to a file-backed transaction.
+    pub async fn finalize_cached_memory_read_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        match self {
+            Self::Memory(txn) => txn.finalize_cached_memory_read_snapshot(cx).await,
+            _ => Err(fsqlite_error::FrankenError::internal(
+                "cached-memory read finalization requires a private :memory: transaction",
+            )),
+        }
+    }
+
+    /// Finalize a cached private-`:memory:` writer that was already published
+    /// by `commit_and_retain`, without executing a second logical commit.
+    pub async fn finalize_cached_memory_published_writer(&mut self, cx: &Cx) -> Result<()> {
+        match self {
+            Self::Memory(txn) => txn.finalize_cached_memory_published_writer(cx).await,
+            _ => Err(fsqlite_error::FrankenError::internal(
+                "cached-memory writer finalization requires a private :memory: transaction",
+            )),
+        }
+    }
+
+    /// Release an already-published cached private-memory writer during
+    /// connection close without flushing an image that is about to disappear.
+    pub async fn finalize_cached_memory_published_writer_for_close(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(txn) => {
+                txn.finalize_cached_memory_published_writer_for_close(cx)
+                    .await
+            }
+            _ => Err(fsqlite_error::FrankenError::internal(
+                "cached-memory close finalization requires a private :memory: transaction",
+            )),
+        }
+    }
+
     /// The pager's live free-page set for this transaction (see
     /// [`SimpleTransaction::live_freelist_pages`]). Used by `PRAGMA
     /// integrity_check` (GH#113) to validate page ownership against the
@@ -1703,6 +1976,10 @@ impl TransactionHandle for TransactionKind {
         async move { dispatch_transaction_kind!(self, txn => txn.commit(cx).await) }
     }
 
+    fn commit_state(&self) -> PagerCommitState {
+        dispatch_transaction_kind!(self, txn => txn.commit_state())
+    }
+
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
         async move { dispatch_transaction_kind!(self, txn => txn.commit_and_retain(cx).await) }
     }
@@ -1757,6 +2034,13 @@ impl TransactionHandle for TransactionKind {
 
     fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move { dispatch_transaction_kind!(self, txn => txn.rollback(cx).await) }
+    }
+
+    fn rollback_with_outcome<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<PagerTransactionEnd>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.rollback_with_outcome(cx).await) }
     }
 
     fn record_write_witness(&mut self, cx: &Cx, key: fsqlite_types::WitnessKey) {

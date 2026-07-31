@@ -2486,7 +2486,9 @@ RAISE functions (trigger-specific error control):
 Execution model:
     Triggers compile to VDBE subroutines.
     Trigger body is a sequence of DML statements, each compiled independently.
-    Maximum trigger recursion depth: 1000 (SQLITE_MAX_TRIGGER_DEPTH).
+    Maximum trigger recursion depth in the current implementation: 8.
+    SQLite's default SQLITE_MAX_TRIGGER_DEPTH is 1000; raising FrankenSQLite's
+    limit is gated on bounded-stack proof at that exact depth.
     Recursive triggers require PRAGMA recursive_triggers = ON.
 ```
 

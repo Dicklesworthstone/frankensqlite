@@ -21,6 +21,7 @@ fsqlite-ext-rtree = { workspace = true, optional = true }
 fsqlite-ext-session = { workspace = true, optional = true }
 fsqlite-ext-icu = { workspace = true, optional = true }
 fsqlite-ext-misc = { workspace = true, optional = true }
+fsqlite-ast = { workspace = true }
 fsqlite-parser = { workspace = true }
 tracing = { workspace = true }
 
@@ -46,7 +47,6 @@ mvcc = []
 # need `asupersync::test_utils::run_test` unconditionally — hence a non-optional
 # dev-dependency as well.
 asupersync = { workspace = true, features = ["test-internals"] }
-fsqlite-ast = { workspace = true }
 fsqlite-func = { workspace = true }
 fsqlite-pager = { workspace = true }
 rand = { workspace = true }

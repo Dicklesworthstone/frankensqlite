@@ -15,8 +15,8 @@ use hashbrown::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+use fsqlite_types::sync_primitives::Instant;
 use std::sync::Arc;
-use std::time::Instant;
 
 pub mod codegen;
 pub mod dataflow;
@@ -39,6 +39,11 @@ pub mod vectorized_sort;
 
 #[cfg(test)]
 mod vectorized_prop_tests;
+
+/// Serializes unit tests that reset process-global VDBE, record-decoding, or
+/// B-tree copy-profile counters.
+#[cfg(test)]
+pub(crate) static VDBE_OBSERVABILITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VdbePipelineStage {

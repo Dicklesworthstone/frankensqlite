@@ -2,7 +2,7 @@
 //!
 //! Validates AST nodes against a schema to ensure:
 //! - Column references resolve to known tables/columns
-//! - Table aliases are unique within a query scope
+//! - Every FROM source remains independently addressable during name resolution
 //! - Function arity matches known functions
 //! - CTE names are visible in the correct scope
 //! - Type affinity is tracked for expression results
@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_ast::{
-    ColumnRef, Expr, FromClause, FunctionArgs, InSet, JoinClause, JoinConstraint, Literal,
+    ColumnRef, Cte, Expr, FromClause, FunctionArgs, InSet, JoinClause, JoinConstraint, Literal,
     QualifiedName, ResultColumn, SelectCore, SelectStatement, Statement, TableOrSubquery,
     WithClause,
 };
@@ -206,30 +206,88 @@ fn table_lookup_key(name: &QualifiedName) -> String {
     }
 }
 
-fn lookup_key_table_name(lookup_key: &str) -> &str {
-    lookup_key
-        .split_once('\0')
-        .map_or(lookup_key, |(_, table_name)| table_name)
-}
-
 // ---------------------------------------------------------------------------
 // Scope tracking
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+struct QualifiedColumnBinding {
+    lookup_key: String,
+    table_name: String,
+    columns: Option<HashSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum StarNamespace {
+    Database(String),
+    Derived,
+}
+
+#[derive(Debug, Clone)]
+struct OrderedColumns {
+    ordered: Vec<String>,
+    membership: HashSet<String>,
+}
+
+impl OrderedColumns {
+    fn new(columns: impl IntoIterator<Item = String>) -> Self {
+        let ordered = columns
+            .into_iter()
+            .map(|column| column.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let membership = ordered.iter().cloned().collect();
+        Self {
+            ordered,
+            membership,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum OutputColumns {
+    Known(OrderedColumns),
+    Unknown,
+}
+
+impl OutputColumns {
+    fn membership(&self) -> Option<&HashSet<String>> {
+        match self {
+            Self::Known(columns) => Some(&columns.membership),
+            Self::Unknown => None,
+        }
+    }
+
+    fn ordered(&self) -> Option<&[String]> {
+        match self {
+            Self::Known(columns) => Some(&columns.ordered),
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FromSourceBinding {
+    effective_name: String,
+    lookup_key: String,
+    star_namespace: StarNamespace,
+    output_columns: OutputColumns,
+    qualified_only: bool,
+}
+
 /// A name scope for query resolution. Scopes nest for subqueries and CTEs.
 #[derive(Debug, Clone)]
 pub struct Scope {
-    /// Table aliases visible in this scope: alias → table name.
-    aliases: HashMap<String, String>,
-    /// Columns visible from each alias: alias → set of column names.
-    /// None means the columns are unknown (CTE or subquery), so any column reference is optimistically accepted.
-    columns: HashMap<String, Option<HashSet<String>>>,
+    /// One binding per FROM source. Multiple sources can legitimately expose
+    /// the same effective name (for example `main.t JOIN temp.t`), so name
+    /// resolution must filter each source by the requested column before
+    /// deciding whether the reference is ambiguous.
+    bindings: Vec<FromSourceBinding>,
     /// Columns that were joined via `USING` and are therefore unambiguous.
     pub using_columns: HashSet<String>,
     /// CTE names visible in this scope.
-    ctes: HashSet<String>,
-    /// Aliases that can only be referenced by qualified names (e.g. UPSERT's "excluded").
-    qualified_only: HashSet<String>,
+    ctes: HashMap<String, Option<Vec<String>>>,
+    /// Real table identities addressable as `schema.table.column`.
+    qualified_bindings: Vec<QualifiedColumnBinding>,
     /// Parent scope (for subquery nesting).
     parent: Option<Box<Self>>,
 }
@@ -239,11 +297,10 @@ impl Scope {
     #[must_use]
     pub fn root() -> Self {
         Self {
-            aliases: HashMap::new(),
-            columns: HashMap::new(),
+            bindings: Vec::new(),
             using_columns: HashSet::new(),
-            ctes: HashSet::new(),
-            qualified_only: HashSet::new(),
+            ctes: HashMap::new(),
+            qualified_bindings: Vec::new(),
             parent: None,
         }
     }
@@ -252,25 +309,79 @@ impl Scope {
     #[must_use]
     pub fn child(parent: Self) -> Self {
         Self {
-            aliases: HashMap::new(),
-            columns: HashMap::new(),
+            bindings: Vec::new(),
             using_columns: HashSet::new(),
-            ctes: HashSet::new(),
-            qualified_only: HashSet::new(),
+            ctes: HashMap::new(),
+            qualified_bindings: Vec::new(),
             parent: Some(Box::new(parent)),
         }
     }
 
     /// Register a table alias with its columns.
     pub fn add_alias(&mut self, alias: &str, table_name: &str, columns: Option<HashSet<String>>) {
-        let key = alias.to_ascii_lowercase();
-        if self.aliases.contains_key(&key) {
-            self.aliases.insert(key.clone(), "<AMBIGUOUS>".to_owned());
-            self.columns.insert(key, None);
+        let ordered_columns = columns.map(|columns| {
+            let mut columns = columns.into_iter().collect::<Vec<_>>();
+            columns.sort_unstable();
+            columns
+        });
+        let star_namespace = if let Some((schema, _)) = table_name.split_once('\0') {
+            StarNamespace::Database(schema.to_ascii_lowercase())
+        } else if table_name.starts_with('<') {
+            StarNamespace::Derived
         } else {
-            self.aliases.insert(key.clone(), table_name.to_owned());
-            self.columns.insert(key, columns);
+            StarNamespace::Database("main".to_owned())
+        };
+        self.add_alias_with_metadata(alias, table_name, star_namespace, ordered_columns, false);
+    }
+
+    fn add_alias_with_metadata(
+        &mut self,
+        alias: &str,
+        lookup_key: &str,
+        star_namespace: StarNamespace,
+        ordered_columns: Option<Vec<String>>,
+        qualified_only: bool,
+    ) {
+        self.bindings.push(FromSourceBinding {
+            effective_name: alias.to_ascii_lowercase(),
+            lookup_key: lookup_key.to_owned(),
+            star_namespace,
+            output_columns: ordered_columns.map_or(OutputColumns::Unknown, |columns| {
+                OutputColumns::Known(OrderedColumns::new(columns))
+            }),
+            qualified_only,
+        });
+    }
+
+    fn add_table_binding(
+        &mut self,
+        name: &QualifiedName,
+        alias: Option<&str>,
+        ordered_columns: Option<Vec<String>>,
+    ) {
+        let effective_name = alias.unwrap_or(&name.name);
+        let membership = ordered_columns
+            .as_ref()
+            .map(|columns| columns.iter().cloned().collect());
+        if effective_name.eq_ignore_ascii_case(&name.name) {
+            self.qualified_bindings.push(QualifiedColumnBinding {
+                lookup_key: table_lookup_key(name),
+                table_name: name.name.to_ascii_lowercase(),
+                columns: membership,
+            });
         }
+        let schema_name = name
+            .schema
+            .as_deref()
+            .unwrap_or("main")
+            .to_ascii_lowercase();
+        self.add_alias_with_metadata(
+            effective_name,
+            &table_lookup_key(name),
+            StarNamespace::Database(schema_name),
+            ordered_columns,
+            false,
+        );
     }
 
     /// Register an alias that does not participate in unqualified column resolution.
@@ -280,66 +391,161 @@ impl Scope {
         table_name: &str,
         columns: Option<HashSet<String>>,
     ) {
-        self.add_alias(alias, table_name, columns);
-        self.qualified_only.insert(alias.to_ascii_lowercase());
+        let ordered_columns = columns.map(|columns| {
+            let mut columns = columns.into_iter().collect::<Vec<_>>();
+            columns.sort_unstable();
+            columns
+        });
+        self.add_alias_with_metadata(
+            alias,
+            table_name,
+            StarNamespace::Derived,
+            ordered_columns,
+            true,
+        );
     }
 
     /// Register a CTE name.
     pub fn add_cte(&mut self, name: &str) {
-        self.ctes.insert(name.to_ascii_lowercase());
+        self.add_cte_with_columns(name, None);
+    }
+
+    fn add_cte_with_columns(&mut self, name: &str, columns: Option<Vec<String>>) {
+        self.ctes.insert(name.to_ascii_lowercase(), columns);
     }
 
     /// Check if a CTE is visible in this scope (or parent scopes).
     #[must_use]
     pub fn has_cte(&self, name: &str) -> bool {
         let key = name.to_ascii_lowercase();
-        if self.ctes.contains(&key) {
+        if self.ctes.contains_key(&key) {
             return true;
         }
         self.parent.as_ref().is_some_and(|p| p.has_cte(name))
+    }
+
+    fn cte_columns(&self, name: &str) -> Option<Option<Vec<String>>> {
+        let key = name.to_ascii_lowercase();
+        if let Some(columns) = self.ctes.get(&key) {
+            return Some(columns.clone());
+        }
+        self.parent
+            .as_ref()
+            .and_then(|parent| parent.cte_columns(name))
     }
 
     /// Check if an alias is visible in this scope (or parent scopes).
     #[must_use]
     pub fn has_alias(&self, alias: &str) -> bool {
         let key = alias.to_ascii_lowercase();
-        if self.aliases.contains_key(&key) {
+        if self
+            .bindings
+            .iter()
+            .any(|binding| binding.effective_name == key)
+        {
             return true;
         }
         self.parent.as_ref().is_some_and(|p| p.has_alias(alias))
     }
 
-    /// Check if a table reference is visible in this scope (or parent scopes).
+    /// Check if a table reference is visible in this scope.
     ///
-    /// Bare `table.*` can match either a visible alias or the underlying table
-    /// name. Schema-qualified references must match the bound table identity
-    /// exactly, with `main.table` normalized to bare `table`.
+    /// Bare `table.*` must name the visible alias exactly. An explicit alias
+    /// hides the underlying table name. Three-part `schema.table.*` is not
+    /// legal SQLite syntax and is rejected by the parser. `table.*` is local
+    /// to the current SELECT's FROM scope and never correlates to a parent
+    /// SELECT. Unlike an ordinary qualified column, it expands every
+    /// same-named local source in FROM order.
     #[must_use]
     pub fn has_table_reference(&self, name: &QualifiedName) -> bool {
-        let target_lookup_key = table_lookup_key(name);
-        let target_name = name.name.to_ascii_lowercase();
+        self.table_star_source_columns(name).is_some()
+    }
 
-        if self.aliases.iter().any(|(alias, bound_name)| {
-            if name.schema.is_none() {
-                alias.eq_ignore_ascii_case(&target_name)
-                    || lookup_key_table_name(bound_name).eq_ignore_ascii_case(&target_name)
-            } else {
-                bound_name.eq_ignore_ascii_case(&target_lookup_key)
-            }
-        }) {
-            return true;
+    /// Return the known column sets for every source expanded by `table.*`.
+    ///
+    /// The outer vector preserves FROM-source order. A `None` entry represents
+    /// a source whose columns are not known during this semantic pass.
+    fn table_star_source_columns(
+        &self,
+        name: &QualifiedName,
+    ) -> Option<Vec<Option<&HashSet<String>>>> {
+        if name.schema.is_some() {
+            return None;
+        }
+        let target_name = name.name.to_ascii_lowercase();
+        let local_matches: Vec<_> = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.effective_name == target_name)
+            .map(|binding| binding.output_columns.membership())
+            .collect();
+        if !local_matches.is_empty() {
+            return Some(local_matches);
         }
 
-        self.parent
-            .as_ref()
-            .is_some_and(|parent| parent.has_table_reference(name))
+        None
+    }
+
+    /// Return the first column made ambiguous by duplicate aliases within one
+    /// database schema.
+    ///
+    /// SQLite expands duplicate aliases across distinct schemas (for example
+    /// `main.a AS q JOIN temp.b AS q`) even when their column names overlap.
+    /// Within one schema, however, an overlapping column makes `q.*`
+    /// ambiguous. Ordinary `q.column` resolution remains schema-independent
+    /// and is handled separately by [`Scope::resolve_column`].
+    fn table_star_ambiguity(&self, name: &QualifiedName) -> Option<(String, Vec<String>)> {
+        if name.schema.is_some() {
+            return None;
+        }
+
+        let target_name = name.name.to_ascii_lowercase();
+        let matching_bindings = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.effective_name == target_name)
+            .collect::<Vec<_>>();
+        for (binding_index, binding) in matching_bindings.iter().enumerate() {
+            let Some(columns) = binding.output_columns.ordered() else {
+                continue;
+            };
+            for column in columns {
+                let overlaps_later_source = matching_bindings
+                    .iter()
+                    .skip(binding_index.saturating_add(1))
+                    .any(|candidate| {
+                        candidate.star_namespace == binding.star_namespace
+                            && candidate
+                                .output_columns
+                                .membership()
+                                .is_some_and(|columns| columns.contains(column))
+                    });
+                if overlaps_later_source {
+                    let candidates = matching_bindings
+                        .iter()
+                        .filter(|candidate| candidate.star_namespace == binding.star_namespace)
+                        .filter(|candidate| {
+                            candidate
+                                .output_columns
+                                .membership()
+                                .is_some_and(|columns| columns.contains(column))
+                        })
+                        .map(|candidate| candidate.effective_name.clone())
+                        .collect();
+                    return Some((column.clone(), candidates));
+                }
+            }
+        }
+        None
     }
 
     /// Check if an alias is defined locally in this scope.
     #[must_use]
     pub fn has_alias_local(&self, alias: &str) -> bool {
         let key = alias.to_ascii_lowercase();
-        self.aliases.contains_key(&key)
+        self.bindings
+            .iter()
+            .any(|binding| binding.effective_name == key)
     }
 
     /// Resolve a column reference: find which alias provides it.
@@ -358,83 +564,126 @@ impl Scope {
 
         if let Some(qualifier) = table_qualifier {
             let key = qualifier.to_ascii_lowercase();
-            if self.aliases.get(&key).map(String::as_str) == Some("<AMBIGUOUS>") {
-                return ResolveResult::Ambiguous(vec![key]);
-            }
-            if let Some(cols) = self.columns.get(&key) {
-                if cols.as_ref().is_none_or(|c| c.contains(&col_lower)) {
-                    return ResolveResult::Resolved(key);
+            let mut table_matches = 0_usize;
+            let mut column_matches = Vec::new();
+            for binding in self
+                .bindings
+                .iter()
+                .filter(|binding| binding.effective_name == key)
+            {
+                table_matches = table_matches.saturating_add(1);
+                let column_exists = binding
+                    .output_columns
+                    .membership()
+                    .is_none_or(|columns| columns.contains(&col_lower))
+                    || schema
+                        .find_table_by_lookup_key(&binding.lookup_key)
+                        .is_some_and(|table| table.is_rowid_alias(&col_lower));
+                if column_exists {
+                    column_matches.push(binding.effective_name.clone());
                 }
-                if let Some(table_name) = self.aliases.get(&key) {
-                    if let Some(table_def) = schema.find_table_by_lookup_key(table_name) {
-                        if table_def.is_rowid_alias(&col_lower) {
-                            return ResolveResult::Resolved(key);
-                        }
+            }
+
+            return match column_matches.len() {
+                1 => ResolveResult::Resolved(column_matches.remove(0)),
+                count if count > 1 => ResolveResult::Ambiguous(column_matches),
+                _ if table_matches > 0 => ResolveResult::ColumnNotFound,
+                _ => {
+                    if let Some(parent) = &self.parent {
+                        parent.resolve_column(schema, table_qualifier, column_name)
+                    } else {
+                        ResolveResult::TableNotFound
                     }
                 }
-                return ResolveResult::ColumnNotFound;
-            }
-            // Check parent scope.
-            if let Some(ref parent) = self.parent {
-                return parent.resolve_column(schema, table_qualifier, column_name);
-            }
-            return ResolveResult::TableNotFound;
+            };
         }
 
-        // Unqualified: search all aliases in this scope.
-        let mut known_matches = Vec::new();
-        let mut unknown_matches = Vec::new();
-
-        for (alias, cols) in &self.columns {
-            if self.qualified_only.contains(alias) {
+        // Unqualified: search every local FROM source independently.
+        let mut matches = Vec::new();
+        for binding in &self.bindings {
+            if binding.qualified_only {
                 continue;
             }
-            if self.aliases.get(alias).map(String::as_str) == Some("<AMBIGUOUS>") {
-                continue; // Do not resolve unqualified columns from ambiguous aliases
-            }
-            let is_match = match cols {
+            let is_match = match binding.output_columns.membership() {
                 Some(c) => {
                     c.contains(&col_lower) || {
-                        self.aliases
-                            .get(alias)
-                            .and_then(|t| schema.find_table_by_lookup_key(t))
+                        schema
+                            .find_table_by_lookup_key(&binding.lookup_key)
                             .is_some_and(|td| td.is_rowid_alias(&col_lower))
                     }
                 }
                 None => true,
             };
             if is_match {
-                if cols.is_some() {
-                    known_matches.push(alias.clone());
-                } else {
-                    unknown_matches.push(alias.clone());
-                }
+                matches.push(binding.effective_name.clone());
             }
         }
 
-        match (known_matches.len(), unknown_matches.len()) {
-            (0, 0) => {
+        match matches.len() {
+            0 => {
                 // Check parent scope.
                 if let Some(ref parent) = self.parent {
                     return parent.resolve_column(schema, None, column_name);
                 }
                 ResolveResult::ColumnNotFound
             }
-            (1, 0) => ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default()),
-            (0, 1) => {
-                ResolveResult::Resolved(unknown_matches.into_iter().next().unwrap_or_default())
-            }
+            1 => ResolveResult::Resolved(matches.remove(0)),
             _ => {
-                let mut all_matches = known_matches;
-                all_matches.extend(unknown_matches);
-                all_matches.sort();
+                matches.sort();
                 if self.using_columns.contains(&col_lower) {
                     // For USING columns, just pick the first one (they are equivalent).
-                    ResolveResult::Resolved(all_matches.into_iter().next().unwrap_or_default())
-                } else if all_matches.contains(&"<output>".to_owned()) {
+                    ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default())
+                } else if matches.iter().any(|alias| alias == "<output>") {
                     ResolveResult::Resolved("<output>".to_owned())
                 } else {
-                    ResolveResult::Ambiguous(all_matches)
+                    ResolveResult::Ambiguous(matches)
+                }
+            }
+        }
+    }
+
+    #[must_use]
+    fn resolve_schema_column(
+        &self,
+        schema: &Schema,
+        schema_name: &str,
+        table_name: &str,
+        column_name: &str,
+    ) -> ResolveResult {
+        let qualified_name =
+            QualifiedName::qualified(schema_name.to_owned(), table_name.to_owned());
+        let lookup_key = table_lookup_key(&qualified_name);
+        let table_lower = table_name.to_ascii_lowercase();
+        let column_lower = column_name.to_ascii_lowercase();
+        let mut table_matches = 0_usize;
+        let mut column_matches = Vec::new();
+
+        for binding in &self.qualified_bindings {
+            if binding.lookup_key != lookup_key || binding.table_name != table_lower {
+                continue;
+            }
+            table_matches = table_matches.saturating_add(1);
+            let column_exists = binding
+                .columns
+                .as_ref()
+                .is_none_or(|columns| columns.contains(&column_lower))
+                || schema
+                    .find_table_by_lookup_key(&binding.lookup_key)
+                    .is_some_and(|table| table.is_rowid_alias(&column_lower));
+            if column_exists {
+                column_matches.push(format!("{schema_name}.{table_name}"));
+            }
+        }
+
+        match column_matches.len() {
+            1 => ResolveResult::Resolved(column_matches.remove(0)),
+            count if count > 1 => ResolveResult::Ambiguous(column_matches),
+            _ if table_matches > 0 => ResolveResult::ColumnNotFound,
+            _ => {
+                if let Some(parent) = &self.parent {
+                    parent.resolve_schema_column(schema, schema_name, table_name, column_name)
+                } else {
+                    ResolveResult::TableNotFound
                 }
             }
         }
@@ -443,25 +692,32 @@ impl Scope {
     /// Number of aliases registered in this scope (not counting parents).
     #[must_use]
     pub fn alias_count(&self) -> usize {
-        self.aliases.len()
+        self.bindings.len()
     }
 
-    /// Return known column sets from all local aliases (for NATURAL JOIN).
+    /// Return known column sets from all local sources (for NATURAL JOIN).
     /// Aliases with unknown columns (`None`) are omitted.
     #[must_use]
     pub fn known_local_column_sets(&self) -> Vec<&HashSet<String>> {
-        self.columns
-            .values()
-            .filter_map(|opt| opt.as_ref())
+        self.bindings
+            .iter()
+            .filter_map(|binding| binding.output_columns.membership())
             .collect()
     }
 
     /// Return the column set for a specific alias (lowercased lookup).
     #[must_use]
     pub fn columns_for_alias(&self, alias: &str) -> Option<&HashSet<String>> {
-        self.columns
-            .get(&alias.to_ascii_lowercase())
-            .and_then(|opt| opt.as_ref())
+        let alias = alias.to_ascii_lowercase();
+        let mut matches = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.effective_name == alias);
+        let binding = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        binding.output_columns.membership()
     }
 }
 
@@ -608,7 +864,9 @@ impl<'a> Resolver<'a> {
 
     fn resolve_stmt_inner(&mut self, stmt: &Statement, scope: &mut Scope) {
         match stmt {
-            Statement::Select(select) => self.resolve_select(select, scope),
+            Statement::Select(select) => {
+                let _ = self.resolve_select(select, scope);
+            }
             Statement::Insert(insert) => {
                 // Process WITH clause CTEs if present.
                 if let Some(ref with) = insert.with {
@@ -627,13 +885,13 @@ impl<'a> Resolver<'a> {
                     }
                     fsqlite_ast::InsertSource::Select(select) => {
                         let mut source_scope = scope.clone();
-                        self.resolve_select(select, &mut source_scope);
+                        let _ = self.resolve_select(select, &mut source_scope);
                     }
                     fsqlite_ast::InsertSource::DefaultValues => {}
                 }
 
                 // Bind the target table so RETURNING or UPSERT can reference it.
-                self.bind_table_to_scope(&insert.table, None, scope);
+                self.bind_table_to_scope(&insert.table, insert.alias.as_deref(), scope);
 
                 // Scope strictly for target column checks
                 let mut target_scope = Scope::root();
@@ -643,16 +901,12 @@ impl<'a> Resolver<'a> {
                     .schema
                     .find_table_in_schema(insert.table.schema.as_deref(), &insert.table.name)
                 {
-                    let col_set: HashSet<String> = table_def
+                    let ordered_columns: Vec<String> = table_def
                         .columns
                         .iter()
                         .map(|c| c.name.to_ascii_lowercase())
                         .collect();
-                    target_scope.add_alias(
-                        &insert.table.name,
-                        &table_lookup_key(&insert.table),
-                        Some(col_set),
-                    );
+                    target_scope.add_table_binding(&insert.table, None, Some(ordered_columns));
                 }
 
                 for col in &insert.columns {
@@ -681,20 +935,22 @@ impl<'a> Resolver<'a> {
                                 insert.table.schema.as_deref(),
                                 &insert.table.name,
                             ) {
-                                let col_set: HashSet<String> = table_def
+                                let ordered_columns: Vec<String> = table_def
                                     .columns
                                     .iter()
                                     .map(|c| c.name.to_ascii_lowercase())
                                     .collect();
+                                let col_set: HashSet<String> =
+                                    ordered_columns.iter().cloned().collect();
                                 upsert_scope.add_qualified_only_alias(
                                     "excluded",
                                     &target_lookup_key,
                                     Some(col_set.clone()),
                                 );
-                                upsert_scope.add_alias(
-                                    alias_name,
-                                    &target_lookup_key,
-                                    Some(col_set),
+                                upsert_scope.add_table_binding(
+                                    &insert.table,
+                                    insert.alias.as_deref(),
+                                    Some(ordered_columns),
                                 );
                             } else {
                                 upsert_scope.add_qualified_only_alias("excluded", "<pseudo>", None);
@@ -817,23 +1073,146 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    fn select_core_output_columns(core: &SelectCore, scope: &Scope) -> Option<Vec<String>> {
+        match core {
+            SelectCore::Select { columns, .. } => {
+                let mut output = Vec::new();
+                for column in columns {
+                    match column {
+                        ResultColumn::Expr {
+                            alias: Some(alias), ..
+                        } => output.push(alias.to_ascii_lowercase()),
+                        ResultColumn::Expr {
+                            expr: Expr::Column(column, _),
+                            ..
+                        } => output.push(column.column.to_ascii_lowercase()),
+                        // SQLite derives a result name from the original SQL
+                        // text for an unaliased expression. The semantic layer
+                        // does not retain that source spelling, so do not turn
+                        // the expression into an "unknown columns" wildcard:
+                        // that would make unrelated outer names spuriously
+                        // resolve (or become ambiguous). Explicit aliases and
+                        // direct column references above remain addressable.
+                        ResultColumn::Expr { .. } => {}
+                        ResultColumn::Star => {
+                            for binding in &scope.bindings {
+                                output.extend(binding.output_columns.ordered()?.iter().cloned());
+                            }
+                        }
+                        ResultColumn::TableStar(name) => {
+                            if scope.table_star_ambiguity(name).is_some() {
+                                return None;
+                            }
+                            let target = name.name.to_ascii_lowercase();
+                            let mut found = false;
+                            for binding in scope
+                                .bindings
+                                .iter()
+                                .filter(|binding| binding.effective_name == target)
+                            {
+                                found = true;
+                                output.extend(binding.output_columns.ordered()?.iter().cloned());
+                            }
+                            if !found {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                Some(output)
+            }
+            SelectCore::Values(rows) => rows.first().map(|row| {
+                (1..=row.len())
+                    .map(|index| format!("column{index}"))
+                    .collect()
+            }),
+        }
+    }
+
+    fn cte_output_columns(cte: &Cte, inferred: Option<Vec<String>>) -> Option<Vec<String>> {
+        let columns = if cte.columns.is_empty() {
+            inferred?
+        } else {
+            cte.columns
+                .iter()
+                .map(|column| column.to_ascii_lowercase())
+                .collect()
+        };
+        Some(Self::canonicalize_derived_output_columns(columns))
+    }
+
+    fn canonicalize_derived_output_columns(columns: Vec<String>) -> Vec<String> {
+        let mut used = HashSet::with_capacity(columns.len());
+        let mut canonical = Vec::with_capacity(columns.len());
+
+        for column in columns {
+            if used.insert(column.to_ascii_lowercase()) {
+                canonical.push(column);
+                continue;
+            }
+
+            let base = column
+                .rsplit_once(':')
+                .map_or(column.as_str(), |(base, suffix)| {
+                    if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                        base
+                    } else {
+                        column.as_str()
+                    }
+                });
+            let candidate_limit = used.len().saturating_add(1);
+            let renamed = (1..=candidate_limit).find_map(|suffix| {
+                let candidate = format!("{base}:{suffix}");
+                used.insert(candidate.to_ascii_lowercase())
+                    .then_some(candidate)
+            });
+
+            if let Some(renamed) = renamed {
+                canonical.push(renamed);
+            } else {
+                debug_assert!(false, "a free derived-column suffix must exist");
+            }
+        }
+
+        canonical
+    }
+
+    fn table_function_output_columns(name: &str) -> Option<Vec<String>> {
+        if name.eq_ignore_ascii_case("json_each") || name.eq_ignore_ascii_case("json_tree") {
+            Some(
+                [
+                    "key", "value", "type", "atom", "id", "parent", "fullkey", "path",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
     fn resolve_with_clause(&mut self, with: &WithClause, scope: &mut Scope) {
         if with.recursive {
             // In WITH RECURSIVE, all CTE names are visible to all CTE bodies.
             for cte in &with.ctes {
-                scope.add_cte(&cte.name);
+                let declared = Self::cte_output_columns(cte, None);
+                scope.add_cte_with_columns(&cte.name, declared);
             }
             for cte in &with.ctes {
                 let mut cte_scope = scope.clone();
-                self.resolve_select(&cte.query, &mut cte_scope);
+                let inferred = self.resolve_select(&cte.query, &mut cte_scope);
+                let columns = Self::cte_output_columns(cte, inferred);
+                scope.add_cte_with_columns(&cte.name, columns);
             }
         } else {
             // In plain WITH, a CTE body can only see previously defined CTEs.
             for cte in &with.ctes {
                 let mut cte_scope = scope.clone();
-                self.resolve_select(&cte.query, &mut cte_scope);
+                let inferred = self.resolve_select(&cte.query, &mut cte_scope);
                 // Add *after* resolving the query so it can't see itself or subsequent CTEs.
-                scope.add_cte(&cte.name);
+                let columns = Self::cte_output_columns(cte, inferred);
+                scope.add_cte_with_columns(&cte.name, columns);
             }
         }
     }
@@ -859,7 +1238,11 @@ impl<'a> Resolver<'a> {
             })
     }
 
-    fn resolve_select(&mut self, select: &SelectStatement, scope: &mut Scope) {
+    fn resolve_select(
+        &mut self,
+        select: &SelectStatement,
+        scope: &mut Scope,
+    ) -> Option<Vec<String>> {
         // Register CTEs if present.
         if let Some(ref with) = select.with {
             self.resolve_with_clause(with, scope);
@@ -868,6 +1251,9 @@ impl<'a> Resolver<'a> {
         // Resolve the primary select core in an isolated scope.
         let mut first_core_scope = scope.clone();
         self.resolve_select_core(&select.body.select, &mut first_core_scope);
+        let output_columns =
+            Self::select_core_output_columns(&select.body.select, &first_core_scope)
+                .map(Self::canonicalize_derived_output_columns);
 
         // Resolve any compound queries (UNION, INTERSECT, EXCEPT) in isolated scopes.
         for (_op, core) in &select.body.compounds {
@@ -925,6 +1311,8 @@ impl<'a> Resolver<'a> {
                 self.resolve_expr(offset, scope);
             }
         }
+
+        output_columns
     }
 
     fn resolve_select_core(&mut self, core: &SelectCore, scope: &mut Scope) {
@@ -1016,28 +1404,27 @@ impl<'a> Resolver<'a> {
                 let table_name = &name.name;
                 let alias_name = alias.as_deref().unwrap_or(table_name);
 
-                // Check for duplicate alias in the CURRENT scope only.
-                if scope.has_alias_local(alias_name) {
-                    self.push_error(SemanticErrorKind::DuplicateAlias {
-                        alias: alias_name.to_owned(),
-                    });
-                }
-
                 // Resolve table name against schema or CTEs.
                 if name.schema.is_none() && scope.has_cte(table_name) {
-                    // CTE reference — columns are unknown at this stage.
-                    scope.add_alias(alias_name, table_name, None);
+                    let columns = scope.cte_columns(table_name).flatten();
+                    scope.add_alias_with_metadata(
+                        alias_name,
+                        &format!("*\0{table_name}"),
+                        StarNamespace::Derived,
+                        columns,
+                        false,
+                    );
                     self.tables_resolved += 1;
                 } else if let Some(table_def) = self
                     .schema
                     .find_table_in_schema(name.schema.as_deref(), table_name)
                 {
-                    let col_set: HashSet<String> = table_def
+                    let ordered_columns: Vec<String> = table_def
                         .columns
                         .iter()
                         .map(|c| c.name.to_ascii_lowercase())
                         .collect();
-                    scope.add_alias(alias_name, &table_lookup_key(name), Some(col_set));
+                    scope.add_table_binding(name, alias.as_deref(), Some(ordered_columns));
                     self.tables_resolved += 1;
                 } else {
                     self.push_error(SemanticErrorKind::UnresolvedTable {
@@ -1048,7 +1435,7 @@ impl<'a> Resolver<'a> {
             TableOrSubquery::Subquery { query, alias, .. } => {
                 // Resolve subquery in a child scope.
                 let mut child = Scope::child(scope.clone());
-                self.resolve_select(query, &mut child);
+                let output_columns = self.resolve_select(query, &mut child);
 
                 let alias_name = if let Some(a) = alias {
                     a.clone()
@@ -1056,44 +1443,13 @@ impl<'a> Resolver<'a> {
                     format!("<subquery_{}>", self.tables_resolved)
                 };
 
-                if !alias_name.starts_with("<subquery_") && scope.has_alias_local(&alias_name) {
-                    self.push_error(SemanticErrorKind::DuplicateAlias {
-                        alias: alias_name.clone(),
-                    });
-                }
-
-                let mut output_cols = HashSet::new();
-                let mut is_complete = true;
-                if let SelectCore::Select { columns, .. } = &query.body.select {
-                    for col in columns {
-                        match col {
-                            ResultColumn::Expr {
-                                alias: Some(alias_id),
-                                ..
-                            } => {
-                                output_cols.insert(alias_id.to_ascii_lowercase());
-                            }
-                            ResultColumn::Expr {
-                                expr: Expr::Column(col_ref, _),
-                                ..
-                            } => {
-                                output_cols.insert(col_ref.column.to_ascii_lowercase());
-                            }
-                            ResultColumn::Star | ResultColumn::TableStar(_) => {
-                                is_complete = false;
-                            }
-                            _ => {}
-                        }
-                    }
-                } else {
-                    is_complete = false;
-                }
-
-                if is_complete {
-                    scope.add_alias(&alias_name, "<subquery>", Some(output_cols));
-                } else {
-                    scope.add_alias(&alias_name, "<subquery>", None);
-                }
+                scope.add_alias_with_metadata(
+                    &alias_name,
+                    "*\0<subquery>",
+                    StarNamespace::Derived,
+                    output_columns,
+                    false,
+                );
 
                 self.tables_resolved += 1;
             }
@@ -1105,14 +1461,13 @@ impl<'a> Resolver<'a> {
                 }
 
                 let alias_name = alias.as_deref().unwrap_or(name);
-
-                if scope.has_alias_local(alias_name) {
-                    self.push_error(SemanticErrorKind::DuplicateAlias {
-                        alias: alias_name.to_owned(),
-                    });
-                }
-
-                scope.add_alias(alias_name, name, None);
+                scope.add_alias_with_metadata(
+                    alias_name,
+                    name,
+                    StarNamespace::Database("main".to_owned()),
+                    Self::table_function_output_columns(name),
+                    false,
+                );
                 self.tables_resolved += 1;
             }
             TableOrSubquery::ParenJoin(inner_from) => {
@@ -1124,12 +1479,12 @@ impl<'a> Resolver<'a> {
     fn resolve_join(&mut self, join: &JoinClause, scope: &mut Scope) {
         // Snapshot column names from existing aliases BEFORE adding the new
         // table, so we can compute shared columns for NATURAL JOIN and USING.
+        let pre_join_binding_count = scope.bindings.len();
         let pre_join_columns: Vec<HashSet<String>> = scope
             .known_local_column_sets()
             .into_iter()
             .cloned()
             .collect();
-        let pre_join_aliases: HashSet<String> = scope.aliases.keys().cloned().collect();
 
         self.resolve_table_or_subquery(&join.table, scope);
 
@@ -1137,13 +1492,11 @@ impl<'a> Resolver<'a> {
             // NATURAL JOIN: implicitly equate all columns with matching names
             // between the pre-existing tables and the newly joined table(s).
             let mut to_insert = Vec::new();
-            for (alias, cols_opt) in &scope.columns {
-                if !pre_join_aliases.contains(alias) {
-                    if let Some(new_cols) = cols_opt {
-                        for col_name in new_cols {
-                            if pre_join_columns.iter().any(|cs| cs.contains(col_name)) {
-                                to_insert.push(col_name.clone());
-                            }
+            for binding in &scope.bindings[pre_join_binding_count..] {
+                if let Some(new_cols) = binding.output_columns.membership() {
+                    for col_name in new_cols {
+                        if pre_join_columns.iter().any(|cs| cs.contains(col_name)) {
+                            to_insert.push(col_name.clone());
                         }
                     }
                 }
@@ -1165,25 +1518,23 @@ impl<'a> Resolver<'a> {
                         let in_left = pre_join_columns.iter().any(|cs| cs.contains(&col_lower));
                         // Validate that column exists on the right side
                         let mut in_right = false;
-                        for (alias, cols_opt) in &scope.columns {
-                            if !pre_join_aliases.contains(alias) {
-                                if let Some(new_cols) = cols_opt {
-                                    if new_cols.contains(&col_lower) {
-                                        in_right = true;
-                                        break;
-                                    }
-                                } else {
-                                    // If right side columns are unknown (e.g. subquery), assume it exists
+                        for binding in &scope.bindings[pre_join_binding_count..] {
+                            if let Some(new_cols) = binding.output_columns.membership() {
+                                if new_cols.contains(&col_lower) {
                                     in_right = true;
                                     break;
                                 }
+                            } else {
+                                // If right side columns are unknown (e.g. subquery), assume it exists
+                                in_right = true;
+                                break;
                             }
                         }
 
                         // If left side has unknown columns, we might not find it in `pre_join_columns`
-                        let left_has_unknown = scope.columns.iter().any(|(alias, cols_opt)| {
-                            pre_join_aliases.contains(alias) && cols_opt.is_none()
-                        });
+                        let left_has_unknown = scope.bindings[..pre_join_binding_count]
+                            .iter()
+                            .any(|binding| binding.output_columns.membership().is_none());
 
                         if (!in_left && !left_has_unknown) || !in_right {
                             self.push_error(SemanticErrorKind::UnresolvedColumn {
@@ -1215,7 +1566,18 @@ impl<'a> Resolver<'a> {
                 }
             }
             ResultColumn::TableStar(table_name) => {
-                if !scope.has_table_reference(table_name) {
+                if let Some((column, candidates)) = scope.table_star_ambiguity(table_name) {
+                    self.push_error(SemanticErrorKind::AmbiguousColumn { column, candidates });
+                } else if let Some(source_columns) = scope.table_star_source_columns(table_name) {
+                    // SQLite expands every matching unaliased source in FROM
+                    // order. Count each known source's columns independently;
+                    // do not collapse equal effective names.
+                    for columns in source_columns.into_iter().flatten() {
+                        self.columns_bound = self
+                            .columns_bound
+                            .saturating_add(u64::try_from(columns.len()).unwrap_or(u64::MAX));
+                    }
+                } else {
                     self.push_error(SemanticErrorKind::UnresolvedTable {
                         name: table_name.to_string(),
                     });
@@ -1265,7 +1627,7 @@ impl<'a> Resolver<'a> {
                     }
                     InSet::Subquery(select) => {
                         let mut child = Scope::child(scope.clone());
-                        self.resolve_select(select, &mut child);
+                        let _ = self.resolve_select(select, &mut child);
                     }
                     InSet::Table(name) => self.resolve_table_name(name, scope),
                 }
@@ -1302,7 +1664,7 @@ impl<'a> Resolver<'a> {
                 subquery: select, ..
             } => {
                 let mut child = Scope::child(scope.clone());
-                self.resolve_select(select, &mut child);
+                let _ = self.resolve_select(select, &mut child);
             }
             Expr::FunctionCall {
                 name,
@@ -1374,7 +1736,19 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_column_ref(&mut self, col_ref: &ColumnRef, scope: &Scope) {
-        let result = scope.resolve_column(self.schema, col_ref.table.as_deref(), &col_ref.column);
+        let result = match (&col_ref.schema, &col_ref.table) {
+            (Some(schema_name), Some(table_name)) => {
+                scope.resolve_schema_column(self.schema, schema_name, table_name, &col_ref.column)
+            }
+            (None, table_name) => {
+                scope.resolve_column(self.schema, table_name.as_deref(), &col_ref.column)
+            }
+            (Some(_), None) => ResolveResult::TableNotFound,
+        };
+        let display_qualifier = match (&col_ref.schema, &col_ref.table) {
+            (Some(schema_name), Some(table_name)) => Some(format!("{schema_name}.{table_name}")),
+            (_, table_name) => table_name.as_ref().map(ToString::to_string),
+        };
         match result {
             ResolveResult::Resolved(_) => {
                 self.columns_bound += 1;
@@ -1382,24 +1756,26 @@ impl<'a> Resolver<'a> {
             ResolveResult::TableNotFound => {
                 tracing::error!(
                     target: "fsqlite.parse",
+                    schema = ?col_ref.schema,
                     table = ?col_ref.table,
                     column = %col_ref.column,
                     "unresolvable table reference"
                 );
                 self.push_error(SemanticErrorKind::UnresolvedColumn {
-                    table: col_ref.table.as_ref().map(ToString::to_string),
+                    table: display_qualifier.clone(),
                     column: col_ref.column.to_string(),
                 });
             }
             ResolveResult::ColumnNotFound => {
                 tracing::error!(
                     target: "fsqlite.parse",
+                    schema = ?col_ref.schema,
                     table = ?col_ref.table,
                     column = %col_ref.column,
                     "unresolvable column reference"
                 );
                 self.push_error(SemanticErrorKind::UnresolvedColumn {
-                    table: col_ref.table.as_ref().map(ToString::to_string),
+                    table: display_qualifier,
                     column: col_ref.column.to_string(),
                 });
             }
@@ -1451,18 +1827,25 @@ impl<'a> Resolver<'a> {
     ) {
         let alias_name = alias.unwrap_or(&name.name);
         if name.schema.is_none() && scope.has_cte(&name.name) {
-            scope.add_alias(alias_name, &name.name, None);
+            let columns = scope.cte_columns(&name.name).flatten();
+            scope.add_alias_with_metadata(
+                alias_name,
+                &format!("*\0{}", name.name),
+                StarNamespace::Derived,
+                columns,
+                false,
+            );
             self.tables_resolved += 1;
         } else if let Some(table_def) = self
             .schema
             .find_table_in_schema(name.schema.as_deref(), &name.name)
         {
-            let col_set: HashSet<String> = table_def
+            let ordered_columns: Vec<String> = table_def
                 .columns
                 .iter()
                 .map(|c| c.name.to_ascii_lowercase())
                 .collect();
-            scope.add_alias(alias_name, &table_lookup_key(name), Some(col_set));
+            scope.add_table_binding(name, alias, Some(ordered_columns));
             self.tables_resolved += 1;
         } else {
             self.push_error(SemanticErrorKind::UnresolvedTable {
@@ -1978,6 +2361,595 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_schema_qualified_column_and_alias_hiding() {
+        let schema = make_schema();
+
+        let stmt = parse_one("SELECT main.users.name FROM users");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(resolver.columns_bound, 1);
+
+        let stmt = parse_one("SELECT main.users.name FROM users AS u");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(
+            errors.iter().any(|error| matches!(
+                &error.kind,
+                SemanticErrorKind::UnresolvedColumn {
+                    table: Some(table),
+                    column,
+                } if table == "main.users" && column == "name"
+            )),
+            "an alias must hide the original schema-qualified identity: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_same_table_name_across_main_and_temp_namespaces() {
+        let mut schema = make_schema();
+        schema.add_table_in_schema(
+            "temp",
+            TableDef {
+                name: "users".to_owned(),
+                columns: vec![ColumnDef {
+                    name: "nickname".to_owned(),
+                    affinity: TypeAffinity::Text,
+                    is_ipk: false,
+                    not_null: false,
+                }],
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        let stmt = parse_one(
+            "SELECT main.users.name, temp.users.nickname, \
+                    users.name, users.nickname, name, nickname \
+             FROM main.users JOIN temp.users",
+        );
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(resolver.columns_bound, 6);
+    }
+
+    #[test]
+    fn test_table_star_expands_every_same_effective_name_source_in_from_order() {
+        let mut schema = make_schema();
+        schema.add_table_in_schema(
+            "temp",
+            TableDef {
+                name: "users".to_owned(),
+                columns: vec![ColumnDef {
+                    name: "nickname".to_owned(),
+                    affinity: TypeAffinity::Text,
+                    is_ipk: false,
+                    not_null: false,
+                }],
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        let stmt = parse_one("SELECT users.* FROM main.users JOIN temp.users");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+
+        assert!(
+            errors.is_empty(),
+            "unexpected table-star errors: {errors:?}"
+        );
+        assert_eq!(
+            resolver.columns_bound, 4,
+            "main.users' three columns and temp.users' one column must both expand"
+        );
+    }
+
+    #[test]
+    fn test_same_effective_table_name_is_ambiguous_only_for_overlapping_column() {
+        let mut schema = make_schema();
+        schema.add_table_in_schema(
+            "temp",
+            TableDef {
+                name: "users".to_owned(),
+                columns: vec![ColumnDef {
+                    name: "name".to_owned(),
+                    affinity: TypeAffinity::Text,
+                    is_ipk: false,
+                    not_null: false,
+                }],
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        let stmt = parse_one(
+            "SELECT users.name, name \
+             FROM main.users JOIN temp.users",
+        );
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert_eq!(
+            errors.len(),
+            2,
+            "expected one qualified and one bare ambiguity: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(&error.kind, SemanticErrorKind::AmbiguousColumn { .. })),
+            "both qualified and bare overlapping columns must be ambiguous: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_explicit_aliases_resolve_each_source_by_matching_column() {
+        let mut schema = Schema::new();
+        for (name, distinct_column) in [("left_source", "x"), ("right_source", "y")] {
+            schema.add_table(TableDef {
+                name: name.to_owned(),
+                columns: [distinct_column, "z"]
+                    .into_iter()
+                    .map(|column| ColumnDef {
+                        name: column.to_owned(),
+                        affinity: TypeAffinity::Integer,
+                        is_ipk: false,
+                        not_null: false,
+                    })
+                    .collect(),
+                without_rowid: false,
+                strict: false,
+            });
+        }
+
+        let disjoint = parse_one(
+            "SELECT q.x, q.y \
+             FROM left_source AS q JOIN right_source AS q",
+        );
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&disjoint);
+        assert!(
+            errors.is_empty(),
+            "duplicate aliases with disjoint columns must resolve: {errors:?}"
+        );
+        assert_eq!(resolver.columns_bound, 2);
+
+        let star = parse_one(
+            "SELECT q.* \
+             FROM left_source AS q JOIN right_source AS q",
+        );
+        let errors = resolver.resolve_statement(&star);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [SemanticError {
+                    kind: SemanticErrorKind::AmbiguousColumn {
+                        column,
+                        candidates,
+                    },
+                    ..
+                }] if column == "z"
+                    && candidates.iter().map(String::as_str).eq(["q", "q"])
+            ),
+            "same-schema q.* must reject the overlapping column: {errors:?}"
+        );
+
+        let Statement::Select(select) = &star else {
+            panic!("expected SELECT statement");
+        };
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            panic!("expected SELECT core with FROM");
+        };
+        let mut star_scope = Scope::root();
+        let mut star_resolver = Resolver::new(&schema);
+        star_resolver.resolve_from(from, &mut star_scope);
+        let source_columns = star_scope
+            .table_star_source_columns(&QualifiedName::bare("q"))
+            .expect("q must match both local FROM sources");
+        assert_eq!(source_columns.len(), 2);
+        assert!(
+            source_columns[0]
+                .is_some_and(|columns| columns.contains("x") && !columns.contains("y")),
+            "left_source must be the first q.* expansion"
+        );
+        assert!(
+            source_columns[1]
+                .is_some_and(|columns| columns.contains("y") && !columns.contains("x")),
+            "right_source must be the second q.* expansion"
+        );
+
+        let overlapping = parse_one(
+            "SELECT q.z \
+             FROM left_source AS q JOIN right_source AS q",
+        );
+        let errors = resolver.resolve_statement(&overlapping);
+        assert_eq!(
+            errors.len(),
+            1,
+            "only the overlapping column must be ambiguous: {errors:?}"
+        );
+        assert!(
+            matches!(
+                &errors[0].kind,
+                SemanticErrorKind::AmbiguousColumn {
+                    column,
+                    candidates,
+                } if column == "z"
+                    && candidates.iter().map(String::as_str).eq(["q", "q"])
+            ),
+            "duplicate aliases must retain one ambiguity candidate per source: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_alias_table_star_expands_overlaps_across_schemas() {
+        let mut schema = Schema::new();
+        schema.add_table_in_schema(
+            "main",
+            TableDef {
+                name: "left_source".to_owned(),
+                columns: ["x", "z"]
+                    .into_iter()
+                    .map(|column| ColumnDef {
+                        name: column.to_owned(),
+                        affinity: TypeAffinity::Integer,
+                        is_ipk: false,
+                        not_null: false,
+                    })
+                    .collect(),
+                without_rowid: false,
+                strict: false,
+            },
+        );
+        schema.add_table_in_schema(
+            "temp",
+            TableDef {
+                name: "right_source".to_owned(),
+                columns: ["y", "z"]
+                    .into_iter()
+                    .map(|column| ColumnDef {
+                        name: column.to_owned(),
+                        affinity: TypeAffinity::Integer,
+                        is_ipk: false,
+                        not_null: false,
+                    })
+                    .collect(),
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        let star = parse_one(
+            "SELECT q.* \
+             FROM main.left_source AS q JOIN temp.right_source AS q",
+        );
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&star);
+        assert!(
+            errors.is_empty(),
+            "cross-schema duplicate aliases must both expand: {errors:?}"
+        );
+        assert_eq!(resolver.columns_bound, 4);
+
+        let overlapping = parse_one(
+            "SELECT q.z \
+             FROM main.left_source AS q JOIN temp.right_source AS q",
+        );
+        let errors = resolver.resolve_statement(&overlapping);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [SemanticError {
+                    kind: SemanticErrorKind::AmbiguousColumn { column, .. },
+                    ..
+                }] if column == "z"
+            ),
+            "ordinary q.z must remain ambiguous across schemas: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_alias_table_star_uses_sqlite_source_namespaces() {
+        let column = |name: &str| ColumnDef {
+            name: name.to_owned(),
+            affinity: TypeAffinity::Integer,
+            is_ipk: false,
+            not_null: false,
+        };
+        let mut schema = Schema::new();
+        schema.add_table(TableDef {
+            name: "main_source".to_owned(),
+            columns: ["x", "z"].into_iter().map(column).collect(),
+            without_rowid: false,
+            strict: false,
+        });
+        schema.add_table(TableDef {
+            name: "json_source".to_owned(),
+            columns: ["key", "other"].into_iter().map(column).collect(),
+            without_rowid: false,
+            strict: false,
+        });
+
+        for sql in [
+            "SELECT q.* FROM main_source AS q \
+             JOIN (SELECT 1 AS y, 2 AS z) AS q",
+            "WITH c(y, z) AS (VALUES (1, 2)) \
+             SELECT q.* FROM main_source AS q JOIN c AS q",
+            "SELECT q.* FROM json_each('[]') AS q \
+             JOIN (SELECT 1 AS key) AS q",
+        ] {
+            let mut resolver = Resolver::new(&schema);
+            let errors = resolver.resolve_statement(&parse_one(sql));
+            assert!(
+                errors.is_empty(),
+                "different SQLite source namespaces must both expand for `{sql}`: {errors:?}"
+            );
+        }
+
+        for (sql, expected_column) in [
+            (
+                "SELECT q.* FROM (SELECT 1 AS x, 2 AS z) AS q \
+                 JOIN (SELECT 3 AS y, 4 AS z) AS q",
+                "z",
+            ),
+            (
+                "WITH a(x, z) AS (VALUES (1, 2)), \
+                      b(y, z) AS (VALUES (3, 4)) \
+                 SELECT q.* FROM a AS q JOIN b AS q",
+                "z",
+            ),
+            (
+                "WITH a(x, z) AS (VALUES (1, 2)) \
+                 SELECT q.* FROM a AS q \
+                 JOIN (SELECT 3 AS y, 4 AS z) AS q",
+                "z",
+            ),
+            (
+                "SELECT q.* FROM json_source AS q JOIN json_each('[]') AS q",
+                "key",
+            ),
+            (
+                "SELECT q.* FROM json_each('[1]') AS q \
+                 JOIN json_each('[2]') AS q",
+                "key",
+            ),
+        ] {
+            let mut resolver = Resolver::new(&schema);
+            let errors = resolver.resolve_statement(&parse_one(sql));
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [SemanticError {
+                        kind: SemanticErrorKind::AmbiguousColumn { column, .. },
+                        ..
+                    }] if column == expected_column
+                ),
+                "same SQLite source namespace must reject overlap for `{sql}`: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_alias_table_star_preserves_declared_column_order() {
+        let mut schema = Schema::new();
+        for (table_name, columns) in [
+            ("left_za", ["z", "a"]),
+            ("right_az", ["a", "z"]),
+            ("left_az", ["a", "z"]),
+            ("right_za", ["z", "a"]),
+        ] {
+            schema.add_table(TableDef {
+                name: table_name.to_owned(),
+                columns: columns
+                    .into_iter()
+                    .map(|name| ColumnDef {
+                        name: name.to_owned(),
+                        affinity: TypeAffinity::Integer,
+                        is_ipk: false,
+                        not_null: false,
+                    })
+                    .collect(),
+                without_rowid: false,
+                strict: false,
+            });
+        }
+
+        for (sql, expected_column) in [
+            ("SELECT q.* FROM left_za AS q JOIN right_az AS q", "z"),
+            ("SELECT q.* FROM left_az AS q JOIN right_za AS q", "a"),
+        ] {
+            let mut resolver = Resolver::new(&schema);
+            let errors = resolver.resolve_statement(&parse_one(sql));
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [SemanticError {
+                        kind: SemanticErrorKind::AmbiguousColumn { column, .. },
+                        ..
+                    }] if column == expected_column
+                ),
+                "SQLite reports the first overlap in the earlier source's declared order for \
+                 `{sql}`: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_alias_derived_stars_propagate_ordered_columns() {
+        let mut schema = Schema::new();
+        for (table_name, columns) in [("left_source", ["x", "z"]), ("right_source", ["y", "z"])] {
+            schema.add_table(TableDef {
+                name: table_name.to_owned(),
+                columns: columns
+                    .into_iter()
+                    .map(|name| ColumnDef {
+                        name: name.to_owned(),
+                        affinity: TypeAffinity::Integer,
+                        is_ipk: false,
+                        not_null: false,
+                    })
+                    .collect(),
+                without_rowid: false,
+                strict: false,
+            });
+        }
+
+        let statement = parse_one(
+            "SELECT q.* \
+             FROM (SELECT * FROM left_source) AS q \
+             JOIN (SELECT * FROM right_source) AS q",
+        );
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&statement);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [SemanticError {
+                    kind: SemanticErrorKind::AmbiguousColumn { column, .. },
+                    ..
+                }] if column == "z"
+            ),
+            "derived SELECT * metadata must expose the shared column: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_derived_output_names_use_sqlite_lowest_free_suffix() {
+        for (columns, expected) in [
+            (vec!["x", "x", "x:1"], vec!["x", "x:1", "x:2"]),
+            (vec!["x", "x:2", "x", "x"], vec!["x", "x:2", "x:1", "x:3"]),
+            (vec!["x:01", "x:01", "x"], vec!["x:01", "x:1", "x"]),
+        ] {
+            assert_eq!(
+                Resolver::canonicalize_derived_output_columns(
+                    columns.into_iter().map(str::to_owned).collect()
+                ),
+                expected.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_derived_and_cte_duplicate_outputs_publish_canonical_names() {
+        let schema = Schema::new();
+        for sql in [
+            "SELECT q.\"x:1\" FROM (SELECT 1 AS x, 2 AS x) AS q",
+            "WITH q(x, x) AS (VALUES (1, 2)) SELECT q.\"x:1\" FROM q",
+        ] {
+            let mut resolver = Resolver::new(&schema);
+            let errors = resolver.resolve_statement(&parse_one(sql));
+            assert!(
+                errors.is_empty(),
+                "derived output names must be addressable after SQLite-style renaming for \
+                 `{sql}`: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cross_schema_star_duplicates_are_renamed_at_derived_boundary() {
+        let column = |name: &str| ColumnDef {
+            name: name.to_owned(),
+            affinity: TypeAffinity::Integer,
+            is_ipk: false,
+            not_null: false,
+        };
+        let mut schema = Schema::new();
+        schema.add_table_in_schema(
+            "main",
+            TableDef {
+                name: "left_source".to_owned(),
+                columns: ["x", "z"].into_iter().map(column).collect(),
+                without_rowid: false,
+                strict: false,
+            },
+        );
+        schema.add_table_in_schema(
+            "temp",
+            TableDef {
+                name: "right_source".to_owned(),
+                columns: ["y", "z"].into_iter().map(column).collect(),
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        let statement = parse_one(
+            "SELECT outer_q.\"z:1\" \
+             FROM (SELECT q.* \
+                   FROM main.left_source AS q JOIN temp.right_source AS q) AS outer_q",
+        );
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&statement);
+        assert!(
+            errors.is_empty(),
+            "a derived boundary must expose the second inherited z as z:1: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_table_star_does_not_correlate_to_parent_scope() {
+        let mut schema = Schema::new();
+        schema.add_table(TableDef {
+            name: "outer_t".to_owned(),
+            columns: vec![ColumnDef {
+                name: "x".to_owned(),
+                affinity: TypeAffinity::Integer,
+                is_ipk: false,
+                not_null: false,
+            }],
+            without_rowid: false,
+            strict: false,
+        });
+
+        let correlated_column = parse_one("SELECT (SELECT outer_t.x) FROM outer_t");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&correlated_column);
+        assert!(
+            errors.is_empty(),
+            "ordinary qualified columns must remain correlated: {errors:?}"
+        );
+        assert_eq!(resolver.columns_bound, 1);
+
+        let correlated_star = parse_one("SELECT (SELECT outer_t.*) FROM outer_t");
+        let errors = resolver.resolve_statement(&correlated_star);
+        assert_eq!(
+            errors.len(),
+            1,
+            "parent-scope table-star must be rejected: {errors:?}"
+        );
+        assert!(
+            matches!(
+                &errors[0].kind,
+                SemanticErrorKind::UnresolvedTable { name } if name == "outer_t"
+            ),
+            "table-star must resolve only against the local FROM scope: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_quoted_dotted_table_identifier_is_not_schema_qualified() {
+        let schema = make_schema();
+        let stmt = parse_one("SELECT \"main.users\".name FROM users");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(
+            errors.iter().any(|error| matches!(
+                &error.kind,
+                SemanticErrorKind::UnresolvedColumn {
+                    table: Some(table),
+                    column,
+                } if table == "main.users" && column == "name"
+            )),
+            "quoted dotted identifier must remain one unresolved table alias: {errors:?}"
+        );
+    }
+
+    #[test]
     fn test_resolve_named_namespace_does_not_fall_back_to_main_schema() {
         let mut schema = make_schema();
         schema.add_table_in_schema(
@@ -2110,36 +3082,26 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_schema_qualified_table_star() {
-        let mut schema = make_schema();
-        schema.add_table_in_schema(
-            "aux",
-            TableDef {
-                name: "users".to_owned(),
-                columns: vec![
-                    ColumnDef {
-                        name: "id".to_owned(),
-                        affinity: TypeAffinity::Integer,
-                        is_ipk: true,
-                        not_null: true,
-                    },
-                    ColumnDef {
-                        name: "nickname".to_owned(),
-                        affinity: TypeAffinity::Text,
-                        is_ipk: false,
-                        not_null: false,
-                    },
-                ],
-                without_rowid: false,
-                strict: false,
-            },
-        );
+    fn test_resolve_table_star_honors_alias_hiding() {
+        let schema = make_schema();
 
-        let stmt = parse_one("SELECT aux.users.* FROM aux.users");
+        for sql in ["SELECT users.* FROM users", "SELECT u.* FROM users AS u"] {
+            let stmt = parse_one(sql);
+            let mut resolver = Resolver::new(&schema);
+            let errors = resolver.resolve_statement(&stmt);
+            assert!(errors.is_empty(), "unexpected errors for {sql}: {errors:?}");
+        }
+
+        let stmt = parse_one("SELECT users.* FROM users AS u");
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-        assert_eq!(resolver.tables_resolved, 1);
+        assert!(
+            errors.iter().any(|error| matches!(
+                &error.kind,
+                SemanticErrorKind::UnresolvedTable { name } if name == "users"
+            )),
+            "the alias must hide the underlying table-star qualifier: {errors:?}"
+        );
     }
 
     #[test]

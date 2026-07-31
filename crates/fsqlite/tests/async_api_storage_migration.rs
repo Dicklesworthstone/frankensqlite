@@ -7,8 +7,33 @@
 //! async `Connection` API.
 
 use asupersync::runtime::RuntimeBuilder;
-use fsqlite::{AsyncConnection, FrankenError, SqliteValue};
+use fsqlite::{AsyncConnection, FrankenError, SqliteValue, Transaction};
 use fsqlite_types::cx::Cx;
+
+fn assert_send<T: Send + ?Sized>(_: &T) {}
+
+fn assert_send_sync<T: Send + Sync>() {}
+
+fn assert_connection_futures_are_send(connection: &mut AsyncConnection, cx: &Cx) {
+    assert_send(&AsyncConnection::open(cx, ":memory:"));
+    assert_send(&connection.query(cx, "SELECT 1"));
+    assert_send(&connection.begin_transaction(cx));
+    assert_send(&connection.close(cx));
+}
+
+fn assert_transaction_futures_are_send(transaction: &mut Transaction<'_>, cx: &Cx) {
+    assert_send(&transaction.prepare(cx, "SELECT 1"));
+    assert_send(&transaction.query(cx, "SELECT 1"));
+    assert_send(&transaction.execute(cx, "SELECT 1"));
+    assert_send(&transaction.commit(cx));
+    assert_send(&transaction.rollback(cx));
+}
+
+#[test]
+fn async_actor_public_types_are_send_sync() {
+    assert_send_sync::<AsyncConnection>();
+    assert_send_sync::<Transaction<'static>>();
+}
 
 #[test]
 fn async_facade_drives_file_backed_storage_futures_to_completion() {
@@ -28,6 +53,7 @@ fn async_facade_drives_file_backed_storage_futures_to_completion() {
         let mut connection = AsyncConnection::open(&cx, database_path.clone())
             .await
             .expect("file-backed async connection should open");
+        assert_connection_futures_are_send(&mut connection, &cx);
 
         connection
             .execute_batch(
@@ -66,19 +92,25 @@ fn async_facade_drives_file_backed_storage_futures_to_completion() {
             .expect("parameterized row query should complete");
         assert_eq!(row.get(0), Some(&SqliteValue::Text("one".into())));
 
-        connection
+        let mut transaction = connection
             .begin_transaction(&cx)
             .await
             .expect("transaction should begin");
+        assert_transaction_futures_are_send(&mut transaction, &cx);
         assert!(connection.in_transaction());
-        connection
+        transaction
+            .prepare(&cx, "INSERT INTO items (id, name) VALUES (?1, ?2)")
+            .await
+            .expect("transaction-scoped prepare should retain actor ownership");
+        transaction
             .execute(&cx, "INSERT INTO items (id, name) VALUES (2, 'two')")
             .await
             .expect("transactional insert should complete");
-        connection
-            .rollback_transaction(&cx)
+        transaction
+            .rollback(&cx)
             .await
             .expect("transaction should roll back");
+        drop(transaction);
         assert!(!connection.in_transaction());
         assert!(
             connection
@@ -88,18 +120,26 @@ fn async_facade_drives_file_backed_storage_futures_to_completion() {
                 .is_empty()
         );
 
-        connection
+        let mut transaction = connection
             .begin_transaction(&cx)
             .await
             .expect("second transaction should begin");
-        connection
+        transaction
             .execute(&cx, "INSERT INTO items (id, name) VALUES (3, 'three')")
             .await
             .expect("committed insert should complete");
-        connection
-            .commit_transaction(&cx)
+        assert_eq!(
+            transaction
+                .last_insert_rowid(&cx)
+                .await
+                .expect("transaction-scoped row id should cross the actor boundary"),
+            3
+        );
+        transaction
+            .commit(&cx)
             .await
             .expect("transaction should commit");
+        drop(transaction);
         assert!(!connection.in_transaction());
 
         let cancelled = Cx::new();
@@ -188,20 +228,30 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
         vec![Some(SqliteValue::Integer(1)), Some(SqliteValue::Integer(2))]
     );
 
-    assert!(matches!(
-        connection.execute_many_with_params_in_transaction_sync(
-            "INSERT INTO items(name) VALUES (?1)",
-            &[vec![SqliteValue::Text("outside".into())]],
-        ),
-        Err(FrankenError::Internal(detail)) if detail.contains("explicit transaction")
-    ));
-
-    connection
+    let mut transaction = connection
         .begin_transaction_sync()
         .expect("batch transaction should begin");
+    transaction
+        .prepare_sync("SELECT id FROM items WHERE id >= ?1")
+        .expect("transaction-scoped prepare should retain actor ownership");
+    let mut pre_batch_ids = Vec::new();
+    transaction
+        .query_with_params_for_each_sync(
+            "SELECT id FROM items WHERE id >= ?1 ORDER BY id",
+            &[SqliteValue::Integer(1)],
+            |row| {
+                pre_batch_ids.push(row.get(0).cloned());
+                Ok(())
+            },
+        )
+        .expect("transaction-scoped bounded stream should complete");
     assert_eq!(
-        connection
-            .execute_many_with_params_in_transaction_sync(
+        pre_batch_ids,
+        vec![Some(SqliteValue::Integer(1)), Some(SqliteValue::Integer(2))]
+    );
+    assert_eq!(
+        transaction
+            .execute_many_with_params_sync(
                 "INSERT INTO items(name) VALUES (?1)",
                 &[
                     vec![SqliteValue::Text("batch-a".into())],
@@ -211,9 +261,16 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
             .expect("batched parameter sets should complete"),
         2
     );
-    connection
-        .commit_transaction_sync()
+    assert_eq!(
+        transaction
+            .last_insert_rowid_sync()
+            .expect("transaction-scoped row id should cross the actor boundary"),
+        4
+    );
+    transaction
+        .commit_sync()
         .expect("batch transaction should commit");
+    drop(transaction);
     let batch_names = connection
         .query_sync("SELECT name FROM items WHERE id >= 3 ORDER BY id")
         .expect("committed batch should be queryable");
@@ -228,12 +285,12 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
         ]
     );
 
-    connection
+    let mut transaction = connection
         .begin_transaction_sync()
         .expect("failing batch transaction should begin");
     assert!(
-        connection
-            .execute_many_with_params_in_transaction_sync(
+        transaction
+            .execute_many_with_params_sync(
                 "INSERT INTO items(id, name) VALUES (?1, ?2)",
                 &[
                     vec![
@@ -249,9 +306,10 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
             .is_err()
     );
     assert!(connection.in_transaction());
-    connection
-        .rollback_transaction_sync()
+    transaction
+        .rollback_sync()
         .expect("caller should roll back a failed batch");
+    drop(transaction);
     assert!(
         connection
             .query_sync("SELECT id FROM items WHERE id = 10")
@@ -259,16 +317,17 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
             .is_empty()
     );
 
-    connection
+    let mut transaction = connection
         .begin_transaction_sync()
         .expect("transaction should begin");
     assert!(connection.in_transaction());
-    connection
+    transaction
         .execute_sync("DELETE FROM items")
         .expect("transactional delete should complete");
-    connection
-        .rollback_transaction_sync()
+    transaction
+        .rollback_sync()
         .expect("transaction should roll back");
+    drop(transaction);
     assert!(!connection.in_transaction());
     assert_eq!(
         connection

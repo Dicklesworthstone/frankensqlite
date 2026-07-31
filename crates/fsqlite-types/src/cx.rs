@@ -26,9 +26,12 @@
 //! ```
 //
 
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 #[cfg(feature = "native")]
@@ -428,6 +431,273 @@ impl Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Capability-free, cross-thread cancellation signal.
+///
+/// A relay carries no runtime handle, task identity, budget, I/O authority, or
+/// other [`Cx`] capability. It is suitable for asking an operation owned by a
+/// different execution context to stop without transplanting the caller's
+/// context into that operation.
+#[derive(Debug, Clone)]
+pub struct CancellationRelay {
+    inner: Arc<CancellationRelayInner>,
+}
+
+#[derive(Debug)]
+struct CancellationRelayInner {
+    requested: AtomicBool,
+    next_waiter_id: AtomicU64,
+    waiters: Mutex<Vec<(u64, Waker)>>,
+    subscribers: Mutex<Vec<Weak<Self>>>,
+    /// Strong references to the flattened leaf sources of a composed relay.
+    ///
+    /// Only leaf inners (whose own `owned_sources` is empty) may appear here,
+    /// so destruction never follows a recursively owned relay chain.
+    owned_sources: Mutex<Vec<Arc<Self>>>,
+}
+
+impl CancellationRelay {
+    /// Create a cancellation relay in the not-requested state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(CancellationRelayInner {
+                requested: AtomicBool::new(false),
+                next_waiter_id: AtomicU64::new(1),
+                waiters: Mutex::new(Vec::new()),
+                subscribers: Mutex::new(Vec::new()),
+                owned_sources: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// Request cancellation and wake every task waiting for the request.
+    pub fn request(&self) {
+        // Relays may be composed at actor boundaries. Propagate iteratively so
+        // even an adversarially deep relay chain cannot consume the call stack.
+        let mut pending = vec![Arc::clone(&self.inner)];
+        while let Some(inner) = pending.pop() {
+            if inner.requested.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            let waiters = {
+                let mut waiters = inner
+                    .waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *waiters)
+            };
+            let subscribers: Vec<Arc<CancellationRelayInner>> = {
+                let mut subscribers = inner
+                    .subscribers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                subscribers.retain(|subscriber| subscriber.strong_count() > 0);
+                subscribers.iter().filter_map(Weak::upgrade).collect()
+            };
+            pending.extend(subscribers);
+            for (_, waker) in waiters {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Return whether cancellation has been requested.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.inner.requested.load(Ordering::Acquire)
+    }
+
+    /// Wait until cancellation is requested.
+    #[must_use]
+    pub fn cancelled(&self) -> CancellationRelayFuture<'_> {
+        CancellationRelayFuture {
+            relay: self,
+            waiter_id: None,
+        }
+    }
+
+    fn subscribe(&self, downstream: &Self) {
+        if Arc::ptr_eq(&self.inner, &downstream.inner) {
+            return;
+        }
+        let mut subscribers = self
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subscribers.retain(|subscriber| subscriber.strong_count() > 0);
+        if self.is_requested() {
+            drop(subscribers);
+            downstream.request();
+        } else {
+            subscribers.push(Arc::downgrade(&downstream.inner));
+        }
+    }
+
+    fn subscribe_effective_sources(&self, downstream: &Self) {
+        self.subscribe(downstream);
+        let sources = self
+            .inner
+            .owned_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for source in sources {
+            Self { inner: source }.subscribe(downstream);
+        }
+    }
+
+    fn leaf_sources(&self) -> Vec<Arc<CancellationRelayInner>> {
+        let sources = self
+            .inner
+            .owned_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sources.is_empty() {
+            vec![Arc::clone(&self.inner)]
+        } else {
+            sources.clone()
+        }
+    }
+
+    fn combine(first: Self, second: Self) -> Self {
+        let combined = Self::new();
+        let mut sources = first.leaf_sources();
+        for source in second.leaf_sources() {
+            if !sources
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &source))
+            {
+                sources.push(source);
+            }
+        }
+        // Preserve direct requests through a retained composed intermediate.
+        // A leaf's direct handle is already covered by the leaf subscription.
+        if !sources
+            .iter()
+            .any(|source| Arc::ptr_eq(source, &first.inner))
+        {
+            first.subscribe(&combined);
+        }
+        if !sources
+            .iter()
+            .any(|source| Arc::ptr_eq(source, &second.inner))
+        {
+            second.subscribe(&combined);
+        }
+        for source in &sources {
+            Self {
+                inner: Arc::clone(source),
+            }
+            .subscribe(&combined);
+        }
+        *combined
+            .inner
+            .owned_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sources;
+        combined
+    }
+
+    fn remove_waiter(&self, waiter_id: u64) {
+        let removed = {
+            let mut waiters = self
+                .inner
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            waiters
+                .iter()
+                .position(|(id, _)| *id == waiter_id)
+                .map(|index| waiters.swap_remove(index))
+        };
+        // A RawWaker drop callback may reenter this relay.
+        drop(removed);
+    }
+}
+
+impl Default for CancellationRelay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Future returned by [`CancellationRelay::cancelled`].
+#[derive(Debug)]
+pub struct CancellationRelayFuture<'a> {
+    relay: &'a CancellationRelay,
+    waiter_id: Option<u64>,
+}
+
+impl Future for CancellationRelayFuture<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, task_cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.relay.is_requested() {
+            if let Some(waiter_id) = self.waiter_id.take() {
+                self.relay.remove_waiter(waiter_id);
+            }
+            return Poll::Ready(());
+        }
+
+        // A RawWaker clone callback may be reentrant. Clone before taking the
+        // relay lock, and move any displaced/unused Waker out for unlocked
+        // destruction below.
+        let replacement_waker = task_cx.waker().clone();
+        let relay_inner = Arc::clone(&self.relay.inner);
+        let current_waiter_id = self.waiter_id;
+        let (poll, waiter_id, displaced_waker, unused_waker) = {
+            let mut waiters = relay_inner
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.relay.is_requested() {
+                let displaced = current_waiter_id
+                    .and_then(|waiter_id| waiters.iter().position(|(id, _)| *id == waiter_id))
+                    .map(|index| waiters.swap_remove(index).1);
+                (Poll::Ready(()), None, displaced, Some(replacement_waker))
+            } else if let Some(waiter_id) = current_waiter_id {
+                if let Some((_, registered)) = waiters.iter_mut().find(|(id, _)| *id == waiter_id) {
+                    if registered.will_wake(&replacement_waker) {
+                        (
+                            Poll::Pending,
+                            Some(waiter_id),
+                            None,
+                            Some(replacement_waker),
+                        )
+                    } else {
+                        (
+                            Poll::Pending,
+                            Some(waiter_id),
+                            Some(std::mem::replace(registered, replacement_waker)),
+                            None,
+                        )
+                    }
+                } else {
+                    waiters.push((waiter_id, replacement_waker));
+                    (Poll::Pending, Some(waiter_id), None, None)
+                }
+            } else {
+                let waiter_id = relay_inner.next_waiter_id.fetch_add(1, Ordering::Relaxed);
+                waiters.push((waiter_id, replacement_waker));
+                (Poll::Pending, Some(waiter_id), None, None)
+            }
+        };
+        self.waiter_id = waiter_id;
+        drop(displaced_waker);
+        drop(unused_waker);
+        poll
+    }
+}
+
+impl Drop for CancellationRelayFuture<'_> {
+    fn drop(&mut self) {
+        if let Some(waiter_id) = self.waiter_id.take() {
+            self.relay.remove_waiter(waiter_id);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CxInner {
     cancel_requested: AtomicBool,
@@ -435,6 +705,7 @@ struct CxInner {
     cancel_reason: Mutex<Option<CancelReason>>,
     mask_depth: AtomicU32,
     children: Mutex<Vec<Weak<Self>>>,
+    cancellation_subscribers: Mutex<Vec<Weak<CancellationRelayInner>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
     last_eprocess_decision: Mutex<Option<EProcessDecision>>,
     eprocess_oracle: std::sync::OnceLock<Arc<EProcessOracle>>,
@@ -461,6 +732,7 @@ impl CxInner {
             cancel_reason: Mutex::new(None),
             mask_depth: AtomicU32::new(0),
             children: Mutex::new(Vec::new()),
+            cancellation_subscribers: Mutex::new(Vec::new()),
             last_checkpoint_msg: Mutex::new(None),
             last_eprocess_decision: Mutex::new(None),
             eprocess_oracle: std::sync::OnceLock::new(),
@@ -557,9 +829,19 @@ fn local_deadline_to_native_time(deadline: Duration) -> NativeTime {
 
 /// Propagate cancellation to a `CxInner` node and all its descendants.
 ///
-/// We release each node's lock before recursing into children to avoid
-/// lock-ordering issues.
+/// Each node's locks are released before its children are visited. The
+/// explicit LIFO worklist preserves the former insertion-order DFS while
+/// making cancellation safe for arbitrarily deep user-created context trees.
 fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
+    let mut pending = cancel_node(inner, reason);
+    pending.reverse();
+    while let Some(node) = pending.pop() {
+        let children = cancel_node(&node, reason);
+        pending.extend(children.into_iter().rev());
+    }
+}
+
+fn cancel_node(inner: &CxInner, reason: CancelReason) -> Vec<Arc<CxInner>> {
     // Set atomic flag (fast-path for checkpoint).
     inner.cancel_requested.store(true, Ordering::Release);
 
@@ -591,17 +873,30 @@ fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
     #[cfg(feature = "native")]
     sync_native_cx_cancel(inner, reason);
 
+    let cancellation_relays: Vec<CancellationRelay> = {
+        let mut subscribers = inner
+            .cancellation_subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subscribers.retain(|subscriber| subscriber.strong_count() > 0);
+        subscribers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|inner| CancellationRelay { inner })
+            .collect()
+    };
+    for relay in cancellation_relays {
+        relay.request();
+    }
+
     // Collect children (release lock before recursing).
-    let children: Vec<Arc<CxInner>> = {
+    {
         let mut guard = inner
             .children
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.retain(|child| child.strong_count() > 0);
         guard.iter().filter_map(Weak::upgrade).collect()
-    };
-    for child in &children {
-        propagate_cancel(child, reason);
     }
 }
 
@@ -613,6 +908,7 @@ fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
 #[derive(Debug)]
 pub struct Cx<Caps: cap::SubsetOf<cap::All> = FullCaps> {
     inner: Arc<CxInner>,
+    external_cancellation: Option<CancellationRelay>,
     budget: Budget,
     trace_id: u64,
     decision_id: u64,
@@ -625,6 +921,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Clone for Cx<Caps> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            external_cancellation: self.external_cancellation.clone(),
             budget: self.budget,
             trace_id: self.trace_id,
             decision_id: self.decision_id,
@@ -695,6 +992,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     pub fn with_budget(budget: Budget) -> Self {
         Self {
             inner: Arc::new(CxInner::new()),
+            external_cancellation: None,
             budget,
             trace_id: 0,
             decision_id: 0,
@@ -766,6 +1064,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     pub fn scope_with_budget(&self, child: Budget) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            external_cancellation: self.external_cancellation.clone(),
             budget: self.budget.meet(child),
             trace_id: self.trace_id,
             decision_id: self.decision_id,
@@ -799,6 +1098,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     {
         Cx {
             inner: Arc::clone(&self.inner),
+            external_cancellation: self.external_cancellation.clone(),
             budget: self.budget,
             trace_id: self.trace_id,
             decision_id: self.decision_id,
@@ -831,6 +1131,50 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// INV-CANCEL-PROPAGATES: cancellation propagates to all descendants.
     pub fn cancel_with_reason(&self, reason: CancelReason) {
         propagate_cancel(&self.inner, reason);
+    }
+
+    /// Create a capability-free observer for this context's cancellation.
+    ///
+    /// The returned relay is one-way: cancelling this context requests the
+    /// relay, but the relay carries no handle that can mutate or widen this
+    /// context.
+    #[must_use]
+    pub fn cancellation_relay(&self) -> CancellationRelay {
+        let relay = CancellationRelay::new();
+        {
+            let mut subscribers = self
+                .inner
+                .cancellation_subscribers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            subscribers.retain(|subscriber| subscriber.strong_count() > 0);
+            if self.inner.cancel_requested.load(Ordering::Acquire) {
+                drop(subscribers);
+                relay.request();
+            } else {
+                subscribers.push(Arc::downgrade(&relay.inner));
+            }
+        }
+        if let Some(external) = &self.external_cancellation {
+            external.subscribe_effective_sources(&relay);
+        }
+        relay
+    }
+
+    /// Return a context handle that also observes an independent,
+    /// capability-free cancellation relay.
+    ///
+    /// This changes only cancellation observation for this handle and handles
+    /// cloned or derived from it. It never changes the persistent context root
+    /// or imports authority from the relay.
+    #[must_use]
+    pub fn with_cancellation_relay(mut self, relay: CancellationRelay) -> Self {
+        self.external_cancellation = match self.external_cancellation.take() {
+            None => Some(relay),
+            Some(existing) if Arc::ptr_eq(&existing.inner, &relay.inner) => Some(existing),
+            Some(existing) => Some(CancellationRelay::combine(existing, relay)),
+        };
+        self
     }
 
     /// Current state in the cancellation lifecycle.
@@ -1057,8 +1401,12 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// self-time on the 2026-04-23 post-bench-fix MT 8t capture
     /// (`fsqlite-bench-fix-validation-194151`).
     pub fn checkpoint(&self) -> Result<()> {
+        let external_cancel_requested = self
+            .external_cancellation
+            .as_ref()
+            .is_some_and(CancellationRelay::is_requested);
         let cancel_requested = self.inner.cancel_requested.load(Ordering::Acquire);
-        if !cancel_requested {
+        if !cancel_requested && !external_cancel_requested {
             // Cheap path already proved we're not locally cancelled. Only
             // the oracle + native cx can still observe a cancel signal.
             if !self.maybe_cancel_via_eprocess() {
@@ -1081,6 +1429,14 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         let masked = self.inner.mask_depth.load(Ordering::Acquire) > 0;
         if masked {
             return Ok(());
+        }
+
+        // An external relay is deliberately handle-local. Do not call
+        // `cancel_with_reason` here: operation contexts commonly clone a
+        // persistent connection root, and mutating that root would poison every
+        // later operation after cancelling just one actor request.
+        if external_cancel_requested && !self.inner.cancel_requested.load(Ordering::Acquire) {
+            return Err(Error::cancelled());
         }
 
         // Slow path: transition CancelRequested → Cancelling.
@@ -1215,6 +1571,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[must_use]
     pub fn create_child(&self) -> Self {
         let mut child = Self::with_budget(self.budget);
+        child
+            .external_cancellation
+            .clone_from(&self.external_cancellation);
         child.trace_id = self.trace_id;
         child.decision_id = self.decision_id;
         child.policy_id = self.policy_id;
@@ -1341,6 +1700,371 @@ mod tests {
     }
 
     #[test]
+    fn test_cancellation_relay_is_handle_local() {
+        let root = Cx::new();
+        let sibling = root.clone();
+        let relay = CancellationRelay::new();
+        let operation = root.clone().with_cancellation_relay(relay.clone());
+
+        relay.request();
+
+        assert!(operation.checkpoint().is_err());
+        assert!(root.checkpoint().is_ok());
+        assert!(sibling.checkpoint().is_ok());
+        assert!(!root.is_cancel_requested());
+    }
+
+    #[test]
+    fn test_cancellation_relay_propagates_to_derived_child_only() {
+        let root = Cx::new();
+        let relay = CancellationRelay::new();
+        let operation = root.clone().with_cancellation_relay(relay.clone());
+        let child = operation.create_child();
+
+        relay.request();
+
+        assert!(operation.checkpoint().is_err());
+        assert!(child.checkpoint().is_err());
+        assert!(root.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn test_external_cancellation_relay_respects_masking() {
+        let relay = CancellationRelay::new();
+        let operation = Cx::new().with_cancellation_relay(relay.clone());
+        relay.request();
+
+        {
+            let _mask = operation.masked();
+            assert!(operation.checkpoint().is_ok());
+        }
+        assert!(operation.checkpoint().is_err());
+    }
+
+    #[test]
+    fn test_cx_cancellation_requests_subscribed_relay() {
+        let cx = Cx::new();
+        let relay = cx.cancellation_relay();
+        assert!(!relay.is_requested());
+
+        cx.cancel();
+
+        assert!(relay.is_requested());
+    }
+
+    #[test]
+    fn test_cancellation_relay_composes_existing_external_source() {
+        let upstream = CancellationRelay::new();
+        let source = Cx::new().with_cancellation_relay(upstream.clone());
+        let downstream = source.cancellation_relay();
+
+        upstream.request();
+
+        assert!(downstream.is_requested());
+        assert!(!source.is_cancel_requested());
+    }
+
+    #[test]
+    fn test_local_child_cancellation_does_not_propagate_to_external_source() {
+        let upstream = CancellationRelay::new();
+        let source = Cx::new().with_cancellation_relay(upstream.clone());
+        let child = source.create_child();
+
+        child.cancel();
+
+        assert!(!upstream.is_requested());
+        assert!(source.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn test_multiple_external_relays_are_composed_without_upstream_authority() {
+        let first = CancellationRelay::new();
+        let second = CancellationRelay::new();
+        let operation = Cx::new()
+            .with_cancellation_relay(first.clone())
+            .with_cancellation_relay(second.clone());
+
+        second.request();
+
+        assert!(operation.checkpoint().is_err());
+        assert!(!first.is_requested());
+        assert!(!operation.is_cancel_requested());
+    }
+
+    #[test]
+    fn test_chained_external_relay_composition_retains_every_source() {
+        let first = CancellationRelay::new();
+        let second = CancellationRelay::new();
+        let third = CancellationRelay::new();
+        let operation = Cx::new()
+            .with_cancellation_relay(first.clone())
+            .with_cancellation_relay(second)
+            .with_cancellation_relay(third);
+
+        first.request();
+
+        assert!(operation.checkpoint().is_err());
+        assert!(!operation.is_cancel_requested());
+    }
+
+    #[test]
+    fn test_deep_cancellation_relay_chain_propagates_iteratively() {
+        std::thread::Builder::new()
+            .name("relay-deep-request".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let root = CancellationRelay::new();
+                let mut relays = vec![root.clone()];
+                for _ in 0..4_096 {
+                    let downstream = CancellationRelay::new();
+                    relays.last().unwrap().subscribe(&downstream);
+                    relays.push(downstream);
+                }
+
+                root.request();
+
+                assert!(relays.last().unwrap().is_requested());
+            })
+            .expect("deep-relay test thread should spawn")
+            .join()
+            .expect("deep-relay request and drop should not overflow");
+    }
+
+    #[test]
+    fn test_deep_composed_relay_drop_uses_bounded_stack() {
+        std::thread::Builder::new()
+            .name("relay-deep-drop".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let first = CancellationRelay::new();
+                let mut operation = Cx::new().with_cancellation_relay(first.clone());
+                for _ in 0..2_048 {
+                    operation = operation.with_cancellation_relay(CancellationRelay::new());
+                }
+
+                first.request();
+                assert!(operation.checkpoint().is_err());
+                drop(operation);
+            })
+            .expect("deep-composition test thread should spawn")
+            .join()
+            .expect("deep composed relay drop should not overflow");
+    }
+
+    #[test]
+    fn test_deep_context_tree_cancellation_uses_bounded_stack() {
+        std::thread::Builder::new()
+            .name("cx-deep-cancel".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut chain = Vec::with_capacity(10_001);
+                chain.push(Cx::new());
+                for _ in 0..10_000 {
+                    let child = chain.last().unwrap().create_child();
+                    chain.push(child);
+                }
+
+                chain[0].cancel_with_reason(CancelReason::Abort);
+
+                for cx in &chain {
+                    assert!(cx.is_cancel_requested());
+                    assert_eq!(cx.cancel_state(), CancelState::CancelRequested);
+                    assert_eq!(cx.cancel_reason(), Some(CancelReason::Abort));
+                }
+            })
+            .expect("deep-cancellation test thread should spawn")
+            .join()
+            .expect("deep-cancellation test thread should not overflow");
+    }
+
+    #[test]
+    fn test_relay_subscribed_after_cancellation_is_immediately_requested() {
+        let cx = Cx::new();
+        cx.cancel();
+
+        let relay = cx.cancellation_relay();
+
+        assert!(relay.is_requested());
+    }
+
+    #[test]
+    fn test_cancellation_subscription_prunes_dead_relays() {
+        let cx = Cx::new();
+        for _ in 0..100 {
+            drop(cx.cancellation_relay());
+        }
+        let live = cx.cancellation_relay();
+
+        assert_eq!(
+            cx.inner
+                .cancellation_subscribers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        assert!(!live.is_requested());
+    }
+
+    #[test]
+    fn test_cancellation_relay_wakes_registered_waiter() {
+        #[derive(Debug, Default)]
+        struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+        impl std::task::Wake for WakeCounter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let relay = CancellationRelay::new();
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut task_cx = Context::from_waker(&waker);
+        let mut cancelled = std::pin::pin!(relay.cancelled());
+
+        assert!(cancelled.as_mut().poll(&mut task_cx).is_pending());
+        relay.request();
+
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+        assert!(cancelled.as_mut().poll(&mut task_cx).is_ready());
+    }
+
+    #[test]
+    fn test_dropped_cancellation_waiter_is_unregistered() {
+        #[derive(Debug, Default)]
+        struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+        impl std::task::Wake for WakeCounter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let relay = CancellationRelay::new();
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut task_cx = Context::from_waker(&waker);
+        {
+            let mut cancelled = std::pin::pin!(relay.cancelled());
+            assert!(cancelled.as_mut().poll(&mut task_cx).is_pending());
+        }
+
+        relay.request();
+
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_cancellation_waiter_replacement_drops_waker_outside_lock() {
+        #[derive(Debug)]
+        struct ReentrantDropWake {
+            relay: CancellationRelay,
+            waiter_lock_was_free: Arc<AtomicBool>,
+        }
+
+        impl std::task::Wake for ReentrantDropWake {
+            fn wake(self: Arc<Self>) {}
+
+            fn wake_by_ref(self: &Arc<Self>) {}
+        }
+
+        impl Drop for ReentrantDropWake {
+            fn drop(&mut self) {
+                self.waiter_lock_was_free.store(
+                    self.relay.inner.waiters.try_lock().is_ok(),
+                    Ordering::Release,
+                );
+            }
+        }
+
+        #[derive(Debug)]
+        struct NoopWake;
+
+        impl std::task::Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+
+            fn wake_by_ref(self: &Arc<Self>) {}
+        }
+
+        let relay = CancellationRelay::new();
+        let lock_was_free = Arc::new(AtomicBool::new(false));
+        let first_waker = Waker::from(Arc::new(ReentrantDropWake {
+            relay: relay.clone(),
+            waiter_lock_was_free: Arc::clone(&lock_was_free),
+        }));
+        let mut cancelled = Box::pin(relay.cancelled());
+        {
+            let mut task_cx = Context::from_waker(&first_waker);
+            assert!(cancelled.as_mut().poll(&mut task_cx).is_pending());
+        }
+        drop(first_waker);
+
+        let replacement_waker = Waker::from(Arc::new(NoopWake));
+        {
+            let mut task_cx = Context::from_waker(&replacement_waker);
+            assert!(cancelled.as_mut().poll(&mut task_cx).is_pending());
+        }
+
+        assert!(
+            lock_was_free.load(Ordering::Acquire),
+            "displaced RawWaker must be dropped after releasing the waiter mutex"
+        );
+    }
+
+    #[test]
+    fn test_cancellation_waiter_removal_drops_waker_outside_lock() {
+        #[derive(Debug)]
+        struct ReentrantDropWake {
+            relay: CancellationRelay,
+            waiter_lock_was_free: Arc<AtomicBool>,
+        }
+
+        impl std::task::Wake for ReentrantDropWake {
+            fn wake(self: Arc<Self>) {}
+
+            fn wake_by_ref(self: &Arc<Self>) {}
+        }
+
+        impl Drop for ReentrantDropWake {
+            fn drop(&mut self) {
+                self.waiter_lock_was_free.store(
+                    self.relay.inner.waiters.try_lock().is_ok(),
+                    Ordering::Release,
+                );
+            }
+        }
+
+        let relay = CancellationRelay::new();
+        let lock_was_free = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(ReentrantDropWake {
+            relay: relay.clone(),
+            waiter_lock_was_free: Arc::clone(&lock_was_free),
+        }));
+        let mut cancelled = Box::pin(relay.cancelled());
+        {
+            let mut task_cx = Context::from_waker(&waker);
+            assert!(cancelled.as_mut().poll(&mut task_cx).is_pending());
+        }
+        drop(waker);
+
+        drop(cancelled);
+
+        assert!(
+            lock_was_free.load(Ordering::Acquire),
+            "removed RawWaker must be dropped after releasing the waiter mutex"
+        );
+    }
+
+    #[test]
     fn test_cx_capability_narrowing_compiles() {
         let cx = Cx::<FullCaps>::new();
         let _compute = cx.restrict::<ComputeCaps>();
@@ -1395,8 +2119,8 @@ mod tests {
 
     #[test]
     fn test_cx_restrict_is_zero_cost() {
-        // CapSet is a ZST; Cx carries only Arc + Budget + PhantomData.
-        // Restrict changes only the phantom marker — same size, same pointer.
+        // CapSet is a ZST. Restrict changes only the phantom marker while
+        // preserving the same cancellation/context handles.
         assert_eq!(
             std::mem::size_of::<Cx<FullCaps>>(),
             std::mem::size_of::<Cx<ComputeCaps>>()

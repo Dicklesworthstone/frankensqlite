@@ -283,30 +283,100 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         buf: &'a [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
+        async move {
+            GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+            let bytes = buf.len() as u64;
+            let result = vfs_trace_op!(
+                "write_async",
+                &*self.path,
+                bytes,
+                self.inner.write(cx, buf, offset).await
+            );
+            if result.is_ok() {
+                GLOBAL_VFS_METRICS
+                    .write_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            result
+        }
     }
 
-    async fn write_tracked(
-        &self,
-        cx: &Cx,
-        buf: &[u8],
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> Result<()> {
-        GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
-        let bytes = buf.len() as u64;
-        let result = vfs_trace_op!(
-            "write_async",
-            &*self.path,
-            bytes,
-            self.inner.write_tracked(cx, buf, offset, completion).await
-        );
-        if result.is_ok() {
-            GLOBAL_VFS_METRICS
-                .write_bytes_total
-                .fetch_add(bytes, Ordering::Relaxed);
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        // Construct the lower future synchronously so dropping this tracing
+        // observer unpolled cannot strand the caller's exact source receipt.
+        let inner_write = self.inner.write_tracked(cx, buf, offset, completion);
+        async move {
+            GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+            let bytes = buf.len() as u64;
+            let result = vfs_trace_op!("write_async", &*self.path, bytes, inner_write.await);
+            if result.is_ok() {
+                GLOBAL_VFS_METRICS
+                    .write_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            result
         }
-        result
+    }
+
+    fn write_page_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+            let bytes = writes.iter().fold(0_u64, |total, (_, data)| {
+                total.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+            });
+            let result = vfs_trace_op!(
+                "write_page_batch_async",
+                &*self.path,
+                bytes,
+                self.inner.write_page_batch(cx, writes).await
+            );
+            if result.is_ok() {
+                GLOBAL_VFS_METRICS
+                    .write_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            result
+        }
+    }
+
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        // Construct the inner future before this wrapper future is returned.
+        // Hidden backends thereby retain the exact caller token even if the
+        // tracing observer is dropped without ever being polled.
+        let inner_write = self.inner.write_page_batch_tracked(cx, writes, completion);
+        async move {
+            GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+            let bytes = writes.iter().fold(0_u64, |total, (_, data)| {
+                total.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+            });
+            let result = vfs_trace_op!(
+                "write_page_batch_async",
+                &*self.path,
+                bytes,
+                inner_write.await
+            );
+            if result.is_ok() {
+                GLOBAL_VFS_METRICS
+                    .write_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            result
+        }
     }
 
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -425,7 +495,13 @@ mod tests {
         let mut traced = TracingFile::new(file, "test.db");
 
         // Write some data.
+        crate::traits::reset_write_completion_creation_count();
         traced.write(&cx, b"hello world", 0).unwrap();
+        assert_eq!(
+            crate::traits::write_completion_creation_count(),
+            0,
+            "ordinary tracing writes must forward the ordinary backend path"
+        );
 
         // Read it back.
         let mut buf = [0u8; 11];
@@ -835,5 +911,64 @@ mod tests {
         let mut traced = TracingFile::new(file, "busy.db");
         traced.set_busy_timeout_ms(5000);
         traced.set_busy_timeout_ms(0);
+    }
+
+    #[test]
+    fn tracing_file_forwards_exact_tracked_batch_completion() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("tracked-batch.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+        let traced = TracingFile::new(file, "tracked-batch.db");
+        let first = [1_u8, 2, 3];
+        let second = [4_u8, 5, 6];
+        let writes = [(0, &first[..]), (8, &second[..])];
+
+        crate::traits::reset_write_completion_creation_count();
+        crate::block_on_test_io(&cx, traced.write_page_batch(&cx, &writes))
+            .expect("ordinary tracing batch");
+        assert_eq!(
+            crate::traits::write_completion_creation_count(),
+            0,
+            "ordinary tracing batches must forward the ordinary backend path"
+        );
+
+        let completion = VfsWriteCompletion::new();
+        crate::block_on_test_io(
+            &cx,
+            traced.write_page_batch_tracked(&cx, &writes, completion.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            completion.state(),
+            crate::traits::VfsWriteCompletionState::Success
+        );
+
+        let abandoned = VfsWriteCompletion::new();
+        let unpolled = traced.write_page_batch_tracked(&cx, &writes, abandoned.clone());
+        assert_eq!(
+            abandoned.state(),
+            crate::traits::VfsWriteCompletionState::Pending
+        );
+        drop(unpolled);
+        assert_eq!(
+            abandoned.state(),
+            crate::traits::VfsWriteCompletionState::Error,
+            "the wrapper must create and retain the inner source before returning"
+        );
+
+        let abandoned_single = VfsWriteCompletion::new();
+        let unpolled_single = traced.write_tracked(&cx, &first, 0, abandoned_single.clone());
+        drop(unpolled_single);
+        assert_eq!(
+            abandoned_single.state(),
+            crate::traits::VfsWriteCompletionState::Error,
+            "the tracing single-write wrapper must synchronously forward the exact source"
+        );
     }
 }
