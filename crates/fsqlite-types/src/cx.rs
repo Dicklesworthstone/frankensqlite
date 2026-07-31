@@ -319,6 +319,8 @@ pub type ComputeCaps = cap::None;
 /// - priority propagates by `max`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
+    /// Relative timeout translated into the receiving runtime's clock domain
+    /// when work crosses a native async boundary.
     pub deadline: Option<Duration>,
     pub poll_quota: u32,
     pub cost_quota: Option<u64>,
@@ -603,37 +605,17 @@ fn sync_one_native_cx_cancel(inner: &CxInner, native: &NativeCx) {
 #[cfg(feature = "native")]
 #[must_use]
 #[allow(dead_code)]
-fn native_budget_from_local(budget: Budget) -> NativeBudget {
+fn native_budget_from_local_at(budget: Budget, now: NativeTime) -> NativeBudget {
     let mut native_budget = NativeBudget::new()
         .with_poll_quota(budget.poll_quota)
         .with_priority(budget.priority);
     if let Some(cost_quota) = budget.cost_quota {
         native_budget = native_budget.with_cost_quota(cost_quota);
     }
-    if let Some(deadline) = budget.deadline {
-        native_budget = native_budget.with_deadline(local_deadline_to_native_time(deadline));
+    if let Some(timeout) = budget.deadline {
+        native_budget = native_budget.with_timeout(now, timeout);
     }
     native_budget
-}
-
-#[cfg(feature = "native")]
-#[must_use]
-#[allow(dead_code)]
-fn wall_clock_now_since_epoch() -> Duration {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-}
-
-#[cfg(feature = "native")]
-#[must_use]
-#[allow(dead_code)]
-fn local_deadline_to_native_time(deadline: Duration) -> NativeTime {
-    let absolute_deadline = wall_clock_now_since_epoch()
-        .checked_add(deadline)
-        .unwrap_or(Duration::MAX);
-    let nanos = u64::try_from(absolute_deadline.as_nanos()).unwrap_or(u64::MAX);
-    NativeTime::from_nanos(nanos)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1157,7 +1139,10 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 self.inner
                     .fallback_native_cx
                     .get_or_init(|| {
-                        NativeCx::for_request_with_budget(native_budget_from_local(self.budget))
+                        NativeCx::for_request_with_budget(native_budget_from_local_at(
+                            self.budget,
+                            asupersync::time::wall_now(),
+                        ))
                     })
                     .clone()
             })
@@ -1465,6 +1450,20 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Compute the native runtime budget for a task spawned on `native_cx`.
+    ///
+    /// FrankenSQLite deadlines are relative timeouts. They must be translated
+    /// using the selected native context's clock so production monotonic time
+    /// and deterministic lab time stay in the same domain. Meeting the result
+    /// with the native parent's budget preserves every tighter parent bound,
+    /// including the maximum scheduling priority.
+    #[cfg(feature = "native")]
+    #[must_use]
+    pub fn native_spawn_budget(&self, native_cx: &NativeCx) -> NativeBudget {
+        let local = native_budget_from_local_at(self.budget, native_cx.now_for_observability());
+        native_cx.budget().meet(local)
     }
 
     /// Return the attached native context shim, if one exists.
@@ -2162,6 +2161,39 @@ mod tests {
         let child = Budget::INFINITE.with_priority(5);
         let effective = parent.meet(child);
         assert_eq!(effective.priority, 5);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn bd_2jpu6_2_native_budget_translation_uses_supplied_clock_domain() {
+        let now = NativeTime::from_nanos(1_000);
+        let local = Budget::INFINITE.with_deadline(Duration::from_nanos(250));
+
+        let native = native_budget_from_local_at(local, now);
+
+        assert_eq!(native.deadline, Some(NativeTime::from_nanos(1_250)));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn bd_2jpu6_2_native_spawn_budget_meets_parent_bounds_and_priority() {
+        let parent = NativeBudget::INFINITE
+            .with_poll_quota(80)
+            .with_cost_quota(900)
+            .with_priority(9);
+        let native_cx = NativeCx::for_testing_with_budget(parent);
+        let local = Cx::<FullCaps>::with_budget(
+            Budget::INFINITE
+                .with_poll_quota(60)
+                .with_cost_quota(700)
+                .with_priority(3),
+        );
+
+        let effective = local.native_spawn_budget(&native_cx);
+
+        assert_eq!(effective.poll_quota, 60);
+        assert_eq!(effective.cost_quota, Some(700));
+        assert_eq!(effective.priority, 9);
     }
 
     #[test]
@@ -3601,8 +3633,7 @@ mod tests {
         // - planner (Instant::now for access-path selection, SystemTime for contracts)
         // - wal (Instant::now for checkpoint timing)
         // - vfs (Instant::now for VFS operation metrics, std::fs allowed by design)
-        // - types (the Cx clock primitive itself: wall_clock_now_since_epoch for
-        //   native deadline conversion — the one place real time enters Cx)
+        // - types (capability-context implementation and its test audit)
         // - func (SQL date/time functions are wall-clock by definition:
         //   datetime('now'), unixepoch(), strftime('now', ...))
         // - fsqlite (migration busy-retry timeout: Instant::now bounds the

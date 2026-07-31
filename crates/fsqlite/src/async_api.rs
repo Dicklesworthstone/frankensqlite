@@ -938,8 +938,17 @@ fn worker_loop(conn: &Connection, rx: &mut CommandReceiver, state: &WorkerState)
                 publish_and_respond(conn, state, tx, result);
             }
             Command::QueryWithParamsStream { sql, params, tx } => {
+                let mut published_before_first_row = false;
                 let result =
                     future::block_on(conn.query_with_params_for_each(&sql, &params, |row| {
+                        // The core executes the complete batch before visiting the
+                        // last statement's rows. A synchronous callback can inspect
+                        // `in_transaction()` before this command's terminal response,
+                        // so publish that completed-batch state before exposing row 1.
+                        if !published_before_first_row {
+                            state.publish_connection_state(conn);
+                            published_before_first_row = true;
+                        }
                         tx.send(Ok(Some(row.clone())))
                             .map_err(|_| stream_consumer_dead_err())
                     }));
@@ -2705,6 +2714,40 @@ mod tests {
         test_thread
             .join()
             .expect("reentrancy test thread should not panic");
+    }
+
+    #[test]
+    fn synchronous_stream_callback_observes_current_worker_transaction_state() {
+        let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
+        assert!(!conn.in_transaction());
+
+        let mut begin_rows = 0usize;
+        conn.query_with_params_for_each_sync("BEGIN; SELECT 1", &[], |_| {
+            begin_rows += 1;
+            assert!(
+                conn.in_transaction(),
+                "the BEGIN state must publish before its following row"
+            );
+            Ok(())
+        })
+        .expect("BEGIN followed by a row should stream successfully");
+        assert_eq!(begin_rows, 1);
+        assert!(conn.in_transaction());
+
+        let mut commit_rows = 0usize;
+        conn.query_with_params_for_each_sync("COMMIT; SELECT 1", &[], |_| {
+            commit_rows += 1;
+            assert!(
+                !conn.in_transaction(),
+                "the COMMIT state must publish before its following row"
+            );
+            Ok(())
+        })
+        .expect("COMMIT followed by a row should stream successfully");
+        assert_eq!(commit_rows, 1);
+        assert!(!conn.in_transaction());
+
+        conn.close_sync().expect("worker should close");
     }
 
     #[test]
