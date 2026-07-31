@@ -767,13 +767,18 @@ fn malformed_explicit_index_expr(context: &str, detail: &str) -> CodegenError {
 fn validate_explicit_index_expr_shape(expr: &Expr, context: &str) -> Result<(), CodegenError> {
     match expr {
         Expr::Literal(..) | Expr::Column(..) => Ok(()),
-        Expr::BinaryOp { left, right, .. } | Expr::JsonAccess { expr: left, path: right, .. } => {
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
             validate_explicit_index_expr_shape(left, context)?;
             validate_explicit_index_expr_shape(right, context)
         }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull { expr, .. } => validate_explicit_index_expr_shape(expr, context),
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            validate_explicit_index_expr_shape(expr, context)
+        }
         Expr::Collate {
             expr, collation, ..
         } => {
@@ -33534,8 +33539,8 @@ mod tests {
         schema[0].columns[0].collation = Some("NOCASE".to_owned());
         let stmt = create_index_sql("CREATE UNIQUE INDEX MiXeD ON T(a DESC)");
 
-        let bound = bind_explicit_index(&stmt, "mixed", "t", &schema[0])
-            .expect("simple index should bind");
+        let bound =
+            bind_explicit_index(&stmt, "mixed", "t", &schema[0]).expect("simple index should bind");
 
         assert_eq!(bound.name, "MiXeD");
         assert_eq!(bound.columns, ["a"]);
@@ -33569,10 +33574,7 @@ mod tests {
             bound.key_sort_directions,
             [SortDirection::Desc, SortDirection::Asc]
         );
-        assert_eq!(
-            bound.key_collations,
-            [Some("custom_sort".to_owned()), None]
-        );
+        assert_eq!(bound.key_collations, [Some("custom_sort".to_owned()), None]);
     }
 
     #[test]
@@ -33621,8 +33623,7 @@ mod tests {
     #[test]
     fn bind_explicit_index_rejects_unknown_partial_predicate_column() {
         let schema = test_schema();
-        let stmt =
-            create_index_sql("CREATE INDEX idx_partial_missing ON t(a) WHERE missing > 0");
+        let stmt = create_index_sql("CREATE INDEX idx_partial_missing ON t(a) WHERE missing > 0");
 
         let error = bind_explicit_index(&stmt, "idx_partial_missing", "t", &schema[0])
             .expect_err("unknown partial-index predicate column must fail");
