@@ -73,7 +73,7 @@ const CONCURRENT_WRITERS_SECTION_TITLE: &str =
     "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
 const DEFAULT_BENCH_PAGE_SIZE_BYTES: u32 = 4096;
 #[cfg(feature = "bridge-experiment")]
-const BRIDGE_REPORT_SCHEMA_V2: &str = "fsqlite-e2e.bridge-experiment.v2";
+const BRIDGE_REPORT_SCHEMA_V3: &str = "fsqlite-e2e.bridge-experiment.v3";
 #[cfg(feature = "bridge-experiment")]
 const BRIDGE_INSERT_SQL: &str = "INSERT INTO bridge_probe(id, value) VALUES (?1, ?2)";
 #[cfg(feature = "bridge-experiment")]
@@ -86,6 +86,21 @@ const BRIDGE_ABSOLUTE_MAX_LOAD_1M: f64 = 1.0;
 const BRIDGE_MAX_CPU_PRESSURE_SOME_AVG10: f64 = 1.0;
 #[cfg(feature = "bridge-experiment")]
 const BRIDGE_MAX_IO_PRESSURE_SOME_AVG60: f64 = 0.10;
+const PARAMETER_CONTROL_DEFAULT_SAMPLES_PER_ROLE: usize = 144;
+#[cfg(feature = "bridge-experiment")]
+const PARAMETER_CONTROL_BOOTSTRAP_RESAMPLES: usize = 10_000;
+#[cfg(feature = "bridge-experiment")]
+const PARAMETER_CONTROL_SCALAR_SQL: &str = "SELECT 40 + 2";
+#[cfg(feature = "bridge-experiment")]
+const PARAMETER_CONTROL_VARIABLE_SQL: &str = "SELECT ?1 + 2";
+#[cfg(feature = "bridge-experiment")]
+const PARAMETER_CONTROL_INDEXED_COUNT_SQL: &str = "SELECT COUNT(*) FROM products WHERE category_id IN \
+     (SELECT id FROM categories WHERE id <= 5)";
+#[cfg(feature = "bridge-experiment")]
+const PARAMETER_CONTROL_READ_BODY_SQL: &str =
+    "SELECT payload + 0 FROM txn_probe INDEXED BY txn_probe_key_idx WHERE probe_key = ?1";
+#[cfg(feature = "bridge-experiment")]
+const PARAMETER_CONTROL_READ_BODY_ROWS: usize = 1_024;
 
 // ─── Record size definitions ───────────────────────────────────────────
 
@@ -1290,6 +1305,7 @@ struct CliOptions {
     allow_unverified_provenance: bool,
     bridge_experiment: bool,
     bridge_samples: usize,
+    parameter_control_samples: usize,
     bridge_operations: usize,
     bridge_seed: u64,
 }
@@ -1585,8 +1601,8 @@ struct JsonBridgePairedComparison {
     median_ratio: f64,
     mean_ratio: f64,
     geomean_ratio: f64,
-    bootstrap_mean_ratio_ci95_low: f64,
-    bootstrap_mean_ratio_ci95_high: f64,
+    bootstrap_median_ratio_ci95_low: f64,
+    bootstrap_median_ratio_ci95_high: f64,
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -1609,6 +1625,7 @@ struct JsonBridgeReadyRegression {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct JsonBridgeConfig {
     samples_per_arm: usize,
+    parameter_control_samples_per_role_per_subblock: usize,
     raw_insert_operations: usize,
     ready_operation_counts: Vec<usize>,
     order_seed: u64,
@@ -1618,6 +1635,132 @@ struct JsonBridgeConfig {
     arm_contracts: BTreeMap<String, String>,
     affinity_policy: String,
     max_load_average_1m: Option<f64>,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum ParameterControlCase {
+    EmptyParamsDispatch,
+    CacheColdIndexedCount,
+    VariableOpcode,
+    ReadBodySnapshotReuse,
+}
+
+#[cfg(feature = "bridge-experiment")]
+impl ParameterControlCase {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::EmptyParamsDispatch => "empty_params_dispatch",
+            Self::CacheColdIndexedCount => "cache_cold_indexed_count",
+            Self::VariableOpcode => "variable_opcode",
+            Self::ReadBodySnapshotReuse => "read_body_snapshot_reuse",
+        }
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ParameterControlRole {
+    Baseline,
+    Candidate,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ParameterControlSubblock {
+    IndependentNull,
+    Claim,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ParameterControlVerdict {
+    DistinguishableFaster,
+    DistinguishableSlower,
+    Inconclusive,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonParameterControlSample {
+    case: ParameterControlCase,
+    block_index: usize,
+    complementary_pair_index: usize,
+    subblock: ParameterControlSubblock,
+    subblock_order_slot: usize,
+    observation_order_slot: usize,
+    assigned_role: ParameterControlRole,
+    executed_role: ParameterControlRole,
+    operation_count: usize,
+    elapsed_ns: u64,
+    runtime_entries_inside_timed_region: usize,
+    checksum: i64,
+    oracle_verified: bool,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonParameterControlRouteReceipt {
+    case: ParameterControlCase,
+    label: String,
+    baseline_contract: String,
+    candidate_contract: String,
+    baseline_sql: String,
+    candidate_sql: String,
+    baseline_sql_sha256: String,
+    candidate_sql_sha256: String,
+    baseline_explain_sha256: String,
+    candidate_explain_sha256: String,
+    baseline_explain_opcodes: Vec<String>,
+    candidate_explain_opcodes: Vec<String>,
+    baseline_hot_path_counters: BTreeMap<String, u64>,
+    candidate_hot_path_counters: BTreeMap<String, u64>,
+    preflight_requirements: Vec<String>,
+    oracle_contract: String,
+    timed_operation_count: usize,
+    verified: bool,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonParameterControlComparison {
+    case: ParameterControlCase,
+    ratio: String,
+    paired_blocks: usize,
+    complementary_pairs: usize,
+    samples_per_role_per_subblock: usize,
+    bootstrap_clusters: usize,
+    bootstrap_resamples: usize,
+    null_median_ratio: f64,
+    null_bootstrap_median_ratio_ci95_low: f64,
+    null_bootstrap_median_ratio_ci95_high: f64,
+    null_radius: f64,
+    guard: f64,
+    claim_median_ratio: f64,
+    claim_bootstrap_median_ratio_ci95_low: f64,
+    claim_bootstrap_median_ratio_ci95_high: f64,
+    verdict: ParameterControlVerdict,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonParameterPathControls {
+    citable: bool,
+    decision_contract: String,
+    samples_per_role_per_subblock: usize,
+    block_count: usize,
+    complementary_pairs: usize,
+    bootstrap_resamples: usize,
+    order_seed: u64,
+    ordering_policy: String,
+    timed_region: String,
+    route_receipts: Vec<JsonParameterControlRouteReceipt>,
+    raw_samples: Vec<JsonParameterControlSample>,
+    comparisons: Vec<JsonParameterControlComparison>,
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -1656,6 +1799,7 @@ struct JsonBridgeReport {
     arm_statistics: Vec<JsonBridgeArmStats>,
     paired_comparisons: Vec<JsonBridgePairedComparison>,
     ready_runtime_entry_regression: JsonBridgeReadyRegression,
+    parameter_path_controls: JsonParameterPathControls,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4313,7 +4457,7 @@ fn bridge_json_schema() -> serde_json::Value {
     let environment = comprehensive["properties"]["environment"].clone();
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v2.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v3.json",
         "title": "FrankenSQLite async bridge experiment report",
         "type": "object",
         "additionalProperties": false,
@@ -4321,10 +4465,11 @@ fn bridge_json_schema() -> serde_json::Value {
             "schema_version", "generated_at_utc", "provenance", "environment",
             "host_state_before", "host_state_checkpoints", "host_state_after",
             "config", "raw_samples",
-            "arm_statistics", "paired_comparisons", "ready_runtime_entry_regression"
+            "arm_statistics", "paired_comparisons", "ready_runtime_entry_regression",
+            "parameter_path_controls"
         ],
         "properties": {
-            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V2},
+            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V3},
             "generated_at_utc": {"type": "string"},
             "provenance": {
                 "allOf": [
@@ -4366,7 +4511,8 @@ fn bridge_json_schema() -> serde_json::Value {
                 "minItems": 1,
                 "items": {"$ref": "#/$defs/paired_comparison"}
             },
-            "ready_runtime_entry_regression": {"$ref": "#/$defs/ready_regression"}
+            "ready_runtime_entry_regression": {"$ref": "#/$defs/ready_regression"},
+            "parameter_path_controls": {"$ref": "#/$defs/parameter_path_controls"}
         },
         "$defs": {
             "arm": {
@@ -4440,7 +4586,9 @@ fn bridge_json_schema() -> serde_json::Value {
                 "type": "object",
                 "additionalProperties": false,
                 "required": [
-                    "samples_per_arm", "raw_insert_operations",
+                    "samples_per_arm",
+                    "parameter_control_samples_per_role_per_subblock",
+                    "raw_insert_operations",
                     "ready_operation_counts", "order_seed", "ordering_policy",
                     "warmup_policy", "timed_region", "arm_contracts",
                     "affinity_policy", "max_load_average_1m"
@@ -4450,6 +4598,11 @@ fn bridge_json_schema() -> serde_json::Value {
                         "type": "integer",
                         "minimum": 48,
                         "multipleOf": 48
+                    },
+                    "parameter_control_samples_per_role_per_subblock": {
+                        "type": "integer",
+                        "minimum": 144,
+                        "multipleOf": 4
                     },
                     "raw_insert_operations": {"type": "integer", "minimum": 1},
                     "ready_operation_counts": {
@@ -4582,8 +4735,8 @@ fn bridge_json_schema() -> serde_json::Value {
                 "required": [
                     "workload", "operation_count", "numerator", "denominator",
                     "paired_blocks", "bootstrap_clusters", "median_ratio", "mean_ratio", "geomean_ratio",
-                    "bootstrap_mean_ratio_ci95_low",
-                    "bootstrap_mean_ratio_ci95_high"
+                    "bootstrap_median_ratio_ci95_low",
+                    "bootstrap_median_ratio_ci95_high"
                 ],
                 "properties": {
                     "workload": {"$ref": "#/$defs/workload"},
@@ -4595,12 +4748,217 @@ fn bridge_json_schema() -> serde_json::Value {
                     "median_ratio": {"type": "number", "exclusiveMinimum": 0},
                     "mean_ratio": {"type": "number", "exclusiveMinimum": 0},
                     "geomean_ratio": {"type": "number", "exclusiveMinimum": 0},
-                    "bootstrap_mean_ratio_ci95_low": {
+                    "bootstrap_median_ratio_ci95_low": {
                         "type": "number", "exclusiveMinimum": 0
                     },
-                    "bootstrap_mean_ratio_ci95_high": {
+                    "bootstrap_median_ratio_ci95_high": {
                         "type": "number", "exclusiveMinimum": 0
                     }
+                }
+            },
+            "parameter_control_case": {
+                "enum": [
+                    "empty_params_dispatch",
+                    "cache_cold_indexed_count",
+                    "variable_opcode",
+                    "read_body_snapshot_reuse"
+                ]
+            },
+            "parameter_control_role": {
+                "enum": ["baseline", "candidate"]
+            },
+            "parameter_control_subblock": {
+                "enum": ["independent_null", "claim"]
+            },
+            "parameter_control_verdict": {
+                "enum": [
+                    "distinguishable_faster",
+                    "distinguishable_slower",
+                    "inconclusive"
+                ]
+            },
+            "parameter_path_controls": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "citable", "decision_contract",
+                    "samples_per_role_per_subblock", "block_count",
+                    "complementary_pairs", "bootstrap_resamples", "order_seed",
+                    "ordering_policy", "timed_region", "route_receipts",
+                    "raw_samples", "comparisons"
+                ],
+                "properties": {
+                    "citable": {"const": false},
+                    "decision_contract": {"type": "string", "minLength": 1},
+                    "samples_per_role_per_subblock": {
+                        "type": "integer",
+                        "minimum": 144,
+                        "multipleOf": 4
+                    },
+                    "block_count": {
+                        "type": "integer",
+                        "minimum": 72,
+                        "multipleOf": 2
+                    },
+                    "complementary_pairs": {"type": "integer", "minimum": 36},
+                    "bootstrap_resamples": {
+                        "const": PARAMETER_CONTROL_BOOTSTRAP_RESAMPLES
+                    },
+                    "order_seed": {"type": "integer", "minimum": 0},
+                    "ordering_policy": {"type": "string", "minLength": 1},
+                    "timed_region": {"type": "string", "minLength": 1},
+                    "route_receipts": {
+                        "type": "array",
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "items": {"$ref": "#/$defs/parameter_control_route_receipt"}
+                    },
+                    "raw_samples": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"$ref": "#/$defs/parameter_control_sample"}
+                    },
+                    "comparisons": {
+                        "type": "array",
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "items": {"$ref": "#/$defs/parameter_control_comparison"}
+                    }
+                }
+            },
+            "parameter_control_sample": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "case", "block_index", "complementary_pair_index",
+                    "subblock", "subblock_order_slot", "observation_order_slot",
+                    "assigned_role", "executed_role", "operation_count",
+                    "elapsed_ns", "runtime_entries_inside_timed_region",
+                    "checksum", "oracle_verified"
+                ],
+                "properties": {
+                    "case": {"$ref": "#/$defs/parameter_control_case"},
+                    "block_index": {"type": "integer", "minimum": 0},
+                    "complementary_pair_index": {"type": "integer", "minimum": 0},
+                    "subblock": {"$ref": "#/$defs/parameter_control_subblock"},
+                    "subblock_order_slot": {
+                        "type": "integer", "minimum": 0, "maximum": 1
+                    },
+                    "observation_order_slot": {
+                        "type": "integer", "minimum": 0, "maximum": 3
+                    },
+                    "assigned_role": {"$ref": "#/$defs/parameter_control_role"},
+                    "executed_role": {"$ref": "#/$defs/parameter_control_role"},
+                    "operation_count": {"type": "integer", "minimum": 1},
+                    "elapsed_ns": {"type": "integer", "minimum": 0},
+                    "runtime_entries_inside_timed_region": {"const": 0},
+                    "checksum": {"type": "integer"},
+                    "oracle_verified": {"const": true}
+                }
+            },
+            "parameter_control_route_receipt": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "case", "label", "baseline_contract", "candidate_contract",
+                    "baseline_sql", "candidate_sql", "baseline_sql_sha256",
+                    "candidate_sql_sha256", "baseline_explain_sha256",
+                    "candidate_explain_sha256", "baseline_explain_opcodes",
+                    "candidate_explain_opcodes", "baseline_hot_path_counters",
+                    "candidate_hot_path_counters", "preflight_requirements",
+                    "oracle_contract", "timed_operation_count", "verified"
+                ],
+                "properties": {
+                    "case": {"$ref": "#/$defs/parameter_control_case"},
+                    "label": {"type": "string", "minLength": 1},
+                    "baseline_contract": {"type": "string", "minLength": 1},
+                    "candidate_contract": {"type": "string", "minLength": 1},
+                    "baseline_sql": {"type": "string", "minLength": 1},
+                    "candidate_sql": {"type": "string", "minLength": 1},
+                    "baseline_sql_sha256": {
+                        "type": "string", "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "candidate_sql_sha256": {
+                        "type": "string", "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "baseline_explain_sha256": {
+                        "type": "string", "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "candidate_explain_sha256": {
+                        "type": "string", "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "baseline_explain_opcodes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1}
+                    },
+                    "candidate_explain_opcodes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1}
+                    },
+                    "baseline_hot_path_counters": {
+                        "type": "object",
+                        "additionalProperties": {"type": "integer", "minimum": 0}
+                    },
+                    "candidate_hot_path_counters": {
+                        "type": "object",
+                        "additionalProperties": {"type": "integer", "minimum": 0}
+                    },
+                    "preflight_requirements": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1}
+                    },
+                    "oracle_contract": {"type": "string", "minLength": 1},
+                    "timed_operation_count": {"type": "integer", "minimum": 1},
+                    "verified": {"const": true}
+                }
+            },
+            "parameter_control_comparison": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "case", "ratio", "paired_blocks", "complementary_pairs",
+                    "samples_per_role_per_subblock", "bootstrap_clusters",
+                    "bootstrap_resamples", "null_median_ratio",
+                    "null_bootstrap_median_ratio_ci95_low",
+                    "null_bootstrap_median_ratio_ci95_high", "null_radius",
+                    "guard", "claim_median_ratio",
+                    "claim_bootstrap_median_ratio_ci95_low",
+                    "claim_bootstrap_median_ratio_ci95_high", "verdict"
+                ],
+                "properties": {
+                    "case": {"$ref": "#/$defs/parameter_control_case"},
+                    "ratio": {"type": "string", "minLength": 1},
+                    "paired_blocks": {
+                        "type": "integer", "minimum": 72, "multipleOf": 2
+                    },
+                    "complementary_pairs": {"type": "integer", "minimum": 36},
+                    "samples_per_role_per_subblock": {
+                        "type": "integer", "minimum": 144, "multipleOf": 4
+                    },
+                    "bootstrap_clusters": {"type": "integer", "minimum": 36},
+                    "bootstrap_resamples": {
+                        "const": PARAMETER_CONTROL_BOOTSTRAP_RESAMPLES
+                    },
+                    "null_median_ratio": {"type": "number", "exclusiveMinimum": 0},
+                    "null_bootstrap_median_ratio_ci95_low": {
+                        "type": "number", "exclusiveMinimum": 0
+                    },
+                    "null_bootstrap_median_ratio_ci95_high": {
+                        "type": "number", "exclusiveMinimum": 0
+                    },
+                    "null_radius": {"type": "number", "minimum": 0},
+                    "guard": {"type": "number", "minimum": 0.01},
+                    "claim_median_ratio": {"type": "number", "exclusiveMinimum": 0},
+                    "claim_bootstrap_median_ratio_ci95_low": {
+                        "type": "number", "exclusiveMinimum": 0
+                    },
+                    "claim_bootstrap_median_ratio_ci95_high": {
+                        "type": "number", "exclusiveMinimum": 0
+                    },
+                    "verdict": {"$ref": "#/$defs/parameter_control_verdict"}
                 }
             },
             "ready_regression": {
@@ -5401,8 +5759,12 @@ Flags:
                        receipts are implemented; use --allow-unverified-provenance.
   --bridge-samples <n> Samples per bridge arm; multiple of 48 and at least 48
                        (default: 96).
+  --parameter-control-samples <n>
+                       Samples per assigned role in each null/claim subblock;
+                       multiple of 4 and at least 144 (default: 144).
   --bridge-operations <n>
-                       Timed insert operations per sample (default: 1000).
+                       Timed insert operations per bridge sample and timed reads
+                       per read-body control observation (default: 1000).
   --bridge-seed <n>    Deterministic ABBA ordering/bootstrap seed.
   --help, -h           Show this help text."
     );
@@ -5421,6 +5783,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         allow_unverified_provenance: false,
         bridge_experiment: false,
         bridge_samples: 96,
+        parameter_control_samples: PARAMETER_CONTROL_DEFAULT_SAMPLES_PER_ROLE,
         bridge_operations: 1_000,
         bridge_seed: 0x4653_514c_4954_4530,
     };
@@ -5488,6 +5851,15 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
                     .map_err(|_| "--bridge-samples must be a positive integer".to_owned())?;
                 index += 2;
             }
+            "--parameter-control-samples" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "expected a value after --parameter-control-samples".to_owned()
+                })?;
+                options.parameter_control_samples = value.parse().map_err(|_| {
+                    "--parameter-control-samples must be a positive integer".to_owned()
+                })?;
+                index += 2;
+            }
             "--bridge-operations" => {
                 let value = args
                     .get(index + 1)
@@ -5515,6 +5887,13 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
     if options.bridge_experiment {
         if options.bridge_samples < 48 || options.bridge_samples % 48 != 0 {
             return Err("--bridge-samples must be a multiple of 48 and at least 48".to_owned());
+        }
+        if options.parameter_control_samples < PARAMETER_CONTROL_DEFAULT_SAMPLES_PER_ROLE
+            || options.parameter_control_samples % 4 != 0
+        {
+            return Err(
+                "--parameter-control-samples must be a multiple of 4 and at least 144".to_owned(),
+            );
         }
         if options.bridge_operations == 0 {
             return Err("--bridge-operations must be greater than zero".to_owned());
@@ -8285,6 +8664,7 @@ mod tests {
                 allow_unverified_provenance: false,
                 bridge_experiment: false,
                 bridge_samples: 96,
+                parameter_control_samples: PARAMETER_CONTROL_DEFAULT_SAMPLES_PER_ROLE,
                 bridge_operations: 1_000,
                 bridge_seed: 0x4653_514c_4954_4530,
             }
@@ -9211,8 +9591,46 @@ mod tests {
             "three_arm_per_operation_inside_existing_runtime_worker_sync_facade".to_owned();
         bridge_provenance.validation_errors =
             vec!["test fixture models the diagnostic-only bridge contract".to_owned()];
+        let parameter_route_receipt = JsonParameterControlRouteReceipt {
+            case: ParameterControlCase::EmptyParamsDispatch,
+            label: "test".to_owned(),
+            baseline_contract: "test".to_owned(),
+            candidate_contract: "test".to_owned(),
+            baseline_sql: PARAMETER_CONTROL_SCALAR_SQL.to_owned(),
+            candidate_sql: PARAMETER_CONTROL_SCALAR_SQL.to_owned(),
+            baseline_sql_sha256: sha256_bytes(PARAMETER_CONTROL_SCALAR_SQL.as_bytes()),
+            candidate_sql_sha256: sha256_bytes(PARAMETER_CONTROL_SCALAR_SQL.as_bytes()),
+            baseline_explain_sha256: sha256_bytes(b"test explain"),
+            candidate_explain_sha256: sha256_bytes(b"test explain"),
+            baseline_explain_opcodes: vec!["ResultRow".to_owned()],
+            candidate_explain_opcodes: vec!["ResultRow".to_owned()],
+            baseline_hot_path_counters: BTreeMap::new(),
+            candidate_hot_path_counters: BTreeMap::new(),
+            preflight_requirements: vec!["test".to_owned()],
+            oracle_contract: "test".to_owned(),
+            timed_operation_count: 1,
+            verified: true,
+        };
+        let parameter_comparison = JsonParameterControlComparison {
+            case: ParameterControlCase::EmptyParamsDispatch,
+            ratio: "candidate/baseline".to_owned(),
+            paired_blocks: 72,
+            complementary_pairs: 36,
+            samples_per_role_per_subblock: 144,
+            bootstrap_clusters: 36,
+            bootstrap_resamples: PARAMETER_CONTROL_BOOTSTRAP_RESAMPLES,
+            null_median_ratio: 1.0,
+            null_bootstrap_median_ratio_ci95_low: 0.99,
+            null_bootstrap_median_ratio_ci95_high: 1.01,
+            null_radius: 0.01,
+            guard: 0.02,
+            claim_median_ratio: 1.0,
+            claim_bootstrap_median_ratio_ci95_low: 0.99,
+            claim_bootstrap_median_ratio_ci95_high: 1.01,
+            verdict: ParameterControlVerdict::Inconclusive,
+        };
         let report = JsonBridgeReport {
-            schema_version: BRIDGE_REPORT_SCHEMA_V2.to_owned(),
+            schema_version: BRIDGE_REPORT_SCHEMA_V3.to_owned(),
             generated_at_utc: "2026-07-26T00:00:01Z".to_owned(),
             provenance: bridge_provenance,
             environment: DetectedEnvironment {
@@ -9238,6 +9656,7 @@ mod tests {
             host_state_after: host_state,
             config: JsonBridgeConfig {
                 samples_per_arm: 96,
+                parameter_control_samples_per_role_per_subblock: 144,
                 raw_insert_operations: 100,
                 ready_operation_counts: vec![1, 10, 100, 1_000],
                 order_seed: 7,
@@ -9284,8 +9703,8 @@ mod tests {
                 median_ratio: 2.0,
                 mean_ratio: 2.0,
                 geomean_ratio: 2.0,
-                bootstrap_mean_ratio_ci95_low: 1.9,
-                bootstrap_mean_ratio_ci95_high: 2.1,
+                bootstrap_median_ratio_ci95_low: 1.9,
+                bootstrap_median_ratio_ci95_high: 2.1,
             }],
             ready_runtime_entry_regression: JsonBridgeReadyRegression {
                 predictor: "test".to_owned(),
@@ -9299,6 +9718,34 @@ mod tests {
                 bootstrap_slope_ci95_low: 4.0,
                 bootstrap_slope_ci95_high: 6.0,
                 r_squared: 1.0,
+            },
+            parameter_path_controls: JsonParameterPathControls {
+                citable: false,
+                decision_contract: "test".to_owned(),
+                samples_per_role_per_subblock: 144,
+                block_count: 72,
+                complementary_pairs: 36,
+                bootstrap_resamples: PARAMETER_CONTROL_BOOTSTRAP_RESAMPLES,
+                order_seed: 7,
+                ordering_policy: "test".to_owned(),
+                timed_region: "test".to_owned(),
+                route_receipts: vec![parameter_route_receipt; 4],
+                raw_samples: vec![JsonParameterControlSample {
+                    case: ParameterControlCase::EmptyParamsDispatch,
+                    block_index: 0,
+                    complementary_pair_index: 0,
+                    subblock: ParameterControlSubblock::IndependentNull,
+                    subblock_order_slot: 0,
+                    observation_order_slot: 0,
+                    assigned_role: ParameterControlRole::Baseline,
+                    executed_role: ParameterControlRole::Baseline,
+                    operation_count: 1,
+                    elapsed_ns: 100,
+                    runtime_entries_inside_timed_region: 0,
+                    checksum: 42,
+                    oracle_verified: true,
+                }],
+                comparisons: vec![parameter_comparison; 4],
             },
         };
         let schema = bridge_json_schema();
@@ -9387,6 +9834,271 @@ mod tests {
 
     #[cfg(feature = "bridge-experiment")]
     #[test]
+    fn parameter_control_orders_pair_abba_with_baab_and_balance_subblock_order() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let orders =
+            parameter_control_orders(72, &mut rng).expect("36 complete pairs should be valid");
+        assert_eq!(orders.len(), 72);
+        let mut null_first = 0_usize;
+        for pair in orders.chunks_exact(2) {
+            for order in pair {
+                assert_eq!(order.roles[0], order.roles[3]);
+                assert_eq!(order.roles[1], order.roles[2]);
+                assert_ne!(order.roles[0], order.roles[1]);
+                assert_ne!(order.subblocks[0], order.subblocks[1]);
+                null_first +=
+                    usize::from(order.subblocks[0] == ParameterControlSubblock::IndependentNull);
+            }
+            for slot in 0..4 {
+                assert_ne!(
+                    pair[0].roles[slot], pair[1].roles[slot],
+                    "paired blocks must use complementary ABBA/BAAB roles"
+                );
+            }
+            assert_eq!(
+                pair[0].subblocks,
+                [pair[1].subblocks[1], pair[1].subblocks[0]],
+                "paired blocks must reverse randomized null/claim subblock order"
+            );
+        }
+        assert_eq!(null_first, 36);
+        assert!(parameter_control_orders(71, &mut rng).is_err());
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_bootstrap_recomputes_the_median_not_the_mean() {
+        let (low, high, clusters) = bridge_bootstrap_median_ci95(&[1.0, 1.0, 100.0], 3, 11)
+            .expect("one complete cluster should bootstrap");
+        assert_eq!(clusters, 1);
+        assert!((low - 1.0).abs() < f64::EPSILON);
+        assert!((high - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn parameter_control_null_guard_and_verdict_are_fail_closed() {
+        let (radius, guard) = parameter_control_null_guard(0.997, 1.004);
+        assert!((radius - 0.004).abs() < 1.0e-12);
+        assert!((guard - 0.01).abs() < f64::EPSILON);
+        assert_eq!(
+            parameter_control_verdict(0.94, 0.98, guard),
+            ParameterControlVerdict::DistinguishableFaster
+        );
+        assert_eq!(
+            parameter_control_verdict(1.02, 1.06, guard),
+            ParameterControlVerdict::DistinguishableSlower
+        );
+        assert_eq!(
+            parameter_control_verdict(0.98, 1.02, guard),
+            ParameterControlVerdict::Inconclusive
+        );
+
+        let (radius, guard) = parameter_control_null_guard(0.95, 1.03);
+        assert!((radius - 0.05).abs() < 1.0e-12);
+        assert!((guard - 0.10).abs() < 1.0e-12);
+        assert_eq!(
+            parameter_control_verdict(0.85, 0.91, guard),
+            ParameterControlVerdict::Inconclusive,
+            "touching the guarded boundary is not distinguishable"
+        );
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn parameter_control_integer_oracle_rejects_wrong_type_value_and_missing_column() {
+        let exact = fsqlite::SqliteValue::Integer(42);
+        assert_eq!(
+            parameter_control_exact_integer(Some(&exact), 42, "test").unwrap(),
+            42
+        );
+        assert!(
+            parameter_control_exact_integer(Some(&exact), 41, "test")
+                .unwrap_err()
+                .contains("expected Integer(41)")
+        );
+        let text = fsqlite::SqliteValue::Text("42".into());
+        assert!(parameter_control_exact_integer(Some(&text), 42, "test").is_err());
+        assert!(parameter_control_exact_integer(None, 42, "test").is_err());
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn parameter_control_route_preflights_require_exact_mechanisms() {
+        let literal = vec![
+            "Init".to_owned(),
+            "Integer".to_owned(),
+            "Integer".to_owned(),
+            "Add".to_owned(),
+            "ResultRow".to_owned(),
+            "Halt".to_owned(),
+        ];
+        let mut parameter = literal.clone();
+        parameter[1] = "Variable".to_owned();
+        parameter_control_validate_variable_routes(&literal, &parameter)
+            .expect("one Variable with the same scalar opcodes should pass");
+        assert!(
+            parameter_control_validate_variable_routes(&literal, &literal).is_err(),
+            "missing Variable must fail closed"
+        );
+
+        let baseline_count = BTreeMap::from([(
+            "direct_count_indexed_rowid_probe_query_row_hits".to_owned(),
+            1,
+        )]);
+        let candidate_count = BTreeMap::from([(
+            "direct_count_indexed_rowid_probe_query_row_hits".to_owned(),
+            1,
+        )]);
+        parameter_control_validate_indexed_count_profiles(&baseline_count, &candidate_count)
+            .expect("matching exact direct-count routes should pass");
+        let missing_candidate_hit = BTreeMap::from([(
+            "direct_count_indexed_rowid_probe_query_row_hits".to_owned(),
+            0,
+        )]);
+        assert!(
+            parameter_control_validate_indexed_count_profiles(
+                &baseline_count,
+                &missing_candidate_hit
+            )
+            .is_err(),
+            "a missing candidate direct hit must fail closed"
+        );
+
+        let read_body = vec![
+            "Init".to_owned(),
+            "Variable".to_owned(),
+            "OpenRead".to_owned(),
+            "OpenRead".to_owned(),
+            "SeekGE".to_owned(),
+            "IdxRowid".to_owned(),
+            "SeekRowid".to_owned(),
+            "ResultRow".to_owned(),
+            "Halt".to_owned(),
+        ];
+        let zero_counters = BTreeMap::from([("direct_indexed_equality_query_hits".to_owned(), 0)]);
+        parameter_control_validate_read_body_route(&read_body, &zero_counters, &zero_counters)
+            .expect("compiled index-to-table route with zero direct counters should pass");
+        let mut direct_hit = zero_counters.clone();
+        direct_hit.insert("direct_indexed_equality_query_hits".to_owned(), 1);
+        assert!(
+            parameter_control_validate_read_body_route(&read_body, &direct_hit, &zero_counters)
+                .is_err(),
+            "a direct prepared-read hit must fail closed"
+        );
+        assert!(
+            parameter_control_validate_read_body_route(
+                &read_body[..4],
+                &zero_counters,
+                &zero_counters
+            )
+            .is_err(),
+            "missing index/table lookup opcodes must fail closed"
+        );
+        let rejected_scan_route = [
+            "Init",
+            "Transaction",
+            "Integer",
+            "IfNot",
+            "OpenRead",
+            "Rewind",
+            "Column",
+            "Variable",
+            "IsNull",
+            "Ne",
+            "Rowid",
+            "Integer",
+            "IsNull",
+            "IsNull",
+            "Le",
+            "Column",
+            "Integer",
+            "Add",
+            "ResultRow",
+            "DecrJumpZero",
+            "Next",
+            "Close",
+            "Halt",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        assert!(
+            parameter_control_validate_read_body_route(
+                &rejected_scan_route,
+                &zero_counters,
+                &zero_counters
+            )
+            .is_err(),
+            "the observed INDEXED BY plus residual-predicate scan route must remain rejected"
+        );
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn parameter_control_actual_routes_and_oracles_pass_fail_closed_preflights() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("parameter-control test runtime should build");
+        let mut rng = StdRng::seed_from_u64(29);
+        let orders =
+            parameter_control_orders(2, &mut rng).expect("one complementary pair should build");
+
+        let (receipt, samples) = runtime
+            .block_on(parameter_control_case_empty_params(&orders))
+            .expect("empty-params route should satisfy its preflight");
+        assert!(receipt.verified);
+        assert_eq!(samples.len(), 16);
+
+        let (receipt, samples) = runtime
+            .block_on(parameter_control_case_indexed_count(&orders))
+            .expect("indexed-count routes should satisfy direct-counter preflights");
+        assert!(receipt.verified);
+        assert_eq!(
+            receipt.baseline_hot_path_counters["direct_count_indexed_rowid_probe_query_row_hits"],
+            1
+        );
+        assert_eq!(
+            receipt.candidate_hot_path_counters["direct_count_indexed_rowid_probe_query_row_hits"],
+            1
+        );
+        assert_eq!(samples.len(), 16);
+
+        let (receipt, samples) = runtime
+            .block_on(parameter_control_case_variable_opcode(&orders))
+            .expect("literal/Variable routes should satisfy opcode preflights");
+        assert!(receipt.verified);
+        assert_eq!(
+            receipt
+                .candidate_explain_opcodes
+                .iter()
+                .filter(|opcode| opcode.as_str() == "Variable")
+                .count(),
+            1
+        );
+        assert_eq!(samples.len(), 16);
+
+        let (receipt, samples) = runtime
+            .block_on(parameter_control_case_read_body(&orders, 1))
+            .expect("read-body route should satisfy compiled-route preflights");
+        assert!(receipt.verified);
+        assert!(
+            receipt
+                .baseline_hot_path_counters
+                .values()
+                .all(|value| *value == 0)
+        );
+        assert!(
+            receipt
+                .candidate_hot_path_counters
+                .values()
+                .all(|value| *value == 0)
+        );
+        assert_eq!(samples.len(), 16);
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
     fn bridge_percentile_interpolates_even_sample_median() {
         let sorted = [1.0, 3.0, 7.0, 9.0];
         assert!((bridge_percentile(&sorted, 50.0) - 5.0).abs() < f64::EPSILON);
@@ -9462,6 +10174,28 @@ mod tests {
             ];
             assert!(parse_cli_args(&args).is_err());
         }
+
+        let valid_parameter_controls = vec![
+            "comprehensive-bench".to_owned(),
+            "--bridge-experiment".to_owned(),
+            "--parameter-control-samples".to_owned(),
+            "144".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_args(&valid_parameter_controls)
+                .unwrap()
+                .parameter_control_samples,
+            144
+        );
+        for invalid in ["140", "145", "144x"] {
+            let args = vec![
+                "comprehensive-bench".to_owned(),
+                "--bridge-experiment".to_owned(),
+                "--parameter-control-samples".to_owned(),
+                invalid.to_owned(),
+            ];
+            assert!(parse_cli_args(&args).is_err());
+        }
     }
 
     #[cfg(feature = "bridge-experiment")]
@@ -9512,7 +10246,7 @@ mod tests {
 
     #[cfg(feature = "bridge-experiment")]
     #[test]
-    fn bridge_paired_comparison_uses_block_means() {
+    fn bridge_paired_comparison_uses_block_means_and_median_bootstrap() {
         let mut samples = Vec::new();
         for block_index in 0..12 {
             samples.push(bridge_test_sample(
@@ -9560,8 +10294,8 @@ mod tests {
         assert!((comparison.median_ratio - 2.0).abs() < f64::EPSILON);
         assert!((comparison.mean_ratio - 2.0).abs() < f64::EPSILON);
         assert!((comparison.geomean_ratio - 2.0).abs() < f64::EPSILON);
-        assert!((comparison.bootstrap_mean_ratio_ci95_low - 2.0).abs() < f64::EPSILON);
-        assert!((comparison.bootstrap_mean_ratio_ci95_high - 2.0).abs() < f64::EPSILON);
+        assert!((comparison.bootstrap_median_ratio_ci95_low - 2.0).abs() < f64::EPSILON);
+        assert!((comparison.bootstrap_median_ratio_ci95_high - 2.0).abs() < f64::EPSILON);
     }
 
     #[cfg(feature = "bridge-experiment")]
@@ -12688,7 +13422,7 @@ fn bridge_arm_statistics(samples: &[JsonBridgeSample]) -> Vec<JsonBridgeArmStats
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_bootstrap_mean_ci95(
+fn bridge_bootstrap_median_ci95(
     values: &[f64],
     cluster_width: usize,
     seed: u64,
@@ -12703,20 +13437,20 @@ fn bridge_bootstrap_mean_ci95(
     const RESAMPLES: usize = 10_000;
     let clusters = values.chunks_exact(cluster_width).collect::<Vec<_>>();
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut means = Vec::with_capacity(RESAMPLES);
+    let mut medians = Vec::with_capacity(RESAMPLES);
+    let mut resample = Vec::with_capacity(values.len());
     for _ in 0..RESAMPLES {
-        let mut total = 0.0_f64;
+        resample.clear();
         for _ in 0..clusters.len() {
-            total += clusters[rng.random_range(0..clusters.len())]
-                .iter()
-                .sum::<f64>();
+            resample.extend_from_slice(clusters[rng.random_range(0..clusters.len())]);
         }
-        means.push(total / values.len() as f64);
+        resample.sort_by(f64::total_cmp);
+        medians.push(bridge_percentile(&resample, 50.0));
     }
-    means.sort_by(f64::total_cmp);
+    medians.sort_by(f64::total_cmp);
     Ok((
-        bridge_percentile(&means, 2.5),
-        bridge_percentile(&means, 97.5),
+        bridge_percentile(&medians, 2.5),
+        bridge_percentile(&medians, 97.5),
         clusters.len(),
     ))
 }
@@ -12786,7 +13520,7 @@ fn bridge_paired_comparison(
     let geomean_ratio =
         (ratios.iter().map(|ratio| ratio.ln()).sum::<f64>() / ratios.len() as f64).exp();
     let (ci_low, ci_high, bootstrap_clusters) =
-        bridge_bootstrap_mean_ci95(&ratios, bootstrap_cluster_width, seed)?;
+        bridge_bootstrap_median_ci95(&ratios, bootstrap_cluster_width, seed)?;
     Ok(JsonBridgePairedComparison {
         workload,
         operation_count,
@@ -12797,8 +13531,8 @@ fn bridge_paired_comparison(
         median_ratio: bridge_percentile(&sorted, 50.0),
         mean_ratio,
         geomean_ratio,
-        bootstrap_mean_ratio_ci95_low: ci_low,
-        bootstrap_mean_ratio_ci95_high: ci_high,
+        bootstrap_median_ratio_ci95_low: ci_low,
+        bootstrap_median_ratio_ci95_high: ci_high,
     })
 }
 
@@ -13013,6 +13747,1198 @@ fn bridge_three_arm_orders(
 }
 
 #[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParameterControlBlockOrder {
+    roles: [ParameterControlRole; 4],
+    subblocks: [ParameterControlSubblock; 2],
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParameterControlSampleContext {
+    case: ParameterControlCase,
+    block_index: usize,
+    subblock: ParameterControlSubblock,
+    subblock_order_slot: usize,
+    observation_order_slot: usize,
+    assigned_role: ParameterControlRole,
+    executed_role: ParameterControlRole,
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_orders(
+    block_count: usize,
+    rng: &mut StdRng,
+) -> Result<Vec<ParameterControlBlockOrder>, String> {
+    if block_count == 0 || block_count % 2 != 0 {
+        return Err(format!(
+            "parameter controls require complete complementary ABBA/BAAB block pairs, got {block_count} blocks"
+        ));
+    }
+    let abba = [
+        ParameterControlRole::Baseline,
+        ParameterControlRole::Candidate,
+        ParameterControlRole::Candidate,
+        ParameterControlRole::Baseline,
+    ];
+    let baab = [
+        ParameterControlRole::Candidate,
+        ParameterControlRole::Baseline,
+        ParameterControlRole::Baseline,
+        ParameterControlRole::Candidate,
+    ];
+    let null_then_claim = [
+        ParameterControlSubblock::IndependentNull,
+        ParameterControlSubblock::Claim,
+    ];
+    let claim_then_null = [
+        ParameterControlSubblock::Claim,
+        ParameterControlSubblock::IndependentNull,
+    ];
+    let mut orders = Vec::with_capacity(block_count);
+    while orders.len() < block_count {
+        let (first_roles, second_roles) = if rng.random::<bool>() {
+            (abba, baab)
+        } else {
+            (baab, abba)
+        };
+        let (first_subblocks, second_subblocks) = if rng.random::<bool>() {
+            (null_then_claim, claim_then_null)
+        } else {
+            (claim_then_null, null_then_claim)
+        };
+        orders.extend([
+            ParameterControlBlockOrder {
+                roles: first_roles,
+                subblocks: first_subblocks,
+            },
+            ParameterControlBlockOrder {
+                roles: second_roles,
+                subblocks: second_subblocks,
+            },
+        ]);
+    }
+    Ok(orders)
+}
+
+#[cfg(feature = "bridge-experiment")]
+struct ParameterControlProfileGuard {
+    previous_enabled: bool,
+}
+
+#[cfg(feature = "bridge-experiment")]
+impl ParameterControlProfileGuard {
+    fn enable() -> Self {
+        let previous_enabled = hot_path_profile_enabled();
+        set_hot_path_profile_enabled(true);
+        reset_hot_path_profile();
+        Self { previous_enabled }
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+impl Drop for ParameterControlProfileGuard {
+    fn drop(&mut self) {
+        set_hot_path_profile_enabled(self.previous_enabled);
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_direct_read_counters(
+    profile: &HotPathProfileSnapshot,
+) -> BTreeMap<String, u64> {
+    BTreeMap::from([
+        (
+            "direct_indexed_equality_query_hits".to_owned(),
+            profile.direct_indexed_equality_query_hits,
+        ),
+        (
+            "direct_rowid_range_query_hits".to_owned(),
+            profile.direct_rowid_range_query_hits,
+        ),
+        (
+            "direct_count_star_query_row_hits".to_owned(),
+            profile.direct_count_star_query_row_hits,
+        ),
+        (
+            "direct_rowid_lookup_query_row_hits".to_owned(),
+            profile.direct_rowid_lookup_query_row_hits,
+        ),
+        (
+            "direct_count_star_rowid_range_query_row_hits".to_owned(),
+            profile.direct_count_star_rowid_range_query_row_hits,
+        ),
+        (
+            "direct_count_indexed_rowid_probe_query_row_hits".to_owned(),
+            profile.direct_count_indexed_rowid_probe_query_row_hits,
+        ),
+    ])
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_explain_opcodes(explain: &str, context: &str) -> Result<Vec<String>, String> {
+    if explain
+        .trim_start()
+        .starts_with("-- prepared SELECT is dispatched dynamically")
+    {
+        return Err(format!(
+            "{context}: prepared statement has the dynamic-dispatch marker instead of compiled bytecode: {explain}"
+        ));
+    }
+    let opcodes = explain
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if opcodes.is_empty() {
+        return Err(format!(
+            "{context}: EXPLAIN disassembly contained no opcode rows: {explain}"
+        ));
+    }
+    Ok(opcodes)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_require_opcode(
+    opcodes: &[String],
+    opcode: &str,
+    context: &str,
+) -> Result<(), String> {
+    if opcodes.iter().any(|observed| observed == opcode) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context}: required opcode {opcode}, observed {opcodes:?}"
+        ))
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_validate_variable_routes(
+    literal_opcodes: &[String],
+    parameter_opcodes: &[String],
+) -> Result<(), String> {
+    for (context, opcodes) in [
+        ("literal scalar route", literal_opcodes),
+        ("parameter scalar route", parameter_opcodes),
+    ] {
+        for opcode in ["Add", "ResultRow", "Halt"] {
+            parameter_control_require_opcode(opcodes, opcode, context)?;
+        }
+    }
+    let literal_variables = literal_opcodes
+        .iter()
+        .filter(|opcode| opcode.as_str() == "Variable")
+        .count();
+    let parameter_variables = parameter_opcodes
+        .iter()
+        .filter(|opcode| opcode.as_str() == "Variable")
+        .count();
+    if literal_variables != 0 || parameter_variables != 1 {
+        return Err(format!(
+            "variable-opcode route mismatch: literal Variable count={literal_variables}, parameter Variable count={parameter_variables}, literal={literal_opcodes:?}, parameter={parameter_opcodes:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_validate_indexed_count_profiles(
+    baseline: &BTreeMap<String, u64>,
+    candidate: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    const TARGET: &str = "direct_count_indexed_rowid_probe_query_row_hits";
+    if baseline.get(TARGET).copied() != Some(1) {
+        return Err(format!(
+            "indexed-count baseline query_row must hit the direct indexed-rowid-probe lane exactly once, observed {baseline:?}"
+        ));
+    }
+    if candidate.get(TARGET).copied() != Some(1) {
+        return Err(format!(
+            "indexed-count empty-params candidate must hit the same direct indexed-rowid-probe lane exactly once, observed {candidate:?}"
+        ));
+    }
+    for (name, value) in baseline {
+        if name != TARGET && *value != 0 {
+            return Err(format!(
+                "indexed-count baseline unexpectedly hit another direct prepared-read lane: {baseline:?}"
+            ));
+        }
+    }
+    for (name, value) in candidate {
+        if name != TARGET && *value != 0 {
+            return Err(format!(
+                "indexed-count candidate unexpectedly hit another direct prepared-read lane: {candidate:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_validate_read_body_route(
+    opcodes: &[String],
+    baseline: &BTreeMap<String, u64>,
+    candidate: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    for opcode in ["Variable", "OpenRead", "IdxRowid", "SeekRowid", "ResultRow"] {
+        parameter_control_require_opcode(opcodes, opcode, "read-body route")?;
+    }
+    if !opcodes
+        .iter()
+        .any(|opcode| matches!(opcode.as_str(), "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT"))
+    {
+        return Err(format!(
+            "read-body route lacks an index-seek opcode, observed {opcodes:?}"
+        ));
+    }
+    if opcodes
+        .iter()
+        .filter(|opcode| opcode.as_str() == "OpenRead")
+        .count()
+        < 2
+    {
+        return Err(format!(
+            "read-body route must open both index and table cursors, observed {opcodes:?}"
+        ));
+    }
+    for (context, counters) in [("baseline", baseline), ("candidate", candidate)] {
+        if counters.values().any(|value| *value != 0) {
+            return Err(format!(
+                "read-body {context} preflight hit a direct prepared-read lane instead of compiled bytecode: {counters:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_exact_integer(
+    value: Option<&fsqlite::SqliteValue>,
+    expected: i64,
+    context: &str,
+) -> Result<i64, String> {
+    match value {
+        Some(fsqlite::SqliteValue::Integer(actual)) if *actual == expected => Ok(*actual),
+        Some(other) => Err(format!(
+            "{context}: expected Integer({expected}), got {other:?}"
+        )),
+        None => Err(format!(
+            "{context}: expected Integer({expected}) in column 0, but the row had no column 0"
+        )),
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_row_integer(
+    row: &fsqlite::Row,
+    expected: i64,
+    context: &str,
+) -> Result<i64, String> {
+    parameter_control_exact_integer(row.get(0), expected, context)
+}
+
+#[cfg(feature = "bridge-experiment")]
+async fn parameter_control_open_memory(context: &str) -> Result<fsqlite::Connection, String> {
+    let conn = bridge_result(fsqlite::Connection::open(":memory:").await, context)?;
+    for pragma in bridge_pragmas() {
+        bridge_result(
+            conn.execute(&pragma).await,
+            &format!("{context}: configure `{pragma}`"),
+        )?;
+    }
+    Ok(conn)
+}
+
+#[cfg(feature = "bridge-experiment")]
+async fn parameter_control_open_file(
+    context: &str,
+) -> Result<(fsqlite::Connection, tempfile::NamedTempFile), String> {
+    let temporary = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("{context}: could not create temporary database: {error}"))?;
+    let path = temporary
+        .path()
+        .to_str()
+        .ok_or_else(|| format!("{context}: temporary database path is not UTF-8"))?;
+    let conn = bridge_result(
+        fsqlite::Connection::open_with_page_size(path, benchmark_page_size_bytes()).await,
+        context,
+    )?;
+    for pragma in bridge_pragmas() {
+        bridge_result(
+            conn.execute(&pragma).await,
+            &format!("{context}: configure `{pragma}`"),
+        )?;
+    }
+    Ok((conn, temporary))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_sample(
+    context: ParameterControlSampleContext,
+    operation_count: usize,
+    elapsed: Duration,
+    checksum: i64,
+) -> JsonParameterControlSample {
+    JsonParameterControlSample {
+        case: context.case,
+        block_index: context.block_index,
+        complementary_pair_index: context.block_index / 2,
+        subblock: context.subblock,
+        subblock_order_slot: context.subblock_order_slot,
+        observation_order_slot: context.observation_order_slot,
+        assigned_role: context.assigned_role,
+        executed_role: context.executed_role,
+        operation_count,
+        elapsed_ns: bridge_elapsed_ns(elapsed),
+        runtime_entries_inside_timed_region: 0,
+        checksum,
+        oracle_verified: true,
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_block_ratios(
+    samples: &[JsonParameterControlSample],
+    case: ParameterControlCase,
+    subblock: ParameterControlSubblock,
+) -> Result<Vec<f64>, String> {
+    let mut blocks: BTreeMap<usize, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for sample in samples
+        .iter()
+        .filter(|sample| sample.case == case && sample.subblock == subblock)
+    {
+        if !sample.oracle_verified {
+            return Err(format!(
+                "{} block {} contains a sample without a verified oracle",
+                case.id(),
+                sample.block_index
+            ));
+        }
+        if subblock == ParameterControlSubblock::IndependentNull
+            && sample.executed_role != ParameterControlRole::Baseline
+        {
+            return Err(format!(
+                "{} null block {} executed {:?}; both assigned roles must execute the baseline mechanism",
+                case.id(),
+                sample.block_index,
+                sample.executed_role
+            ));
+        }
+        let block = blocks.entry(sample.block_index).or_default();
+        match sample.assigned_role {
+            ParameterControlRole::Baseline => block.0.push(sample.elapsed_ns as f64),
+            ParameterControlRole::Candidate => block.1.push(sample.elapsed_ns as f64),
+        }
+    }
+    if blocks.is_empty() {
+        return Err(format!("{} {subblock:?} has no samples", case.id()));
+    }
+    let mut ratios = Vec::with_capacity(blocks.len());
+    for (block_index, (baseline, candidate)) in blocks {
+        if baseline.len() != 2 || candidate.len() != 2 {
+            return Err(format!(
+                "{} {subblock:?} block {block_index} has {} baseline-role and {} candidate-role samples; expected two each",
+                case.id(),
+                baseline.len(),
+                candidate.len()
+            ));
+        }
+        let baseline_mean = baseline.iter().sum::<f64>() / 2.0;
+        let candidate_mean = candidate.iter().sum::<f64>() / 2.0;
+        if !baseline_mean.is_finite()
+            || baseline_mean <= 0.0
+            || !candidate_mean.is_finite()
+            || candidate_mean <= 0.0
+        {
+            return Err(format!(
+                "{} {subblock:?} block {block_index} has invalid means baseline={baseline_mean} candidate={candidate_mean}",
+                case.id()
+            ));
+        }
+        ratios.push(candidate_mean / baseline_mean);
+    }
+    Ok(ratios)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_verdict(
+    claim_ci_low: f64,
+    claim_ci_high: f64,
+    guard: f64,
+) -> ParameterControlVerdict {
+    if claim_ci_high < 1.0 - guard {
+        ParameterControlVerdict::DistinguishableFaster
+    } else if claim_ci_low > 1.0 + guard {
+        ParameterControlVerdict::DistinguishableSlower
+    } else {
+        ParameterControlVerdict::Inconclusive
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_null_guard(null_ci_low: f64, null_ci_high: f64) -> (f64, f64) {
+    let null_radius = (null_ci_low - 1.0).abs().max((null_ci_high - 1.0).abs());
+    (null_radius, (2.0 * null_radius).max(0.01))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_comparison(
+    samples: &[JsonParameterControlSample],
+    case: ParameterControlCase,
+    expected_samples_per_role: usize,
+    seed: u64,
+) -> Result<JsonParameterControlComparison, String> {
+    let null_ratios =
+        parameter_control_block_ratios(samples, case, ParameterControlSubblock::IndependentNull)?;
+    let claim_ratios =
+        parameter_control_block_ratios(samples, case, ParameterControlSubblock::Claim)?;
+    if null_ratios.len() != claim_ratios.len() || null_ratios.len() % 2 != 0 {
+        return Err(format!(
+            "{} requires equal, even null/claim block counts, got null={} claim={}",
+            case.id(),
+            null_ratios.len(),
+            claim_ratios.len()
+        ));
+    }
+    let samples_per_role = null_ratios.len().saturating_mul(2);
+    if samples_per_role != expected_samples_per_role {
+        return Err(format!(
+            "{} expected {expected_samples_per_role} samples per role/subblock, observed {samples_per_role}",
+            case.id()
+        ));
+    }
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_claim = claim_ratios.clone();
+    sorted_claim.sort_by(f64::total_cmp);
+    let (null_ci_low, null_ci_high, null_clusters) =
+        bridge_bootstrap_median_ci95(&null_ratios, 2, seed ^ 0x4e55_4c4c)?;
+    let (claim_ci_low, claim_ci_high, claim_clusters) =
+        bridge_bootstrap_median_ci95(&claim_ratios, 2, seed ^ 0x434c_4149)?;
+    if null_clusters != claim_clusters {
+        return Err(format!(
+            "{} null/claim bootstrap cluster counts differ: {null_clusters} vs {claim_clusters}",
+            case.id()
+        ));
+    }
+    let (null_radius, guard) = parameter_control_null_guard(null_ci_low, null_ci_high);
+    Ok(JsonParameterControlComparison {
+        case,
+        ratio: "candidate_assigned_role_block_mean_ns / baseline_assigned_role_block_mean_ns"
+            .to_owned(),
+        paired_blocks: null_ratios.len(),
+        complementary_pairs: null_ratios.len() / 2,
+        samples_per_role_per_subblock: samples_per_role,
+        bootstrap_clusters: null_clusters,
+        bootstrap_resamples: PARAMETER_CONTROL_BOOTSTRAP_RESAMPLES,
+        null_median_ratio: bridge_percentile(&sorted_null, 50.0),
+        null_bootstrap_median_ratio_ci95_low: null_ci_low,
+        null_bootstrap_median_ratio_ci95_high: null_ci_high,
+        null_radius,
+        guard,
+        claim_median_ratio: bridge_percentile(&sorted_claim, 50.0),
+        claim_bootstrap_median_ratio_ci95_low: claim_ci_low,
+        claim_bootstrap_median_ratio_ci95_high: claim_ci_high,
+        verdict: parameter_control_verdict(claim_ci_low, claim_ci_high, guard),
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[allow(clippy::too_many_arguments)]
+fn parameter_control_route_receipt(
+    case: ParameterControlCase,
+    label: &str,
+    baseline_contract: &str,
+    candidate_contract: &str,
+    baseline_sql: &str,
+    candidate_sql: &str,
+    baseline_explain: &str,
+    candidate_explain: &str,
+    baseline_explain_opcodes: Vec<String>,
+    candidate_explain_opcodes: Vec<String>,
+    baseline_hot_path_counters: BTreeMap<String, u64>,
+    candidate_hot_path_counters: BTreeMap<String, u64>,
+    preflight_requirements: &[&str],
+    oracle_contract: &str,
+    timed_operation_count: usize,
+) -> JsonParameterControlRouteReceipt {
+    JsonParameterControlRouteReceipt {
+        case,
+        label: label.to_owned(),
+        baseline_contract: baseline_contract.to_owned(),
+        candidate_contract: candidate_contract.to_owned(),
+        baseline_sql: baseline_sql.to_owned(),
+        candidate_sql: candidate_sql.to_owned(),
+        baseline_sql_sha256: sha256_bytes(baseline_sql.as_bytes()),
+        candidate_sql_sha256: sha256_bytes(candidate_sql.as_bytes()),
+        baseline_explain_sha256: sha256_bytes(baseline_explain.as_bytes()),
+        candidate_explain_sha256: sha256_bytes(candidate_explain.as_bytes()),
+        baseline_explain_opcodes,
+        candidate_explain_opcodes,
+        baseline_hot_path_counters,
+        candidate_hot_path_counters,
+        preflight_requirements: preflight_requirements
+            .iter()
+            .map(|requirement| (*requirement).to_owned())
+            .collect(),
+        oracle_contract: oracle_contract.to_owned(),
+        timed_operation_count,
+        verified: true,
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_executed_role(
+    subblock: ParameterControlSubblock,
+    assigned_role: ParameterControlRole,
+) -> ParameterControlRole {
+    match subblock {
+        ParameterControlSubblock::IndependentNull => ParameterControlRole::Baseline,
+        ParameterControlSubblock::Claim => assigned_role,
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+async fn parameter_control_case_empty_params(
+    orders: &[ParameterControlBlockOrder],
+) -> Result<
+    (
+        JsonParameterControlRouteReceipt,
+        Vec<JsonParameterControlSample>,
+    ),
+    String,
+> {
+    let conn = parameter_control_open_memory("empty-params control open").await?;
+    let statement = bridge_result(
+        conn.prepare(PARAMETER_CONTROL_SCALAR_SQL).await,
+        "empty-params control prepare",
+    )?;
+    let explain = statement.explain();
+    let opcodes = parameter_control_explain_opcodes(&explain, "empty-params scalar route")?;
+    for opcode in ["Add", "ResultRow", "Halt"] {
+        parameter_control_require_opcode(&opcodes, opcode, "empty-params scalar route")?;
+    }
+    if opcodes.iter().any(|opcode| opcode == "Variable") {
+        return Err(format!(
+            "empty-params scalar route unexpectedly contains Variable: {opcodes:?}"
+        ));
+    }
+
+    let warm_baseline = bridge_result(statement.query_row().await, "empty-params baseline warmup")?;
+    parameter_control_row_integer(&warm_baseline, 42, "empty-params baseline warmup")?;
+    let warm_candidate = bridge_result(
+        statement.query_row_with_params(&[]).await,
+        "empty-params candidate warmup",
+    )?;
+    parameter_control_row_integer(&warm_candidate, 42, "empty-params candidate warmup")?;
+
+    let mut samples = Vec::with_capacity(orders.len().saturating_mul(8));
+    for (block_index, order) in orders.iter().copied().enumerate() {
+        for (subblock_order_slot, subblock) in order.subblocks.into_iter().enumerate() {
+            for (observation_order_slot, assigned_role) in order.roles.into_iter().enumerate() {
+                let executed_role = parameter_control_executed_role(subblock, assigned_role);
+                let start = Instant::now();
+                let row = match executed_role {
+                    ParameterControlRole::Baseline => bridge_result(
+                        statement.query_row().await,
+                        "empty-params baseline timed query",
+                    )?,
+                    ParameterControlRole::Candidate => bridge_result(
+                        statement.query_row_with_params(&[]).await,
+                        "empty-params candidate timed query",
+                    )?,
+                };
+                let checksum =
+                    parameter_control_row_integer(&row, 42, "empty-params timed oracle")?;
+                let elapsed = start.elapsed();
+                std::hint::black_box(checksum);
+                samples.push(parameter_control_sample(
+                    ParameterControlSampleContext {
+                        case: ParameterControlCase::EmptyParamsDispatch,
+                        block_index,
+                        subblock,
+                        subblock_order_slot,
+                        observation_order_slot,
+                        assigned_role,
+                        executed_role,
+                    },
+                    1,
+                    elapsed,
+                    checksum,
+                ));
+            }
+        }
+    }
+
+    let receipt = parameter_control_route_receipt(
+        ParameterControlCase::EmptyParamsDispatch,
+        "None versus Some(empty) prepared query-row dispatch",
+        "retained PreparedStatement::query_row()",
+        "the same retained PreparedStatement::query_row_with_params(&[])",
+        PARAMETER_CONTROL_SCALAR_SQL,
+        PARAMETER_CONTROL_SCALAR_SQL,
+        &explain,
+        &explain,
+        opcodes.clone(),
+        opcodes,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        &[
+            "one retained statement and identical SQL/bytecode in both arms",
+            "compiled Add, ResultRow, and Halt opcodes",
+            "no Variable opcode",
+            "exact Integer(42) result in warmup and every timed observation",
+        ],
+        "column 0 is exactly SqliteValue::Integer(42)",
+        1,
+    );
+    drop(statement);
+    bridge_result(conn.close().await, "empty-params control close")?;
+    Ok((receipt, samples))
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[allow(clippy::too_many_lines)]
+async fn parameter_control_case_indexed_count(
+    orders: &[ParameterControlBlockOrder],
+) -> Result<
+    (
+        JsonParameterControlRouteReceipt,
+        Vec<JsonParameterControlSample>,
+    ),
+    String,
+> {
+    let conn = parameter_control_open_memory("indexed-count control open").await?;
+    bridge_result(
+        conn.execute(
+            "CREATE TABLE products(\
+             id INTEGER PRIMARY KEY, name TEXT, price REAL, category_id INTEGER)",
+        )
+        .await,
+        "indexed-count create products",
+    )?;
+    bridge_result(
+        conn.execute("CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT)")
+            .await,
+        "indexed-count create categories",
+    )?;
+    bridge_result(conn.execute("BEGIN").await, "indexed-count seed begin")?;
+    let category_insert = bridge_result(
+        conn.prepare("INSERT INTO categories VALUES (?1, ?2)").await,
+        "indexed-count prepare category seed",
+    )?;
+    for id in 1_i64..=50 {
+        let affected = bridge_result(
+            category_insert
+                .execute_with_params(&[
+                    fsqlite::SqliteValue::Integer(id),
+                    fsqlite::SqliteValue::Text(format!("cat_{id}").into()),
+                ])
+                .await,
+            "indexed-count seed category",
+        )?;
+        bridge_verify_affected_rows(affected, "indexed-count seed category")?;
+    }
+    drop(category_insert);
+    let product_insert = bridge_result(
+        conn.prepare("INSERT INTO products VALUES (?1, ?2, ?3, ?4)")
+            .await,
+        "indexed-count prepare product seed",
+    )?;
+    for id in 1_i64..=1_000 {
+        let category_id = (id % 50) + 1;
+        let affected = bridge_result(
+            product_insert
+                .execute_with_params(&[
+                    fsqlite::SqliteValue::Integer(id),
+                    fsqlite::SqliteValue::Text(format!("prod_{id}").into()),
+                    fsqlite::SqliteValue::Integer(id * 314),
+                    fsqlite::SqliteValue::Integer(category_id),
+                ])
+                .await,
+            "indexed-count seed product",
+        )?;
+        bridge_verify_affected_rows(affected, "indexed-count seed product")?;
+    }
+    drop(product_insert);
+    bridge_result(conn.execute("COMMIT").await, "indexed-count seed commit")?;
+    bridge_result(
+        conn.execute("CREATE INDEX idx_prod_cat ON products(category_id)")
+            .await,
+        "indexed-count create category index",
+    )?;
+    let statement = bridge_result(
+        conn.prepare(PARAMETER_CONTROL_INDEXED_COUNT_SQL).await,
+        "indexed-count prepare retained statement",
+    )?;
+    let explain = statement.explain();
+    let opcodes = parameter_control_explain_opcodes(&explain, "indexed-count prepared route")?;
+
+    let profile_guard = ParameterControlProfileGuard::enable();
+    conn.clear_compilation_reuse_caches();
+    reset_hot_path_profile();
+    let baseline_preflight = bridge_result(
+        statement.query_row().await,
+        "indexed-count baseline route preflight",
+    )?;
+    parameter_control_row_integer(
+        &baseline_preflight,
+        100,
+        "indexed-count baseline route preflight",
+    )?;
+    let baseline_counters = parameter_control_direct_read_counters(&hot_path_profile_snapshot());
+
+    conn.clear_compilation_reuse_caches();
+    reset_hot_path_profile();
+    let candidate_preflight = bridge_result(
+        statement.query_row_with_params(&[]).await,
+        "indexed-count empty-params route preflight",
+    )?;
+    parameter_control_row_integer(
+        &candidate_preflight,
+        100,
+        "indexed-count empty-params route preflight",
+    )?;
+    let candidate_counters = parameter_control_direct_read_counters(&hot_path_profile_snapshot());
+    parameter_control_validate_indexed_count_profiles(&baseline_counters, &candidate_counters)?;
+    drop(profile_guard);
+
+    conn.clear_compilation_reuse_caches();
+    let warm_baseline =
+        bridge_result(statement.query_row().await, "indexed-count baseline warmup")?;
+    parameter_control_row_integer(&warm_baseline, 100, "indexed-count baseline warmup")?;
+    conn.clear_compilation_reuse_caches();
+    let warm_candidate = bridge_result(
+        statement.query_row_with_params(&[]).await,
+        "indexed-count candidate warmup",
+    )?;
+    parameter_control_row_integer(&warm_candidate, 100, "indexed-count candidate warmup")?;
+
+    let mut samples = Vec::with_capacity(orders.len().saturating_mul(8));
+    for (block_index, order) in orders.iter().copied().enumerate() {
+        for (subblock_order_slot, subblock) in order.subblocks.into_iter().enumerate() {
+            for (observation_order_slot, assigned_role) in order.roles.into_iter().enumerate() {
+                let executed_role = parameter_control_executed_role(subblock, assigned_role);
+                conn.clear_compilation_reuse_caches();
+                let start = Instant::now();
+                let row = match executed_role {
+                    ParameterControlRole::Baseline => bridge_result(
+                        statement.query_row().await,
+                        "indexed-count baseline timed query",
+                    )?,
+                    ParameterControlRole::Candidate => bridge_result(
+                        statement.query_row_with_params(&[]).await,
+                        "indexed-count candidate timed query",
+                    )?,
+                };
+                let checksum =
+                    parameter_control_row_integer(&row, 100, "indexed-count timed oracle")?;
+                let elapsed = start.elapsed();
+                std::hint::black_box(checksum);
+                samples.push(parameter_control_sample(
+                    ParameterControlSampleContext {
+                        case: ParameterControlCase::CacheColdIndexedCount,
+                        block_index,
+                        subblock,
+                        subblock_order_slot,
+                        observation_order_slot,
+                        assigned_role,
+                        executed_role,
+                    },
+                    1,
+                    elapsed,
+                    checksum,
+                ));
+            }
+        }
+    }
+
+    let receipt = parameter_control_route_receipt(
+        ParameterControlCase::CacheColdIndexedCount,
+        "cache-cold dispatch/API overhead with identical direct indexed-count routing",
+        "clear all compilation/reuse caches, then retained PreparedStatement::query_row()",
+        "clear all compilation/reuse caches, then the same retained PreparedStatement::query_row_with_params(&[])",
+        PARAMETER_CONTROL_INDEXED_COUNT_SQL,
+        PARAMETER_CONTROL_INDEXED_COUNT_SQL,
+        &explain,
+        &explain,
+        opcodes.clone(),
+        opcodes,
+        baseline_counters,
+        candidate_counters,
+        &[
+            "fixture has 50 categories, 1000 products, and idx_prod_cat(category_id)",
+            "query_row increments direct_count_indexed_rowid_probe_query_row_hits exactly once",
+            "query_row_with_params(&[]) hits the same direct_count_indexed_rowid_probe_query_row lane exactly once",
+            "all other direct prepared-read counters remain zero in both arms",
+            "current-tip route evidence falsifies a params.is_none()-gated direct-lane-bypass explanation for this shape",
+            "any measured timing delta is dispatch/API overhead only and must not be attributed to different engine routing",
+            "Connection::clear_compilation_reuse_caches() occurs before and outside every timed query",
+            "exactly one query occurs after each cache reset",
+            "exact Integer(100) result in preflight, warmup, and every timed observation",
+        ],
+        "column 0 is exactly SqliteValue::Integer(100)",
+        1,
+    );
+    drop(statement);
+    bridge_result(conn.close().await, "indexed-count control close")?;
+    Ok((receipt, samples))
+}
+
+#[cfg(feature = "bridge-experiment")]
+async fn parameter_control_case_variable_opcode(
+    orders: &[ParameterControlBlockOrder],
+) -> Result<
+    (
+        JsonParameterControlRouteReceipt,
+        Vec<JsonParameterControlSample>,
+    ),
+    String,
+> {
+    let conn = parameter_control_open_memory("variable-opcode control open").await?;
+    let literal_statement = bridge_result(
+        conn.prepare(PARAMETER_CONTROL_SCALAR_SQL).await,
+        "variable-opcode prepare literal statement",
+    )?;
+    let parameter_statement = bridge_result(
+        conn.prepare(PARAMETER_CONTROL_VARIABLE_SQL).await,
+        "variable-opcode prepare parameter statement",
+    )?;
+    let literal_explain = literal_statement.explain();
+    let parameter_explain = parameter_statement.explain();
+    let literal_opcodes =
+        parameter_control_explain_opcodes(&literal_explain, "variable-opcode literal route")?;
+    let parameter_opcodes =
+        parameter_control_explain_opcodes(&parameter_explain, "variable-opcode parameter route")?;
+    parameter_control_validate_variable_routes(&literal_opcodes, &parameter_opcodes)?;
+
+    let warm_literal = bridge_result(
+        literal_statement.query_row_with_params(&[]).await,
+        "variable-opcode literal warmup",
+    )?;
+    parameter_control_row_integer(&warm_literal, 42, "variable-opcode literal warmup")?;
+    let warm_parameter = bridge_result(
+        parameter_statement
+            .query_row_with_params(&[fsqlite::SqliteValue::Integer(40)])
+            .await,
+        "variable-opcode parameter warmup",
+    )?;
+    parameter_control_row_integer(&warm_parameter, 42, "variable-opcode parameter warmup")?;
+
+    let mut samples = Vec::with_capacity(orders.len().saturating_mul(8));
+    for (block_index, order) in orders.iter().copied().enumerate() {
+        for (subblock_order_slot, subblock) in order.subblocks.into_iter().enumerate() {
+            for (observation_order_slot, assigned_role) in order.roles.into_iter().enumerate() {
+                let executed_role = parameter_control_executed_role(subblock, assigned_role);
+                let start = Instant::now();
+                let row = match executed_role {
+                    ParameterControlRole::Baseline => bridge_result(
+                        literal_statement.query_row_with_params(&[]).await,
+                        "variable-opcode literal timed query",
+                    )?,
+                    ParameterControlRole::Candidate => bridge_result(
+                        parameter_statement
+                            .query_row_with_params(&[fsqlite::SqliteValue::Integer(40)])
+                            .await,
+                        "variable-opcode parameter timed query",
+                    )?,
+                };
+                let checksum =
+                    parameter_control_row_integer(&row, 42, "variable-opcode timed oracle")?;
+                let elapsed = start.elapsed();
+                std::hint::black_box(checksum);
+                samples.push(parameter_control_sample(
+                    ParameterControlSampleContext {
+                        case: ParameterControlCase::VariableOpcode,
+                        block_index,
+                        subblock,
+                        subblock_order_slot,
+                        observation_order_slot,
+                        assigned_role,
+                        executed_role,
+                    },
+                    1,
+                    elapsed,
+                    checksum,
+                ));
+            }
+        }
+    }
+
+    let receipt = parameter_control_route_receipt(
+        ParameterControlCase::VariableOpcode,
+        "literal versus one Variable opcode with the same parameterized public method",
+        "retained literal statement SELECT 40 + 2 via query_row_with_params(&[])",
+        "retained statement SELECT ?1 + 2 via query_row_with_params(&[Integer(40)])",
+        PARAMETER_CONTROL_SCALAR_SQL,
+        PARAMETER_CONTROL_VARIABLE_SQL,
+        &literal_explain,
+        &parameter_explain,
+        literal_opcodes,
+        parameter_opcodes,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        &[
+            "both routes are compiled and have no dynamic-dispatch marker",
+            "both routes contain Add, ResultRow, and Halt",
+            "literal route contains no Variable opcode",
+            "parameter route contains exactly one Variable opcode",
+            "both arms use PreparedStatement::query_row_with_params",
+            "exact Integer(42) result in warmup and every timed observation",
+        ],
+        "column 0 is exactly SqliteValue::Integer(42)",
+        1,
+    );
+    drop(parameter_statement);
+    drop(literal_statement);
+    bridge_result(conn.close().await, "variable-opcode control close")?;
+    Ok((receipt, samples))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn parameter_control_read_body_key(
+    block_index: usize,
+    operation_index: usize,
+) -> Result<i64, String> {
+    let zero_based = (block_index % PARAMETER_CONTROL_READ_BODY_ROWS)
+        .saturating_mul(131)
+        .saturating_add((operation_index % PARAMETER_CONTROL_READ_BODY_ROWS).saturating_mul(73))
+        % PARAMETER_CONTROL_READ_BODY_ROWS;
+    i64::try_from(zero_based.saturating_add(1))
+        .map_err(|_| "read-body key exceeds i64::MAX".to_owned())
+}
+
+#[cfg(feature = "bridge-experiment")]
+async fn parameter_control_read_body_observation(
+    conn: &fsqlite::Connection,
+    statement: &fsqlite::PreparedStatement<'_>,
+    block_index: usize,
+    operation_count: usize,
+    explicit_transaction: bool,
+) -> Result<(Duration, i64), String> {
+    if explicit_transaction {
+        bridge_result(
+            conn.execute("BEGIN").await,
+            "read-body candidate begin outside timer",
+        )?;
+    }
+    let timed_result = async {
+        let start = Instant::now();
+        let mut checksum = 0_i64;
+        for operation_index in 0..operation_count {
+            let key = parameter_control_read_body_key(block_index, operation_index)?;
+            let expected = key
+                .checked_mul(7)
+                .and_then(|value| value.checked_add(3))
+                .ok_or_else(|| "read-body expected payload overflowed i64".to_owned())?;
+            let row = bridge_result(
+                statement
+                    .query_row_with_params(&[fsqlite::SqliteValue::Integer(key)])
+                    .await,
+                "read-body timed query",
+            )?;
+            let actual =
+                parameter_control_row_integer(&row, expected, "read-body timed row oracle")?;
+            checksum = checksum
+                .checked_add(actual)
+                .ok_or_else(|| "read-body checksum overflowed i64".to_owned())?;
+        }
+        let elapsed = start.elapsed();
+        std::hint::black_box(checksum);
+        Ok::<_, String>((elapsed, checksum))
+    }
+    .await;
+    if explicit_transaction {
+        let commit_result = bridge_result(
+            conn.execute("COMMIT").await,
+            "read-body candidate commit outside timer",
+        );
+        match (timed_result, commit_result) {
+            (Ok(sample), Ok(_)) => Ok(sample),
+            (Err(timed_error), Ok(_)) => Err(timed_error),
+            (Ok(_), Err(commit_error)) => Err(commit_error),
+            (Err(timed_error), Err(commit_error)) => Err(format!(
+                "{timed_error}; transaction cleanup also failed: {commit_error}"
+            )),
+        }
+    } else {
+        timed_result
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[allow(clippy::too_many_lines)]
+async fn parameter_control_case_read_body(
+    orders: &[ParameterControlBlockOrder],
+    operation_count: usize,
+) -> Result<
+    (
+        JsonParameterControlRouteReceipt,
+        Vec<JsonParameterControlSample>,
+    ),
+    String,
+> {
+    let (conn, temporary) = parameter_control_open_file("read-body control open").await?;
+    bridge_result(
+        conn.execute("PRAGMA fsqlite.stmt_microbatch=OFF").await,
+        "read-body disable implicit statement microbatch carry",
+    )?;
+    bridge_result(
+        conn.execute(
+            "CREATE TABLE txn_probe(\
+             id INTEGER PRIMARY KEY, probe_key INTEGER NOT NULL, payload INTEGER NOT NULL)",
+        )
+        .await,
+        "read-body create table",
+    )?;
+    bridge_result(
+        conn.execute("CREATE UNIQUE INDEX txn_probe_key_idx ON txn_probe(probe_key)")
+            .await,
+        "read-body create unique index",
+    )?;
+    bridge_result(conn.execute("BEGIN").await, "read-body seed begin")?;
+    let insert = bridge_result(
+        conn.prepare("INSERT INTO txn_probe VALUES (?1, ?2, ?3)")
+            .await,
+        "read-body prepare seed insert",
+    )?;
+    for key in 1_i64
+        ..=i64::try_from(PARAMETER_CONTROL_READ_BODY_ROWS)
+            .map_err(|_| "read-body fixture row count exceeds i64::MAX".to_owned())?
+    {
+        let payload = key
+            .checked_mul(7)
+            .and_then(|value| value.checked_add(3))
+            .ok_or_else(|| "read-body fixture payload overflowed i64".to_owned())?;
+        let affected = bridge_result(
+            insert
+                .execute_with_params(&[
+                    fsqlite::SqliteValue::Integer(key),
+                    fsqlite::SqliteValue::Integer(key),
+                    fsqlite::SqliteValue::Integer(payload),
+                ])
+                .await,
+            "read-body seed row",
+        )?;
+        bridge_verify_affected_rows(affected, "read-body seed row")?;
+    }
+    drop(insert);
+    bridge_result(conn.execute("COMMIT").await, "read-body seed commit")?;
+
+    let statement = bridge_result(
+        conn.prepare(PARAMETER_CONTROL_READ_BODY_SQL).await,
+        "read-body prepare retained statement",
+    )?;
+    let explain = statement.explain();
+    let opcodes = parameter_control_explain_opcodes(&explain, "read-body prepared route")?;
+
+    let profile_guard = ParameterControlProfileGuard::enable();
+    reset_hot_path_profile();
+    let baseline_preflight = bridge_result(
+        statement
+            .query_row_with_params(&[fsqlite::SqliteValue::Integer(512)])
+            .await,
+        "read-body baseline route preflight",
+    )?;
+    parameter_control_row_integer(
+        &baseline_preflight,
+        3_587,
+        "read-body baseline route preflight",
+    )?;
+    let baseline_counters = parameter_control_direct_read_counters(&hot_path_profile_snapshot());
+
+    reset_hot_path_profile();
+    bridge_result(
+        conn.execute("BEGIN").await,
+        "read-body candidate route preflight begin",
+    )?;
+    let candidate_preflight = bridge_result(
+        statement
+            .query_row_with_params(&[fsqlite::SqliteValue::Integer(512)])
+            .await,
+        "read-body candidate route preflight",
+    )?;
+    parameter_control_row_integer(
+        &candidate_preflight,
+        3_587,
+        "read-body candidate route preflight",
+    )?;
+    bridge_result(
+        conn.execute("COMMIT").await,
+        "read-body candidate route preflight commit",
+    )?;
+    let candidate_counters = parameter_control_direct_read_counters(&hot_path_profile_snapshot());
+    parameter_control_validate_read_body_route(&opcodes, &baseline_counters, &candidate_counters)?;
+    drop(profile_guard);
+
+    parameter_control_read_body_observation(&conn, &statement, 0, 1, false).await?;
+    parameter_control_read_body_observation(&conn, &statement, 0, 1, true).await?;
+
+    let mut samples = Vec::with_capacity(orders.len().saturating_mul(8));
+    for (block_index, order) in orders.iter().copied().enumerate() {
+        for (subblock_order_slot, subblock) in order.subblocks.into_iter().enumerate() {
+            for (observation_order_slot, assigned_role) in order.roles.into_iter().enumerate() {
+                let executed_role = parameter_control_executed_role(subblock, assigned_role);
+                let (elapsed, checksum) = parameter_control_read_body_observation(
+                    &conn,
+                    &statement,
+                    block_index,
+                    operation_count,
+                    executed_role == ParameterControlRole::Candidate,
+                )
+                .await?;
+                samples.push(parameter_control_sample(
+                    ParameterControlSampleContext {
+                        case: ParameterControlCase::ReadBodySnapshotReuse,
+                        block_index,
+                        subblock,
+                        subblock_order_slot,
+                        observation_order_slot,
+                        assigned_role,
+                        executed_role,
+                    },
+                    operation_count,
+                    elapsed,
+                    checksum,
+                ));
+            }
+        }
+    }
+
+    let receipt = parameter_control_route_receipt(
+        ParameterControlCase::ReadBodySnapshotReuse,
+        "read_body_snapshot_reuse",
+        "N retained prepared reads in file-backed autocommit with fsqlite.stmt_microbatch=OFF",
+        "BEGIN before the timed N-read body and COMMIT after the timer",
+        PARAMETER_CONTROL_READ_BODY_SQL,
+        PARAMETER_CONTROL_READ_BODY_SQL,
+        &explain,
+        &explain,
+        opcodes.clone(),
+        opcodes,
+        baseline_counters,
+        candidate_counters,
+        &[
+            "compiled route with no dynamic-dispatch marker",
+            "Variable, at least two OpenRead, index seek, IdxRowid, SeekRowid, and ResultRow opcodes",
+            "all direct prepared-read counters remain zero in autocommit and explicit-transaction preflights",
+            "the fixture is file-backed, where the memory-only cached read snapshot is ineligible",
+            "fsqlite.stmt_microbatch is disabled so the baseline cannot carry a prepared-program microbatch",
+            "BEGIN and COMMIT are outside the candidate timed region",
+            "every row is checked against payload=probe_key*7+3 and folded into the checksum",
+        ],
+        "each varying key returns exactly Integer(key*7+3); the timed body checksum is checked while extracting every row",
+        operation_count,
+    );
+    drop(statement);
+    bridge_result(conn.close().await, "read-body control close")?;
+    drop(temporary);
+    Ok((receipt, samples))
+}
+
+#[cfg(feature = "bridge-experiment")]
 fn bridge_balanced_ready_count_orders(
     operation_counts: &[usize],
     block_count: usize,
@@ -13060,6 +14986,110 @@ fn bridge_balanced_ready_count_orders(
         }
     }
     Ok(orders)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_collect_parameter_path_controls(
+    runtime: &Runtime,
+    options: &CliOptions,
+) -> Result<(JsonParameterPathControls, Vec<JsonBridgeHostState>), String> {
+    let block_count = options.parameter_control_samples / 2;
+    let complementary_pairs = block_count / 2;
+    let order_seed = options.bridge_seed ^ 0x5041_5241_4d53;
+    let mut rng = StdRng::seed_from_u64(order_seed);
+    let empty_params_orders = parameter_control_orders(block_count, &mut rng)?;
+    let indexed_count_orders = parameter_control_orders(block_count, &mut rng)?;
+    let variable_opcode_orders = parameter_control_orders(block_count, &mut rng)?;
+    let read_body_orders = parameter_control_orders(block_count, &mut rng)?;
+
+    let mut route_receipts = Vec::with_capacity(4);
+    let mut raw_samples = Vec::with_capacity(block_count.saturating_mul(8).saturating_mul(4));
+    let mut host_state_checkpoints = Vec::with_capacity(4);
+
+    eprintln!(
+        "parameter control A/4: None vs Some(empty), samples/role/subblock={}",
+        options.parameter_control_samples
+    );
+    let (receipt, samples) =
+        runtime.block_on(parameter_control_case_empty_params(&empty_params_orders))?;
+    route_receipts.push(receipt);
+    raw_samples.extend(samples);
+    host_state_checkpoints.push(capture_bridge_host_state());
+
+    eprintln!(
+        "parameter control B/4: cache-cold indexed COUNT routing, samples/role/subblock={}",
+        options.parameter_control_samples
+    );
+    let (receipt, samples) =
+        runtime.block_on(parameter_control_case_indexed_count(&indexed_count_orders))?;
+    route_receipts.push(receipt);
+    raw_samples.extend(samples);
+    host_state_checkpoints.push(capture_bridge_host_state());
+
+    eprintln!(
+        "parameter control C/4: literal vs Variable opcode, samples/role/subblock={}",
+        options.parameter_control_samples
+    );
+    let (receipt, samples) = runtime.block_on(parameter_control_case_variable_opcode(
+        &variable_opcode_orders,
+    ))?;
+    route_receipts.push(receipt);
+    raw_samples.extend(samples);
+    host_state_checkpoints.push(capture_bridge_host_state());
+
+    eprintln!(
+        "parameter control D/4: read-body snapshot reuse, reads/observation={}, samples/role/subblock={}",
+        options.bridge_operations, options.parameter_control_samples
+    );
+    let (receipt, samples) = runtime.block_on(parameter_control_case_read_body(
+        &read_body_orders,
+        options.bridge_operations,
+    ))?;
+    route_receipts.push(receipt);
+    raw_samples.extend(samples);
+    host_state_checkpoints.push(capture_bridge_host_state());
+
+    let comparisons = [
+        ParameterControlCase::EmptyParamsDispatch,
+        ParameterControlCase::CacheColdIndexedCount,
+        ParameterControlCase::VariableOpcode,
+        ParameterControlCase::ReadBodySnapshotReuse,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, case)| {
+        parameter_control_comparison(
+            &raw_samples,
+            case,
+            options.parameter_control_samples,
+            order_seed ^ index as u64,
+        )
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((
+        JsonParameterPathControls {
+            citable: false,
+            decision_contract:
+                "diagnostic only: the independent A/A null CI defines null_radius=max(|CI endpoint-1|); guard=max(2*null_radius,0.01); the A/B claim is distinguishable_faster only when its entire median-ratio CI is below 1-guard, distinguishable_slower only when its entire CI is above 1+guard, otherwise inconclusive; this never emits KEEP/REJECT or a causal release claim"
+                    .to_owned(),
+            samples_per_role_per_subblock: options.parameter_control_samples,
+            block_count,
+            complementary_pairs,
+            bootstrap_resamples: PARAMETER_CONTROL_BOOTSTRAP_RESAMPLES,
+            order_seed,
+            ordering_policy:
+                "each block contains an independent A/A null subblock and an A/B claim subblock; each subblock has two observations per assigned role in ABBA or BAAB order; adjacent blocks are complementary ABBA/BAAB pairs; null/claim subblock order is randomized per pair and reversed in the paired block; bootstrap resamples whole two-block complementary clusters and recomputes the median for 10000 resamples"
+                    .to_owned(),
+            timed_region:
+                "one existing asupersync runtime entry encloses each complete case outside all timers; setup, prepare, route/profile preflight, warmup, cache reset, and transaction BEGIN/COMMIT are excluded; both timed roles await, extract, validate, and checksum results symmetrically"
+                    .to_owned(),
+            route_receipts,
+            raw_samples,
+            comparisons,
+        },
+        host_state_checkpoints,
+    ))
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -13292,8 +15322,11 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
         eprintln!("  provenance: {error}");
     }
 
-    let (samples, host_state_checkpoints) =
+    let (samples, mut host_state_checkpoints) =
         bridge_collect_samples(&runtime, options, &ready_operation_counts)?;
+    let (parameter_path_controls, parameter_host_checkpoints) =
+        bridge_collect_parameter_path_controls(&runtime, options)?;
+    host_state_checkpoints.extend(parameter_host_checkpoints);
     for (index, checkpoint) in host_state_checkpoints.iter().enumerate() {
         let phase = format!("measurement checkpoint {index}");
         bridge_validate_host_state(
@@ -13347,7 +15380,7 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
     }
 
     let report = JsonBridgeReport {
-        schema_version: BRIDGE_REPORT_SCHEMA_V2.to_owned(),
+        schema_version: BRIDGE_REPORT_SCHEMA_V3.to_owned(),
         generated_at_utc: chrono_stamp(),
         provenance,
         environment,
@@ -13356,6 +15389,7 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
         host_state_after,
         config: JsonBridgeConfig {
             samples_per_arm: options.bridge_samples,
+            parameter_control_samples_per_role_per_subblock: options.parameter_control_samples,
             raw_insert_operations: options.bridge_operations,
             ready_operation_counts,
             order_seed: options.bridge_seed,
@@ -13394,6 +15428,7 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
         arm_statistics: statistics,
         paired_comparisons: comparisons,
         ready_runtime_entry_regression: ready_regression,
+        parameter_path_controls,
     };
 
     let json_path = options
