@@ -99,7 +99,7 @@ use fsqlite_func::vtab::{
     VirtualTable, VirtualTableCursor, VtabModuleFactory, module_factory_from,
 };
 use fsqlite_func::{
-    ErasedWindowFunction, FunctionKey, FunctionRegistry, get_last_changes, get_last_insert_rowid,
+    ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
     get_total_changes, sqlite_compile_options,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -151,8 +151,9 @@ use fsqlite_types::{
 use fsqlite_vdbe::codegen::{
     CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
-    SelectPlannerDirective, TableSchema, codegen_delete, codegen_insert, codegen_select,
-    codegen_update, emit_backfill_key_expr, emit_scan_filter, without_rowid_pk_indices,
+    SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
+    codegen_select, codegen_update, emit_backfill_key_expr, emit_scan_filter,
+    without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -17144,12 +17145,8 @@ impl Connection {
         F: fsqlite_func::ScalarFunction + 'static,
     {
         let func_name = function.name().to_owned();
-        let func_args = function.num_args();
-        let (min_args, max_args) = if func_args >= 0 {
-            (func_args, Some(func_args))
-        } else {
-            (function.min_args(), function.max_args())
-        };
+        let arity = function.arity();
+        let func_args = arity.declared_args();
         let deterministic = function.is_deterministic();
         tracing::info!(
             target: "fsqlite.udf",
@@ -17164,12 +17161,7 @@ impl Connection {
             let published = self.func_registry.borrow();
             FunctionRegistry::clone_from_arc(&published)
         };
-        let displaced_function = registry.register_scalar_keyed_with_arity(
-            FunctionKey::new(&func_name, func_args),
-            min_args,
-            max_args,
-            function,
-        );
+        let displaced_function = registry.register_scalar_captured(&func_name, arity, function);
         let displaced_registry = {
             let mut published = self.func_registry.borrow_mut();
             std::mem::replace(&mut *published, Arc::new(registry))
@@ -17205,12 +17197,8 @@ impl Connection {
         F::State: 'static,
     {
         let func_name = function.name().to_owned();
-        let func_args = function.num_args();
-        let (min_args, max_args) = if func_args >= 0 {
-            (func_args, Some(func_args))
-        } else {
-            (function.min_args(), function.max_args())
-        };
+        let arity = function.arity();
+        let func_args = arity.declared_args();
         tracing::info!(
             target: "fsqlite.udf",
             func_name = %func_name,
@@ -17223,12 +17211,7 @@ impl Connection {
             let published = self.func_registry.borrow();
             FunctionRegistry::clone_from_arc(&published)
         };
-        let displaced_function = registry.register_aggregate_keyed_with_arity(
-            FunctionKey::new(&func_name, func_args),
-            min_args,
-            max_args,
-            function,
-        );
+        let displaced_function = registry.register_aggregate_captured(&func_name, arity, function);
         let displaced_registry = {
             let mut published = self.func_registry.borrow_mut();
             std::mem::replace(&mut *published, Arc::new(registry))
@@ -17260,12 +17243,8 @@ impl Connection {
         F::State: 'static,
     {
         let func_name = function.name().to_owned();
-        let func_args = function.num_args();
-        let (min_args, max_args) = if func_args >= 0 {
-            (func_args, Some(func_args))
-        } else {
-            (function.min_args(), function.max_args())
-        };
+        let arity = function.arity();
+        let func_args = arity.declared_args();
         tracing::info!(
             target: "fsqlite.udf",
             func_name = %func_name,
@@ -17278,12 +17257,8 @@ impl Connection {
             let published = self.func_registry.borrow();
             FunctionRegistry::clone_from_arc(&published)
         };
-        let (registered, displaced_function) = registry.register_window_keyed_with_arity(
-            FunctionKey::new(&func_name, func_args),
-            min_args,
-            max_args,
-            function,
-        );
+        let (registered, displaced_function) =
+            registry.register_window_captured(&func_name, arity, function);
         let displaced_registry = {
             let mut published = self.func_registry.borrow_mut();
             std::mem::replace(&mut *published, Arc::new(registry))
@@ -46963,15 +46938,47 @@ impl Connection {
     }
 
     async fn backfill_index(&self, table: &TableSchema, index: &IndexSchema) -> Result<()> {
-        let is_expression_index = index.columns.is_empty() && !index.key_expressions.is_empty();
+        let has_column_terms = !index.columns.is_empty();
+        let has_expression_terms = !index.key_expressions.is_empty();
+        if has_column_terms == has_expression_terms {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{}` on table `{}` must have exactly one executable key representation",
+                    index.name, table.name
+                ),
+            });
+        }
+        let key_term_count = index.key_term_count();
+        if (!index.key_sort_directions.is_empty()
+            && index.key_sort_directions.len() != key_term_count)
+            || (!index.key_collations.is_empty()
+                && index.key_collations.len() != key_term_count)
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{}` on table `{}` has inconsistent per-key metadata",
+                    index.name, table.name
+                ),
+            });
+        }
+        let is_expression_index = has_expression_terms;
         let idx_col_positions: Vec<usize> = if is_expression_index {
             Vec::new()
         } else {
             index
                 .columns
                 .iter()
-                .filter_map(|column| table.column_index(column))
-                .collect()
+                .map(|column| {
+                    table.column_index(column).ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` on table `{}` refers to missing key column `{column}`",
+                                index.name, table.name
+                            ),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
         };
         // For expression indexes, parse each key expression from SQL text.
         let key_exprs: Vec<Expr> = if is_expression_index {
@@ -47632,80 +47639,40 @@ impl Connection {
             }
         }
 
-        // Phase 2: Validate indexed terms and collect column names (with borrow).
-        // For each term, try to normalize as a plain column reference.  If that
-        // fails the term is an expression — validate that every column it
-        // references exists in the table.  When ANY term is an expression the
-        // index is an *expression index*: `columns` is left empty and the
-        // backfill path uses `key_expressions` to evaluate terms at runtime.
-        let (col_names, key_sort_directions, key_collations, has_expression_term) = {
+        // Phase 2: Bind the complete logical index before allocating storage.
+        // The same rootless binder is used by catalog reload, preventing live
+        // DDL and persisted schema reconstruction from accepting different
+        // column, expression, predicate, or metadata shapes.
+        let table_schema = {
             let schema = self.schema.borrow();
-            let table = schema
+            schema
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(table_name))
                 .ok_or_else(|| FrankenError::NoSuchTable {
                     name: table_name.clone(),
-                })?;
-            let mut col_names = Vec::with_capacity(stmt.columns.len());
-            let mut sort_dirs = Vec::with_capacity(stmt.columns.len());
-            let mut collations: Vec<Option<String>> = Vec::with_capacity(stmt.columns.len());
-            let mut has_expr = false;
-            for idx_col in &stmt.columns {
-                if let Some(mut normalized) = normalize_indexed_column_term(idx_col) {
-                    // Plain column reference — validate it exists.
-                    if !table
-                        .columns
-                        .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(&normalized.column_name))
-                    {
-                        return Err(FrankenError::Internal(format!(
-                            "no such column: {}",
-                            normalized.column_name
-                        )));
-                    }
-                    if normalized.collation.is_none() {
-                        normalized.collation =
-                            column_info_collation_by_name(&table.columns, &normalized.column_name);
-                    }
-                    col_names.push(normalized.column_name);
-                    sort_dirs.push(normalized.direction.unwrap_or(SortDirection::Asc));
-                    collations.push(normalized.collation);
-                } else {
-                    // Expression term — validate all referenced columns exist.
-                    has_expr = true;
-                    let mut refs = Vec::new();
-                    collect_expr_column_refs(&idx_col.expr, &mut refs);
-                    for col_name in &refs {
-                        if !table
-                            .columns
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(col_name))
-                        {
-                            return Err(FrankenError::Internal(format!(
-                                "no such column: {col_name}"
-                            )));
-                        }
-                    }
-                    // Expression terms don't contribute to `col_names`.
-                    sort_dirs.push(idx_col.direction.unwrap_or(SortDirection::Asc));
-                    collations.push(idx_col.collation.clone());
-                }
-            }
-            // If any term is an expression, clear col_names so the schema
-            // reflects an expression index (columns.is_empty()).
-            if has_expr {
-                col_names.clear();
-            }
-            (col_names, sort_dirs, collations, has_expr)
+                })?
+                .clone()
         };
-        let key_expressions = if has_expression_term {
-            stmt.columns
-                .iter()
-                .map(|indexed| indexed.expr.to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let bound_index = bind_explicit_index(
+            stmt,
+            &index_name,
+            table_name,
+            &table_schema,
+        )
+        .map_err(codegen_error_to_franken)?;
+        let collation_registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+        for collation in bound_index.key_collations.iter().flatten() {
+            validate_registered_collation(collation, &collation_registry)?;
+        }
+        for indexed in &stmt.columns {
+            validate_expr_collation_boundary(self, &indexed.expr, &collation_registry)?;
+        }
+        if let Some(predicate) = stmt.where_clause.as_ref() {
+            validate_expr_collation_boundary(self, predicate, &collation_registry)?;
+        }
+        let has_expression_term = !bound_index.key_expressions.is_empty();
+        let col_names = bound_index.columns.clone();
+        let key_collations = bound_index.key_collations.clone();
 
         if target_is_temp && stmt.unique && has_expression_term {
             return Err(FrankenError::NotImplemented(
@@ -47714,17 +47681,10 @@ impl Connection {
         }
 
         let temp_unique_columns = if target_is_temp && stmt.unique {
-            let schema = self.schema.borrow();
-            let table = schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .ok_or_else(|| FrankenError::NoSuchTable {
-                    name: table_name.clone(),
-                })?;
             let columns = col_names
                 .iter()
                 .map(|column| {
-                    table
+                    table_schema
                         .columns
                         .iter()
                         .position(|candidate| candidate.name.eq_ignore_ascii_case(column))
@@ -47736,7 +47696,7 @@ impl Connection {
                     ))
                 })?;
             let db = self.db.borrow();
-            let table = db.get_table(table.root_page).ok_or_else(|| {
+            let table = db.get_table(table_schema.root_page).ok_or_else(|| {
                 FrankenError::Internal(format!("TEMP table `{table_name}` has no attached storage"))
             })?;
             if !table.unique_column_group_is_valid(&columns, &key_collations) {
@@ -47754,7 +47714,7 @@ impl Connection {
             .allocate_schema_table_root(target_is_temp, 0, true)
             .await?;
 
-        // Phase 5: Record index in schema (with mut borrow)
+        // Phase 4: Record index in schema (with mut borrow)
         {
             let mut schema = self.schema.borrow_mut();
             let table = schema
@@ -47763,17 +47723,7 @@ impl Connection {
                 .ok_or_else(|| FrankenError::NoSuchTable {
                     name: table_name.clone(),
                 })?;
-            table.indexes.push(IndexSchema {
-                name: index_name.clone(),
-                columns: col_names,
-                key_expressions,
-                key_sort_directions,
-                where_clause: stmt.where_clause.as_ref().map(|e| e.to_string()),
-                root_page,
-                is_unique: stmt.unique,
-                key_collations: key_collations.clone(),
-                conflict_action: None,
-            });
+            table.indexes.push(bound_index.into_index_schema(root_page));
         }
 
         if let Some(columns) = temp_unique_columns {
@@ -47791,7 +47741,7 @@ impl Connection {
             }
         }
 
-        // Phase 6: Persist to sqlite_master
+        // Phase 5: Persist to sqlite_master
         let create_sql = stmt.to_string();
         if !target_is_temp {
             self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)
@@ -47800,7 +47750,7 @@ impl Connection {
 
         self.increment_schema_cookie().await?;
 
-        // Phase 7: Backfill existing table rows into the new index.
+        // Phase 6: Backfill existing table rows into the new index.
         // SQLite populates a new index with all current table data during
         // CREATE INDEX.  For UNIQUE indexes this also validates that no
         // duplicate values exist.
@@ -70738,8 +70688,12 @@ impl Connection {
             let mut new_db = MemDatabase::new();
             let mut new_triggers = Vec::new();
             let mut new_views: Vec<ViewDef> = Vec::new();
-            let mut pending_indexes: Vec<(String, String, i32, ReconstructedIndexDefinition)> =
-                Vec::new();
+            let mut pending_indexes: Vec<(
+                String,
+                String,
+                i32,
+                fsqlite_ast::CreateIndexStatement,
+            )> = Vec::new();
             let mut pending_rootpage_zero_virtual_tables: Vec<(String, String, Vec<ColumnInfo>)> =
                 Vec::new();
             let mut pending_materialized_live_vtabs: Vec<(String, String)> = Vec::new();
@@ -70824,61 +70778,20 @@ impl Connection {
                     };
                     new_original_ddl_sql
                         .insert(index_name.to_ascii_lowercase(), create_sql.to_string());
-                    let table_columns = new_schema
-                        .iter()
-                        .find(|table| table.name.eq_ignore_ascii_case(&table_name))
-                        .map(|table| table.columns.clone())
-                        .or_else(|| {
-                            master_entries.iter().find_map(|candidate| {
-                                if candidate.len() < 5 {
-                                    return None;
-                                }
-                                let entry_type = match &candidate[0] {
-                                    SqliteValue::Text(s) => s,
-                                    _ => return None,
-                                };
-                                if !entry_type.eq_ignore_ascii_case("table") {
-                                    return None;
-                                }
-                                let entry_name = match &candidate[1] {
-                                    SqliteValue::Text(s) => s,
-                                    _ => return None,
-                                };
-                                if !entry_name.eq_ignore_ascii_case(&table_name) {
-                                    return None;
-                                }
-                                let create_sql = match &candidate[4] {
-                                    SqliteValue::Text(sql) => sql,
-                                    _ => return None,
-                                };
-                                Some(crate::compat_persist::parse_columns_from_sqlite_master_sql(
-                                    create_sql,
-                                ))
-                            })
-                        });
-                    let maybe_index_definition = parse_index_definition_from_create_sql(
-                        create_sql,
-                        table_columns.as_deref(),
-                    );
-                    let Some(index_definition) = maybe_index_definition else {
+                    let Ok(Statement::CreateIndex(create_stmt)) =
+                        parse_single_statement(create_sql)
+                    else {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "schema reload cannot reconstruct explicit index `{index_name}` on table `{table_name}`"
                             ),
                         });
                     };
-                    if index_definition.key_term_count() == 0 {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "schema reload reconstructed explicit index `{index_name}` on table `{table_name}` without any key terms"
-                            ),
-                        });
-                    }
                     pending_indexes.push((
                         index_name.to_string(),
                         table_name.to_string(),
                         root_page,
-                        index_definition,
+                        create_stmt,
                     ));
                     continue;
                 }
@@ -71249,10 +71162,10 @@ impl Connection {
             }
 
             // Attach indexes after all table schemas are available.
-            for (index_name, table_name, root_page, index_definition) in pending_indexes {
-                let Some(table) = new_schema
+            for (index_name, table_name, root_page, create_stmt) in pending_indexes {
+                let Some(table_position) = new_schema
                     .iter_mut()
-                    .find(|t| t.name.eq_ignore_ascii_case(&table_name))
+                    .position(|table| table.name.eq_ignore_ascii_case(&table_name))
                 else {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -71260,6 +71173,7 @@ impl Connection {
                         ),
                     });
                 };
+                let table = &new_schema[table_position];
                 if table
                     .indexes
                     .iter()
@@ -71271,17 +71185,20 @@ impl Connection {
                         ),
                     });
                 }
-                table.indexes.push(IndexSchema {
-                    name: index_name,
-                    root_page,
-                    columns: index_definition.columns,
-                    key_expressions: index_definition.key_expressions,
-                    key_sort_directions: index_definition.key_sort_directions,
-                    key_collations: index_definition.key_collations,
-                    where_clause: index_definition.where_clause,
-                    is_unique: index_definition.is_unique,
-                    conflict_action: index_definition.conflict_action,
-                });
+                let bound_index = bind_explicit_index(
+                    &create_stmt,
+                    &index_name,
+                    &table_name,
+                    table,
+                )
+                .map_err(|error| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "invalid explicit index `{index_name}` on table `{table_name}` during schema reload: {error}"
+                    ),
+                })?;
+                new_schema[table_position]
+                    .indexes
+                    .push(bound_index.into_index_schema(root_page));
                 if !new_db.tables.contains_key(&root_page) {
                     new_db.create_table_at(root_page, 0);
                 }
@@ -111744,7 +111661,7 @@ mod tests {
             reentrant_vtab_connection().register_scalar_function(MetadataNestedScalarFunction {
                 function_name: nested_name,
             });
-            0
+            -1
         }
 
         fn name(&self) -> &str {

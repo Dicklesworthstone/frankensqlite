@@ -51,6 +51,7 @@ use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
     CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
+    bind_explicit_index,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -1739,25 +1740,24 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 ),
             })?;
 
-        // Find the parent table in the schema.
-        let Some(table) = schema
-            .iter_mut()
-            .find(|t| t.name.eq_ignore_ascii_case(&tbl_name))
+        // Find the parent table in the schema and bind the authoritative SQL
+        // against it before mutating either schema or MemDatabase state.
+        let Some(table_position) = schema
+            .iter()
+            .position(|table| table.name.eq_ignore_ascii_case(&tbl_name))
         else {
             return Err(sqlite_master_corrupt(format!(
                 "validated index `{index_name}` lost parent table `{tbl_name}` during load"
             )));
         };
 
-        // Parse the CREATE INDEX SQL to extract column names, collations,
-        // sort directions, and WHERE clause.
-        let Some(idx_schema) =
-            self::parse_create_index_sql_to_schema(&index_name, root_page_i32, &create_sql)
+        let Some(Statement::CreateIndex(create_stmt)) = parse_single_statement(&create_sql)
         else {
             return Err(sqlite_master_corrupt(format!(
-                "validated CREATE INDEX SQL for `{index_name}` could not produce executable metadata"
+                "validated CREATE INDEX SQL for `{index_name}` could not be parsed during load"
             )));
         };
+        let table = &schema[table_position];
         if table
             .indexes
             .iter()
@@ -1767,7 +1767,15 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 "validated explicit index `{index_name}` duplicates an existing index on table `{tbl_name}` during load"
             )));
         }
-        table.indexes.push(idx_schema);
+        let bound_index = bind_explicit_index(&create_stmt, &index_name, &tbl_name, table)
+            .map_err(|error| {
+                sqlite_master_corrupt(format!(
+                    "invalid explicit index `{index_name}` on table `{tbl_name}` during load: {error}"
+                ))
+            })?;
+        schema[table_position]
+            .indexes
+            .push(bound_index.into_index_schema(root_page_i32));
         db.create_table_at(root_page_i32, 0);
     }
 

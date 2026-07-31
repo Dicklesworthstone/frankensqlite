@@ -254,44 +254,63 @@ impl FunctionKey {
     }
 }
 
+/// Immutable SQL-visible argument-count contract for a registered function.
+///
+/// Construct this once from user metadata and publish it alongside the
+/// function object. Runtime lookup uses only this value, never re-entering
+/// user-defined metadata callbacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FunctionArity {
+pub struct FunctionArity {
+    declared_args: i32,
     min_args: i32,
     max_args: Option<i32>,
 }
 
 impl FunctionArity {
+    /// Construct an exact-arity contract.
+    #[must_use]
+    pub fn exact(num_args: i32) -> Self {
+        assert!(num_args >= 0, "exact function arity must be non-negative");
+        Self {
+            declared_args: num_args,
+            min_args: num_args,
+            max_args: Some(num_args),
+        }
+    }
+
+    /// Construct a variadic contract with inclusive argument-count bounds.
+    #[must_use]
+    pub fn variadic(min_args: i32, max_args: Option<i32>) -> Self {
+        assert!(min_args >= 0, "minimum function arity must be non-negative");
+        assert!(
+            max_args.is_none_or(|max| max >= min_args),
+            "maximum function arity must not be below its minimum"
+        );
+        Self {
+            declared_args: -1,
+            min_args,
+            max_args,
+        }
+    }
+
+    /// Registry key arity (`-1` for a variadic contract).
+    #[must_use]
+    pub const fn declared_args(self) -> i32 {
+        self.declared_args
+    }
+
+    /// Whether this contract accepts `num_args` SQL-visible arguments.
+    #[must_use]
+    pub fn accepts(self, num_args: i32) -> bool {
+        num_args >= self.min_args && self.max_args.is_none_or(|max| num_args <= max)
+    }
+
     fn for_key(key: &FunctionKey) -> Self {
         if key.num_args >= 0 {
-            Self {
-                min_args: key.num_args,
-                max_args: Some(key.num_args),
-            }
+            Self::exact(key.num_args)
         } else {
-            Self {
-                min_args: 0,
-                max_args: None,
-            }
+            Self::variadic(0, None)
         }
-    }
-
-    fn from_declared_bounds(
-        key: &FunctionKey,
-        min_args: i32,
-        max_args: Option<i32>,
-    ) -> Self {
-        if key.num_args >= 0 {
-            Self::for_key(key)
-        } else {
-            Self {
-                min_args,
-                max_args,
-            }
-        }
-    }
-
-    fn accepts(self, num_args: i32) -> bool {
-        num_args >= self.min_args && self.max_args.is_none_or(|max| num_args <= max)
     }
 }
 
@@ -471,13 +490,9 @@ impl FunctionRegistry {
     where
         F: ScalarFunction + 'static,
     {
-        let key = FunctionKey::new(function.name(), function.num_args());
-        let (min_args, max_args) = if key.num_args >= 0 {
-            (key.num_args, Some(key.num_args))
-        } else {
-            (function.min_args(), function.max_args())
-        };
-        self.register_scalar_keyed_with_arity(key, min_args, max_args, function)
+        let name = function.name().to_owned();
+        let arity = function.arity();
+        self.register_scalar_captured(&name, arity, function)
     }
 
     /// Register a scalar function under caller-precomputed identity.
@@ -499,21 +514,21 @@ impl FunctionRegistry {
         self.scalars.insert(key, Arc::new(function))
     }
 
-    /// Register a scalar function with caller-captured variadic bounds.
+    /// Register a scalar function with caller-captured metadata.
     ///
-    /// No user metadata callback runs in this method. Fixed-arity keys always
-    /// use their exact key arity; bounds are only consulted for a `-1` key.
-    pub fn register_scalar_keyed_with_arity<F>(
+    /// No user metadata callback runs in this method. The registry key and
+    /// runtime acceptance contract are both derived from the same immutable
+    /// arity value.
+    pub fn register_scalar_captured<F>(
         &mut self,
-        key: FunctionKey,
-        min_args: i32,
-        max_args: Option<i32>,
+        name: &str,
+        arity: FunctionArity,
         function: F,
     ) -> Option<Arc<dyn ScalarFunction>>
     where
         F: ScalarFunction + 'static,
     {
-        let arity = FunctionArity::from_declared_bounds(&key, min_args, max_args);
+        let key = FunctionKey::new(name, arity.declared_args());
         self.scalar_arities.insert(key.clone(), arity);
         self.scalars.insert(key, Arc::new(function))
     }
@@ -526,13 +541,9 @@ impl FunctionRegistry {
         F: AggregateFunction + 'static,
         F::State: 'static,
     {
-        let key = FunctionKey::new(function.name(), function.num_args());
-        let (min_args, max_args) = if key.num_args >= 0 {
-            (key.num_args, Some(key.num_args))
-        } else {
-            (function.min_args(), function.max_args())
-        };
-        self.register_aggregate_keyed_with_arity(key, min_args, max_args, function)
+        let name = function.name().to_owned();
+        let arity = function.arity();
+        self.register_aggregate_captured(&name, arity, function)
     }
 
     /// Register an aggregate function under caller-precomputed identity.
@@ -554,20 +565,21 @@ impl FunctionRegistry {
             .insert(key, Arc::new(AggregateAdapter::new(function)))
     }
 
-    /// Register an aggregate function with caller-captured variadic bounds.
-    /// No user metadata callback runs in this method.
-    pub fn register_aggregate_keyed_with_arity<F>(
+    /// Register an aggregate function with caller-captured metadata.
+    ///
+    /// No user metadata callback runs in this method. The registry key and
+    /// runtime acceptance contract share one immutable arity value.
+    pub fn register_aggregate_captured<F>(
         &mut self,
-        key: FunctionKey,
-        min_args: i32,
-        max_args: Option<i32>,
+        name: &str,
+        arity: FunctionArity,
         function: F,
     ) -> Option<Arc<ErasedAggregateFunction>>
     where
         F: AggregateFunction + 'static,
         F::State: 'static,
     {
-        let arity = FunctionArity::from_declared_bounds(&key, min_args, max_args);
+        let key = FunctionKey::new(name, arity.declared_args());
         self.aggregate_arities.insert(key.clone(), arity);
         self.aggregates
             .insert(key, Arc::new(AggregateAdapter::new(function)))
@@ -581,14 +593,9 @@ impl FunctionRegistry {
         F: WindowFunction + 'static,
         F::State: 'static,
     {
-        let key = FunctionKey::new(function.name(), function.num_args());
-        let (min_args, max_args) = if key.num_args >= 0 {
-            (key.num_args, Some(key.num_args))
-        } else {
-            (function.min_args(), function.max_args())
-        };
-        let (_, displaced) =
-            self.register_window_keyed_with_arity(key, min_args, max_args, function);
+        let name = function.name().to_owned();
+        let arity = function.arity();
+        let (_, displaced) = self.register_window_captured(&name, arity, function);
         displaced
     }
 
@@ -612,13 +619,14 @@ impl FunctionRegistry {
         (registered, displaced)
     }
 
-    /// Register a window function with caller-captured variadic bounds.
-    /// No user metadata callback runs in this method.
-    pub fn register_window_keyed_with_arity<F>(
+    /// Register a window function with caller-captured metadata.
+    ///
+    /// No user metadata callback runs in this method. The registry key and
+    /// runtime acceptance contract share one immutable arity value.
+    pub fn register_window_captured<F>(
         &mut self,
-        key: FunctionKey,
-        min_args: i32,
-        max_args: Option<i32>,
+        name: &str,
+        arity: FunctionArity,
         function: F,
     ) -> (Arc<ErasedWindowFunction>, Option<Arc<ErasedWindowFunction>>)
     where
@@ -626,7 +634,7 @@ impl FunctionRegistry {
         F::State: 'static,
     {
         let registered: Arc<ErasedWindowFunction> = Arc::new(WindowAdapter::new(function));
-        let arity = FunctionArity::from_declared_bounds(&key, min_args, max_args);
+        let key = FunctionKey::new(name, arity.declared_args());
         self.window_arities.insert(key.clone(), arity);
         let displaced = self.windows.insert(key, Arc::clone(&registered));
         (registered, displaced)
