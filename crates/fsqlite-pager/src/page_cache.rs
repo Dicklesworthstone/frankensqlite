@@ -1234,6 +1234,26 @@ struct CachedPageEntry {
     mutation_generation: AtomicU64,
 }
 
+struct PageWriteSnapshot {
+    page: PageData,
+    image_identity: Arc<[u8]>,
+    mutation_generation: u64,
+}
+
+#[cfg(all(test, feature = "native"))]
+fn dirty_writeback_join_error(
+    page_no: PageNumber,
+    error: asupersync::runtime::JoinError,
+) -> FrankenError {
+    match &error {
+        asupersync::runtime::JoinError::Cancelled(_) => FrankenError::Abort,
+        asupersync::runtime::JoinError::Panicked(_)
+        | asupersync::runtime::JoinError::PolledAfterCompletion => FrankenError::internal(format!(
+            "dirty page {page_no} writeback task failed: {error}"
+        )),
+    }
+}
+
 impl CachedPageEntry {
     #[inline]
     fn new(buf: PageBuf) -> Self {
@@ -1267,7 +1287,6 @@ impl CachedPageEntry {
     fn as_mut_slice(&mut self) -> &mut [u8] {
         self.record_access();
         self.mark_dirty();
-        self.shared = None;
         self.buf.as_mut_slice()
     }
 
@@ -1282,6 +1301,21 @@ impl CachedPageEntry {
             shared
         };
         PageData::from_shared(shared)
+    }
+
+    #[inline]
+    fn page_write_snapshot(&mut self) -> PageWriteSnapshot {
+        let page = self.shared_page();
+        let image_identity = Arc::clone(
+            self.shared
+                .as_ref()
+                .expect("shared_page must publish the cached image identity"),
+        );
+        PageWriteSnapshot {
+            page,
+            image_identity,
+            mutation_generation: self.mutation_generation(),
+        }
     }
 
     #[inline]
@@ -1305,7 +1339,12 @@ impl CachedPageEntry {
     }
 
     #[inline]
-    fn mark_dirty(&self) {
+    fn mark_dirty(&mut self) {
+        // Every mutation retires the identity held by an in-flight writeback.
+        // Generation comparison alone is insufficient because replacing a
+        // page installs a fresh entry whose generation starts at the same
+        // value as the old entry (an ABA collision).
+        self.shared = None;
         self.mutation_generation.fetch_add(1, Ordering::AcqRel);
         self.dirty.store(true, Ordering::Relaxed);
     }
@@ -1318,6 +1357,15 @@ impl CachedPageEntry {
     #[inline]
     fn mutation_generation(&self) -> u64 {
         self.mutation_generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn matches_write_snapshot(&self, snapshot: &PageWriteSnapshot) -> bool {
+        self.mutation_generation() == snapshot.mutation_generation
+            && self
+                .shared
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &snapshot.image_identity))
     }
 
     #[inline]
@@ -2744,13 +2792,13 @@ impl ShardedPageCache {
         }
     }
 
-    fn mark_page_clean_if_generation(&self, page_no: PageNumber, generation: u64) {
+    fn mark_page_clean_if_snapshot(&self, page_no: PageNumber, snapshot: &PageWriteSnapshot) {
         if self.use_fast_path.load(Ordering::Relaxed)
             && let Some(ref fast) = self.fast_array
         {
             let idx = FastPageArray::pgno_to_idx(page_no);
             if let Some(Some(entry)) = fast.lock().pages.get(idx)
-                && entry.mutation_generation() == generation
+                && entry.matches_write_snapshot(snapshot)
             {
                 entry.mark_clean();
             }
@@ -2761,7 +2809,7 @@ impl ShardedPageCache {
             let guard = self.flat_slots.slots[slot_idx].data.lock();
             if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
                 && let Some(ref entry) = *guard
-                && entry.mutation_generation() == generation
+                && entry.matches_write_snapshot(snapshot)
             {
                 entry.mark_clean();
                 return;
@@ -2770,13 +2818,13 @@ impl ShardedPageCache {
 
         let idx = self.shard_index(page_no);
         if let Some(entry) = self.shards[idx].lock().pages.get(&page_no)
-            && entry.mutation_generation() == generation
+            && entry.matches_write_snapshot(snapshot)
         {
             entry.mark_clean();
         }
     }
 
-    fn page_write_snapshot(&self, page_no: PageNumber) -> Option<(PageData, u64)> {
+    fn page_write_snapshot(&self, page_no: PageNumber) -> Option<PageWriteSnapshot> {
         if self.use_fast_path.load(Ordering::Relaxed)
             && let Some(ref fast) = self.fast_array
         {
@@ -2785,8 +2833,7 @@ impl ShardedPageCache {
                 .pages
                 .get_mut(FastPageArray::pgno_to_idx(page_no))?
                 .as_mut()?;
-            entry.record_access();
-            return Some((entry.shared_page(), entry.mutation_generation()));
+            return Some(entry.page_write_snapshot());
         }
 
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
@@ -2795,7 +2842,7 @@ impl ShardedPageCache {
                 && let Some(ref mut entry) = *guard
             {
                 self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
-                return Some((entry.shared_page(), entry.mutation_generation()));
+                return Some(entry.page_write_snapshot());
             }
         }
 
@@ -2803,7 +2850,7 @@ impl ShardedPageCache {
         let mut shard = self.shards[idx].lock();
         shard.hits = shard.hits.saturating_add(1);
         let entry = shard.pages.get_mut(&page_no)?;
-        Some((entry.shared_page(), entry.mutation_generation()))
+        Some(entry.page_write_snapshot())
     }
 
     fn claim_in_flight_read(&self, page_no: PageNumber) -> InFlightReadRole<'_> {
@@ -3189,14 +3236,14 @@ impl ShardedPageCache {
         file: &impl VfsFile,
         page_no: PageNumber,
     ) -> Result<()> {
-        let Some((page, generation)) = self.page_write_snapshot(page_no) else {
+        let Some(snapshot) = self.page_write_snapshot(page_no) else {
             return Err(FrankenError::internal(format!(
                 "page {page_no} not in cache"
             )));
         };
         let offset = page_offset(page_no, self.page_size);
-        file.write(cx, page.as_bytes(), offset).await?;
-        self.mark_page_clean_if_generation(page_no, generation);
+        file.write(cx, snapshot.page.as_bytes(), offset).await?;
+        self.mark_page_clean_if_snapshot(page_no, &snapshot);
         self.record_eviction_access(page_no);
         Ok(())
     }
@@ -3217,7 +3264,7 @@ impl ShardedPageCache {
                 buf.as_mut_slice().fill(0);
                 let result = f(buf.as_mut_slice());
                 let admitted_new = arr.insert(page_no, buf);
-                if let Some(Some(entry)) = arr.pages.get(FastPageArray::pgno_to_idx(page_no)) {
+                if let Some(Some(entry)) = arr.pages.get_mut(FastPageArray::pgno_to_idx(page_no)) {
                     entry.mark_dirty();
                     entry.record_access();
                 }
@@ -3406,19 +3453,18 @@ impl ShardedPageCache {
         self.take_clean_buffer().is_some()
     }
 
-    /// Evict one page without blocking an executor worker on dirty writeback.
+    /// Exercise standalone dirty-cache writeback without blocking an executor
+    /// worker.
     ///
-    /// Clean pages are removed immediately. If every resident page is dirty,
-    /// the coldest dirty candidate is written by a task owned by the current
-    /// asupersync region. The candidate is removed only after that task
-    /// succeeds and only if its mutation generation is unchanged; a concurrent
-    /// writer therefore leaves the page resident and dirty for a later retry.
+    /// This is a low-level cache oracle, not a `SimplePager` capacity-recovery
+    /// path. Writing a shared-cache image directly to the database would bypass
+    /// WAL/journal durability, MVCC conflict validation, and publication
+    /// ordering. Production pager recovery must therefore remain clean-only.
     ///
-    /// Native callers must invoke this from an asupersync runtime task (or
-    /// attach a runtime-backed native context to `cx`). The non-native fallback
-    /// performs the same generation-safe async write directly because there is
-    /// no multi-worker runtime on that target.
-    pub async fn evict_any_async<F>(self: &Arc<Self>, cx: &Cx, file: Arc<F>) -> Result<bool>
+    /// Native tests dispatch the write through the caller's asupersync region;
+    /// non-native tests execute the same image-safe write directly.
+    #[cfg(test)]
+    pub(crate) async fn evict_any_async<F>(self: &Arc<Self>, cx: &Cx, file: Arc<F>) -> Result<bool>
     where
         F: VfsFile + 'static,
     {
@@ -3439,7 +3485,7 @@ impl ShardedPageCache {
                         "dirty page eviction requires an asupersync runtime region",
                     )
                 })?;
-            let scope = native_cx.scope();
+            let scope = native_cx.scope_with_budget(cx.native_spawn_budget(&native_cx));
             let task_cache = Arc::clone(self);
             let task_cx = cx.create_child_for_spawn();
             let mut writeback = native_cx
@@ -3454,11 +3500,10 @@ impl ShardedPageCache {
                         "failed to dispatch dirty page {page_no} writeback: {error}"
                     ))
                 })?;
-            writeback.join(&native_cx).await.map_err(|error| {
-                FrankenError::internal(format!(
-                    "dirty page {page_no} writeback task failed: {error}"
-                ))
-            })??;
+            writeback
+                .join(&native_cx)
+                .await
+                .map_err(|error| dirty_writeback_join_error(page_no, error))??;
         }
 
         #[cfg(not(feature = "native"))]
@@ -3467,6 +3512,7 @@ impl ShardedPageCache {
         Ok(self.take_clean_buffer_at(page_no).is_some())
     }
 
+    #[cfg(test)]
     fn dirty_writeback_victim(&self) -> Option<PageNumber> {
         let mut candidates = self.page_snapshots();
         if let Some(preferred) = self.preferred_reconstructed_victim()
@@ -4040,6 +4086,8 @@ mod tests {
     use super::*;
     use crate::s3_fifo::{QueueKind, S3Fifo, S3FifoConfig, S3FifoEvent};
     use fsqlite_types::LockLevel;
+    #[cfg(feature = "native")]
+    use fsqlite_types::cx::Budget;
     use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
     use fsqlite_vfs::{MemoryVfs, ShmRegion, Vfs};
     use serde_json::json;
@@ -4488,30 +4536,43 @@ mod tests {
         }
     }
 
-    struct RegionWritebackFile {
+    struct ControlledWritebackFile {
         bytes: std::sync::Mutex<Vec<u8>>,
         write_calls: AtomicUsize,
+        #[cfg(feature = "native")]
         parent_task:
             std::sync::Mutex<Option<(asupersync::types::TaskId, asupersync::types::RegionId)>>,
+        #[cfg(feature = "native")]
         observed_child_task: AtomicBool,
+        #[cfg(feature = "native")]
         observed_parent_region: AtomicBool,
+        #[cfg(feature = "native")]
         observed_inline_io_safe: AtomicBool,
+        #[cfg(feature = "native")]
+        observed_native_budget: std::sync::Mutex<Option<asupersync::Budget>>,
         fail_writes: bool,
     }
 
-    impl RegionWritebackFile {
+    impl ControlledWritebackFile {
         fn new(page_size: PageSize, fail_writes: bool) -> Self {
             Self {
                 bytes: std::sync::Mutex::new(vec![0; page_size.as_usize()]),
                 write_calls: AtomicUsize::new(0),
+                #[cfg(feature = "native")]
                 parent_task: std::sync::Mutex::new(None),
+                #[cfg(feature = "native")]
                 observed_child_task: AtomicBool::new(false),
+                #[cfg(feature = "native")]
                 observed_parent_region: AtomicBool::new(false),
+                #[cfg(feature = "native")]
                 observed_inline_io_safe: AtomicBool::new(false),
+                #[cfg(feature = "native")]
+                observed_native_budget: std::sync::Mutex::new(None),
                 fail_writes,
             }
         }
 
+        #[cfg(feature = "native")]
         fn set_parent(&self, native_cx: &asupersync::Cx) {
             *self
                 .parent_task
@@ -4526,9 +4587,17 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         }
+
+        #[cfg(feature = "native")]
+        fn native_budget(&self) -> asupersync::Budget {
+            self.observed_native_budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("writeback task must record its native budget")
+        }
     }
 
-    impl VfsFile for RegionWritebackFile {
+    impl VfsFile for ControlledWritebackFile {
         fn close(&mut self, _cx: &Cx) -> Result<()> {
             Ok(())
         }
@@ -4621,23 +4690,34 @@ mod tests {
         }
     }
 
-    impl RegionWritebackFile {
-        fn write_sync(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    impl ControlledWritebackFile {
+        fn write_sync(&self, _cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
             self.write_calls.fetch_add(1, Ordering::AcqRel);
-            let native_cx = cx.attached_native_cx().ok_or_else(|| {
-                FrankenError::internal("writeback task did not receive its native asupersync Cx")
-            })?;
-            let (parent_task, parent_region) = self
-                .parent_task
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .ok_or_else(|| FrankenError::internal("writeback parent task was not recorded"))?;
-            self.observed_child_task
-                .store(native_cx.task_id() != parent_task, Ordering::Release);
-            self.observed_parent_region
-                .store(native_cx.region_id() == parent_region, Ordering::Release);
-            self.observed_inline_io_safe
-                .store(cx.blocking_io_inline_safe(), Ordering::Release);
+            #[cfg(feature = "native")]
+            {
+                let native_cx = _cx.attached_native_cx().ok_or_else(|| {
+                    FrankenError::internal(
+                        "writeback task did not receive its native asupersync Cx",
+                    )
+                })?;
+                let (parent_task, parent_region) = self
+                    .parent_task
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .ok_or_else(|| {
+                        FrankenError::internal("writeback parent task was not recorded")
+                    })?;
+                self.observed_child_task
+                    .store(native_cx.task_id() != parent_task, Ordering::Release);
+                self.observed_parent_region
+                    .store(native_cx.region_id() == parent_region, Ordering::Release);
+                self.observed_inline_io_safe
+                    .store(_cx.blocking_io_inline_safe(), Ordering::Release);
+                *self
+                    .observed_native_budget
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native_cx.budget());
+            }
 
             if self.fail_writes {
                 return Err(FrankenError::internal(
@@ -4757,6 +4837,7 @@ mod tests {
         assert_eq!(cache.metrics_snapshot().admits, 1);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region() {
         let page_size = PageSize::DEFAULT;
@@ -4764,7 +4845,7 @@ mod tests {
         cache
             .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xD7))
             .expect("admit dirty writeback candidate");
-        let file = Arc::new(RegionWritebackFile::new(page_size, false));
+        let file = Arc::new(ControlledWritebackFile::new(page_size, false));
 
         let runtime = asupersync::runtime::RuntimeBuilder::low_latency()
             .worker_threads(2)
@@ -4776,7 +4857,12 @@ mod tests {
         let writeback = runtime.handle().spawn(async move {
             let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
             task_file.set_parent(&native_cx);
-            let cx = Cx::new();
+            let cx = Cx::with_budget(Budget {
+                deadline: None,
+                poll_quota: 97,
+                cost_quota: Some(1_234),
+                priority: u8::MAX,
+            });
             cx.mark_blocking_io_inline_safe();
             cx.set_native_cx(native_cx);
             task_cache.evict_any_async(&cx, task_file).await
@@ -4800,11 +4886,16 @@ mod tests {
             !file.observed_inline_io_safe.load(Ordering::Acquire),
             "a spawned writeback must not inherit the parent OS-thread inline-I/O permission"
         );
+        let observed_budget = file.native_budget();
+        assert_eq!(observed_budget.poll_quota, 97);
+        assert_eq!(observed_budget.cost_quota, Some(1_234));
+        assert_eq!(observed_budget.priority, u8::MAX);
         assert_eq!(file.bytes(), vec![0xD7; page_size.as_usize()]);
         assert!(!cache.contains(PageNumber::ONE));
         assert_eq!(cache.pool().available(), 1);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn bd_2jpu6_2_failed_dirty_writeback_preserves_resident_dirty_page() {
         let page_size = PageSize::DEFAULT;
@@ -4812,7 +4903,7 @@ mod tests {
         cache
             .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xE1))
             .expect("admit dirty writeback candidate");
-        let file = Arc::new(RegionWritebackFile::new(page_size, true));
+        let file = Arc::new(ControlledWritebackFile::new(page_size, true));
 
         let runtime = asupersync::runtime::RuntimeBuilder::low_latency()
             .worker_threads(2)
@@ -4845,6 +4936,212 @@ mod tests {
                 .iter()
                 .any(|snapshot| snapshot.page_no == PageNumber::ONE && snapshot.dirty)
         );
+    }
+
+    #[cfg(not(feature = "native"))]
+    #[test]
+    fn bd_2jpu6_2_non_native_dirty_eviction_writes_directly() {
+        run_async_test(|| async {
+            let page_size = PageSize::DEFAULT;
+            let cache = Arc::new(ShardedPageCache::with_max_buffers(page_size, 1));
+            cache
+                .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xD7))
+                .expect("admit standalone dirty writeback candidate");
+            let file = Arc::new(ControlledWritebackFile::new(page_size, false));
+
+            assert!(
+                cache
+                    .evict_any_async(&Cx::new(), Arc::clone(&file))
+                    .await
+                    .expect("direct non-native writeback must succeed")
+            );
+            assert_eq!(file.write_calls.load(Ordering::Acquire), 1);
+            assert_eq!(file.bytes(), vec![0xD7; page_size.as_usize()]);
+            assert!(!cache.contains(PageNumber::ONE));
+            assert_eq!(cache.pool().available(), 1);
+        });
+    }
+
+    #[cfg(not(feature = "native"))]
+    #[test]
+    fn bd_2jpu6_2_non_native_failed_writeback_preserves_dirty_page() {
+        run_async_test(|| async {
+            let page_size = PageSize::DEFAULT;
+            let cache = Arc::new(ShardedPageCache::with_max_buffers(page_size, 1));
+            cache
+                .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xE1))
+                .expect("admit standalone dirty writeback candidate");
+            let file = Arc::new(ControlledWritebackFile::new(page_size, true));
+
+            let error = cache
+                .evict_any_async(&Cx::new(), Arc::clone(&file))
+                .await
+                .expect_err("injected direct writeback failure must surface");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected dirty page writeback failure")
+            );
+            assert_eq!(file.write_calls.load(Ordering::Acquire), 1);
+            assert!(cache.contains(PageNumber::ONE));
+            assert!(
+                cache
+                    .page_snapshots()
+                    .iter()
+                    .any(|snapshot| snapshot.page_no == PageNumber::ONE && snapshot.dirty)
+            );
+        });
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn bd_2jpu6_2_dirty_writeback_join_error_preserves_cancellation_class() {
+        use asupersync::runtime::JoinError;
+        use asupersync::types::{CancelReason, PanicPayload};
+
+        assert!(matches!(
+            dirty_writeback_join_error(
+                PageNumber::ONE,
+                JoinError::Cancelled(CancelReason::timeout())
+            ),
+            FrankenError::Abort
+        ));
+        assert!(matches!(
+            dirty_writeback_join_error(
+                PageNumber::ONE,
+                JoinError::Panicked(PanicPayload::new("controlled panic"))
+            ),
+            FrankenError::Internal(_)
+        ));
+        assert!(matches!(
+            dirty_writeback_join_error(PageNumber::ONE, JoinError::PolledAfterCompletion),
+            FrankenError::Internal(_)
+        ));
+    }
+
+    fn assert_stale_writeback_cannot_clean_replacement(
+        cache: &ShardedPageCache,
+        page_no: PageNumber,
+    ) {
+        const OLD_BYTE: u8 = 0xA1;
+        const REPLACEMENT_BYTE: u8 = 0xB2;
+
+        let stale = cache
+            .page_write_snapshot(page_no)
+            .expect("old dirty image must be resident");
+        assert!(
+            stale.page.as_bytes().iter().all(|byte| *byte == OLD_BYTE),
+            "the controlled stale snapshot must retain the old image"
+        );
+
+        assert!(cache.evict(page_no), "replace the old resident image");
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(REPLACEMENT_BYTE))
+            .expect("install the dirty replacement image");
+        let replacement = cache
+            .page_write_snapshot(page_no)
+            .expect("replacement image must be resident");
+
+        assert_eq!(
+            stale.mutation_generation, replacement.mutation_generation,
+            "the regression requires the old and replacement entries to share a generation"
+        );
+        assert!(
+            !Arc::ptr_eq(&stale.image_identity, &replacement.image_identity),
+            "replacement must have a distinct cache-image identity"
+        );
+
+        cache.mark_page_clean_if_snapshot(page_no, &stale);
+
+        assert!(
+            cache
+                .get_copy(page_no)
+                .is_some_and(|bytes| bytes.iter().all(|byte| *byte == REPLACEMENT_BYTE)),
+            "stale completion must not replace or mutate the newer bytes"
+        );
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+            "stale completion must leave the replacement dirty"
+        );
+        assert!(
+            cache.take_clean_buffer_at(page_no).is_none(),
+            "the dirty replacement must remain ineligible for clean eviction"
+        );
+    }
+
+    #[test]
+    fn bd_2jpu6_2_stale_writeback_cannot_clean_fast_array_replacement() {
+        let mut cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 1, 1);
+        cache.enable_fast_path();
+        cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xA1))
+            .expect("install old fast-array image");
+
+        assert_stale_writeback_cannot_clean_replacement(&cache, PageNumber::ONE);
+    }
+
+    #[test]
+    fn bd_2jpu6_2_stale_writeback_cannot_clean_flat_slot_replacement() {
+        let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 1, 1);
+        cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xA1))
+            .expect("install old flat-slot image");
+        assert!(cache.flat_slots.contains(PageNumber::ONE));
+
+        assert_stale_writeback_cannot_clean_replacement(&cache, PageNumber::ONE);
+    }
+
+    #[test]
+    fn bd_2jpu6_2_stale_writeback_cannot_clean_overflow_replacement() {
+        let resident_count = MAX_PROBE_LENGTH + 1;
+        let cache =
+            ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, resident_count, 1);
+        let target_bucket = cache.flat_slots.hash_pgno(PageNumber::ONE.get());
+        let colliders = track_q_collision_pages(&cache.flat_slots, target_bucket, resident_count);
+        for page_no in colliders.iter().copied() {
+            cache
+                .insert_fresh(page_no, |bytes| bytes.fill(0xA1))
+                .expect("install controlled collision image");
+        }
+        let page_no = *colliders.last().expect("overflow collision page");
+        assert!(!cache.flat_slots.contains(page_no));
+        assert!(
+            cache.shards[cache.shard_index(page_no)]
+                .lock()
+                .contains(page_no)
+        );
+
+        assert_stale_writeback_cannot_clean_replacement(&cache, page_no);
+        assert!(!cache.flat_slots.contains(page_no));
+        assert!(
+            cache.shards[cache.shard_index(page_no)]
+                .lock()
+                .contains(page_no)
+        );
+    }
+
+    #[test]
+    fn bd_2jpu6_2_matching_writeback_snapshot_marks_current_image_clean() {
+        let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 1, 1);
+        cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xC3))
+            .expect("install current dirty image");
+        let current = cache
+            .page_write_snapshot(PageNumber::ONE)
+            .expect("current image must be resident");
+
+        cache.mark_page_clean_if_snapshot(PageNumber::ONE, &current);
+
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == PageNumber::ONE && !snapshot.dirty)
+        );
+        assert!(cache.take_clean_buffer_at(PageNumber::ONE).is_some());
     }
 
     #[cfg(unix)]
