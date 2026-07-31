@@ -7,7 +7,7 @@ type: "rfc"
 
 # RFC: Generation-Stable, Sidecar-Proven Existing-Runtime Open
 
-**Status:** Revised after round-3 synthesis; proposed for re-review
+**Status:** Revised after round-4 synthesis; proposed for re-review
 **Date:** 2026-07-31
 **Owner issue:** [frankensqlite#308](https://github.com/Dicklesworthstone/frankensqlite/issues/308)
 **Decision:** Agent Kernel decision 87
@@ -32,7 +32,9 @@ The public API for the first implementation is one safe constructor:
 Connection::open_existing_generation_bound(path, options)
 ```
 
-Authority construction and consumption remain engine-internal and sealed across `fsqlite-vfs`, `fsqlite-pager`, and `fsqlite-core`. Cross-crate representations have only the visibility required for owner-controlled composition; their fields and minting operations remain inaccessible to downstream callers, and they are not a supported public capability API. Pager/connection construction consumes authority issued by the safe constructor without independently reopening the main file by pathname.
+`fsqlite-pager` owns `DatabaseGenerationAuthority` and the complete admission-to-pager composition. `fsqlite-vfs` supplies low-level file, identity, namespace, and locking primitives but cannot mint generation authority. `fsqlite-core` exposes the sole supported conforming connection constructor.
+
+Rust has no friend-crate visibility. `fsqlite-pager` may therefore expose a technically public, safe, `#[doc(hidden)]` factory used by `fsqlite-core` as an unsupported composition seam. The factory performs complete admission and returns an authority-bearing pager; it does not accept caller-assembled authority parts, expose the authority, or permit authority extraction. The authority type, fields, minting operations, and extraction remain private to `fsqlite-pager`. Direct factory use carries no Decision-87 API conformance or stability commitment, but every returned pager still preserves the authority contract. Pager/connection construction never independently reopens the main file by pathname.
 
 The first implementation refuses generation-changing publication while the connection remains live. Every cooperative generation-changing publication route, including weaker connection and pager entrypoints, must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. Atomic live generation-authority rotation is a separate future decision.
 
@@ -107,7 +109,7 @@ An `Arc` or equivalent may share the internal authority among pager and backends
 
 ### Sole conforming public entrypoint
 
-For the first implementation, only `Connection::open_existing_generation_bound` may claim Decision-87 conformance.
+For the first implementation, only the supported `Connection::open_existing_generation_bound` API may claim Decision-87 conformance. A technically public hidden pager factory exists only as the safe core-to-pager composition seam; it is not a second supported API and cannot weaken the resulting pager's semantics.
 
 The following remain weaker and non-equivalent until separately proved to delegate exclusively to the conforming path under the same feature/backend matrix:
 
@@ -125,14 +127,14 @@ No option, environment field, feature flag, PRAGMA, or custom backend may silent
 
 The first implementation must not expose:
 
-- public fields of the generation authority;
-- a public constructor from `FileIdentity`, `VfsFile`, path, or namespace binding;
+- the generation-authority type, fields, minting operations, or extraction;
+- a constructor accepting `FileIdentity`, `VfsFile`, path, namespace binding, or other caller-assembled authority parts;
 - a public implementable trait that can mint an authority;
 - deserialization or durable reconstruction;
 - conversion from a validation probe into authoritative I/O; or
 - an unsafe or "advanced" bypass constructor.
 
-Any future public lower-level capability API requires a separate architecture decision.
+The technically public hidden pager factory is permitted only because it performs complete owner admission and returns a safe authority-bearing pager without exposing authority. Any supported public lower-level capability API, caller-minted authority, or authority extraction requires a separate architecture decision.
 
 ## Admission protocol
 
@@ -217,7 +219,9 @@ A sidecar not present at linearization may later be created only through the aut
 
 ### Generation transition invariant
 
-**Generation-changing publication** means replacing the main-file object or installing an independently produced logical database image, including a full-image VACUUM or validated-image installation that preserves file identity but invalidates generation-wide caches or artifact state. It does not include ordinary pager writes, authority-admitted WAL or rollback recovery, or checkpoint materialization performed through the retained generation authority; those are generation-preserving I/O and remain subject to the authority and sidecar rules without acquiring the exclusive publication gate.
+**Generation-changing publication** is any mutation of main-file bytes or length outside the admitted authority's cache-coherent transactional, authority-admitted recovery, or checkpoint protocol. It includes main-object replacement; installation of an independently produced image; full-image VACUUM or validated-image installation; and in-place whole or partial repair, overwrite, truncate, extend, or similar mutation—even when pathname and file identity remain unchanged.
+
+Ordinary pager writes, authority-admitted WAL or rollback recovery, and checkpoint materialization are generation-preserving only when performed through the retained authority and its cache-coherent protocol. Mutation size, structural validity, and preservation of file identity do not make an out-of-protocol mutation generation-preserving. The classification applies to cooperative and non-cooperating mutation; namespace-wide exclusion applies to cooperative routes, while raw mutation remains governed by the stated threat limits.
 
 Every cooperative route capable of generation-changing publication must acquire the same namespace-wide exclusive publication authority. This includes ordinary and expected-identity connections, pager-level APIs, compatibility/async/C entrypoints, VACUUM paths, and any internal validated-image publication path. Weaker APIs may remain non-conforming for exact admission, but they cannot bypass a live generation authority. Publication may proceed only when no generation authority holds the conflicting lifetime lease.
 
@@ -387,7 +391,7 @@ Implementation acceptance requires:
 13. typed refusal for unnamed temporary and unsupported VFS inputs;
 14. objective concurrent-writer overlap with no serialized fallback;
 15. crash/failure injection with exact pre-operation, completed post-operation, and indeterminate-effect oracles;
-16. a public API conformance matrix proving weaker entrypoints do not inherit admission conformance or bypass namespace-wide publication exclusion; and
+16. a public API conformance matrix proving weaker entrypoints do not inherit admission conformance or bypass namespace-wide publication exclusion, plus compile/API proof that the hidden pager factory accepts no caller-assembled authority and exposes no authority extraction; and
 17. exact downstream Agent Kernel dependency, feature, and exclusive result-lineage validation proving that every authoritative task-4195 execution, readback, and receipt descends from the conforming constructor with no weaker fallback.
 
 ## Migration and compatibility

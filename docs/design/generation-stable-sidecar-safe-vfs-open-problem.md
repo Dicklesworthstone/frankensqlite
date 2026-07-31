@@ -62,9 +62,9 @@ The API must not claim universal hostile namespace ownership. Environments requi
 
 ### Live main-generation replacement
 
-A connection that retains generation A cannot silently continue after **generation-changing publication**: replacement of the main-file object or installation of an independently produced logical database image, including identity-preserving full-image VACUUM/validated-image installation that invalidates generation-wide caches or artifact state. Every cooperative generation-changing publication route—including weaker connection and pager entrypoints—must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. The first contract must refuse such publication invoked through a generation-bound connection before effects.
+A connection that retains generation A cannot silently continue after **generation-changing publication**: any mutation of main-file bytes or length outside the admitted authority's cache-coherent transactional, recovery, or checkpoint protocol. This includes object replacement, independently produced images, identity-preserving full-image installation, and partial repair, overwrite, truncate, or extend operations. Every cooperative generation-changing publication route—including weaker connection and pager entrypoints—must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. The first contract must refuse such publication invoked through a generation-bound connection before effects.
 
-Ordinary pager writes, authority-admitted WAL or rollback recovery, and checkpoint materialization are generation-preserving I/O. They remain lawful through the retained authority and do not acquire the exclusive publication gate. A future separately decided protocol may atomically rotate the complete generation authority.
+Ordinary pager writes, authority-admitted WAL or rollback recovery, and checkpoint materialization are generation-preserving only through the retained authority and its coherence protocol. They remain lawful and do not acquire the exclusive publication gate. A future separately decided protocol may atomically rotate the complete generation authority.
 
 ### Artifact coverage
 
@@ -152,7 +152,7 @@ A reviewed owner contract must prove, for each explicitly supported backend and 
 
 - authoritative main I/O descends from the admitted main handle;
 - cooperative sidecar membership is established at admission or by generation-owned creation;
-- cooperative generation-changing publication is excluded namespace-wide while a generation authority is live, without blocking ordinary writes, admitted recovery, or checkpoint;
+- every cooperative out-of-authority main mutation is excluded namespace-wide while a generation authority is live, without blocking ordinary authority-governed writes, admitted recovery, or checkpoint;
 - cooperative generation replacement cannot leave stale artifacts attributed to the new main;
 - pre-existing recovery artifacts without an exact owner binding rule refuse before recovery;
 - unsupported artifact families, filesystems, aliases, and replacement operations refuse before database effects;

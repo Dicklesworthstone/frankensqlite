@@ -123,10 +123,10 @@ The revised bootstrap rule requires an enumerated artifact-specific exact bindin
 
 1. A strong connection retains a generation authority for A.
 2. A cooperative peer enters through a weaker constructor.
-3. The peer attempts generation-changing publication: replacement of the main object or installation of an independently produced full logical image, including identity-preserving VACUUM/validated-image installation.
+3. The peer attempts generation-changing publication: any out-of-authority main mutation, including replacement, independently produced image installation, partial repair/overwrite, truncate, or extend.
 4. The strong connection resumes with stale caches or artifact state.
 
-Every cooperative generation-changing publication entrypoint must acquire a namespace-wide exclusive gate that conflicts with the strong lifetime lease. Ordinary writes, authority-admitted recovery, and checkpoint remain generation-preserving I/O through the retained authority. Constructor conformance and publication exclusion are separate properties.
+Every cooperative out-of-authority main-mutation entrypoint must acquire a namespace-wide exclusive gate that conflicts with the strong lifetime lease. Ordinary writes, authority-admitted recovery, and checkpoint are generation-preserving only through the retained authority's coherence protocol. Constructor conformance and publication exclusion are separate properties.
 
 ## Required proof matrix
 
@@ -143,7 +143,7 @@ Every cooperative generation-changing publication entrypoint must acquire a name
 | Rollback journal | Exercise hot and non-hot journal inputs | Recovery runs only with an exact binding witness; canonical/format-valid ambiguity refuses before replay |
 | Auxiliary artifacts | Enable WAL-FEC, DB-FEC, MVCC history/witness, and parallel-WAL separately | Each uses the authority or returns typed unsupported before effects |
 | Post-return main reads | Force WAL refresh, export, copy, checkpoint support, and header/conflict reads | No path selects a new authoritative main handle |
-| Generation-changing publication | Invoke object replacement and independently produced full-image VACUUM/validated-image installation through strong, weak, pager, compatibility, async, and C entrypoints; separately run ordinary writes, admitted recovery, and checkpoint | Strong publication refuses before effects; peer publication is excluded while authority is live; generation-preserving I/O remains enabled through retained authority |
+| Generation-changing publication | Invoke object replacement, full-image installation, and partial repair/overwrite/truncate/extend outside the authority through strong, weak, pager, compatibility, async, and C routes; separately run ordinary authority-governed writes, admitted recovery, and checkpoint | Strong publication refuses before effects; every cooperative out-of-authority mutation is excluded while authority is live; authority-governed generation-preserving I/O remains enabled |
 | Alias handling | Exercise symlink, hard-link, reparse, mount/path alias, case, and relative-path inputs | Supported profiles prove secure admission; ambiguous inputs refuse |
 | Parent replacement | Replace a parent between canonicalization and sidecar acquisition | No universal prevention claim; stronger profiles prove directory authority, otherwise threat limitation is explicit |
 | Filesystem qualification | Run on local qualified filesystems and representative remote/virtual filesystems | Unknown or unproved filesystems refuse exact mode rather than silently weakening it |
@@ -154,7 +154,7 @@ Every cooperative generation-changing publication entrypoint must acquire a name
 | Concurrent writers | Instrument overlapping disjoint-page write transactions and durability phases | Objective overlap exists; no global serialization or default-off MVCC fallback |
 | Failure injection | Fail admission, sidecar open, bind, recovery, sync, validation, cleanup, and close | Outcome is pre-effect refusal, definite completion, or indeterminate effect; no class is mislabeled |
 | Crash state | Crash at every recovery/publication cut and crash again during recovery | Recovery converges to a declared valid pre-operation or completed post-operation state and is idempotent |
-| API conformance | Exercise every public writable existing-open entrypoint | Only the exact generation-bound symbol claims this contract; weaker APIs remain visibly non-conforming |
+| API conformance | Exercise every supported public writable existing-open entrypoint and the technically public hidden pager factory | Only the exact connection symbol claims supported conformance; the factory performs complete safe admission, accepts no assembled authority, exposes no authority, and still preserves all runtime invariants |
 | Consumer return gate | Evaluate the exact dependency revision, features, and full result lineage in Agent Kernel | Every authoritative task-4195 execution, readback, and receipt descends exclusively from the conforming constructor with no weak fallback before explicit return authorization |
 
 ## Evidence still required before implementation acceptance
