@@ -95,6 +95,36 @@ run_step() {
     fi
 }
 
+run_exact_test() {
+    local package="$1"
+    local test_name="$2"
+    local output
+    local status=0
+
+    output="$(
+        rch exec -- cargo test \
+            -p "${package}" \
+            --lib \
+            --features fault-injection \
+            "${test_name}" \
+            -- \
+            --exact \
+            --nocapture 2>&1
+    )" || status=$?
+    printf '%s\n' "${output}"
+    if [[ ${status} -ne 0 ]]; then
+        return "${status}"
+    fi
+    if ! grep -Fq "running 1 test" <<<"${output}"; then
+        echo "exact selector did not run one test: ${test_name}" >&2
+        return 1
+    fi
+    if ! grep -Eq 'test result: ok\. 1 passed; 0 failed;' <<<"${output}"; then
+        echo "exact selector did not report one passing test: ${test_name}" >&2
+        return 1
+    fi
+}
+
 echo "=== ${BEAD_ID}: commit-path fault-hook verification ==="
 echo "run_id=${RUN_ID}"
 echo "trace_id=${TRACE_ID}"
@@ -108,19 +138,19 @@ export RUST_LOG="${RUST_LOG:-fsqlite_wal::fault_injection=info,fsqlite_pager::fa
 run_step \
     "wal_after_append" \
     "running WAL after-append hook contract test" \
-    rch exec -- cargo test -p fsqlite-wal --features fault-injection test_fault_hook_after_wal_append_returns_error_and_records_context -- --nocapture
+    run_exact_test fsqlite-wal wal::tests::test_fault_hook_after_wal_append_returns_error_and_records_context
 
 run_step \
     "wal_sync_failure" \
     "running WAL sync hook contract test" \
-    rch exec -- cargo test -p fsqlite-wal --features fault-injection test_fault_hook_sync_failure_returns_error_and_records_context -- --nocapture
+    run_exact_test fsqlite-wal wal::tests::test_fault_hook_sync_failure_returns_error_and_records_context
 
 run_step \
     "wal_busy_countdown" \
     "running WAL append busy-countdown hook contract test" \
-    rch exec -- cargo test -p fsqlite-wal --features fault-injection test_fault_hook_append_busy_countdown_fires_once_and_preserves_retry_surface -- --nocapture
+    run_exact_test fsqlite-wal wal::tests::test_fault_hook_append_busy_countdown_fires_once_and_preserves_retry_surface
 
 run_step \
     "pager_publish_boundary" \
     "running pager after-flush-before-publish hook contract test" \
-    rch exec -- cargo test -p fsqlite-pager --features fault-injection test_group_commit_fault_hook_after_flush_before_publish_wakes_waiters_with_error_and_records_context -- --nocapture
+    run_exact_test fsqlite-pager pager::tests::test_group_commit_fault_hook_after_durability_completes_without_abort_and_records_context

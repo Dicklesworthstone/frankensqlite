@@ -2903,6 +2903,20 @@ impl ShardedPageCache {
     ///
     /// Returns `true` if the miss-fill was admitted.
     fn insert_tiered_if_absent(&self, page_no: PageNumber, buf: PageBuf) -> bool {
+        if self.use_fast_path.load(Ordering::Acquire)
+            && let Some(ref fast) = self.fast_array
+        {
+            // Fast-path reads never consult the flat/sharded tiers. Keep the
+            // absence check and insertion under the same array lock so a
+            // newer writer image that arrives during VFS I/O wins atomically
+            // over this stale miss-fill (GH #197).
+            let mut fast = fast.lock();
+            if fast.contains(page_no) {
+                return false;
+            }
+            return fast.insert(page_no, buf);
+        }
+
         let shard_idx = self.shard_index(page_no);
         let mut shard = self.shards[shard_idx].lock();
         if shard.pages.contains_key(&page_no) || self.flat_slots.contains_stable(page_no) {
@@ -5620,6 +5634,98 @@ mod tests {
             assert!(
                 resident.iter().all(|&b| b == 0x22),
                 "newer resident image must win over the stale late miss-fill (GH #197)"
+            );
+        });
+    }
+
+    #[test]
+    fn gh_197_fast_array_late_miss_fill_does_not_overwrite_newer_resident_page() {
+        run_async_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let (file, _) = vfs
+                .open(
+                    &cx,
+                    Some(Path::new("/gh-197-fast-array.db")),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB,
+                )
+                .expect("open db file");
+
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_no = PageNumber::new(7).unwrap();
+            let offset = page_offset(page_no, PageSize::DEFAULT);
+            file.write(&cx, &vec![0x11_u8; page_size], offset)
+                .await
+                .expect("seed stale page");
+
+            let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+            cache
+                .read_page(&cx, &file, page_no, |stale| {
+                    assert!(
+                        stale.iter().all(|&byte| byte == 0x11),
+                        "fast miss I/O must observe the stale backing bytes"
+                    );
+                    let mut fresh = cache.pool().acquire().expect("acquire fresh buf");
+                    fresh.as_mut_slice().fill(0x22);
+                    cache.insert_buffer(page_no, fresh);
+                })
+                .await
+                .expect("fast miss read");
+
+            let resident = cache
+                .get_copy(page_no)
+                .expect("fast-array page must remain resident after the race");
+            assert!(
+                resident.iter().all(|&byte| byte == 0x22),
+                "newer fast-array image must win over the stale late miss-fill (GH #197)"
+            );
+        });
+    }
+
+    #[test]
+    fn gh_197_fast_array_late_miss_fill_preserves_dirty_resident_page() {
+        run_async_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let (file, _) = vfs
+                .open(
+                    &cx,
+                    Some(Path::new("/gh-197-fast-array-dirty.db")),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB,
+                )
+                .expect("open db file");
+
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_no = PageNumber::new(7).unwrap();
+            let offset = page_offset(page_no, PageSize::DEFAULT);
+            file.write(&cx, &vec![0x11_u8; page_size], offset)
+                .await
+                .expect("seed stale page");
+
+            let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+            cache
+                .read_page(&cx, &file, page_no, |stale| {
+                    assert!(stale.iter().all(|&byte| byte == 0x11));
+                    cache
+                        .insert_fresh(page_no, |bytes| bytes.fill(0xD4))
+                        .expect("install dirty writer image");
+                })
+                .await
+                .expect("fast miss read");
+
+            let resident = cache
+                .get_copy(page_no)
+                .expect("dirty fast-array page must remain resident");
+            assert!(
+                resident.iter().all(|&byte| byte == 0xD4),
+                "stale miss-fill must never replace a dirty resident image"
+            );
+            assert!(
+                cache
+                    .page_snapshots()
+                    .iter()
+                    .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+                "the winning writer image must retain its dirty state"
             );
         });
     }
