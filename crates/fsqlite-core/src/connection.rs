@@ -110269,10 +110269,10 @@ mod tests {
         FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS, FSQLITE_JOIN_EXPR_BINDING_HITS,
         FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
         FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
-        FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, InProcessPageLockTable, IoPollStrategy,
-        ImplicitAutoindexSlot, MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot,
-        PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
-        SimplePager, Snapshot, arm_trigger_stack_probe, bind_placeholders_in_select_for_fallback,
+        FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, ImplicitAutoindexSlot, InProcessPageLockTable,
+        IoPollStrategy, MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope,
+        Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
+        arm_trigger_stack_probe, bind_placeholders_in_select_for_fallback,
         canonicalize_select_placeholders, implicit_autoindex_layout, init_global_runtime,
         is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
         join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
@@ -110843,6 +110843,22 @@ mod tests {
             2
         );
         assert_eq!(
+            signature("CREATE TABLE t(a TEXT, UNIQUE(a), UNIQUE(a COLLATE BINARY))").len(),
+            1,
+            "implicit BINARY and an omitted collation are equivalent"
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a TEXT COLLATE NOCASE COLLATE RTRIM UNIQUE)"),
+            vec![(
+                false,
+                false,
+                vec!["a".to_owned()],
+                vec![SortDirection::Asc],
+                vec![Some("RTRIM".to_owned())],
+            )],
+            "the final column COLLATE clause determines the autoindex collation"
+        );
+        assert_eq!(
             signature("CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE)"),
             vec![(
                 false,
@@ -110879,6 +110895,28 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             conflict,
+            FrankenError::FunctionError(message)
+                if message == "conflicting ON CONFLICT clauses specified"
+        ));
+
+        let rowid_ipk = layout(
+            "CREATE TABLE t(a INTEGER, UNIQUE(a) ON CONFLICT IGNORE, \
+             PRIMARY KEY(a) ON CONFLICT FAIL)",
+        )
+        .unwrap();
+        assert_eq!(rowid_ipk.len(), 1);
+        assert_eq!(
+            rowid_ipk[0].definition.conflict_action,
+            Some(fsqlite_ast::ConflictAction::Ignore),
+            "a rowid-alias PK consumes no slot and does not conflict with an earlier UNIQUE"
+        );
+        let without_rowid_conflict = layout(
+            "CREATE TABLE t(a INTEGER, UNIQUE(a) ON CONFLICT IGNORE, \
+             PRIMARY KEY(a) ON CONFLICT FAIL) WITHOUT ROWID",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            without_rowid_conflict,
             FrankenError::FunctionError(message)
                 if message == "conflicting ON CONFLICT clauses specified"
         ));
@@ -158527,6 +158565,44 @@ mod without_rowid_runtime_tests {
                 panic!("sqlite_master.sql should be TEXT");
             };
             assert!(sql.to_ascii_uppercase().contains("WITHOUT ROWID"));
+        });
+    }
+
+    #[test]
+    fn test_implicit_autoindex_layout_failure_leaves_create_table_side_effect_free() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let error = conn
+                .execute(
+                    "CREATE TABLE wr(a TEXT PRIMARY KEY ON CONFLICT ABORT, \
+                     UNIQUE(a) ON CONFLICT REPLACE) WITHOUT ROWID;",
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                FrankenError::FunctionError(message)
+                    if message == "conflicting ON CONFLICT clauses specified"
+            ));
+            assert!(
+                conn.schema
+                    .borrow()
+                    .iter()
+                    .all(|table| !table.name.eq_ignore_ascii_case("wr")),
+                "a rejected canonical layout must not publish partial schema state"
+            );
+            assert!(!conn.rowid_alias_columns.borrow().contains_key("wr"));
+
+            conn.execute("CREATE TABLE wr(a TEXT PRIMARY KEY) WITHOUT ROWID;")
+                .await
+                .unwrap();
+            assert!(
+                conn.schema
+                    .borrow()
+                    .iter()
+                    .any(|table| table.name.eq_ignore_ascii_case("wr")),
+                "the rejected CREATE must not reserve the table name"
+            );
         });
     }
 

@@ -4749,6 +4749,35 @@ PRAGMA integrity_check;
     }
 
     #[test]
+    fn test_extract_implicit_autoindexes_preserves_without_rowid_slots_and_exact_integer_rules() {
+        let indexes = extract_unique_constraint_indexes_from_sql(
+            "CREATE TABLE wr(
+                pk TEXT PRIMARY KEY,
+                u TEXT COLLATE NOCASE COLLATE RTRIM UNIQUE
+             ) WITHOUT ROWID",
+            "wr",
+        )
+        .unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "sqlite_autoindex_wr_2");
+        assert_eq!(indexes[0].columns, ["u"]);
+        assert_eq!(indexes[0].key_collations, [Some("RTRIM".to_owned())]);
+
+        let typed = extract_unique_constraint_indexes_from_sql(
+            "CREATE TABLE typed(id INTEGER(8) PRIMARY KEY, u TEXT UNIQUE)",
+            "typed",
+        )
+        .unwrap();
+        assert_eq!(
+            typed
+                .iter()
+                .map(|index| index.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sqlite_autoindex_typed_1", "sqlite_autoindex_typed_2"]
+        );
+    }
+
+    #[test]
     fn test_is_strict_table_sql_detects_strict_options() {
         assert!(is_strict_table_sql(
             "CREATE TABLE s (id INTEGER, body TEXT) STRICT"
