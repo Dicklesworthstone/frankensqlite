@@ -7,7 +7,7 @@ type: "evidence"
 
 # Evidence: Generation-Stable, Sidecar-Proven Existing-Runtime Open
 
-**Status:** Revised decision evidence after adversarial review
+**Status:** Revised decision evidence; post-ADR expected-identity/readback gap recorded
 **Date:** 2026-07-31
 **Owner issue:** [frankensqlite#308](https://github.com/Dicklesworthstone/frankensqlite/issues/308)
 **Decision:** Agent Kernel decision 87
@@ -18,7 +18,12 @@ type: "evidence"
 
 This document distinguishes implemented behavior, source-observed gaps, and proposed proof. Source inspection is not runtime proof. Existing tests establish only the schedules and oracles they exercise.
 
-Identity equality is not handle lineage. Canonical naming is not sidecar provenance. Stress success is not concurrent-writer overlap. A final successful check cannot erase earlier mutation.
+Identity equality is not handle lineage. A comparison performed after recovery
+or another effect is not an admission fence. A successful connection without
+an authority-derived admitted-identity readback cannot durably support the
+consumer's exact-generation result lineage. Canonical naming is not sidecar
+provenance. Stress success is not concurrent-writer overlap. A final successful
+check cannot erase earlier mutation.
 
 ## Upstream implementation evidence
 
@@ -56,7 +61,8 @@ These tests do not prove issue #308. They do not collectively establish exact ha
 
 ## Consumer evidence
 
-Agent Kernel task 4195 reconciliation packet 82 v2 records the concrete downstream failure:
+Agent Kernel task 4195 reconciliation version 5 and evidence 5811 record the
+current concrete downstream failure:
 
 - one generation was identified;
 - a later writable runtime open still occurred by pathname;
@@ -65,6 +71,21 @@ Agent Kernel task 4195 reconciliation packet 82 v2 records the concrete downstre
 - no Agent Kernel wrapper could own both exact main authority and FrankenSQLite's artifact namespace.
 
 Agent Kernel ADR-0031 disallows path-only fallback. Task 4195 remains held, and task 4196 remains transitively blocked.
+
+Post-ADR exact-commit architecture review `asc://dispatch-1785575299207` found a
+bounded owner-contract gap: a constructor that admits whichever generation it
+opens can prove internal consistency, but cannot prove that the retained handle
+is the consumer-authorized expected generation before effects. A post-return
+comparison is too late if recovery or sidecar mutation has already occurred.
+The required correction is explicit
+`GenerationExpectation::Exact(ExpectedMainIdentityGuard)` checked by pager against
+the exact retained handle before generation-governed sidecar admission or any
+database/recovery effect, plus a mandatory successful opaque
+`AdmittedMainIdentity` readback projected from private authority. `Any` remains
+explicitly available only for callers that do not claim selection of an
+expected generation; Agent Kernel authoritative work must not use it. The
+non-cloneable expected guard retains the originating preflight object through
+final open outcome and cannot be constructed from detached raw `FileIdentity`.
 
 ## Adversarial review evidence
 
@@ -110,6 +131,24 @@ All participants can obey the namespace protocol while provenance remains wrong.
 
 The first contract must refuse step 2 before effect or atomically rotate the entire generation authority.
 
+### Late expected-generation comparison
+
+1. A consumer retains identity for authorized generation A.
+2. The canonical pathname is replaced so the owner constructor retains B.
+3. The constructor admits sidecars or begins recovery on B.
+4. The constructor returns B and the consumer compares identity afterward.
+5. The consumer rejects B, but effects may already have occurred on an
+   unauthorized generation.
+
+`Exact(ExpectedMainIdentityGuard)` must therefore be compared by pager with identity
+from the exact retained handle before generation-governed sidecar admission or
+any database/recovery effect. Mismatch is a typed refusal before those effects;
+only enumerated generation-independent coordination effects with idempotent
+cleanup may precede it. Every public success follows required open-time work and
+atomically returns a non-optional authority-derived `AdmittedMainIdentity`.
+Provenance/dataflow evidence, not equality alone, must prove it was not copied
+from caller input.
+
 ### Untagged sidecar false provenance
 
 1. Create main A and unrelated main B with compatible page size and database shape.
@@ -133,6 +172,9 @@ Every cooperative out-of-authority main-mutation entrypoint must acquire a names
 | Proof | Required injection or observation | Pass condition |
 | --- | --- | --- |
 | Admission linearization | Deterministic hook at every admission stage | No database effect occurs before main, namespace, alias, and supported sidecars are admitted |
+| Expected-generation fence | Select matching and mismatching `Exact(ExpectedMainIdentityGuard)` while selecting A, B, and A/B/A at every post-open hook | Guard retains its originating preflight object through final outcome; comparison uses the exact retained handle; mismatch is typed and occurs before generation-governed sidecar admission or database/recovery effect; earlier coordination effects are enumerated and cleaned idempotently |
+| Expected-guard lifetime | Close caller reference before/during open; attempt platform identity reuse, detached raw-identity conversion, clone/copy, weaker-open conversion, and post-outcome use | Owner-held observation remains live through final outcome; detached conversion/reuse and stale-token schedules cannot satisfy `Exact` |
+| Successful admission readback | Use authority-source instrumentation, mutate the projection seam to echo input, and fail at every open-time work cut | Every public success follows open-time work and atomically returns non-optional `AdmittedMainIdentity` projected from private authority; echo mutation fails; effect-aware failures expose no successful readback |
 | Main-handle lineage | Tag every authoritative handle by origin | All main I/O descends from the admitted handle or an identity-preserving duplicate; no pathname-opened probe is promoted |
 | Cooperative A/B/A | Attempt namespace-governed replacement throughout construction and connection lifetime | Transition is excluded or receives typed refusal while the authority is live |
 | Cooperative stale sidecar | Leave each recovery-bearing artifact across a legal A-to-B transition | Transition retires/adopts it under the selected rule or refuses before publishing B |
@@ -151,19 +193,33 @@ Every cooperative out-of-authority main-mutation entrypoint must acquire a names
 | io_uring | Require actual submission and completion, with fallback measured separately | No main pathname reopen and in-flight requests retain authority until completion |
 | Memory/custom VFS | Exercise supported and identity-less implementations | Process-local semantics are explicit; unsupported backends refuse |
 | Temporary databases | Pass unnamed and named temporary inputs | Unnamed inputs are inapplicable; named support is claimed only with backend proof |
-| Concurrent writers | Instrument overlapping disjoint-page write transactions and durability phases | Objective overlap exists; no global serialization or default-off MVCC fallback |
+| Concurrent writers | Record disjoint frozen mutation page sets and `prepare_begin`/`prepare_end`, where prepare spans page-specific mutation preparation through readiness for WAL/durability | Objective prepare-critical-section overlap exists; parsing, queue wait, transaction lifetime, and generic buffer staging cannot pass; no namespace lease/global serialization or default-off MVCC fallback |
 | Failure injection | Fail admission, sidecar open, bind, recovery, sync, validation, cleanup, and close | Outcome is pre-effect refusal, definite completion, or indeterminate effect; no class is mislabeled |
 | Crash state | Crash at every recovery/publication cut and crash again during recovery | Recovery converges to a declared valid pre-operation or completed post-operation state and is idempotent |
-| API conformance | Exercise every supported public writable existing-open entrypoint and the technically public hidden pager factory | Only the exact connection symbol claims supported conformance; the factory performs complete safe admission, accepts no assembled authority, exposes no authority, and still preserves all runtime invariants |
-| Consumer return gate | Evaluate the exact dependency revision, features, and full result lineage in Agent Kernel | Every authoritative task-4195 execution, readback, and receipt descends exclusively from the conforming constructor with no weak fallback before explicit return authorization |
+| API conformance | Exercise every supported public writable existing-open entrypoint and the technically public hidden pager factory | Only the exact connection symbol claims supported conformance; options require no-default `GenerationExpectation`; purpose-specific expected/admitted wrappers expose no public codec or weaker-open conversion; the factory accepts no assembled minting parts, exposes no authority, returns mandatory authority-derived readback through core, and preserves all runtime invariants |
+| Consumer return gate | Evaluate the exact dependency revision, features, and full result lineage in Agent Kernel | Every authoritative task-4195 execution uses guarded `Exact` from the same retained preflight object as durable identity, verifies authority-derived admitted identity, and records a non-authorizing append-only receipt bound to unique operation/result plus equality/API/profile/revision; a byte-identical same-operation/result duplicate returns the original committed receipt without a second append or authority effect, while conflicting same-operation duplicates and all cross-operation/stale replay fail; a delayed exact-tuple retry is not stale, while a different or superseded operation/result tuple is stale; all execution, readback, and receipts descend exclusively from the conforming constructor with no weak fallback before explicit return authorization |
 
 ## Evidence still required before implementation acceptance
 
 1. Artifact-specific exact-binding rules, or deterministic pre-effect refusal, for every pre-existing recovery family claimed by the first implementation.
 2. A complete artifact classification for every feature reachable from the generation-bound constructor.
-3. Concrete typed errors implementing the selected three-state effect semantics.
+3. Concrete typed errors implementing the selected three-state effect semantics,
+   including pre-effect expected-main mismatch.
 4. Qualified platform and filesystem profiles.
 5. Deterministic handle-lineage, publication-gate, and sidecar-race instrumentation.
-6. An exact immutable downstream dependency and exclusive result-lineage receipt.
+6. `Any` and matching/mismatching `Exact` proof, coordination-effect cleanup,
+   open-time ordering, and mandatory authority-derived successful readback
+   provenance proof.
+7. Purpose-specific public wrapper/API proof: no default expectation, `Clone`,
+   `Copy`, detached raw-identity construction, public codec, weaker-open
+   conversion, use after final outcome, or authority extraction; owner-held
+   observation survives caller close and owner-internal namespace encoding
+   remains confined.
+8. An exact immutable downstream dependency and exclusive, unique-operation
+   result-lineage receipt that does not serialize live identity values, returns
+   the original committed receipt without a second append or authority effect
+   for byte-identical same-operation/result retry, and rejects conflicting
+   same-operation duplicates plus every cross-operation/stale replay. A delayed
+   exact-tuple retry is not stale; a different or superseded tuple is stale.
 
 These are proof requirements, not evidence that implementation already exists.

@@ -8,7 +8,7 @@ type: "plan"
 
 # Implementation Plan: Generation-Stable, Sidecar-Proven Existing-Runtime Open
 
-**Status:** Proposed for post-ADR review; no implementation authorized
+**Status:** Expected-identity/readback amendment proposed for re-review; no implementation authorized
 **Date:** 2026-07-31
 **Owner issue:** [frankensqlite#308](https://github.com/Dicklesworthstone/frankensqlite/issues/308)
 **Decision:** Agent Kernel decision 87 / [ADR-0003](../adr/0003-generation-stable-sidecar-proven-existing-runtime-open.md)
@@ -29,7 +29,10 @@ substitute for the complete immutable-revision proof pack.
 
 The implementation revision must contain:
 
-1. one supported `Connection::open_existing_generation_bound` constructor;
+1. one supported `Connection::open_existing_generation_bound` constructor
+   requiring explicit `GenerationExpectation::{Any, Exact}` with no default and
+   atomically returning a non-optional authority-derived opaque
+   `AdmittedMainIdentity` with the connection;
 2. a private pager-owned `DatabaseGenerationAuthority`;
 3. one safe hidden complete-admission core-to-pager factory;
 4. a closed artifact inventory and authority-owned sidecar resolver;
@@ -94,7 +97,9 @@ Actions:
   temporary artifact;
 - identify existing deterministic VFS/fault hooks and missing hooks;
 - define handle-origin, admission-stage, effect-stage, and writer-overlap event
-  schemas;
+  schemas, including `prepare_begin` after the mutation page set is frozen and
+  page-specific preparation begins, and `prepare_end` at readiness for
+  WAL/durability;
 - record the exact initial feature/backend matrix; and
 - mark each artifact `clean-admit`, `exact-bind`, `generation-independent`, or
   `typed-refuse`.
@@ -112,9 +117,25 @@ Exit:
 Actions:
 
 - add typed distinctions required by ADR-0003;
-- define a closed `GenerationBoundOpenOptions` surface;
-- prevent expected identity, arbitrary VFS, caller resolver, and silent
-  best-effort fallback;
+- define opaque purpose-specific `ExpectedMainIdentityGuard` and
+  `AdmittedMainIdentity` wrappers with no `Clone`, `Copy`, caller-visible
+  serde/byte/durable codec, detached raw-identity conversion, weaker-open
+  conversion, or authority conversion;
+- define a closed `GenerationBoundOpenOptions` surface requiring explicit
+  `GenerationExpectation::{Any, Exact}` with no `Default`; `Exact` carries the
+  optional expected-generation comparison precondition;
+- define an owner-reviewed comparison-only primitive that produces
+  `ExpectedMainIdentityGuard` from the consumer's retained live preflight object
+  without exposing identity bytes, raw handles, or authority; the guard owns or
+  duplicates observation lifetime, is consumed by `Exact`, and remains live
+  through public success or final failure;
+- define the successful result/readback surface carrying non-optional
+  `AdmittedMainIdentity` derived from private authority;
+- prevent caller handles, arbitrary VFS, caller resolvers, namespace/sidecar
+  parts, and silent best-effort fallback;
+- prohibit caller-visible serialization or durable reconstruction of live
+  expected/admitted wrappers while preserving existing owner-internal
+  `FileIdentity` namespace-record encoding inside its coordination boundary;
 - classify each return path as pre-effect, definite completion, or
   indeterminate effect; and
 - add mapping/display tests without collapsing contract distinctions.
@@ -158,11 +179,23 @@ Actions:
 - move retained main, identity, canonical naming root, namespace binding,
   backend profile, and sidecar set under that owner;
 - add the safe hidden complete-admission factory;
+- compare `Exact(ExpectedMainIdentityGuard)` with identity from the exact retained
+  main handle before generation-governed sidecar admission or any
+  database/recovery effect;
+- return typed `ExpectedMainIdentityMismatch` or equivalent as a pre-effect
+  refusal and prove the mismatch path performs no generation-governed
+  sidecar/recovery mutation; only enumerated generation-independent
+  coordination effects may occur, with idempotent cleanup;
 - implement the explicit admission state machine and linearization witness;
 - discover the complete enabled artifact family before linearization;
 - implement `GenerationSidecarSet` and authority-owned resolver;
-- prohibit caller-assembled parts and authority extraction; and
-- keep the namespace lease until every dependent I/O lease ends.
+- prohibit caller-assembled parts and authority extraction;
+- keep the namespace lease until every dependent I/O lease ends;
+- project `AdmittedMainIdentity` internally from the constructed authority,
+  never by echoing caller input;
+- complete required open-time recovery/bootstrap/schema work after projection
+  with effect-aware errors; and
+- return connection plus readback only as one public success after that work.
 
 Exit:
 
@@ -253,8 +286,11 @@ Exit:
 
 Actions:
 
-- add `Connection::open_existing_generation_bound` and its reviewed options;
-- delegate only to the hidden complete-admission pager factory;
+- add `Connection::open_existing_generation_bound`, its reviewed closed
+  options with explicit no-default `GenerationExpectation`, and an atomic
+  connection-plus-`AdmittedMainIdentity` result;
+- delegate expected-identity comparison and all admission only to the hidden
+  complete-admission pager factory;
 - document weaker APIs as non-equivalent;
 - update the facade and any supported async/C surface truthfully;
 - prohibit feature/env/PRAGMA downgrade; and
@@ -265,7 +301,11 @@ Exit:
 - only the exact constructor claims Decision-87 conformance;
 - symbol-to-pager call graph is exclusive and machine-tested;
 - unsupported backends/features return typed refusal; and
-- hidden pager factory remains safe but unsupported.
+- hidden pager factory remains safe but unsupported;
+- a mismatching `Exact` expectation is typed and pre-effect except for
+  enumerated generation-independent coordination effects; and
+- every success returns a non-optional authority-derived identity readback that
+  exposes no public codec, weaker-open conversion, or authority extraction.
 
 ### I8 — Full owner proof
 
@@ -273,11 +313,26 @@ Exit:
 
 Actions:
 
-- run deterministic A/B/A, sidecar substitution, stale-transition, alias,
-  parent, crash, cancellation, and effect-class schedules;
+- run deterministic matching/mismatching guarded expected-main schedules plus
+  caller-close-before/during-open, platform identity-reuse, A/B/A, sidecar
+  substitution, stale-transition, alias, parent, crash, cancellation,
+  and effect-class schedules;
+- prove mismatch precedes all generation-governed sidecar/recovery effects and
+  successful readback comes from authority rather than caller input;
+- prove the expected guard has no detached raw-`FileIdentity` construction,
+  cloning/copying, weaker-open conversion, or use after final open outcome;
+- add readback provenance/dataflow instrumentation and a negative mutation test
+  that substitutes the expectation at the projection seam and must fail;
+- test creation/update and idempotent cleanup of every coordination record
+  permitted before exact comparison;
+- test that byte-identical same-operation/result receipt duplication returns the
+  original committed receipt without a second append or authority effect;
+  reject conflicting same-operation duplicates and cross-operation/stale replay,
+  treating delayed exact-tuple retry as non-stale and a different or superseded
+  operation/result tuple as stale;
 - prove actual io_uring submission/completion separately from fallback;
 - run Windows full-identity and weak-identity refusal profiles;
-- prove objective disjoint-page writer overlap;
+- prove overlap of disjoint-page `prepare_begin`/`prepare_end` critical sections;
 - run workspace format, check, clippy, and tests;
 - run targeted all-feature/refusal matrices; and
 - capture exact command, environment, feature, platform, result, and artifact
@@ -322,8 +377,20 @@ Prerequisites:
 Actions:
 
 - evaluate exact dependency and features in a clean Agent Kernel candidate;
+- require `GenerationExpectation::Exact` produced from the same retained
+  preflight object as the consumer's durable database identity, with the
+  expected observation guard retained by the owner through final open outcome,
+  and verify successful authority-derived admitted identity equality;
 - prove every authoritative execution, readback, and receipt descends from the
   conforming constructor;
+- record only a non-authorizing append-only durable consumer identity plus
+  owner-confirmed equality, exact API/profile, owner revision, unique operation
+  identity, and result digest; return the original committed receipt without a
+  second append or authority effect for byte-identical same-operation/result
+  retry, reject conflicting same-operation duplicates and every
+  cross-operation/stale replay, define delayed exact-tuple retry as non-stale
+  and a different/superseded tuple as stale, and do not serialize the live
+  value;
 - prove no path-only or weaker fallback;
 - preserve ADR-0031 generation fencing; and
 - request explicit task-4195 return authorization only after consumer proof.
@@ -366,6 +433,14 @@ Stop and return to review if:
 - complete admission cannot be owned by pager without exposing minting;
 - a required artifact lacks both an exact owner-binding rule and a reliable
   pre-effect refusal;
+- exact expected-main comparison can occur only after a generation-governed
+  sidecar admission or database/recovery effect;
+- expected observation lifetime cannot remain owner-held through final open
+  outcome, or the expected guard permits clone/copy, detached raw-identity
+  construction, weaker-open conversion, or post-outcome use;
+- successful construction can omit or echo rather than authority-derive the
+  admitted identity readback, or return public success before required
+  open-time recovery/bootstrap/schema work completes;
 - an effect can begin before the selected linearization point;
 - a cooperative publication route cannot join the common gate;
 - main pathname reopen remains in authoritative conforming-path I/O;

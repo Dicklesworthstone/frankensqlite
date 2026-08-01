@@ -8,7 +8,7 @@ type: "validation-plan"
 
 # Validation, Rollout, and Rollback: Generation-Stable Existing-Runtime Open
 
-**Status:** Proposed for post-ADR review; no rollout authorized
+**Status:** Expected-identity/readback amendment proposed for re-review; no rollout authorized
 **Date:** 2026-07-31
 **Owner issue:** [frankensqlite#308](https://github.com/Dicklesworthstone/frankensqlite/issues/308)
 **Decision:** Agent Kernel decision 87 / [ADR-0003](../adr/0003-generation-stable-sidecar-proven-existing-runtime-open.md)
@@ -22,7 +22,8 @@ platform profile, toolchain, and evidence manifest.
 The following are not equivalent to proof:
 
 - source inspection without executed behavior;
-- identity equality without handle-origin lineage;
+- identity equality without handle-origin lineage or without a pre-effect
+  owner comparison against the exact retained handle;
 - canonical naming without sidecar provenance;
 - a stress run without deterministic schedule control;
 - throughput without measured writer overlap;
@@ -51,6 +52,14 @@ The owner proof pack must include a machine-readable manifest containing:
 - whether io_uring actually submitted/completed or fell back;
 - schedule seed and deterministic hook sequence;
 - authority/main/sidecar lineage identifiers;
+- explicit `GenerationExpectation::{Any, Exact}` selection, the typed
+  comparison outcome, and provenance/dataflow evidence that successful
+  `AdmittedMainIdentity` was authority-derived rather than copied from caller
+  input;
+- expected observation-guard lifetime events, including caller-reference close,
+  final release, and attempted identity reuse;
+- unique operation identity, result digest, and same-operation identical,
+  same-operation conflicting, cross-operation, and stale receipt replay results;
 - outcome semantic class;
 - writer interval observations; and
 - reviewer and synthesis references.
@@ -66,6 +75,11 @@ reported as if the first attempt never happened.
 | Case | Injection/observation | Pass condition |
 | --- | --- | --- |
 | Stage failure | Fail before/after every admission stage | No main/recovery/sidecar effect before authority construction; typed pre-effect refusal |
+| Exact expected main matches | Select `Exact(ExpectedMainIdentityGuard)` from the retained preflight object | Owner retains the opaque observation guard through final outcome; after open-time work succeeds, public success atomically returns a connection and equal non-optional authority-derived `AdmittedMainIdentity` |
+| Exact expected main mismatches | Select `Exact` for a different opaque identity at every hook after main open | Typed `ExpectedMainIdentityMismatch` or equivalent before generation-governed sidecar admission and every database/recovery effect; only enumerated generation-independent coordination effects with idempotent cleanup may occur; no success/readback |
+| Expected guard lifetime | Close caller reference before/during owner open; attempt platform identity reuse; attempt raw-identity conversion, clone/copy, and use after final outcome | Owner-held guard preserves originating-object lifetime through final outcome; detached conversion, clone/copy, weaker-open reuse, and post-outcome use are unavailable or typed refusal |
+| Any expectation | Select explicit `Any` | Success, when otherwise supported, still returns non-optional authority-derived `AdmittedMainIdentity` and claims consistency with the admitted generation, not selection of a caller-authorized generation; Agent Kernel authoritative profiles reject `Any` |
+| Success ordering | Fail after authority/readback derivation and at each open-time recovery/bootstrap/schema cut | Total order is authority, internal readback derivation, open-time work completion, public atomic success; post-effect failure returns effect-aware error and no successful readback |
 | Linearization witness | Record ordered stage events | Exactly one authority-construction event precedes all recovery/data effects |
 | Namespace drift | Attempt cooperative A/B transition at every stage | Admission revalidates or refuses; no mixed authority |
 | Empty/missing/malformed main | Existing-only strong open | No creation or initialization; typed refusal |
@@ -79,6 +93,8 @@ lineage ID.
 
 Schedules:
 
+- expected A while the retained open selects A, B, and an A/B/A replacement at
+  every deterministic admission hook;
 - exact main `A -> B -> A` during admission and after return;
 - WAL conflict refresh after path replacement;
 - export and copy after path replacement;
@@ -89,6 +105,13 @@ Schedules:
 
 Pass:
 
+- `Exact` comparison uses identity from the exact retained main handle and
+  precedes generation-governed sidecar admission plus all database/recovery
+  effects; every permitted earlier coordination effect and its idempotent
+  mismatch cleanup are enumerated and observed;
+- provenance/dataflow instrumentation proves every successful
+  `AdmittedMainIdentity` comes from the constructed authority, and a negative
+  mutation that copies the expected input at the projection seam fails;
 - every authoritative event descends from the admitted main handle or a
   capability-derived duplicate;
 - a pathname-opened observational probe cannot be promoted;
@@ -183,10 +206,22 @@ Pass:
 Compile and runtime tests must show:
 
 - only `Connection::open_existing_generation_bound` claims conformance;
-- the hidden pager factory accepts no identity/file/binding/sidecar parts;
+- the hidden pager factory accepts no opened file, binding, sidecar, resolver,
+  lease, or other authority-minting parts; it may accept only explicit
+  `GenerationExpectation` as a comparison precondition;
 - authority type and fields cannot be named or extracted externally;
 - no public implementable trait can mint authority;
-- no serde/durable reconstruction exists;
+- `ExpectedMainIdentityGuard` and connection-bound `AdmittedMainIdentity` have
+  no `Clone`, `Copy`, caller-visible serialization, serde, byte/durable codec,
+  detached raw-identity conversion, weaker-open conversion, or authority
+  conversion; owner-internal `FileIdentity` namespace encoding remains confined
+  to its coordination boundary;
+- the expected guard retains its originating observation object through final
+  outcome despite caller-reference close; identity-reuse and use-after-outcome
+  schedules cannot satisfy `Exact`;
+- every successful conforming result has a non-optional authority-derived
+  admitted identity, no mismatch can produce success or a readback, and no
+  public success occurs before required open-time work completes;
 - options, feature flags, PRAGMAs, environment, custom VFS, and wrappers cannot
   silently downgrade; and
 - weaker entrypoints remain publication-gated even though admission is weaker.
@@ -210,14 +245,20 @@ unnamed temporary and unsealed custom VFS combinations.
 
 ### 3.8 Concurrent writers
 
-Instrumentation records transaction, page set, prepare interval, WAL/durability
-interval, and commit result.
+Instrumentation records transaction, frozen mutation page set,
+`prepare_begin`, `prepare_end`, WAL/durability interval, and commit result.
+`prepare_begin` occurs only after the mutation page set is frozen and
+page-specific mutation preparation starts. `prepare_end` occurs when that work
+is ready for WAL/durability. Parsing, queue wait, transaction lifetime, and
+generic buffer staging are excluded.
 
 Pass:
 
 - `concurrent_mode_default` and harness defaults remain `true`;
-- at least two disjoint-page writers have objectively overlapping transaction
-  or prepare intervals;
+- at least two disjoint-page writers have objectively overlapping
+  `prepare_begin`/`prepare_end` critical sections;
+- no namespace admission/publication lease is held across ordinary write or
+  prepare critical sections as a new serialization mechanism;
 - no global connection, transaction, or file-level writer baton is introduced
   as Decision-87 safety;
 - existing physical publication/durability serialization is measured
@@ -304,7 +345,18 @@ Required consumer proof:
 - exact dependency revision/features;
 - exclusive use of the conforming constructor;
 - no weaker fallback;
+- required `GenerationExpectation::Exact` derived from the same retained
+  preflight object as consumer durable identity, plus authority-derived
+  successful admitted-main readback equality;
 - authoritative execution, readback, and receipt lineage;
+- non-authorizing append-only durable receipt projection containing
+  consumer-owned database identity, owner-confirmed equality, exact API/profile,
+  owner revision, unique operation identity, and result digest without
+  serializing the live value. A byte-identical duplicate for the same
+  operation/result returns the original committed receipt without a second
+  append or authority effect. Conflicting same-operation duplicates and all
+  cross-operation/stale replay are rejected. A delayed exact-tuple retry is not
+  stale; a different or superseded operation/result tuple is stale;
 - preserved ADR-0031 generation fencing; and
 - clean rollback to exposure-only behavior.
 
@@ -322,6 +374,15 @@ No canary activation is part of these stages.
 
 Stop the active stage immediately on:
 
+- exact expected-main comparison after generation-governed sidecar admission or
+  any database/recovery effect, or an unenumerated coordination effect before
+  comparison;
+- expected observation guard detached, cloned/copied, released before final
+  outcome, constructed from raw identity, converted to weaker-open input, or
+  accepted after platform identity reuse;
+- successful return without a non-optional authority-derived admitted identity,
+  readback copied from caller input, or public success before required open-time
+  recovery/bootstrap/schema work completes;
 - any authoritative main pathname reopen;
 - ambiguous sidecar recovery or adoption;
 - cooperative publication while authority is live;
@@ -380,6 +441,19 @@ Before any claim of completion, answer yes with evidence:
 
 - Is the commit immutable and exact?
 - Is the feature/platform matrix exact?
+- Was explicit `Exact` identity compared with the exact retained-handle identity
+  before generation-governed sidecar admission and all database/recovery
+  effects, with every earlier coordination effect enumerated and cleaned
+  idempotently?
+- Did mismatch refuse before generation-governed effects and did every success
+  occur after open-time work and atomically return a non-optional,
+  provenance-proved authority-derived admitted identity?
+- Did the non-cloneable expected guard retain its originating observation object
+  through final outcome and defeat close/reuse/detached-token schedules?
+- Did a byte-identical same-operation/result duplicate return the original
+  committed receipt without a second append or authority effect, while
+  conflicting same-operation duplicates and all cross-operation/stale replay
+  failed against unique operation/result binding?
 - Did every authoritative main I/O event descend from one admitted handle?
 - Did every artifact family integrate or refuse?
 - Did A/B/A and stale-sidecar schedules run deterministically?

@@ -8,7 +8,7 @@ type: "design"
 
 # Design Packet: Generation-Stable, Sidecar-Proven Existing-Runtime Open
 
-**Status:** Post-ADR design for implementation review
+**Status:** Post-ADR design; expected-identity/readback amendment proposed for re-review
 **Date:** 2026-07-31
 **Owner issue:** [frankensqlite#308](https://github.com/Dicklesworthstone/frankensqlite/issues/308)
 **Decision:** Agent Kernel decision 87 / [ADR-0003](../adr/0003-generation-stable-sidecar-proven-existing-runtime-open.md)
@@ -103,9 +103,12 @@ The exact fields may differ, but the following are fixed:
 - sidecar leases cannot outlive the authority;
 - `Arc` cloning shares one authority and cannot mint an independent pager;
 - no serialization, deserialization, extraction, or construction from parts;
-- no public implementable trait can mint authority; and
+- no public implementable trait can mint authority;
 - connection close waits until in-flight backend operations release their
-  authority leases.
+  authority leases; and
+- pager may project the actual identity as a non-optional live opaque
+  `AdmittedMainIdentity` readback, without exposing handles, leases, resolvers,
+  minting operations, or authority extraction.
 
 `SimplePager` should hold one authority value instead of separately exposing
 main, path, namespace, and sidecar ownership. Existing fields may be migrated in
@@ -128,8 +131,11 @@ pub async fn open_existing_generation_bound_for_connection(
 
 The final signature is an implementation choice. Its API proof must show:
 
-- it accepts no `FileIdentity`, opened file, namespace binding, sidecar set, or
-  other caller-assembled authority part;
+- it accepts no opened file, namespace binding, sidecar set, resolver,
+  authority lease, or other caller-assembled minting part;
+- it may accept required explicit `GenerationExpectation` only to compare
+  `Exact(ExpectedMainIdentityGuard)` with identity derived from the retained
+  handle while the guard's originating preflight object remains live;
 - it performs the whole admission protocol internally;
 - its return type exposes neither authority nor extraction;
 - direct use still preserves all runtime invariants; and
@@ -138,16 +144,66 @@ The final signature is an implementation choice. Its API proof must show:
 
 ### 3.3 Sole supported public API
 
-The selected public symbol is:
+The selected public symbol and conceptual result contract are:
 
 ```rust,ignore
+pub struct ExpectedMainIdentityGuard {
+    identity: FileIdentity,
+    observation: OpaqueObservedMainGuard,
+}
+pub struct AdmittedMainIdentity(FileIdentity);
+
+pub enum GenerationExpectation {
+    Any,
+    Exact(ExpectedMainIdentityGuard),
+}
+
+pub struct GenerationBoundOpenOptions {
+    pub expectation: GenerationExpectation,
+    // Other fields are closed, reviewed profile settings only.
+}
+
+pub struct GenerationBoundConnection {
+    connection: Connection,
+    admitted_main_identity: AdmittedMainIdentity,
+}
+
 Connection::open_existing_generation_bound(path, options)
+    -> Result<GenerationBoundConnection, GenerationOpenError>
 ```
 
+Exact naming and accessors remain implementation choices. The semantic
+requirements—purpose-specific opaque wrappers, required explicit `Any` versus
+`Exact` selection with no default, and atomic mandatory successful readback—do
+not. `ExpectedMainIdentityGuard` must be produced from the consumer's retained
+live preflight object through an owner-reviewed comparison-only primitive. It
+owns or duplicates an opaque observation guard, is consumed by `Exact`, and is
+retained through public success or final failure. It exposes no raw handle,
+bytes, identity extraction, `Clone`, `Copy`, or conversion from detached
+`FileIdentity`. Consumer proof must show the guard and durable database identity
+came from the same retained preflight object. Tests close the original caller
+reference before and during open, force platform identity-reuse attempts, and
+prove the owner-held guard preserves the lifetime premise.
+
 The first options surface must be closed and explicit. It may select only
-reviewed backend/runtime settings. It must not accept an expected identity,
-custom VFS, compatibility downgrade, caller artifact resolver, or option that
-turns unsupported into best-effort behavior.
+reviewed backend/runtime settings plus required explicit
+`GenerationExpectation`. `Exact(ExpectedMainIdentityGuard)` is the optional
+expected-generation precondition; `Any` does not select a caller-authorized
+generation. Agent Kernel authoritative work must use `Exact`. It must not
+accept a custom VFS, compatibility downgrade, caller artifact resolver, opened
+main-authority handle, namespace lease, or option that turns unsupported into
+best-effort behavior. The opaque observation guard inside `Exact` is permitted
+only as a non-I/O comparison precondition.
+
+Successful construction atomically returns the connection and a non-optional
+`AdmittedMainIdentity` projected from the constructed private authority. The
+readback must not echo the expected input. Both purpose-specific identity values
+are live opaque equality values. The expected guard and connection-bound
+admitted readback expose no `Clone`, `Copy`, serde/bytes/durable codecs, detached
+raw-identity conversion, weaker-open conversion, reusable durable admission
+authority, or authority construction/extraction. Existing owner-internal
+`FileIdentity` namespace encoding remains internal and is not a public token
+codec.
 
 Ordinary `open*`, expected-identity, schema-only, compatibility, async wrapper,
 C, and pager constructors remain non-conforming until a later reviewed change.
@@ -163,14 +219,16 @@ Start
   -> cooperative admission locks acquired
   -> main securely opened existing-only exactly once
   -> identity derived from retained handle
+  -> Exact expected-main identity compared [MISMATCH = PRE-EFFECT REFUSAL]
   -> alias/link invariants checked
   -> namespace bound to identity
   -> enabled artifact family enumerated
   -> pre-existing artifacts securely opened and provenance-checked
   -> namespace generation revalidated
   -> DatabaseGenerationAuthority constructed  [LINEARIZATION]
-  -> recovery / WAL bootstrap / schema work may begin
-  -> connection returned
+  -> admitted-main identity projected internally from authority
+  -> recovery / WAL bootstrap / schema work completes with effect-aware errors
+  -> connection + non-optional readback returned atomically on public success
 ```
 
 ### 4.1 Permitted pre-linearization effects
@@ -194,6 +252,12 @@ Start
 
 Each stage needs a deterministic hook. The proof harness must be able to pause
 or fail before and after every stage.
+
+Before exact comparison, only enumerated generation-independent namespace/lock
+coordination records may be created or updated. They cannot carry recovery data
+or admit a generation-governed sidecar, and mismatch cleanup must be idempotent.
+No WAL, SHM, journal, FEC, history, witness, parallel-WAL, publication, or other
+generation-governed artifact may be mutated before comparison.
 
 ## 5. Sidecar model
 
@@ -343,6 +407,7 @@ typed contract that covers at least:
 - identity unavailable or too weak;
 - alias/link ambiguity;
 - namespace generation drift;
+- expected main identity mismatch before any database/recovery effect;
 - sidecar provenance ambiguity;
 - unsupported artifact family/feature combination;
 - generation rotation unsupported;
@@ -363,8 +428,10 @@ failed.
 - The authority outlives pager caches, WAL/backend work, SHM users, background
   operations, and actual io_uring completions.
 - Close/cancel cannot release namespace generation while dependent work lives.
-- Proof must observe overlapping disjoint-page writer intervals; throughput or
-  successful stress alone is insufficient.
+- Proof must observe overlapping disjoint-page prepare critical sections from
+  frozen mutation page-set entry through readiness for WAL/durability. Parsing,
+  queue wait, transaction lifetime, and generic buffer staging do not qualify;
+  throughput or successful stress alone is insufficient.
 
 ## 11. Conformance boundary
 
@@ -389,7 +456,15 @@ immutable FrankenSQLite revision, a separate consumer task may evaluate:
 - exact dependency commit and feature set;
 - exact public symbol and call graph;
 - no weaker constructor fallback;
-- authoritative execution, readback, and receipt lineage;
+- authoritative execution and non-optional admitted-identity readback lineage;
+- non-authorizing append-only durable receipt binding to the consumer-owned
+  database identity, successful owner comparison, exact API/profile, owner
+  revision, unique operation identity, and result digest without serializing
+  the live expected/admitted value. A byte-identical duplicate for the same
+  operation/result returns the original committed receipt without a second
+  append or authority effect. Conflicting same-operation duplicates and all
+  cross-operation or stale replay are rejected; a delayed exact-tuple retry is
+  not stale, while a different or superseded operation/result tuple is stale;
 - preserved ADR-0031 generation fencing; and
 - explicit authorization before task 4195 resumes.
 
@@ -400,12 +475,16 @@ No owner document or green owner test authorizes pin rotation by itself.
 This packet is ready for implementation review only when reviewers can answer:
 
 1. Does one private pager owner mint all authority?
-2. Does admission precede every recovery/data effect?
-3. Is every observed artifact classified or refused?
-4. Can no main-path probe become authoritative I/O?
-5. Does every cooperative publication route share one exclusive gate?
-6. Are ordinary writes/recovery/checkpoint still generation-preserving?
-7. Are outcome classes impossible to collapse silently?
-8. Is objective writer overlap required?
-9. Are platform and io_uring claims separately proved?
-10. Is downstream adoption still separately gated?
+2. Is `Exact(ExpectedMainIdentityGuard)` compared with retained-handle identity
+   before generation-governed sidecar admission or every recovery/data effect,
+   with only enumerated coordination effects and typed mismatch?
+3. Does every success atomically return an authority-derived admitted identity
+   that is not copied from caller input?
+4. Is every observed artifact classified or refused?
+5. Can no main-path probe become authoritative I/O?
+6. Does every cooperative publication route share one exclusive gate?
+7. Are ordinary writes/recovery/checkpoint still generation-preserving?
+8. Are outcome classes impossible to collapse silently?
+9. Is objective writer overlap required?
+10. Are platform and io_uring claims separately proved?
+11. Is downstream adoption still separately gated?

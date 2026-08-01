@@ -7,7 +7,7 @@ type: "rfc"
 
 # RFC: Generation-Stable, Sidecar-Proven Existing-Runtime Open
 
-**Status:** Revised after round-4 synthesis; proposed for re-review
+**Status:** Accepted architecture; expected-identity/readback amendment proposed for re-review
 **Date:** 2026-07-31
 **Owner issue:** [frankensqlite#308](https://github.com/Dicklesworthstone/frankensqlite/issues/308)
 **Decision:** Agent Kernel decision 87
@@ -26,11 +26,27 @@ The authority must own:
 - the admitted sidecar set and sidecar resolver; and
 - the lifetime state needed by pager, recovery, WAL, export/copy, and auxiliary artifact managers.
 
-The public API for the first implementation is one safe constructor:
+The public API for the first implementation is one safe constructor with an
+atomic successful-admission result:
 
 ```rust,ignore
 Connection::open_existing_generation_bound(path, options)
+    -> GenerationBoundConnection
 ```
+
+`GenerationBoundOpenOptions` carries a required closed
+`GenerationExpectation`: `Any`, or `Exact(ExpectedMainIdentityGuard)`. `Exact` is the
+optional expected-generation precondition; `Any` claims only consistency with
+the owner-admitted generation, not selection of a caller-authorized generation.
+The selector has no implicit default. Pager compares an `Exact` token with the
+identity from the exact retained main handle before generation-governed sidecar
+admission or any database/recovery effect. Every successful result exposes a
+non-optional opaque `AdmittedMainIdentity` projected from the constructed
+private authority. The non-cloneable, non-copyable expected guard retains its
+originating preflight object until public success or final failure; it exposes
+no raw handle and cannot be built from detached `FileIdentity`. Neither
+purpose-specific value can mint or reconstruct authority. Agent Kernel
+authoritative work must use `Exact`.
 
 `fsqlite-pager` owns `DatabaseGenerationAuthority` and the complete admission-to-pager composition. `fsqlite-vfs` supplies low-level file, identity, namespace, and locking primitives but cannot mint generation authority. `fsqlite-core` exposes the sole supported conforming connection constructor.
 
@@ -75,7 +91,9 @@ The revised architecture treats the admitted database generation—not one descr
 - supporting live generation rotation in the first slice;
 - guaranteeing protection from arbitrary non-cooperating same-UID namespace mutation;
 - serializing writers or changing MVCC policy;
-- creating persistent or cross-machine main-file identities; or
+- creating persistent or cross-machine main-file identities usable as
+  filesystem authority—the audit-only durable receipt projection defined below
+  is not reusable admission authority; or
 - making every existing open API generation-bound.
 
 ## Selected architecture
@@ -107,9 +125,24 @@ Names and field layout remain implementation choices. The semantics are fixed:
 
 An `Arc` or equivalent may share the internal authority among pager and backends. Sharing is not independent capability cloning. Each lease refers to the same admitted main object, namespace binding, and sidecar state.
 
+Pager may project the actual main identity from the constructed authority as a
+live opaque `AdmittedMainIdentity` token. This readback exposes no main handle,
+namespace lease, sidecar lease, resolver, minting operation, or authority
+extraction. It is mandatory on every successful conforming open and must not be
+populated by copying the expected guard's comparison identity.
+
+Both are purpose-specific public wrappers around owner identity semantics. The
+expected wrapper owns an opaque observation guard and is consumed by open; the
+admitted wrapper remains connection-bound. They expose no `Clone`, `Copy`, serde
+implementation, byte conversion, durable codec, raw-`FileIdentity` conversion,
+authority conversion, or conversion from admitted readback into a weaker-open
+token.
+Existing owner-internal `FileIdentity` encoding used for namespace coordination
+remains permitted and is not a caller-visible codec for either wrapper.
+
 ### Sole conforming public entrypoint
 
-For the first implementation, only the supported `Connection::open_existing_generation_bound` API may claim Decision-87 conformance. A technically public hidden pager factory exists only as the safe core-to-pager composition seam; it is not a second supported API and cannot weaken the resulting pager's semantics.
+For the first implementation, only the supported `Connection::open_existing_generation_bound` API may claim Decision-87 conformance. Its closed options contain reviewed settings plus the required explicit `GenerationExpectation` selector. Its successful return atomically contains the connection and authority-derived `AdmittedMainIdentity`. A technically public hidden pager factory exists only as the safe core-to-pager composition seam; it is not a second supported API and cannot weaken the resulting pager's semantics.
 
 The following remain weaker and non-equivalent until separately proved to delegate exclusively to the conforming path under the same feature/backend matrix:
 
@@ -128,13 +161,19 @@ No option, environment field, feature flag, PRAGMA, or custom backend may silent
 The first implementation must not expose:
 
 - the generation-authority type, fields, minting operations, or extraction;
-- a constructor accepting `FileIdentity`, `VfsFile`, path, namespace binding, or other caller-assembled authority parts;
+- a constructor accepting an opened `VfsFile`, namespace binding, sidecar set,
+  resolver, authority lease, or other caller-assembled minting part; the sole
+  exception is purpose-specific `GenerationExpectation`, used only as a
+  guarded comparison precondition and never as authority;
 - a public implementable trait that can mint an authority;
-- deserialization or durable reconstruction;
+- caller-visible serialization, deserialization, durable reconstruction, or
+  weaker-open conversion of `ExpectedMainIdentityGuard`, `AdmittedMainIdentity`, or
+  private authority; owner-internal `FileIdentity` namespace encoding remains
+  permitted only inside its existing coordination boundary;
 - conversion from a validation probe into authoritative I/O; or
 - an unsafe or "advanced" bypass constructor.
 
-The technically public hidden pager factory is permitted only because it performs complete owner admission and returns a safe authority-bearing pager without exposing authority. Any supported public lower-level capability API, caller-minted authority, or authority extraction requires a separate architecture decision.
+The technically public hidden pager factory is permitted only because it performs complete owner admission and returns a safe authority-bearing pager without exposing authority. It may accept `GenerationExpectation` solely to compare `Exact` while retaining its originating observation guard through public open completion. Any supported public lower-level capability API, caller-minted authority, raw-identity conversion, or authority extraction requires a separate architecture decision.
 
 ## Admission protocol
 
@@ -162,7 +201,10 @@ Before linearization, the constructor may:
 - securely open the main and existing artifacts without mutation;
 - derive identities and inspect headers;
 - allocate in-memory state; and
-- create only documented coordination records whose creation cannot mutate database contents or trigger recovery.
+- create only enumerated generation-independent coordination records whose
+  creation cannot mutate database/recovery state or admit a generation-governed
+  sidecar. Such records are the sole permitted persistent effect before exact
+  expectation comparison and require idempotent mismatch cleanup semantics.
 
 Before linearization it must not:
 
@@ -181,17 +223,32 @@ Before linearization it must not:
 3. Begin cooperative namespace admission.
 4. Open the main once using profile-required alias and regular-file protections.
 5. Derive identity from that exact handle.
-6. Enforce single-link and other profile invariants.
-7. Bind namespace admission to the identity.
-8. Discover the complete enabled artifact family.
-9. Securely open and validate every pre-existing recovery-bearing artifact required by that family.
-10. Establish the admitted `GenerationSidecarSet`.
-11. Revalidate the cooperative namespace generation.
-12. Construct the sealed `DatabaseGenerationAuthority`.
+6. For `Exact`, compare guarded expected identity with the actual identity while
+   the originating preflight object remains live;
+   mismatch returns typed `ExpectedMainIdentityMismatch` before
+   generation-governed sidecar admission or any database/recovery effect. Only
+   the enumerated generation-independent coordination effects above may have
+   occurred, and their mismatch cleanup is idempotent.
+7. Enforce single-link and other profile invariants.
+8. Bind namespace admission to the actual identity.
+9. Discover the complete enabled artifact family.
+10. Securely open and validate every pre-existing recovery-bearing artifact required by that family.
+11. Establish the admitted `GenerationSidecarSet`.
+12. Revalidate the cooperative namespace generation.
+13. Construct the sealed `DatabaseGenerationAuthority`.
+14. Project `AdmittedMainIdentity` internally from that authority.
+15. Perform required open-time recovery, WAL bootstrap, and schema work through
+    the authority.
+16. Atomically return public success containing the connection and readback.
 
-Step 12 is the admission linearization point. Recovery and other database effects occur only after it.
-
-A failure before step 12 is a typed pre-effect refusal except for explicitly documented coordination-record effects. A failure after recovery or another durable database effect begins must report a typed effect-aware or indeterminate result rather than ordinary `CannotOpen`.
+Step 13 is the admission linearization point. The order is total:
+`authority_linearized -> readback_derived -> open_time_work_completed ->
+public_success_returned`. Recovery and other database effects occur only after
+step 13. A failure before step 13 is a typed pre-effect refusal except for the
+enumerated coordination-record effects. A failure after recovery or another
+durable database effect begins must report a typed effect-aware or indeterminate
+result rather than ordinary `CannotOpen`; it returns no successful public
+readback. Public success is unavailable until step 16.
 
 ## Cooperative sidecar provenance
 
@@ -362,6 +419,7 @@ The implementation must expose typed distinctions for at least:
 
 - unsupported backend/filesystem profile;
 - identity unavailable or too weak;
+- expected main identity mismatch, always before database/recovery effects;
 - alias or link ambiguity;
 - namespace generation drift;
 - sidecar provenance ambiguity;
@@ -377,22 +435,29 @@ Generic `CannotOpen` is not sufficient for these contract boundaries.
 Implementation acceptance requires:
 
 1. deterministic admission hooks and one explicit linearization witness;
-2. handle-origin instrumentation proving all authoritative main I/O descends from the admitted object;
-3. cooperative A/B/A exclusion for the authority lifetime;
-4. stale-sidecar A-to-B transition tests for every enabled artifact family;
-5. raw main and sidecar replacement schedules with claims limited to the active backend profile;
-6. non-empty WAL/SHM and rollback recovery only for artifact families with an enumerated exact-binding rule; otherwise deterministic pre-effect provenance refusal;
-7. coverage of WAL-FEC, DB-FEC, MVCC history/witness, and parallel-WAL or typed unsupported refusal;
-8. post-return WAL refresh, export, copy, and auxiliary-read proof;
-9. namespace-wide exclusion of every cooperative generation-changing publication route while any generation authority is live, plus pre-effect refusal when such publication is invoked through the strong connection and positive proof that ordinary writes, admitted recovery, and checkpoint remain generation-preserving;
-10. symlink, hard-link, reparse, parent, and filesystem-profile tests;
-11. actual io_uring submission/completion proof separate from fallback;
-12. Windows probe non-authority and weak-identity profile tests;
-13. typed refusal for unnamed temporary and unsupported VFS inputs;
-14. objective concurrent-writer overlap with no serialized fallback;
-15. crash/failure injection with exact pre-operation, completed post-operation, and indeterminate-effect oracles;
-16. a public API conformance matrix proving weaker entrypoints do not inherit admission conformance or bypass namespace-wide publication exclusion, plus compile/API proof that the hidden pager factory accepts no caller-assembled authority and exposes no authority extraction; and
-17. exact downstream Agent Kernel dependency, feature, and exclusive result-lineage validation proving that every authoritative task-4195 execution, readback, and receipt descends from the conforming constructor with no weaker fallback.
+2. `Any` and matching/mismatching `Exact` schedules proving comparison uses the
+   retained handle, mismatch precedes generation-governed sidecar and database
+   effects, and every success returns non-optional authority-derived
+   `AdmittedMainIdentity` rather than echoing input;
+3. handle-origin instrumentation proving all authoritative main I/O descends from the admitted object;
+4. cooperative A/B/A exclusion for the authority lifetime;
+5. stale-sidecar A-to-B transition tests for every enabled artifact family;
+6. raw main and sidecar replacement schedules with claims limited to the active backend profile;
+7. non-empty WAL/SHM and rollback recovery only for artifact families with an enumerated exact-binding rule; otherwise deterministic pre-effect provenance refusal;
+8. coverage of WAL-FEC, DB-FEC, MVCC history/witness, and parallel-WAL or typed unsupported refusal;
+9. post-return WAL refresh, export, copy, and auxiliary-read proof;
+10. namespace-wide exclusion of every cooperative generation-changing publication route while any generation authority is live, plus pre-effect refusal when such publication is invoked through the strong connection and positive proof that ordinary writes, admitted recovery, and checkpoint remain generation-preserving;
+11. symlink, hard-link, reparse, parent, and filesystem-profile tests;
+12. actual io_uring submission/completion proof separate from fallback;
+13. Windows probe non-authority and weak-identity profile tests;
+14. typed refusal for unnamed temporary and unsupported VFS inputs;
+15. objective overlap of disjoint-page prepare critical sections, from frozen
+    mutation page-set entry through readiness for WAL/durability, with no
+    serialized fallback; parsing, queue wait, transaction lifetime, and generic
+    buffer staging do not qualify;
+16. crash/failure injection with exact pre-operation, completed post-operation, and indeterminate-effect oracles;
+17. a public API conformance matrix proving weaker entrypoints do not inherit admission conformance or bypass namespace-wide publication exclusion, plus compile/API proof that the hidden pager factory accepts no caller-assembled minting parts and exposes no authority extraction; and
+18. exact downstream Agent Kernel dependency, feature, and exclusive result-lineage validation proving that every authoritative task-4195 execution uses `Exact` and that execution, readback, and receipt descend from the conforming constructor with no weaker fallback. The non-authorizing append-only durable receipt records the consumer-owned database identity, successful owner comparison, exact owner API/profile, owner revision, unique operation identity, and result digest; it does not serialize the live token. A byte-identical duplicate for the same operation/result must return the original committed receipt without a second append or authority effect; conflicting same-operation duplicates and all cross-operation or stale replay must fail validation. A delayed byte-identical retry for the exact operation/result tuple is not stale; a different or superseded operation/result tuple is stale.
 
 ## Migration and compatibility
 
@@ -401,6 +466,17 @@ Implementation acceptance requires:
 - Reuse current namespace and identity machinery; do not create a second competing generation ledger.
 - No database on-disk format change is authorized by this decision. If implementation finds durable sidecar-generation metadata necessary, it must return to architecture review.
 - Namespace/coordination record versioning is permitted only if separately scoped and compatibility-safe.
+- `ExpectedMainIdentityGuard` and `AdmittedMainIdentity` expose no public durable
+  codec. Existing owner-internal `FileIdentity` namespace-record encoding is
+  permitted but cannot escape as a consumer token codec. A durable consumer
+  audit projection may attest owner-confirmed equality for one uniquely bound
+  operation/result. A byte-identical duplicate for that same tuple returns the
+  original committed receipt without a second append or authority effect.
+  Conflicting same-operation duplicates and every cross-operation or stale
+  replay are rejected. A delayed byte-identical retry for the exact tuple is not
+  stale; a different or superseded operation/result tuple is stale. A receipt
+  cannot be replayed as an expected
+  identity, authorize a future operation, or reconstruct authority.
 - Do not rotate downstream pins until the exact revision passes owner and consumer proof.
 - Do not declare issues #140, #141, #307, Agent Kernel tasks 4326/4340, or Softwareco Decision 86 closed by this work.
 
@@ -427,3 +503,6 @@ After downstream adoption, rollback requires consumers to return to fail-closed 
 2. Which local filesystem profiles qualify on Unix and Windows?
 3. Which coordination records are genuinely generation-independent?
 4. Should a future authority-rotation protocol be pursued, or should generation-bound connections remain permanently non-rotating?
+5. What exact accessor ergonomics best preserve the selected purpose-specific
+   wrapper, no-codec, no-weaker-conversion, and no-authority-extraction
+   contract?
