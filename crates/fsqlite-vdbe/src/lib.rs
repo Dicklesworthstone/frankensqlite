@@ -310,12 +310,11 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
         }
         Opcode::SorterCompare => {
             let (read_start, read_len) = register_range(op.p3, 1);
-            let (write_start, write_len) =
-                if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 {
-                    (read_start, read_len)
-                } else {
-                    (-1, 0)
-                };
+            let (write_start, write_len) = if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 {
+                (read_start, read_len)
+            } else {
+                (-1, 0)
+            };
             (read_start, read_len, write_start, write_len)
         }
         Opcode::SorterOpen if (op.p5 & SORTER_OPEN_TOP_N_REGISTER) != 0 => {

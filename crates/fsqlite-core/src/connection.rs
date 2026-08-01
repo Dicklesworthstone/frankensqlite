@@ -10625,11 +10625,7 @@ struct PendingConnectedLiveVtabRegistryGuard<'a> {
 }
 
 impl<'a> TakenLiveVtabRestoreGuard<'a> {
-    fn new(
-        conn: &'a Connection,
-        table_key: String,
-        taken: TakenLiveVtabInstance,
-    ) -> Self {
+    fn new(conn: &'a Connection, table_key: String, taken: TakenLiveVtabInstance) -> Self {
         Self {
             conn,
             table_key,
@@ -10676,15 +10672,14 @@ impl Drop for TakenLiveVtabRestoreGuard<'_> {
             .remove(&self.table_key)
         {
             let cx = self.conn.teardown_cx();
-            let cleanup_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.conn.cleanup_detached_live_vtab(
-                        &cx,
-                        &self.table_key,
-                        taken,
-                        LiveVtabCleanupAction::Disconnect,
-                    )
-                }));
+            let cleanup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.conn.cleanup_detached_live_vtab(
+                    &cx,
+                    &self.table_key,
+                    taken,
+                    LiveVtabCleanupAction::Disconnect,
+                )
+            }));
             match cleanup_result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::error!(
@@ -10868,9 +10863,7 @@ impl<'a> PendingConnectedLiveVtabRegistryGuard<'a> {
     ) -> Result<()> {
         if self.instances.contains_key(&table_key) {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "schema reload contains duplicate virtual table key `{table_key}`"
-                ),
+                detail: format!("schema reload contains duplicate virtual table key `{table_key}`"),
             });
         }
         self.instances.insert(table_key, pending.take_instance());
@@ -10884,9 +10877,7 @@ impl<'a> PendingConnectedLiveVtabRegistryGuard<'a> {
             .find(|key| self.instances.contains_key(*key))
         {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "schema reload contains duplicate virtual table key `{duplicate}`"
-                ),
+                detail: format!("schema reload contains duplicate virtual table key `{duplicate}`"),
             });
         }
         self.instances.extend(std::mem::take(&mut other.instances));
@@ -12197,8 +12188,7 @@ impl Connection {
     pub fn background_status(&self) -> Result<()> {
         if self.live_vtab_callback_depth.get() != 0 {
             return Err(FrankenError::Internal(
-                "recursive SQL is not allowed while a virtual-table callback is active"
-                    .to_owned(),
+                "recursive SQL is not allowed while a virtual-table callback is active".to_owned(),
             ));
         }
         if let Some(detail) = self.post_vacuum_rebind_failure.borrow().as_deref() {
@@ -13308,12 +13298,11 @@ impl Connection {
             LiveVtabCleanupAction::Destroy => "xDestroy",
         };
         let _callback_guard = self.enter_live_vtab_callback(callback_name)?;
-        let cleanup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match action {
+        let cleanup_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match action {
                 LiveVtabCleanupAction::Disconnect => taken.instance.disconnect(cx),
                 LiveVtabCleanupAction::Destroy => taken.instance.destroy(cx),
-            }
-        }));
+            }));
         // The erased instance can own a user-defined Rust destructor. Drop it
         // while the callback-phase guard is still active so reentrant SQL
         // cannot observe partially reconciled transaction state. This is also
@@ -13364,7 +13353,9 @@ impl Connection {
                 } else {
                     registry.insert(
                         table_name.to_owned(),
-                        instance.take().expect("taken live-vtab instance is present"),
+                        instance
+                            .take()
+                            .expect("taken live-vtab instance is present"),
                     );
                     return Ok(());
                 }
@@ -13431,13 +13422,11 @@ impl Connection {
         callback: impl FnOnce(&mut dyn ErasedVtabInstance) -> Result<R>,
     ) -> Result<R> {
         let key = table_name.to_ascii_uppercase();
-        let mut taken = self
-            .take_active_live_vtab_instance(&key)
-            .ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "virtual table {table_name} missing for {callback_name}"
-                ))
-            })?;
+        let mut taken = self.take_active_live_vtab_instance(&key).ok_or_else(|| {
+            FrankenError::Internal(format!(
+                "virtual table {table_name} missing for {callback_name}"
+            ))
+        })?;
         let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.invoke_taken_live_vtab_instance(&mut taken, callback_name, callback)
         }));
@@ -13446,12 +13435,7 @@ impl Connection {
             .borrow_mut()
             .remove(&key);
         let registry_result = if invalidate_after_callback {
-            self.cleanup_detached_live_vtab(
-                cx,
-                &key,
-                taken,
-                LiveVtabCleanupAction::Disconnect,
-            )
+            self.cleanup_detached_live_vtab(cx, &key, taken, LiveVtabCleanupAction::Disconnect)
         } else {
             self.restore_taken_live_vtab_instance(cx, &key, taken)
         };
@@ -13629,9 +13613,7 @@ impl Connection {
         Ok(())
     }
 
-    fn take_committed_dropped_live_vtabs(
-        &self,
-    ) -> HashMap<String, Box<dyn ErasedVtabInstance>> {
+    fn take_committed_dropped_live_vtabs(&self) -> HashMap<String, Box<dyn ErasedVtabInstance>> {
         if self.dropped_vtab_instances.borrow().is_empty()
             && self.live_vtab_registry_undo.borrow().is_empty()
         {
@@ -13677,18 +13659,17 @@ impl Connection {
         context: &str,
     ) {
         for (table_name, instance) in instances {
-            let cleanup_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.cleanup_detached_live_vtab(
-                        cx,
-                        &table_name,
-                        TakenLiveVtabInstance {
-                            origin: LiveVtabRegistryOrigin::Live,
-                            instance,
-                        },
-                        action,
-                    )
-                }));
+            let cleanup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.cleanup_detached_live_vtab(
+                    cx,
+                    &table_name,
+                    TakenLiveVtabInstance {
+                        origin: LiveVtabRegistryOrigin::Live,
+                        instance,
+                    },
+                    action,
+                )
+            }));
             match cleanup_result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::error!(
@@ -13811,9 +13792,7 @@ impl Connection {
                 instance.sync_txn(cx)
             })
             .map_err(|error| {
-                FrankenError::Internal(format!(
-                    "virtual table {table_name} sync failed: {error}"
-                ))
+                FrankenError::Internal(format!("virtual table {table_name} sync failed: {error}"))
             })?;
         }
         Ok(())
@@ -13868,12 +13847,11 @@ impl Connection {
             if !should_invoke {
                 continue;
             }
-            if let Err(error) = self.with_active_live_vtab_instance(
-                cx,
-                &table_name,
-                "xRelease",
-                |instance| instance.release(cx, level),
-            ) {
+            if let Err(error) =
+                self.with_active_live_vtab_instance(cx, &table_name, "xRelease", |instance| {
+                    instance.release(cx, level)
+                })
+            {
                 errors.push(format!(
                     "virtual table {table_name} release({level}) failed: {error}"
                 ));
@@ -13903,12 +13881,11 @@ impl Connection {
             if !should_invoke {
                 continue;
             }
-            if let Err(error) = self.with_active_live_vtab_instance(
-                cx,
-                &table_name,
-                "xRollbackTo",
-                |instance| instance.rollback_to(cx, level),
-            ) {
+            if let Err(error) =
+                self.with_active_live_vtab_instance(cx, &table_name, "xRollbackTo", |instance| {
+                    instance.rollback_to(cx, level)
+                })
+            {
                 errors.push(format!(
                     "virtual table {table_name} rollback_to({level}) failed: {error}"
                 ));
@@ -13932,12 +13909,10 @@ impl Connection {
         let mut all_succeeded = true;
         let mut invalidated_instances = Vec::new();
         for table_name in names {
-            let commit_result = self.with_active_live_vtab_instance(
-                cx,
-                &table_name,
-                "xCommit",
-                |instance| instance.commit(cx),
-            );
+            let commit_result =
+                self.with_active_live_vtab_instance(cx, &table_name, "xCommit", |instance| {
+                    instance.commit(cx)
+                });
             if let Err(error) = commit_result {
                 all_succeeded = false;
                 tracing::error!(
@@ -13964,9 +13939,7 @@ impl Connection {
                 LiveVtabRegistryOrigin::Live => LiveVtabCleanupAction::Disconnect,
                 LiveVtabRegistryOrigin::Dropped => LiveVtabCleanupAction::Destroy,
             };
-            if let Err(error) =
-                self.cleanup_detached_live_vtab(cx, &table_name, taken, action)
-            {
+            if let Err(error) = self.cleanup_detached_live_vtab(cx, &table_name, taken, action) {
                 tracing::error!(
                     table = %table_name,
                     error = %error,
@@ -13980,29 +13953,23 @@ impl Connection {
         let names = self.active_live_vtab_names();
         let mut errors = Vec::new();
         for table_name in names {
-            if let Err(error) = self.with_active_live_vtab_instance(
-                cx,
-                &table_name,
-                "xRollback",
-                |instance| instance.rollback(cx),
-            ) {
+            if let Err(error) =
+                self.with_active_live_vtab_instance(cx, &table_name, "xRollback", |instance| {
+                    instance.rollback(cx)
+                })
+            {
                 errors.push(format!(
                     "virtual table {table_name} rollback failed: {error}"
                 ));
-                let cleanup_action = if self
-                    .live_vtab_was_created_in_current_transaction(&table_name)
-                {
-                    LiveVtabCleanupAction::Destroy
-                } else {
-                    LiveVtabCleanupAction::Disconnect
-                };
+                let cleanup_action =
+                    if self.live_vtab_was_created_in_current_transaction(&table_name) {
+                        LiveVtabCleanupAction::Destroy
+                    } else {
+                        LiveVtabCleanupAction::Disconnect
+                    };
                 if let Some(taken) = self.take_active_live_vtab_instance(&table_name)
-                    && let Err(cleanup_error) = self.cleanup_detached_live_vtab(
-                        cx,
-                        &table_name,
-                        taken,
-                        cleanup_action,
-                    )
+                    && let Err(cleanup_error) =
+                        self.cleanup_detached_live_vtab(cx, &table_name, taken, cleanup_action)
                 {
                     errors.push(format!(
                         "virtual table {table_name} cleanup after rollback failure failed: {cleanup_error}"
@@ -14177,16 +14144,12 @@ impl Connection {
         }
 
         let cx = self.op_cx()?;
-        let mut cursor = self.with_active_live_vtab_instance(
-            &cx,
-            &src.table_name,
-            "xOpen",
-            |instance| {
-                instance.open_cursor().map(|cursor| {
-                    LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor)
-                })
-            },
-        )?;
+        let mut cursor =
+            self.with_active_live_vtab_instance(&cx, &src.table_name, "xOpen", |instance| {
+                instance
+                    .open_cursor()
+                    .map(|cursor| LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor))
+            })?;
         self.invoke_live_vtab_callback("xFilter", || {
             cursor.erased_filter(&cx, plan.idx_num, plan.idx_str.as_deref(), &plan.args)
         })?;
@@ -14202,8 +14165,7 @@ impl Connection {
                 row.push(col_ctx.take_value().unwrap_or(SqliteValue::Null));
             }
             if src.hidden_rowid_projection.is_some() {
-                let rowid =
-                    self.invoke_live_vtab_callback("xRowid", || cursor.erased_rowid())?;
+                let rowid = self.invoke_live_vtab_callback("xRowid", || cursor.erased_rowid())?;
                 row.push(SqliteValue::Integer(rowid));
             }
             rows.push(row);
@@ -14274,9 +14236,9 @@ impl Connection {
             &name.name,
             "xOpen",
             |instance| {
-                instance.open_cursor().map(|cursor| {
-                    LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor)
-                })
+                instance
+                    .open_cursor()
+                    .map(|cursor| LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor))
             },
         )?);
 
@@ -14293,18 +14255,14 @@ impl Connection {
                     cursor.erased_filter(&cursor_cx, 0, None, &[])
                 })?;
                 let mut count = 0_i64;
-                while !self
-                    .invoke_live_vtab_callback("xEof", || Ok(cursor.erased_eof()))?
-                {
+                while !self.invoke_live_vtab_callback("xEof", || Ok(cursor.erased_eof()))? {
                     count = count.checked_add(1).ok_or_else(|| {
                         FrankenError::Internal(format!(
                             "virtual table row count exceeds i64: {}",
                             name.name
                         ))
                     })?;
-                    self.invoke_live_vtab_callback("xNext", || {
-                        cursor.erased_next(&cursor_cx)
-                    })?;
+                    self.invoke_live_vtab_callback("xNext", || cursor.erased_next(&cursor_cx))?;
                 }
                 count
             }
@@ -17062,8 +17020,7 @@ impl Connection {
         }
 
         let live_vtab_instances = std::mem::take(self.vtab_instances.get_mut());
-        let staged_dropped_vtab_instances =
-            std::mem::take(self.dropped_vtab_instances.get_mut());
+        let staged_dropped_vtab_instances = std::mem::take(self.dropped_vtab_instances.get_mut());
         self.live_vtab_transactions.get_mut().clear();
         self.live_vtab_registry_undo.get_mut().clear();
         self.live_vtab_failed_begin_cleanup.get_mut().clear();
@@ -17319,23 +17276,18 @@ impl Connection {
         geometry: Box<dyn RtreeGeometry>,
     ) -> Result<()> {
         let cx = self.op_cx()?;
-        self.with_active_live_vtab_instance(
-            &cx,
-            table_name,
-            "xRegisterGeometry",
-            move |instance| {
-                let rtree = instance
-                    .as_any_mut()
-                    .downcast_mut::<RtreeVirtualTable>()
-                    .ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "virtual table {table_name} is not an R-tree instance",
-                        ))
-                    })?;
-                rtree.register_geometry(geometry_name, geometry);
-                Ok(())
-            },
-        )
+        self.with_active_live_vtab_instance(&cx, table_name, "xRegisterGeometry", move |instance| {
+            let rtree = instance
+                .as_any_mut()
+                .downcast_mut::<RtreeVirtualTable>()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "virtual table {table_name} is not an R-tree instance",
+                    ))
+                })?;
+            rtree.register_geometry(geometry_name, geometry);
+            Ok(())
+        })
     }
 
     /// Return lowercase `(name, arity)` keys for custom aggregate UDFs.
@@ -26557,9 +26509,9 @@ impl Connection {
             Ok(value) => {
                 let pager_release_result = {
                     let mut active_txn = self.active_txn.borrow_mut();
-                    active_txn.as_mut().map_or(Ok(()), |txn| {
-                        txn.release_savepoint(cx, &savepoint_name)
-                    })
+                    active_txn
+                        .as_mut()
+                        .map_or(Ok(()), |txn| txn.release_savepoint(cx, &savepoint_name))
                 };
                 if let Err(error) = pager_release_result {
                     return Err(self
@@ -26588,9 +26540,9 @@ impl Connection {
                 if matches!(statement_error, FrankenError::RaiseFail(_)) {
                     let pager_release_result = {
                         let mut active_txn = self.active_txn.borrow_mut();
-                        active_txn.as_mut().map_or(Ok(()), |txn| {
-                            txn.release_savepoint(cx, &savepoint_name)
-                        })
+                        active_txn
+                            .as_mut()
+                            .map_or(Ok(()), |txn| txn.release_savepoint(cx, &savepoint_name))
                     };
                     if let Err(error) = pager_release_result {
                         return Err(self
@@ -36760,38 +36712,33 @@ impl Connection {
             contentless
         };
         let (inserted_rowids, patch_first_column_with_rowid) = self
-            .with_active_live_vtab_instance(
-                &cx,
-                table_name,
-                "xBegin/xUpdate",
-                |instance| {
-                    self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)?;
-                    let patch_first_column_with_rowid = is_rtree_instance(instance);
-                    let mut inserted_rowids = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let mut args = Vec::with_capacity(row.values.len() + 2);
-                        args.push(SqliteValue::Null);
-                        let new_rowid = if patch_first_column_with_rowid {
-                            row.explicit_rowid
-                                .clone()
-                                .or_else(|| row.values.first().cloned())
-                                .unwrap_or(SqliteValue::Null)
-                        } else {
-                            row.explicit_rowid.clone().unwrap_or(SqliteValue::Null)
-                        };
-                        args.push(new_rowid);
-                        args.extend(row.values.iter().cloned());
-                        let rowid = instance.update(&cx, &args)?.ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "virtual table {table_name} did not return a rowid for INSERT",
-                            ))
-                        })?;
-                        inserted_rowids.push(rowid);
-                        self.record_last_insert_rowid(rowid);
-                    }
-                    Ok((inserted_rowids, patch_first_column_with_rowid))
-                },
-            )?;
+            .with_active_live_vtab_instance(&cx, table_name, "xBegin/xUpdate", |instance| {
+                self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)?;
+                let patch_first_column_with_rowid = is_rtree_instance(instance);
+                let mut inserted_rowids = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let mut args = Vec::with_capacity(row.values.len() + 2);
+                    args.push(SqliteValue::Null);
+                    let new_rowid = if patch_first_column_with_rowid {
+                        row.explicit_rowid
+                            .clone()
+                            .or_else(|| row.values.first().cloned())
+                            .unwrap_or(SqliteValue::Null)
+                    } else {
+                        row.explicit_rowid.clone().unwrap_or(SqliteValue::Null)
+                    };
+                    args.push(new_rowid);
+                    args.extend(row.values.iter().cloned());
+                    let rowid = instance.update(&cx, &args)?.ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "virtual table {table_name} did not return a rowid for INSERT",
+                        ))
+                    })?;
+                    inserted_rowids.push(rowid);
+                    self.record_last_insert_rowid(rowid);
+                }
+                Ok((inserted_rowids, patch_first_column_with_rowid))
+            })?;
 
         #[cfg(feature = "ext-fts5")]
         if self
@@ -36931,12 +36878,12 @@ impl Connection {
                 "xBegin/xUpdate",
                 |instance| {
                     self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)?;
-                let mut count = 0usize;
-                for rowid in rowids {
-                    // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
-                    instance.update(&cx, &[SqliteValue::Integer(*rowid)])?;
-                    count = count.saturating_add(1);
-                }
+                    let mut count = 0usize;
+                    for rowid in rowids {
+                        // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
+                        instance.update(&cx, &[SqliteValue::Integer(*rowid)])?;
+                        count = count.saturating_add(1);
+                    }
                     Ok(count)
                 },
             )?;
@@ -36959,12 +36906,9 @@ impl Connection {
                 let mut count = 0usize;
                 for rowid in rowids {
                     // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
-                    self.with_active_live_vtab_instance(
-                        cx,
-                        table_name,
-                        "xUpdate",
-                        |instance| instance.update(cx, &[SqliteValue::Integer(*rowid)]),
-                    )?;
+                    self.with_active_live_vtab_instance(cx, table_name, "xUpdate", |instance| {
+                        instance.update(cx, &[SqliteValue::Integer(*rowid)])
+                    })?;
                     if cursor.table_move_to(cx, *rowid).await?.is_found() {
                         cursor.delete(cx).await?;
                     }
@@ -44785,11 +44729,9 @@ impl Connection {
             let factory_columns = self.invoke_live_vtab_callback("xColumnInfo", || {
                 Ok(factory.column_info(&full_arg_refs))
             })?;
-            let col_infos =
-                resolve_virtual_table_column_infos(declared_columns, factory_columns);
-            let instance = self.invoke_live_vtab_callback("xCreate", || {
-                factory.create(&cx, &full_arg_refs)
-            })?;
+            let col_infos = resolve_virtual_table_column_infos(declared_columns, factory_columns);
+            let instance =
+                self.invoke_live_vtab_callback("xCreate", || factory.create(&cx, &full_arg_refs))?;
             let mut pending_instance =
                 PendingLiveVtabGuard::created(self, &cx, &table_name, instance);
             #[cfg(feature = "ext-fts5")]
@@ -44841,7 +44783,10 @@ impl Connection {
             self.note_live_vtab_created(&table_name);
 
             #[cfg(test)]
-            if self.fail_live_vtab_create_after_registry_once.replace(false) {
+            if self
+                .fail_live_vtab_create_after_registry_once
+                .replace(false)
+            {
                 return Err(FrankenError::Internal(
                     "injected CREATE VIRTUAL TABLE failure after registry publication".to_owned(),
                 ));
@@ -46951,8 +46896,7 @@ impl Connection {
         let key_term_count = index.key_term_count();
         if (!index.key_sort_directions.is_empty()
             && index.key_sort_directions.len() != key_term_count)
-            || (!index.key_collations.is_empty()
-                && index.key_collations.len() != key_term_count)
+            || (!index.key_collations.is_empty() && index.key_collations.len() != key_term_count)
         {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -46969,14 +46913,14 @@ impl Connection {
                 .columns
                 .iter()
                 .map(|column| {
-                    table.column_index(column).ok_or_else(|| {
-                        FrankenError::DatabaseCorrupt {
+                    table
+                        .column_index(column)
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "index `{}` on table `{}` refers to missing key column `{column}`",
                                 index.name, table.name
                             ),
-                        }
-                    })
+                        })
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -47653,13 +47597,8 @@ impl Connection {
                 })?
                 .clone()
         };
-        let bound_index = bind_explicit_index(
-            stmt,
-            &index_name,
-            table_name,
-            &table_schema,
-        )
-        .map_err(codegen_error_to_franken)?;
+        let bound_index = bind_explicit_index(stmt, &index_name, table_name, &table_schema)
+            .map_err(codegen_error_to_franken)?;
         let collation_registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
         for collation in bound_index.key_collations.iter().flatten() {
             validate_registered_collation(collation, &collation_registry)?;
@@ -51862,9 +51801,9 @@ impl Connection {
             // but keep the savepoint (don't pop it).
             let pager_rollback_result = {
                 let mut active_txn = self.active_txn.borrow_mut();
-                active_txn.as_mut().map_or(Ok(()), |txn| {
-                    txn.rollback_to_savepoint(cx, &canonical_name)
-                })
+                active_txn
+                    .as_mut()
+                    .map_or(Ok(()), |txn| txn.rollback_to_savepoint(cx, &canonical_name))
             };
             if let Err(error) = pager_rollback_result {
                 return Err(self
@@ -60985,8 +60924,8 @@ impl Connection {
         // snapshot. `column_info` is user code and may replace its own module
         // registration reentrantly; re-reading the map afterward would combine
         // the old factory's column shape with the replacement's instance.
-        let factory_columns = self
-            .invoke_live_vtab_callback("xColumnInfo", || {
+        let factory_columns =
+            self.invoke_live_vtab_callback("xColumnInfo", || {
                 Ok(factory.column_info(&factory_arg_refs))
             })?
             .into_iter()
@@ -61005,9 +60944,8 @@ impl Connection {
             factory_columns
         };
         let column_count = column_names.len();
-        let instance = self.invoke_live_vtab_callback("xConnect", || {
-            factory.connect(&cx, &factory_arg_refs)
-        })?;
+        let instance =
+            self.invoke_live_vtab_callback("xConnect", || factory.connect(&cx, &factory_arg_refs))?;
         let pending_instance = PendingLiveVtabGuard::connected(self, &cx, name, instance);
         let scan_result = self.scan_erased_table_function_vtab(
             pending_instance.instance(),
@@ -61092,13 +61030,10 @@ impl Connection {
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let cx = self.op_cx()?;
         let mut cursor = self.invoke_live_vtab_callback("xOpen", || {
-            vtab.open_cursor().map(|cursor| {
-                LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor)
-            })
+            vtab.open_cursor()
+                .map(|cursor| LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor))
         })?;
-        self.invoke_live_vtab_callback("xFilter", || {
-            cursor.erased_filter(&cx, 0, None, args)
-        })?;
+        self.invoke_live_vtab_callback("xFilter", || cursor.erased_filter(&cx, 0, None, args))?;
 
         let mut rows = Vec::new();
         while !self.invoke_live_vtab_callback("xEof", || Ok(cursor.erased_eof()))? {
@@ -70093,9 +70028,8 @@ impl Connection {
             ];
             full_args.extend(create_stmt.args.iter().cloned());
             let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
-            let instance = self.invoke_live_vtab_callback("xConnect", || {
-                factory.connect(cx, &full_arg_refs)
-            })?;
+            let instance =
+                self.invoke_live_vtab_callback("xConnect", || factory.connect(cx, &full_arg_refs))?;
             let mut pending_instance =
                 PendingLiveVtabGuard::connected(self, cx, table_name, instance);
 
@@ -70688,12 +70622,8 @@ impl Connection {
             let mut new_db = MemDatabase::new();
             let mut new_triggers = Vec::new();
             let mut new_views: Vec<ViewDef> = Vec::new();
-            let mut pending_indexes: Vec<(
-                String,
-                String,
-                i32,
-                fsqlite_ast::CreateIndexStatement,
-            )> = Vec::new();
+            let mut pending_indexes: Vec<(String, String, i32, fsqlite_ast::CreateIndexStatement)> =
+                Vec::new();
             let mut pending_rootpage_zero_virtual_tables: Vec<(String, String, Vec<ColumnInfo>)> =
                 Vec::new();
             let mut pending_materialized_live_vtabs: Vec<(String, String)> = Vec::new();
@@ -111816,9 +111746,7 @@ mod tests {
         f(vtab)
     }
 
-    fn register_txn_test_factory(
-        conn: &Connection,
-    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+    fn register_txn_test_factory(conn: &Connection) -> Arc<std::sync::Mutex<Vec<String>>> {
         let lifecycle_events = Arc::new(std::sync::Mutex::new(Vec::new()));
         conn.register_module(
             "txn_test",
@@ -111915,7 +111843,10 @@ mod tests {
 
         fn commit(&mut self, _cx: &Cx) -> Result<()> {
             self.record_hook("commit");
-            assert!(!self.panic_commit, "txn-aware test vtab forced commit panic");
+            assert!(
+                !self.panic_commit,
+                "txn-aware test vtab forced commit panic"
+            );
             if self.fail_commit {
                 return Err(FrankenError::Internal(
                     "txn-aware test vtab forced commit failure".to_owned(),
@@ -112245,7 +112176,12 @@ mod tests {
 
         fn eof(&self) -> bool {
             !self.filter_args_valid
-                || self.pos >= if self.table_name == "VT_PERMUTE" { 1 } else { 2 }
+                || self.pos
+                    >= if self.table_name == "VT_PERMUTE" {
+                        1
+                    } else {
+                        2
+                    }
         }
 
         fn column(&self, ctx: &mut VtabColumnContext, col: i32) -> Result<()> {
@@ -147168,9 +147104,7 @@ mod tests {
             );
             let _guard = ReentrantVtabConnectionGuard::install(&connection);
             connection
-                .execute(
-                    "CREATE VIRTUAL TABLE cursor_drop_table USING cursor_drop_probe(value);",
-                )
+                .execute("CREATE VIRTUAL TABLE cursor_drop_table USING cursor_drop_probe(value);")
                 .await
                 .unwrap();
 
@@ -147202,9 +147136,7 @@ mod tests {
             assert_eq!(probe.drops.load(AtomicOrdering::SeqCst), 3);
             assert_eq!(probe.guarded_drops.load(AtomicOrdering::SeqCst), 3);
             assert_eq!(
-                probe
-                    .recursive_sql_rejections
-                    .load(AtomicOrdering::SeqCst),
+                probe.recursive_sql_rejections.load(AtomicOrdering::SeqCst),
                 3,
                 "cursor destructors must observe recursive SQL as rejected"
             );
@@ -148792,12 +148724,25 @@ mod tests {
                 ],
                 "failed xSavepoint must escalate directly to full xRollback fanout"
             );
-            assert!(!conn.in_transaction(), "fatal savepoint failure must close the transaction");
+            assert!(
+                !conn.in_transaction(),
+                "fatal savepoint failure must close the transaction"
+            );
             assert!(conn.savepoints.borrow().is_empty());
             assert!(conn.live_vtab_transactions.borrow().is_empty());
             assert!(conn.background_status().is_ok());
-            assert!(conn.query("SELECT value FROM vt1;").await.unwrap().is_empty());
-            assert!(conn.query("SELECT value FROM vt2;").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT value FROM vt1;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                conn.query("SELECT value FROM vt2;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -148991,7 +148936,12 @@ mod tests {
             assert!(!conn.in_transaction());
             assert!(conn.live_vtab_transactions.borrow().is_empty());
             assert!(conn.background_status().is_ok());
-            assert!(conn.query("SELECT value FROM vt;").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT value FROM vt;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -149038,8 +148988,18 @@ mod tests {
             );
             assert!(!conn.in_transaction());
             assert!(conn.savepoints.borrow().is_empty());
-            assert!(conn.query("SELECT value FROM vt1;").await.unwrap().is_empty());
-            assert!(conn.query("SELECT value FROM vt2;").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT value FROM vt1;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                conn.query("SELECT value FROM vt2;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -149088,8 +149048,18 @@ mod tests {
             );
             assert!(!conn.in_transaction());
             assert!(conn.savepoints.borrow().is_empty());
-            assert!(conn.query("SELECT value FROM vt1;").await.unwrap().is_empty());
-            assert!(conn.query("SELECT value FROM vt2;").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT value FROM vt1;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                conn.query("SELECT value FROM vt2;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -149269,10 +149239,7 @@ mod tests {
             );
 
             conn.execute("COMMIT;").await.unwrap();
-            let rows = conn
-                .query("SELECT value FROM keeper;")
-                .await
-                .unwrap();
+            let rows = conn.query("SELECT value FROM keeper;").await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].values(), &[SqliteValue::Text("survives".into())]);
         });
@@ -149317,16 +149284,10 @@ mod tests {
             assert!(!conn.dropped_vtab_instances.borrow().contains_key("VT"));
             let rows = conn.query("SELECT value FROM vt;").await.unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows[0].values(),
-                &[SqliteValue::Text("still-live".into())]
-            );
+            assert_eq!(rows[0].values(), &[SqliteValue::Text("still-live".into())]);
 
             conn.execute("COMMIT;").await.unwrap();
-            let rows = conn
-                .query("SELECT value FROM keeper;")
-                .await
-                .unwrap();
+            let rows = conn.query("SELECT value FROM keeper;").await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].values(), &[SqliteValue::Text("survives".into())]);
             assert!(conn.vtab_instances.borrow().contains_key("VT"));
@@ -149663,10 +149624,7 @@ mod tests {
                     struct NestedGeometry;
 
                     impl fsqlite_ext_rtree::RtreeGeometry for NestedGeometry {
-                        fn query_func(
-                            &self,
-                            _bbox: &[f64],
-                        ) -> fsqlite_ext_rtree::RtreeQueryResult {
+                        fn query_func(&self, _bbox: &[f64]) -> fsqlite_ext_rtree::RtreeQueryResult {
                             fsqlite_ext_rtree::RtreeQueryResult::Include
                         }
                     }
@@ -149679,10 +149637,8 @@ mod tests {
                     let safely_rejected = result.is_err_and(|error| {
                         error.to_string().contains("recursive SQL is not allowed")
                     });
-                    self.observation.store(
-                        if safely_rejected { 1 } else { 2 },
-                        AtomicOrdering::SeqCst,
-                    );
+                    self.observation
+                        .store(if safely_rejected { 1 } else { 2 }, AtomicOrdering::SeqCst);
                 }
             }
 
@@ -149715,11 +149671,7 @@ mod tests {
                 .unwrap();
 
             connection
-                .register_rtree_geometry(
-                    "spatial",
-                    "replace_me",
-                    Box::new(ReplacementGeometry),
-                )
+                .register_rtree_geometry("spatial", "replace_me", Box::new(ReplacementGeometry))
                 .unwrap();
 
             assert_eq!(observation.load(AtomicOrdering::SeqCst), 1);

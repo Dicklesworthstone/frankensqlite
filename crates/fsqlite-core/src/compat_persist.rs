@@ -50,8 +50,7 @@ use crate::connection::{
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
-    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
-    bind_explicit_index,
+    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema, bind_explicit_index,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -1751,8 +1750,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             )));
         };
 
-        let Some(Statement::CreateIndex(create_stmt)) = parse_single_statement(&create_sql)
-        else {
+        let Some(Statement::CreateIndex(create_stmt)) = parse_single_statement(&create_sql) else {
             return Err(sqlite_master_corrupt(format!(
                 "validated CREATE INDEX SQL for `{index_name}` could not be parsed during load"
             )));
