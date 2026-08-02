@@ -3582,9 +3582,6 @@ fn expression_matches_index_key(query: &Expr, key: &Expr, index_table: &str) -> 
 fn normalize_expression_index_columns(expr: &mut Expr, index_table: &str) -> bool {
     match expr {
         Expr::Literal(..) | Expr::Placeholder(..) => true,
-        // Bound values are runtime-only nodes and can never be part of a
-        // parser-authored expression-index or partial-index definition.
-        Expr::BoundOuterValue { .. } => false,
         Expr::Column(column, _) => {
             if column
                 .table
@@ -3691,7 +3688,12 @@ fn normalize_expression_index_columns(expr: &mut Expr, index_table: &str) -> boo
         Expr::RowValue(items, _) => items
             .iter_mut()
             .all(|item| normalize_expression_index_columns(item, index_table)),
-        Expr::Exists { .. } | Expr::Subquery(..) | Expr::Raise { .. } => false,
+        // Bound values are runtime-only nodes, while subqueries and RAISE
+        // expressions cannot be part of a local expression-index key.
+        Expr::BoundOuterValue { .. }
+        | Expr::Exists { .. }
+        | Expr::Subquery(..)
+        | Expr::Raise { .. } => false,
     }
 }
 
@@ -5683,8 +5685,10 @@ fn collect_table_refs(expr: &Expr, out: &mut HashSet<String>) {
             }
         }
         // Constant leaves and parser placeholders contain no column refs.
-        Expr::Literal(..) | Expr::BoundOuterValue { .. } | Expr::Placeholder(..) => {}
-        Expr::Raise { .. } => {}
+        Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Placeholder(..)
+        | Expr::Raise { .. } => {}
     }
 }
 
