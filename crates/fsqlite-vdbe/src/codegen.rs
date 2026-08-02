@@ -8,15 +8,17 @@ use std::cell::{Cell, RefCell};
 use std::env;
 use std::sync::Arc;
 
-use crate::{Label, ProgramBuilder};
+use crate::{Label, ProgramBuilder, SchemaEvaluationContext};
 use fsqlite_ast::{
     AssignmentTarget, BinaryOp, ColumnRef, ConflictAction, CreateIndexStatement, DeleteStatement,
     Distinctness, Expr, FromClause, FunctionArgs, InSet, IndexedColumn, InsertSource,
-    InsertStatement, JsonArrow, LimitClause, Literal, NullsOrder, OrderingTerm, QualifiedTableRef,
-    ResultColumn, SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery,
-    TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction, UpsertClause, UpsertTarget,
+    InsertStatement, JsonArrow, LimitClause, Literal, NullsOrder, OrderingTerm, QualifiedName,
+    QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, SortDirection, Span,
+    TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction,
+    UpsertClause, UpsertTarget,
 };
 use fsqlite_error::ErrorCode;
+use fsqlite_func::{FunctionArity, FunctionRegistry};
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{
     IndexCursorMeta, Opcode, P4, SORTER_COMPARE_TOP_N_PREFLIGHT, SORTER_OPEN_TOP_N_REGISTER,
@@ -37,36 +39,42 @@ use fsqlite_types::{SmallText, SqliteValue, StrictColumnType, TypeAffinity};
 // runs on a single thread.
 
 thread_local! {
-    static CUSTOM_AGG_KEYS: RefCell<Vec<(String, i32)>> = const { RefCell::new(Vec::new()) };
+    static CUSTOM_AGG_KEYS: RefCell<Vec<(String, FunctionArity)>> = const { RefCell::new(Vec::new()) };
+    static FUNCTION_REGISTRY: RefCell<Option<Arc<FunctionRegistry>>> = const { RefCell::new(None) };
     static USE_BUILTIN_LIKE_GLOB_SEMANTICS: Cell<bool> = const { Cell::new(true) };
     static USE_BUILTIN_SCALAR_FUNCTION_SEMANTICS: Cell<bool> = const { Cell::new(true) };
 }
 
 struct ConnectionFunctionContextGuard {
-    previous_custom_aggregate_keys: Vec<(String, i32)>,
-    previous_builtin_like_glob_semantics: bool,
-    previous_builtin_scalar_function_semantics: bool,
+    custom_aggregate_keys: Vec<(String, FunctionArity)>,
+    function_registry: Option<Arc<FunctionRegistry>>,
+    builtin_like_glob_semantics: bool,
+    builtin_scalar_function_semantics: bool,
 }
 
 impl Drop for ConnectionFunctionContextGuard {
     fn drop(&mut self) {
-        let previous_custom_aggregate_keys =
-            std::mem::take(&mut self.previous_custom_aggregate_keys);
+        let previous_custom_aggregate_keys = std::mem::take(&mut self.custom_aggregate_keys);
         CUSTOM_AGG_KEYS.with(|keys| {
             *keys.borrow_mut() = previous_custom_aggregate_keys;
         });
+        let previous_function_registry = self.function_registry.take();
+        FUNCTION_REGISTRY.with(|registry| {
+            *registry.borrow_mut() = previous_function_registry;
+        });
         USE_BUILTIN_LIKE_GLOB_SEMANTICS.with(|enabled| {
-            enabled.set(self.previous_builtin_like_glob_semantics);
+            enabled.set(self.builtin_like_glob_semantics);
         });
         USE_BUILTIN_SCALAR_FUNCTION_SEMANTICS.with(|enabled| {
-            enabled.set(self.previous_builtin_scalar_function_semantics);
+            enabled.set(self.builtin_scalar_function_semantics);
         });
     }
 }
 
 /// Run one codegen invocation with the connection's function-overriding state.
 ///
-/// Custom aggregate names must be lowercase and use `-1` for variadic arity.
+/// Custom aggregate names must be lowercase. Each frozen arity contract controls
+/// both exact/variadic precedence and the accepted variadic range.
 /// `use_builtin_like_glob_semantics` must be false when the connection has
 /// replaced an operator-compatible `like()` or `glob()` function: direct LIKE
 /// opcodes and LIKE/GLOB prefix-to-range rewrites would otherwise bypass the
@@ -76,23 +84,76 @@ impl Drop for ConnectionFunctionContextGuard {
 /// populated. The previous thread-local state is restored even if `codegen`
 /// unwinds.
 pub fn with_connection_function_context<R>(
-    custom_aggregate_keys: Vec<(String, i32)>,
+    custom_aggregate_keys: Vec<(String, FunctionArity)>,
+    use_builtin_like_glob_semantics: bool,
+    use_builtin_scalar_function_semantics: bool,
+    codegen: impl FnOnce() -> R,
+) -> R {
+    with_connection_function_registry_context(
+        None,
+        custom_aggregate_keys,
+        use_builtin_like_glob_semantics,
+        use_builtin_scalar_function_semantics,
+        codegen,
+    )
+}
+
+/// Registry-aware form of [`with_connection_function_context`] used by the
+/// connection compiler.
+///
+/// Keeping the exact immutable registry snapshot in the
+/// guard lets constant-expression decisions use frozen scalar safety metadata
+/// without invoking user callbacks or racing a later registration.
+pub fn with_connection_function_registry_context<R>(
+    function_registry: Option<Arc<FunctionRegistry>>,
+    custom_aggregate_keys: Vec<(String, FunctionArity)>,
     use_builtin_like_glob_semantics: bool,
     use_builtin_scalar_function_semantics: bool,
     codegen: impl FnOnce() -> R,
 ) -> R {
     let previous_custom_aggregate_keys = CUSTOM_AGG_KEYS
         .with(|keys| std::mem::replace(&mut *keys.borrow_mut(), custom_aggregate_keys));
+    let previous_function_registry = FUNCTION_REGISTRY
+        .with(|registry| std::mem::replace(&mut *registry.borrow_mut(), function_registry));
     let previous_builtin_like_glob_semantics = USE_BUILTIN_LIKE_GLOB_SEMANTICS
         .with(|enabled| enabled.replace(use_builtin_like_glob_semantics));
     let previous_builtin_scalar_function_semantics = USE_BUILTIN_SCALAR_FUNCTION_SEMANTICS
         .with(|enabled| enabled.replace(use_builtin_scalar_function_semantics));
     let _guard = ConnectionFunctionContextGuard {
-        previous_custom_aggregate_keys,
-        previous_builtin_like_glob_semantics,
-        previous_builtin_scalar_function_semantics,
+        custom_aggregate_keys: previous_custom_aggregate_keys,
+        function_registry: previous_function_registry,
+        builtin_like_glob_semantics: previous_builtin_like_glob_semantics,
+        builtin_scalar_function_semantics: previous_builtin_scalar_function_semantics,
     };
     codegen()
+}
+
+fn scalar_is_query_constant_for_codegen(name: &str, num_args: i32) -> bool {
+    FUNCTION_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .as_ref()
+            .and_then(|registry| registry.resolve_scalar(name, num_args))
+            .is_some_and(|resolved| resolved.query_constancy().is_query_constant())
+    })
+}
+
+fn scalar_consumes_argument_collation_for_codegen(name: &str, num_args: i32) -> bool {
+    FUNCTION_REGISTRY.with(|registry| {
+        registry.borrow().as_ref().map_or_else(
+            || {
+                matches!(
+                    (name.to_ascii_uppercase().as_str(), num_args),
+                    ("NULLIF", 2) | ("MIN" | "MAX", 2..)
+                )
+            },
+            |registry| {
+                registry
+                    .scalar_consumes_argument_collation(name, num_args)
+                    .unwrap_or(false)
+            },
+        )
+    })
 }
 
 fn use_builtin_like_glob_semantics() -> bool {
@@ -101,6 +162,19 @@ fn use_builtin_like_glob_semantics() -> bool {
 
 fn use_builtin_scalar_function_semantics() -> bool {
     USE_BUILTIN_SCALAR_FUNCTION_SEMANTICS.with(Cell::get)
+}
+
+fn use_builtin_scalar_implementation_for_codegen(name: &str, num_args: i32) -> bool {
+    FUNCTION_REGISTRY.with(|registry| {
+        registry.borrow().as_ref().map_or_else(
+            use_builtin_scalar_function_semantics,
+            |registry| {
+                registry
+                    .resolve_application_function(name, num_args)
+                    .is_none()
+            },
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -151,9 +225,64 @@ fn effective_oe(
 
 fn json_access_func_name(arrow: JsonArrow) -> &'static str {
     match arrow {
-        JsonArrow::Arrow => "JSON_ARROW",
-        JsonArrow::DoubleArrow => "JSON_DOUBLE_ARROW",
+        JsonArrow::Arrow => "->",
+        JsonArrow::DoubleArrow => "->>",
     }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_sqlite_value(b: &mut ProgramBuilder, value: &SqliteValue, reg: i32) {
+    match value {
+        SqliteValue::Null => {
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        }
+        SqliteValue::Integer(value) => {
+            if let Ok(value) = i32::try_from(*value) {
+                b.emit_op(Opcode::Integer, value, reg, 0, P4::None, 0);
+            } else {
+                b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(*value), 0);
+            }
+        }
+        SqliteValue::Float(value) => {
+            b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(*value), 0);
+        }
+        SqliteValue::Text(value) => {
+            b.emit_op(
+                Opcode::String8,
+                0,
+                reg,
+                0,
+                P4::Str(value.as_str().to_owned()),
+                0,
+            );
+        }
+        SqliteValue::Blob(value) => {
+            b.emit_op(
+                Opcode::Blob,
+                value.len() as i32,
+                reg,
+                0,
+                P4::Blob(value.as_ref().to_vec()),
+                0,
+            );
+        }
+    }
+}
+
+fn bound_outer_affinity_code(affinity: Option<TypeAffinity>) -> u8 {
+    affinity.map_or(b'A', |affinity| affinity as u8)
+}
+
+fn scalar_function_p4(canonical_name: String, args: &[Expr], ctx: Option<&ScanCtx<'_>>) -> P4 {
+    if scalar_consumes_argument_collation_for_codegen(
+        &canonical_name,
+        i32::try_from(args.len()).unwrap_or(i32::MAX),
+    )
+        && let Some(collation) = scalar_function_argument_collation_ctx(args, ctx)
+    {
+        return P4::FuncNameCollated(canonical_name, collation);
+    }
+    P4::FuncName(canonical_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -686,12 +815,21 @@ pub fn bind_explicit_index(
 
         let declared_collation = simple_column
             .and_then(|column_name| table.column_index(column_name))
-            .and_then(|column_index| table.columns[column_index].collation.as_deref())
-            .or_else(|| column_collation(&indexed.expr, table, None));
+            .and_then(|column_index| table.columns[column_index].collation.as_deref());
+        // The collation of an expression-index key is not the collation of
+        // every comparison performed inside that expression. SQLite assigns a
+        // non-BINARY key collation only to a bare column (which inherits its
+        // declaration) or to a COLLATE operator at the root of the indexed
+        // expression. Nested COLLATE operators, CAST, and unary plus can still
+        // be runtime dependencies without changing the stored key ordering.
+        let root_collation = match &indexed.expr {
+            Expr::Collate { collation, .. } => Some(collation.as_str()),
+            _ => None,
+        };
         let effective_collation = indexed
             .collation
             .as_deref()
-            .or_else(|| extract_collation(&indexed.expr))
+            .or(root_collation)
             .or(declared_collation);
         validate_explicit_index_collation(effective_collation, &context)?;
         key_collations.push(effective_collation.map(str::to_owned));
@@ -745,7 +883,29 @@ fn validate_explicit_index_term(
 ) -> Result<(), CodegenError> {
     validate_explicit_index_collation(indexed.collation.as_deref(), context)?;
     validate_explicit_index_expr_shape(&indexed.expr, context)?;
-    validate_single_table_expr_columns(&indexed.expr, table, None)
+    validate_explicit_index_key_columns(&indexed.expr, table, context)
+}
+
+fn validate_explicit_index_key_columns(
+    expr: &Expr,
+    table: &TableSchema,
+    context: &str,
+) -> Result<(), CodegenError> {
+    validate_expr_columns_with(expr, &|column| {
+        if column.table.is_some() {
+            return Err(malformed_explicit_index_expr(
+                context,
+                "the `.` operator is prohibited in index key expressions",
+            ));
+        }
+        if table.column_index(&column.column).is_some() {
+            return Ok(());
+        }
+        Err(CodegenError::ColumnNotFound {
+            table: table.name.clone(),
+            column: column.column.to_string(),
+        })
+    })
 }
 
 fn validate_explicit_index_collation(
@@ -767,6 +927,10 @@ fn malformed_explicit_index_expr(context: &str, detail: &str) -> CodegenError {
 fn validate_explicit_index_expr_shape(expr: &Expr, context: &str) -> Result<(), CodegenError> {
     match expr {
         Expr::Literal(..) | Expr::Column(..) => Ok(()),
+        Expr::BoundOuterValue { .. } => Err(malformed_explicit_index_expr(
+            context,
+            "bound outer-query values are internal and are not allowed",
+        )),
         Expr::BinaryOp { left, right, .. }
         | Expr::JsonAccess {
             expr: left,
@@ -1038,29 +1202,120 @@ fn emit_upsert_assignments(
     Ok(())
 }
 
-fn upsert_expr_collation_p4(
+fn upsert_declared_collation(
+    expr: &Expr,
+    existing_ctx: &ScanCtx<'_>,
+    _excluded_ctx: &ScanCtx<'_>,
+    table: &TableSchema,
+) -> Option<String> {
+    let source = declared_collation_source_expr(expr);
+    if let Expr::BoundOuterValue {
+        collation,
+        ..
+    } = source
+    {
+        return collation.as_name().map(str::to_owned);
+    }
+    let Expr::Column(col_ref, _) = source else {
+        return None;
+    };
+
+    // SQLite lowers excluded.* references to TK_REGISTER values. The register
+    // keeps its runtime value but does not inherit the target column's declared
+    // collation. An explicit COLLATE wrapper is handled by the caller before
+    // this declared-collation fallback.
+    if is_upsert_excluded_pseudo_table(col_ref, table, existing_ctx.table_alias) {
+        return None;
+    }
+
+    let source_table = existing_ctx.table;
+    let source_alias = existing_ctx.table_alias;
+    if col_ref.table.as_deref().is_some_and(|qualifier| {
+        !qualifier.eq_ignore_ascii_case("excluded")
+            && !matches_table_or_alias(qualifier, source_table, source_alias)
+    }) {
+        return None;
+    }
+    if let Some(index) = source_table.column_index(&col_ref.column) {
+        return Some(
+            source_table.columns[index]
+                .collation
+                .as_deref()
+                .unwrap_or("BINARY")
+                .to_owned(),
+        );
+    }
+    source_table
+        .resolves_to_hidden_rowid(&col_ref.column)
+        .then(|| "BINARY".to_owned())
+}
+
+fn upsert_effective_collation(
     expr: &Expr,
     existing_ctx: &ScanCtx<'_>,
     excluded_ctx: &ScanCtx<'_>,
     table: &TableSchema,
-) -> P4 {
-    if let Some(collation) = extract_collation(expr) {
-        return P4::Collation(collation.to_owned());
-    }
+) -> Option<String> {
+    extract_collation(expr)
+        .map(str::to_owned)
+        .or_else(|| upsert_declared_collation(expr, existing_ctx, excluded_ctx, table))
+}
 
-    let inner = if let Expr::Collate { expr: inner, .. } = expr {
-        inner.as_ref()
-    } else {
-        expr
-    };
-    let collation = if let Expr::Column(col_ref, _) = inner
+fn upsert_comparison_collation(
+    left: &Expr,
+    right: &Expr,
+    existing_ctx: &ScanCtx<'_>,
+    excluded_ctx: &ScanCtx<'_>,
+    table: &TableSchema,
+) -> Option<String> {
+    extract_collation(left)
+        .or_else(|| extract_collation(right))
+        .map(str::to_owned)
+        .or_else(|| upsert_declared_collation(left, existing_ctx, excluded_ctx, table))
+        .or_else(|| upsert_declared_collation(right, existing_ctx, excluded_ctx, table))
+}
+
+fn upsert_expr_affinity(
+    expr: &Expr,
+    existing_ctx: &ScanCtx<'_>,
+    _excluded_ctx: &ScanCtx<'_>,
+    table: &TableSchema,
+) -> u8 {
+    let inner = strip_collate_wrappers(expr);
+    if let Expr::Column(col_ref, _) = inner
         && is_upsert_excluded_pseudo_table(col_ref, table, existing_ctx.table_alias)
     {
-        column_collation(inner, excluded_ctx.table, excluded_ctx.table_alias)
+        // Like its collation, an excluded.* TK_REGISTER has no declared
+        // affinity. CAST remains intrinsic because it does not reach this
+        // direct-column branch.
+        b'A'
     } else {
-        column_collation(inner, existing_ctx.table, existing_ctx.table_alias)
-    };
-    collation.map_or(P4::None, |name| P4::Collation(name.to_owned()))
+        expr_affinity(expr, Some(existing_ctx))
+    }
+}
+
+fn upsert_comparison_affinity(
+    left: &Expr,
+    right: &Expr,
+    existing_ctx: &ScanCtx<'_>,
+    excluded_ctx: &ScanCtx<'_>,
+    table: &TableSchema,
+) -> u16 {
+    combine_comparison_affinity(
+        upsert_expr_affinity(left, existing_ctx, excluded_ctx, table),
+        upsert_expr_affinity(right, existing_ctx, excluded_ctx, table),
+    )
+}
+
+fn upsert_scalar_function_collation<'expr>(
+    args: impl IntoIterator<Item = &'expr Expr>,
+    existing_ctx: &ScanCtx<'_>,
+    excluded_ctx: &ScanCtx<'_>,
+    table: &TableSchema,
+) -> Option<String> {
+    args.into_iter().find_map(|argument| {
+        upsert_effective_collation(argument, existing_ctx, excluded_ctx, table)
+    })
 }
 
 /// Emit an expression that may reference both `excluded.*` and existing row columns.
@@ -1169,20 +1424,35 @@ fn emit_upsert_expr(
                         BinaryOp::Ge => Opcode::Ge,
                         _ => unreachable!(),
                     };
-                    let left_p4 =
-                        upsert_expr_collation_p4(left, existing_ctx, excluded_ctx, _table);
-                    let p4 = if matches!(left_p4, P4::None) {
-                        upsert_expr_collation_p4(right, existing_ctx, excluded_ctx, _table)
-                    } else {
-                        left_p4
-                    };
+                    let p4 = upsert_comparison_collation(
+                        left,
+                        right,
+                        existing_ctx,
+                        excluded_ctx,
+                        _table,
+                    )
+                    .map_or(P4::None, P4::Collation);
+                    let comparison_affinity = upsert_comparison_affinity(
+                        left,
+                        right,
+                        existing_ctx,
+                        excluded_ctx,
+                        _table,
+                    );
 
                     let null_label = b.emit_label();
                     let true_label = b.emit_label();
                     let done_label = b.emit_label();
                     b.emit_jump_to_label(Opcode::IsNull, left_reg, 0, null_label, P4::None, 0);
                     b.emit_jump_to_label(Opcode::IsNull, right_reg, 0, null_label, P4::None, 0);
-                    b.emit_jump_to_label(cmp_opcode, right_reg, left_reg, true_label, p4, 0);
+                    b.emit_jump_to_label(
+                        cmp_opcode,
+                        right_reg,
+                        left_reg,
+                        true_label,
+                        p4,
+                        comparison_affinity,
+                    );
                     b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                     b.resolve_label(true_label);
@@ -1207,7 +1477,29 @@ fn emit_upsert_expr(
                         } else {
                             Opcode::Ne
                         };
-                        b.emit_jump_to_label(cmp, right_reg, left_reg, true_label, P4::None, 0x80);
+                        let p4 = upsert_comparison_collation(
+                            left,
+                            right,
+                            existing_ctx,
+                            excluded_ctx,
+                            _table,
+                        )
+                        .map_or(P4::None, P4::Collation);
+                        let comparison_affinity = upsert_comparison_affinity(
+                            left,
+                            right,
+                            existing_ctx,
+                            excluded_ctx,
+                            _table,
+                        );
+                        b.emit_jump_to_label(
+                            cmp,
+                            right_reg,
+                            left_reg,
+                            true_label,
+                            p4,
+                            0x80 | comparison_affinity,
+                        );
                         b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
                         b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                         b.resolve_label(true_label);
@@ -1334,12 +1626,29 @@ fn emit_upsert_expr(
                             excluded_hidden_rowid_reg,
                         );
                     }
+                    let function_p4 = if scalar_consumes_argument_collation_for_codegen(
+                        &canon,
+                        i32::from(nargs),
+                    ) {
+                        upsert_scalar_function_collation(
+                            arg_list,
+                            existing_ctx,
+                            excluded_ctx,
+                            _table,
+                        )
+                        .map_or_else(
+                            || P4::FuncName(canon.clone()),
+                            |collation| P4::FuncNameCollated(canon.clone(), collation),
+                        )
+                    } else {
+                        P4::FuncName(canon.clone())
+                    };
                     b.emit_op(
                         Opcode::PureFunc,
                         0,
                         arg_base,
                         reg,
-                        P4::FuncName(canon),
+                        function_p4,
                         nargs,
                     );
                 }
@@ -1385,7 +1694,35 @@ fn emit_upsert_expr(
                     );
                     b.emit_jump_to_label(Opcode::IsNull, r_op, 0, next_when, P4::None, 0);
                     b.emit_jump_to_label(Opcode::IsNull, r_when, 0, next_when, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
+                    let comparison_p4 = operand
+                        .as_deref()
+                        .and_then(|operand| {
+                            upsert_comparison_collation(
+                                operand,
+                                when_expr,
+                                existing_ctx,
+                                excluded_ctx,
+                                _table,
+                            )
+                        })
+                        .map_or(P4::None, P4::Collation);
+                    let comparison_affinity = operand.as_deref().map_or(0, |operand| {
+                        upsert_comparison_affinity(
+                            operand,
+                            when_expr,
+                            existing_ctx,
+                            excluded_ctx,
+                            _table,
+                        )
+                    });
+                    b.emit_jump_to_label(
+                        Opcode::Ne,
+                        r_when,
+                        r_op,
+                        next_when,
+                        comparison_p4,
+                        comparison_affinity,
+                    );
                     b.free_temp(r_when);
                 } else {
                     emit_upsert_expr(
@@ -1510,12 +1847,31 @@ fn emit_upsert_expr(
                     excluded_hidden_rowid_reg,
                 );
             }
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(
+                func_name,
+                i32::from(nargs),
+            ) {
+                upsert_scalar_function_collation(
+                    [pattern.as_ref(), operand.as_ref()]
+                        .into_iter()
+                        .chain(escape.as_deref()),
+                    existing_ctx,
+                    excluded_ctx,
+                    _table,
+                )
+                .map_or_else(
+                    || P4::FuncName(func_name.to_owned()),
+                    |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
+                )
+            } else {
+                P4::FuncName(func_name.to_owned())
+            };
             b.emit_op(
                 Opcode::PureFunc,
                 0,
                 arg_base,
                 reg,
-                P4::FuncName(func_name.to_owned()),
+                function_p4,
                 nargs,
             );
             if *not {
@@ -1567,18 +1923,53 @@ fn emit_upsert_expr(
             let false_label = b.emit_label();
             let null_label = b.emit_label();
             let done_label = b.emit_label();
-            let collation_p4 =
-                upsert_expr_collation_p4(operand, existing_ctx, excluded_ctx, _table);
+            let low_collation_p4 = upsert_comparison_collation(
+                operand,
+                low,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+            )
+            .map_or(P4::None, P4::Collation);
+            let high_collation_p4 = upsert_comparison_collation(
+                operand,
+                high,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+            )
+            .map_or(P4::None, P4::Collation);
+            let low_affinity = upsert_comparison_affinity(
+                operand,
+                low,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+            );
+            let high_affinity = upsert_comparison_affinity(
+                operand,
+                high,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+            );
             b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::Lt,
                 r_low,
                 r_operand,
                 false_label,
-                collation_p4.clone(),
-                0,
+                low_collation_p4,
+                low_affinity,
             );
-            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, collation_p4, 0);
+            b.emit_jump_to_label(
+                Opcode::Gt,
+                r_high,
+                r_operand,
+                false_label,
+                high_collation_p4,
+                high_affinity,
+            );
             b.emit_jump_to_label(Opcode::IsNull, r_low, 0, null_label, P4::None, 0);
             b.emit_jump_to_label(Opcode::IsNull, r_high, 0, null_label, P4::None, 0);
             b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
@@ -1624,6 +2015,24 @@ fn emit_upsert_expr(
                 let r_saw_null = b.alloc_temp();
                 b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
                 let r_val = b.alloc_temp();
+                let in_collation = if values.len() == 1
+                    && singleton_in_rhs_is_constant(&values[0])
+                {
+                    upsert_comparison_collation(
+                        operand,
+                        &values[0],
+                        existing_ctx,
+                        excluded_ctx,
+                        _table,
+                    )
+                } else {
+                    upsert_effective_collation(operand, existing_ctx, excluded_ctx, _table)
+                };
+                let comparison_p4 = in_collation.map_or(P4::None, P4::Collation);
+                let comparison_affinity = combine_comparison_affinity(
+                    upsert_expr_affinity(operand, existing_ctx, excluded_ctx, _table),
+                    b'A',
+                );
                 for val_expr in values {
                     emit_upsert_expr(
                         b,
@@ -1635,7 +2044,14 @@ fn emit_upsert_expr(
                         existing_hidden_rowid_reg,
                         excluded_hidden_rowid_reg,
                     );
-                    b.emit_jump_to_label(Opcode::Eq, r_val, r_operand, true_label, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::Eq,
+                        r_val,
+                        r_operand,
+                        true_label,
+                        comparison_p4.clone(),
+                        comparison_affinity,
+                    );
                     let next_val = b.emit_label();
                     let set_flag = b.emit_label();
                     b.emit_jump_to_label(Opcode::IsNull, r_val, 0, set_flag, P4::None, 0);
@@ -1690,12 +2106,28 @@ fn emit_upsert_expr(
                 existing_hidden_rowid_reg,
                 excluded_hidden_rowid_reg,
             );
+            let function_name = json_access_func_name(*arrow);
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2)
+            {
+                upsert_scalar_function_collation(
+                    [inner.as_ref(), path.as_ref()],
+                    existing_ctx,
+                    excluded_ctx,
+                    _table,
+                )
+                .map_or_else(
+                    || P4::FuncName(function_name.to_owned()),
+                    |collation| P4::FuncNameCollated(function_name.to_owned(), collation),
+                )
+            } else {
+                P4::FuncName(function_name.to_owned())
+            };
             b.emit_op(
                 Opcode::PureFunc,
                 0,
                 arg_base,
                 reg,
-                P4::FuncName(json_access_func_name(*arrow).to_owned()),
+                function_p4,
                 2,
             );
         }
@@ -1859,9 +2291,11 @@ fn emit_set_snapshot(b: &mut ProgramBuilder, cursor: i32, tt: Option<&TimeTravel
 fn count_anon_placeholders(expr: &Expr) -> u32 {
     match expr {
         Expr::Placeholder(fsqlite_ast::PlaceholderType::Anonymous, _) => 1,
-        Expr::Placeholder(_, _) | Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => {
-            0
-        }
+        Expr::Placeholder(_, _)
+        | Expr::Literal(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(_, _)
+        | Expr::Raise { .. } => 0,
         Expr::Subquery(subquery, _) | Expr::Exists { subquery, .. } => {
             count_anon_placeholders_in_select(subquery)
         }
@@ -2077,9 +2511,12 @@ fn count_anon_placeholders_in_frame_bound(bound: &fsqlite_ast::FrameBound) -> u3
 /// reorder the expression.
 fn expr_contains_non_numbered_placeholder(expr: &Expr) -> bool {
     match expr {
-        Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _) => false,
+        Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+        | Expr::Literal(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(_, _)
+        | Expr::Raise { .. } => false,
         Expr::Placeholder(_, _) => true,
-        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => false,
         Expr::Subquery(select, _)
         | Expr::Exists {
             subquery: select, ..
@@ -4768,7 +5205,7 @@ struct RowidRangeTarget<'a> {
 #[derive(Clone)]
 enum ColumnRangeExpr<'a> {
     Borrowed(&'a Expr),
-    Owned(Expr),
+    Owned(Box<Expr>),
 }
 
 #[derive(Clone)]
@@ -7478,6 +7915,13 @@ fn count_exists_semijoin_merge_is_safe(
     if !matches!(probe_source.value, InProbeValue::Rowid) {
         return false;
     }
+    count_rowid_probe_index_is_seek_compatible(table, idx_schema)
+}
+
+fn count_rowid_probe_index_is_seek_compatible(
+    table: &TableSchema,
+    idx_schema: &IndexSchema,
+) -> bool {
     idx_schema
         .columns
         .first()
@@ -8387,15 +8831,15 @@ fn codegen_select_ordered_scan(
         } else {
             stored_data_base
         };
+    let scan = ScanCtx {
+        cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
     {
-        let scan = ScanCtx {
-            cursor,
-            table,
-            table_alias,
-            schema: Some(schema),
-            register_base: None,
-            secondaries: &[],
-        };
         let mut output_emitted = vec![false; num_data_cols];
 
         // In the ordinary (non-merged) SQLite DISTINCT+ORDER BY shape, result
@@ -8406,11 +8850,8 @@ fn codegen_select_ordered_scan(
         if let Some(distinct_cursor) = distinct_cursor {
             emit_column_reads_selected(
                 b,
-                cursor,
+                &scan,
                 columns,
-                table,
-                table_alias,
-                schema,
                 output_base,
                 |_| true,
             )?;
@@ -8449,11 +8890,8 @@ fn codegen_select_ordered_scan(
                 if !output_emitted[output_slot] {
                     emit_column_reads_selected(
                         b,
-                        cursor,
+                        &scan,
                         columns,
-                        table,
-                        table_alias,
-                        schema,
                         output_base,
                         |slot| slot == output_slot,
                     )?;
@@ -8499,11 +8937,8 @@ fn codegen_select_ordered_scan(
         // output was already evaluated above, before its membership probe.
         emit_column_reads_selected(
             b,
-            cursor,
+            &scan,
             columns,
-            table,
-            table_alias,
-            schema,
             output_base,
             |slot| !output_emitted[slot],
         )?;
@@ -8643,11 +9078,8 @@ fn codegen_select_ordered_scan(
             );
             emit_column_reads_selected(
                 b,
-                cursor,
+                &scan,
                 columns,
-                table,
-                table_alias,
-                schema,
                 out_regs,
                 |_| true,
             )?;
@@ -8759,7 +9191,10 @@ fn has_window_columns(columns: &[ResultColumn]) -> bool {
 /// (filtered ASC variant).
 fn where_is_plain_scan_safe(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(..) | Expr::Column(..) | Expr::Placeholder(..) => true,
+        Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(..)
+        | Expr::Placeholder(..) => true,
         Expr::BinaryOp { left, right, .. } => {
             where_is_plain_scan_safe(left) && where_is_plain_scan_safe(right)
         }
@@ -8894,6 +9329,15 @@ fn is_aggregate_function_call(name: &str, args: &FunctionArgs) -> bool {
         FunctionArgs::Star => 0,
         FunctionArgs::List(items) => i32::try_from(items.len()).unwrap_or(i32::MAX),
     };
+    if let Some(kind) = FUNCTION_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .as_ref()
+            .and_then(|registry| registry.resolve_application_function(name, arity))
+            .map(|resolution| resolution.kind())
+    }) {
+        return kind.is_aggregate_callable();
+    }
     if custom_aggregate_overrides_builtin(name, arity) {
         return true;
     }
@@ -8907,6 +9351,15 @@ fn is_aggregate_function_call(name: &str, args: &FunctionArgs) -> bool {
 }
 
 fn custom_aggregate_overrides_builtin(name: &str, arity: i32) -> bool {
+    if let Some(application_override) = FUNCTION_REGISTRY.with(|registry| {
+        registry.borrow().as_ref().map(|registry| {
+            registry
+                .resolve_application_function(name, arity)
+                .is_some_and(|resolution| resolution.kind().is_aggregate_callable())
+        })
+    }) {
+        return application_override;
+    }
     let builtin_has_exact_arity = (name.eq_ignore_ascii_case("count") && matches!(arity, 0 | 1))
         || (name.eq_ignore_ascii_case("string_agg") && arity == 2)
         || (arity == 1
@@ -8920,7 +9373,8 @@ fn custom_aggregate_overrides_builtin(name: &str, arity: i32) -> bool {
     CUSTOM_AGG_KEYS.with(|keys| {
         keys.borrow().iter().any(|(custom_name, custom_arity)| {
             custom_name.eq_ignore_ascii_case(name)
-                && (*custom_arity == arity || (*custom_arity == -1 && !builtin_has_exact_arity))
+                && custom_arity.accepts(arity)
+                && (custom_arity.declared_args() != -1 || !builtin_has_exact_arity)
         })
     })
 }
@@ -8933,6 +9387,14 @@ fn custom_aggregate_overrides_builtin(name: &str, arity: i32) -> bool {
 /// and one-row MIN/MAX leaf seeks bypass part of that protocol and are valid
 /// only when the connection has not replaced the corresponding built-in.
 fn builtin_aggregate_semantics_available(name: &str, arity: i32) -> bool {
+    if FUNCTION_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .as_ref()
+            .is_some_and(|registry| registry.resolve_application_function(name, arity).is_some())
+    }) {
+        return false;
+    }
     !custom_aggregate_overrides_builtin(name, arity)
 }
 
@@ -9093,6 +9555,10 @@ fn expr_collation_for_agg(
             return Some(collation.clone());
         }
         return None;
+    }
+    if let Some(declared_collation) = bound_outer_declared_collation(expr) {
+        return (!declared_collation.eq_ignore_ascii_case("BINARY"))
+            .then(|| declared_collation.to_owned());
     }
     // Column reference: inherit from schema.
     if let Some(idx) = col_idx {
@@ -9774,7 +10240,7 @@ fn join_lookup_effective_collation<'a>(
     right: &'a Expr,
     tables: &[(&'a TableSchema, Option<&'a str>)],
 ) -> Option<&'a str> {
-    join_effective_collation(left, tables).or_else(|| join_effective_collation(right, tables))
+    join_comparison_collation_name(left, right, tables)
 }
 
 fn direct_lookup_index_collation_matches_join(
@@ -11179,6 +11645,10 @@ fn emit_join_expr(
             }
             Ok(())
         }
+        Expr::BoundOuterValue { value, .. } => {
+            emit_sqlite_value(b, value, target);
+            Ok(())
+        }
         Expr::BinaryOp {
             left, op, right, ..
         } => {
@@ -11187,8 +11657,7 @@ fn emit_join_expr(
             let right_reg = b.alloc_regs(1);
             emit_join_expr(b, left, left_reg, tables, _ctx)?;
             emit_join_expr(b, right, right_reg, tables, _ctx)?;
-            let comparison_collation = join_effective_collation(left, tables)
-                .or_else(|| join_effective_collation(right, tables))
+            let comparison_collation = join_comparison_collation_name(left, right, tables)
                 .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
             let comparison_p5 = 0x20 | join_comparison_affinity_p5(left, right, tables);
             match op {
@@ -14587,7 +15056,10 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
 
 fn expr_contains_function_call(expr: &Expr) -> bool {
     match expr {
-        Expr::FunctionCall { .. } => true,
+        // JSON operators are SQL-visible scalar function calls (`->`/`->>`)
+        // and can be replaced by an application registration. Their child
+        // expressions are irrelevant once the operator itself is recognized.
+        Expr::FunctionCall { .. } | Expr::JsonAccess { .. } => true,
         Expr::Subquery(select, _)
         | Expr::Exists {
             subquery: select, ..
@@ -14638,13 +15110,12 @@ fn expr_contains_function_call(expr: &Expr) -> bool {
                     .as_deref()
                     .is_some_and(expr_contains_function_call)
         }
-        Expr::JsonAccess { expr, path, .. } => {
-            expr_contains_function_call(expr) || expr_contains_function_call(path)
-        }
         Expr::RowValue(items, _) => items.iter().any(expr_contains_function_call),
-        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
-            false
-        }
+        Expr::Literal(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => false,
     }
 }
 
@@ -17402,7 +17873,7 @@ enum GroupByKey {
     /// Direct table column — read via `Opcode::Column`.
     Column(usize),
     /// Arbitrary expression — evaluated via `emit_expr` during the scan phase.
-    Expression(Expr),
+    Expression(Box<Expr>),
 }
 
 /// Describes one output column in a GROUP BY query.
@@ -17447,7 +17918,7 @@ fn parse_group_by_output(
             if let Some(col_idx) = resolve_column_index(expr, table) {
                 GroupByKey::Column(col_idx)
             } else {
-                GroupByKey::Expression(expr.clone())
+                GroupByKey::Expression(Box::new(expr.clone()))
             }
         })
         .collect();
@@ -17546,7 +18017,9 @@ fn parse_group_by_output(
                 } else {
                     group_by_keys
                         .iter()
-                        .position(|k| matches!(k, GroupByKey::Expression(e) if e == expr))
+                        .position(|k| {
+                            matches!(k, GroupByKey::Expression(e) if e.as_ref() == expr)
+                        })
                 }
                 .ok_or_else(|| {
                     CodegenError::Unsupported("result column not in GROUP BY clause".to_owned())
@@ -24357,7 +24830,8 @@ fn parse_default_expr(default_sql: &str) -> Option<Expr> {
 fn default_expr_is_self_contained(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_, _) => true,
-        Expr::Column(_, _)
+        Expr::BoundOuterValue { .. }
+        | Expr::Column(_, _)
         | Expr::Exists { .. }
         | Expr::Subquery(_, _)
         | Expr::Raise { .. }
@@ -24459,7 +24933,9 @@ fn emit_index_predicate_guard(
         return;
     };
     let result_reg = b.alloc_reg();
-    emit_expr(b, &predicate, result_reg, Some(scan_ctx));
+    b.with_schema_evaluation_context(SchemaEvaluationContext::Index, |b| {
+        emit_expr(b, &predicate, result_reg, Some(scan_ctx));
+    });
     // Partial indexes include only rows where the predicate is true.
     b.emit_jump_to_label(Opcode::IfNot, result_reg, 1, skip_label, P4::None, 0);
 }
@@ -24476,7 +24952,9 @@ fn emit_index_key_term(
         return;
     };
     if let Some(expr) = parse_default_expr(term_sql) {
-        emit_expr(b, &expr, dest_reg, Some(scan_ctx));
+        b.with_schema_evaluation_context(SchemaEvaluationContext::Index, |b| {
+            emit_expr(b, &expr, dest_reg, Some(scan_ctx));
+        });
     } else {
         b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
     }
@@ -24507,7 +24985,9 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
                     register_base: Some(val_regs),
                     secondaries: &[],
                 };
-                emit_expr(b, &expr, dest_reg, Some(&gen_ctx));
+                b.with_schema_evaluation_context(SchemaEvaluationContext::GeneratedColumn, |b| {
+                    emit_expr(b, &expr, dest_reg, Some(&gen_ctx));
+                });
             } else {
                 // Expression parse failed — store NULL.
                 b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
@@ -24581,7 +25061,9 @@ fn emit_table_column_read(
             register_base: None,
             secondaries: &[],
         };
-        emit_expr(b, &gen_expr, reg, Some(&scan));
+        b.with_schema_evaluation_context(SchemaEvaluationContext::GeneratedColumn, |b| {
+            emit_expr(b, &gen_expr, reg, Some(&scan));
+        });
         emit_single_column_affinity(b, reg, col.affinity);
     } else {
         b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
@@ -24624,7 +25106,9 @@ fn emit_check_constraints(
             secondaries: &[],
         };
 
-        emit_expr(b, &expr, result_reg, Some(&check_ctx));
+        b.with_schema_evaluation_context(SchemaEvaluationContext::CheckConstraint, |b| {
+            emit_expr(b, &expr, result_reg, Some(&check_ctx));
+        });
 
         // NULL result: CHECK passes (SQLite semantics).
         b.emit_jump_to_label(Opcode::IsNull, result_reg, 0, ok_label, P4::None, 0);
@@ -24999,16 +25483,15 @@ fn emit_column_reads(
     schema: &[TableSchema],
     base_reg: i32,
 ) -> Result<(), CodegenError> {
-    emit_column_reads_selected(
-        b,
+    let scan = ScanCtx {
         cursor,
-        columns,
         table,
         table_alias,
-        schema,
-        base_reg,
-        |_| true,
-    )
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
+    emit_column_reads_selected(b, &scan, columns, base_reg, |_| true)
 }
 
 /// Emit selected flattened result columns into their normal output slots.
@@ -25020,14 +25503,15 @@ fn emit_column_reads(
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_column_reads_selected(
     b: &mut ProgramBuilder,
-    cursor: i32,
+    scan: &ScanCtx<'_>,
     columns: &[ResultColumn],
-    table: &TableSchema,
-    table_alias: Option<&str>,
-    schema: &[TableSchema],
     base_reg: i32,
     mut should_emit: impl FnMut(usize) -> bool,
 ) -> Result<(), CodegenError> {
+    let cursor = scan.cursor;
+    let table = scan.table;
+    let table_alias = scan.table_alias;
+    let schema = scan.schema;
     let mut reg = base_reg;
     let mut output_slot = 0usize;
     for col in columns {
@@ -25035,7 +25519,7 @@ fn emit_column_reads_selected(
             ResultColumn::Star => {
                 for i in 0..table.columns.len() {
                     if should_emit(output_slot) {
-                        emit_table_column_read(b, cursor, table, table_alias, Some(schema), i, reg);
+                        emit_table_column_read(b, cursor, table, table_alias, schema, i, reg);
                     }
                     reg += 1;
                     output_slot += 1;
@@ -25047,7 +25531,7 @@ fn emit_column_reads_selected(
                 }
                 for i in 0..table.columns.len() {
                     if should_emit(output_slot) {
-                        emit_table_column_read(b, cursor, table, table_alias, Some(schema), i, reg);
+                        emit_table_column_read(b, cursor, table, table_alias, schema, i, reg);
                     }
                     reg += 1;
                     output_slot += 1;
@@ -25067,7 +25551,7 @@ fn emit_column_reads_selected(
                                 cursor,
                                 table,
                                 table_alias,
-                                Some(schema),
+                                schema,
                                 col_idx,
                                 reg,
                             );
@@ -25084,15 +25568,7 @@ fn emit_column_reads_selected(
                     } else {
                         // Evaluate non-column expressions (literals, arithmetic, CASE, CAST, etc.)
                         // against the current scan row.
-                        let scan = ScanCtx {
-                            cursor,
-                            table,
-                            table_alias,
-                            schema: Some(schema),
-                            register_base: None,
-                            secondaries: &[],
-                        };
-                        emit_expr(b, expr, reg, Some(&scan));
+                        emit_expr(b, expr, reg, Some(scan));
                     }
                 }
                 reg += 1;
@@ -25166,7 +25642,9 @@ fn emit_table_column_read_from_register_row(
             register_base: Some(source_base),
             secondaries: &[],
         };
-        emit_expr(b, &generated_expr, target, Some(&scan));
+        b.with_schema_evaluation_context(SchemaEvaluationContext::GeneratedColumn, |b| {
+            emit_expr(b, &generated_expr, target, Some(&scan));
+        });
         emit_single_column_affinity(b, target, column.affinity);
     } else {
         b.emit_op(
@@ -25775,7 +26253,9 @@ impl ResolvedComparisonInfo {
         let right_resolved = resolve_column_ref(right, scan.table, scan.table_alias);
         let collation_p4 = extract_collation(left)
             .or_else(|| extract_collation(right))
+            .or_else(|| bound_outer_declared_collation(left))
             .or_else(|| resolved_primary_collation(left_resolved.as_ref(), scan.table))
+            .or_else(|| bound_outer_declared_collation(right))
             .or_else(|| resolved_primary_collation(right_resolved.as_ref(), scan.table))
             .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
         let cmp_p5 = 0x80
@@ -25807,10 +26287,11 @@ fn resolved_primary_collation<'a>(
 
 fn resolved_expr_affinity(expr: &Expr, resolved: Option<&SortKeySource>, scan: &ScanCtx<'_>) -> u8 {
     match resolved {
-        Some(SortKeySource::Column(idx)) => scan.table.columns[*idx]
-            .type_name
-            .as_deref()
-            .map_or(b'A', column_type_to_affinity),
+        Some(SortKeySource::Column(idx)) => scan
+            .table
+            .columns
+            .get(*idx)
+            .map_or(b'A', schema_column_expr_affinity),
         Some(SortKeySource::Rowid) => b'D',
         Some(SortKeySource::Expression(_)) | None => expr_affinity(expr, Some(scan)),
     }
@@ -25879,7 +26360,7 @@ enum SortKeySource {
     Column(usize),
     Rowid,
     /// Arbitrary expression (e.g., `a + b`, `LENGTH(name)`, `CASE WHEN ...`).
-    Expression(Expr),
+    Expression(Box<Expr>),
 }
 
 /// Emit bytecode to load a resolved column reference into a register.
@@ -25957,7 +26438,7 @@ fn resolve_sort_key(
     if let Expr::Column(col_ref, _) = expr {
         if let Some(qualifier) = &col_ref.table {
             if !matches_table_or_alias(qualifier, table, table_alias) {
-                return SortKeySource::Expression(expr.clone());
+                return SortKeySource::Expression(Box::new(expr.clone()));
             }
         }
         if let Some(idx) = table.column_index(&col_ref.column) {
@@ -25967,7 +26448,7 @@ fn resolve_sort_key(
             return SortKeySource::Rowid;
         }
     }
-    SortKeySource::Expression(expr.clone())
+    SortKeySource::Expression(Box::new(expr.clone()))
 }
 
 fn resolve_order_by_output_expr<'a>(
@@ -26436,6 +26917,7 @@ where
         Expr::Exists { .. }
         | Expr::Subquery(_, _)
         | Expr::Literal(_, _)
+        | Expr::BoundOuterValue { .. }
         | Expr::Placeholder(_, _)
         | Expr::Raise { .. } => Ok(()),
     }
@@ -26474,8 +26956,7 @@ fn validate_single_table_order_by_terms(
     for (term_index, term) in order_by.iter().enumerate() {
         if let Some(ordinal) = order_by_integer_ordinal(&term.expr) {
             let in_range = usize::try_from(ordinal)
-                .ok()
-                .is_some_and(|one_based| (1..=output_count).contains(&one_based));
+                .is_ok_and(|one_based| (1..=output_count).contains(&one_based));
             if !in_range {
                 return Err(CodegenError::Unsupported(format!(
                     "ORDER BY term {} out of range - should be between 1 and {output_count}",
@@ -26664,7 +27145,7 @@ fn normalize_table_local_expression(
 ) -> bool {
     let normalize = |expr: &mut Expr| normalize_table_local_expression(expr, table, table_alias);
     match expr {
-        Expr::Literal(..) | Expr::Placeholder(..) => true,
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } | Expr::Placeholder(..) => true,
         Expr::Column(column, _) => {
             if column.table.as_deref().is_some_and(|qualifier| {
                 !qualifier.eq_ignore_ascii_case(&table.name)
@@ -27064,6 +27545,15 @@ fn resolve_result_column_indices(
 }
 
 fn is_simple_constant(expr: &Expr) -> bool {
+    // This predicate is used only to admit values into raw physical
+    // rowid/index probes.  A bound outer value is logically constant for one
+    // invocation, but its comparison still carries the outer expression's
+    // affinity and declared-collation metadata.  The b-tree seek key does not
+    // encode that operand-order-dependent comparison contract, so treating a
+    // BoundOuterValue like a literal can make the probed key range either a
+    // subset or a superset of the SQL equality result.  Keep literals and bind
+    // parameters on the fast path, and make correlated values use the
+    // comparator-correct scan path.
     matches!(expr, Expr::Placeholder(..) | Expr::Literal(..))
 }
 
@@ -27088,6 +27578,99 @@ fn is_index_range_constant(expr: &Expr) -> bool {
     // whether the extracted range is seek-safe (and `is_numeric_literal_bound` mirrors this
     // negated-literal shape), so broadening extraction cannot admit an unsafe seek.
     is_rowid_range_constant(expr) || is_numeric_literal_bound(expr)
+}
+
+/// Whether an expression contains a value captured from an outer query scope.
+///
+/// Correlated rowid-probe extraction accepts expressions rather than only
+/// literals, so the top-level constant gates above are not enough: a bound
+/// value can be nested below CAST, arithmetic, CASE, or a function call.  Such
+/// a value must not become an authoritative physical seek key until that seek
+/// can reproduce the full SQL comparison's operand order, affinity, and
+/// collation.
+fn expr_contains_bound_outer_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::BoundOuterValue { .. } => true,
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => expr_contains_bound_outer_value(left) || expr_contains_bound_outer_value(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_contains_bound_outer_value(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_bound_outer_value(expr)
+                || expr_contains_bound_outer_value(low)
+                || expr_contains_bound_outer_value(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_bound_outer_value(expr)
+                || matches!(
+                    set,
+                    InSet::List(values) if values.iter().any(expr_contains_bound_outer_value)
+                )
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_bound_outer_value(expr)
+                || expr_contains_bound_outer_value(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(expr_contains_bound_outer_value)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(expr_contains_bound_outer_value)
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_bound_outer_value(when_expr)
+                        || expr_contains_bound_outer_value(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_bound_outer_value)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            matches!(
+                args,
+                FunctionArgs::List(values)
+                    if values.iter().any(expr_contains_bound_outer_value)
+            ) || order_by
+                .iter()
+                .any(|term| expr_contains_bound_outer_value(&term.expr))
+                || filter
+                    .as_deref()
+                    .is_some_and(expr_contains_bound_outer_value)
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_contains_bound_outer_value),
+        // Nested SELECT scopes are rejected separately by the rowid-probe
+        // admission gate.  They are opaque here by design.
+        Expr::Exists { .. }
+        | Expr::Subquery(..)
+        | Expr::Literal(..)
+        | Expr::Column(..)
+        | Expr::Placeholder(..)
+        | Expr::Raise { .. } => false,
+    }
 }
 
 /// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
@@ -28028,6 +28611,14 @@ fn extract_count_indexed_exists_target<'a>(
     if idx_schema.key_term_count() != 1 || idx_schema.key_term_descending(0) {
         return None;
     }
+    // This plan probes the outer index directly with inner rowids and cannot
+    // defer to an SQL comparison opcode to apply affinity.  A TEXT/BLOB outer
+    // key can compare equal only after numeric affinity while its raw index key
+    // occupies a different storage-class range, so retain only the established
+    // numeric-storage subset.
+    if !count_rowid_probe_index_is_seek_compatible(table, idx_schema) {
+        return None;
+    }
     if residual_terms
         .iter()
         .any(|term| expr_references_scan(term, table, table_alias))
@@ -28436,7 +29027,10 @@ fn borrowed_column_range_bound(expr: &Expr, inclusive: bool) -> ColumnRangeBound
 
 fn owned_string_column_range_bound<'a>(value: String, inclusive: bool) -> ColumnRangeBound<'a> {
     ColumnRangeBound {
-        expr: ColumnRangeExpr::Owned(Expr::Literal(Literal::String(value), Span::ZERO)),
+        expr: ColumnRangeExpr::Owned(Box::new(Expr::Literal(
+            Literal::String(value),
+            Span::ZERO,
+        ))),
         inclusive,
     }
 }
@@ -28850,6 +29444,7 @@ fn try_emit_column_substr_prefix(
     if !(name.eq_ignore_ascii_case("substr") || name.eq_ignore_ascii_case("substring"))
         || arg_list.len() != 3
         || ctx.register_base.is_some()
+        || !use_builtin_scalar_implementation_for_codegen(name, 3)
     {
         return false;
     }
@@ -28899,6 +29494,7 @@ fn try_emit_column_octet_length(
     if !name.eq_ignore_ascii_case("octet_length")
         || arg_list.len() != 1
         || ctx.register_base.is_some()
+        || !use_builtin_scalar_implementation_for_codegen(name, 1)
     {
         return false;
     }
@@ -29061,18 +29657,10 @@ fn scalar_in_operand_metadata(
             let resolved = resolve_column_ref(expr, table, table_alias);
             resolved_expr_affinity(expr, resolved.as_ref(), &scalar_scan)
         }
-        [ResultColumn::Star | ResultColumn::TableStar(_)] if table.columns.len() == 1 => {
-            table.columns.first().map_or(b'A', |column| {
-                if column.is_ipk {
-                    b'D'
-                } else {
-                    column
-                        .type_name
-                        .as_deref()
-                        .map_or(b'A', column_type_to_affinity)
-                }
-            })
-        }
+        [ResultColumn::Star | ResultColumn::TableStar(_)] if table.columns.len() == 1 => table
+            .columns
+            .first()
+            .map_or(b'A', schema_column_expr_affinity),
         _ => return None,
     };
     Some(ScalarInOperandMetadata { affinity })
@@ -29147,16 +29735,11 @@ fn in_probe_value_effective_collation(
 fn in_probe_value_affinity(probe_source: &InProbeSource<'_>, probe_scan: &ScanCtx<'_>) -> u8 {
     match probe_source.value {
         InProbeValue::Rowid => b'D',
-        InProbeValue::FirstColumn => probe_source.table.columns.first().map_or(b'A', |column| {
-            if column.is_ipk {
-                b'D'
-            } else {
-                column
-                    .type_name
-                    .as_deref()
-                    .map_or(b'A', column_type_to_affinity)
-            }
-        }),
+        InProbeValue::FirstColumn => probe_source
+            .table
+            .columns
+            .first()
+            .map_or(b'A', schema_column_expr_affinity),
         InProbeValue::Expr(expr) => expr_affinity(expr, Some(probe_scan)),
     }
 }
@@ -29315,7 +29898,10 @@ fn in_probe_expr_requires_semantic_fallback(expr: &Expr) -> bool {
                             .any(in_probe_expr_requires_semantic_fallback)
                 )
         }
-        Expr::Literal(..) | Expr::Column(..) | Expr::Placeholder(..) => false,
+        Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(..)
+        | Expr::Placeholder(..) => false,
     }
 }
 
@@ -29857,7 +30443,7 @@ fn try_emit_complex_in_subquery(
             distinct_cursor,
             1,
             0,
-            probe_collation.map_or(P4::None, |collation| P4::Collation(collation.to_owned())),
+            probe_collation.map_or(P4::None, |collation| P4::Collation(collation.clone())),
             0,
         );
     }
@@ -29878,7 +30464,7 @@ fn try_emit_complex_in_subquery(
         b.emit_jump_to_label(Opcode::Rewind, subq_cursor, 0, scan_done, P4::None, 0);
 
         let next_source_row = b.emit_label();
-        if let Some(where_expr) = where_clause.as_deref() {
+        if let Some(where_expr) = where_clause {
             emit_where_filter(
                 b,
                 where_expr,
@@ -30168,7 +30754,7 @@ fn try_emit_complex_in_subquery(
         b.emit_jump_to_label(Opcode::Rewind, subq_cursor, 0, selected_done, P4::None, 0);
 
         let next_source_row = b.emit_label();
-        if let Some(where_expr) = where_clause.as_deref() {
+        if let Some(where_expr) = where_clause {
             emit_where_filter(
                 b,
                 where_expr,
@@ -30533,6 +31119,134 @@ fn emit_in_probe_codegen_failure(b: &mut ProgramBuilder, reason: &str) {
     );
 }
 
+/// Lower a materialized row-value `IN` list without collapsing the row into a
+/// scalar register.
+///
+/// SQLite compares each candidate tuple field by field. A definite inequality
+/// rejects that candidate even if an earlier field comparison was unknown;
+/// only a candidate with no unequal field and at least one NULL contributes an
+/// UNKNOWN result. The final syntactic RHS tuple supplies comparison affinity
+/// and collation metadata for every candidate, matching SQLite's vector-IN
+/// expression metadata rules.
+fn emit_row_value_in_list(
+    b: &mut ProgramBuilder,
+    lhs_exprs: &[Expr],
+    values: &[Expr],
+    not: bool,
+    reg: i32,
+    ctx: Option<&ScanCtx<'_>>,
+) {
+    if lhs_exprs.is_empty() {
+        emit_in_probe_codegen_failure(b, "row-value operand has no fields");
+        return;
+    }
+
+    let mut rhs_rows = Vec::with_capacity(values.len());
+    for value in values {
+        let Expr::RowValue(rhs_exprs, _) = value else {
+            emit_in_probe_codegen_failure(b, "row-value IN list contains a scalar candidate");
+            return;
+        };
+        if rhs_exprs.len() != lhs_exprs.len() {
+            emit_in_probe_codegen_failure(
+                b,
+                &format!(
+                    "row-value IN arity mismatch: expected {}, found {}",
+                    lhs_exprs.len(),
+                    rhs_exprs.len()
+                ),
+            );
+            return;
+        }
+        rhs_rows.push(rhs_exprs.as_slice());
+    }
+
+    let Some(donor_exprs) = rhs_rows.last().copied() else {
+        // The caller handles the empty-list truth table before evaluating the
+        // LHS. Keep this defensive branch correct if the helper is reused.
+        b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+        return;
+    };
+    let Ok(lhs_arity) = i32::try_from(lhs_exprs.len()) else {
+        emit_in_probe_codegen_failure(b, "row-value IN arity exceeds VDBE register limits");
+        return;
+    };
+
+    // These must remain stable while every candidate is inspected: volatile
+    // LHS expressions are evaluated exactly once, not once per candidate.
+    let lhs_base = b.alloc_regs(lhs_arity);
+    for (field_index, lhs_expr) in lhs_exprs.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        emit_expr(b, lhs_expr, lhs_base + field_index as i32, ctx);
+    }
+
+    let matched_label = b.emit_label();
+    let null_label = b.emit_label();
+    let done_label = b.emit_label();
+    let saw_unknown = b.alloc_temp();
+    let candidate_unknown = b.alloc_temp();
+    let rhs_reg = b.alloc_temp();
+    b.emit_op(Opcode::Integer, 0, saw_unknown, 0, P4::None, 0);
+
+    for rhs_exprs in rhs_rows {
+        let candidate_rejected = b.emit_label();
+        b.emit_op(Opcode::Integer, 0, candidate_unknown, 0, P4::None, 0);
+
+        for (field_index, ((lhs_expr, rhs_expr), donor_expr)) in
+            lhs_exprs.iter().zip(rhs_exprs).zip(donor_exprs).enumerate()
+        {
+            emit_expr(b, rhs_expr, rhs_reg, ctx);
+            let next_field = b.emit_label();
+            let field_unknown = b.emit_label();
+            let comparison_p4 =
+                comparison_collation_ctx(lhs_expr, donor_expr, ctx).map_or(P4::None, P4::Collation);
+            let comparison_affinity = comparison_affinity_p5(lhs_expr, donor_expr, ctx);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let lhs_reg = lhs_base + field_index as i32;
+
+            b.emit_jump_to_label(
+                Opcode::Eq,
+                rhs_reg,
+                lhs_reg,
+                next_field,
+                comparison_p4,
+                comparison_affinity,
+            );
+            b.emit_jump_to_label(Opcode::IsNull, lhs_reg, 0, field_unknown, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IsNull, rhs_reg, 0, field_unknown, P4::None, 0);
+            // Both fields are non-NULL and unequal. This candidate is FALSE,
+            // even if an earlier field had produced UNKNOWN.
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, candidate_rejected, P4::None, 0);
+
+            b.resolve_label(field_unknown);
+            b.emit_op(Opcode::Integer, 1, candidate_unknown, 0, P4::None, 0);
+            b.resolve_label(next_field);
+        }
+
+        let mark_unknown = b.emit_label();
+        b.emit_jump_to_label(Opcode::If, candidate_unknown, 0, mark_unknown, P4::None, 0);
+        // Every field was definitely equal.
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, matched_label, P4::None, 0);
+        b.resolve_label(mark_unknown);
+        b.emit_op(Opcode::Integer, 1, saw_unknown, 0, P4::None, 0);
+        b.resolve_label(candidate_rejected);
+    }
+
+    b.emit_jump_to_label(Opcode::If, saw_unknown, 0, null_label, P4::None, 0);
+    b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.resolve_label(matched_label);
+    b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.resolve_label(null_label);
+    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    b.resolve_label(done_label);
+
+    b.free_temp(rhs_reg);
+    b.free_temp(candidate_unknown);
+    b.free_temp(saw_unknown);
+}
+
 /// Handles literals, bind parameters, binary/unary operators, CASE, CAST,
 /// and (when `ctx` is provided) column references from a table scan cursor.
 #[allow(
@@ -30590,6 +31304,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
         },
+        Expr::BoundOuterValue { value, .. } => emit_sqlite_value(b, value, reg),
         Expr::BinaryOp {
             left, op, right, ..
         } => {
@@ -30691,12 +31406,29 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             if let Some(esc) = escape {
                 emit_expr(b, esc, arg_base + 2, ctx);
             }
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(
+                func_name,
+                i32::from(nargs),
+            ) {
+                scalar_function_argument_collation_ctx(
+                    [pattern.as_ref(), operand.as_ref()]
+                        .into_iter()
+                        .chain(escape.as_deref()),
+                    ctx,
+                )
+                .map_or_else(
+                    || P4::FuncName(func_name.to_owned()),
+                    |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
+                )
+            } else {
+                P4::FuncName(func_name.to_owned())
+            };
             b.emit_op(
                 Opcode::PureFunc,
                 0,
                 arg_base,
                 reg,
-                P4::FuncName(func_name.to_owned()),
+                function_p4,
                 nargs,
             );
             if *not {
@@ -30721,9 +31453,12 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             emit_expr(b, operand, r_operand, ctx);
             emit_expr(b, low, r_low, ctx);
             emit_expr(b, high, r_high, ctx);
-            // Resolve collation from the operand (e.g. column-level NOCASE).
-            let collation_p4 = effective_collation_ctx(operand, ctx)
-                .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+            // BETWEEN is two comparisons. Each independently uses the
+            // operand's collation first, then that comparison's RHS.
+            let low_collation_p4 =
+                comparison_collation_ctx(operand, low, ctx).map_or(P4::None, P4::Collation);
+            let high_collation_p4 =
+                comparison_collation_ctx(operand, high, ctx).map_or(P4::None, P4::Collation);
             let low_aff = comparison_affinity_p5(operand, low, ctx);
             let high_aff = comparison_affinity_p5(operand, high, ctx);
             let false_label = b.emit_label();
@@ -30737,7 +31472,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 r_low,
                 r_operand,
                 false_label,
-                collation_p4.clone(),
+                low_collation_p4,
                 low_aff,
             );
             // Jump to false if operand > high (NULL high → no jump, handled below).
@@ -30746,7 +31481,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 r_high,
                 r_operand,
                 false_label,
-                collation_p4,
+                high_collation_p4,
                 high_aff,
             );
             // Passed both comparisons.  If either bound was NULL the comparison
@@ -30779,6 +31514,20 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
                     return;
                 }
+                if let Expr::RowValue(lhs_exprs, _) = operand.as_ref() {
+                    emit_row_value_in_list(b, lhs_exprs, values, *not, reg, ctx);
+                    return;
+                }
+                if values
+                    .iter()
+                    .any(|value| matches!(value, Expr::RowValue(..)))
+                {
+                    emit_in_probe_codegen_failure(
+                        b,
+                        "scalar IN list contains a row-value candidate",
+                    );
+                    return;
+                }
                 if can_use_once_materialized_in_list(values, operand, ctx) {
                     emit_once_materialized_in_list(b, operand, values, *not, reg, ctx);
                     return;
@@ -30791,9 +31540,18 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 //   v IN (...) hit           → TRUE
                 let r_operand = b.alloc_temp();
                 emit_expr(b, operand, r_operand, ctx);
-                // Resolve collation from the operand (e.g. column-level NOCASE).
-                let collation_p4 = effective_collation_ctx(operand, ctx)
-                    .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+                // A constant singleton IN-list is comparison-equivalent in
+                // SQLite, so its RHS may supply an explicit/declared collation.
+                // Longer or row-dependent lists use only the LHS collation.
+                let in_collation = if values.len() == 1 && singleton_in_rhs_is_constant(&values[0])
+                {
+                    comparison_collation_ctx(operand, &values[0], ctx)
+                } else {
+                    extract_collation(operand)
+                        .map(str::to_owned)
+                        .or_else(|| declared_collation_ctx(operand, ctx).map(str::to_owned))
+                };
+                let collation_p4 = in_collation.map_or(P4::None, P4::Collation);
                 // Apply the operand's comparison affinity to each list value, so
                 // `INTEGER_col IN ('1','5')` coerces the text literals to numbers
                 // exactly like a plain `=`/BETWEEN comparison (bd-cfmf6/bd-56aj2).
@@ -30841,6 +31599,13 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.resolve_label(done_label);
                 b.free_temp(r_operand);
             } else {
+                if matches!(operand.as_ref(), Expr::RowValue(..)) {
+                    emit_in_probe_codegen_failure(
+                        b,
+                        "multi-column subquery/table probes require prior list materialization",
+                    );
+                    return;
+                }
                 emit_in_probe_expr(b, operand, set, *not, reg, ctx);
             }
         }
@@ -30873,7 +31638,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                         0,
                         arg_base,
                         reg,
-                        P4::FuncName(canon),
+                        scalar_function_p4(canon, arg_list, ctx),
                         nargs,
                     );
                 }
@@ -30914,7 +31679,10 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                         // index key over it, or a STORED column / CHECK constraint
                         // that reads it — recompute it from the sibling column
                         // registers and coerce to its declared affinity.
-                        emit_expr(b, &gen_expr, reg, Some(sc));
+                        b.with_schema_evaluation_context(
+                            SchemaEvaluationContext::GeneratedColumn,
+                            |b| emit_expr(b, &gen_expr, reg, Some(sc)),
+                        );
                         emit_single_column_affinity(b, reg, sc.table.columns[col_idx].affinity);
                     } else {
                         b.emit_op(Opcode::Copy, reg_base + col_idx as i32, reg, 0, P4::None, 0);
@@ -30935,7 +31703,10 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     // referenced base columns resolve through this same path),
                     // then coerce to the column's declared affinity — matching
                     // what record packing applies to STORED columns at write.
-                    emit_expr(b, &gen_expr, reg, Some(sc));
+                    b.with_schema_evaluation_context(
+                        SchemaEvaluationContext::GeneratedColumn,
+                        |b| emit_expr(b, &gen_expr, reg, Some(sc)),
+                    );
                     emit_single_column_affinity(b, reg, sc.table.columns[col_idx].affinity);
                 } else {
                     b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
@@ -30990,12 +31761,26 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             let arg_base = b.alloc_regs(2);
             emit_expr(b, inner, arg_base, ctx);
             emit_expr(b, path, arg_base + 1, ctx);
+            let function_name = json_access_func_name(*arrow);
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2)
+            {
+                scalar_function_argument_collation_ctx(
+                    [inner.as_ref(), path.as_ref()],
+                    ctx,
+                )
+                .map_or_else(
+                    || P4::FuncName(function_name.to_owned()),
+                    |collation| P4::FuncNameCollated(function_name.to_owned(), collation),
+                )
+            } else {
+                P4::FuncName(function_name.to_owned())
+            };
             b.emit_op(
                 Opcode::PureFunc,
                 0,
                 arg_base,
                 reg,
-                P4::FuncName(json_access_func_name(*arrow).to_owned()),
+                function_p4,
                 2,
             );
         }
@@ -31124,6 +31909,10 @@ fn expr_references_scan(expr: &Expr, table: &TableSchema, table_alias: Option<&s
                     .as_deref()
                     .is_some_and(|inner| expr_references_scan(inner, table, table_alias))
         }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_references_scan(expr, table, table_alias)
+                || expr_references_scan(path, table, table_alias)
+        }
         Expr::Exists { .. } | Expr::Subquery(_, _) => true,
         _ => false,
     }
@@ -31138,6 +31927,110 @@ fn in_list_value_supports_once_materialization(expr: &Expr) -> bool {
         | Expr::Cast { expr: inner, .. }
         | Expr::Collate { expr: inner, .. } => in_list_value_supports_once_materialization(inner),
         _ => false,
+    }
+}
+
+/// Whether SQLite may treat a one-element IN-list as an ordinary binary
+/// comparison for collation precedence.  This is narrower than "evaluates to
+/// one value": table columns, scalar subqueries, and non-deterministic calls
+/// remain genuine IN-list terms and therefore cannot donate an RHS collation.
+/// Registry metadata admits both deterministic and SQLite slow-changing scalar
+/// calls, provided every argument is recursively query-constant.
+fn singleton_in_rhs_is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            singleton_in_rhs_is_constant(left) && singleton_in_rhs_is_constant(right)
+        }
+        Expr::JsonAccess {
+            expr: left,
+            path: right,
+            arrow,
+            ..
+        } => {
+            let name = json_access_func_name(*arrow);
+            scalar_is_query_constant_for_codegen(name, 2)
+                && singleton_in_rhs_is_constant(left)
+                && singleton_in_rhs_is_constant(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => singleton_in_rhs_is_constant(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            singleton_in_rhs_is_constant(expr)
+                && singleton_in_rhs_is_constant(low)
+                && singleton_in_rhs_is_constant(high)
+        }
+        Expr::In { expr, set, .. } => {
+            singleton_in_rhs_is_constant(expr)
+                && matches!(set, InSet::List(values) if values.iter().all(singleton_in_rhs_is_constant))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            op,
+            ..
+        } => {
+            let (name, arity) = match op {
+                fsqlite_ast::LikeOp::Like => ("like", if escape.is_some() { 3 } else { 2 }),
+                fsqlite_ast::LikeOp::Glob => ("glob", 2),
+                fsqlite_ast::LikeOp::Match => ("match", 2),
+                fsqlite_ast::LikeOp::Regexp => ("regexp", 2),
+            };
+            scalar_is_query_constant_for_codegen(name, arity)
+                && singleton_in_rhs_is_constant(expr)
+                && singleton_in_rhs_is_constant(pattern)
+                && escape.as_deref().is_none_or(singleton_in_rhs_is_constant)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_none_or(singleton_in_rhs_is_constant)
+                && whens.iter().all(|(condition, value)| {
+                    singleton_in_rhs_is_constant(condition) && singleton_in_rhs_is_constant(value)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(singleton_in_rhs_is_constant)
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if *distinct || !order_by.is_empty() || filter.is_some() || over.is_some() {
+                return false;
+            }
+            let (arity, arguments_are_constant) = match args {
+                FunctionArgs::Star => return false,
+                FunctionArgs::List(values) => {
+                    let Ok(arity) = i32::try_from(values.len()) else {
+                        return false;
+                    };
+                    (arity, values.iter().all(singleton_in_rhs_is_constant))
+                }
+            };
+            arguments_are_constant && scalar_is_query_constant_for_codegen(name, arity)
+        }
+        Expr::RowValue(values, _) => {
+            !values.is_empty() && values.iter().all(singleton_in_rhs_is_constant)
+        }
+        Expr::BoundOuterValue { .. }
+        | Expr::Column(_, _)
+        | Expr::Subquery(_, _)
+        | Expr::Exists { .. }
+        | Expr::Raise { .. } => false,
     }
 }
 
@@ -31271,7 +32164,10 @@ fn probe_expr_references_outer_scan(
             .any(|item| probe_expr_references_outer_scan(item, probe_source, scan_ctx)),
         // As above, nested SELECT scoping is deliberately unsupported here.
         Expr::Exists { .. } | Expr::Subquery(_, _) => true,
-        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+        Expr::Literal(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Placeholder(_, _)
+        | Expr::Raise { .. } => false,
     }
 }
 
@@ -31738,6 +32634,8 @@ fn extract_exists_rowid_probe<'a>(
             );
             if left_rowid
                 && !expr_references_scan(right, table, table_alias)
+                && !expr_contains_bound_outer_value(right)
+                && !expr_contains_nested_subquery(right)
                 && probe_expr.is_none()
             {
                 probe_expr = Some(right.as_ref());
@@ -31745,6 +32643,8 @@ fn extract_exists_rowid_probe<'a>(
             }
             if right_rowid
                 && !expr_references_scan(left, table, table_alias)
+                && !expr_contains_bound_outer_value(left)
+                && !expr_contains_nested_subquery(left)
                 && probe_expr.is_none()
             {
                 probe_expr = Some(left.as_ref());
@@ -32386,6 +33286,51 @@ fn emit_scalar_aggregate_subquery(
 /// For column references, tries the inner (subquery) context first; if the
 /// column doesn't belong to the inner table, falls back to the outer context.
 /// For compound expressions, recurses so nested column refs get fallback logic.
+fn fallback_declared_collation(
+    expr: &Expr,
+    inner_ctx: &ScanCtx<'_>,
+    outer_ctx: Option<&ScanCtx<'_>>,
+) -> Option<String> {
+    declared_collation_ctx(expr, Some(inner_ctx))
+        .or_else(|| outer_ctx.and_then(|outer| declared_collation_ctx(expr, Some(outer))))
+        .map(str::to_owned)
+}
+
+fn fallback_comparison_collation(
+    left: &Expr,
+    right: &Expr,
+    inner_ctx: &ScanCtx<'_>,
+    outer_ctx: Option<&ScanCtx<'_>>,
+) -> Option<String> {
+    extract_collation(left)
+        .or_else(|| extract_collation(right))
+        .map(str::to_owned)
+        .or_else(|| fallback_declared_collation(left, inner_ctx, outer_ctx))
+        .or_else(|| fallback_declared_collation(right, inner_ctx, outer_ctx))
+}
+
+fn fallback_effective_collation(
+    expr: &Expr,
+    inner_ctx: &ScanCtx<'_>,
+    outer_ctx: Option<&ScanCtx<'_>>,
+) -> Option<String> {
+    extract_collation(expr)
+        .map(str::to_owned)
+        .or_else(|| fallback_declared_collation(expr, inner_ctx, outer_ctx))
+}
+
+fn fallback_scalar_function_collation<'expr>(
+    args: impl IntoIterator<Item = &'expr Expr>,
+    inner_ctx: &ScanCtx<'_>,
+    outer_ctx: Option<&ScanCtx<'_>>,
+) -> Option<String> {
+    args.into_iter().find_map(|argument| {
+        extract_collation(argument)
+            .map(str::to_owned)
+            .or_else(|| fallback_declared_collation(argument, inner_ctx, outer_ctx))
+    })
+}
+
 fn emit_expr_with_fallback(
     b: &mut ProgramBuilder,
     expr: &Expr,
@@ -32394,10 +33339,13 @@ fn emit_expr_with_fallback(
     outer_ctx: Option<&ScanCtx<'_>>,
 ) {
     match expr {
+        Expr::BoundOuterValue { value, .. } => emit_sqlite_value(b, value, reg),
         Expr::Column(col_ref, _) => {
-            if resolve_column_in_ctx(col_ref, inner_ctx).is_some() {
+            if column_ref_resolves_in_ctx(col_ref, inner_ctx) {
                 emit_expr(b, expr, reg, Some(inner_ctx));
-            } else if let Some(outer) = outer_ctx {
+            } else if let Some(outer) =
+                outer_ctx.filter(|outer| column_ref_resolves_in_ctx(col_ref, outer))
+            {
                 emit_expr(b, expr, reg, Some(outer));
             } else {
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -32434,9 +33382,23 @@ fn emit_expr_with_fallback(
                 let null_label = b.emit_label();
                 let true_label = b.emit_label();
                 let done_label = b.emit_label();
+                let comparison_collation =
+                    fallback_comparison_collation(left, right, inner_ctx, outer_ctx)
+                        .map_or(P4::None, P4::Collation);
+                let comparison_affinity = combine_comparison_affinity(
+                    fallback_expr_affinity(left, inner_ctx, outer_ctx),
+                    fallback_expr_affinity(right, inner_ctx, outer_ctx),
+                );
                 b.emit_jump_to_label(Opcode::IsNull, r_left, 0, null_label, P4::None, 0);
                 b.emit_jump_to_label(Opcode::IsNull, r_right, 0, null_label, P4::None, 0);
-                b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, 0);
+                b.emit_jump_to_label(
+                    cmp_opcode,
+                    r_right,
+                    r_left,
+                    true_label,
+                    comparison_collation,
+                    comparison_affinity,
+                );
                 b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                 b.resolve_label(true_label);
@@ -32455,7 +33417,21 @@ fn emit_expr_with_fallback(
                     };
                     let true_label = b.emit_label();
                     let done_label = b.emit_label();
-                    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, flag);
+                    let comparison_collation =
+                        fallback_comparison_collation(left, right, inner_ctx, outer_ctx)
+                            .map_or(P4::None, P4::Collation);
+                    let comparison_affinity = combine_comparison_affinity(
+                        fallback_expr_affinity(left, inner_ctx, outer_ctx),
+                        fallback_expr_affinity(right, inner_ctx, outer_ctx),
+                    );
+                    b.emit_jump_to_label(
+                        cmp_opcode,
+                        r_right,
+                        r_left,
+                        true_label,
+                        comparison_collation,
+                        flag | comparison_affinity,
+                    );
                     b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                     b.resolve_label(true_label);
@@ -32505,12 +33481,38 @@ fn emit_expr_with_fallback(
             emit_expr_with_fallback(b, operand, r_operand, inner_ctx, outer_ctx);
             emit_expr_with_fallback(b, low, r_low, inner_ctx, outer_ctx);
             emit_expr_with_fallback(b, high, r_high, inner_ctx, outer_ctx);
+            let low_collation = fallback_comparison_collation(operand, low, inner_ctx, outer_ctx)
+                .map_or(P4::None, P4::Collation);
+            let high_collation = fallback_comparison_collation(operand, high, inner_ctx, outer_ctx)
+                .map_or(P4::None, P4::Collation);
+            let low_affinity = combine_comparison_affinity(
+                fallback_expr_affinity(operand, inner_ctx, outer_ctx),
+                fallback_expr_affinity(low, inner_ctx, outer_ctx),
+            );
+            let high_affinity = combine_comparison_affinity(
+                fallback_expr_affinity(operand, inner_ctx, outer_ctx),
+                fallback_expr_affinity(high, inner_ctx, outer_ctx),
+            );
             let false_label = b.emit_label();
             let null_label = b.emit_label();
             let done_label = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Lt, r_low, r_operand, false_label, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Lt,
+                r_low,
+                r_operand,
+                false_label,
+                low_collation,
+                low_affinity,
+            );
+            b.emit_jump_to_label(
+                Opcode::Gt,
+                r_high,
+                r_operand,
+                false_label,
+                high_collation,
+                high_affinity,
+            );
             b.emit_jump_to_label(Opcode::IsNull, r_low, 0, null_label, P4::None, 0);
             b.emit_jump_to_label(Opcode::IsNull, r_high, 0, null_label, P4::None, 0);
             b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
@@ -32566,17 +33568,62 @@ fn emit_expr_with_fallback(
             if let Some(esc) = escape {
                 emit_expr_with_fallback(b, esc, arg_base + 2, inner_ctx, outer_ctx);
             }
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(
+                func_name,
+                i32::from(nargs),
+            ) {
+                fallback_scalar_function_collation(
+                    [pattern.as_ref(), operand.as_ref()]
+                        .into_iter()
+                        .chain(escape.as_deref()),
+                    inner_ctx,
+                    outer_ctx,
+                )
+                .map_or_else(
+                    || P4::FuncName(func_name.to_owned()),
+                    |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
+                )
+            } else {
+                P4::FuncName(func_name.to_owned())
+            };
             b.emit_op(
                 Opcode::PureFunc,
                 0,
                 arg_base,
                 reg,
-                P4::FuncName(func_name.to_owned()),
+                function_p4,
                 nargs,
             );
             if *not {
                 b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
             }
+        }
+        // ── JSON extraction operators ─────────────────────────────────
+        Expr::JsonAccess {
+            expr: inner,
+            path,
+            arrow,
+            ..
+        } => {
+            let arg_base = b.alloc_regs(2);
+            emit_expr_with_fallback(b, inner, arg_base, inner_ctx, outer_ctx);
+            emit_expr_with_fallback(b, path, arg_base + 1, inner_ctx, outer_ctx);
+            let function_name = json_access_func_name(*arrow);
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2)
+            {
+                fallback_scalar_function_collation(
+                    [inner.as_ref(), path.as_ref()],
+                    inner_ctx,
+                    outer_ctx,
+                )
+                .map_or_else(
+                    || P4::FuncName(function_name.to_owned()),
+                    |collation| P4::FuncNameCollated(function_name.to_owned(), collation),
+                )
+            } else {
+                P4::FuncName(function_name.to_owned())
+            };
+            b.emit_op(Opcode::PureFunc, 0, arg_base, reg, function_p4, 2);
         }
         // ── Function call ──────────────────────────────────────────────
         Expr::FunctionCall { name, args, .. } => {
@@ -32610,14 +33657,18 @@ fn emit_expr_with_fallback(
                             outer_ctx,
                         );
                     }
-                    b.emit_op(
-                        Opcode::PureFunc,
-                        0,
-                        arg_base,
-                        reg,
-                        P4::FuncName(canon),
-                        nargs,
-                    );
+                    let function_p4 =
+                        if scalar_consumes_argument_collation_for_codegen(&canon, i32::from(nargs))
+                        {
+                            fallback_scalar_function_collation(arg_list, inner_ctx, outer_ctx)
+                                .map_or_else(
+                                    || P4::FuncName(canon.clone()),
+                                    |collation| P4::FuncNameCollated(canon.clone(), collation),
+                                )
+                        } else {
+                            P4::FuncName(canon.clone())
+                        };
+                    b.emit_op(Opcode::PureFunc, 0, arg_base, reg, function_p4, nargs);
                 }
             }
         }
@@ -32643,7 +33694,19 @@ fn emit_expr_with_fallback(
                         op_aff,
                         fallback_expr_affinity(when_expr, inner_ctx, outer_ctx),
                     );
-                    b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next, P4::None, cmp_aff);
+                    let comparison_collation =
+                        fallback_comparison_collation(op_expr, when_expr, inner_ctx, outer_ctx)
+                            .map_or(P4::None, P4::Collation);
+                    b.emit_jump_to_label(Opcode::IsNull, r_op, 0, next, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IsNull, r_when, 0, next, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::Ne,
+                        r_when,
+                        r_op,
+                        next,
+                        comparison_collation,
+                        cmp_aff,
+                    );
                     b.free_temp(r_when);
                     emit_expr_with_fallback(b, then_expr, reg, inner_ctx, outer_ctx);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
@@ -32655,7 +33718,7 @@ fn emit_expr_with_fallback(
                     let r_when = b.alloc_temp();
                     emit_expr_with_fallback(b, when_expr, r_when, inner_ctx, outer_ctx);
                     let next = b.emit_label();
-                    b.emit_jump_to_label(Opcode::IfNot, r_when, 0, next, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IfNot, r_when, 1, next, P4::None, 0);
                     b.free_temp(r_when);
                     emit_expr_with_fallback(b, then_expr, reg, inner_ctx, outer_ctx);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
@@ -32691,20 +33754,37 @@ fn emit_expr_with_fallback(
                     let done_label = b.emit_label();
                     let null_label = b.emit_label();
                     b.emit_jump_to_label(Opcode::IsNull, r_op, 0, null_label, P4::None, 0);
+                    let in_collation =
+                        if values.len() == 1 && singleton_in_rhs_is_constant(&values[0]) {
+                            fallback_comparison_collation(operand, &values[0], inner_ctx, outer_ctx)
+                        } else {
+                            fallback_effective_collation(operand, inner_ctx, outer_ctx)
+                        };
+                    let comparison_p4 = in_collation.map_or(P4::None, P4::Collation);
+                    let r_saw_null = b.alloc_temp();
+                    b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
+                    let r_val = b.alloc_temp();
                     for val in values {
-                        let r_val = b.alloc_temp();
                         emit_expr_with_fallback(b, val, r_val, inner_ctx, outer_ctx);
-                        b.emit_jump_to_label(Opcode::IsNull, r_val, 0, null_label, P4::None, 0);
                         b.emit_jump_to_label(
                             Opcode::Eq,
                             r_val,
                             r_op,
                             found_label,
-                            P4::None,
+                            comparison_p4.clone(),
                             in_aff,
                         );
-                        b.free_temp(r_val);
+                        let next_value = b.emit_label();
+                        let mark_null = b.emit_label();
+                        b.emit_jump_to_label(Opcode::IsNull, r_val, 0, mark_null, P4::None, 0);
+                        b.emit_jump_to_label(Opcode::Goto, 0, 0, next_value, P4::None, 0);
+                        b.resolve_label(mark_null);
+                        b.emit_op(Opcode::Integer, 1, r_saw_null, 0, P4::None, 0);
+                        b.resolve_label(next_value);
                     }
+                    b.free_temp(r_val);
+                    b.emit_jump_to_label(Opcode::If, r_saw_null, 0, null_label, P4::None, 0);
+                    b.free_temp(r_saw_null);
                     b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                     b.resolve_label(found_label);
@@ -32792,6 +33872,26 @@ fn resolve_column_in_ctx(col_ref: &ColumnRef, ctx: &ScanCtx<'_>) -> Option<usize
         .columns
         .iter()
         .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
+}
+
+fn column_ref_resolves_in_ctx(col_ref: &ColumnRef, ctx: &ScanCtx<'_>) -> bool {
+    if resolve_column_in_ctx(col_ref, ctx).is_some() {
+        return true;
+    }
+    if let Some(qualifier) = col_ref.table.as_deref() {
+        if matches_table_or_alias(qualifier, ctx.table, ctx.table_alias) {
+            return ctx.table.resolves_to_hidden_rowid(&col_ref.column);
+        }
+        return ctx.secondaries.iter().any(|secondary| {
+            matches_table_or_alias(qualifier, secondary.table, secondary.table_alias)
+                && table_has_column_or_rowid(secondary.table, &col_ref.column)
+        });
+    }
+    ctx.table.resolves_to_hidden_rowid(&col_ref.column)
+        || ctx
+            .secondaries
+            .iter()
+            .any(|secondary| table_has_column_or_rowid(secondary.table, &col_ref.column))
 }
 
 /// Map an AST `BinaryOp` to the corresponding VDBE opcode.
@@ -32894,8 +33994,8 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
             pattern,
             escape,
             ..
-        } => extract_collation(expr)
-            .or_else(|| extract_collation(pattern))
+        } => extract_collation(pattern)
+            .or_else(|| extract_collation(expr))
             .or_else(|| escape.as_deref().and_then(extract_collation)),
         Expr::Case {
             operand,
@@ -32917,6 +34017,7 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
         },
         Expr::RowValue(values, _) => values.iter().find_map(extract_collation),
         Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
         | Expr::Column(..)
         | Expr::Exists { .. }
         | Expr::Subquery(..)
@@ -32925,15 +34026,19 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn join_effective_collation<'a>(
+fn join_declared_collation<'a>(
     expr: &'a Expr,
-    tables: &[(&'a TableSchema, Option<&'a str>)],
+    tables: &[(&'a TableSchema, Option<&str>)],
 ) -> Option<&'a str> {
-    if let Some(collation) = extract_collation(expr) {
-        return Some(collation);
+    let source = declared_collation_source_expr(expr);
+    if let Expr::BoundOuterValue {
+        collation,
+        ..
+    } = source
+    {
+        return collation.as_name();
     }
-    let inner = declared_collation_source_expr(expr);
-    let Expr::Column(col_ref, _) = inner else {
+    let Expr::Column(col_ref, _) = source else {
         return None;
     };
     tables.iter().find_map(|(table, alias)| {
@@ -32942,19 +34047,35 @@ fn join_effective_collation<'a>(
         {
             return None;
         }
+        if let Some(index) = table.column_index(&col_ref.column) {
+            return Some(
+                table.columns[index]
+                    .collation
+                    .as_deref()
+                    .unwrap_or("BINARY"),
+            );
+        }
         table
-            .column_index(&col_ref.column)
-            .and_then(|index| table.columns[index].collation.as_deref())
+            .resolves_to_hidden_rowid(&col_ref.column)
+            .then_some("BINARY")
     })
 }
 
+fn join_comparison_collation_name<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    tables: &[(&'a TableSchema, Option<&'a str>)],
+) -> Option<&'a str> {
+    extract_collation(left)
+        .or_else(|| extract_collation(right))
+        .or_else(|| join_declared_collation(left, tables))
+        .or_else(|| join_declared_collation(right, tables))
+}
+
 fn join_expr_affinity(expr: &Expr, tables: &[(&TableSchema, Option<&str>)]) -> u8 {
-    let inner = if let Expr::Collate { expr: inner, .. } = expr {
-        inner.as_ref()
-    } else {
-        expr
-    };
+    let inner = strip_collate_wrappers(expr);
     match inner {
+        Expr::BoundOuterValue { affinity, .. } => bound_outer_affinity_code(*affinity),
         Expr::Column(col_ref, _) => tables
             .iter()
             .find_map(|(table, alias)| {
@@ -32964,12 +34085,7 @@ fn join_expr_affinity(expr: &Expr, tables: &[(&TableSchema, Option<&str>)]) -> u
                     return None;
                 }
                 if let Some(index) = table.column_index(&col_ref.column) {
-                    return Some(
-                        table.columns[index]
-                            .type_name
-                            .as_deref()
-                            .map_or(b'A', column_type_to_affinity),
-                    );
+                    return Some(schema_column_expr_affinity(&table.columns[index]));
                 }
                 table
                     .resolves_to_hidden_rowid(&col_ref.column)
@@ -32977,6 +34093,9 @@ fn join_expr_affinity(expr: &Expr, tables: &[(&TableSchema, Option<&str>)]) -> u
             })
             .unwrap_or(b'A'),
         Expr::Cast { type_name, .. } => type_name_to_affinity(type_name),
+        Expr::Subquery(select, _) => {
+            scalar_subquery_affinity_in_join(select, tables).unwrap_or(b'A')
+        }
         _ => b'A',
     }
 }
@@ -33020,6 +34139,15 @@ fn column_collation<'a>(
     table_alias: Option<&str>,
 ) -> Option<&'a str> {
     let inner = declared_collation_source_expr(expr);
+    if let Expr::BoundOuterValue {
+        collation,
+        ..
+    } = inner
+    {
+        return collation
+            .as_name()
+            .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"));
+    }
     if let Expr::Column(col_ref, _) = inner {
         if let Some(qualifier) = &col_ref.table {
             if !matches_table_or_alias(qualifier, table, table_alias) {
@@ -33031,6 +34159,99 @@ fn column_collation<'a>(
         }
     }
     None
+}
+
+/// Resolve the declared collation of the column value carried by `expr`.
+///
+/// The outer `Option` is deliberately significant: a resolved column with no
+/// named declaration still defines the BINARY collation and must stop SQLite's
+/// precedence search.  Returning `None` means that the expression does not
+/// derive its collation from a column in this scan scope.
+fn declared_collation_ctx<'a>(expr: &'a Expr, ctx: Option<&'a ScanCtx<'_>>) -> Option<&'a str> {
+    let source = declared_collation_source_expr(expr);
+    if let Expr::BoundOuterValue {
+        collation,
+        ..
+    } = source
+    {
+        return collation.as_name();
+    }
+    let ctx = ctx?;
+    let Expr::Column(col_ref, _) = source else {
+        return None;
+    };
+
+    let in_table = |table: &'a TableSchema, alias: Option<&str>| -> Option<&'a str> {
+        if col_ref
+            .table
+            .as_deref()
+            .is_some_and(|qualifier| !matches_table_or_alias(qualifier, table, alias))
+        {
+            return None;
+        }
+        if let Some(index) = table.column_index(&col_ref.column) {
+            return Some(
+                table.columns[index]
+                    .collation
+                    .as_deref()
+                    .unwrap_or("BINARY"),
+            );
+        }
+        table
+            .resolves_to_hidden_rowid(&col_ref.column)
+            .then_some("BINARY")
+    };
+
+    if col_ref.table.is_some() {
+        return in_table(ctx.table, ctx.table_alias).or_else(|| {
+            ctx.secondaries
+                .iter()
+                .find_map(|secondary| in_table(secondary.table, secondary.table_alias))
+        });
+    }
+
+    let mut winner = in_table(ctx.table, ctx.table_alias);
+    for secondary in ctx.secondaries {
+        if let Some(collation) = in_table(secondary.table, secondary.table_alias) {
+            if winner.is_some() {
+                // Validation reports the ambiguous column before execution.
+                // Do not guess a collation if this defensive path is reached.
+                return None;
+            }
+            winner = Some(collation);
+        }
+    }
+    winner
+}
+
+/// Resolve a comparison collation with SQLite precedence: an explicit
+/// COLLATE on either operand (left wins a tie), then a declared collation on
+/// either operand (again left first).  BINARY remains an explicit winner so a
+/// later named declaration cannot override it.
+fn comparison_collation_ctx(
+    left: &Expr,
+    right: &Expr,
+    ctx: Option<&ScanCtx<'_>>,
+) -> Option<String> {
+    extract_collation(left)
+        .or_else(|| extract_collation(right))
+        .map(str::to_owned)
+        .or_else(|| declared_collation_ctx(left, ctx).map(str::to_owned))
+        .or_else(|| declared_collation_ctx(right, ctx).map(str::to_owned))
+}
+
+/// NULLIF and scalar MIN/MAX choose the first argument that defines a
+/// collation.  A bare BINARY column therefore stops the search before a later
+/// argument's explicit or declared named collation.
+fn scalar_function_argument_collation_ctx<'expr>(
+    args: impl IntoIterator<Item = &'expr Expr>,
+    ctx: Option<&ScanCtx<'_>>,
+) -> Option<String> {
+    args.into_iter().find_map(|argument| {
+        extract_collation(argument)
+            .map(str::to_owned)
+            .or_else(|| declared_collation_ctx(argument, ctx).map(str::to_owned))
+    })
 }
 
 /// Reach a column whose declared collation is inherited by this expression.
@@ -33052,13 +34273,23 @@ fn declared_collation_source_expr(expr: &Expr) -> &Expr {
     }
 }
 
+fn bound_outer_declared_collation(expr: &Expr) -> Option<&str> {
+    let Expr::BoundOuterValue {
+        collation,
+        ..
+    } = declared_collation_source_expr(expr)
+    else {
+        return None;
+    };
+    collation.as_name()
+}
+
 /// Get effective collation via `ScanCtx`: explicit COLLATE first, then column-level.
 fn effective_collation_ctx<'a>(expr: &'a Expr, ctx: Option<&'a ScanCtx<'a>>) -> Option<&'a str> {
     if let Some(coll) = extract_collation(expr) {
         return Some(coll);
     }
-    let ctx = ctx?;
-    column_collation(expr, ctx.table, ctx.table_alias)
+    declared_collation_ctx(expr, ctx).filter(|collation| !collation.eq_ignore_ascii_case("BINARY"))
 }
 
 /// Emit a comparison expression that produces 1 (true) or 0 (false).
@@ -33093,9 +34324,7 @@ fn emit_comparison(
     };
 
     // Check for COLLATE on either operand, then column-level collation.
-    let p4 = effective_collation_ctx(left, ctx)
-        .or_else(|| effective_collation_ctx(right, ctx))
-        .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+    let p4 = comparison_collation_ctx(left, right, ctx).map_or(P4::None, P4::Collation);
 
     // SQL three-valued logic: if either operand is NULL, the result is NULL.
     // Check for NULL before the comparison.
@@ -33164,13 +34393,16 @@ fn emit_is_comparison(
         return;
     };
 
+    let p4 = comparison_collation_ctx(left, right, ctx).map_or(P4::None, P4::Collation);
+
+    let comparison_affinity = comparison_affinity_p5(left, right, ctx);
     b.emit_jump_to_label(
         cmp_opcode,
         r_right,
         r_left,
         true_label,
-        P4::None,
-        nulleq_flag,
+        p4,
+        nulleq_flag | comparison_affinity,
     );
     b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
@@ -33247,8 +34479,18 @@ fn emit_case_expr(
             // operand coerces a text WHEN literal to a number before comparing.
             let cmp_aff =
                 operand.map_or(0, |op_expr| comparison_affinity_p5(op_expr, when_expr, ctx));
+            let comparison_collation = operand
+                .and_then(|op_expr| comparison_collation_ctx(op_expr, when_expr, ctx))
+                .map_or(P4::None, P4::Collation);
             // If operand != when_value, skip to next WHEN.
-            b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, cmp_aff);
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                r_when,
+                r_op,
+                next_when,
+                comparison_collation,
+                cmp_aff,
+            );
             b.free_temp(r_when);
         } else {
             // Searched CASE: each WHEN is a boolean condition.
@@ -33278,21 +34520,372 @@ fn emit_case_expr(
     }
 }
 
+fn strip_collate_wrappers(mut expr: &Expr) -> &Expr {
+    while let Expr::Collate { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    expr
+}
+
+#[derive(Clone)]
+struct AffinityTableBinding<'a> {
+    table: &'a TableSchema,
+    alias: Option<String>,
+}
+
+enum ScopedColumnAffinity {
+    Missing,
+    Resolved(u8),
+    Ambiguous,
+}
+
+fn schema_column_expr_affinity(column: &ColumnInfo) -> u8 {
+    if column.is_ipk {
+        b'D'
+    } else {
+        match column.affinity.to_ascii_uppercase() {
+            'B' => b'B',
+            'C' => b'C',
+            'D' => b'D',
+            'E' => b'E',
+            _ => b'A',
+        }
+    }
+}
+
+fn table_column_expr_affinity(table: &TableSchema, column_name: &str) -> Option<u8> {
+    if let Some(index) = table.column_index(column_name) {
+        return table.columns.get(index).map(schema_column_expr_affinity);
+    }
+    table.resolves_to_hidden_rowid(column_name).then_some(b'D')
+}
+
+fn column_affinity_in_scope(
+    column: &ColumnRef,
+    scope: &[AffinityTableBinding<'_>],
+) -> ScopedColumnAffinity {
+    let mut resolved = None;
+    let mut qualifier_matched = false;
+    for binding in scope {
+        if let Some(qualifier) = column.table.as_deref() {
+            if !matches_table_or_alias(qualifier, binding.table, binding.alias.as_deref()) {
+                continue;
+            }
+            qualifier_matched = true;
+        }
+        let Some(affinity) = table_column_expr_affinity(binding.table, &column.column) else {
+            continue;
+        };
+        if resolved.replace(affinity).is_some() {
+            return ScopedColumnAffinity::Ambiguous;
+        }
+    }
+    if let Some(affinity) = resolved {
+        ScopedColumnAffinity::Resolved(affinity)
+    } else if qualifier_matched {
+        // A matching local qualifier shadows outer scopes even when the named
+        // column is invalid.  Treat that shape as unprovable rather than
+        // accidentally borrowing affinity from an outer table.
+        ScopedColumnAffinity::Ambiguous
+    } else {
+        ScopedColumnAffinity::Missing
+    }
+}
+
+fn scoped_column_affinity(
+    column: &ColumnRef,
+    scopes: &[&[AffinityTableBinding<'_>]],
+) -> Option<u8> {
+    for scope in scopes {
+        match column_affinity_in_scope(column, scope) {
+            ScopedColumnAffinity::Missing => {}
+            ScopedColumnAffinity::Resolved(affinity) => return Some(affinity),
+            ScopedColumnAffinity::Ambiguous => return None,
+        }
+    }
+    None
+}
+
+fn push_affinity_catalog_table<'a>(catalog: &mut Vec<&'a TableSchema>, table: &'a TableSchema) {
+    if !catalog
+        .iter()
+        .any(|candidate| std::ptr::eq(*candidate, table))
+    {
+        catalog.push(table);
+    }
+}
+
+fn extend_affinity_catalog_from_scan<'a>(catalog: &mut Vec<&'a TableSchema>, ctx: &ScanCtx<'a>) {
+    if let Some(schema) = ctx.schema {
+        for table in schema {
+            push_affinity_catalog_table(catalog, table);
+        }
+    }
+    push_affinity_catalog_table(catalog, ctx.table);
+    for secondary in ctx.secondaries {
+        push_affinity_catalog_table(catalog, secondary.table);
+    }
+}
+
+fn affinity_scope_from_scan<'a>(ctx: &ScanCtx<'a>) -> Vec<AffinityTableBinding<'a>> {
+    std::iter::once(AffinityTableBinding {
+        table: ctx.table,
+        alias: ctx.table_alias.map(str::to_owned),
+    })
+    .chain(
+        ctx.secondaries
+            .iter()
+            .map(|secondary| AffinityTableBinding {
+                table: secondary.table,
+                alias: secondary.table_alias.map(str::to_owned),
+            }),
+    )
+    .collect()
+}
+
+fn find_affinity_catalog_table<'a>(
+    name: &QualifiedName,
+    catalog: &[&'a TableSchema],
+) -> Option<&'a TableSchema> {
+    // TableSchema does not retain attached-database identity, so a qualified
+    // source cannot be proven to name a particular catalog entry here.
+    if name.schema.is_some() {
+        return None;
+    }
+    let mut found: Option<&'a TableSchema> = None;
+    for table in catalog {
+        if !table.name.eq_ignore_ascii_case(&name.name) {
+            continue;
+        }
+        if let Some(previous) = found
+            && !std::ptr::eq(previous, *table)
+        {
+            return None;
+        }
+        found = Some(*table);
+    }
+    found
+}
+
+fn collect_affinity_source_bindings<'a>(
+    source: &TableOrSubquery,
+    catalog: &[&'a TableSchema],
+    bindings: &mut Vec<AffinityTableBinding<'a>>,
+) -> Option<()> {
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => {
+            let table = find_affinity_catalog_table(name, catalog)?;
+            bindings.push(AffinityTableBinding {
+                table,
+                alias: alias.clone(),
+            });
+            Some(())
+        }
+        TableOrSubquery::ParenJoin(from) => collect_affinity_from_bindings(from, catalog, bindings),
+        // Derived tables and table-valued functions do not expose result
+        // affinity metadata through TableSchema.  Decline rather than guessing.
+        TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => None,
+    }
+}
+
+fn collect_affinity_from_bindings<'a>(
+    from: &FromClause,
+    catalog: &[&'a TableSchema],
+    bindings: &mut Vec<AffinityTableBinding<'a>>,
+) -> Option<()> {
+    collect_affinity_source_bindings(&from.source, catalog, bindings)?;
+    for join in &from.joins {
+        collect_affinity_source_bindings(&join.table, catalog, bindings)?;
+    }
+    Some(())
+}
+
+fn first_star_affinity(scope: &[AffinityTableBinding<'_>]) -> Option<u8> {
+    scope
+        .iter()
+        .find_map(|binding| binding.table.columns.first())
+        .map(schema_column_expr_affinity)
+}
+
+fn first_table_star_affinity(
+    name: &QualifiedName,
+    scope: &[AffinityTableBinding<'_>],
+) -> Option<u8> {
+    if name.schema.is_some() {
+        return None;
+    }
+    let mut found = None;
+    for binding in scope {
+        if !matches_table_or_alias(&name.name, binding.table, binding.alias.as_deref()) {
+            continue;
+        }
+        let affinity = binding
+            .table
+            .columns
+            .first()
+            .map(schema_column_expr_affinity)?;
+        if found.replace(affinity).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+fn scoped_expr_affinity(
+    expr: &Expr,
+    scopes: &[&[AffinityTableBinding<'_>]],
+    catalog: &[&TableSchema],
+) -> Option<u8> {
+    match strip_collate_wrappers(expr) {
+        Expr::BoundOuterValue { affinity, .. } => Some(bound_outer_affinity_code(*affinity)),
+        Expr::Column(column, _) => scoped_column_affinity(column, scopes),
+        Expr::Cast { type_name, .. } => Some(type_name_to_affinity(type_name)),
+        Expr::Subquery(select, _) => scalar_subquery_result_affinity(select, scopes, catalog),
+        // Literals and every other computed expression have NONE affinity.
+        _ => Some(b'A'),
+    }
+}
+
+fn intrinsic_expr_affinity(expr: &Expr) -> Option<u8> {
+    match strip_collate_wrappers(expr) {
+        Expr::BoundOuterValue { affinity, .. } => Some(bound_outer_affinity_code(*affinity)),
+        Expr::Column(..) | Expr::Subquery(..) => None,
+        Expr::Cast { type_name, .. } => Some(type_name_to_affinity(type_name)),
+        // Every other expression shape is computed and therefore has NONE
+        // affinity even when it contains column references.
+        _ => Some(b'A'),
+    }
+}
+
+fn select_core_first_result_affinity(
+    core: &SelectCore,
+    outer_scopes: &[&[AffinityTableBinding<'_>]],
+    catalog: &[&TableSchema],
+) -> Option<u8> {
+    match core {
+        SelectCore::Select { columns, from, .. } => {
+            let local_scope = from.as_ref().and_then(|from| {
+                let mut bindings = Vec::new();
+                collect_affinity_from_bindings(from, catalog, &mut bindings)?;
+                Some(bindings)
+            });
+            let result = columns.first()?;
+            if from.is_some() && local_scope.is_none() {
+                return match result {
+                    ResultColumn::Expr { expr, .. } => intrinsic_expr_affinity(expr),
+                    ResultColumn::Star | ResultColumn::TableStar(_) => None,
+                };
+            }
+            let mut scopes = Vec::with_capacity(outer_scopes.len() + usize::from(from.is_some()));
+            if let Some(local_scope) = local_scope.as_deref() {
+                scopes.push(local_scope);
+            }
+            scopes.extend_from_slice(outer_scopes);
+            match result {
+                ResultColumn::Expr { expr, .. } => scoped_expr_affinity(expr, &scopes, catalog),
+                ResultColumn::Star => local_scope.as_deref().and_then(first_star_affinity),
+                ResultColumn::TableStar(name) => local_scope
+                    .as_deref()
+                    .and_then(|scope| first_table_star_affinity(name, scope)),
+            }
+        }
+        SelectCore::Values(values) => {
+            // VALUES comparison metadata follows the representation selected
+            // before rewrites.  A deferred clause has not consulted the active
+            // function registry yet, so declining affinity is the only safe
+            // answer here; guessing from a syntactic row can change comparison
+            // coercion and therefore query results.
+            let expr = values.donor_row()?.first()?;
+            scoped_expr_affinity(expr, outer_scopes, catalog)
+        }
+    }
+}
+
+/// Determine the affinity of a scalar subquery's first result column.
+///
+/// SQLite preserves this affinity across the scalar-subquery boundary, while
+/// result collation remains local to the SELECT.  Direct scalar codegen takes
+/// affinity from the parser-root SELECT, which is the rightmost compound arm.
+/// A VALUES core instead uses its frozen representation donor and declines to
+/// provide affinity while donor selection is still deferred.
+fn scalar_subquery_result_affinity(
+    select: &SelectStatement,
+    outer_scopes: &[&[AffinityTableBinding<'_>]],
+    catalog: &[&TableSchema],
+) -> Option<u8> {
+    let parser_root = select
+        .body
+        .compounds
+        .last()
+        .map_or(&select.body.select, |(_, core)| core);
+    select_core_first_result_affinity(parser_root, outer_scopes, catalog)
+}
+
+fn scalar_subquery_affinity_in_scan(
+    select: &SelectStatement,
+    ctx: Option<&ScanCtx<'_>>,
+) -> Option<u8> {
+    let mut catalog = Vec::new();
+    let scope = ctx.map(affinity_scope_from_scan);
+    if let Some(ctx) = ctx {
+        extend_affinity_catalog_from_scan(&mut catalog, ctx);
+    }
+    let outer_scopes = scope.as_deref().map_or_else(Vec::new, |scope| vec![scope]);
+    scalar_subquery_result_affinity(select, &outer_scopes, &catalog)
+}
+
+fn scalar_subquery_affinity_with_fallback(
+    select: &SelectStatement,
+    inner: &ScanCtx<'_>,
+    outer: Option<&ScanCtx<'_>>,
+) -> Option<u8> {
+    let inner_scope = affinity_scope_from_scan(inner);
+    let outer_scope = outer.map(affinity_scope_from_scan);
+    let mut scopes = vec![inner_scope.as_slice()];
+    if let Some(outer_scope) = outer_scope.as_deref() {
+        scopes.push(outer_scope);
+    }
+    let mut catalog = Vec::new();
+    extend_affinity_catalog_from_scan(&mut catalog, inner);
+    if let Some(outer) = outer {
+        extend_affinity_catalog_from_scan(&mut catalog, outer);
+    }
+    scalar_subquery_result_affinity(select, &scopes, &catalog)
+}
+
+fn scalar_subquery_affinity_in_join(
+    select: &SelectStatement,
+    tables: &[(&TableSchema, Option<&str>)],
+) -> Option<u8> {
+    let scope = tables
+        .iter()
+        .map(|(table, alias)| AffinityTableBinding {
+            table,
+            alias: alias.map(str::to_owned),
+        })
+        .collect::<Vec<_>>();
+    let mut catalog = Vec::new();
+    for (table, _) in tables {
+        push_affinity_catalog_table(&mut catalog, table);
+    }
+    scalar_subquery_result_affinity(select, &[scope.as_slice()], &catalog)
+}
+
 /// Determine the type affinity of an expression for comparison coercion.
 ///
-/// Per SQLite §3.2 (comparisonAffinity): only column references and CAST
-/// expressions have affinity for comparison purposes. Literals and computed
+/// Per SQLite §3.2 (comparisonAffinity), column references and CAST expressions
+/// have affinity for comparison purposes, and a scalar subquery preserves the
+/// affinity of its first projected result. Literals and other computed
 /// expressions have BLOB/NONE affinity (i.e., no coercion influence).
 ///
 /// Returns SQLite affinity codes: A=BLOB, B=TEXT, C=NUMERIC, D=INTEGER, E=REAL.
 fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
-    // Unwrap COLLATE to reach the underlying expression
-    let inner = if let Expr::Collate { expr: inner, .. } = expr {
-        inner.as_ref()
-    } else {
-        expr
-    };
+    // COLLATE changes comparison ordering but preserves the underlying
+    // expression affinity, including through repeated postfix wrappers.
+    // Do not unwrap unary plus: SQLite intentionally strips affinity there.
+    let inner = strip_collate_wrappers(expr);
     match inner {
+        Expr::BoundOuterValue { affinity, .. } => bound_outer_affinity_code(*affinity),
         Expr::Column(col_ref, _) => {
             // Look up column type in the table schema
             if let Some(ctx) = ctx {
@@ -33303,12 +34896,12 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
                             return None;
                         }
                     }
-                    table.column_index(&col_ref.column).map(|idx| {
-                        table.columns[idx]
-                            .type_name
-                            .as_deref()
-                            .map_or(b'A', column_type_to_affinity)
-                    })
+                    if let Some(idx) = table.column_index(&col_ref.column) {
+                        return Some(schema_column_expr_affinity(&table.columns[idx]));
+                    }
+                    table
+                        .resolves_to_hidden_rowid(&col_ref.column)
+                        .then_some(b'D')
                 };
                 if let Some(aff) = check_table(ctx.table, ctx.table_alias) {
                     return aff;
@@ -33328,10 +34921,10 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
                             }
                         }
                         if let Some(idx) = table.column_index(&col_ref.column) {
-                            return table.columns[idx]
-                                .type_name
-                                .as_deref()
-                                .map_or(b'A', column_type_to_affinity);
+                            return schema_column_expr_affinity(&table.columns[idx]);
+                        }
+                        if table.resolves_to_hidden_rowid(&col_ref.column) {
+                            return b'D';
                         }
                     }
                 }
@@ -33341,23 +34934,8 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
         // Literals have NO column affinity for comparison purposes.
         // Per C SQLite: only TK_COLUMN and TK_CAST produce comparison affinity.
         Expr::Cast { type_name, .. } => type_name_to_affinity(type_name),
+        Expr::Subquery(select, _) => scalar_subquery_affinity_in_scan(select, ctx).unwrap_or(b'A'),
         _ => b'A', // BLOB/NONE affinity for literals and computed expressions
-    }
-}
-
-/// Determine the column type affinity from a column type string.
-fn column_type_to_affinity(type_name: &str) -> u8 {
-    let name = type_name.to_uppercase();
-    if name.contains("INT") {
-        b'D'
-    } else if name.contains("CHAR") || name.contains("TEXT") || name.contains("CLOB") {
-        b'B'
-    } else if name.contains("BLOB") || name.is_empty() {
-        b'A'
-    } else if name.contains("REAL") || name.contains("FLOA") || name.contains("DOUB") {
-        b'E'
-    } else {
-        b'C'
     }
 }
 
@@ -33379,13 +34957,22 @@ fn in_operand_affinity_p5(operand: &Expr, ctx: Option<&ScanCtx<'_>>) -> u16 {
 
 /// Resolve an expression's comparison affinity in the correlated-subquery
 /// fallback path: prefer the inner (subquery) context, but fall back to the
-/// outer context when the column doesn't resolve to a typed inner column.
+/// outer context when the column does not resolve in the inner scope.
 fn fallback_expr_affinity(expr: &Expr, inner: &ScanCtx<'_>, outer: Option<&ScanCtx<'_>>) -> u8 {
-    let inner_aff = expr_affinity(expr, Some(inner));
-    if inner_aff != b'A' {
-        inner_aff
-    } else {
-        outer.map_or(b'A', |o| expr_affinity(expr, Some(o)))
+    match strip_collate_wrappers(expr) {
+        Expr::Column(col_ref, _) => {
+            if column_ref_resolves_in_ctx(col_ref, inner) {
+                return expr_affinity(expr, Some(inner));
+            }
+            outer
+                .filter(|outer| column_ref_resolves_in_ctx(col_ref, outer))
+                .map_or(b'A', |outer| expr_affinity(expr, Some(outer)))
+        }
+        Expr::Subquery(select, _) => {
+            scalar_subquery_affinity_with_fallback(select, inner, outer).unwrap_or(b'A')
+        }
+        // CAST has intrinsic affinity; every other computed expression has NONE.
+        _ => expr_affinity(expr, Some(inner)),
     }
 }
 
@@ -33486,11 +35073,11 @@ mod tests {
     use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
     use asupersync::runtime::RuntimeBuilder;
     use fsqlite_ast::{
-        Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
-        Distinctness, Expr, FromClause, InSet, InsertSource, InsertStatement, JoinClause,
-        JoinConstraint, JoinKind, JoinType, LimitClause, Literal, OrderingTerm, PlaceholderType,
-        QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore, SelectStatement,
-        SortDirection, Span, Statement, TableOrSubquery, UpdateStatement,
+        Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, BoundCollation, ColumnRef,
+        DeleteStatement, Distinctness, Expr, FromClause, InSet, InsertSource, InsertStatement,
+        JoinClause, JoinConstraint, JoinKind, JoinType, LimitClause, Literal, OrderingTerm,
+        PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore,
+        SelectStatement, SortDirection, Span, Statement, TableOrSubquery, UpdateStatement,
     };
     use fsqlite_func::{FunctionRegistry, register_builtins};
     use fsqlite_parser::parse_first_statement_with_tail;
@@ -33514,6 +35101,135 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    #[test]
+    fn fallback_json_operator_resolves_inner_and_outer_operands_positionally() {
+        let schema = test_schema_with_subquery_source();
+        let outer = ScanCtx {
+            cursor: 3,
+            table: &schema[0],
+            table_alias: Some("o"),
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let inner = ScanCtx {
+            cursor: 4,
+            table: &schema[1],
+            table_alias: Some("i"),
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+
+        for (left, right, expected_left_cursor, expected_right_cursor) in [
+            (("o", "a"), ("i", "b"), 3, 4),
+            (("i", "b"), ("o", "a"), 4, 3),
+        ] {
+            let expr = Expr::JsonAccess {
+                expr: Box::new(Expr::Column(
+                    ColumnRef::qualified(left.0, left.1),
+                    Span::ZERO,
+                )),
+                path: Box::new(Expr::Column(
+                    ColumnRef::qualified(right.0, right.1),
+                    Span::ZERO,
+                )),
+                arrow: JsonArrow::Arrow,
+                span: Span::ZERO,
+            };
+            let mut builder = ProgramBuilder::new();
+            let result = builder.alloc_reg();
+            emit_expr_with_fallback(&mut builder, &expr, result, &inner, Some(&outer));
+            let program = builder.finish().expect("JSON fallback program should finish");
+            let function = program
+                .ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::PureFunc)
+                .expect("JSON fallback must emit a scalar function call");
+            assert_eq!(function.p4, P4::FuncName("->".to_owned()));
+            assert_eq!(function.p5, 2);
+            let arg_base = function.p2;
+            assert!(program.ops().iter().any(|op| {
+                op.opcode == Opcode::Column
+                    && op.p1 == expected_left_cursor
+                    && op.p3 == arg_base
+            }));
+            assert!(program.ops().iter().any(|op| {
+                op.opcode == Opcode::Column
+                    && op.p1 == expected_right_cursor
+                    && op.p3 == arg_base + 1
+            }));
+        }
+    }
+
+    #[test]
+    fn fallback_json_operator_resolves_secondary_outer_scan_columns() {
+        let schema = test_schema_with_subquery_source();
+        let secondary_table = TableSchema {
+            name: "u".to_owned(),
+            root_page: 4,
+            columns: vec![ColumnInfo::basic("b", 'd', false)],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        let secondaries = [SecondaryScan {
+            cursor: 7,
+            table: &secondary_table,
+            table_alias: Some("u"),
+        }];
+        let outer = ScanCtx {
+            cursor: 3,
+            table: &schema[0],
+            table_alias: Some("o"),
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &secondaries,
+        };
+        let inner = ScanCtx {
+            cursor: 4,
+            table: &schema[1],
+            table_alias: Some("i"),
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let expr = Expr::JsonAccess {
+            expr: Box::new(Expr::Column(
+                ColumnRef::qualified("u", "b"),
+                Span::ZERO,
+            )),
+            path: Box::new(Expr::Column(
+                ColumnRef::qualified("i", "b"),
+                Span::ZERO,
+            )),
+            arrow: JsonArrow::DoubleArrow,
+            span: Span::ZERO,
+        };
+        let mut builder = ProgramBuilder::new();
+        let result = builder.alloc_reg();
+        emit_expr_with_fallback(&mut builder, &expr, result, &inner, Some(&outer));
+        let program = builder.finish().expect("JSON fallback program should finish");
+        let function = program
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::PureFunc)
+            .expect("JSON fallback must emit a scalar function call");
+        assert_eq!(function.p4, P4::FuncName("->>".to_owned()));
+        assert!(program.ops().iter().any(|op| {
+            op.opcode == Opcode::Column && op.p1 == 7 && op.p3 == function.p2
+        }));
+        assert!(
+            !program.ops().iter().any(|op| {
+                op.opcode == Opcode::Null && op.p2 == function.p2
+            }),
+            "a secondary outer reference must never degrade to SQL NULL",
+        );
     }
 
     fn create_index_sql(sql: &str) -> CreateIndexStatement {
@@ -33578,15 +35294,57 @@ mod tests {
     }
 
     #[test]
+    fn bind_explicit_index_keeps_nested_and_derived_collations_out_of_key_metadata() {
+        let mut schema = test_schema();
+        schema[0].columns[0].collation = Some("declared_sort".to_owned());
+        for expression in [
+            "lower(a COLLATE nested_sort)",
+            "nullif(a COLLATE nested_sort, 'z')",
+            "+(a COLLATE nested_sort)",
+            "CAST(a COLLATE nested_sort AS TEXT)",
+            "+a",
+            "CAST(a AS TEXT)",
+            "0 AND (a COLLATE nested_sort = 'x')",
+            "(a COLLATE nested_sort = 'x') AND 0",
+        ] {
+            let sql = format!("CREATE INDEX idx_expr ON t({expression})");
+            let stmt = create_index_sql(&sql);
+            let bound = bind_explicit_index(&stmt, "idx_expr", "t", &schema[0])
+                .expect("derived expression index should bind");
+            assert_eq!(
+                bound.key_collations,
+                [None],
+                "{expression} must keep BINARY key ordering"
+            );
+        }
+
+        for (expression, expected) in [
+            ("a", "declared_sort"),
+            ("a COLLATE root_sort", "root_sort"),
+            ("lower(a) COLLATE root_sort", "root_sort"),
+        ] {
+            let sql = format!("CREATE INDEX idx_expr ON t({expression})");
+            let stmt = create_index_sql(&sql);
+            let bound = bind_explicit_index(&stmt, "idx_expr", "t", &schema[0])
+                .expect("root-collated expression index should bind");
+            assert_eq!(
+                bound.key_collations,
+                [Some(expected.to_owned())],
+                "{expression} must retain its key collation"
+            );
+        }
+    }
+
+    #[test]
     fn bind_explicit_index_binds_partial_predicate() {
         let schema = test_schema();
-        let stmt = create_index_sql("CREATE INDEX idx_partial ON t(a) WHERE b > 0");
+        let stmt = create_index_sql("CREATE INDEX idx_partial ON t(a) WHERE t.b > 0 AND rowid > 0");
 
         let bound = bind_explicit_index(&stmt, "idx_partial", "t", &schema[0])
             .expect("partial index should bind");
 
         assert_eq!(bound.columns, ["a"]);
-        assert_eq!(bound.where_clause.as_deref(), Some("b > 0"));
+        assert_eq!(bound.where_clause.as_deref(), Some("t.b > 0 AND rowid > 0"));
     }
 
     #[test]
@@ -33611,13 +35369,39 @@ mod tests {
         for sql in [
             "CREATE INDEX idx_missing ON t(missing)",
             "CREATE INDEX idx_missing ON t(lower(missing))",
-            "CREATE INDEX idx_missing ON t(lower(other.a))",
         ] {
             let stmt = create_index_sql(sql);
             let error = bind_explicit_index(&stmt, "idx_missing", "t", &schema[0])
                 .expect_err("unknown indexed column must fail");
             assert!(matches!(error, CodegenError::ColumnNotFound { .. }));
         }
+    }
+
+    #[test]
+    fn bind_explicit_index_rejects_qualified_and_hidden_rowid_key_references() {
+        let schema = test_schema();
+        for sql in [
+            "CREATE INDEX idx_invalid ON t(t.a)",
+            "CREATE INDEX idx_invalid ON t(lower(t.a))",
+        ] {
+            let stmt = create_index_sql(sql);
+            let error = bind_explicit_index(&stmt, "idx_invalid", "t", &schema[0])
+                .expect_err("qualified index key reference must fail");
+            assert!(
+                matches!(error, CodegenError::Unsupported(message) if message.contains("operator"))
+            );
+        }
+
+        let stmt = create_index_sql("CREATE INDEX idx_invalid ON t(rowid + 1)");
+        let error = bind_explicit_index(&stmt, "idx_invalid", "t", &schema[0])
+            .expect_err("hidden rowid aliases are not indexable columns");
+        assert_eq!(
+            error,
+            CodegenError::ColumnNotFound {
+                table: "t".to_owned(),
+                column: "rowid".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -33760,6 +35544,17 @@ mod tests {
         schema: &[TableSchema],
         db: MemDatabase,
     ) -> Vec<Vec<SqliteValue>> {
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        execute_codegen_select_with_registry(stmt, schema, db, registry)
+    }
+
+    fn execute_codegen_select_with_registry(
+        stmt: &SelectStatement,
+        schema: &[TableSchema],
+        db: MemDatabase,
+        registry: FunctionRegistry,
+    ) -> Vec<Vec<SqliteValue>> {
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, stmt, schema, &ctx).expect("select should codegen");
@@ -33768,8 +35563,6 @@ mod tests {
         engine.enable_storage_read_cursors(true);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
-        let mut registry = FunctionRegistry::new();
-        register_builtins(&mut registry);
         engine.set_function_registry(std::sync::Arc::new(registry));
         let runtime = RuntimeBuilder::current_thread()
             .blocking_threads(1, 2)
@@ -33944,6 +35737,27 @@ mod tests {
                 check_constraints: Vec::new(),
             },
         ]
+    }
+
+    fn scalar_affinity_test_schema() -> Vec<TableSchema> {
+        let typed_column = |name: &str, affinity: char, type_name: &str| {
+            let mut column = ColumnInfo::basic(name, affinity, false);
+            column.type_name = Some(type_name.to_owned());
+            column
+        };
+        let mut schema = test_schema_with_subquery_source();
+        schema[0].columns = vec![
+            typed_column("outer_n", 'C', "NUMERIC"),
+            typed_column("outer_t", 'B', "TEXT"),
+            typed_column("outer_b", 'A', "BLOB"),
+        ];
+        schema[1].columns = vec![
+            typed_column("n", 'C', "NUMERIC"),
+            typed_column("txt", 'B', "TEXT"),
+            typed_column("raw", 'A', "BLOB"),
+        ];
+        schema[1].columns[1].collation = Some("NOCASE".to_owned());
+        schema
     }
 
     fn test_schema_with_index_and_subquery_source() -> Vec<TableSchema> {
@@ -34268,6 +36082,74 @@ mod tests {
 
     fn expr_sql(sql: &str) -> Expr {
         parse_sql_expr(sql).expect("test expression SQL should parse")
+    }
+
+    #[test]
+    fn singleton_in_rhs_uses_sealed_query_constancy_metadata() {
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+
+        with_connection_function_registry_context(
+            Some(Arc::new(registry)),
+            Vec::new(),
+            true,
+            true,
+            || {
+                assert!(singleton_in_rhs_is_constant(&expr_sql("CURRENT_TIMESTAMP")));
+                assert!(singleton_in_rhs_is_constant(&expr_sql("sqlite_version()")));
+                assert!(singleton_in_rhs_is_constant(&expr_sql(
+                    "date('2000-01-01')"
+                )));
+                assert!(singleton_in_rhs_is_constant(&expr_sql("abs(1)")));
+                assert!(!singleton_in_rhs_is_constant(&expr_sql("random()")));
+                assert!(!singleton_in_rhs_is_constant(&expr_sql("abs(random())")));
+
+                let mut distinct = expr_sql("abs(1)");
+                let Expr::FunctionCall {
+                    distinct: is_distinct,
+                    ..
+                } = &mut distinct
+                else {
+                    unreachable!("abs(1) should parse as a function call");
+                };
+                *is_distinct = true;
+                assert!(!singleton_in_rhs_is_constant(&distinct));
+
+                let mut star = expr_sql("abs(1)");
+                let Expr::FunctionCall { args, .. } = &mut star else {
+                    unreachable!("abs(1) should parse as a function call");
+                };
+                *args = FunctionArgs::Star;
+                assert!(!singleton_in_rhs_is_constant(&star));
+                assert!(!singleton_in_rhs_is_constant(&Expr::RowValue(
+                    Vec::new(),
+                    Span::ZERO,
+                )));
+            },
+        );
+
+        with_connection_function_registry_context(None, Vec::new(), true, true, || {
+            assert!(
+                !singleton_in_rhs_is_constant(&expr_sql("abs(1)")),
+                "missing frozen registry metadata must fail closed"
+            );
+        });
+    }
+
+    fn scalar_values_with_frozen_donor(sql: &str, donor_row: usize) -> Expr {
+        let mut expr = expr_sql(sql);
+        let Expr::Subquery(select, _) = &mut expr else {
+            unreachable!("expected scalar VALUES subquery expression");
+        };
+        assert!(
+            select.body.compounds.is_empty(),
+            "VALUES donor fixture must have one parser-root core"
+        );
+        let SelectCore::Values(values) = &mut select.body.select else {
+            unreachable!("expected VALUES parser-root core");
+        };
+        values.freeze_donor_row(Some(donor_row));
+        expr
     }
 
     fn select_sql(sql: &str) -> SelectStatement {
@@ -34663,12 +36545,10 @@ mod tests {
     /// bd-2dgf5 regression fixture: `t(id INTEGER PRIMARY KEY, k INTEGER, v TEXT)`
     /// with a single-column ascending index on `k`.
     ///
-    /// `type_name` MUST be populated. `resolved_expr_affinity` reads `type_name`,
-    /// not `affinity`, so a fixture built purely from `ColumnInfo::basic` (which
-    /// leaves `type_name: None`) reports BLOB affinity and makes any affinity
-    /// assertion vacuously "clean" -- exactly how an earlier version of this
-    /// test hid the real behaviour and sent this investigation down a blind
-    /// alley.
+    /// Keep `type_name` populated so the fixture mirrors an ordinary parsed
+    /// schema. Comparison code nevertheless treats `ColumnInfo::affinity` as
+    /// authoritative; statement-local materialized schemas legitimately have
+    /// expression affinity while carrying no declared SQL type text.
     fn bd_2dgf5_table() -> TableSchema {
         let typed = |name: &str, affinity: char, is_ipk: bool, ty: &str| {
             let mut col = ColumnInfo::basic(name, affinity, is_ipk);
@@ -37345,7 +39225,7 @@ mod tests {
         let stmt = SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(vec![]),
+                select: SelectCore::Values(vec![].into()),
                 compounds: vec![],
             },
             order_by: vec![],
@@ -40027,6 +41907,177 @@ mod tests {
         );
     }
 
+    #[test]
+    fn row_value_in_list_executes_match_miss_unknown_not_and_empty_truth_tables() {
+        let stmt = select_sql(
+            "SELECT \
+             (1, 2) IN ((9, 9), (1, 2)), \
+             (1, 2) IN ((9, 9), (3, 4)), \
+             (1, 2) IN ((1, NULL), (3, 4)), \
+             (1, 2) IN ((NULL, 3)), \
+             (1, 2) NOT IN ((9, 9), (3, 4)), \
+             (1, 2) NOT IN ((1, NULL), (3, 4)), \
+             (NULL, 2) IN (), \
+             (NULL, 2) NOT IN ()",
+        );
+
+        let rows = execute_codegen_select_with_storage_cursor(&stmt, &[], MemDatabase::new());
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(0),
+                SqliteValue::Null,
+                SqliteValue::Integer(0),
+                SqliteValue::Integer(1),
+                SqliteValue::Null,
+                SqliteValue::Integer(0),
+                SqliteValue::Integer(1),
+            ]],
+            "vector IN must preserve candidate-local NULL semantics and invert only definite results"
+        );
+    }
+
+    #[test]
+    fn row_value_in_list_uses_final_rhs_tuple_as_field_metadata_donor() {
+        let stmt = select_sql(
+            "SELECT \
+             (1, 2) IN ((CAST('1' AS TEXT), 2), (CAST('x' AS BLOB), 3)), \
+             (1, 2) IN ((CAST('x' AS BLOB), 3), (CAST('1' AS TEXT), 2)), \
+             ('a', 1) IN (('A', 1), ('x' COLLATE NOCASE, 2)), \
+             ('a', 1) IN (('x' COLLATE NOCASE, 2), ('A', 1))",
+        );
+
+        let rows = execute_codegen_select_with_storage_cursor(&stmt, &[], MemDatabase::new());
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Integer(0),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(0),
+            ]],
+            "reversing the final syntactic tuple must reverse affinity/collation donation"
+        );
+    }
+
+    #[test]
+    fn row_value_in_list_evaluates_each_volatile_lhs_field_once() {
+        use fsqlite_func::ScalarFunction;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct NextVectorValue(Arc<AtomicUsize>);
+
+        impl ScalarFunction for NextVectorValue {
+            fn invoke(&self, _args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+                let value = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(SqliteValue::Integer(
+                    i64::try_from(value).expect("test counter should fit in i64"),
+                ))
+            }
+
+            fn is_deterministic(&self) -> bool {
+                false
+            }
+
+            fn num_args(&self) -> i32 {
+                0
+            }
+
+            fn name(&self) -> &str {
+                "next_vector_value"
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        registry.register_scalar(NextVectorValue(Arc::clone(&calls)));
+        let stmt = select_sql(
+            "SELECT (next_vector_value(), next_vector_value()) \
+             IN ((9, 9), (1, 2))",
+        );
+
+        let rows = execute_codegen_select_with_registry(&stmt, &[], MemDatabase::new(), registry);
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "each volatile LHS field must run once, independent of candidate count"
+        );
+    }
+
+    #[test]
+    fn row_value_in_list_fails_closed_on_arity_and_probe_shape_mismatches() {
+        let scalar = |value| Expr::Literal(Literal::Integer(value), Span::ZERO);
+        let lhs = Expr::RowValue(vec![scalar(1), scalar(2)], Span::ZERO);
+        let malformed_list = Expr::In {
+            expr: Box::new(lhs.clone()),
+            set: InSet::List(vec![Expr::RowValue(vec![scalar(1)], Span::ZERO)]),
+            not: false,
+            span: Span::ZERO,
+        };
+        let unmaterialized_probe = Expr::In {
+            expr: Box::new(lhs),
+            set: InSet::Subquery(Box::new(select_sql("SELECT 1, 2"))),
+            not: false,
+            span: Span::ZERO,
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build fail-closed row-value test runtime");
+
+        for (expr, expected_reason) in [
+            (
+                malformed_list,
+                "row-value IN arity mismatch: expected 2, found 1",
+            ),
+            (
+                unmaterialized_probe,
+                "multi-column subquery/table probes require prior list materialization",
+            ),
+        ] {
+            let mut builder = ProgramBuilder::new();
+            let result = builder.alloc_reg();
+            emit_expr(&mut builder, &expr, result, None);
+            let program = builder
+                .finish()
+                .expect("fail-closed row-value program should finish");
+
+            assert_eq!(
+                program.ops(),
+                &[VdbeOp {
+                    opcode: Opcode::Halt,
+                    p1: ErrorCode::Internal as i32,
+                    p2: 0,
+                    p3: 0,
+                    p4: P4::Str(format!(
+                        "IN probe codegen invariant failed: {expected_reason}"
+                    )),
+                    p5: 0,
+                }],
+                "unsupported vector probe shape must never degrade to a scalar NULL result"
+            );
+
+            let mut engine = VdbeEngine::new(program.register_count());
+            let outcome = runtime
+                .block_on(async { engine.execute(&program).await })
+                .expect("fail-closed program execution should return a VDBE outcome");
+            assert_eq!(
+                outcome,
+                ExecOutcome::Error {
+                    code: ErrorCode::Internal as i32,
+                    message: format!("IN probe codegen invariant failed: {expected_reason}"),
+                },
+                "unsupported vector probe shape must surface the codegen invariant at runtime"
+            );
+        }
+    }
+
     fn in_subquery_program_ops(sql: &str, schema: &[TableSchema]) -> Vec<VdbeOp> {
         let stmt = select_sql(sql);
         let mut b = ProgramBuilder::new();
@@ -40147,6 +42198,300 @@ mod tests {
             output_calls, 1,
             "an INTEGER PRIMARY KEY alias and rowid name the same projected value"
         );
+    }
+
+    #[test]
+    fn scalar_subquery_affinity_reaches_comparison_codegen_in_both_operand_orders() {
+        let schema = scalar_affinity_test_schema();
+        let compile = |sql: &str| {
+            let stmt = select_sql(sql);
+            let mut builder = ProgramBuilder::new();
+            codegen_select(&mut builder, &stmt, &schema, &CodegenContext::default())
+                .expect("scalar-subquery comparison should compile");
+            builder
+                .finish()
+                .expect("scalar-subquery comparison program should finish")
+                .ops()
+                .to_vec()
+        };
+
+        for (scalar, other, expected_p5) in [
+            ("(SELECT n FROM s)", "'5'", u16::from(b'C')),
+            ("(SELECT txt FROM s)", "5", u16::from(b'B')),
+            ("(SELECT raw FROM s)", "5", 0),
+        ] {
+            for sql in [
+                format!("SELECT {scalar} = {other} FROM t"),
+                format!("SELECT {other} = {scalar} FROM t"),
+            ] {
+                let ops = compile(&sql);
+                let comparisons = ops
+                    .iter()
+                    .filter(|op| op.opcode == Opcode::Eq)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    comparisons.len(),
+                    1,
+                    "fixture must emit one equality comparison: `{sql}`",
+                );
+                assert_eq!(comparisons[0].p5, expected_p5, "wrong P5 for `{sql}`");
+                assert_eq!(
+                    comparisons[0].p4,
+                    P4::None,
+                    "a scalar result's inner declared collation must not cross the subquery boundary: `{sql}`",
+                );
+            }
+        }
+
+        let case_ops = compile("SELECT CASE (SELECT n FROM s) WHEN '5' THEN 1 ELSE 0 END FROM t");
+        let case_comparison = case_ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("simple CASE should emit a comparison");
+        assert_eq!(case_comparison.p5, u16::from(b'C'));
+
+        let between_ops = compile("SELECT (SELECT txt FROM s) BETWEEN 1 AND 2 FROM t");
+        let between_comparisons = between_ops
+            .iter()
+            .filter(|op| matches!(op.opcode, Opcode::Lt | Opcode::Gt))
+            .collect::<Vec<_>>();
+        assert_eq!(between_comparisons.len(), 2);
+        assert!(
+            between_comparisons
+                .iter()
+                .all(|op| { op.p5 == u16::from(b'B') && matches!(op.p4, P4::None) })
+        );
+    }
+
+    #[test]
+    fn fallback_and_join_scalar_subquery_affinity_use_the_local_result_scope() {
+        let schema = scalar_affinity_test_schema();
+        let inner = ScanCtx {
+            cursor: 3,
+            table: &schema[0],
+            table_alias: Some("t"),
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let join_tables = [(&schema[0], Some("t")), (&schema[1], Some("outer_s"))];
+
+        for (scalar, other, expected_p5) in [
+            ("(SELECT n FROM s)", "'5'", u16::from(b'C')),
+            ("(SELECT txt FROM s)", "5", u16::from(b'B')),
+            ("(SELECT raw FROM s)", "5", 0),
+        ] {
+            for sql in [format!("{scalar} = {other}"), format!("{other} = {scalar}")] {
+                let expr = expr_sql(&sql);
+                let Expr::BinaryOp { left, right, .. } = &expr else {
+                    unreachable!("expected comparison expression");
+                };
+
+                let mut builder = ProgramBuilder::new();
+                let result = builder.alloc_reg();
+                emit_expr_with_fallback(&mut builder, &expr, result, &inner, None);
+                builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                let program = builder
+                    .finish()
+                    .expect("fallback scalar-subquery program should finish");
+                let comparison = program
+                    .ops()
+                    .iter()
+                    .find(|op| op.opcode == Opcode::Eq)
+                    .expect("fallback expression should emit equality");
+                assert_eq!(comparison.p5, expected_p5, "wrong fallback P5 for `{sql}`");
+                assert_eq!(
+                    join_comparison_affinity_p5(left, right, &join_tables),
+                    expected_p5,
+                    "wrong join-codegen P5 for `{sql}`",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_metadata_uses_column_info_without_declared_type_text() {
+        let mut column = ColumnInfo::basic("value", 'B', false);
+        column.collation = Some("NOCASE".to_owned());
+        let schema = vec![TableSchema {
+            name: "materialized_view".to_owned(),
+            root_page: 2,
+            columns: vec![column],
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let scan = ScanCtx {
+            cursor: 3,
+            table: &schema[0],
+            table_alias: None,
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let literal = expr_sql("1");
+        let column = expr_sql("value");
+        let resolved = resolve_column_ref(&column, scan.table, scan.table_alias);
+
+        assert_eq!(expr_affinity(&column, Some(&scan)), b'B');
+        assert_eq!(
+            resolved_expr_affinity(&column, resolved.as_ref(), &scan),
+            b'B'
+        );
+        assert_eq!(join_expr_affinity(&column, &[(&schema[0], None)]), b'B');
+
+        let comparison = ResolvedComparisonInfo::new(&literal, &column, &scan);
+        assert_eq!(comparison.cmp_p5, 0x80 | u16::from(b'B'));
+        assert!(matches!(
+            comparison.collation_p4,
+            P4::Collation(ref name) if name == "NOCASE"
+        ));
+    }
+
+    #[test]
+    fn scalar_subquery_affinity_uses_outer_and_parser_root_metadata() {
+        let schema = scalar_affinity_test_schema();
+        let outer = ScanCtx {
+            cursor: 3,
+            table: &schema[0],
+            table_alias: Some("t"),
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let inner = ScanCtx {
+            cursor: 4,
+            table: &schema[1],
+            table_alias: Some("s"),
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let join_tables = [(&schema[0], Some("t")), (&schema[1], Some("s"))];
+
+        let compact_schema = test_schema_with_subquery_source();
+        let compact_outer = ScanCtx {
+            cursor: 5,
+            table: &compact_schema[0],
+            table_alias: Some("t"),
+            schema: Some(&compact_schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        assert_eq!(
+            expr_affinity(&expr_sql("(SELECT b FROM s)"), Some(&compact_outer)),
+            b'D',
+            "scalar result affinity must use ColumnInfo.affinity when declared type text is absent",
+        );
+
+        let correlated_outer = expr_sql("(SELECT t.outer_n)");
+        assert_eq!(expr_affinity(&correlated_outer, Some(&outer)), b'C');
+        assert_eq!(
+            fallback_expr_affinity(&correlated_outer, &inner, Some(&outer)),
+            b'C',
+        );
+        assert_eq!(join_expr_affinity(&correlated_outer, &join_tables), b'C');
+
+        let mut bound_select = select_sql("SELECT 0");
+        let SelectCore::Select { columns, .. } = &mut bound_select.body.select else {
+            unreachable!("expected SELECT core");
+        };
+        columns[0] = ResultColumn::Expr {
+            expr: Expr::BoundOuterValue {
+                value: SqliteValue::Text("5".into()),
+                collation: BoundCollation::Named("NOCASE".to_owned()),
+                affinity: Some(TypeAffinity::Numeric),
+                span: Span::ZERO,
+            },
+            alias: None,
+        };
+        let bound_scalar = Expr::Subquery(Box::new(bound_select), Span::ZERO);
+        assert_eq!(expr_affinity(&bound_scalar, None), b'C');
+        assert_eq!(
+            fallback_expr_affinity(&bound_scalar, &inner, Some(&outer)),
+            b'C'
+        );
+        assert_eq!(join_expr_affinity(&bound_scalar, &join_tables), b'C');
+
+        let deferred_values = expr_sql("(VALUES (CAST(1 AS INTEGER)), (CAST('2' AS TEXT)))");
+        assert_eq!(
+            expr_affinity(&deferred_values, None),
+            b'A',
+            "an unresolved VALUES representation must not guess a donor affinity",
+        );
+        assert_eq!(
+            fallback_expr_affinity(&deferred_values, &inner, Some(&outer)),
+            b'A'
+        );
+        assert_eq!(join_expr_affinity(&deferred_values, &join_tables), b'A');
+
+        let values_agree = scalar_values_with_frozen_donor(
+            "(VALUES (CAST(1 AS INTEGER)), (CAST(2 AS INTEGER)))",
+            0,
+        );
+        let values_integer_then_text = scalar_values_with_frozen_donor(
+            "(VALUES (CAST(1 AS INTEGER)), (CAST('2' AS TEXT)))",
+            0,
+        );
+        let values_text_then_integer = scalar_values_with_frozen_donor(
+            "(VALUES (CAST('2' AS TEXT)), (CAST(1 AS INTEGER)))",
+            0,
+        );
+        assert_eq!(expr_affinity(&values_agree, None), b'D');
+        assert_eq!(expr_affinity(&values_integer_then_text, None), b'D');
+        assert_eq!(expr_affinity(&values_text_then_integer, None), b'B');
+        assert_eq!(
+            fallback_expr_affinity(&values_integer_then_text, &inner, Some(&outer)),
+            b'D'
+        );
+        assert_eq!(
+            join_expr_affinity(&values_integer_then_text, &join_tables),
+            b'D'
+        );
+
+        let values_integer_then_text_second_donor = scalar_values_with_frozen_donor(
+            "(VALUES (CAST(1 AS INTEGER)), (CAST('2' AS TEXT)))",
+            1,
+        );
+        let values_text_then_integer_second_donor = scalar_values_with_frozen_donor(
+            "(VALUES (CAST('2' AS TEXT)), (CAST(1 AS INTEGER)))",
+            1,
+        );
+        assert_eq!(
+            expr_affinity(&values_integer_then_text_second_donor, None),
+            b'B'
+        );
+        assert_eq!(
+            expr_affinity(&values_text_then_integer_second_donor, None),
+            b'D'
+        );
+
+        let compound_agrees =
+            expr_sql("(SELECT CAST(1 AS INTEGER) UNION ALL SELECT CAST(2 AS INTEGER))");
+        let compound_integer_then_text =
+            expr_sql("(SELECT CAST(1 AS INTEGER) UNION ALL SELECT CAST('2' AS TEXT))");
+        let compound_text_then_integer =
+            expr_sql("(SELECT CAST('2' AS TEXT) UNION ALL SELECT CAST(1 AS INTEGER))");
+        assert_eq!(expr_affinity(&compound_agrees, None), b'D');
+        assert_eq!(expr_affinity(&compound_integer_then_text, None), b'B');
+        assert_eq!(expr_affinity(&compound_text_then_integer, None), b'D');
+
+        let with_base_table = expr_sql("(WITH c(x) AS (VALUES (0)) SELECT n FROM s)");
+        assert_eq!(expr_affinity(&with_base_table, Some(&outer)), b'C');
+
+        let with_integer_then_text = expr_sql(
+            "(WITH c(x) AS (VALUES (0)) \
+             SELECT CAST(1 AS INTEGER) UNION ALL SELECT CAST('2' AS TEXT))",
+        );
+        let with_text_then_integer = expr_sql(
+            "(WITH c(x) AS (VALUES (0)) \
+             SELECT CAST('2' AS TEXT) UNION ALL SELECT CAST(1 AS INTEGER))",
+        );
+        assert_eq!(expr_affinity(&with_integer_then_text, None), b'B');
+        assert_eq!(expr_affinity(&with_text_then_integer, None), b'D');
     }
 
     #[test]
@@ -40558,7 +42903,7 @@ mod tests {
             .find(|op| op.opcode == Opcode::SorterOpen)
             .expect("ordered RHS should open sorter");
         let P4::Str(sorter_p4) = &sorter_open.p4 else {
-            panic!("unexpected sorter metadata: {:?}", &sorter_open.p4);
+            panic!("unexpected sorter metadata: {:?}", sorter_open.p4);
         };
         assert_eq!(
             sorter_p4, "+|NOCASE",
@@ -40588,6 +42933,209 @@ mod tests {
                 "declared collation should survive `{sql}`"
             );
         }
+    }
+
+    #[test]
+    fn bound_outer_text_value_emits_losslessly_and_retains_only_declared_metadata() {
+        let expr = Expr::BoundOuterValue {
+            value: SqliteValue::Text("outer value".into()),
+            collation: BoundCollation::Named("NOCASE".to_owned()),
+            affinity: Some(TypeAffinity::Text),
+            span: Span::ZERO,
+        };
+
+        assert_eq!(extract_collation(&expr), None);
+        assert_eq!(declared_collation_ctx(&expr, None), Some("NOCASE"));
+        assert_eq!(expr_affinity(&expr, None), b'B');
+        assert!(!expr_contains_non_numbered_placeholder(&expr));
+        assert!(!expr_contains_function_call(&expr));
+        assert!(!expr_has_window(&expr));
+        assert!(!is_aggregate_expr(&expr));
+        assert!(validate_explicit_index_expr_shape(&expr, "index key").is_err());
+
+        let binary_no_affinity = Expr::BoundOuterValue {
+            value: SqliteValue::Null,
+            collation: BoundCollation::Binary,
+            affinity: None,
+            span: Span::ZERO,
+        };
+        assert_eq!(
+            declared_collation_ctx(&binary_no_affinity, None),
+            Some("BINARY"),
+        );
+        assert_eq!(expr_affinity(&binary_no_affinity, None), b'A');
+
+        let unspecified = Expr::BoundOuterValue {
+            value: SqliteValue::Text("outer value".into()),
+            collation: BoundCollation::Unspecified,
+            affinity: None,
+            span: Span::ZERO,
+        };
+        assert_eq!(declared_collation_ctx(&unspecified, None), None);
+        assert_eq!(bound_outer_declared_collation(&unspecified), None);
+        assert_eq!(
+            comparison_collation_ctx(&unspecified, &expr, None),
+            Some("NOCASE".to_owned()),
+            "metadata-neutral bound values must not prevent a later operand from donating collation",
+        );
+        assert_eq!(
+            comparison_collation_ctx(&binary_no_affinity, &expr, None),
+            Some("BINARY".to_owned()),
+            "known BINARY bound columns must stop declared-collation precedence",
+        );
+
+        let mut builder = ProgramBuilder::new();
+        let output = builder.alloc_reg();
+        emit_expr(&mut builder, &expr, output, None);
+        let op = builder
+            .op_at(0)
+            .expect("bound value emission should produce one opcode");
+        assert_eq!(op.opcode, Opcode::String8);
+        assert_eq!(op.p2, output);
+        assert_eq!(op.p4, P4::Str("outer value".to_owned()));
+    }
+
+    #[test]
+    fn bound_outer_values_are_not_admitted_as_raw_physical_seek_keys() {
+        let bound = Expr::BoundOuterValue {
+            value: SqliteValue::Text("5".into()),
+            collation: BoundCollation::Named("NOCASE".to_owned()),
+            affinity: Some(TypeAffinity::Text),
+            span: Span::ZERO,
+        };
+
+        assert!(!is_simple_constant(&bound));
+        assert!(!is_rowid_range_constant(&bound));
+        assert!(!is_index_range_constant(&bound));
+        assert!(is_simple_constant(&placeholder(1)));
+        assert!(is_rowid_range_constant(&placeholder(1)));
+        assert!(is_index_range_constant(&placeholder(1)));
+        assert!(is_simple_constant(&Expr::Literal(
+            Literal::Integer(5),
+            Span::ZERO,
+        )));
+
+        let schema = test_schema_with_index();
+        let table = &schema[0];
+        let indexed_eq = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(bound.clone()),
+            span: Span::ZERO,
+        };
+        assert!(extract_column_eq_target(Some(&indexed_eq), table, None).is_none());
+        assert!(
+            extract_index_equality_prefix_exprs(&table.indexes[0], table, None, Some(&indexed_eq))
+                .is_empty(),
+        );
+
+        let indexed_range = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(bound.clone()),
+            span: Span::ZERO,
+        };
+        assert!(extract_column_range_target(Some(&indexed_range), table, None).is_none());
+
+        let rowid_eq = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(bound.clone()),
+            span: Span::ZERO,
+        };
+        assert!(extract_rowid_target_expr(Some(&rowid_eq), Some(table), None).is_none());
+        let rowid_range = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(bound.clone()),
+            span: Span::ZERO,
+        };
+        assert!(extract_rowid_range_target(Some(&rowid_range), Some(table), None).is_none());
+
+        let expression_schema = test_schema_with_expression_index();
+        let expression_table = &expression_schema[0];
+        let expression_eq = Expr::BinaryOp {
+            left: Box::new(expr_sql("lower(name)")),
+            op: AstBinaryOp::Eq,
+            right: Box::new(bound.clone()),
+            span: Span::ZERO,
+        };
+        assert!(
+            extract_expression_index_equality_expr(
+                Some(&expression_eq),
+                &expression_table.indexes[0],
+                expression_table,
+                None,
+            )
+            .is_none(),
+        );
+
+        let expression_range = Expr::BinaryOp {
+            left: Box::new(expr_sql("lower(name)")),
+            op: AstBinaryOp::Lt,
+            right: Box::new(bound.clone()),
+            span: Span::ZERO,
+        };
+        assert!(
+            extract_expression_index_range_target(
+                Some(&expression_range),
+                &expression_table.indexes[0],
+                expression_table,
+                None,
+            )
+            .is_none(),
+        );
+
+        let subquery_schema = test_schema_with_subquery_source();
+        let inner_table = &subquery_schema[1];
+        let correlated_rowid_eq = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("s", "rowid"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(bound.clone()),
+            span: Span::ZERO,
+        };
+        assert!(extract_exists_rowid_probe(&correlated_rowid_eq, inner_table, Some("s")).is_none());
+
+        let nested_bound_rowid_eq = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("s", "rowid"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::UnaryOp {
+                op: fsqlite_ast::UnaryOp::Plus,
+                expr: Box::new(bound),
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        };
+        assert!(
+            extract_exists_rowid_probe(&nested_bound_rowid_eq, inner_table, Some("s")).is_none(),
+        );
+    }
+
+    #[test]
+    fn indexed_count_exists_rowid_probe_requires_numeric_outer_storage() {
+        let stmt = agg_count_star_exists_rowid_probe();
+        let mut schema = test_schema_with_index_and_subquery_source();
+        let SelectCore::Select {
+            where_clause: Some(where_clause),
+            ..
+        } = &stmt.body.select
+        else {
+            unreachable!("fixture must have a WHERE clause");
+        };
+
+        assert!(
+            extract_count_indexed_exists_target(Some(where_clause), &schema[0], None, &schema)
+                .is_some(),
+            "numeric outer index remains on the rowid-probe fast path",
+        );
+
+        schema[0].columns[1].affinity = 'B';
+        schema[0].columns[1].collation = Some("NOCASE".to_owned());
+        assert!(
+            extract_count_indexed_exists_target(Some(where_clause), &schema[0], None, &schema)
+                .is_none(),
+            "TEXT/NOCASE outer storage must not be probed with raw rowid keys",
+        );
     }
 
     #[test]
@@ -46641,6 +49189,11 @@ mod tests {
             Expr::Literal(Literal::Integer(1), Span::ZERO),
             Expr::Literal(Literal::Integer(2), Span::ZERO),
         ]);
+        let ternary = FunctionArgs::List(vec![
+            Expr::Literal(Literal::Integer(1), Span::ZERO),
+            Expr::Literal(Literal::Integer(2), Span::ZERO),
+            Expr::Literal(Literal::Integer(3), Span::ZERO),
+        ]);
 
         assert!(is_aggregate_function_call("max", &unary));
         assert!(
@@ -46648,37 +49201,74 @@ mod tests {
             "the built-in two-argument max() form is scalar"
         );
 
-        with_connection_function_context(vec![("max".to_owned(), 1)], true, true, || {
-            assert!(is_aggregate_function_call("max", &unary));
-            assert!(
-                !is_aggregate_function_call("max", &binary),
-                "a custom max/1 must not change max/2"
-            );
-        });
-        with_connection_function_context(vec![("max".to_owned(), -1)], true, true, || {
-            assert!(
-                is_aggregate_function_call("max", &unary),
-                "the exact built-in max/1 outranks the variadic registration but remains aggregate"
-            );
-            assert!(
-                is_aggregate_function_call("max", &binary),
-                "a variadic custom max replaces the scalar-shaped max/2 call"
-            );
-        });
-        with_connection_function_context(vec![("max".to_owned(), 2)], true, true, || {
-            assert!(is_aggregate_function_call("max", &binary));
-        });
-        with_connection_function_context(vec![("custom".to_owned(), 1)], true, true, || {
-            assert!(is_aggregate_function_call("custom", &unary));
-            assert!(
-                !is_aggregate_function_call("custom", &binary),
-                "a fixed-arity custom aggregate must not capture a scalar overload"
-            );
-        });
-        with_connection_function_context(vec![("custom".to_owned(), -1)], true, true, || {
-            assert!(is_aggregate_function_call("custom", &unary));
-            assert!(is_aggregate_function_call("custom", &binary));
-        });
+        with_connection_function_context(
+            vec![("max".to_owned(), FunctionArity::exact(1))],
+            true,
+            true,
+            || {
+                assert!(is_aggregate_function_call("max", &unary));
+                assert!(
+                    !is_aggregate_function_call("max", &binary),
+                    "a custom max/1 must not change max/2"
+                );
+            },
+        );
+        with_connection_function_context(
+            vec![("max".to_owned(), FunctionArity::variadic(0, None))],
+            true,
+            true,
+            || {
+                assert!(
+                    is_aggregate_function_call("max", &unary),
+                    "the exact built-in max/1 outranks the variadic registration but remains aggregate"
+                );
+                assert!(
+                    is_aggregate_function_call("max", &binary),
+                    "a variadic custom max replaces the scalar-shaped max/2 call"
+                );
+            },
+        );
+        with_connection_function_context(
+            vec![("max".to_owned(), FunctionArity::variadic(2, Some(2)))],
+            true,
+            true,
+            || {
+                assert!(is_aggregate_function_call("max", &binary));
+                assert!(
+                    !is_aggregate_function_call("max", &ternary),
+                    "a bounded variadic max/2 aggregate must not capture scalar max/3"
+                );
+            },
+        );
+        with_connection_function_context(
+            vec![("max".to_owned(), FunctionArity::exact(2))],
+            true,
+            true,
+            || {
+                assert!(is_aggregate_function_call("max", &binary));
+            },
+        );
+        with_connection_function_context(
+            vec![("custom".to_owned(), FunctionArity::exact(1))],
+            true,
+            true,
+            || {
+                assert!(is_aggregate_function_call("custom", &unary));
+                assert!(
+                    !is_aggregate_function_call("custom", &binary),
+                    "a fixed-arity custom aggregate must not capture a scalar overload"
+                );
+            },
+        );
+        with_connection_function_context(
+            vec![("custom".to_owned(), FunctionArity::variadic(0, None))],
+            true,
+            true,
+            || {
+                assert!(is_aggregate_function_call("custom", &unary));
+                assert!(is_aggregate_function_call("custom", &binary));
+            },
+        );
 
         assert!(
             !is_aggregate_function_call("max", &binary),
@@ -46688,24 +49278,25 @@ mod tests {
 
     #[test]
     fn custom_builtin_aggregate_overrides_decline_algebraic_codegen_shortcuts() {
-        let compile =
-            |stmt: &SelectStatement, schema: &[TableSchema], custom_keys: Vec<(String, i32)>| {
-                with_connection_function_context(custom_keys, true, true, || {
-                    let mut builder = ProgramBuilder::new();
-                    codegen_select(&mut builder, stmt, schema, &CodegenContext::default())
-                        .expect("custom aggregate fixture should compile");
-                    builder
-                        .finish()
-                        .expect("custom aggregate program should finish")
-                        .ops()
-                        .to_vec()
-                })
-            };
+        let compile = |stmt: &SelectStatement,
+                       schema: &[TableSchema],
+                       custom_keys: Vec<(String, FunctionArity)>| {
+            with_connection_function_context(custom_keys, true, true, || {
+                let mut builder = ProgramBuilder::new();
+                codegen_select(&mut builder, stmt, schema, &CodegenContext::default())
+                    .expect("custom aggregate fixture should compile");
+                builder
+                    .finish()
+                    .expect("custom aggregate program should finish")
+                    .ops()
+                    .to_vec()
+            })
+        };
 
         let count_ops = compile(
             &agg_count_star("t"),
             &test_schema(),
-            vec![("count".to_owned(), 0)],
+            vec![("count".to_owned(), FunctionArity::exact(0))],
         );
         assert!(
             !count_ops.iter().any(|op| op.opcode == Opcode::Count),
@@ -46722,7 +49313,7 @@ mod tests {
         let count_sum_ops = compile(
             &agg_count_star_and_sum("a", "t"),
             &test_schema(),
-            vec![("sum".to_owned(), 1)],
+            vec![("sum".to_owned(), FunctionArity::exact(1))],
         );
         assert!(
             !count_sum_ops.iter().any(|op| op.opcode == Opcode::Count),
@@ -46749,7 +49340,7 @@ mod tests {
         let scalar_ops = compile(
             &scalar_stmt,
             &test_schema_with_subquery_source(),
-            vec![("count".to_owned(), 0)],
+            vec![("count".to_owned(), FunctionArity::exact(0))],
         );
         assert!(
             !scalar_ops.iter().any(|op| op.opcode == Opcode::Count),
@@ -46778,12 +49369,18 @@ mod tests {
             simple_group_by_rowid_bucket_sum_plan(columns, &table, None, group_by).is_some(),
             "fixture must exercise the grouped rowid-bucket SUM shortcut"
         );
-        with_connection_function_context(vec![("sum".to_owned(), 1)], true, true, || {
-            assert!(
-                simple_group_by_rowid_bucket_sum_plan(columns, &table, None, group_by).is_none(),
-                "custom sum/1 must decline grouped rowid-bucket SUM algebra"
-            );
-        });
+        with_connection_function_context(
+            vec![("sum".to_owned(), FunctionArity::exact(1))],
+            true,
+            true,
+            || {
+                assert!(
+                    simple_group_by_rowid_bucket_sum_plan(columns, &table, None, group_by)
+                        .is_none(),
+                    "custom sum/1 must decline grouped rowid-bucket SUM algebra"
+                );
+            },
+        );
 
         let join_stmt = grouped_join_count_sum_index_lookup_stmt();
         let SelectCore::Select {
@@ -46800,7 +49397,10 @@ mod tests {
                 .is_some(),
             "fixture must exercise the grouped inner-join COUNT+SUM shortcut"
         );
-        for custom_key in [("count".to_owned(), 0), ("sum".to_owned(), 1)] {
+        for custom_key in [
+            ("count".to_owned(), FunctionArity::exact(0)),
+            ("sum".to_owned(), FunctionArity::exact(1)),
+        ] {
             with_connection_function_context(vec![custom_key], true, true, || {
                 assert!(
                     grouped_inner_join_count_sum_plan(&join_stmt, join_from, &join_schema)
@@ -46893,57 +49493,67 @@ mod tests {
             "fixture must exercise the COUNT(DISTINCT) index walk"
         );
 
-        with_connection_function_context(vec![("max".to_owned(), 1)], true, true, || {
-            assert!(
-                minmax_rowid_seek_plan(&rowid_agg).is_none(),
-                "custom max/1 must decline the rowid leaf seek"
-            );
-            assert!(
-                minmax_index_seek_plan(&index_agg, &table).is_none(),
-                "custom max/1 must decline the secondary-index leaf seek"
-            );
-            assert!(
-                minmax_pair_seek_plan(&pair_agg, &table).is_none(),
-                "custom max/1 must decline the MIN/MAX pair seek"
-            );
-            assert!(
-                minmax_range_seek_plan(&range_agg, &table, None, fixture_where(&range_stmt),)
+        with_connection_function_context(
+            vec![("max".to_owned(), FunctionArity::exact(1))],
+            true,
+            true,
+            || {
+                assert!(
+                    minmax_rowid_seek_plan(&rowid_agg).is_none(),
+                    "custom max/1 must decline the rowid leaf seek"
+                );
+                assert!(
+                    minmax_index_seek_plan(&index_agg, &table).is_none(),
+                    "custom max/1 must decline the secondary-index leaf seek"
+                );
+                assert!(
+                    minmax_pair_seek_plan(&pair_agg, &table).is_none(),
+                    "custom max/1 must decline the MIN/MAX pair seek"
+                );
+                assert!(
+                    minmax_range_seek_plan(&range_agg, &table, None, fixture_where(&range_stmt),)
+                        .is_none(),
+                    "custom max/1 must decline the bounded secondary-index leaf seek"
+                );
+                assert!(
+                    minmax_rowid_range_seek_plan(
+                        &rowid_range_agg,
+                        &table,
+                        None,
+                        fixture_where(&rowid_range_stmt),
+                    )
                     .is_none(),
-                "custom max/1 must decline the bounded secondary-index leaf seek"
-            );
-            assert!(
-                minmax_rowid_range_seek_plan(
-                    &rowid_range_agg,
-                    &table,
-                    None,
-                    fixture_where(&rowid_range_stmt),
-                )
-                .is_none(),
-                "custom max/1 must decline the bounded rowid leaf seek"
-            );
-            assert!(
-                minmax_prefix_seek_plan(
-                    &prefix_agg,
-                    prefix_table,
-                    None,
-                    fixture_where(&prefix_stmt),
-                )
-                .is_none(),
-                "custom max/1 must decline the composite-prefix leaf seek"
-            );
-        });
+                    "custom max/1 must decline the bounded rowid leaf seek"
+                );
+                assert!(
+                    minmax_prefix_seek_plan(
+                        &prefix_agg,
+                        prefix_table,
+                        None,
+                        fixture_where(&prefix_stmt),
+                    )
+                    .is_none(),
+                    "custom max/1 must decline the composite-prefix leaf seek"
+                );
+            },
+        );
 
-        with_connection_function_context(vec![("count".to_owned(), 1)], true, true, || {
-            assert!(
-                count_distinct_index_walk_plan(
-                    &distinct_agg,
-                    fixture_columns(&distinct_stmt),
-                    &table,
-                )
-                .is_none(),
-                "custom count/1 must decline COUNT(DISTINCT) index-walk algebra"
-            );
-        });
+        with_connection_function_context(
+            vec![("count".to_owned(), FunctionArity::exact(1))],
+            true,
+            true,
+            || {
+                assert!(
+                    count_distinct_index_walk_plan(
+                        &distinct_agg,
+                        fixture_columns(&distinct_stmt),
+                        &table,
+                    )
+                    .is_none(),
+                    "custom count/1 must decline COUNT(DISTINCT) index-walk algebra"
+                );
+            },
+        );
 
         // Keep the statements live through all borrowed WHERE checks above and
         // make the deliberately no-WHERE fixtures explicit.
@@ -49414,7 +52024,8 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_upsert_between_preserves_excluded_operand_collation() -> Result<(), String> {
+    fn test_codegen_upsert_between_does_not_inherit_excluded_column_collation() -> Result<(), String>
+    {
         let stmt = InsertStatement {
             with: None,
             or_conflict: None,
@@ -49455,15 +52066,23 @@ mod tests {
         codegen_insert(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
         let prog = b.finish().map_err(|err| format!("{err:?}"))?;
 
-        let lt_has_nocase = prog.ops().iter().any(|op| {
-            op.opcode == Opcode::Lt && matches!(&op.p4, P4::Collation(name) if name == "NOCASE")
-        });
-        let gt_has_nocase = prog.ops().iter().any(|op| {
-            op.opcode == Opcode::Gt && matches!(&op.p4, P4::Collation(name) if name == "NOCASE")
-        });
-        if !lt_has_nocase || !gt_has_nocase {
+        let lt_collations = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Lt)
+            .map(|op| op.p4.clone())
+            .collect::<Vec<_>>();
+        let gt_collations = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Gt)
+            .map(|op| op.p4.clone())
+            .collect::<Vec<_>>();
+        if !matches!(lt_collations.as_slice(), [P4::None])
+            || !matches!(gt_collations.as_slice(), [P4::None])
+        {
             return Err(format!(
-                "UPSERT BETWEEN comparison opcodes missed NOCASE collation: lt={lt_has_nocase} gt={gt_has_nocase}"
+                "excluded.name incorrectly donated a declared collation: lt={lt_collations:?} gt={gt_collations:?}"
             ));
         }
 
@@ -50051,6 +52670,104 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    #[test]
+    fn test_schema_evaluation_context_codegen_tags_function_owners() {
+        fn emitted_function_contexts(mut builder: ProgramBuilder) -> Vec<SchemaEvaluationContext> {
+            builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            builder
+                .finish()
+                .expect("schema-expression program should build")
+                .ops()
+                .iter()
+                .filter(|op| matches!(op.opcode, Opcode::Function | Opcode::PureFunc))
+                .map(|op| {
+                    SchemaEvaluationContext::from_function_p1(op.p1)
+                        .expect("schema expression function must carry its owner context")
+                })
+                .collect()
+        }
+
+        let schema = test_schema();
+        let table = &schema[0];
+        let scan = ScanCtx {
+            cursor: 0,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: None,
+            secondaries: &[],
+        };
+        let index = IndexSchema {
+            name: "idx_random".to_owned(),
+            root_page: 3,
+            columns: Vec::new(),
+            key_expressions: vec!["random()".to_owned()],
+            key_sort_directions: vec![],
+            where_clause: Some("random() != 0".to_owned()),
+            is_unique: false,
+            key_collations: vec![],
+            conflict_action: None,
+        };
+        let mut index_builder = ProgramBuilder::new();
+        let skip = index_builder.emit_label();
+        emit_index_predicate_guard(&mut index_builder, &index, &scan, skip);
+        let index_key = index_builder.alloc_reg();
+        emit_index_key_term(&mut index_builder, &index, 0, index_key, &scan);
+        index_builder.resolve_label(skip);
+        assert_eq!(
+            emitted_function_contexts(index_builder),
+            [
+                SchemaEvaluationContext::Index,
+                SchemaEvaluationContext::Index,
+            ]
+        );
+
+        let mut stored_table = test_schema_with_stored_generated().remove(0);
+        stored_table.columns[2].generated_expr = Some("random()".to_owned());
+        let mut stored_builder = ProgramBuilder::new();
+        let stored_row = stored_builder.alloc_regs(
+            i32::try_from(stored_table.columns.len()).expect("test column count fits i32"),
+        );
+        emit_stored_generated_columns(&mut stored_builder, &stored_table, stored_row);
+        assert_eq!(
+            emitted_function_contexts(stored_builder),
+            [SchemaEvaluationContext::GeneratedColumn]
+        );
+
+        let mut virtual_table = test_schema_with_virtual_generated().remove(0);
+        virtual_table.columns[2].generated_expr = Some("random()".to_owned());
+        let mut virtual_builder = ProgramBuilder::new();
+        let virtual_value = virtual_builder.alloc_reg();
+        emit_table_column_read(
+            &mut virtual_builder,
+            0,
+            &virtual_table,
+            None,
+            None,
+            2,
+            virtual_value,
+        );
+        assert_eq!(
+            emitted_function_contexts(virtual_builder),
+            [SchemaEvaluationContext::GeneratedColumn]
+        );
+
+        let mut check_table = test_schema().remove(0);
+        check_table.check_constraints = vec![CheckConstraint {
+            expr: "random() != 0".to_owned(),
+            owner_column: None,
+        }];
+        let mut check_builder = ProgramBuilder::new();
+        let check_row = check_builder.alloc_regs(
+            i32::try_from(check_table.columns.len()).expect("test column count fits i32"),
+        );
+        emit_check_constraints(&mut check_builder, &check_table, check_row, None);
+        assert_eq!(
+            emitted_function_contexts(check_builder),
+            [SchemaEvaluationContext::CheckConstraint]
+        );
     }
 
     #[test]

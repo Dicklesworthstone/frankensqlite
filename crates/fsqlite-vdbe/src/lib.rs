@@ -39,6 +39,48 @@ pub mod vectorized_ops;
 pub mod vectorized_scan;
 pub mod vectorized_sort;
 
+/// P1 bits reserved for [`SchemaEvaluationContext`] on `Function`/`PureFunc`.
+///
+/// SQLite uses the low P1 bits for its constant-argument mask, so schema
+/// context metadata lives in the two highest non-sign bits and leaves that
+/// existing opcode payload intact.
+pub const FUNCTION_SCHEMA_CONTEXT_MASK: i32 = 0x6000_0000;
+
+/// Schema-owned expression currently being evaluated by `Function`/`PureFunc`.
+///
+/// The execution engine needs the precise owner because SQLite applies
+/// different runtime determinism rules to CHECK constraints than it does to
+/// indexes and generated columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum SchemaEvaluationContext {
+    /// Expression-index key or partial-index predicate.
+    Index = 0x2000_0000,
+    /// STORED or VIRTUAL generated-column expression.
+    GeneratedColumn = 0x4000_0000,
+    /// CHECK-constraint expression evaluated for a row mutation.
+    CheckConstraint = 0x6000_0000,
+}
+
+impl SchemaEvaluationContext {
+    /// Encode this context into the reserved `Function`/`PureFunc` P1 bits.
+    #[must_use]
+    pub const fn function_p1_bits(self) -> i32 {
+        self as i32
+    }
+
+    /// Decode schema-evaluation metadata from a `Function`/`PureFunc` P1.
+    #[must_use]
+    pub const fn from_function_p1(p1: i32) -> Option<Self> {
+        match p1 & FUNCTION_SCHEMA_CONTEXT_MASK {
+            0x2000_0000 => Some(Self::Index),
+            0x4000_0000 => Some(Self::GeneratedColumn),
+            0x6000_0000 => Some(Self::CheckConstraint),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod vectorized_prop_tests;
 
@@ -310,12 +352,11 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
         }
         Opcode::SorterCompare => {
             let (read_start, read_len) = register_range(op.p3, 1);
-            let (write_start, write_len) =
-                if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 {
-                    (read_start, read_len)
-                } else {
-                    (-1, 0)
-                };
+            let (write_start, write_len) = if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 {
+                (read_start, read_len)
+            } else {
+                (-1, 0)
+            };
             (read_start, read_len, write_start, write_len)
         }
         Opcode::SorterOpen if (op.p5 & SORTER_OPEN_TOP_N_REGISTER) != 0 => {
@@ -524,6 +565,8 @@ pub struct ProgramBuilder {
     next_anon_placeholder: u32,
     /// Table-to-index cursor metadata for REPLACE conflict resolution.
     table_index_meta: HashMap<i32, Vec<fsqlite_types::opcode::IndexCursorMeta>>,
+    /// Schema-owned expression surrounding the current emission, if any.
+    schema_evaluation_context: Option<SchemaEvaluationContext>,
 }
 
 impl ProgramBuilder {
@@ -535,7 +578,24 @@ impl ProgramBuilder {
             regs: RegisterAllocator::new(),
             next_anon_placeholder: 1,
             table_index_meta: HashMap::new(),
+            schema_evaluation_context: None,
         }
+    }
+
+    /// Emit a complete schema-owned expression under `context`.
+    ///
+    /// Every scalar-function opcode emitted by `emit` is tagged so execution
+    /// can apply the owner-specific determinism policy before the surrounding
+    /// row mutation proceeds. Nested contexts restore the caller's metadata.
+    pub fn with_schema_evaluation_context<T>(
+        &mut self,
+        context: SchemaEvaluationContext,
+        emit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = self.schema_evaluation_context.replace(context);
+        let result = emit(self);
+        self.schema_evaluation_context = previous;
+        result
     }
 
     /// Get the next anonymous placeholder index (1-based) and increment the counter.
@@ -567,6 +627,14 @@ impl ProgramBuilder {
 
     /// Emit a simple instruction from parts.
     pub fn emit_op(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4, p5: u16) -> usize {
+        let p1 = if matches!(opcode, Opcode::Function | Opcode::PureFunc) {
+            (p1 & !FUNCTION_SCHEMA_CONTEXT_MASK)
+                | self
+                    .schema_evaluation_context
+                    .map_or(0, SchemaEvaluationContext::function_p1_bits)
+        } else {
+            p1
+        };
         self.emit(VdbeOp {
             opcode,
             p1,
@@ -2444,6 +2512,96 @@ mod tests {
         assert_eq!(op.p3, 0_i32);
         assert_eq!(op.p4, P4::None);
         assert_eq!(op.p5, 0_u16);
+    }
+
+    #[test]
+    fn test_schema_evaluation_context_encoding_and_nested_restoration() {
+        const CONSTANT_ARGUMENT_MASK: i32 = 0x15;
+
+        let mut builder = ProgramBuilder::new();
+        let output = builder.alloc_reg();
+        builder.with_schema_evaluation_context(SchemaEvaluationContext::Index, |builder| {
+            builder.emit_op(
+                Opcode::PureFunc,
+                CONSTANT_ARGUMENT_MASK,
+                0,
+                output,
+                P4::FuncName("INDEX_FN".to_owned()),
+                0,
+            );
+            builder.with_schema_evaluation_context(
+                SchemaEvaluationContext::CheckConstraint,
+                |builder| {
+                    builder.emit_op(
+                        Opcode::Function,
+                        CONSTANT_ARGUMENT_MASK,
+                        0,
+                        output,
+                        P4::FuncName("CHECK_FN".to_owned()),
+                        0,
+                    );
+                },
+            );
+            builder.emit_op(
+                Opcode::PureFunc,
+                CONSTANT_ARGUMENT_MASK,
+                0,
+                output,
+                P4::FuncName("INDEX_AGAIN_FN".to_owned()),
+                0,
+            );
+        });
+        builder.with_schema_evaluation_context(
+            SchemaEvaluationContext::GeneratedColumn,
+            |builder| {
+                builder.emit_op(
+                    Opcode::PureFunc,
+                    CONSTANT_ARGUMENT_MASK,
+                    0,
+                    output,
+                    P4::FuncName("GENERATED_FN".to_owned()),
+                    0,
+                );
+            },
+        );
+        builder.emit_op(
+            Opcode::PureFunc,
+            CONSTANT_ARGUMENT_MASK,
+            0,
+            output,
+            P4::FuncName("ORDINARY_FN".to_owned()),
+            0,
+        );
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let program = builder
+            .finish()
+            .expect("schema-context program should build");
+        let function_ops: Vec<_> = program
+            .ops()
+            .iter()
+            .filter(|op| matches!(op.opcode, Opcode::Function | Opcode::PureFunc))
+            .collect();
+        let contexts: Vec<_> = function_ops
+            .iter()
+            .map(|op| SchemaEvaluationContext::from_function_p1(op.p1))
+            .collect();
+
+        assert_eq!(
+            contexts,
+            [
+                Some(SchemaEvaluationContext::Index),
+                Some(SchemaEvaluationContext::CheckConstraint),
+                Some(SchemaEvaluationContext::Index),
+                Some(SchemaEvaluationContext::GeneratedColumn),
+                None,
+            ]
+        );
+        assert!(
+            function_ops
+                .iter()
+                .all(|op| { op.p1 & !FUNCTION_SCHEMA_CONTEXT_MASK == CONSTANT_ARGUMENT_MASK })
+        );
     }
 
     // ── test_p4_variant_all_types ───────────────────────────────────────

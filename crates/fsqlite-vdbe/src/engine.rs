@@ -152,7 +152,10 @@ use fsqlite_btree::{
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
-use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
+use fsqlite_func::{
+    ApplicationFunctionKind, ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry,
+    ResolvedScalarFunction,
+};
 use fsqlite_mvcc::ConcurrentPageState;
 use fsqlite_mvcc::{
     AllocatorKey, CommitIndex, CommitLog, ConcurrentRowIdAllocator, InProcessPageLockTable,
@@ -189,7 +192,7 @@ use fsqlite_types::{
 };
 
 use crate::{
-    TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
+    SchemaEvaluationContext, TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage,
     jit::{
         CompiledProgram, CompiledRecordBuilder, ConstantResultRowTemplate, FullScanSelectTemplate,
@@ -199,6 +202,40 @@ use crate::{
 };
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
+
+fn validate_schema_function_invocation(
+    context: SchemaEvaluationContext,
+    function_name: &str,
+    safety: fsqlite_func::ScalarSchemaSafety,
+    args: &[SqliteValue],
+) -> Result<()> {
+    let safe = match safety {
+        fsqlite_func::ScalarSchemaSafety::Always => true,
+        // SQLite deliberately permits ordinary nondeterministic functions and
+        // CURRENT_* literals in CHECK constraints. Index and generated-column
+        // values, by contrast, must remain reproducible from stored row data.
+        fsqlite_func::ScalarSchemaSafety::Never => {
+            context == SchemaEvaluationContext::CheckConstraint
+        }
+        fsqlite_func::ScalarSchemaSafety::DateTimeConditional => {
+            fsqlite_func::datetime::is_datetime_invocation_safe_for_schema(function_name, args)
+        }
+    };
+    if safe {
+        Ok(())
+    } else {
+        let owner = match context {
+            SchemaEvaluationContext::Index => "an index",
+            SchemaEvaluationContext::GeneratedColumn => "a generated column",
+            SchemaEvaluationContext::CheckConstraint => "a CHECK constraint",
+        };
+        Err(FrankenError::function_error(format!(
+            "non-deterministic use of {}() in {owner}",
+            function_name.to_ascii_lowercase(),
+        )))
+    }
+}
+
 /// FrankenSQLite-specific p5 flag for `Insert`/`Delete` opcodes emitted from
 /// UPDATE rewrites.
 ///
@@ -5928,7 +5965,7 @@ pub struct VdbeEngine {
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
     func_registry: Option<Arc<FunctionRegistry>>,
     /// Resolved scalar functions keyed by opcode address.
-    scalar_function_cache: HashMap<usize, Arc<dyn fsqlite_func::ScalarFunction>>,
+    scalar_function_cache: HashMap<usize, ResolvedScalarFunction>,
     /// Resolved aggregate functions keyed by opcode address.
     aggregate_function_cache: HashMap<usize, Arc<ErasedAggregateFunction>>,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
@@ -8835,18 +8872,14 @@ impl VdbeEngine {
                             }
                         }
                     } else {
-                        // Fast path: Integer vs Integer with no collation.
-                        // This is the dominant comparison case (rowid checks,
-                        // WHERE filters on int columns, index probes). Avoids
-                        // coerce_for_comparison Cow allocation and collation lookup.
-                        let cmp = if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) =
-                            (lhs, rhs)
+                        // Same-storage values can bypass affinity coercion only
+                        // when P5 cannot change that storage class. In
+                        // particular, TEXT P5 must stringify numeric values and
+                        // NUMERIC P5 must attempt to coerce each TEXT value.
+                        let cmp = if let Some(cmp) =
+                            fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5)
                         {
-                            if !matches!(op.p4, P4::Collation(_)) {
-                                Some(a.cmp(b))
-                            } else {
-                                lhs.partial_cmp(rhs)
-                            }
+                            cmp
                         } else {
                             // General path: affinity coercion + collation.
                             let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
@@ -12205,26 +12238,50 @@ impl VdbeEngine {
 
                     let func_pc = pc;
                     #[allow(clippy::cast_possible_wrap)]
-                    let func = if let Some(func) = self.scalar_function_cache.get(&func_pc) {
-                        Arc::clone(func)
-                    } else {
-                        let registry = self.func_registry.as_ref().ok_or_else(|| {
-                            FrankenError::Internal(
-                                "Function opcode executed without function registry".to_owned(),
+                    let (func, schema_safety, function_consumes_argument_collation) =
+                        if let Some(resolved) = self.scalar_function_cache.get(&func_pc) {
+                            (
+                                resolved.function(),
+                                resolved.schema_safety(),
+                                resolved.consumes_argument_collation(),
                             )
-                        })?;
-                        let func = registry
-                            .find_scalar_precanonical(func_name, arg_count as i32)
-                            .or_else(|| registry.find_scalar(func_name, arg_count as i32))
-                            .ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "no such function: {func_name}/{arg_count}",
-                                ))
+                        } else {
+                            let registry = self.func_registry.as_ref().ok_or_else(|| {
+                                FrankenError::Internal(
+                                    "Function opcode executed without function registry".to_owned(),
+                                )
                             })?;
-                        self.scalar_function_cache
-                            .insert(func_pc, Arc::clone(&func));
-                        func
-                    };
+                            let resolved = registry
+                                .resolve_scalar_precanonical(func_name, arg_count as i32)
+                                .or_else(|| registry.resolve_scalar(func_name, arg_count as i32))
+                                .ok_or_else(|| {
+                                    registry
+                                        .resolve_application_function(func_name, arg_count as i32)
+                                        .filter(|resolution| {
+                                            resolution.kind() != ApplicationFunctionKind::Scalar
+                                        })
+                                        .map_or_else(
+                                            || {
+                                                FrankenError::Internal(format!(
+                                                    "no such function: {func_name}/{arg_count}",
+                                                ))
+                                            },
+                                            |resolution| {
+                                                FrankenError::function_error(format!(
+                                                    "misuse of {} function {}()",
+                                                    resolution.kind().label(),
+                                                    func_name.to_ascii_lowercase(),
+                                                ))
+                                            },
+                                        )
+                                })?;
+                            let func = resolved.function();
+                            let schema_safety = resolved.schema_safety();
+                            let consumes_argument_collation =
+                                resolved.consumes_argument_collation();
+                            self.scalar_function_cache.insert(func_pc, resolved);
+                            (func, schema_safety, consumes_argument_collation)
+                        };
 
                     // Gather per-argument subtypes (cheap when none are set:
                     // `has_subtypes` short-circuits before any HashMap probes).
@@ -12238,6 +12295,25 @@ impl VdbeEngine {
                         })
                         .collect();
                     let any_arg_subtype = arg_subtypes.iter().any(|&st| st != 0);
+                    let function_collation = if function_consumes_argument_collation {
+                        match &op.p4 {
+                            P4::FuncNameCollated(_, collation_name) => {
+                                let registry = self
+                                    .collation_registry
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                Some(registry.find(collation_name).ok_or_else(|| {
+                                    FrankenError::function_error(format!(
+                                        "no such collation sequence: {collation_name}"
+                                    ))
+                                })?)
+                            }
+                            P4::FuncName(_) => None,
+                            _ => unreachable!("function P4 was validated above"),
+                        }
+                    } else {
+                        None
+                    };
 
                     // Use a direct slice into the register file instead of
                     // allocating a SmallVec via collect_reg_range.  Same pattern as
@@ -12250,16 +12326,36 @@ impl VdbeEngine {
                         let start_idx = first_arg_reg as usize;
                         let end_idx = start_idx + arg_count;
                         let args = &self.registers[start_idx..end_idx];
+                        if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1) {
+                            validate_schema_function_invocation(
+                                context,
+                                func_name,
+                                schema_safety,
+                                args,
+                            )?;
+                        }
                         observe_execution_cancellation(&self.execution_cx)?;
-                        if any_arg_subtype {
+                        if function_consumes_argument_collation {
+                            func.invoke_with_collation(args, function_collation.as_deref())?
+                        } else if any_arg_subtype {
                             func.invoke_with_arg_subtypes(args, &arg_subtypes)?
                         } else {
                             func.invoke(args)?
                         }
                     } else {
                         let args = self.collect_reg_range(first_arg_reg, arg_count);
+                        if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1) {
+                            validate_schema_function_invocation(
+                                context,
+                                func_name,
+                                schema_safety,
+                                &args,
+                            )?;
+                        }
                         observe_execution_cancellation(&self.execution_cx)?;
-                        if any_arg_subtype {
+                        if function_consumes_argument_collation {
+                            func.invoke_with_collation(&args, function_collation.as_deref())?
+                        } else if any_arg_subtype {
                             func.invoke_with_arg_subtypes(&args, &arg_subtypes)?
                         } else {
                             func.invoke(&args)?
@@ -14397,7 +14493,7 @@ impl VdbeEngine {
             return Ok(());
         }
 
-        let cmp = if let Some(cmp) = fast_compare_same_storage_class(lhs, rhs, &op.p4) {
+        let cmp = if let Some(cmp) = fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5) {
             cmp
         } else {
             let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
@@ -16398,6 +16494,7 @@ impl VdbeEngine {
 
 /// SQLite affinity constants (from §3.2 of datatype3.html).
 /// Encoded in the lower bits of comparison opcode p5 (masked by 0x47).
+const SQLITE_AFF_MASK: u16 = 0x47;
 const SQLITE_AFF_TEXT: u16 = 0x42; // 'B'
 const SQLITE_AFF_NUMERIC: u16 = 0x43; // 'C'
 
@@ -16420,10 +16517,11 @@ fn vdbe_real_is_truthy(val: &SqliteValue) -> bool {
 
 /// Apply SQLite comparison affinity coercion (§3.2 of datatype3.html).
 ///
-/// Coercion only applies when the comparison opcode's p5 carries a
-/// numeric-class affinity (>= NUMERIC / 0x43).  When p5 is 0 or carries
-/// BLOB affinity (0x41), no coercion is performed — values compare using
-/// their native storage classes (NULL < numeric < text < blob).
+/// Comparison affinity is applied independently to each operand. TEXT affinity
+/// stringifies numeric values, while a numeric-class affinity attempts to
+/// convert every TEXT value to numeric. When p5 is 0 or carries BLOB affinity
+/// (0x41), no coercion is performed — values compare using their native storage
+/// classes (NULL < numeric < text < blob).
 fn coerce_for_comparison<'a>(
     lhs: &'a SqliteValue,
     rhs: &'a SqliteValue,
@@ -16434,7 +16532,7 @@ fn coerce_for_comparison<'a>(
 ) {
     use std::borrow::Cow;
 
-    let affinity = p5 & 0x47_u16; // SQLITE_AFF_MASK
+    let affinity = p5 & SQLITE_AFF_MASK;
 
     // TEXT affinity (0x42): convert numeric operands to text for comparison.
     if affinity == SQLITE_AFF_TEXT {
@@ -16454,25 +16552,20 @@ fn coerce_for_comparison<'a>(
         );
     }
 
-    // Numeric affinity (>= 0x43): coerce text→numeric when one side is numeric.
+    // Numeric affinity (>= 0x43): independently attempt text→numeric on both
+    // operands. Whether the opposite runtime value is already numeric must not
+    // affect application of the opcode's declared comparison affinity.
     if affinity >= SQLITE_AFF_NUMERIC {
-        let is_numeric =
-            |v: &SqliteValue| matches!(v, SqliteValue::Integer(_) | SqliteValue::Float(_));
-
-        if is_numeric(lhs) {
-            if let SqliteValue::Text(s) = rhs {
-                if let Some(coerced) = try_coerce_text_to_numeric_cmp(s) {
-                    return (Cow::Borrowed(lhs), Cow::Owned(coerced));
-                }
-            }
-        }
-        if is_numeric(rhs) {
-            if let SqliteValue::Text(s) = lhs {
-                if let Some(coerced) = try_coerce_text_to_numeric_cmp(s) {
-                    return (Cow::Owned(coerced), Cow::Borrowed(rhs));
-                }
-            }
-        }
+        let coerce_to_numeric = |value: &SqliteValue| match value {
+            SqliteValue::Text(text) => try_coerce_text_to_numeric_cmp(text),
+            _ => None,
+        };
+        let new_lhs = coerce_to_numeric(lhs);
+        let new_rhs = coerce_to_numeric(rhs);
+        return (
+            new_lhs.map_or_else(|| Cow::Borrowed(lhs), Cow::Owned),
+            new_rhs.map_or_else(|| Cow::Borrowed(rhs), Cow::Owned),
+        );
     }
 
     (Cow::Borrowed(lhs), Cow::Borrowed(rhs))
@@ -16605,11 +16698,17 @@ fn fast_compare_same_storage_class(
     lhs: &SqliteValue,
     rhs: &SqliteValue,
     p4: &P4,
+    p5: u16,
 ) -> Option<Option<Ordering>> {
+    let affinity = p5 & SQLITE_AFF_MASK;
     match (lhs, rhs) {
-        (SqliteValue::Integer(a), SqliteValue::Integer(b)) => Some(Some(a.cmp(b))),
-        (SqliteValue::Float(a), SqliteValue::Float(b)) => Some(a.partial_cmp(b)),
-        (SqliteValue::Text(a), SqliteValue::Text(b)) => match p4 {
+        (SqliteValue::Integer(a), SqliteValue::Integer(b)) if affinity != SQLITE_AFF_TEXT => {
+            Some(Some(a.cmp(b)))
+        }
+        (SqliteValue::Float(a), SqliteValue::Float(b)) if affinity != SQLITE_AFF_TEXT => {
+            Some(a.partial_cmp(b))
+        }
+        (SqliteValue::Text(a), SqliteValue::Text(b)) if affinity < SQLITE_AFF_NUMERIC => match p4 {
             P4::Collation(coll_name) => builtin_collation_compare_text(a, b, coll_name).map(Some),
             _ => Some(Some(a.as_bytes().cmp(b.as_bytes()))),
         },
@@ -18594,6 +18693,78 @@ mod tests {
             .into_iter()
             .map(|v| v.into_vec())
             .collect()
+    }
+
+    #[test]
+    fn test_schema_evaluation_context_function_policy_and_diagnostics() {
+        let fixed_datetime = [SqliteValue::Text("2000-01-01".into())];
+        let current_datetime = [SqliteValue::Text("now".into())];
+
+        for context in [
+            SchemaEvaluationContext::Index,
+            SchemaEvaluationContext::GeneratedColumn,
+        ] {
+            let error = validate_schema_function_invocation(
+                context,
+                "RANDOM",
+                fsqlite_func::ScalarSchemaSafety::Never,
+                &[],
+            )
+            .expect_err("indexes and generated columns must reject Never functions");
+            let expected_owner = match context {
+                SchemaEvaluationContext::Index => "an index",
+                SchemaEvaluationContext::GeneratedColumn => "a generated column",
+                SchemaEvaluationContext::CheckConstraint => unreachable!(),
+            };
+            assert!(
+                error.to_string().contains(&format!(
+                    "non-deterministic use of random() in {expected_owner}"
+                )),
+                "unexpected diagnostic: {error}"
+            );
+        }
+
+        validate_schema_function_invocation(
+            SchemaEvaluationContext::CheckConstraint,
+            "RANDOM",
+            fsqlite_func::ScalarSchemaSafety::Never,
+            &[],
+        )
+        .expect("ordinary nondeterministic functions are legal in CHECK constraints");
+
+        for (context, expected_owner) in [
+            (SchemaEvaluationContext::Index, "an index"),
+            (
+                SchemaEvaluationContext::GeneratedColumn,
+                "a generated column",
+            ),
+            (
+                SchemaEvaluationContext::CheckConstraint,
+                "a CHECK constraint",
+            ),
+        ] {
+            validate_schema_function_invocation(
+                context,
+                "DATE",
+                fsqlite_func::ScalarSchemaSafety::DateTimeConditional,
+                &fixed_datetime,
+            )
+            .expect("fixed date/time arguments are safe in every schema context");
+
+            let error = validate_schema_function_invocation(
+                context,
+                "DATE",
+                fsqlite_func::ScalarSchemaSafety::DateTimeConditional,
+                &current_datetime,
+            )
+            .expect_err("current-time date() must fail in every schema context");
+            assert!(
+                error.to_string().contains(&format!(
+                    "non-deterministic use of date() in {expected_owner}"
+                )),
+                "unexpected diagnostic: {error}"
+            );
+        }
     }
 
     #[test]
@@ -22259,6 +22430,106 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec![SqliteValue::Integer(1)]); // 5 > 3 = true
         assert_eq!(rows[1], vec![SqliteValue::Integer(0)]); // 3 > 5 = false
+    }
+
+    #[test]
+    fn test_comparison_affinity_precedes_same_storage_fast_paths() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_text_non_numeric = b.alloc_reg();
+            let r_text_two = b.alloc_reg();
+            let r_text_ten = b.alloc_reg();
+            let r_int_two = b.alloc_reg();
+            let r_int_ten = b.alloc_reg();
+            let r_float_two = b.alloc_reg();
+            let r_float_ten = b.alloc_reg();
+            let outputs = b.alloc_regs(4);
+
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_text_non_numeric,
+                0,
+                P4::Str("0x".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_text_two,
+                0,
+                P4::Str("2".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_text_ten,
+                0,
+                P4::Str("10".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::Integer, 2, r_int_two, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 10, r_int_ten, 0, P4::None, 0);
+            b.emit_op(Opcode::Real, 0, r_float_two, 0, P4::Real(2.0), 0);
+            b.emit_op(Opcode::Real, 0, r_float_ten, 0, P4::Real(10.0), 0);
+
+            // NUMERIC affinity converts each TEXT operand independently. "0x"
+            // remains TEXT while "10" becomes INTEGER, so storage-class order
+            // makes "0x" greater. A same-TEXT fast path would compare bytes and
+            // produce the opposite result.
+            b.emit_op(
+                Opcode::Gt,
+                r_text_ten,
+                outputs,
+                r_text_non_numeric,
+                P4::None,
+                SQLITE_AFF_NUMERIC | 0x20,
+            );
+            // Both numeric-looking TEXT operands become integers: 2 < 10.
+            b.emit_op(
+                Opcode::Lt,
+                r_text_ten,
+                outputs + 1,
+                r_text_two,
+                P4::None,
+                SQLITE_AFF_NUMERIC | 0x20,
+            );
+            // TEXT affinity stringifies same-storage numeric operands before
+            // comparison, making both "2" > "10" and "2.0" > "10.0".
+            b.emit_op(
+                Opcode::Gt,
+                r_int_ten,
+                outputs + 2,
+                r_int_two,
+                P4::None,
+                SQLITE_AFF_TEXT | 0x20,
+            );
+            b.emit_op(
+                Opcode::Gt,
+                r_float_ten,
+                outputs + 3,
+                r_float_two,
+                P4::None,
+                SQLITE_AFF_TEXT | 0x20,
+            );
+
+            b.emit_op(Opcode::ResultRow, outputs, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+            ]]
+        );
     }
 
     #[test]
