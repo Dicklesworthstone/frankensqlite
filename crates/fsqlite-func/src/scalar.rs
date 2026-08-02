@@ -23,7 +23,7 @@
 use fsqlite_error::Result;
 use fsqlite_types::SqliteValue;
 
-use crate::FunctionArity;
+use crate::{FunctionArity, collation::CollationFunction};
 
 /// A scalar (row-level) SQL function.
 ///
@@ -58,6 +58,27 @@ pub trait ScalarFunction: Send + Sync {
         &self,
         args: &[SqliteValue],
         _arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        self.invoke(args)
+    }
+
+    /// Whether this function consumes the SQL collation selected from its
+    /// arguments (for example built-in `nullif`, scalar `min`, and scalar
+    /// `max`). Custom functions default to collation-opaque semantics.
+    fn consumes_argument_collation(&self) -> bool {
+        false
+    }
+
+    /// Invoke with the selected SQL collation, when this implementation
+    /// advertises [`Self::consumes_argument_collation`].
+    ///
+    /// The default deliberately ignores the collation so a custom function
+    /// that happens to replace a collation-consuming built-in keeps its own
+    /// semantics.
+    fn invoke_with_collation(
+        &self,
+        args: &[SqliteValue],
+        _collation: Option<&dyn CollationFunction>,
     ) -> Result<SqliteValue> {
         self.invoke(args)
     }
@@ -108,11 +129,7 @@ pub trait ScalarFunction: Send + Sync {
     /// with dynamically-computed metadata may override this method directly.
     fn arity(&self) -> FunctionArity {
         let declared = self.num_args();
-        if declared >= 0 {
-            FunctionArity::exact(declared)
-        } else {
-            FunctionArity::variadic(self.min_args(), self.max_args())
-        }
+        FunctionArity::from_declared_args(declared, || (self.min_args(), self.max_args()))
     }
 
     /// The function name, used in error messages and EXPLAIN output.

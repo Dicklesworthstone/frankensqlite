@@ -81,11 +81,7 @@ pub trait WindowFunction: Send + Sync {
     /// a key and bounds from different observations.
     fn arity(&self) -> FunctionArity {
         let declared = self.num_args();
-        if declared >= 0 {
-            FunctionArity::exact(declared)
-        } else {
-            FunctionArity::variadic(self.min_args(), self.max_args())
-        }
+        FunctionArity::from_declared_args(declared, || (self.min_args(), self.max_args()))
     }
 
     /// The function name, used in error messages and EXPLAIN output.

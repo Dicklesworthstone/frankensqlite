@@ -192,8 +192,19 @@ const AUTO_JDN_MAX: f64 = 5_373_484.499_999;
 const AUTO_UNIX_MIN: f64 = -210_866_760_000.0;
 const AUTO_UNIX_MAX: f64 = 253_402_300_799.0;
 
+fn jdn_to_unix_millis(jdn: f64) -> i64 {
+    ((jdn - UNIX_EPOCH_JDN) * 86_400_000.0).round() as i64
+}
+
 fn jdn_to_unix(jdn: f64) -> i64 {
-    ((jdn - UNIX_EPOCH_JDN) * 86400.0).round() as i64
+    // SQLite first normalizes its internal Julian day to milliseconds, then
+    // floors to the containing Unix second. `div_euclid` is important before
+    // the epoch: -1ms belongs to Unix second -1, not 0.
+    jdn_to_unix_millis(jdn).div_euclid(1000)
+}
+
+fn jdn_to_unix_subsec(jdn: f64) -> f64 {
+    jdn_to_unix_millis(jdn) as f64 / 1000.0
 }
 
 fn unix_to_jdn(ts: f64) -> f64 {
@@ -231,33 +242,70 @@ fn day_of_year(y: i64, m: i64, d: i64) -> i64 {
 
 /// Parse a SQLite time string into a JDN.
 fn parse_timestring(s: &str) -> Option<f64> {
-    let s = s.trim();
+    // sqlite3_value_text() exposes a NUL-terminated C string to date.c. Bytes
+    // after the first embedded NUL are therefore not part of the time value.
+    let s = sqlite_c_string_str(s);
 
-    // Special value: 'now' — return the current UTC wall-clock time as JDN.
+    // Special values are exact (apart from ASCII case): unlike numeric input,
+    // SQLite does not ignore surrounding whitespace around these keywords.
     // C SQLite (date.c:451) captures time once per sqlite3_step() via the VFS
     // and caches it; we use SystemTime::now() which gives per-call resolution.
     // A future refinement (Track: Cx time source) could freeze time at
     // statement start for full C SQLite compatibility.
-    if s.eq_ignore_ascii_case("now") {
-        use fsqlite_types::sync_primitives::SystemTime;
-        let secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        // Unix epoch (1970-01-01 00:00:00) = JDN 2_440_587.5
-        return Some(2_440_587.5 + secs / 86_400.0);
+    if s.eq_ignore_ascii_case("now")
+        || s.eq_ignore_ascii_case("subsec")
+        || s.eq_ignore_ascii_case("subsecond")
+    {
+        return Some(current_time_jdn());
     }
 
     // Try as a Julian Day Number (bare float).
     // Reject non-finite values (NaN/Inf) — sqlite3AtoF doesn't recognize them.
-    if let Ok(jdn) = s.parse::<f64>() {
+    let numeric = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    if let Ok(jdn) = numeric.parse::<f64>() {
         if jdn >= 0.0 && jdn.is_finite() {
             return Some(jdn);
         }
     }
 
-    // ISO-8601 variants.
-    parse_iso8601(s)
+    // SQLite accepts trailing ASCII whitespace on ISO-8601 input, but not
+    // leading whitespace.
+    parse_iso8601(s.trim_end_matches(|c: char| c.is_ascii_whitespace()))
+}
+
+fn current_time_jdn() -> f64 {
+    use fsqlite_types::sync_primitives::SystemTime;
+
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    UNIX_EPOCH_JDN + secs / 86_400.0
+}
+
+fn sqlite_c_string_bytes(bytes: &[u8]) -> &[u8] {
+    bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .map_or(bytes, |nul| &bytes[..nul])
+}
+
+fn sqlite_c_string_str(text: &str) -> &str {
+    let bytes = sqlite_c_string_bytes(text.as_bytes());
+    // `bytes` is a prefix of an already-valid UTF-8 string. A NUL is one byte
+    // and therefore always lies on a character boundary.
+    std::str::from_utf8(bytes).unwrap_or("")
+}
+
+fn sqlite_value_datetime_text(value: &SqliteValue) -> Option<Cow<'_, str>> {
+    match value {
+        SqliteValue::Null => None,
+        SqliteValue::Text(text) => Some(Cow::Borrowed(sqlite_c_string_str(text))),
+        SqliteValue::Blob(bytes) => std::str::from_utf8(sqlite_c_string_bytes(bytes))
+            .ok()
+            .map(Cow::Borrowed),
+        SqliteValue::Integer(_) | SqliteValue::Float(_) => Some(Cow::Owned(value.to_text())),
+    }
 }
 
 fn parse_iso8601(s: &str) -> Option<f64> {
@@ -444,7 +492,10 @@ fn parse_two_ascii_digits(tens: u8, ones: u8) -> Option<i64> {
 
 /// Apply a single modifier string to a JDN.  Returns None if invalid.
 fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
-    let m = modifier.trim().to_ascii_lowercase();
+    if has_outer_ascii_whitespace(modifier) {
+        return None;
+    }
+    let m = modifier.to_ascii_lowercase();
 
     // 'start of month' / 'start of year' / 'start of day'
     if m == "start of month" {
@@ -562,6 +613,14 @@ fn apply_month_delta(months: f64) -> f64 {
     months * 30.436875
 }
 
+fn has_outer_ascii_whitespace(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_whitespace)
+        || value.as_bytes().last().is_some_and(u8::is_ascii_whitespace)
+}
+
 /// SQLite's `computeFloor` (date.c): given a (possibly day-of-month-overflowing)
 /// Y-M-D, return how many days must be subtracted to bring the date back to the
 /// last valid day of month `m`.  Consumed by the `'floor'` datetime modifier.
@@ -582,14 +641,28 @@ fn compute_floor(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// Apply a sequence of modifiers, also tracking the 'subsec' flag.
-fn apply_modifiers(jdn: f64, modifiers: &[String]) -> Option<(f64, bool)> {
+fn apply_modifiers(jdn: f64, modifiers: &[String], mut raw_numeric: bool) -> Option<(f64, bool)> {
     let mut j = jdn;
     let mut subsec = false;
     // Pending day-of-month overflow from the most recent +N month/year shift,
     // consumed by a later 'floor' modifier (mirrors SQLite's DateTime.nFloor).
     let mut n_floor: i64 = 0;
-    for m in modifiers {
-        let m_lower = m.trim().to_ascii_lowercase();
+    for (index, m) in modifiers.iter().enumerate() {
+        if has_outer_ascii_whitespace(m) {
+            return None;
+        }
+        let m_lower = m.to_ascii_lowercase();
+        if matches!(m_lower.as_str(), "unixepoch" | "julianday" | "auto") {
+            // These reinterpretations are valid only as the first modifier of
+            // a raw numeric time value (date.c parseModifier's `idx>1` and
+            // `rawS` checks).
+            if index != 0 || !raw_numeric {
+                return None;
+            }
+            raw_numeric = false;
+        } else if m_lower != "subsec" && m_lower != "subsecond" {
+            raw_numeric = false;
+        }
         if m_lower == "subsec" || m_lower == "subsecond" {
             subsec = true;
             continue;
@@ -771,23 +844,55 @@ fn format_date(jdn: f64) -> SmallText {
     build_small_text(move |w| write!(w, "{y:04}-{m:02}-{d:02}"))
 }
 
-fn format_time(jdn: f64, subsec: bool) -> SmallText {
-    let (h, m, s, frac) = jdn_to_hms(jdn);
-    if subsec && frac > 1e-9 {
-        let ms = (frac * 1000.0).round() as i64;
+#[derive(Clone, Copy)]
+struct UnmodifiedHms {
+    hour: i64,
+    minute: i64,
+    second: i64,
+    fraction: f64,
+}
+
+fn hms_for_output(jdn: f64, unmodified: Option<UnmodifiedHms>) -> UnmodifiedHms {
+    unmodified.unwrap_or_else(|| {
+        let (hour, minute, second, fraction) = jdn_to_hms(jdn);
+        UnmodifiedHms {
+            hour,
+            minute,
+            second,
+            fraction,
+        }
+    })
+}
+
+fn rounded_second_and_millis(hms: UnmodifiedHms) -> (i64, i64) {
+    // date.c rounds the seconds field independently of hours/minutes. Thus an
+    // input ending in 59.9995 is deliberately rendered as 60.000 rather than
+    // carrying into the next minute.
+    let total_millis = ((hms.second as f64 + hms.fraction) * 1000.0 + 0.5).floor() as i64;
+    (total_millis / 1000, total_millis % 1000)
+}
+
+fn format_time(jdn: f64, subsec: bool, unmodified: Option<UnmodifiedHms>) -> SmallText {
+    let hms = hms_for_output(jdn, unmodified);
+    let (h, m) = (hms.hour, hms.minute);
+    if subsec {
+        let (s, ms) = rounded_second_and_millis(hms);
         build_small_text(move |w| write!(w, "{h:02}:{m:02}:{s:02}.{ms:03}"))
     } else {
+        let s = hms.second;
         build_small_text(move |w| write!(w, "{h:02}:{m:02}:{s:02}"))
     }
 }
 
-fn format_datetime(jdn: f64, subsec: bool) -> SmallText {
+fn format_datetime(jdn: f64, subsec: bool, unmodified: Option<UnmodifiedHms>) -> SmallText {
     let (y, mo, d) = jdn_to_ymd(jdn);
-    let (h, mi, s, frac) = jdn_to_hms(jdn);
-    if subsec && frac > 1e-9 {
-        let ms = (frac * 1000.0).round() as i64;
+    let hms = hms_for_output(jdn, unmodified);
+    let (h, mi) = (hms.hour, hms.minute);
+    if subsec {
+        let (s, ms) = rounded_second_and_millis(hms);
         build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}"))
     } else {
+        let s = hms.second;
         build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"))
     }
 }
@@ -849,9 +954,10 @@ fn push_zero_padded_4(result: &mut String, value: i64) {
 }
 
 /// strftime format engine.
-fn format_strftime(fmt: &str, jdn: f64) -> String {
+fn format_strftime(fmt: &str, jdn: f64, subsec: bool, unmodified: Option<UnmodifiedHms>) -> String {
     let (y, mo, d) = jdn_to_ymd(jdn);
-    let (h, mi, s, frac) = jdn_to_hms(jdn);
+    let hms = hms_for_output(jdn, unmodified);
+    let (h, mi, s, frac) = (hms.hour, hms.minute, hms.second, hms.fraction);
     let doy = day_of_year(y, mo, d);
     // Day of week: 0=Sunday.
     let jdn_int = (jdn + 0.5).floor() as i64;
@@ -890,7 +996,7 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
             }
             'f' => {
                 // Seconds with fractional part.
-                let total = s as f64 + frac;
+                let total = (s as f64 + frac).min(59.999);
                 push_format(&mut result, format_args!("{total:06.3}"));
             }
             'H' => push_zero_padded_2(&mut result, h),
@@ -945,8 +1051,13 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
                 push_zero_padded_2(&mut result, mi);
             }
             's' => {
-                let unix = jdn_to_unix(jdn);
-                push_format(&mut result, format_args!("{unix}"));
+                if subsec {
+                    let unix = jdn_to_unix_subsec(jdn);
+                    push_format(&mut result, format_args!("{unix:.3}"));
+                } else {
+                    let unix = jdn_to_unix(jdn);
+                    push_format(&mut result, format_args!("{unix}"));
+                }
             }
             'S' => push_zero_padded_2(&mut result, s),
             'T' => {
@@ -1085,42 +1196,260 @@ fn timediff_impl(jdn1: f64, jdn2: f64) -> String {
 
 // ── Scalar Function Implementations ───────────────────────────────────────
 
-/// Parse args: first arg is time string, rest are modifiers.
-fn parse_args(args: &[SqliteValue]) -> Option<(f64, bool)> {
-    if args.is_empty() || args[0].is_null() {
-        return None;
+/// Return whether an evaluated built-in date/time call is safe in a schema
+/// expression whose value must remain stable for the lifetime of the schema.
+///
+/// SQLite's date/time functions are conditionally deterministic. Fixed text,
+/// numeric, and row-derived values are safe, but the following forms consult
+/// wall-clock or host-local state and must not be used while maintaining an
+/// expression index, partial index, generated column, or CHECK constraint:
+///
+/// - an omitted time value (for example, `date()` or `strftime('%Y')`);
+/// - `now` as a time value;
+/// - `subsec` or `subsecond` in the first time-value position, where SQLite
+///   treats it as shorthand for the current time with subsecond precision;
+/// - `localtime` or `utc` in a modifier position.
+///
+/// The argument layout is function-specific: `strftime`'s format occupies
+/// `args[0]`, while both `timediff` arguments are time values and neither is a
+/// modifier. NULLs preserve SQLite's left-to-right short-circuit behaviour: a
+/// NULL encountered before a conditional feature makes the call return NULL
+/// without consulting that feature.
+///
+/// Names other than the seven built-in date/time functions return `true`.
+/// Callers that permit user-defined overrides must resolve function identity
+/// before relying on this helper; a custom function merely named `date` is not
+/// necessarily governed by SQLite's built-in date/time rules.
+#[must_use]
+pub fn is_datetime_invocation_safe_for_schema(function_name: &str, args: &[SqliteValue]) -> bool {
+    if function_name.eq_ignore_ascii_case("strftime") {
+        // C SQLite returns NULL before evaluating the time arguments when the
+        // format is absent or NULL. With a non-NULL format, an omitted time
+        // value means "now".
+        return args.first().is_none_or(SqliteValue::is_null)
+            || datetime_arguments_are_schema_safe(&args[1..]);
     }
 
-    let numeric_input = matches!(&args[0], SqliteValue::Integer(_) | SqliteValue::Float(_));
-    let input = match &args[0] {
-        SqliteValue::Text(s) => parse_timestring(s)?,
-        SqliteValue::Integer(i) => *i as f64,
-        SqliteValue::Float(f) => *f,
-        _ => return None,
+    if function_name.eq_ignore_ascii_case("timediff") {
+        // Wrong-arity calls are rejected by function resolution and never
+        // invoke timediff. For the valid arity, each argument is independently
+        // parsed as a time value; neither position accepts modifiers.
+        if args.len() != 2 {
+            return true;
+        }
+        for time_value in args {
+            match classify_time_value_for_schema(time_value) {
+                SchemaTimeValue::Dynamic => return false,
+                SchemaTimeValue::NullOrInvalid => return true,
+                SchemaTimeValue::Fixed { .. } => {}
+            }
+        }
+        return true;
+    }
+
+    if function_name.eq_ignore_ascii_case("date")
+        || function_name.eq_ignore_ascii_case("time")
+        || function_name.eq_ignore_ascii_case("datetime")
+        || function_name.eq_ignore_ascii_case("julianday")
+        || function_name.eq_ignore_ascii_case("unixepoch")
+    {
+        return datetime_arguments_are_schema_safe(args);
+    }
+
+    true
+}
+
+/// Check the common `(time-value, modifier...)` date/time call shape.
+fn datetime_arguments_are_schema_safe(args: &[SqliteValue]) -> bool {
+    let Some(time_value) = args.first() else {
+        return false;
+    };
+    let (input, raw_numeric) = match classify_time_value_for_schema(time_value) {
+        SchemaTimeValue::Dynamic => return false,
+        SchemaTimeValue::NullOrInvalid => return true,
+        SchemaTimeValue::Fixed { input, raw_numeric } => (input, raw_numeric),
     };
 
-    // C SQLite: a NULL modifier causes the entire function to return NULL
-    // (date.c:1127). Previously, NULL modifiers were silently skipped.
-    if args[1..].iter().any(SqliteValue::is_null) {
-        return None;
+    let mut reached_modifiers = Vec::with_capacity(args.len().saturating_sub(1));
+    for modifier in &args[1..] {
+        if modifier.is_null() {
+            return true;
+        }
+        if sqlite_value_is_keyword(modifier, "localtime")
+            || sqlite_value_is_keyword(modifier, "utc")
+        {
+            return false;
+        }
+        let Some(modifier) = sqlite_value_datetime_text(modifier) else {
+            return true;
+        };
+        reached_modifiers.push(modifier.into_owned());
+        if apply_modifiers(input, &reached_modifiers, raw_numeric).is_none() {
+            // Evaluation stops at the first invalid modifier. A conditional
+            // token farther to the right is therefore unreachable.
+            return true;
+        }
     }
-    let modifiers: Vec<String> = args[1..].iter().map(SqliteValue::to_text).collect();
+    true
+}
+
+enum SchemaTimeValue {
+    Dynamic,
+    NullOrInvalid,
+    Fixed { input: f64, raw_numeric: bool },
+}
+
+fn classify_time_value_for_schema(value: &SqliteValue) -> SchemaTimeValue {
+    if value.is_null() {
+        return SchemaTimeValue::NullOrInvalid;
+    }
+    if is_implicit_now_time_value(value) {
+        return SchemaTimeValue::Dynamic;
+    }
+    match parse_time_value(value) {
+        Some(parsed) => SchemaTimeValue::Fixed {
+            input: parsed.jdn,
+            raw_numeric: parsed.raw_numeric,
+        },
+        None => SchemaTimeValue::NullOrInvalid,
+    }
+}
+
+fn is_implicit_now_time_value(value: &SqliteValue) -> bool {
+    sqlite_value_is_keyword(value, "now")
+        || sqlite_value_is_keyword(value, "subsec")
+        || sqlite_value_is_keyword(value, "subsecond")
+}
+
+/// Compare SQLite's NUL-terminated text view without allocating. Special
+/// date/time words are ASCII-case-insensitive but do not permit surrounding
+/// whitespace. Numeric values cannot equal any keyword checked here.
+fn sqlite_value_is_keyword(value: &SqliteValue, keyword: &str) -> bool {
+    let bytes = match value {
+        SqliteValue::Text(text) => sqlite_c_string_bytes(text.as_bytes()),
+        SqliteValue::Blob(bytes) => sqlite_c_string_bytes(bytes),
+        SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => return false,
+    };
+    bytes.eq_ignore_ascii_case(keyword.as_bytes())
+}
+
+#[derive(Clone, Copy)]
+struct ParsedTimeValue {
+    jdn: f64,
+    raw_numeric: bool,
+    unmodified_hms: Option<UnmodifiedHms>,
+}
+
+fn parse_time_value(value: &SqliteValue) -> Option<ParsedTimeValue> {
+    match value {
+        SqliteValue::Null => None,
+        SqliteValue::Integer(integer) => Some(ParsedTimeValue {
+            jdn: *integer as f64,
+            raw_numeric: true,
+            unmodified_hms: None,
+        }),
+        SqliteValue::Float(float) if float.is_finite() => Some(ParsedTimeValue {
+            jdn: *float,
+            raw_numeric: true,
+            unmodified_hms: None,
+        }),
+        SqliteValue::Float(_) => None,
+        SqliteValue::Text(_) | SqliteValue::Blob(_) => {
+            let text = sqlite_value_datetime_text(value)?;
+            let numeric = text.trim_matches(|c: char| c.is_ascii_whitespace());
+            if let Ok(number) = numeric.parse::<f64>()
+                && number.is_finite()
+            {
+                return Some(ParsedTimeValue {
+                    jdn: number,
+                    raw_numeric: true,
+                    unmodified_hms: None,
+                });
+            }
+            Some(ParsedTimeValue {
+                jdn: parse_timestring(text.as_ref())?,
+                raw_numeric: false,
+                unmodified_hms: unmodified_hms_from_timestring(text.as_ref()),
+            })
+        }
+    }
+}
+
+fn unmodified_hms_from_timestring(value: &str) -> Option<UnmodifiedHms> {
+    let value = sqlite_c_string_str(value).trim_end_matches(|c: char| c.is_ascii_whitespace());
+    let time = if value.len() > 10
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+        && value
+            .as_bytes()
+            .get(10)
+            .is_some_and(|separator| matches!(*separator, b' ' | b'T'))
+    {
+        &value[11..]
+    } else if value.len() >= 5 && value.as_bytes().get(2) == Some(&b':') {
+        value
+    } else {
+        return None;
+    };
+    let (hour, minute, second, fraction, timezone_offset) = parse_time_part_with_tz(time)?;
+    (timezone_offset == 0).then_some(UnmodifiedHms {
+        hour,
+        minute,
+        second,
+        fraction,
+    })
+}
+
+struct ParsedDateTimeArgs {
+    jdn: f64,
+    subsec: bool,
+    unmodified_hms: Option<UnmodifiedHms>,
+}
+
+/// Parse the common `(time-value, modifier...)` argument layout.
+fn parse_args(args: &[SqliteValue]) -> Option<ParsedDateTimeArgs> {
+    let first_position_subsec = args.first().is_some_and(|value| {
+        sqlite_value_is_keyword(value, "subsec") || sqlite_value_is_keyword(value, "subsecond")
+    });
+    let parsed = match args.first() {
+        None => ParsedTimeValue {
+            jdn: current_time_jdn(),
+            raw_numeric: false,
+            unmodified_hms: None,
+        },
+        Some(value) => parse_time_value(value)?,
+    };
+
+    let mut modifiers = Vec::with_capacity(args.len().saturating_sub(1));
+    for modifier in args.get(1..).unwrap_or_default() {
+        modifiers.push(sqlite_value_datetime_text(modifier)?.into_owned());
+    }
 
     // C SQLite rejects a numeric argument outside the representable
     // Julian-day range (date.c validJulianDay), returning NULL rather than
     // formatting a saturated garbage date — unless the first modifier
     // reinterprets the raw number ('unixepoch', 'julianday', 'auto').
-    if numeric_input {
+    if parsed.raw_numeric {
         let first = modifiers
             .first()
-            .map(|modifier| modifier.trim().to_ascii_lowercase());
+            .map(|modifier| modifier.to_ascii_lowercase());
         let reinterprets_raw = matches!(first.as_deref(), Some("unixepoch" | "julianday" | "auto"));
-        if !reinterprets_raw && !(0.0..=AUTO_JDN_MAX).contains(&input) {
+        if !reinterprets_raw && !(0.0..=AUTO_JDN_MAX).contains(&parsed.jdn) {
             return None;
         }
     }
 
-    apply_modifiers(input, &modifiers)
+    let preserves_input_hms = modifiers.iter().all(|modifier| {
+        modifier.eq_ignore_ascii_case("subsec") || modifier.eq_ignore_ascii_case("subsecond")
+    });
+    let (jdn, modifier_subsec) = apply_modifiers(parsed.jdn, &modifiers, parsed.raw_numeric)?;
+    Some(ParsedDateTimeArgs {
+        jdn,
+        subsec: first_position_subsec || modifier_subsec,
+        unmodified_hms: preserves_input_hms
+            .then_some(parsed.unmodified_hms)
+            .flatten(),
+    })
 }
 
 // ── date() ────────────────────────────────────────────────────────────────
@@ -1130,13 +1459,17 @@ pub struct DateFunc;
 impl ScalarFunction for DateFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, _)) => Ok(SqliteValue::Text(format_date(jdn))),
+            Some(parsed) => Ok(SqliteValue::Text(format_date(parsed.jdn))),
             None => Ok(SqliteValue::Null),
         }
     }
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -1151,13 +1484,21 @@ pub struct TimeFunc;
 impl ScalarFunction for TimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_time(jdn, subsec))),
+            Some(parsed) => Ok(SqliteValue::Text(format_time(
+                parsed.jdn,
+                parsed.subsec,
+                parsed.unmodified_hms,
+            ))),
             None => Ok(SqliteValue::Null),
         }
     }
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -1172,13 +1513,21 @@ pub struct DateTimeFunc;
 impl ScalarFunction for DateTimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_datetime(jdn, subsec))),
+            Some(parsed) => Ok(SqliteValue::Text(format_datetime(
+                parsed.jdn,
+                parsed.subsec,
+                parsed.unmodified_hms,
+            ))),
             None => Ok(SqliteValue::Null),
         }
     }
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -1193,13 +1542,17 @@ pub struct JuliandayFunc;
 impl ScalarFunction for JuliandayFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, _)) => Ok(SqliteValue::Float(jdn)),
+            Some(parsed) => Ok(SqliteValue::Float(parsed.jdn)),
             None => Ok(SqliteValue::Null),
         }
     }
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -1216,18 +1569,18 @@ impl ScalarFunction for UnixepochFunc {
         match parse_args(args) {
             // bd-855l7: the 'subsec'/'subsecond' modifier makes unixepoch return
             // a floating-point value carrying the fractional seconds.
-            Some((jdn, true)) => {
-                let secs = (jdn - UNIX_EPOCH_JDN) * 86400.0;
-                let rounded = (secs * 1000.0).round() / 1000.0;
-                Ok(SqliteValue::Float(rounded))
-            }
-            Some((jdn, false)) => Ok(SqliteValue::Integer(jdn_to_unix(jdn))),
+            Some(parsed) if parsed.subsec => Ok(SqliteValue::Float(jdn_to_unix_subsec(parsed.jdn))),
+            Some(parsed) => Ok(SqliteValue::Integer(jdn_to_unix(parsed.jdn))),
             None => Ok(SqliteValue::Null),
         }
     }
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -1241,24 +1594,33 @@ pub struct StrftimeFunc;
 
 impl ScalarFunction for StrftimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 2 || args[0].is_null() || args[1].is_null() {
+        let Some(format_value) = args.first() else {
             return Ok(SqliteValue::Null);
-        }
+        };
+        let Some(fmt) = sqlite_value_datetime_text(format_value) else {
+            return Ok(SqliteValue::Null);
+        };
         let rest = &args[1..];
         match parse_args(rest) {
-            Some((jdn, _)) => {
-                let fmt = match args[0].as_text_str() {
-                    Some(text) => Cow::Borrowed(text),
-                    None => Cow::Owned(args[0].to_text()),
-                };
-                Ok(SqliteValue::Text(format_strftime(fmt.as_ref(), jdn).into()))
-            }
+            Some(parsed) => Ok(SqliteValue::Text(
+                format_strftime(
+                    fmt.as_ref(),
+                    parsed.jdn,
+                    parsed.subsec,
+                    parsed.unmodified_hms,
+                )
+                .into(),
+            )),
             None => Ok(SqliteValue::Null),
         }
     }
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -1276,18 +1638,12 @@ impl ScalarFunction for TimediffFunc {
             return Ok(SqliteValue::Null);
         }
 
-        let jdn1 = match &args[0] {
-            SqliteValue::Text(s) => parse_timestring(s),
-            SqliteValue::Integer(i) => Some(*i as f64),
-            SqliteValue::Float(f) => Some(*f),
-            _ => None,
-        };
-        let jdn2 = match &args[1] {
-            SqliteValue::Text(s) => parse_timestring(s),
-            SqliteValue::Integer(i) => Some(*i as f64),
-            SqliteValue::Float(f) => Some(*f),
-            _ => None,
-        };
+        let jdn1 = parse_time_value(&args[0])
+            .map(|parsed| parsed.jdn)
+            .filter(|jdn| (0.0..=AUTO_JDN_MAX).contains(jdn));
+        let jdn2 = parse_time_value(&args[1])
+            .map(|parsed| parsed.jdn)
+            .filter(|jdn| (0.0..=AUTO_JDN_MAX).contains(jdn));
 
         match (jdn1, jdn2) {
             (Some(j1), Some(j2)) => Ok(SqliteValue::Text(timediff_impl(j1, j2).into())),
@@ -1299,6 +1655,10 @@ impl ScalarFunction for TimediffFunc {
         2
     }
 
+    fn is_deterministic(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "timediff"
     }
@@ -1308,13 +1668,13 @@ impl ScalarFunction for TimediffFunc {
 
 /// Register all §13.3 date/time functions.
 pub fn register_datetime_builtins(registry: &mut FunctionRegistry) {
-    registry.register_scalar(DateFunc);
-    registry.register_scalar(TimeFunc);
-    registry.register_scalar(DateTimeFunc);
-    registry.register_scalar(JuliandayFunc);
-    registry.register_scalar(UnixepochFunc);
-    registry.register_scalar(StrftimeFunc);
-    registry.register_scalar(TimediffFunc);
+    registry.register_conditionally_deterministic_scalar(DateFunc);
+    registry.register_conditionally_deterministic_scalar(TimeFunc);
+    registry.register_conditionally_deterministic_scalar(DateTimeFunc);
+    registry.register_conditionally_deterministic_scalar(JuliandayFunc);
+    registry.register_conditionally_deterministic_scalar(UnixepochFunc);
+    registry.register_conditionally_deterministic_scalar(StrftimeFunc);
+    registry.register_conditionally_deterministic_scalar(TimediffFunc);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1346,7 +1706,308 @@ mod tests {
         }
     }
 
+    // ── Schema-expression safety ─────────────────────────────────────────
+
+    fn blob(s: &str) -> SqliteValue {
+        SqliteValue::Blob(s.as_bytes().into())
+    }
+
+    #[test]
+    fn test_schema_safety_common_datetime_argument_layout() {
+        for name in ["date", "time", "datetime", "julianday", "unixepoch"] {
+            assert!(
+                !is_datetime_invocation_safe_for_schema(name, &[]),
+                "{name}() implicitly reads the current time"
+            );
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2024-03-15 12:34:56")]
+            ));
+            assert!(is_datetime_invocation_safe_for_schema(name, &[int(0)]));
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[float(2_460_384.5)]
+            ));
+            assert!(is_datetime_invocation_safe_for_schema(name, &[null()]));
+
+            for current_time in ["now", "NOW", "subsec", "SUBSECOND"] {
+                assert!(
+                    !is_datetime_invocation_safe_for_schema(name, &[text(current_time)]),
+                    "{name}({current_time:?}) must be conditional"
+                );
+            }
+            assert!(!is_datetime_invocation_safe_for_schema(
+                name,
+                &[blob("NOW")]
+            ));
+            assert!(!is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("now\0ignored")]
+            ));
+            assert!(!is_datetime_invocation_safe_for_schema(
+                name,
+                &[SqliteValue::Blob(b"subsec\0\xff".as_slice().into())]
+            ));
+            for invalid_padded in [" now ", "subsec ", " subsecond"] {
+                assert!(is_datetime_invocation_safe_for_schema(
+                    name,
+                    &[text(invalid_padded)]
+                ));
+            }
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[blob(" NoW ")]
+            ));
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("nowhere")]
+            ));
+
+            // These words only have conditional meaning in modifier position.
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("localtime")]
+            ));
+            assert!(is_datetime_invocation_safe_for_schema(name, &[text("utc")]));
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2024-03-15"), text("subsec")]
+            ));
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2024-03-15"), text("subsecond")]
+            ));
+
+            for modifier in ["localtime", "LOCALTIME", "utc"] {
+                assert!(
+                    !is_datetime_invocation_safe_for_schema(
+                        name,
+                        &[text("2024-03-15"), text(modifier)]
+                    ),
+                    "{name} modifier {modifier:?} depends on host-local state"
+                );
+            }
+            assert!(!is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2024-03-15"), blob("UTC")]
+            ));
+            assert!(!is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2024-03-15"), text("localtime\0ignored")]
+            ));
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2024-03-15"), text(" utc ")]
+            ));
+
+            // A prior NULL returns NULL without reaching later modifiers.
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2024-03-15"), null(), text("localtime")]
+            ));
+            assert!(!is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2024-03-15"), text("localtime"), null()]
+            ));
+
+            // Invalid input or an invalid modifier stops evaluation before a
+            // later conditional token is reached.
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("bogus"), text("localtime")]
+            ));
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("2000-01-01"), text("bogus"), text("localtime")]
+            ));
+        }
+    }
+
+    #[test]
+    fn test_schema_safety_strftime_uses_shifted_time_arguments() {
+        assert!(is_datetime_invocation_safe_for_schema("strftime", &[]));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[null()]
+        ));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[null(), text("now")]
+        ));
+
+        // A format without a time value implicitly formats the current time.
+        assert!(!is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[text("%Y")]
+        ));
+        assert!(!is_datetime_invocation_safe_for_schema(
+            "STRFTIME",
+            &[text("%Y"), text("now")]
+        ));
+        assert!(!is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[text("%s"), text("subsecond")]
+        ));
+
+        // Keywords in the format slot are ordinary fixed format strings.
+        assert!(is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[text("now localtime utc"), text("2024-03-15")]
+        ));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[text("%Y"), int(0), text("unixepoch")]
+        ));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[text("%f"), text("2024-03-15"), text("subsec")]
+        ));
+        assert!(!is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[text("%Y"), text("2024-03-15"), text("localtime")]
+        ));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "strftime",
+            &[text("%Y"), text("2024-03-15"), null(), text("localtime")]
+        ));
+    }
+
+    #[test]
+    fn test_schema_safety_timediff_treats_both_inputs_as_time_values() {
+        assert!(is_datetime_invocation_safe_for_schema("timediff", &[]));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "timediff",
+            &[text("2024-03-15")]
+        ));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "timediff",
+            &[text("2024-03-15"), text("2024-03-14")]
+        ));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "timediff",
+            &[int(2_460_384), float(2_460_383.5)]
+        ));
+
+        for current_time in ["now", "subsec", "subsecond"] {
+            assert!(!is_datetime_invocation_safe_for_schema(
+                "timediff",
+                &[text(current_time), text("2024-03-14")]
+            ));
+            assert!(!is_datetime_invocation_safe_for_schema(
+                "timediff",
+                &[text("2024-03-15"), text(current_time)]
+            ));
+        }
+
+        // timediff has no modifier positions, so these are fixed (invalid)
+        // time strings rather than requests for host-local conversion.
+        assert!(is_datetime_invocation_safe_for_schema(
+            "timediff",
+            &[text("localtime"), text("utc")]
+        ));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "timediff",
+            &[null(), text("now")]
+        ));
+        assert!(is_datetime_invocation_safe_for_schema(
+            "timediff",
+            &[text("bogus"), text("now")]
+        ));
+        assert!(!is_datetime_invocation_safe_for_schema(
+            "timediff",
+            &[blob("NOW"), null()]
+        ));
+    }
+
+    #[test]
+    fn test_schema_safety_ignores_non_datetime_function_names() {
+        for name in ["", "my_date", "current_date", "date ", "random"] {
+            assert!(is_datetime_invocation_safe_for_schema(
+                name,
+                &[text("now"), text("localtime")]
+            ));
+        }
+    }
+
     // ── Basic functions ───────────────────────────────────────────────
+
+    #[test]
+    fn test_omitted_time_value_uses_current_time() {
+        let date = DateFunc.invoke(&[]).unwrap();
+        let time = TimeFunc.invoke(&[]).unwrap();
+        let datetime = DateTimeFunc.invoke(&[]).unwrap();
+        let julianday = JuliandayFunc.invoke(&[]).unwrap();
+        let unixepoch = UnixepochFunc.invoke(&[]).unwrap();
+        let year = StrftimeFunc.invoke(&[text("%Y")]).unwrap();
+
+        assert!(matches!(&date, SqliteValue::Text(value) if value.len() == 10));
+        assert!(matches!(&time, SqliteValue::Text(value) if value.len() == 8));
+        assert!(matches!(&datetime, SqliteValue::Text(value) if value.len() == 19));
+        assert!(matches!(julianday, SqliteValue::Float(_)));
+        assert!(matches!(unixepoch, SqliteValue::Integer(_)));
+        assert!(matches!(&year, SqliteValue::Text(value)
+            if value.len() == 4 && value.as_bytes().iter().all(u8::is_ascii_digit)));
+
+        assert_eq!(StrftimeFunc.invoke(&[]).unwrap(), SqliteValue::Null);
+        assert_eq!(StrftimeFunc.invoke(&[null()]).unwrap(), SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_first_position_subsec_aliases_use_current_time() {
+        for alias in ["subsec", "subsecond"] {
+            assert!(matches!(
+                DateFunc.invoke(&[text(alias)]).unwrap(),
+                SqliteValue::Text(value) if value.len() == 10
+            ));
+            assert!(matches!(
+                TimeFunc.invoke(&[text(alias)]).unwrap(),
+                SqliteValue::Text(value) if value.len() == 12 && value.as_bytes()[8] == b'.'
+            ));
+            assert!(matches!(
+                DateTimeFunc.invoke(&[text(alias)]).unwrap(),
+                SqliteValue::Text(value) if value.len() == 23 && value.as_bytes()[19] == b'.'
+            ));
+            assert!(matches!(
+                JuliandayFunc.invoke(&[text(alias)]).unwrap(),
+                SqliteValue::Float(_)
+            ));
+            assert!(matches!(
+                UnixepochFunc.invoke(&[text(alias)]).unwrap(),
+                SqliteValue::Float(_)
+            ));
+            assert!(matches!(
+                StrftimeFunc.invoke(&[text("%s"), text(alias)]).unwrap(),
+                SqliteValue::Text(value)
+                    if value.rsplit_once('.').is_some_and(|(_, fraction)| fraction.len() == 3)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_padded_and_nul_terminated_special_values() {
+        for invalid in [" now ", "subsec ", " subsecond"] {
+            assert_eq!(
+                DateFunc.invoke(&[text(invalid)]).unwrap(),
+                SqliteValue::Null
+            );
+        }
+        assert_eq!(
+            DateFunc
+                .invoke(&[text("2000-01-01"), text(" localtime ")])
+                .unwrap(),
+            SqliteValue::Null
+        );
+        assert!(matches!(
+            DateFunc.invoke(&[text("now\0ignored")]).unwrap(),
+            SqliteValue::Text(value) if value.len() == 10
+        ));
+        assert!(matches!(
+            TimeFunc
+                .invoke(&[SqliteValue::Blob(b"subsec\0\xff".as_slice().into())])
+                .unwrap(),
+            SqliteValue::Text(value) if value.len() == 12
+        ));
+    }
 
     #[test]
     fn test_date_basic() {
@@ -1992,16 +2653,86 @@ mod tests {
 
     #[test]
     fn test_modifier_subsec() {
-        let r = TimeFunc
-            .invoke(&[text("2024-01-01 12:00:00.123"), text("subsec")])
-            .unwrap();
-        match &r {
-            SqliteValue::Text(s) => assert!(
-                s.contains('.'),
-                "expected fractional seconds with subsec: {s}"
-            ),
-            other => panic!("expected Text, got {other:?}"),
+        assert_text(
+            &TimeFunc
+                .invoke(&[text("2024-01-01 12:00:00"), text("subsec")])
+                .unwrap(),
+            "12:00:00.000",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("2024-01-01 12:00:00"), text("subsecond")])
+                .unwrap(),
+            "2024-01-01 12:00:00.000",
+        );
+        assert_text(
+            &TimeFunc
+                .invoke(&[text("2024-01-01 12:00:00.123"), text("subsec")])
+                .unwrap(),
+            "12:00:00.123",
+        );
+    }
+
+    #[test]
+    fn test_subsec_unix_seconds_and_integer_flooring() {
+        assert_text(
+            &StrftimeFunc
+                .invoke(&[text("%s"), text("1970-01-01 00:00:00.125"), text("subsec")])
+                .unwrap(),
+            "0.125",
+        );
+        assert_eq!(
+            UnixepochFunc
+                .invoke(&[text("1970-01-01 00:00:00.125"), text("subsec")])
+                .unwrap(),
+            float(0.125)
+        );
+
+        for input in ["1970-01-01 00:00:00.500", "1970-01-01 00:00:00.999"] {
+            assert_eq!(UnixepochFunc.invoke(&[text(input)]).unwrap(), int(0));
+            assert_text(
+                &StrftimeFunc.invoke(&[text("%s"), text(input)]).unwrap(),
+                "0",
+            );
         }
+        assert_eq!(
+            UnixepochFunc
+                .invoke(&[text("1969-12-31 23:59:59.999")])
+                .unwrap(),
+            int(-1)
+        );
+        assert_text(
+            &StrftimeFunc
+                .invoke(&[text("%s"), text("1969-12-31 23:59:59.999")])
+                .unwrap(),
+            "-1",
+        );
+    }
+
+    #[test]
+    fn test_subsec_rounding_preserves_sqlite_second_60() {
+        assert_text(
+            &TimeFunc
+                .invoke(&[text("12:34:59.9995"), text("subsec")])
+                .unwrap(),
+            "12:34:60.000",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("1970-01-01 23:59:59.9995"), text("subsec")])
+                .unwrap(),
+            "1970-01-01 23:59:60.000",
+        );
+        assert_text(
+            &StrftimeFunc
+                .invoke(&[
+                    text("%H:%M:%f|%s"),
+                    text("1970-01-01 23:59:59.9995"),
+                    text("subsec"),
+                ])
+                .unwrap(),
+            "23:59:59.999|86400.000",
+        );
     }
 
     // ── Registration ──────────────────────────────────────────────────
@@ -2025,6 +2756,41 @@ mod tests {
             assert!(
                 reg.find_scalar(name, 1).is_some() || reg.find_scalar(name, 2).is_some(),
                 "datetime function '{name}' not registered"
+            );
+        }
+    }
+
+    #[test]
+    fn test_public_datetime_function_metadata_fails_closed_for_direct_registration() {
+        assert!(!DateFunc.is_deterministic());
+        assert!(!TimeFunc.is_deterministic());
+        assert!(!DateTimeFunc.is_deterministic());
+        assert!(!JuliandayFunc.is_deterministic());
+        assert!(!UnixepochFunc.is_deterministic());
+        assert!(!StrftimeFunc.is_deterministic());
+        assert!(!TimediffFunc.is_deterministic());
+
+        let mut registry = FunctionRegistry::new();
+        registry.register_scalar(DateFunc);
+        registry.register_scalar(TimeFunc);
+        registry.register_scalar(DateTimeFunc);
+        registry.register_scalar(JuliandayFunc);
+        registry.register_scalar(UnixepochFunc);
+        registry.register_scalar(StrftimeFunc);
+        registry.register_scalar(TimediffFunc);
+        for (name, num_args) in [
+            ("date", 0),
+            ("time", 0),
+            ("datetime", 0),
+            ("julianday", 0),
+            ("unixepoch", 0),
+            ("strftime", 1),
+            ("timediff", 2),
+        ] {
+            assert_eq!(
+                registry.scalar_schema_safety(name, num_args),
+                Some(crate::ScalarSchemaSafety::Never),
+                "generic registration of {name}/{num_args} must fail closed"
             );
         }
     }
