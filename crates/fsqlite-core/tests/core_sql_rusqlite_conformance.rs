@@ -298,6 +298,10 @@ const AGGREGATE_EDGE_CASES: &[QueryCase] = &[
         sql: "SELECT COUNT(*), COUNT(qty), SUM(qty), AVG(qty), MIN(qty), MAX(qty) FROM sales WHERE qty > 1000",
     },
     QueryCase {
+        name: "empty input keeps row-independent aggregate projections",
+        sql: "SELECT 'lit', 1 + 1, qty, COUNT(*) FROM sales WHERE qty > 1000",
+    },
+    QueryCase {
         name: "left join aggregate null skipping",
         sql: "SELECT COUNT(*), COUNT(ret.qty), SUM(ret.qty), COALESCE(SUM(ret.qty), 0) FROM sales s LEFT JOIN returns ret ON ret.sale_id = s.id",
     },
