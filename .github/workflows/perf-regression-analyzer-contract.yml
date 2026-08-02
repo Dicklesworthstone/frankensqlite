@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - ".github/workflows/perf-regression-analyzer-contract.yml"
+      - ".cargo/config.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -20,6 +21,7 @@ on:
       - main
     paths:
       - ".github/workflows/perf-regression-analyzer-contract.yml"
+      - ".cargo/config.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -45,8 +47,8 @@ jobs:
   # benchmark pipeline or produce performance or release evidence.
   analyzer-contract:
     runs-on: ubuntu-latest
-    # A cold workspace compile can exceed RCH's 30-minute transport default;
-    # leave enough wall-clock budget for compilation plus all analyzer fixtures.
+    # A cold GitHub-hosted workspace build plus all analyzer fixtures can exceed
+    # 45 minutes, so leave a conservative wall-clock budget for this contract.
     timeout-minutes: 90
     steps:
       - name: Checkout
