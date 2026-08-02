@@ -166,14 +166,14 @@ fn use_builtin_scalar_function_semantics() -> bool {
 
 fn use_builtin_scalar_implementation_for_codegen(name: &str, num_args: i32) -> bool {
     FUNCTION_REGISTRY.with(|registry| {
-        registry.borrow().as_ref().map_or_else(
-            use_builtin_scalar_function_semantics,
-            |registry| {
+        registry
+            .borrow()
+            .as_ref()
+            .map_or_else(use_builtin_scalar_function_semantics, |registry| {
                 registry
                     .resolve_application_function(name, num_args)
                     .is_none()
-            },
-        )
+            })
     })
 }
 
@@ -277,8 +277,7 @@ fn scalar_function_p4(canonical_name: String, args: &[Expr], ctx: Option<&ScanCt
     if scalar_consumes_argument_collation_for_codegen(
         &canonical_name,
         i32::try_from(args.len()).unwrap_or(i32::MAX),
-    )
-        && let Some(collation) = scalar_function_argument_collation_ctx(args, ctx)
+    ) && let Some(collation) = scalar_function_argument_collation_ctx(args, ctx)
     {
         return P4::FuncNameCollated(canonical_name, collation);
     }
@@ -1209,11 +1208,7 @@ fn upsert_declared_collation(
     table: &TableSchema,
 ) -> Option<String> {
     let source = declared_collation_source_expr(expr);
-    if let Expr::BoundOuterValue {
-        collation,
-        ..
-    } = source
-    {
+    if let Expr::BoundOuterValue { collation, .. } = source {
         return collation.as_name().map(str::to_owned);
     }
     let Expr::Column(col_ref, _) = source else {
@@ -1432,13 +1427,8 @@ fn emit_upsert_expr(
                         _table,
                     )
                     .map_or(P4::None, P4::Collation);
-                    let comparison_affinity = upsert_comparison_affinity(
-                        left,
-                        right,
-                        existing_ctx,
-                        excluded_ctx,
-                        _table,
-                    );
+                    let comparison_affinity =
+                        upsert_comparison_affinity(left, right, existing_ctx, excluded_ctx, _table);
 
                     let null_label = b.emit_label();
                     let true_label = b.emit_label();
@@ -1626,31 +1616,23 @@ fn emit_upsert_expr(
                             excluded_hidden_rowid_reg,
                         );
                     }
-                    let function_p4 = if scalar_consumes_argument_collation_for_codegen(
-                        &canon,
-                        i32::from(nargs),
-                    ) {
-                        upsert_scalar_function_collation(
-                            arg_list,
-                            existing_ctx,
-                            excluded_ctx,
-                            _table,
-                        )
-                        .map_or_else(
-                            || P4::FuncName(canon.clone()),
-                            |collation| P4::FuncNameCollated(canon.clone(), collation),
-                        )
-                    } else {
-                        P4::FuncName(canon.clone())
-                    };
-                    b.emit_op(
-                        Opcode::PureFunc,
-                        0,
-                        arg_base,
-                        reg,
-                        function_p4,
-                        nargs,
-                    );
+                    let function_p4 =
+                        if scalar_consumes_argument_collation_for_codegen(&canon, i32::from(nargs))
+                        {
+                            upsert_scalar_function_collation(
+                                arg_list,
+                                existing_ctx,
+                                excluded_ctx,
+                                _table,
+                            )
+                            .map_or_else(
+                                || P4::FuncName(canon.clone()),
+                                |collation| P4::FuncNameCollated(canon.clone(), collation),
+                            )
+                        } else {
+                            P4::FuncName(canon.clone())
+                        };
+                    b.emit_op(Opcode::PureFunc, 0, arg_base, reg, function_p4, nargs);
                 }
             }
         }
@@ -1847,33 +1829,24 @@ fn emit_upsert_expr(
                     excluded_hidden_rowid_reg,
                 );
             }
-            let function_p4 = if scalar_consumes_argument_collation_for_codegen(
-                func_name,
-                i32::from(nargs),
-            ) {
-                upsert_scalar_function_collation(
-                    [pattern.as_ref(), operand.as_ref()]
-                        .into_iter()
-                        .chain(escape.as_deref()),
-                    existing_ctx,
-                    excluded_ctx,
-                    _table,
-                )
-                .map_or_else(
-                    || P4::FuncName(func_name.to_owned()),
-                    |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
-                )
-            } else {
-                P4::FuncName(func_name.to_owned())
-            };
-            b.emit_op(
-                Opcode::PureFunc,
-                0,
-                arg_base,
-                reg,
-                function_p4,
-                nargs,
-            );
+            let function_p4 =
+                if scalar_consumes_argument_collation_for_codegen(func_name, i32::from(nargs)) {
+                    upsert_scalar_function_collation(
+                        [pattern.as_ref(), operand.as_ref()]
+                            .into_iter()
+                            .chain(escape.as_deref()),
+                        existing_ctx,
+                        excluded_ctx,
+                        _table,
+                    )
+                    .map_or_else(
+                        || P4::FuncName(func_name.to_owned()),
+                        |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
+                    )
+                } else {
+                    P4::FuncName(func_name.to_owned())
+                };
+            b.emit_op(Opcode::PureFunc, 0, arg_base, reg, function_p4, nargs);
             if *not {
                 b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
             }
@@ -1923,36 +1896,16 @@ fn emit_upsert_expr(
             let false_label = b.emit_label();
             let null_label = b.emit_label();
             let done_label = b.emit_label();
-            let low_collation_p4 = upsert_comparison_collation(
-                operand,
-                low,
-                existing_ctx,
-                excluded_ctx,
-                _table,
-            )
-            .map_or(P4::None, P4::Collation);
-            let high_collation_p4 = upsert_comparison_collation(
-                operand,
-                high,
-                existing_ctx,
-                excluded_ctx,
-                _table,
-            )
-            .map_or(P4::None, P4::Collation);
-            let low_affinity = upsert_comparison_affinity(
-                operand,
-                low,
-                existing_ctx,
-                excluded_ctx,
-                _table,
-            );
-            let high_affinity = upsert_comparison_affinity(
-                operand,
-                high,
-                existing_ctx,
-                excluded_ctx,
-                _table,
-            );
+            let low_collation_p4 =
+                upsert_comparison_collation(operand, low, existing_ctx, excluded_ctx, _table)
+                    .map_or(P4::None, P4::Collation);
+            let high_collation_p4 =
+                upsert_comparison_collation(operand, high, existing_ctx, excluded_ctx, _table)
+                    .map_or(P4::None, P4::Collation);
+            let low_affinity =
+                upsert_comparison_affinity(operand, low, existing_ctx, excluded_ctx, _table);
+            let high_affinity =
+                upsert_comparison_affinity(operand, high, existing_ctx, excluded_ctx, _table);
             b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::Lt,
@@ -2015,8 +1968,7 @@ fn emit_upsert_expr(
                 let r_saw_null = b.alloc_temp();
                 b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
                 let r_val = b.alloc_temp();
-                let in_collation = if values.len() == 1
-                    && singleton_in_rhs_is_constant(&values[0])
+                let in_collation = if values.len() == 1 && singleton_in_rhs_is_constant(&values[0])
                 {
                     upsert_comparison_collation(
                         operand,
@@ -2107,8 +2059,7 @@ fn emit_upsert_expr(
                 excluded_hidden_rowid_reg,
             );
             let function_name = json_access_func_name(*arrow);
-            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2)
-            {
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2) {
                 upsert_scalar_function_collation(
                     [inner.as_ref(), path.as_ref()],
                     existing_ctx,
@@ -2122,14 +2073,7 @@ fn emit_upsert_expr(
             } else {
                 P4::FuncName(function_name.to_owned())
             };
-            b.emit_op(
-                Opcode::PureFunc,
-                0,
-                arg_base,
-                reg,
-                function_p4,
-                2,
-            );
+            b.emit_op(Opcode::PureFunc, 0, arg_base, reg, function_p4, 2);
         }
 
         // ── Fallback: subqueries, EXISTS, aggregates, etc. ─────────────
@@ -8848,13 +8792,7 @@ fn codegen_select_ordered_scan(
         // a duplicate output cannot invoke a volatile or failing sort-only
         // expression. Exact ORDER aliases/ordinals below reuse these registers.
         if let Some(distinct_cursor) = distinct_cursor {
-            emit_column_reads_selected(
-                b,
-                &scan,
-                columns,
-                output_base,
-                |_| true,
-            )?;
+            emit_column_reads_selected(b, &scan, columns, output_base, |_| true)?;
             output_emitted.fill(true);
 
             let distinct_record = b.alloc_temp();
@@ -8888,13 +8826,9 @@ fn codegen_select_ordered_scan(
         for (index, (reg, key)) in (sorter_base..).zip(sort_keys.iter()).enumerate() {
             if let Some(output_slot) = order_output_slots[index] {
                 if !output_emitted[output_slot] {
-                    emit_column_reads_selected(
-                        b,
-                        &scan,
-                        columns,
-                        output_base,
-                        |slot| slot == output_slot,
-                    )?;
+                    emit_column_reads_selected(b, &scan, columns, output_base, |slot| {
+                        slot == output_slot
+                    })?;
                     output_emitted[output_slot] = true;
                 }
                 b.emit_op(
@@ -8935,13 +8869,7 @@ fn codegen_select_ordered_scan(
         // an exact ORDER BY key. This occurs after admission, so rejected rows
         // cannot invoke volatile or failing payload expressions. DISTINCT
         // output was already evaluated above, before its membership probe.
-        emit_column_reads_selected(
-            b,
-            &scan,
-            columns,
-            output_base,
-            |slot| !output_emitted[slot],
-        )?;
+        emit_column_reads_selected(b, &scan, columns, output_base, |slot| !output_emitted[slot])?;
 
         if distinct_projection_mode == OrderedDistinctProjectionMode::ReprojectRepresentative {
             emit_ordered_distinct_source_state(b, cursor, table, stored_data_base);
@@ -9076,13 +9004,7 @@ fn codegen_select_ordered_scan(
                 P4::None,
                 0,
             );
-            emit_column_reads_selected(
-                b,
-                &scan,
-                columns,
-                out_regs,
-                |_| true,
-            )?;
+            emit_column_reads_selected(b, &scan, columns, out_regs, |_| true)?;
         }
     }
 
@@ -18017,9 +17939,7 @@ fn parse_group_by_output(
                 } else {
                     group_by_keys
                         .iter()
-                        .position(|k| {
-                            matches!(k, GroupByKey::Expression(e) if e.as_ref() == expr)
-                        })
+                        .position(|k| matches!(k, GroupByKey::Expression(e) if e.as_ref() == expr))
                 }
                 .ok_or_else(|| {
                     CodegenError::Unsupported("result column not in GROUP BY clause".to_owned())
@@ -29027,10 +28947,7 @@ fn borrowed_column_range_bound(expr: &Expr, inclusive: bool) -> ColumnRangeBound
 
 fn owned_string_column_range_bound<'a>(value: String, inclusive: bool) -> ColumnRangeBound<'a> {
     ColumnRangeBound {
-        expr: ColumnRangeExpr::Owned(Box::new(Expr::Literal(
-            Literal::String(value),
-            Span::ZERO,
-        ))),
+        expr: ColumnRangeExpr::Owned(Box::new(Expr::Literal(Literal::String(value), Span::ZERO))),
         inclusive,
     }
 }
@@ -31406,31 +31323,22 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             if let Some(esc) = escape {
                 emit_expr(b, esc, arg_base + 2, ctx);
             }
-            let function_p4 = if scalar_consumes_argument_collation_for_codegen(
-                func_name,
-                i32::from(nargs),
-            ) {
-                scalar_function_argument_collation_ctx(
-                    [pattern.as_ref(), operand.as_ref()]
-                        .into_iter()
-                        .chain(escape.as_deref()),
-                    ctx,
-                )
-                .map_or_else(
-                    || P4::FuncName(func_name.to_owned()),
-                    |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
-                )
-            } else {
-                P4::FuncName(func_name.to_owned())
-            };
-            b.emit_op(
-                Opcode::PureFunc,
-                0,
-                arg_base,
-                reg,
-                function_p4,
-                nargs,
-            );
+            let function_p4 =
+                if scalar_consumes_argument_collation_for_codegen(func_name, i32::from(nargs)) {
+                    scalar_function_argument_collation_ctx(
+                        [pattern.as_ref(), operand.as_ref()]
+                            .into_iter()
+                            .chain(escape.as_deref()),
+                        ctx,
+                    )
+                    .map_or_else(
+                        || P4::FuncName(func_name.to_owned()),
+                        |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
+                    )
+                } else {
+                    P4::FuncName(func_name.to_owned())
+                };
+            b.emit_op(Opcode::PureFunc, 0, arg_base, reg, function_p4, nargs);
             if *not {
                 b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
             }
@@ -31762,27 +31670,16 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             emit_expr(b, inner, arg_base, ctx);
             emit_expr(b, path, arg_base + 1, ctx);
             let function_name = json_access_func_name(*arrow);
-            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2)
-            {
-                scalar_function_argument_collation_ctx(
-                    [inner.as_ref(), path.as_ref()],
-                    ctx,
-                )
-                .map_or_else(
-                    || P4::FuncName(function_name.to_owned()),
-                    |collation| P4::FuncNameCollated(function_name.to_owned(), collation),
-                )
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2) {
+                scalar_function_argument_collation_ctx([inner.as_ref(), path.as_ref()], ctx)
+                    .map_or_else(
+                        || P4::FuncName(function_name.to_owned()),
+                        |collation| P4::FuncNameCollated(function_name.to_owned(), collation),
+                    )
             } else {
                 P4::FuncName(function_name.to_owned())
             };
-            b.emit_op(
-                Opcode::PureFunc,
-                0,
-                arg_base,
-                reg,
-                function_p4,
-                2,
-            );
+            b.emit_op(Opcode::PureFunc, 0, arg_base, reg, function_p4, 2);
         }
         _ => {
             // Column refs without scan context and other unhandled expressions: Null.
@@ -33568,32 +33465,23 @@ fn emit_expr_with_fallback(
             if let Some(esc) = escape {
                 emit_expr_with_fallback(b, esc, arg_base + 2, inner_ctx, outer_ctx);
             }
-            let function_p4 = if scalar_consumes_argument_collation_for_codegen(
-                func_name,
-                i32::from(nargs),
-            ) {
-                fallback_scalar_function_collation(
-                    [pattern.as_ref(), operand.as_ref()]
-                        .into_iter()
-                        .chain(escape.as_deref()),
-                    inner_ctx,
-                    outer_ctx,
-                )
-                .map_or_else(
-                    || P4::FuncName(func_name.to_owned()),
-                    |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
-                )
-            } else {
-                P4::FuncName(func_name.to_owned())
-            };
-            b.emit_op(
-                Opcode::PureFunc,
-                0,
-                arg_base,
-                reg,
-                function_p4,
-                nargs,
-            );
+            let function_p4 =
+                if scalar_consumes_argument_collation_for_codegen(func_name, i32::from(nargs)) {
+                    fallback_scalar_function_collation(
+                        [pattern.as_ref(), operand.as_ref()]
+                            .into_iter()
+                            .chain(escape.as_deref()),
+                        inner_ctx,
+                        outer_ctx,
+                    )
+                    .map_or_else(
+                        || P4::FuncName(func_name.to_owned()),
+                        |collation| P4::FuncNameCollated(func_name.to_owned(), collation),
+                    )
+                } else {
+                    P4::FuncName(func_name.to_owned())
+                };
+            b.emit_op(Opcode::PureFunc, 0, arg_base, reg, function_p4, nargs);
             if *not {
                 b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
             }
@@ -33609,8 +33497,7 @@ fn emit_expr_with_fallback(
             emit_expr_with_fallback(b, inner, arg_base, inner_ctx, outer_ctx);
             emit_expr_with_fallback(b, path, arg_base + 1, inner_ctx, outer_ctx);
             let function_name = json_access_func_name(*arrow);
-            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2)
-            {
+            let function_p4 = if scalar_consumes_argument_collation_for_codegen(function_name, 2) {
                 fallback_scalar_function_collation(
                     [inner.as_ref(), path.as_ref()],
                     inner_ctx,
@@ -34031,11 +33918,7 @@ fn join_declared_collation<'a>(
     tables: &[(&'a TableSchema, Option<&str>)],
 ) -> Option<&'a str> {
     let source = declared_collation_source_expr(expr);
-    if let Expr::BoundOuterValue {
-        collation,
-        ..
-    } = source
-    {
+    if let Expr::BoundOuterValue { collation, .. } = source {
         return collation.as_name();
     }
     let Expr::Column(col_ref, _) = source else {
@@ -34139,11 +34022,7 @@ fn column_collation<'a>(
     table_alias: Option<&str>,
 ) -> Option<&'a str> {
     let inner = declared_collation_source_expr(expr);
-    if let Expr::BoundOuterValue {
-        collation,
-        ..
-    } = inner
-    {
+    if let Expr::BoundOuterValue { collation, .. } = inner {
         return collation
             .as_name()
             .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"));
@@ -34169,11 +34048,7 @@ fn column_collation<'a>(
 /// derive its collation from a column in this scan scope.
 fn declared_collation_ctx<'a>(expr: &'a Expr, ctx: Option<&'a ScanCtx<'_>>) -> Option<&'a str> {
     let source = declared_collation_source_expr(expr);
-    if let Expr::BoundOuterValue {
-        collation,
-        ..
-    } = source
-    {
+    if let Expr::BoundOuterValue { collation, .. } = source {
         return collation.as_name();
     }
     let ctx = ctx?;
@@ -34274,11 +34149,7 @@ fn declared_collation_source_expr(expr: &Expr) -> &Expr {
 }
 
 fn bound_outer_declared_collation(expr: &Expr) -> Option<&str> {
-    let Expr::BoundOuterValue {
-        collation,
-        ..
-    } = declared_collation_source_expr(expr)
-    else {
+    let Expr::BoundOuterValue { collation, .. } = declared_collation_source_expr(expr) else {
         return None;
     };
     collation.as_name()
@@ -35142,7 +35013,9 @@ mod tests {
             let mut builder = ProgramBuilder::new();
             let result = builder.alloc_reg();
             emit_expr_with_fallback(&mut builder, &expr, result, &inner, Some(&outer));
-            let program = builder.finish().expect("JSON fallback program should finish");
+            let program = builder
+                .finish()
+                .expect("JSON fallback program should finish");
             let function = program
                 .ops()
                 .iter()
@@ -35152,9 +35025,7 @@ mod tests {
             assert_eq!(function.p5, 2);
             let arg_base = function.p2;
             assert!(program.ops().iter().any(|op| {
-                op.opcode == Opcode::Column
-                    && op.p1 == expected_left_cursor
-                    && op.p3 == arg_base
+                op.opcode == Opcode::Column && op.p1 == expected_left_cursor && op.p3 == arg_base
             }));
             assert!(program.ops().iter().any(|op| {
                 op.opcode == Opcode::Column
@@ -35200,34 +35071,34 @@ mod tests {
             secondaries: &[],
         };
         let expr = Expr::JsonAccess {
-            expr: Box::new(Expr::Column(
-                ColumnRef::qualified("u", "b"),
-                Span::ZERO,
-            )),
-            path: Box::new(Expr::Column(
-                ColumnRef::qualified("i", "b"),
-                Span::ZERO,
-            )),
+            expr: Box::new(Expr::Column(ColumnRef::qualified("u", "b"), Span::ZERO)),
+            path: Box::new(Expr::Column(ColumnRef::qualified("i", "b"), Span::ZERO)),
             arrow: JsonArrow::DoubleArrow,
             span: Span::ZERO,
         };
         let mut builder = ProgramBuilder::new();
         let result = builder.alloc_reg();
         emit_expr_with_fallback(&mut builder, &expr, result, &inner, Some(&outer));
-        let program = builder.finish().expect("JSON fallback program should finish");
+        let program = builder
+            .finish()
+            .expect("JSON fallback program should finish");
         let function = program
             .ops()
             .iter()
             .find(|op| op.opcode == Opcode::PureFunc)
             .expect("JSON fallback must emit a scalar function call");
         assert_eq!(function.p4, P4::FuncName("->>".to_owned()));
-        assert!(program.ops().iter().any(|op| {
-            op.opcode == Opcode::Column && op.p1 == 7 && op.p3 == function.p2
-        }));
         assert!(
-            !program.ops().iter().any(|op| {
-                op.opcode == Opcode::Null && op.p2 == function.p2
-            }),
+            program
+                .ops()
+                .iter()
+                .any(|op| { op.opcode == Opcode::Column && op.p1 == 7 && op.p3 == function.p2 })
+        );
+        assert!(
+            !program
+                .ops()
+                .iter()
+                .any(|op| { op.opcode == Opcode::Null && op.p2 == function.p2 }),
             "a secondary outer reference must never degrade to SQL NULL",
         );
     }
@@ -49040,7 +48911,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "ScanCtx/SecondaryScanCtx/InProbeSource structs not yet defined"]
     fn test_in_probe_source_reference_detection_considers_secondary_outer_scan() {
         let schema = test_schema_with_subquery_source();
         let outer_table = &schema[0];

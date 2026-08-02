@@ -634,12 +634,7 @@ impl PartialEq for Expr {
                     affinity: a2,
                     ..
                 },
-            ) => {
-                v1.storage_class() == v2.storage_class()
-                    && v1 == v2
-                    && c1 == c2
-                    && a1 == a2
-            }
+            ) => v1.storage_class() == v2.storage_class() && v1 == v2 && c1 == c2 && a1 == a2,
             (Self::Column(a, _), Self::Column(b, _)) => a == b,
             (
                 Self::BinaryOp {
@@ -2946,7 +2941,10 @@ mod tests {
         assert_eq!(list.first(), Some(&args[0]));
         assert_eq!(list.get(2), Some(&args[2]));
         assert_eq!(list.get(3), None);
-        assert_eq!(list.iter().collect::<Vec<_>>(), args.iter().collect::<Vec<_>>());
+        assert_eq!(
+            list.iter().collect::<Vec<_>>(),
+            args.iter().collect::<Vec<_>>()
+        );
         assert_eq!(list.as_list(), Some(args.as_slice()));
         assert_eq!(list.to_owned(), FunctionArgs::List(args.to_vec()));
 
@@ -3024,10 +3022,7 @@ mod tests {
 
     #[test]
     fn test_json_access_has_borrowed_semantic_function_call_view() {
-        for (arrow, expected_name) in [
-            (JsonArrow::Arrow, "->"),
-            (JsonArrow::DoubleArrow, "->>"),
-        ] {
+        for (arrow, expected_name) in [(JsonArrow::Arrow, "->"), (JsonArrow::DoubleArrow, "->>")] {
             assert_eq!(arrow.sql_function_name(), expected_name);
 
             let expr = Expr::JsonAccess {
@@ -3979,13 +3974,11 @@ mod tests {
 
     #[test]
     fn test_bound_outer_value_equality_preserves_storage_and_metadata() {
-        let bound = |value, collation, affinity, span| {
-            Expr::BoundOuterValue {
-                value,
-                collation,
-                affinity,
-                span,
-            }
+        let bound = |value, collation, affinity, span| Expr::BoundOuterValue {
+            value,
+            collation,
+            affinity,
+            span,
         };
 
         let integer = bound(

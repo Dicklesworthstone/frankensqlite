@@ -1347,10 +1347,7 @@ fn write_sql_blob_literal(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Resu
     f.write_str("'")
 }
 
-fn write_sqlite_value_literal(
-    f: &mut fmt::Formatter<'_>,
-    value: &SqliteValue,
-) -> fmt::Result {
+fn write_sqlite_value_literal(f: &mut fmt::Formatter<'_>, value: &SqliteValue) -> fmt::Result {
     match value {
         SqliteValue::Null => f.write_str("NULL"),
         SqliteValue::Integer(value) => write!(f, "{value}"),

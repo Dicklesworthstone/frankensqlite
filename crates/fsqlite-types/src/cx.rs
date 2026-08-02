@@ -1790,11 +1790,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         child.trace_id = self.trace_id;
         child.decision_id = self.decision_id;
         child.policy_id = self.policy_id;
-        if self
-            .inner
-            .unix_millis_is_fixed
-            .load(Ordering::Acquire)
-        {
+        if self.inner.unix_millis_is_fixed.load(Ordering::Acquire) {
             let unix_millis = self.inner.unix_millis.load(Ordering::Acquire);
             child
                 .inner
@@ -1924,11 +1920,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     where
         Caps: cap::HasTime,
     {
-        if self
-            .inner
-            .unix_millis_is_fixed
-            .load(Ordering::Acquire)
-        {
+        if self.inner.unix_millis_is_fixed.load(Ordering::Acquire) {
             return self.inner.unix_millis.load(Ordering::Acquire);
         }
 

@@ -53,52 +53,34 @@ enum CachedRoot {
     ScalarSubquery,
 }
 
-fn syntactically_known_select_core_arity(core: &SelectCore) -> Option<usize> {
-    match core {
-        SelectCore::Select { columns, .. } => columns
-            .iter()
-            .all(|column| matches!(column, ResultColumn::Expr { .. }))
-            .then_some(columns.len()),
-        SelectCore::Values(rows) => {
-            let arity = rows.first()?.len();
-            rows.iter().all(|row| row.len() == arity).then_some(arity)
-        }
-    }
-}
-
-fn syntactically_known_select_arity(select: &SelectStatement) -> Option<usize> {
-    let arity = syntactically_known_select_core_arity(&select.body.select)?;
-    select
-        .body
-        .compounds
-        .iter()
-        .all(|(_, core)| syntactically_known_select_core_arity(core) == Some(arity))
-        .then_some(arity)
-}
-
-fn vector_in_list_element_arity_error(lhs: &Expr, element: &Expr) -> Option<String> {
+fn vector_in_list_arity_error(lhs: &Expr, items: &[ParsedExpr]) -> Option<String> {
     let expected = match lhs {
         Expr::RowValue(lhs_terms, _) => lhs_terms.len(),
-        Expr::Subquery(select, _) => {
-            syntactically_known_select_arity(select).filter(|arity| *arity > 1)?
-        }
+        // A subquery-expression LHS is not an explicit row-value literal. SQLite
+        // resolves it semantically, where name/function errors, constant
+        // short-circuiting, and context-sensitive row-value diagnostics can
+        // take precedence over an IN-list arity error.
         _ => return None,
     };
-    let actual = match element {
-        Expr::RowValue(element_terms, _) => element_terms.len(),
-        // A parenthesized SELECT inside an explicit list can itself return a
-        // row value, for example `(a, b) IN ((SELECT 1, 2))`. Its arity is a
-        // subquery semantic concern rather than a scalar list-element arity.
-        Expr::Subquery(..) => return None,
-        _ => 1,
-    };
-    if actual == expected {
-        return None;
+    for item in items {
+        let actual = match &item.expr {
+            Expr::RowValue(element_terms, _) => element_terms.len(),
+            // Exactly one bare parenthesized subquery is a set-valued RHS, for
+            // example `(a, b) IN ((SELECT 1, 2))`. In a multi-item list the
+            // same syntax is one scalar-shaped element, so normal list arity
+            // validation applies.
+            Expr::Subquery(..) if items.len() == 1 => continue,
+            _ => 1,
+        };
+        if actual == expected {
+            continue;
+        }
+        let term_suffix = if actual == 1 { "" } else { "s" };
+        return Some(format!(
+            "IN(...) element has {actual} term{term_suffix} - expected {expected}"
+        ));
     }
-    let term_suffix = if actual == 1 { "" } else { "s" };
-    Some(format!(
-        "IN(...) element has {actual} term{term_suffix} - expected {expected}"
-    ))
+    None
 }
 
 #[cfg(test)]
@@ -1733,9 +1715,6 @@ impl<'a> ParseMachine<'a> {
                 start,
             } => {
                 let item = self.pop_expr()?;
-                if let Some(message) = vector_in_list_element_arity_error(&lhs.expr, &item.expr) {
-                    return Err(self.parser.err_here(message));
-                }
                 items.push(item);
                 if self.parser.eat_kind(&TokenKind::Comma) {
                     self.controls.push(ParseControl::InItemDone {
@@ -2619,6 +2598,9 @@ impl<'a> ParseMachine<'a> {
         items: Vec<ParsedExpr>,
         span: Span,
     ) -> Result<(), ParseError> {
+        if let Some(message) = vector_in_list_arity_error(&lhs.expr, &items) {
+            return Err(self.parser.err_here(message));
+        }
         let item_height = items.iter().map(|item| item.height).max().unwrap_or(0);
         let items_are_constant = items.iter().all(|item| item.is_constant);
         let item_has_function = items.iter().any(|item| item.has_function);
@@ -4625,19 +4607,16 @@ impl Parser {
         let mut parsed_items = Vec::new();
         if !self.at_kind(&TokenKind::RightParen) {
             let item = self.parse_expr_bp(0)?;
-            if let Some(message) = vector_in_list_element_arity_error(&lhs.expr, &item.expr) {
-                return Err(self.err_here(message));
-            }
             parsed_items.push(item);
             while self.eat_kind(&TokenKind::Comma) {
                 let item = self.parse_expr_bp(0)?;
-                if let Some(message) = vector_in_list_element_arity_error(&lhs.expr, &item.expr) {
-                    return Err(self.err_here(message));
-                }
                 parsed_items.push(item);
             }
         }
         let end = self.expect_kind(&TokenKind::RightParen)?;
+        if let Some(message) = vector_in_list_arity_error(&lhs.expr, &parsed_items) {
+            return Err(self.err_here(message));
+        }
         let span = start.merge(end);
         let item_height = parsed_items
             .iter()
@@ -5245,6 +5224,8 @@ mod tests {
             "x NOT BETWEEN 1 AND 2",
             "x IN (1, 2 + 3)",
             "(SELECT 1, 2) IN ((1, 2))",
+            "(a, b) IN ((SELECT 1))",
+            "(a, b) IN ((SELECT 1, 2, 3))",
             "(SELECT * FROM t) IN (1)",
             "x IN (SELECT y FROM t WHERE z > 0 ORDER BY y LIMIT 1)",
             "EXISTS (SELECT 1 FROM t WHERE x = y)",
@@ -5277,6 +5258,8 @@ mod tests {
             "a BETWEEN 1 2",
             "a IN (1,)",
             "(a, b) IN (1)",
+            "(a, b) IN (+(SELECT 1, 2))",
+            "(a, b) IN ((SELECT 1), (SELECT 2))",
             "(a, b) IN ((1, 2), 3)",
             "(a, b) NOT IN ((1, 2, 3))",
             "(SELECT 1, 2) IN (1)",
@@ -6218,7 +6201,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_in_list_rejects_mismatched_element_arities() {
+    fn test_explicit_row_value_in_list_rejects_mismatched_element_arities() {
         for (sql, expected_message) in [
             (
                 "(a, b, c) IN ((1, 2))",
@@ -6242,23 +6225,11 @@ mod tests {
                 "IN(...) element has 1 term - expected 2",
             ),
             (
-                "(SELECT 1, 2) IN (1)",
+                "(a, b) IN (+(SELECT 1, 2))",
                 "IN(...) element has 1 term - expected 2",
             ),
             (
-                "(SELECT 1, 2) IN ((1, 2, 3))",
-                "IN(...) element has 3 terms - expected 2",
-            ),
-            (
-                "(VALUES (1, 2, 3)) IN ((1, 2))",
-                "IN(...) element has 2 terms - expected 3",
-            ),
-            (
-                "(SELECT 1, 2 UNION ALL SELECT 3, 4) NOT IN (5)",
-                "IN(...) element has 1 term - expected 2",
-            ),
-            (
-                "0 AND (SELECT 1, 2) IN (1)",
+                "(a, b) IN ((SELECT 1), (SELECT 2))",
                 "IN(...) element has 1 term - expected 2",
             ),
         ] {
@@ -6276,12 +6247,34 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_in_list_accepts_matching_elements_and_empty_lists() {
+    fn test_subquery_lhs_defers_in_list_arity_to_semantic_resolution() {
+        for sql in [
+            "(SELECT 1, 2) IN (1)",
+            "(SELECT 1, 2) IN ((1, 2, 3))",
+            "(VALUES (1, 2, 3)) IN ((1, 2))",
+            "(SELECT 1, 2 UNION ALL SELECT 3, 4) NOT IN (5)",
+            "0 AND (SELECT 1, 2) IN (1)",
+            "(SELECT 1, 2) IN (nosuch_vector_function())",
+        ] {
+            let expr = parse_expr(sql).unwrap_or_else(|error| {
+                panic!("subquery-expression IN semantics must be deferred for `{sql}`: {error}")
+            });
+            assert!(
+                matches!(expr, Expr::In { .. } | Expr::BinaryOp { .. }),
+                "unexpected AST for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vector_in_list_accepts_matching_empty_and_singleton_subquery_forms() {
         for sql in [
             "(a, b) IN ((1, 2), (3, 4))",
             "(a, b) NOT IN ((1, 2), (3, 4))",
             "(a, b) IN ()",
             "(a, b) IN ((SELECT 1, 2))",
+            "(a, b) IN ((SELECT 1))",
+            "(a, b) IN ((SELECT 1, 2, 3))",
             "(SELECT 1, 2) IN ((1, 2), (3, 4))",
             "(VALUES (1, 2), (3, 4)) NOT IN ((1, 2))",
             "(SELECT 1, 2 UNION ALL SELECT 3, 4) IN ((1, 2))",
@@ -6303,6 +6296,14 @@ mod tests {
     }
 
     #[test]
+    fn test_vector_in_list_trailing_comma_syntax_error_precedes_arity() {
+        let error = parse_expr("(a, b) IN (1,)")
+            .expect_err("a trailing comma in an IN list must fail parsing");
+        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        assert_eq!(error.message, "unexpected token in expression: RightParen");
+    }
+
+    #[test]
     fn test_statement_parsers_reject_vector_in_list_arity_mismatches() {
         for (sql, expected_message) in [
             (
@@ -6315,18 +6316,6 @@ mod tests {
             ),
             (
                 "DELETE FROM t WHERE (a, b) NOT IN ((1, 2), 3)",
-                "IN(...) element has 1 term - expected 2",
-            ),
-            (
-                "SELECT (SELECT 1, 2) IN (1)",
-                "IN(...) element has 1 term - expected 2",
-            ),
-            (
-                "UPDATE t SET flag = (SELECT 1, 2) IN ((1, 2, 3))",
-                "IN(...) element has 3 terms - expected 2",
-            ),
-            (
-                "DELETE FROM t WHERE 0 AND (SELECT 1, 2) NOT IN ((1, 2), 3)",
                 "IN(...) element has 1 term - expected 2",
             ),
         ] {
@@ -6342,6 +6331,21 @@ mod tests {
                 error.message, expected_message,
                 "unexpected error for `{sql}`"
             );
+        }
+    }
+
+    #[test]
+    fn test_statement_parsers_defer_subquery_in_list_arity() {
+        for sql in [
+            "SELECT (SELECT 1, 2) IN (1)",
+            "UPDATE t SET flag = (SELECT 1, 2) IN ((1, 2, 3))",
+            "DELETE FROM t WHERE 0 AND (SELECT 1, 2) NOT IN ((1, 2), 3)",
+        ] {
+            Parser::from_sql(sql)
+                .parse_statement()
+                .unwrap_or_else(|error| {
+                    panic!("statement semantics must be deferred for `{sql}`: {error}")
+                });
         }
     }
 
