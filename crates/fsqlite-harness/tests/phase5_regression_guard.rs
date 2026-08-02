@@ -4142,6 +4142,7 @@ fn test_regression_guard_release_loader_verifies_git_provenance_and_rename_delta
     assert!(git(&["config", "user.email", "guard@example.invalid"]).success());
     assert!(git(&["config", "commit.gpgsign", "false"]).success());
     assert!(git(&["config", "core.autocrlf", "false"]).success());
+    assert!(git(&["config", "core.hooksPath", ".no-hooks"]).success());
     fs::write(root.join("seed.txt"), "seed\n").expect("write seed");
     fs::write(root.join("source.rs"), "fn source() {}\n").expect("write source");
     fs::write(
@@ -4149,7 +4150,7 @@ fn test_regression_guard_release_loader_verifies_git_provenance_and_rename_delta
         format!("/{REGRESSION_BASELINE_PATH}\n"),
     )
     .expect("write ignore rule");
-    assert!(git(&["add", ".gitignore", "seed.txt", "source.rs"]).success());
+    assert!(git(&["add", "--force", ".gitignore", "seed.txt", "source.rs",]).success());
     assert!(git(&["commit", "-m", "seed"]).success());
     let baseline_commit = resolve_current_head(root).expect("resolve isolated HEAD");
     let baseline_path = root.join(REGRESSION_BASELINE_PATH);
@@ -4243,8 +4244,9 @@ fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
     assert!(git(&["config", "user.email", "evidence@example.invalid"]).success());
     assert!(git(&["config", "commit.gpgsign", "false"]).success());
     assert!(git(&["config", "core.autocrlf", "false"]).success());
+    assert!(git(&["config", "core.hooksPath", ".no-hooks"]).success());
     fs::write(root.join("seed.txt"), "tested tree\n").expect("write tested tree");
-    assert!(git(&["add", "seed.txt"]).success());
+    assert!(git(&["add", "--force", "seed.txt"]).success());
     assert!(git(&["commit", "-m", "tested tree"]).success());
     let tested_commit = resolve_current_head(root).expect("resolve tested commit");
 
@@ -4290,14 +4292,7 @@ fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
     let manifest_digest = blake3::hash(&manifest_bytes).to_hex().to_string();
     fs::write(root.join(&manifest_path), manifest_bytes).expect("write evidence manifest");
-    assert!(
-        git(&[
-            "add",
-            "--force",
-            "tests/artifacts/release-evidence",
-        ])
-        .success()
-    );
+    assert!(git(&["add", "--force", "tests/artifacts/release-evidence",]).success());
     assert!(git(&["commit", "-m", "release evidence"]).success());
     let evidence_head = resolve_current_head(root).expect("resolve evidence commit");
 
