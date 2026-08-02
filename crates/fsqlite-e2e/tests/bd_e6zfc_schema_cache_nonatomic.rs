@@ -33,6 +33,8 @@ use std::{env, process::Command, process::Stdio};
 use fsqlite::{Connection, FrankenError, Row, SqliteValue};
 
 const STRESS_DURATION: Duration = Duration::from_secs(2);
+// This bounds retry admission and backoff, not an in-flight async operation.
+// The supervised child process below provides the hard wall-clock deadline.
 const SCHEMA_STORM_RETRY_BUDGET: Duration = Duration::from_secs(5);
 const SCHEMA_STORM_CHILD_ENV: &str = "FSQLITE_SCHEMA_STORM_CHILD";
 const SCHEMA_STORM_RECEIPT_ENV: &str = "FSQLITE_SCHEMA_STORM_RECEIPT";
@@ -48,8 +50,13 @@ fn supervise_schema_storm_test() -> bool {
     const TEST_NAME: &str = "s5_schema_coherence_after_storm";
     const TIMEOUT: Duration = Duration::from_secs(90);
 
-    if env::var_os(SCHEMA_STORM_CHILD_ENV).is_some() {
-        return false;
+    match (
+        env::var_os(SCHEMA_STORM_CHILD_ENV),
+        env::var_os(SCHEMA_STORM_RECEIPT_ENV),
+    ) {
+        (Some(child_token), Some(receipt_token)) if child_token == receipt_token => return false,
+        (None, None) => {}
+        _ => panic!("inconsistent inherited schema-storm supervision environment"),
     }
 
     let receipt_token = format!(
@@ -64,8 +71,8 @@ fn supervise_schema_storm_test() -> bool {
     let test_binary = env::current_exe().expect("resolve current test binary");
     let mut child = Command::new(test_binary)
         .args(["--exact", TEST_NAME, "--include-ignored", "--nocapture"])
-        .env(SCHEMA_STORM_CHILD_ENV, "1")
-        .env(SCHEMA_STORM_RECEIPT_ENV, receipt_token)
+        .env(SCHEMA_STORM_CHILD_ENV, &receipt_token)
+        .env(SCHEMA_STORM_RECEIPT_ENV, &receipt_token)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn supervised schema-storm child");
@@ -126,6 +133,26 @@ fn is_schema_storm_transient(error: &FrankenError) -> bool {
             | FrankenError::DatabaseLocked { .. }
             | FrankenError::SchemaChanged
     )
+}
+
+struct SchemaStormClosePermit<'a> {
+    lock: &'a AtomicBool,
+}
+
+impl Drop for SchemaStormClosePermit<'_> {
+    fn drop(&mut self) {
+        self.lock.store(false, Ordering::Release);
+    }
+}
+
+fn acquire_schema_storm_close_permit(lock: &AtomicBool) -> SchemaStormClosePermit<'_> {
+    while lock
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        std::thread::yield_now();
+    }
+    SchemaStormClosePermit { lock }
 }
 
 async fn execute_schema_storm_step(
@@ -585,19 +612,21 @@ fn s5_schema_coherence_after_storm() {
         let total_rounds = Arc::new(AtomicU64::new(0));
         let transient_retries = Arc::new(AtomicU64::new(0));
         let workers_with_progress = Arc::new(AtomicU64::new(0));
+        let close_in_progress = Arc::new(AtomicBool::new(false));
         let start = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::channel();
 
         // Four DDL workers repeatedly create, exercise, and drop thread-owned
         // tables and views. Every step is checked: transient contention is
         // retried, while every non-transient error fails the worker.
-        let threads: Vec<_> = (0..4)
+        let threads: Vec<_> = (0_u64..4)
             .map(|tid| {
                 let path = path_str.to_string();
                 let s = Arc::clone(&stop);
                 let rounds = Arc::clone(&total_rounds);
                 let retries = Arc::clone(&transient_retries);
                 let progress = Arc::clone(&workers_with_progress);
+                let worker_close_lock = Arc::clone(&close_in_progress);
                 let worker_start = Arc::clone(&start);
                 let worker_ready = ready_tx.clone();
                 std::thread::spawn(move || {
@@ -609,6 +638,8 @@ fn s5_schema_coherence_after_storm() {
                         drop(worker_ready);
                         while !worker_start.load(Ordering::Acquire) {
                             if s.load(Ordering::Acquire) {
+                                let _close_permit =
+                                    acquire_schema_storm_close_permit(&worker_close_lock);
                                 conn.close_without_checkpoint()
                                     .await
                                     .expect("close cancelled DDL worker connection");
@@ -617,6 +648,8 @@ fn s5_schema_coherence_after_storm() {
                             std::thread::yield_now();
                         }
                         if s.load(Ordering::Acquire) {
+                            let _close_permit =
+                                acquire_schema_storm_close_permit(&worker_close_lock);
                             conn.close_without_checkpoint()
                                 .await
                                 .expect("close cancelled DDL worker connection");
@@ -683,33 +716,53 @@ fn s5_schema_coherence_after_storm() {
                             .await
                             .expect("drop storm table");
 
+                            let table_sql = format!("SELECT * FROM {name}");
+                            let view_name = format!("v_{name}");
+                            let view_sql = format!("SELECT * FROM {view_name}");
+                            if (completed_rounds + tid).is_multiple_of(2) {
+                                assert_schema_storm_object_absent(
+                                    &conn,
+                                    &view_sql,
+                                    &view_name,
+                                    retries.as_ref(),
+                                )
+                                .await;
+                                assert_schema_storm_object_absent(
+                                    &conn,
+                                    &table_sql,
+                                    &name,
+                                    retries.as_ref(),
+                                )
+                                .await;
+                            } else {
+                                assert_schema_storm_object_absent(
+                                    &conn,
+                                    &table_sql,
+                                    &name,
+                                    retries.as_ref(),
+                                )
+                                .await;
+                                assert_schema_storm_object_absent(
+                                    &conn,
+                                    &view_sql,
+                                    &view_name,
+                                    retries.as_ref(),
+                                )
+                                .await;
+                            }
                             let residual_objects = query_schema_storm_step(
                                 &conn,
                                 &format!(
-                                    "SELECT name FROM sqlite_master WHERE name IN ('{name}', 'v_{name}')"
+                                    "SELECT name FROM sqlite_master WHERE name IN ('{name}', '{view_name}')"
                                 ),
                                 retries.as_ref(),
                             )
                             .await
-                            .expect("verify storm objects were dropped");
+                            .expect("verify storm objects were dropped from the catalog");
                             assert!(
                                 residual_objects.is_empty(),
                                 "worker {tid} round {completed_rounds}: dropped table or view remains visible"
                             );
-                            assert_schema_storm_object_absent(
-                                &conn,
-                                &format!("SELECT * FROM {name}"),
-                                &name,
-                                retries.as_ref(),
-                            )
-                            .await;
-                            assert_schema_storm_object_absent(
-                                &conn,
-                                &format!("SELECT * FROM v_{name}"),
-                                &format!("v_{name}"),
-                                retries.as_ref(),
-                            )
-                            .await;
                             completed_rounds += 1;
                         }
 
@@ -730,6 +783,8 @@ fn s5_schema_coherence_after_storm() {
                         // The worker's job is complete, and the final verifier below owns
                         // the single checkpoint after all workers have joined. Avoid making
                         // concurrent worker shutdown contend on an unrelated checkpoint.
+                        let _close_permit =
+                            acquire_schema_storm_close_permit(&worker_close_lock);
                         conn.close_without_checkpoint()
                             .await
                             .expect("close DDL worker connection without checkpoint");
