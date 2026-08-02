@@ -23,8 +23,8 @@ use std::path::Path;
 
 use fsqlite_ast::{
     ColumnConstraintKind, CreateTableBody, CreateTableStatement, DefaultValue, Expr,
-    GeneratedStorage, IndexedColumn, Literal, SortDirection, Statement, TableConstraintKind,
-    TriggerTiming, UnaryOp,
+    GeneratedStorage, Literal, SortDirection, Statement, TableConstraintKind, TriggerTiming,
+    UnaryOp,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_btree::BtreeCursorOps;
@@ -45,13 +45,13 @@ use fsqlite_types::value::SqliteValue;
 
 use crate::connection::{
     ImplicitAutoindexSlot, column_def_is_exact_integer, implicit_autoindex_layout,
+    validate_builtin_persisted_index_expr_functions,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
-    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
-    bind_explicit_index,
+    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema, bind_explicit_index,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -1751,12 +1751,16 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             )));
         };
 
-        let Some(Statement::CreateIndex(create_stmt)) = parse_single_statement(&create_sql)
-        else {
+        let Some(Statement::CreateIndex(create_stmt)) = parse_single_statement(&create_sql) else {
             return Err(sqlite_master_corrupt(format!(
                 "validated CREATE INDEX SQL for `{index_name}` could not be parsed during load"
             )));
         };
+        if let Some(schema_name) = create_stmt.name.schema.as_deref() {
+            return Err(sqlite_master_corrupt(format!(
+                "explicit index `{index_name}` on table `{tbl_name}` has non-canonical schema-qualified CREATE INDEX SQL (`{schema_name}`) during load"
+            )));
+        }
         let table = &schema[table_position];
         if table
             .indexes
@@ -1773,6 +1777,20 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     "invalid explicit index `{index_name}` on table `{tbl_name}` during load: {error}"
                 ))
             })?;
+        for indexed in &create_stmt.columns {
+            validate_builtin_persisted_index_expr_functions(&indexed.expr).map_err(|error| {
+                sqlite_master_corrupt(format!(
+                    "invalid explicit index `{index_name}` on table `{tbl_name}` during load: {error}"
+                ))
+            })?;
+        }
+        if let Some(predicate) = create_stmt.where_clause.as_ref() {
+            validate_builtin_persisted_index_expr_functions(predicate).map_err(|error| {
+                sqlite_master_corrupt(format!(
+                    "invalid explicit index `{index_name}` on table `{tbl_name}` during load: {error}"
+                ))
+            })?;
+        }
         schema[table_position]
             .indexes
             .push(bound_index.into_index_schema(root_page_i32));
@@ -1860,151 +1878,6 @@ async fn init_leaf_index_page(
     };
     page[5..7].copy_from_slice(&content_start.to_be_bytes());
     txn.write_page(cx, page_no, &page).await
-}
-
-/// Parse a `CREATE INDEX` SQL string into an `IndexSchema`.
-/// Returns `None` if the SQL cannot be parsed.
-fn parse_create_index_sql_to_schema(
-    index_name: &str,
-    root_page: i32,
-    sql: &str,
-) -> Option<IndexSchema> {
-    if let Some(Statement::CreateIndex(create)) = parse_single_statement(sql) {
-        return Some(create_index_statement_to_index_schema(
-            index_name, root_page, &create,
-        ));
-    }
-
-    // Simple regex-free parser: look for "ON table_name (col1, col2 COLLATE NOCASE DESC)"
-    // while preserving quoted names and comments inside the indexed term list.
-    let keyword_tokens = unquoted_sql_keyword_tokens(sql);
-    let is_unique = unquoted_tokens_contain_phrase(&keyword_tokens, &["CREATE", "UNIQUE", "INDEX"]);
-    // Find the indexed-term list between the unquoted '(' after ON and its
-    // matching ')'.
-    let on_pos = find_unquoted_sql_keyword(sql, "ON")?;
-    let after_on_pos = on_pos + "ON".len();
-    let paren_start = after_on_pos + find_unquoted_sql_char(&sql[after_on_pos..], '(')?;
-    let paren_end = find_matching_sql_paren(sql, paren_start)?;
-    let col_list = &sql[paren_start + 1..paren_end];
-
-    let mut columns = Vec::new();
-    let mut collations = Vec::new();
-    let mut directions = Vec::new();
-
-    for part in split_top_level_csv_items(col_list) {
-        let (col_name, remainder) = parse_column_name_and_remainder(&part)?;
-        columns.push(col_name);
-        collations.push(extract_collation_name(remainder));
-        directions.push(extract_index_term_direction(remainder));
-    }
-
-    // WHERE clause for partial indexes (everything after the closing paren).
-    let after_paren = trim_leading_sql_space_and_comments(&sql[paren_end + 1..]);
-    let where_clause = if collect_unquoted_sql_keyword_tokens(after_paren)
-        .first()
-        .is_some_and(|(token, start)| token == "WHERE" && *start == 0)
-    {
-        let expr = trim_leading_sql_space_and_comments(&after_paren["WHERE".len()..]);
-        Some(expr.to_owned())
-    } else {
-        None
-    };
-
-    Some(IndexSchema {
-        name: index_name.to_owned(),
-        root_page,
-        columns,
-        key_expressions: Vec::new(),
-        key_sort_directions: directions,
-        where_clause,
-        is_unique,
-        key_collations: collations,
-        conflict_action: None,
-    })
-}
-
-fn create_index_statement_to_index_schema(
-    index_name: &str,
-    root_page: i32,
-    create: &fsqlite_ast::CreateIndexStatement,
-) -> IndexSchema {
-    let normalized_terms = create
-        .columns
-        .iter()
-        .map(|indexed| {
-            Some((
-                indexed_column_name(indexed)?.to_owned(),
-                normalized_indexed_column_collation(indexed),
-            ))
-        })
-        .collect::<Option<Vec<_>>>();
-    let (columns, key_expressions, key_collations) =
-        if let Some(normalized_terms) = normalized_terms {
-            (
-                normalized_terms
-                    .iter()
-                    .map(|(column_name, _)| column_name.clone())
-                    .collect(),
-                Vec::new(),
-                normalized_terms
-                    .into_iter()
-                    .map(|(_, collation)| collation)
-                    .collect(),
-            )
-        } else {
-            (
-                Vec::new(),
-                create
-                    .columns
-                    .iter()
-                    .map(|indexed| indexed.expr.to_string())
-                    .collect(),
-                create
-                    .columns
-                    .iter()
-                    .map(normalized_indexed_column_collation)
-                    .collect(),
-            )
-        };
-
-    IndexSchema {
-        name: index_name.to_owned(),
-        root_page,
-        columns,
-        key_expressions,
-        key_sort_directions: create
-            .columns
-            .iter()
-            .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
-            .collect(),
-        where_clause: create.where_clause.as_ref().map(ToString::to_string),
-        is_unique: create.unique,
-        key_collations,
-        conflict_action: None,
-    }
-}
-
-fn normalized_indexed_column_collation(indexed: &IndexedColumn) -> Option<String> {
-    indexed_column_collation(indexed).map(|collation| collation.to_ascii_uppercase())
-}
-
-fn extract_index_term_direction(remainder: &str) -> SortDirection {
-    let collation_name_range = find_collation_name_range(remainder);
-    let mut direction = SortDirection::Asc;
-    for (token, start) in collect_unquoted_sql_keyword_tokens(remainder) {
-        if collation_name_range
-            .as_ref()
-            .is_some_and(|range| range.contains(&start))
-        {
-            continue;
-        }
-        match token.as_str() {
-            "DESC" => direction = SortDirection::Desc,
-            "ASC" => direction = SortDirection::Asc,
-            _ => {}
-        }
-    }
-    direction
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -3063,12 +2936,12 @@ fn format_default_value(dv: &DefaultValue) -> String {
     }
 }
 
-fn indexed_column_name(indexed_column: &IndexedColumn) -> Option<&str> {
+fn indexed_column_name(indexed_column: &fsqlite_ast::IndexedColumn) -> Option<&str> {
     fn extract(expr: &Expr) -> Option<&str> {
         match expr {
-            Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(&col_ref.column),
-            // SQLite accepts a legacy single-quoted identifier in indexed
-            // terms and resolves it as the constrained column name.
+            Expr::Column(column, _) if column.table.is_none() => Some(&column.column),
+            // SQLite accepts a legacy single-quoted identifier in table-level
+            // PRIMARY KEY and UNIQUE constraints.
             Expr::Literal(Literal::String(name), _) => Some(name),
             Expr::Collate { expr, .. } => extract(expr),
             _ => None,
@@ -3076,23 +2949,6 @@ fn indexed_column_name(indexed_column: &IndexedColumn) -> Option<&str> {
     }
 
     extract(&indexed_column.expr)
-}
-
-fn indexed_column_collation(indexed_column: &IndexedColumn) -> Option<String> {
-    fn extract(expr: &Expr) -> Option<&str> {
-        match expr {
-            // The outermost COLLATE is the final postfix clause and therefore
-            // determines the effective collation when malformed-but-accepted
-            // DDL repeats the clause.
-            Expr::Collate { collation, .. } => Some(collation.as_str()),
-            _ => None,
-        }
-    }
-
-    indexed_column
-        .collation
-        .clone()
-        .or_else(|| extract(&indexed_column.expr).map(str::to_owned))
 }
 
 fn strip_wrapping_default_parens(mut default_sql: &str) -> &str {
@@ -4237,6 +4093,23 @@ mod tests {
     async fn load_test_db(path: &Path) -> Result<LoadedState> {
         let cx = Cx::new();
         load_from_sqlite(&cx, path).await
+    }
+
+    fn bare_table_schema(name: &str, columns: &[&str]) -> TableSchema {
+        TableSchema {
+            name: name.to_owned(),
+            root_page: 2,
+            columns: columns
+                .iter()
+                .map(|column| ColumnInfo::basic(*column, 'A', false))
+                .collect(),
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }
     }
 
     #[test]
@@ -5646,7 +5519,10 @@ PRAGMA integrity_check;
         else {
             panic!("expected CREATE INDEX");
         };
-        let index = create_index_statement_to_index_schema("idx_t_a", 7, &create);
+        let table = bare_table_schema("t", &["a"]);
+        let index = bind_explicit_index(&create, "idx_t_a", "t", &table)
+            .expect("authoritative index binder should accept repeated COLLATE syntax")
+            .into_index_schema(7);
         assert_eq!(index.columns, ["a"]);
         assert_eq!(index.key_collations, [Some("RTRIM".to_owned())]);
     }
@@ -5801,7 +5677,16 @@ PRAGMA integrity_check;
             ord COLLATE [DESC] DESC
         ) /* index tail */ WHERE active = 1"#;
 
-        let idx = parse_create_index_sql_to_schema("idx(words)", 7, sql).unwrap();
+        let Some(Statement::CreateIndex(create)) = parse_single_statement(sql) else {
+            panic!("expected CREATE INDEX");
+        };
+        let table = bare_table_schema(
+            "items(table)",
+            &["last, name", "code", "tag", "ord", "active"],
+        );
+        let idx = bind_explicit_index(&create, "idx(words)", "items(table)", &table)
+            .expect("authoritative index binder should preserve quoted metadata")
+            .into_index_schema(7);
 
         assert_eq!(
             idx.columns,
@@ -5838,7 +5723,13 @@ PRAGMA integrity_check;
         let sql =
             "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name) DESC) WHERE is_active = 1";
 
-        let idx = parse_create_index_sql_to_schema("uq_agents_name_ci", 7, sql).unwrap();
+        let Some(Statement::CreateIndex(create)) = parse_single_statement(sql) else {
+            panic!("expected CREATE INDEX");
+        };
+        let table = bare_table_schema("agents", &["name", "is_active"]);
+        let idx = bind_explicit_index(&create, "uq_agents_name_ci", "agents", &table)
+            .expect("authoritative index binder should preserve expression metadata")
+            .into_index_schema(7);
 
         assert!(idx.columns.is_empty());
         assert_eq!(idx.key_expressions.len(), 1);
@@ -7451,6 +7342,139 @@ PRAGMA integrity_check;
                 message.contains("docs_title_idx") && message.contains("2147483648"),
                 "unexpected load error: {message}"
             );
+        });
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_explicit_index_with_missing_key_column() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("compat_corrupt_index_key_column.db");
+
+            {
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                sqlite
+                    .execute_batch(
+                        r"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                CREATE INDEX docs_title_idx ON docs(title);
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master
+                SET sql = 'CREATE INDEX docs_title_idx ON docs(missing_title)'
+                WHERE name = 'docs_title_idx';
+                PRAGMA writable_schema = OFF;
+                ",
+                    )
+                    .unwrap();
+            }
+
+            let error = load_test_db(&db_path)
+                .await
+                .expect_err("compat reload must reject an unresolved explicit-index key");
+            assert!(matches!(&error, FrankenError::DatabaseCorrupt { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains("docs_title_idx") && message.contains("missing_title"),
+                "unexpected malformed-index compat-load error: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_schema_qualified_persisted_create_index_sql() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("compat_schema_qualified_index_sql.db");
+            {
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                sqlite
+                    .execute_batch(
+                        r"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                CREATE INDEX docs_title_idx ON docs(title);
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master
+                SET sql = 'CREATE INDEX main.docs_title_idx ON docs(title)'
+                WHERE name = 'docs_title_idx';
+                PRAGMA writable_schema = OFF;
+                ",
+                    )
+                    .unwrap();
+            }
+
+            let error = load_test_db(&db_path)
+                .await
+                .expect_err("compat load must reject schema-qualified index SQL");
+            assert!(matches!(&error, FrankenError::DatabaseCorrupt { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains("docs_title_idx") && message.contains("schema-qualified"),
+                "unexpected schema-qualified-index compat-load error: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_known_invalid_index_functions() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            for (case, create_sql, expected) in [
+                (
+                    "random",
+                    "CREATE INDEX docs_title_idx ON docs(random())",
+                    "non-deterministic",
+                ),
+                (
+                    "aggregate",
+                    "CREATE INDEX docs_title_idx ON docs(sum(title))",
+                    "aggregate",
+                ),
+                (
+                    "wrong_arity",
+                    "CREATE INDEX docs_title_idx ON docs(lower(title, title))",
+                    "wrong number of arguments",
+                ),
+                (
+                    "current_timestamp",
+                    "CREATE INDEX docs_title_idx ON docs(CURRENT_TIMESTAMP)",
+                    "non-deterministic",
+                ),
+            ] {
+                let db_path = dir
+                    .path()
+                    .join(format!("compat_invalid_index_function_{case}.db"));
+                {
+                    let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                    sqlite
+                        .execute_batch(
+                            r"
+                        CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                        CREATE INDEX docs_title_idx ON docs(title);
+                        PRAGMA writable_schema = ON;
+                        ",
+                        )
+                        .unwrap();
+                    sqlite
+                        .execute(
+                            "UPDATE sqlite_master SET sql = ?1 WHERE name = 'docs_title_idx'",
+                            [create_sql],
+                        )
+                        .unwrap();
+                    sqlite
+                        .execute_batch("PRAGMA writable_schema = OFF;")
+                        .unwrap();
+                }
+
+                let error = load_test_db(&db_path)
+                    .await
+                    .expect_err("known-invalid persisted index function must fail compat load");
+                assert!(matches!(&error, FrankenError::DatabaseCorrupt { .. }));
+                let message = error.to_string().to_ascii_lowercase();
+                assert!(
+                    message.contains("docs_title_idx") && message.contains(expected),
+                    "unexpected compat persisted-function error for `{create_sql}`: {error}"
+                );
+            }
         });
     }
 
