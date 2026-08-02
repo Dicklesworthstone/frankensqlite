@@ -4141,6 +4141,7 @@ fn test_regression_guard_release_loader_verifies_git_provenance_and_rename_delta
     assert!(git(&["config", "user.name", "Regression Guard Keeper"]).success());
     assert!(git(&["config", "user.email", "guard@example.invalid"]).success());
     assert!(git(&["config", "commit.gpgsign", "false"]).success());
+    assert!(git(&["config", "core.autocrlf", "false"]).success());
     fs::write(root.join("seed.txt"), "seed\n").expect("write seed");
     fs::write(root.join("source.rs"), "fn source() {}\n").expect("write source");
     fs::write(
@@ -4241,6 +4242,7 @@ fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
     assert!(git(&["config", "user.name", "Release Evidence Keeper"]).success());
     assert!(git(&["config", "user.email", "evidence@example.invalid"]).success());
     assert!(git(&["config", "commit.gpgsign", "false"]).success());
+    assert!(git(&["config", "core.autocrlf", "false"]).success());
     fs::write(root.join("seed.txt"), "tested tree\n").expect("write tested tree");
     assert!(git(&["add", "seed.txt"]).success());
     assert!(git(&["commit", "-m", "tested tree"]).success());
@@ -4288,7 +4290,14 @@ fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
     let manifest_digest = blake3::hash(&manifest_bytes).to_hex().to_string();
     fs::write(root.join(&manifest_path), manifest_bytes).expect("write evidence manifest");
-    assert!(git(&["add", "tests/artifacts/release-evidence"]).success());
+    assert!(
+        git(&[
+            "add",
+            "--force",
+            "tests/artifacts/release-evidence",
+        ])
+        .success()
+    );
     assert!(git(&["commit", "-m", "release evidence"]).success());
     let evidence_head = resolve_current_head(root).expect("resolve evidence commit");
 
