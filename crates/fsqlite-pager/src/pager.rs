@@ -12706,15 +12706,23 @@ where
         let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
         let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
-        let pending_namespace = if vfs.is_memory() {
-            None
+        let (pending_namespace, replace_quiescent_namespace_record) = if vfs.is_memory() {
+            (None, false)
         } else {
             let intent = if disposition == ReadWriteOpenDisposition::ReservedEmpty {
                 NamespaceOpenIntent::ReservedExclusive
             } else {
                 NamespaceOpenIntent::Shared
             };
-            Some(PendingNamespaceOpen::begin(&db_path, intent)?)
+            let pending = PendingNamespaceOpen::begin(&db_path, intent)?;
+            // A Shared admission without an expected identity owns both
+            // namespace locks exclusively. Its bind may therefore repair a
+            // plain copied/corrupt base record after validating the opened
+            // main-file identity; joined and transition-bearing generations
+            // remain fail-closed in the namespace layer.
+            let replace_record =
+                intent == NamespaceOpenIntent::Shared && pending.has_quiescent_record_bytes()?;
+            (Some(pending), replace_record)
         };
         #[cfg(all(feature = "native", any(unix, windows)))]
         if disposition == ReadWriteOpenDisposition::ReservedEmpty && pending_namespace.is_some() {
@@ -12739,6 +12747,12 @@ where
         let mut flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         if disposition == ReadWriteOpenDisposition::CreateIfMissing {
             flags |= VfsOpenFlags::CREATE;
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if replace_quiescent_namespace_record {
+            // A stale nonempty namespace record must never turn a missing
+            // main database into a silently created empty replacement.
+            flags.remove(VfsOpenFlags::CREATE);
         }
         let (db_file, _actual_flags) = match (disposition, effective_expected_identity) {
             (ReadWriteOpenDisposition::ReservedEmpty, Some(expected_identity)) => {
@@ -12778,7 +12792,11 @@ where
                 .ok_or_else(|| FrankenError::CannotOpen {
                     path: db_path.clone(),
                 })?;
-            let binding = pending.bind(identity)?;
+            let binding = if replace_quiescent_namespace_record {
+                pending.bind_replacing_quiescent_record(identity)?
+            } else {
+                pending.bind(identity)?
+            };
             binding.validate_path_identity()?;
             Some(binding)
         } else {
@@ -13338,8 +13356,8 @@ where
         let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
         let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
-        let pending_namespace = if vfs.is_memory() {
-            None
+        let (mut pending_namespace, mut replace_quiescent_namespace_record) = if vfs.is_memory() {
+            (None, false)
         } else {
             // GH #140: prefer strictly read-only admission — join the
             // existing namespace generation without creating or rewriting
@@ -13351,11 +13369,13 @@ where
             // Busy is NOT a fallback trigger: it means a live generation
             // transition is in flight and must stay retryable.
             match PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::ReadOnlyExisting) {
-                Ok(pending) => Some(pending),
-                Err(FrankenError::CannotOpen { .. }) => Some(PendingNamespaceOpen::begin(
-                    &db_path,
-                    NamespaceOpenIntent::Shared,
-                )?),
+                Ok(pending) => (Some(pending), false),
+                Err(FrankenError::CannotOpen { .. }) => {
+                    let pending =
+                        PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::Shared)?;
+                    let replace_record = pending.has_quiescent_record_bytes()?;
+                    (Some(pending), replace_record)
+                }
                 Err(error) => return Err(error),
             }
         };
@@ -13376,6 +13396,46 @@ where
         #[cfg(not(all(feature = "native", any(unix, windows))))]
         let effective_expected_identity = expected_identity;
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let (db_file, _actual_flags) = {
+            let initial_open = if let Some(identity) = effective_expected_identity {
+                vfs.open_with_expected_identity(cx, &db_path, flags, identity)
+            } else {
+                vfs.open(cx, Some(&db_path), flags)
+            };
+            match initial_open {
+                Ok(opened) => opened,
+                Err(FrankenError::CannotOpen { .. })
+                    if expected_identity.is_none() && namespace_expected_identity.is_some() =>
+                {
+                    // bd-g5rdj: namespace sidecars are machine-local runtime
+                    // state and are routinely copied alongside the database.
+                    // A valid record from the source inode must not make the
+                    // copied database permanently unopenable. Release the
+                    // read-only join and retry through Shared admission: when
+                    // the copied namespace is quiescent this takes `use`
+                    // exclusively, opens the current database identity, and
+                    // republishes that identity during `bind`. If a live peer
+                    // owns the namespace, Shared admission joins its identity
+                    // instead and the exact-identity open remains fail-closed.
+                    drop(pending_namespace.take());
+                    let replacement_pending =
+                        PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::Shared)?;
+                    let replacement_expected = replacement_pending.expected_identity();
+                    replace_quiescent_namespace_record =
+                        replacement_pending.has_quiescent_record_bytes()?;
+                    let opened = if let Some(identity) = replacement_expected {
+                        vfs.open_with_expected_identity(cx, &db_path, flags, identity)?
+                    } else {
+                        vfs.open(cx, Some(&db_path), flags)?
+                    };
+                    pending_namespace = Some(replacement_pending);
+                    opened
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
         let (db_file, _actual_flags) = if let Some(expected_identity) = effective_expected_identity
         {
             vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
@@ -13408,7 +13468,11 @@ where
                 .ok_or_else(|| FrankenError::CannotOpen {
                     path: db_path.clone(),
                 })?;
-            let binding = pending.bind(identity)?;
+            let binding = if replace_quiescent_namespace_record {
+                pending.bind_replacing_quiescent_record(identity)?
+            } else {
+                pending.bind(identity)?
+            };
             binding.validate_path_identity()?;
             Some(binding)
         } else {
@@ -20919,6 +20983,83 @@ mod tests {
             assert_eq!(peer.expected_identity(), Some(binding.identity()));
             peer.bind(binding.identity())
                 .expect("peer joins the published generation");
+        });
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn copied_or_corrupt_quiescent_namespace_records_rebind_safely() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("namespace-copy-source.db");
+            let source_pager =
+                SimplePager::open_with_cx(&cx, UnixVfs::new(), &source, PageSize::DEFAULT)
+                    .await
+                    .expect("create source database and namespace record");
+            drop(source_pager);
+
+            let sidecar = |path: &Path, suffix: &str| {
+                let mut suffixed = path.as_os_str().to_owned();
+                suffixed.push(suffix);
+                PathBuf::from(suffixed)
+            };
+            let target = dir.path().join("namespace-copy-target.db");
+            std::fs::copy(&source, &target).expect("copy source database");
+            for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+                std::fs::copy(sidecar(&source, suffix), sidecar(&target, suffix))
+                    .expect("copy namespace sidecar");
+            }
+            let target_bytes = std::fs::read(&target).expect("snapshot target database");
+
+            let readonly =
+                SimplePager::open_readonly_with_cx(&cx, UnixVfs::new(), &target, PageSize::DEFAULT)
+                    .await
+                    .expect("open copied namespace state read-only");
+            drop(readonly);
+
+            std::fs::write(sidecar(&target, "-fsqlite-ns-use"), b"corrupt base record")
+                .expect("corrupt quiescent namespace record");
+            let repaired =
+                SimplePager::open_readonly_with_cx(&cx, UnixVfs::new(), &target, PageSize::DEFAULT)
+                    .await
+                    .expect("repair corrupt quiescent namespace state");
+            drop(repaired);
+            assert_eq!(
+                std::fs::read(&target).expect("re-read target database"),
+                target_bytes,
+                "read-only namespace repair must not modify the main database"
+            );
+
+            for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+                std::fs::copy(sidecar(&source, suffix), sidecar(&target, suffix))
+                    .expect("restore namespace sidecar");
+            }
+            let writable = SimplePager::open_existing_with_cx_and_page_buffer_max(
+                &cx,
+                UnixVfs::new(),
+                &target,
+                PageSize::DEFAULT,
+                None,
+                None,
+            )
+            .await
+            .expect("open copied namespace state read-write");
+            drop(writable);
+
+            let missing = dir.path().join("namespace-copy-missing-main.db");
+            for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+                std::fs::copy(sidecar(&source, suffix), sidecar(&missing, suffix))
+                    .expect("copy orphan namespace sidecar");
+            }
+            assert!(matches!(
+                SimplePager::open_with_cx(&cx, UnixVfs::new(), &missing, PageSize::DEFAULT,).await,
+                Err(FrankenError::CannotOpen { .. })
+            ));
+            assert!(
+                !missing.exists(),
+                "stale sidecars must not create a replacement for a missing main database"
+            );
         });
     }
 

@@ -108,6 +108,12 @@ enum PendingLease {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamespaceBindMode {
+    PreserveRecord,
+    ReplaceQuiescentRecord,
+}
+
 /// Admission guard held while the caller opens and verifies the main file.
 ///
 /// Dropping this value at any error point releases every acquired lock.
@@ -216,16 +222,63 @@ impl PendingNamespaceOpen {
         }
     }
 
+    /// Whether this admission exclusively owns a nonempty namespace record.
+    ///
+    /// `true` identifies the only state in which a caller may need
+    /// [`Self::bind_replacing_quiescent_record`]. New namespaces have an empty
+    /// record; joined/live namespaces are never reported as quiescent.
+    pub fn has_quiescent_record_bytes(&self) -> Result<bool> {
+        match self.lease.as_ref() {
+            Some(PendingLease::NewShared { use_file, .. }) => Ok(use_file.metadata()?.len() != 0),
+            _ => Ok(false),
+        }
+    }
+
     /// Bind admission to the identity obtained from the opened main-file
     /// descriptor.  No recovery artifact may be inspected before this step.
     pub fn bind(self, identity: FileIdentity) -> Result<Arc<DatabaseNamespaceBinding>> {
         self.bind_with_gate_release(identity, release_gate)
     }
 
+    /// Bind a newly opened generation after proving that a stale namespace
+    /// record has no live owner.
+    ///
+    /// This is deliberately narrower than [`Self::bind`]: it succeeds only
+    /// for a `Shared` admission that owns both namespace locks exclusively.
+    /// The caller must already have opened the current main-file descriptor;
+    /// its identity is revalidated against the pathname before the stale
+    /// record is replaced. A joined/live generation always fails closed.
+    pub fn bind_replacing_quiescent_record(
+        self,
+        identity: FileIdentity,
+    ) -> Result<Arc<DatabaseNamespaceBinding>> {
+        self.bind_with_gate_release_mode(
+            identity,
+            release_gate,
+            NamespaceBindMode::ReplaceQuiescentRecord,
+        )
+    }
+
     fn bind_with_gate_release<F>(
+        self,
+        identity: FileIdentity,
+        release_gate_fn: F,
+    ) -> Result<Arc<DatabaseNamespaceBinding>>
+    where
+        F: FnOnce(&File) -> Result<()>,
+    {
+        self.bind_with_gate_release_mode(
+            identity,
+            release_gate_fn,
+            NamespaceBindMode::PreserveRecord,
+        )
+    }
+
+    fn bind_with_gate_release_mode<F>(
         mut self,
         identity: FileIdentity,
         release_gate_fn: F,
+        bind_mode: NamespaceBindMode,
     ) -> Result<Arc<DatabaseNamespaceBinding>>
     where
         F: FnOnce(&File) -> Result<()>,
@@ -237,9 +290,17 @@ impl PendingNamespaceOpen {
 
         let state = match lease {
             PendingLease::NewShared { gate, mut use_file } => {
-                if let Err(error) =
-                    write_identity_record(&mut use_file, &self.stable_path, identity)
-                {
+                let write_result = match bind_mode {
+                    NamespaceBindMode::PreserveRecord => {
+                        write_identity_record(&mut use_file, &self.stable_path, identity)
+                    }
+                    NamespaceBindMode::ReplaceQuiescentRecord => replace_quiescent_identity_record(
+                        &mut use_file,
+                        &self.stable_path,
+                        identity,
+                    ),
+                };
+                if let Err(error) = write_result {
                     release_namespace_locks(&gate, &use_file);
                     return Err(error);
                 }
@@ -253,6 +314,10 @@ impl PendingNamespaceOpen {
                 mut use_file,
                 generation_identity,
             } => {
+                if bind_mode == NamespaceBindMode::ReplaceQuiescentRecord {
+                    release_namespace_locks(&gate, &use_file);
+                    return Err(cannot_open(&self.stable_path));
+                }
                 let observed_identity = match read_identity_record(&mut use_file, &self.stable_path)
                 {
                     Ok(identity) => identity,
@@ -273,6 +338,10 @@ impl PendingNamespaceOpen {
                 BindingLease::Shared { use_file }
             }
             PendingLease::BootstrapExclusive { gate, mut use_file } => {
+                if bind_mode == NamespaceBindMode::ReplaceQuiescentRecord {
+                    release_namespace_locks(&gate, &use_file);
+                    return Err(cannot_open(&self.stable_path));
+                }
                 if let Err(error) =
                     write_identity_record(&mut use_file, &self.stable_path, identity)
                 {
@@ -1280,6 +1349,37 @@ fn write_identity_record(
         return Ok(());
     }
 
+    write_fresh_identity_record(file, identity)
+}
+
+fn replace_quiescent_identity_record(
+    file: &mut File,
+    database_path: &Path,
+    identity: FileIdentity,
+) -> Result<()> {
+    // `NewShared` holds both `gate` and `use` exclusively. Revalidate the
+    // caller's already-open main generation against the stable pathname before
+    // discarding copied/corrupt machine-local namespace state. A valid,
+    // terminal transition ledger is safe to collapse in a copied namespace;
+    // incomplete or malformed transition evidence must remain fail-closed.
+    let existing_len = file.metadata()?.len();
+    validate_generation_path_identity(database_path, identity)?;
+    if existing_len >= RECORD_BYTES as u64 {
+        match read_namespace_record_state(file, database_path, false) {
+            Ok(state) if state.current_identity == identity => {
+                file.sync_data()?;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(FrankenError::CannotOpen { .. }) if existing_len <= RECORD_BYTES as u64 => {}
+            Err(FrankenError::CannotOpen { .. }) => return Err(cannot_open(database_path)),
+            Err(error) => return Err(error),
+        }
+    }
+    write_fresh_identity_record(file, identity)
+}
+
+fn write_fresh_identity_record(file: &mut File, identity: FileIdentity) -> Result<()> {
     let mut record = [0_u8; RECORD_BYTES];
     record[..8].copy_from_slice(&RECORD_MAGIC);
     record[8] = RECORD_VERSION;
@@ -1996,6 +2096,161 @@ mod tests {
             fs::read(&use_path).expect("read refused identity record"),
             record_before,
             "read-only identity refusal must not rebind the record to a replacement file"
+        );
+    }
+
+    #[test]
+    fn quiescent_rebind_repairs_stale_record_but_live_join_fails_closed() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("quiescent-rebind.db");
+        let displaced = dir.path().join("quiescent-rebind.displaced.db");
+        let original_identity = create_database(&database, b"original generation");
+        let original = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit original generation")
+            .bind(original_identity)
+            .expect("bind original generation");
+        original
+            .finish_bootstrap()
+            .expect("publish original generation");
+        drop(original);
+
+        fs::rename(&database, &displaced).expect("displace original generation");
+        let replacement_identity = create_database(&database, b"replacement generation");
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+        let stale_record = fs::read(&use_path).expect("snapshot stale identity record");
+
+        let ordinary = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("obtain quiescent namespace exclusively");
+        assert_eq!(ordinary.expected_identity(), None);
+        assert!(ordinary.has_quiescent_record_bytes().unwrap());
+        assert!(matches!(
+            ordinary.bind(replacement_identity),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(
+            fs::read(&use_path).expect("read preserved stale record"),
+            stale_record,
+            "ordinary admission must retain fail-closed replacement semantics"
+        );
+
+        let wrong_generation = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("reacquire quiescent namespace for identity check");
+        assert!(matches!(
+            wrong_generation.bind_replacing_quiescent_record(original_identity),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(
+            fs::read(&use_path).expect("read record after rejected identity"),
+            stale_record,
+            "repair must validate the current pathname identity before rewriting"
+        );
+
+        let mut transition_bearing_record = stale_record.clone();
+        transition_bearing_record.push(0x7f);
+        fs::write(&use_path, &transition_bearing_record)
+            .expect("append simulated transition evidence");
+        let transition_bearing =
+            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+                .expect("reacquire namespace with transition evidence");
+        assert!(matches!(
+            transition_bearing.bind_replacing_quiescent_record(replacement_identity),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(
+            fs::read(&use_path).expect("read preserved transition evidence"),
+            transition_bearing_record,
+            "repair must never discard namespace transition evidence"
+        );
+        fs::write(&use_path, &stale_record).expect("restore plain stale admission record");
+
+        let replacement = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("reacquire quiescent namespace exclusively")
+            .bind_replacing_quiescent_record(replacement_identity)
+            .expect("replace copied machine-local namespace record");
+        replacement
+            .finish_bootstrap()
+            .expect("publish replacement namespace generation");
+
+        let joined = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("join live replacement generation");
+        assert_eq!(joined.expected_identity(), Some(replacement_identity));
+        assert!(!joined.has_quiescent_record_bytes().unwrap());
+        let replacement_record = fs::read(&use_path).expect("snapshot replacement record");
+        assert!(matches!(
+            joined.bind_replacing_quiescent_record(replacement_identity),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(
+            fs::read(&use_path).expect("read live replacement record"),
+            replacement_record,
+            "a live joined generation must never enter the repair path"
+        );
+    }
+
+    #[test]
+    fn quiescent_rebind_collapses_completed_copied_transition_history() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("completed-ledger-source.db");
+        let displaced = dir.path().join("completed-ledger-source.displaced.db");
+        let original_identity = create_database(&database, b"original generation");
+        publish_generation(&database, original_identity);
+
+        let mut transition =
+            begin_database_namespace_generation_transition(&database, original_identity)
+                .expect("prepare generation transition");
+        fs::rename(&database, &displaced).expect("displace original generation");
+        let replacement_identity = create_database(&database, b"replacement generation");
+        transition
+            .publish_replacement(replacement_identity)
+            .expect("publish replacement generation");
+        transition.finish().expect("finish replacement generation");
+
+        let source_use_path = sidecar_path(&database, USE_SUFFIX);
+        let terminal_ledger_len = fs::metadata(&source_use_path).unwrap().len();
+        assert!(
+            terminal_ledger_len > RECORD_BYTES as u64,
+            "completed transition must leave durable history for this keeper"
+        );
+        let reopened = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit current terminal namespace")
+            .bind_replacing_quiescent_record(replacement_identity)
+            .expect("retain current terminal namespace history");
+        reopened
+            .finish_bootstrap()
+            .expect("publish current namespace");
+        drop(reopened);
+        assert_eq!(
+            fs::metadata(&source_use_path).unwrap().len(),
+            terminal_ledger_len,
+            "an already-current terminal ledger must not be rewritten"
+        );
+        let copied = dir.path().join("completed-ledger-copy.db");
+        fs::copy(&database, &copied).expect("copy replacement main database");
+        for suffix in [GATE_SUFFIX, USE_SUFFIX] {
+            fs::copy(
+                sidecar_path(&database, suffix),
+                sidecar_path(&copied, suffix),
+            )
+            .expect("copy namespace sidecar");
+        }
+        let copied_file = File::open(&copied).expect("open copied main database");
+        let copied_identity = FileIdentity::from_file(&copied_file)
+            .expect("query copied main identity")
+            .expect("native copied main identity");
+
+        let rebound = PendingNamespaceOpen::begin(&copied, NamespaceOpenIntent::Shared)
+            .expect("admit copied completed namespace")
+            .bind_replacing_quiescent_record(copied_identity)
+            .expect("collapse terminal copied transition history");
+        rebound
+            .finish_bootstrap()
+            .expect("publish copied generation");
+        assert_eq!(
+            fs::metadata(sidecar_path(&copied, USE_SUFFIX))
+                .unwrap()
+                .len(),
+            RECORD_BYTES as u64,
+            "copied terminal history should collapse to one current base record"
         );
     }
 
