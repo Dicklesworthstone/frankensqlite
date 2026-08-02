@@ -62,7 +62,7 @@ use fsqlite_ast::{
     NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, QualifiedName, ResultColumn,
     SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement, TableConstraintKind,
     TableOrSubquery, TimeTravelTarget, UnaryOp, UpsertAction, UpsertClause, WindowReference,
-    WindowSpec,
+    WindowSpec, ValuesClause,
 };
 use fsqlite_btree::cursor::{
     TableLeafDeleteRun, TableLeafDeleteRunDelete, TableLeafDeleteRunMissReason,
@@ -17758,7 +17758,8 @@ impl Connection {
                     span
                 });
             let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
-            self.cached_parse_single(sql)?
+            let parsed = self.cached_parse_single(sql)?;
+            self.freeze_statement_values_snapshot(parsed.as_ref())
         };
         // Relation lookup must observe the original parsed AST. Rewriting can
         // eagerly evaluate or erase subqueries, which would otherwise move a
@@ -25811,6 +25812,22 @@ impl Connection {
         )
     }
 
+    /// Clone a parsed statement into the connection-local preparation or
+    /// execution snapshot and seal every deferred `VALUES` representation.
+    ///
+    /// Parse-cache entries intentionally remain schema and registry agnostic,
+    /// while SQLite's coroutine-versus-`UNION ALL` decision depends on the
+    /// active scalar-function registry. Freezing the clone at this boundary
+    /// gives direct and prepared routing the same immutable donor metadata;
+    /// downstream clones preserve that decision because already-frozen
+    /// clauses are never recomputed.
+    fn freeze_statement_values_snapshot(&self, statement: &Statement) -> Statement {
+        let mut snapshot = statement.clone();
+        let function_registry = Arc::clone(&self.func_registry.borrow());
+        freeze_values_donors_in_statement(&mut snapshot, function_registry.as_ref());
+        snapshot
+    }
+
     /// Return a cached parsed single statement, or parse fresh and cache it.
     /// The cache is invalidated whenever the schema cookie changes (DDL).
     fn cached_parse_single(&self, sql: &str) -> Result<std::sync::Arc<Statement>> {
@@ -27342,7 +27359,8 @@ impl Connection {
         Box::pin(async move {
             #[cfg(test)]
             record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
-            self.execute_statement_impl_after_background_status(statement, params, None)
+            let statement = self.freeze_statement_values_snapshot(statement);
+            self.execute_statement_impl_after_background_status(&statement, params, None)
                 .await
         })
     }
