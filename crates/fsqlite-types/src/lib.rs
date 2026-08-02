@@ -627,6 +627,81 @@ impl TypeAffinity {
     }
 }
 
+/// SQLite affinity attached to an expression for comparison purposes.
+///
+/// This deliberately distinguishes an expression with no affinity (for
+/// example, a literal or most computed expressions) from an expression with
+/// genuine [`TypeAffinity::Blob`] affinity. Although both cases avoid storage
+/// conversion in many comparisons, they combine differently with the other
+/// operand's affinity under SQLite's comparison rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExprAffinity {
+    /// The expression has no affinity.
+    None,
+    /// The expression carries the specified SQLite type affinity.
+    Affinity(TypeAffinity),
+}
+
+/// Affinity encoded on a SQLite comparison operation.
+///
+/// The discriminants match SQLite's comparison-affinity codes, including
+/// `@` (`0x40`) for no affinity. Keeping `None` distinct from `Blob` is
+/// essential: a no-affinity literal paired with a TEXT column selects TEXT,
+/// while two declared TEXT/BLOB operands select BLOB (raw) comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ComparisonAffinity {
+    /// No comparison affinity (`SQLITE_AFF_NONE`, `@`).
+    None = b'@',
+    /// Raw/BLOB comparison affinity (`SQLITE_AFF_BLOB`, `A`).
+    Blob = b'A',
+    /// TEXT comparison affinity (`SQLITE_AFF_TEXT`, `B`).
+    Text = b'B',
+    /// NUMERIC comparison affinity (`SQLITE_AFF_NUMERIC`, `C`).
+    Numeric = b'C',
+    /// INTEGER comparison affinity (`SQLITE_AFF_INTEGER`, `D`).
+    Integer = b'D',
+    /// REAL comparison affinity (`SQLITE_AFF_REAL`, `E`).
+    Real = b'E',
+}
+
+impl ComparisonAffinity {
+    /// Combine two expression affinities using SQLite's comparison rules.
+    ///
+    /// If neither operand has affinity, the comparison has no affinity. If
+    /// exactly one operand has affinity, that exact affinity is preserved. If
+    /// both operands have affinity, any numeric-class operand selects NUMERIC;
+    /// otherwise the comparison uses BLOB affinity and keeps runtime storage
+    /// classes unchanged.
+    #[must_use]
+    pub const fn from_operands(left: ExprAffinity, right: ExprAffinity) -> Self {
+        match (left, right) {
+            (ExprAffinity::None, ExprAffinity::None) => Self::None,
+            (ExprAffinity::Affinity(affinity), ExprAffinity::None)
+            | (ExprAffinity::None, ExprAffinity::Affinity(affinity)) => match affinity {
+                TypeAffinity::Blob => Self::Blob,
+                TypeAffinity::Text => Self::Text,
+                TypeAffinity::Numeric => Self::Numeric,
+                TypeAffinity::Integer => Self::Integer,
+                TypeAffinity::Real => Self::Real,
+            },
+            (ExprAffinity::Affinity(left), ExprAffinity::Affinity(right)) => {
+                if matches!(
+                    left,
+                    TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real
+                ) || matches!(
+                    right,
+                    TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real
+                ) {
+                    Self::Numeric
+                } else {
+                    Self::Blob
+                }
+            }
+        }
+    }
+}
+
 /// The five fundamental SQLite storage classes.
 ///
 /// Every value stored in SQLite belongs to exactly one of these classes.
@@ -2666,6 +2741,89 @@ mod tests {
             TypeAffinity::from_type_name("POINTERFLOAT"),
             TypeAffinity::Integer
         );
+    }
+
+    #[test]
+    fn comparison_affinity_codes_match_sqlite_p5() {
+        assert_eq!(ComparisonAffinity::None as u8, b'@');
+        assert_eq!(ComparisonAffinity::Blob as u8, b'A');
+        assert_eq!(ComparisonAffinity::Text as u8, b'B');
+        assert_eq!(ComparisonAffinity::Numeric as u8, b'C');
+        assert_eq!(ComparisonAffinity::Integer as u8, b'D');
+        assert_eq!(ComparisonAffinity::Real as u8, b'E');
+    }
+
+    #[test]
+    fn expression_comparison_affinity_has_exhaustive_sqlite_truth_table() {
+        let operands = [
+            ExprAffinity::None,
+            ExprAffinity::Affinity(TypeAffinity::Blob),
+            ExprAffinity::Affinity(TypeAffinity::Text),
+            ExprAffinity::Affinity(TypeAffinity::Numeric),
+            ExprAffinity::Affinity(TypeAffinity::Integer),
+            ExprAffinity::Affinity(TypeAffinity::Real),
+        ];
+        let expected = [
+            [
+                ComparisonAffinity::None,
+                ComparisonAffinity::Blob,
+                ComparisonAffinity::Text,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Integer,
+                ComparisonAffinity::Real,
+            ],
+            [
+                ComparisonAffinity::Blob,
+                ComparisonAffinity::Blob,
+                ComparisonAffinity::Blob,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+            ],
+            [
+                ComparisonAffinity::Text,
+                ComparisonAffinity::Blob,
+                ComparisonAffinity::Blob,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+            ],
+            [
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+            ],
+            [
+                ComparisonAffinity::Integer,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+            ],
+            [
+                ComparisonAffinity::Real,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+                ComparisonAffinity::Numeric,
+            ],
+        ];
+
+        assert_eq!(operands.len() * operands.len(), 36);
+        for (left_index, left) in operands.iter().copied().enumerate() {
+            for (right_index, right) in operands.iter().copied().enumerate() {
+                assert_eq!(
+                    ComparisonAffinity::from_operands(left, right),
+                    expected[left_index][right_index],
+                    "unexpected comparison affinity for left={left:?}, right={right:?}",
+                );
+            }
+        }
     }
 
     #[test]

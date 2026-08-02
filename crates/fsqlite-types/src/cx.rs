@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
 
+use crate::sync_primitives::SystemTime;
+
 #[cfg(feature = "native")]
 use asupersync::types::Time as NativeTime;
 #[cfg(feature = "native")]
@@ -495,8 +497,14 @@ struct CxInner {
     // Deliberately NOT feature-gated: this is an OS-thread-ownership
     // property, not an asupersync property.
     blocking_io_inline_safe: AtomicBool,
-    // Deterministic clock: milliseconds since epoch for tests.
+    // Deterministic clock override: milliseconds since epoch for tests.
+    //
+    // The mode bit is separate from the value so every `u64`, including zero
+    // and `u64::MAX`, remains a valid fixed timestamp. Writers publish the
+    // value before the mode bit with release ordering; readers acquire the
+    // mode before loading the value.
     unix_millis: AtomicU64,
+    unix_millis_is_fixed: AtomicBool,
 }
 
 impl CxInner {
@@ -520,6 +528,7 @@ impl CxInner {
             fallback_native_cx: std::sync::OnceLock::new(),
             blocking_io_inline_safe: AtomicBool::new(false),
             unix_millis: AtomicU64::new(0),
+            unix_millis_is_fixed: AtomicBool::new(false),
         }
     }
 }
@@ -1781,6 +1790,21 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         child.trace_id = self.trace_id;
         child.decision_id = self.decision_id;
         child.policy_id = self.policy_id;
+        if self
+            .inner
+            .unix_millis_is_fixed
+            .load(Ordering::Acquire)
+        {
+            let unix_millis = self.inner.unix_millis.load(Ordering::Acquire);
+            child
+                .inner
+                .unix_millis
+                .store(unix_millis, Ordering::Release);
+            child
+                .inner
+                .unix_millis_is_fixed
+                .store(true, Ordering::Release);
+        }
         if let Some(oracle) = self.inner.eprocess_oracle.get().cloned() {
             child.set_eprocess_oracle(oracle);
         }
@@ -1886,15 +1910,44 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         Caps: cap::HasTime,
     {
         self.inner.unix_millis.store(millis, Ordering::Release);
+        self.inner
+            .unix_millis_is_fixed
+            .store(true, Ordering::Release);
     }
 
-    /// Return current time as a Julian day (via deterministic unix millis).
+    /// Return current Unix time in milliseconds.
+    ///
+    /// Production contexts use the live system wall clock. Tests can install
+    /// an exact fixed value with [`Self::set_unix_millis_for_testing`].
+    #[must_use]
+    pub fn current_time_unix_millis(&self) -> u64
+    where
+        Caps: cap::HasTime,
+    {
+        if self
+            .inner
+            .unix_millis_is_fixed
+            .load(Ordering::Acquire)
+        {
+            return self.inner.unix_millis.load(Ordering::Acquire);
+        }
+
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    /// Return current time as a Julian day.
     #[must_use]
     pub fn current_time_julian_day(&self) -> f64
     where
         Caps: cap::HasTime,
     {
-        let millis = self.inner.unix_millis.load(Ordering::Acquire);
+        let millis = self.current_time_unix_millis();
         #[allow(clippy::cast_precision_loss)]
         let secs = (millis as f64) / 1000.0;
         // Unix epoch in Julian days: 2440587.5
@@ -2316,18 +2369,100 @@ mod tests {
         assert!(compute.checkpoint().is_err());
     }
 
+    fn system_time_unix_millis() -> u64 {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
     #[test]
-    fn test_cx_current_time_julian_day() {
+    fn test_cx_current_time_uses_live_clock_by_default() {
         let cx = Cx::<FullCaps>::new();
-        // Unix epoch = Julian day 2440587.5
+        let observed = cx.current_time_unix_millis();
+        let expected = system_time_unix_millis();
+
+        assert!(
+            observed.abs_diff(expected) <= 60_000,
+            "default Cx clock must be live: observed={observed}, expected approximately {expected}"
+        );
+    }
+
+    #[test]
+    fn test_cx_fixed_unix_millis_supports_full_u64_domain() {
+        let cx = Cx::<FullCaps>::new();
+
+        cx.set_unix_millis_for_testing(0);
+        assert_eq!(cx.current_time_unix_millis(), 0);
+
+        cx.set_unix_millis_for_testing(u64::MAX);
+        assert_eq!(cx.current_time_unix_millis(), u64::MAX);
+    }
+
+    #[test]
+    fn test_cx_current_time_julian_day_uses_fixed_unix_millis() {
+        let cx = Cx::<FullCaps>::new();
+
+        // Unix epoch = Julian day 2440587.5.
         cx.set_unix_millis_for_testing(0);
         let jd = cx.current_time_julian_day();
         assert!((jd - 2_440_587.5).abs() < 1e-10);
 
-        // 1 day = 86_400_000 ms
+        // One day = 86_400_000 ms.
         cx.set_unix_millis_for_testing(86_400_000);
         let jd = cx.current_time_julian_day();
         assert!((jd - 2_440_588.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cx_children_inherit_fixed_or_live_clock_state() {
+        let fixed_parent = Cx::<FullCaps>::new();
+        fixed_parent.set_unix_millis_for_testing(0);
+        let fixed_child = fixed_parent.create_child();
+        let fixed_spawn_child = fixed_parent.create_child_for_spawn();
+
+        assert_eq!(fixed_child.current_time_unix_millis(), 0);
+        assert_eq!(fixed_spawn_child.current_time_unix_millis(), 0);
+
+        // Child clocks are snapshots rather than aliases of the parent's
+        // override, so a later parent update cannot rewrite an existing child.
+        fixed_parent.set_unix_millis_for_testing(86_400_000);
+        assert_eq!(fixed_child.current_time_unix_millis(), 0);
+
+        let live_parent = Cx::<FullCaps>::new();
+        let live_child = live_parent.create_child();
+        let observed = live_child.current_time_unix_millis();
+        let expected = system_time_unix_millis();
+        assert!(
+            observed.abs_diff(expected) <= 60_000,
+            "child of live Cx must remain live: observed={observed}, expected approximately {expected}"
+        );
+    }
+
+    #[test]
+    fn test_cx_fixed_clock_updates_publish_complete_values() {
+        const FIRST: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        const SECOND: u64 = 0x5555_5555_5555_5555;
+
+        let cx = Cx::<FullCaps>::new();
+        cx.set_unix_millis_for_testing(FIRST);
+        let writer_cx = cx.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..1_000 {
+                writer_cx.set_unix_millis_for_testing(FIRST);
+                writer_cx.set_unix_millis_for_testing(SECOND);
+            }
+        });
+
+        for _ in 0..1_000 {
+            let observed = cx.current_time_unix_millis();
+            assert!(matches!(observed, FIRST | SECOND));
+        }
+        writer.join().expect("clock writer must not panic");
+        assert_eq!(cx.current_time_unix_millis(), SECOND);
     }
 
     #[test]
