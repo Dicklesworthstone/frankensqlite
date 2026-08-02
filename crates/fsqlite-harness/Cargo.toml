@@ -33,6 +33,7 @@ asupersync = { workspace = true, features = ["test-internals"] }
 blake3 = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
+syn.workspace = true
 tempfile = { workspace = true }
 trybuild = "1.0"
 fsqlite-btree = { workspace = true }
