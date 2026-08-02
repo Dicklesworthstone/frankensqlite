@@ -229,7 +229,7 @@ fn install_counting_identity(
     r: &rusqlite::Connection,
 ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let frank_calls = Arc::new(AtomicUsize::new(0));
-    f.register_scalar_function(CountingIdentity {
+    f.register_nondeterministic_scalar_function(CountingIdentity {
         calls: Arc::clone(&frank_calls),
     });
 
@@ -597,7 +597,7 @@ fn ordered_top_n_reuses_exact_output_and_skips_rejected_payloads() {
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        connection.register_scalar_function(CountingIdentity {
+        connection.register_nondeterministic_scalar_function(CountingIdentity {
             calls: Arc::clone(&calls),
         });
 

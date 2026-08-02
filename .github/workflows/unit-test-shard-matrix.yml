@@ -438,6 +438,11 @@ jobs:
     env:
       RUST_BACKTRACE: "1"
       CARGO_TERM_COLOR: always
+      # Consumed by ci_e2e_test_discovery_gate.sh. This job enumerates every
+      # tracked integration-test target, executes each target exactly once,
+      # and emits receipts that the accounting job verifies below.
+      E2E_COVERAGE_MODE: all-tracked-targets
+      E2E_TEST_SOURCE_DIR: crates/fsqlite-e2e/tests
       SHARD_COUNT: "16"
       SHARD_INDEX: ${{ matrix.shard_index }}
     steps:
@@ -474,7 +479,8 @@ jobs:
           : > "${manifest}"
 
           mapfile -t targets < <(
-            find crates/fsqlite-e2e/tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' \
+            git ls-files "${E2E_TEST_SOURCE_DIR}/*.rs" \
+              | xargs -r -n1 basename \
               | sed -e 's/\.rs$//' \
               | LC_ALL=C sort
           )
@@ -553,6 +559,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
+      E2E_TEST_SOURCE_DIR: crates/fsqlite-e2e/tests
       SHARD_COUNT: "16"
     steps:
       - name: Checkout
@@ -571,7 +578,8 @@ jobs:
           set -euo pipefail
 
           mapfile -t expected_targets < <(
-            find crates/fsqlite-e2e/tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' \
+            git ls-files "${E2E_TEST_SOURCE_DIR}/*.rs" \
+              | xargs -r -n1 basename \
               | sed -e 's/\.rs$//' \
               | LC_ALL=C sort
           )

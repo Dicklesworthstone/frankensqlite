@@ -1,0 +1,70 @@
+name: Perf Regression Analyzer Contract
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/perf-regression-analyzer-contract.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/fsqlite-e2e/Cargo.toml"
+      - "crates/fsqlite-e2e/build.rs"
+      - "crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs"
+      - "crates/fsqlite-e2e/tests/bd_zywqc_2_regression_gate.rs"
+      - "scripts/perf_regression_gate.sh"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/perf-regression-analyzer-contract.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/fsqlite-e2e/Cargo.toml"
+      - "crates/fsqlite-e2e/build.rs"
+      - "crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs"
+      - "crates/fsqlite-e2e/tests/bd_zywqc_2_regression_gate.rs"
+      - "scripts/perf_regression_gate.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # This checks the analyzer's correctness fixtures. It does not execute the
+  # benchmark pipeline or produce performance or release evidence.
+  analyzer-contract:
+    runs-on: ubuntu-latest
+    # A cold workspace compile can exceed RCH's 30-minute transport default;
+    # leave enough wall-clock budget for compilation plus all analyzer fixtures.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: nightly
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: perf-regression-analyzer-contract
+
+      - name: Run the analyzer contract only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fsqlite-e2e \
+            --test bd_zywqc_2_regression_gate -- --nocapture

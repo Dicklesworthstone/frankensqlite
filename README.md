@@ -1701,7 +1701,7 @@ OCT_EXP[209] = 0x8E
 For bulk operations (the inner loop of RaptorQ encoding/decoding), FrankenSQLite precomputes the full 256×256 multiplication table:
 
 ```
-MUL_TABLES: [[u8; 256]; 256]    // 65,536 bytes, fits in L1 cache
+MUL_TABLES: [[u8; 256]; 256]    // 65,536 bytes; cache residency is host-dependent
 
 Precomputed once at startup:
     MUL_TABLES[a][b] = if a == 0 || b == 0 { 0 }
@@ -1717,7 +1717,12 @@ decode. For a 4 KiB symbol this performs 4,096 table lookups and XOR
 operations; its latency depends on the implementation, compiler, and host and
 is therefore left to the benchmark matrix.
 
-**Why GF(256)?** Byte-aligned arithmetic means no bit-packing overhead. The 64 KB multiplication table fits in L1 cache. Field operations are branchless (important for constant-time security properties). And 256 elements provide enough algebraic structure for the RaptorQ constraint system while keeping everything byte-addressable.
+**Why GF(256)?** Byte-aligned arithmetic avoids bit packing, and 256 elements
+provide enough algebraic structure for the RaptorQ constraint system while
+keeping values byte-addressable. The 64 KiB multiplication table's actual
+cache residency and throughput are host-dependent and remain benchmark work.
+Its lookup loop can be branch-free, but data-dependent table indices are not a
+constant-time security proof.
 
 ### Fountain Codes: Information-Theoretic Durability Bounds
 
@@ -1778,12 +1783,16 @@ Step 3 — Generate any encoding symbol X:
 Phase 1 — Peeling (O(K) average):
     While any row has exactly 1 unresolved column c:
         C[c] = (D[r] ⊕ Σ known terms) × inverse(a_{r,c})
-    Resolves 90-95% of symbols.
+    Continue until no degree-one row remains.
 
 Phase 2 — Gaussian elimination on the "inactive" subsystem:
-    Remaining ~O(√K') symbols form a small dense system.
-    Cost: O(I² × T) for symbol operations, negligible since I < 50 for K' < 10,000.
+    Solve the remaining dense subsystem.
+    Algebraic work shape: O(I² × T) for I inactive symbols of size T.
 ```
+
+The peeling fraction, inactive-system size, and runtime cost depend on the
+code parameters and input. They are not current FrankenSQLite measurements;
+the release matrix must measure the shipped implementation.
 
 **Illustrative multicast bandwidth model:**
 
@@ -2157,10 +2166,11 @@ Loss matrix:
 Abort if P(anomaly | evidence) > L_fp / (L_fp + L_miss)
        = 1 / 1001 ≈ 0.001
 
-The cost of missing an anomaly (data corruption) is 1000× the cost of
-a false positive (retry). So we abort at extremely low evidence thresholds.
-PostgreSQL has shipped this same SSI approach since 2011 with measured
-false positive rates below 0.5% at row granularity.
+The loss values above are an illustrative policy preference, not measured
+costs or a calibrated threshold for the current engine. They explain why the
+design favors a retry over an undetected anomaly. PostgreSQL's row-granular SSI
+is useful prior art, but its measurements do not establish FrankenSQLite's
+page-granular abort or false-positive rate; those remain release-matrix work.
 ```
 
 **Page-SSI tracking via the SireadTable:**
@@ -2206,9 +2216,11 @@ Formalism:
 
 **Result:** This is used in the conformance harness (`fsqlite-harness`) to verify that multi-process MVCC produces results consistent with some serial execution order — even when the anomaly would be invisible to any pairwise comparison.
 
-### Conformal Calibration: Distribution-Free Performance Bounds
+### Conformal Calibration (Design Target, Not a Current Release Gate)
 
-Benchmark results follow unknown distributions. Claiming "MVCC adds less than 5% overhead" requires statistical rigor. FrankenSQLite uses **conformal prediction** for distribution-free confidence intervals.
+Benchmark results follow unknown distributions. Any future claim about bounded
+MVCC overhead requires statistical rigor. The design proposes **conformal
+prediction** for distribution-free confidence intervals.
 
 ```
 Nonconformity score:
@@ -2225,7 +2237,16 @@ Coverage guarantee:
     or any other pathological distribution real databases produce.
 ```
 
-**Application:** Phase 9 verification gates use conformal p-values to detect benchmark regressions: "no regression (conformal p-value > 0.01) compared to Phase 8." This means the statement "no performance regression" is statistically rigorous, not a hand-wave over noisy benchmarks.
+This is a proposed calibration design, not the gate implemented on current
+`main`. The repository's current analyzer,
+`scripts/perf_regression_gate.sh`, reports bootstrap confidence intervals and
+explicitly marks its output as not provenance-bound, not release evidence, and
+not release-eligible. No tracked current-main baseline exists from which either
+that analyzer or a conformal test could make a release decision. `bd-zywqc.2`
+tracks the missing baseline, runner, calibration, synthetic-regression, and
+retention evidence; `bd-dqdoe` tracks same-source performance re-verification.
+Until those gates are implemented and satisfied, the project makes no current
+"no performance regression" claim.
 
 ### Varint Encoding: Huffman-Optimal Integer Compression
 
@@ -2250,7 +2271,11 @@ headers use fewer bytes than a fixed-width integer representation. The actual
 space reduction depends on the data distribution and is not claimed here as a
 universal percentage.
 
-**Decode performance:** A varint decode is a tight loop with one branch per byte. For 1-byte varints (the common case), it's a single comparison and mask. The branch predictor handles this well because the common case (1-2 bytes) dominates.
+**Decode work shape:** The decoder loops over encoded bytes and tests each
+continuation bit. A one-byte value takes the shortest path, but whether one- or
+two-byte values dominate—and the resulting branch cost—depends on the database
+and host. No numeric varint throughput claim is made without a cited benchmark
+artifact.
 
 ### Collation Sequences
 
@@ -2475,7 +2500,9 @@ FrankenSQLite follows a 9-phase implementation plan. Each phase has specific **v
 **Phase 9 (Conformance):**
 - 100% parity target across 1,000+ golden test files (with any intentional divergences documented + annotated)
 - Single-writer benchmarks within 3× of C SQLite
-- No regression (conformal p-value > 0.01) compared to Phase 8
+- No regression against an immutable, same-source baseline under a
+  provenance-bound release gate (not yet satisfied; tracked by `bd-zywqc.2`
+  and `bd-dqdoe`)
 
 ---
 
@@ -2485,7 +2512,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 
 | Risk | Severity | Mitigation |
 |------|----------|-----------|
-| **R1: SSI abort rate too high** (Page-SSI is conservative, may false-positive) | High | Refine SIREAD keys from page to (page, cell range) if needed; intent-level rebase turns conflicts into merges (30-60% reduction); PostgreSQL's measured false positive rate is 0.5% at row granularity |
+| **R1: SSI abort rate too high** (Page-SSI is conservative, may false-positive) | High | Measure the current page-granular rate on the release matrix; refine SIREAD keys to page ranges if needed; evaluate the dormant intent-replay ladder only with repository benchmark evidence. PostgreSQL's row-granular results are prior art, not an estimate for this engine. |
 | **R2: RaptorQ overhead dominates CPU** | Medium | Symbol sizing policy per object type; cache decoded objects aggressively via ARC; profile/tune encoder/decoder hot paths |
 | **R3: Append-only storage grows without bound** | Medium | Checkpoint and compaction are first-class operations; enforce budgets for MVCC history, SIREAD table, symbol caches; GC horizon = min(active txn ids) bounds version chain length |
 | **R4: Bootstrap chicken-and-egg** (need index to find symbols, need symbols to build index) | Low | Symbol records are self-describing (header + OTI); one tiny mutable root pointer per database; rebuild-from-scan always possible as fallback |

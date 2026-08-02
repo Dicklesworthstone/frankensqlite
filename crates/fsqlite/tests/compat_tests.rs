@@ -1399,6 +1399,33 @@ mod rusqlite_parity {
         );
     }
 
+    async fn assert_direct_and_prepared_query_parity(
+        label: &str,
+        rconn: &rusqlite::Connection,
+        fconn: &Connection,
+        sql: &str,
+    ) {
+        let expected = rusqlite_query_rows(rconn, sql);
+        assert_parity(
+            &format!("{label}_DIRECT"),
+            expected.clone(),
+            franken_query_rows(fconn, sql).await,
+        );
+
+        let statement = fconn
+            .prepare(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: prepare failed: {error}"));
+        let prepared = statement
+            .query()
+            .await
+            .unwrap_or_else(|error| panic!("{label}: prepared query failed: {error}"))
+            .iter()
+            .map(|row| row.values().iter().map(sqlite_val_to_string).collect())
+            .collect();
+        assert_parity(&format!("{label}_PREPARED"), expected, prepared);
+    }
+
     fn setup_rusqlite() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1438,6 +1465,515 @@ mod rusqlite_parity {
         .await
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn parity_comparison_collation_precedence() {
+        asupersync::test_utils::run_test(|| async {
+            let rconn = RusqliteConnection::open_in_memory().unwrap();
+            let fconn = Connection::open(":memory:").await.unwrap();
+            let schema = "
+                CREATE TABLE comparison_semantics (
+                    left_nocase TEXT COLLATE NOCASE,
+                    right_plain TEXT,
+                    left_binary TEXT,
+                    right_nocase TEXT COLLATE NOCASE
+                );
+                INSERT INTO comparison_semantics
+                VALUES ('a ', 'a', 'a', 'A');
+            ";
+            rconn.execute_batch(schema).unwrap();
+            fconn.execute_batch(schema).await.unwrap();
+
+            // Explicit COLLATE on the right outranks a declaration on the left.
+            // Without an explicit COLLATE, the plain left column still contributes
+            // its implicit BINARY declaration and outranks right-side NOCASE.
+            assert_direct_and_prepared_query_parity(
+                "COMPARISON_COLLATION_PRECEDENCE",
+                &rconn,
+                &fconn,
+                "SELECT
+                     left_nocase = right_plain COLLATE RTRIM,
+                     left_nocase IS right_plain COLLATE RTRIM,
+                     CASE left_nocase
+                         WHEN right_plain COLLATE RTRIM THEN 1 ELSE 0
+                     END,
+                     left_binary = right_nocase,
+                     left_binary IS right_nocase,
+                     CASE left_binary WHEN right_nocase THEN 1 ELSE 0 END
+                 FROM comparison_semantics",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn parity_upsert_expression_collation_and_affinity() {
+        asupersync::test_utils::run_test(|| async {
+            const SCHEMA_AND_ROW: &str = "
+                CREATE TABLE upsert_semantics (
+                    id INTEGER PRIMARY KEY,
+                    left_nocase TEXT COLLATE NOCASE,
+                    right_plain TEXT,
+                    left_plain TEXT,
+                    right_nocase TEXT COLLATE NOCASE,
+                    numeric_value INTEGER,
+                    numeric_text TEXT,
+                    eq_explicit INTEGER,
+                    is_explicit INTEGER,
+                    case_explicit INTEGER,
+                    between_explicit INTEGER,
+                    in_singleton INTEGER,
+                    implicit_binary INTEGER,
+                    numeric_equal INTEGER
+                );
+                INSERT INTO upsert_semantics VALUES (
+                    1, 'a ', 'unused', 'a', 'unused', 1, 'unused',
+                    0, 0, 0, 0, 0, 0, 0
+                );
+            ";
+            const UPSERT: &str = "
+                INSERT INTO upsert_semantics (
+                    id, left_nocase, right_plain, left_plain,
+                    right_nocase, numeric_value, numeric_text
+                ) VALUES (1, 'unused', 'a', 'unused', 'A', 0, '1')
+                ON CONFLICT(id) DO UPDATE SET
+                    eq_explicit =
+                        left_nocase = excluded.right_plain COLLATE RTRIM,
+                    is_explicit =
+                        left_nocase IS excluded.right_plain COLLATE RTRIM,
+                    case_explicit = CASE left_nocase
+                        WHEN excluded.right_plain COLLATE RTRIM THEN 1 ELSE 0
+                    END,
+                    between_explicit =
+                        'B' BETWEEN 'a' COLLATE NOCASE AND 'b' COLLATE NOCASE,
+                    in_singleton = 'A' IN ('a' COLLATE NOCASE),
+                    implicit_binary = left_plain = excluded.right_nocase,
+                    numeric_equal = numeric_value = excluded.numeric_text
+            ";
+            const RESULT: &str = "
+                SELECT eq_explicit, is_explicit, case_explicit,
+                       between_explicit, in_singleton, implicit_binary,
+                       numeric_equal
+                FROM upsert_semantics
+            ";
+
+            for prepared in [false, true] {
+                let rconn = RusqliteConnection::open_in_memory().unwrap();
+                let fconn = Connection::open(":memory:").await.unwrap();
+                rconn.execute_batch(SCHEMA_AND_ROW).unwrap();
+                fconn.execute_batch(SCHEMA_AND_ROW).await.unwrap();
+                rconn.execute_batch(UPSERT).unwrap();
+
+                if prepared {
+                    fconn
+                        .prepare(UPSERT)
+                        .await
+                        .unwrap()
+                        .execute()
+                        .await
+                        .unwrap();
+                } else {
+                    fconn.execute(UPSERT).await.unwrap();
+                }
+
+                assert_parity(
+                    if prepared {
+                        "UPSERT_EXPRESSION_COLLATION_AFFINITY_PREPARED"
+                    } else {
+                        "UPSERT_EXPRESSION_COLLATION_AFFINITY_DIRECT"
+                    },
+                    rusqlite_query_rows(&rconn, RESULT),
+                    franken_query_rows(&fconn, RESULT).await,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn parity_excluded_register_and_is_affinity_semantics() {
+        asupersync::test_utils::run_test(|| async {
+            const SCHEMA: &str = "
+                CREATE TABLE excluded_semantics (
+                    id INTEGER PRIMARY KEY,
+                    existing_nocase TEXT COLLATE NOCASE,
+                    ex_nocase TEXT COLLATE NOCASE,
+                    ex_binary TEXT,
+                    ex_integer INTEGER,
+                    result_eq_collation INTEGER,
+                    result_is_affinity INTEGER,
+                    result_case_collation INTEGER,
+                    result_case_affinity INTEGER,
+                    result_between_collation INTEGER,
+                    result_between_affinity INTEGER,
+                    result_in_collation INTEGER,
+                    result_in_affinity INTEGER,
+                    result_explicit_collation INTEGER,
+                    result_cast_affinity INTEGER,
+                    result_nullif_register INTEGER,
+                    result_nullif_explicit INTEGER
+                );
+                INSERT INTO excluded_semantics (
+                    id, existing_nocase, ex_nocase, ex_binary, ex_integer
+                ) VALUES (1, 'a', 'old', 'old', 0);
+
+                CREATE TABLE rowid_semantics (
+                    id INTEGER PRIMARY KEY,
+                    incoming_text TEXT,
+                    result INTEGER
+                );
+                INSERT INTO rowid_semantics VALUES (1, 'old', 0);
+            ";
+            const EXCLUDED_UPSERT: &str = "
+                INSERT INTO excluded_semantics (
+                    id, existing_nocase, ex_nocase, ex_binary, ex_integer
+                ) VALUES (1, 'unused', 'A', 'A', 1)
+                ON CONFLICT(id) DO UPDATE SET
+                    result_eq_collation = excluded.ex_nocase = 'a',
+                    result_is_affinity = excluded.ex_integer IS '01',
+                    result_case_collation = CASE excluded.ex_binary
+                        WHEN existing_nocase THEN 1 ELSE 0 END,
+                    result_case_affinity = CASE excluded.ex_integer
+                        WHEN '01' THEN 1 ELSE 0 END,
+                    result_between_collation = excluded.ex_binary
+                        BETWEEN existing_nocase AND existing_nocase,
+                    result_between_affinity = excluded.ex_integer
+                        BETWEEN '01' AND '01',
+                    result_in_collation = excluded.ex_nocase IN ('a'),
+                    result_in_affinity = excluded.ex_integer IN ('01'),
+                    result_explicit_collation =
+                        excluded.ex_nocase COLLATE NOCASE = 'a',
+                    result_cast_affinity =
+                        CAST(excluded.ex_integer AS INTEGER) IS '01',
+                    result_nullif_register =
+                        nullif(excluded.ex_nocase, 'a') IS NULL,
+                    result_nullif_explicit =
+                        nullif(excluded.ex_nocase COLLATE NOCASE, 'a') IS NULL
+            ";
+            const EXCLUDED_RESULT: &str = "
+                SELECT result_eq_collation, result_is_affinity,
+                       result_case_collation, result_case_affinity,
+                       result_between_collation, result_between_affinity,
+                       result_in_collation, result_in_affinity,
+                       result_explicit_collation, result_cast_affinity,
+                       result_nullif_register, result_nullif_explicit
+                FROM excluded_semantics
+            ";
+            const ROWID_UPSERT: &str = "
+                INSERT INTO rowid_semantics(id, incoming_text) VALUES (1, '01')
+                ON CONFLICT(id) DO UPDATE SET
+                    result = rowid = excluded.incoming_text
+            ";
+
+            for prepared in [false, true] {
+                let rconn = RusqliteConnection::open_in_memory().unwrap();
+                let fconn = Connection::open(":memory:").await.unwrap();
+                rconn.execute_batch(SCHEMA).unwrap();
+                fconn.execute_batch(SCHEMA).await.unwrap();
+                rconn.execute_batch(EXCLUDED_UPSERT).unwrap();
+                rconn.execute_batch(ROWID_UPSERT).unwrap();
+
+                if prepared {
+                    fconn
+                        .prepare(EXCLUDED_UPSERT)
+                        .await
+                        .unwrap()
+                        .execute()
+                        .await
+                        .unwrap();
+                    fconn
+                        .prepare(ROWID_UPSERT)
+                        .await
+                        .unwrap()
+                        .execute()
+                        .await
+                        .unwrap();
+                } else {
+                    fconn.execute(EXCLUDED_UPSERT).await.unwrap();
+                    fconn.execute(ROWID_UPSERT).await.unwrap();
+                }
+
+                let expected = rusqlite_query_rows(&rconn, EXCLUDED_RESULT);
+                assert_eq!(
+                    expected,
+                    vec![vec![
+                        "0".to_owned(),
+                        "0".to_owned(),
+                        "1".to_owned(),
+                        "0".to_owned(),
+                        "1".to_owned(),
+                        "0".to_owned(),
+                        "0".to_owned(),
+                        "0".to_owned(),
+                        "1".to_owned(),
+                        "1".to_owned(),
+                        "0".to_owned(),
+                        "1".to_owned(),
+                    ]],
+                    "SQLite oracle for excluded-register metadata changed",
+                );
+                assert_parity(
+                    if prepared {
+                        "EXCLUDED_REGISTER_METADATA_PREPARED"
+                    } else {
+                        "EXCLUDED_REGISTER_METADATA_DIRECT"
+                    },
+                    expected,
+                    franken_query_rows(&fconn, EXCLUDED_RESULT).await,
+                );
+                assert_query_parity(
+                    if prepared {
+                        "UPSERT_HIDDEN_ROWID_AFFINITY_PREPARED"
+                    } else {
+                        "UPSERT_HIDDEN_ROWID_AFFINITY_DIRECT"
+                    },
+                    &rconn,
+                    &fconn,
+                    "SELECT result FROM rowid_semantics",
+                )
+                .await;
+            }
+
+            let rconn = RusqliteConnection::open_in_memory().unwrap();
+            let fconn = Connection::open(":memory:").await.unwrap();
+            const IS_SCHEMA: &str = "
+                CREATE TABLE comparison_values (integer_value INTEGER, text_value TEXT);
+                INSERT INTO comparison_values VALUES (1, '01');
+                CREATE TABLE outer_values (id INTEGER, value INTEGER);
+                INSERT INTO outer_values VALUES (1, 1);
+                CREATE TABLE inner_values (id INTEGER, value BLOB);
+                INSERT INTO inner_values VALUES (1, '01');
+                CREATE TABLE inner_nulls (value BLOB);
+                INSERT INTO inner_nulls VALUES (NULL);
+                CREATE TABLE outer_rowids (id INTEGER);
+                INSERT INTO outer_rowids(rowid, id) VALUES (9, 1);
+                CREATE TABLE inner_rowids (value TEXT);
+                INSERT INTO inner_rowids(rowid, value) VALUES (1, 'x');
+            ";
+            rconn.execute_batch(IS_SCHEMA).unwrap();
+            fconn.execute_batch(IS_SCHEMA).await.unwrap();
+
+            assert_direct_and_prepared_query_parity(
+                "IS_COMPARISON_AFFINITY",
+                &rconn,
+                &fconn,
+                "SELECT integer_value IS text_value FROM comparison_values",
+            )
+            .await;
+            assert_direct_and_prepared_query_parity(
+                "NESTED_COLLATE_PRESERVES_AFFINITY",
+                &rconn,
+                &fconn,
+                "SELECT (integer_value COLLATE NOCASE COLLATE RTRIM) IS '01'
+                 FROM comparison_values",
+            )
+            .await;
+            assert_direct_and_prepared_query_parity(
+                "ROWID_AFFINITY_AND_UNARY_PLUS",
+                &rconn,
+                &fconn,
+                "SELECT rowid = '01', +rowid = '01',
+                        (rowid COLLATE NOCASE COLLATE RTRIM) IS '01'
+                 FROM inner_rowids",
+            )
+            .await;
+            assert_direct_and_prepared_query_parity(
+                "CORRELATED_INNER_BLOB_SHADOWS_OUTER_INTEGER_AFFINITY",
+                &rconn,
+                &fconn,
+                "SELECT
+                     (SELECT value IS 1 FROM inner_values
+                      WHERE inner_values.id = outer_values.id),
+                     (SELECT value = 1 FROM inner_values
+                      WHERE inner_values.id = outer_values.id)
+                 FROM outer_values",
+            )
+            .await;
+            assert_direct_and_prepared_query_parity(
+                "CORRELATED_INNER_HIDDEN_ROWID_SCOPE_AND_AFFINITY",
+                &rconn,
+                &fconn,
+                "SELECT
+                     (SELECT rowid FROM inner_rowids
+                      WHERE inner_rowids.rowid = outer_rowids.id),
+                     (SELECT rowid IS '01' FROM inner_rowids
+                      WHERE inner_rowids.rowid = outer_rowids.id)
+                 FROM outer_rowids",
+            )
+            .await;
+            assert_direct_and_prepared_query_parity(
+                "CORRELATED_SIMPLE_CASE_NULL_NEVER_MATCHES",
+                &rconn,
+                &fconn,
+                "SELECT
+                     (SELECT CASE value WHEN NULL THEN 1 ELSE 0 END
+                      FROM inner_nulls
+                      WHERE inner_nulls.rowid = outer_values.id),
+                     (SELECT CASE WHEN value THEN 1 ELSE 0 END
+                      FROM inner_nulls
+                      WHERE inner_nulls.rowid = outer_values.id)
+                 FROM outer_values",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn parity_collating_scalars_stop_at_first_binary_column() {
+        asupersync::test_utils::run_test(|| async {
+            let rconn = RusqliteConnection::open_in_memory().unwrap();
+            let fconn = Connection::open(":memory:").await.unwrap();
+            let schema = "
+                CREATE TABLE scalar_semantics (
+                    first_plain TEXT,
+                    equal_nocase TEXT,
+                    order_nocase TEXT
+                );
+                INSERT INTO scalar_semantics VALUES ('a', 'A', 'B');
+            ";
+            rconn.execute_batch(schema).unwrap();
+            fconn.execute_batch(schema).await.unwrap();
+
+            // A bare column defines BINARY even when its schema metadata omits an
+            // explicit COLLATE clause. Literals do not, so their later NOCASE
+            // argument remains the selected collation in the control expressions.
+            assert_direct_and_prepared_query_parity(
+                "COLLATING_SCALAR_FIRST_ARGUMENT",
+                &rconn,
+                &fconn,
+                "SELECT
+                     nullif(first_plain, equal_nocase COLLATE NOCASE),
+                     min(first_plain, order_nocase COLLATE NOCASE),
+                     max(first_plain, order_nocase COLLATE NOCASE),
+                     nullif('a', 'A' COLLATE NOCASE),
+                     min('a', 'B' COLLATE NOCASE),
+                     max('a', 'B' COLLATE NOCASE)
+                 FROM scalar_semantics",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn parity_in_list_rhs_collation_rules() {
+        asupersync::test_utils::run_test(|| async {
+            let rconn = RusqliteConnection::open_in_memory().unwrap();
+            let fconn = Connection::open(":memory:").await.unwrap();
+            let schema = "
+                CREATE TABLE in_rhs (value TEXT COLLATE NOCASE);
+                INSERT INTO in_rhs VALUES ('a');
+            ";
+            rconn.execute_batch(schema).unwrap();
+            fconn.execute_batch(schema).await.unwrap();
+
+            // SQLite's one-element constant-list rewrite admits the RHS COLLATE.
+            // Multi-item and row-dependent IN lists instead compare using only
+            // the LHS collation; explicit LHS BINARY/NOCASE still wins a tie.
+            assert_direct_and_prepared_query_parity(
+                "IN_LIST_RHS_COLLATION",
+                &rconn,
+                &fconn,
+                "SELECT
+                     'A' IN ('a' COLLATE NOCASE),
+                     'A' IN ('a' COLLATE NOCASE, 'x'),
+                     'A' IN (value),
+                     'A' IN (value COLLATE NOCASE),
+                     ('A' COLLATE NOCASE) IN (value COLLATE BINARY),
+                     ('A' COLLATE BINARY) IN ('a' COLLATE NOCASE)
+                 FROM in_rhs",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn parity_correlated_fallback_collation_and_null_ordering() {
+        asupersync::test_utils::run_test(|| async {
+            let rconn = RusqliteConnection::open_in_memory().unwrap();
+            let fconn = Connection::open(":memory:").await.unwrap();
+            let schema = "
+                CREATE TABLE outer_bounds (id INTEGER PRIMARY KEY, probe TEXT);
+                CREATE TABLE inner_bounds (
+                    id INTEGER,
+                    low_value TEXT COLLATE NOCASE,
+                    high_value TEXT COLLATE RTRIM
+                );
+                INSERT INTO outer_bounds VALUES (1, 'B'), (2, 'b ');
+                INSERT INTO inner_bounds VALUES (1, 'a', 'z'), (2, 'a', 'b');
+
+                CREATE TABLE outer_members (probe TEXT, exact_probe TEXT);
+                CREATE TABLE inner_members (value TEXT);
+                INSERT INTO outer_members VALUES ('A', 'a');
+                INSERT INTO inner_members VALUES ('a');
+            ";
+            rconn.execute_batch(schema).unwrap();
+            fconn.execute_batch(schema).await.unwrap();
+
+            // Concatenation removes the outer column's declared collation, so the
+            // low and high comparisons independently inherit their RHS columns.
+            assert_direct_and_prepared_query_parity(
+                "CORRELATED_BETWEEN_COLLATION",
+                &rconn,
+                &fconn,
+                "SELECT o.id,
+                        (SELECT count(*)
+                         FROM inner_bounds AS i
+                         WHERE i.id = o.id
+                           AND (o.probe || '') BETWEEN i.low_value AND i.high_value)
+                 FROM outer_bounds AS o
+                 ORDER BY o.id",
+            )
+            .await;
+
+            // Keep the NULL before the matching IN element: a correct IN loop
+            // remembers it but continues looking for a definitive match.
+            assert_direct_and_prepared_query_parity(
+                "CORRELATED_IN_NULLIF_COLLATION",
+                &rconn,
+                &fconn,
+                "SELECT
+                     (SELECT count(*) FROM inner_members AS i
+                      WHERE (o.probe COLLATE NOCASE) IN (i.value)),
+                     (SELECT count(*) FROM inner_members AS i
+                      WHERE o.exact_probe IN (NULL, i.value)),
+                     (SELECT count(*) FROM inner_members AS i
+                      WHERE nullif(o.probe COLLATE NOCASE, i.value) IS NULL),
+                     (SELECT count(*) FROM inner_members AS i
+                      WHERE (o.probe || '') IN ('a' COLLATE NOCASE))
+                 FROM outer_members AS o",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn parity_like_and_glob_propagate_pattern_collation_first() {
+        asupersync::test_utils::run_test(|| async {
+            let rconn = RusqliteConnection::open_in_memory().unwrap();
+            let fconn = Connection::open(":memory:").await.unwrap();
+            let schema = "
+                CREATE TABLE pattern_inputs (source TEXT);
+                INSERT INTO pattern_inputs VALUES ('abc');
+            ";
+            rconn.execute_batch(schema).unwrap();
+            fconn.execute_batch(schema).await.unwrap();
+
+            // LIKE/GLOB lower to function-call argument order (pattern, source),
+            // so the pattern's explicit collation propagates through CAST into
+            // the enclosing comparison. RTRIM and NOCASE distinguish the winner.
+            assert_direct_and_prepared_query_parity(
+                "PATTERN_OPERATOR_COLLATION_PROPAGATION",
+                &rconn,
+                &fconn,
+                "SELECT
+                     CAST((source COLLATE NOCASE GLOB ('*' COLLATE RTRIM)) AS TEXT) < '1 ',
+                     CAST((source COLLATE RTRIM GLOB ('*' COLLATE NOCASE)) AS TEXT) < '1 ',
+                     CAST((source COLLATE NOCASE LIKE ('%' COLLATE RTRIM)) AS TEXT) < '1 ',
+                     CAST((source COLLATE RTRIM LIKE ('%' COLLATE NOCASE)) AS TEXT) < '1 '
+                 FROM pattern_inputs",
+            )
+            .await;
+        });
     }
 
     struct ForceMatch;
@@ -1811,7 +2347,7 @@ mod rusqlite_parity {
     fn parity_match_udf_uses_registered_scalar_path() {
         asupersync::test_utils::run_test(|| async {
             let fconn = setup_franken().await;
-            fconn.register_scalar_function(ForceMatch);
+            fconn.register_deterministic_scalar_function(ForceMatch);
 
             assert_query_parity(
                 "MATCH_UDF_REAL_PATH",
@@ -1827,7 +2363,7 @@ mod rusqlite_parity {
     fn parity_prepared_match_udf_uses_registered_scalar_path() {
         asupersync::test_utils::run_test(|| async {
             let fconn = setup_franken().await;
-            fconn.register_scalar_function(ForceMatch);
+            fconn.register_deterministic_scalar_function(ForceMatch);
 
             let stmt = fconn
                 .prepare("SELECT id FROM msgs WHERE content MATCH ?1 ORDER BY id")

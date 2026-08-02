@@ -48,6 +48,92 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-02 - INVALIDATED ATTRIBUTION: small-row DML component counters are observer-dominated; scored F/C rows were never inflated (bd-he3ua)
+
+- Target workload: `comprehensive_bench` small-row INSERT profiling, especially
+  `tiny_1col` and `small_3col`, and the 2026-07-23 conclusion that the small-N
+  write gap had "no single fat component." The touched surface was the
+  env-gated INSERT profiler in `crates/fsqlite-core/src/connection.rs`.
+- History: `61dfef29` first claimed seven nested timers cost about 2.6x the
+  quantity reported; `b52a3236` revised that to six timers/about 2.1x.
+  Both mechanism claims were retracted by `dd84b4d7` after running the actual
+  benchmark end to end instead of extrapolating from code plus a timer
+  microbenchmark.
+- Corrected evidence: the profiler runs a separate pass on its own connection
+  after the scored `measure()` rows, so it cannot inflate published F/C wall
+  times. On one release-perf binary, `small_3col` 10K measured 9.65 ms with
+  profiling off versus 9.40 ms with deep profiling; the model had predicted
+  roughly 6 ms of inflation, which did not occur.
+- What remains invalid: the component attribution itself. One timed region cost
+  47.96-52.24 ns; `tiny_1col` reported `row_build_ns` of 48.7 ns/row at 100 rows
+  and 48.6 ns/row at 10,000 rows, while `small_3col` reported 674 ns/row against
+  about 600 ns/row of structural timer cost. Those counters cannot locate a hot
+  component at sub-microsecond row sizes. The "no single fat component"
+  conclusion may be true, but this instrument did not establish it.
+- Result: keep the `FSQLITE_DML_PROFILE_DEEP` gating because it improves
+  attribution fidelity, but assign it no benchmark-throughput benefit. Do not
+  use the affected component counters to select a small-row optimization.
+- Artifact caveat: commit `dd84b4d7` cites
+  `tests/artifacts/perf/dml-observer-3way-20260725T2205Z/`, but that directory is
+  absent from the current checkout. Treat the numbers as historical,
+  non-release-citable evidence backed by the commit and `bd-he3ua`.
+- Retry only with a committed artifact, one self-identifying binary, an
+  end-to-end off/default/deep comparison, and timer-overhead subtraction or
+  coarse regions whose measured work is comfortably larger than clock cost.
+
+## 2026-08-02 - BENCHMARK-INTEGRITY BLOCKER: an exit-zero RCH build is not proof that the requested performance binary was delivered (bd-8wumh)
+
+- Target: every performance measurement whose executable is built through RCH,
+  especially nonstandard Cargo profiles such as `release-perf` and custom or
+  out-of-tree `CARGO_TARGET_DIR` paths.
+- Evidence: `bd-8wumh` records four builds that reported remote success while
+  leaving a stale or byte-identical local executable, including one failure
+  after applying the in-repo-target workaround. A 2026-07-29 reproduction on
+  RCH 1.0.52 returned exit 0 after retrieving only metadata while the requested
+  `release-perf/comprehensive-bench` executable remained absent. Source review
+  recorded that retrieval patterns included `debug/**` and `release/**` but not
+  the resolved custom profile.
+- Result: invalidate every timing run whose launched process did not report an
+  expected ELF SHA-256/byte length/path and matching source identity. Successful
+  Cargo/RCH exit status, local file existence, or a previously validated target
+  directory is insufficient because a stale executable can satisfy those weaker
+  checks. This hazard motivated the landed self-reporting contract in
+  `24d33e0c`.
+- Current status (source-proven 2026-08-02): installed RCH is 1.0.53
+  (`bb6fe4c33881`; local executable SHA-256
+  `3cea0adf59bafaaacdcc7a014e3653fdcfe23bbf98c49ecd3cb8cc736af8ff95`).
+  The exact installed commit routes `CargoBuild` through
+  `default_rust_artifact_patterns`, whose only Cargo profile output globs are
+  `target/debug/**` and `target/release/**`; custom-target retrieval merely
+  strips the `target/` prefix and therefore still has no `release-perf/**`
+  include. This checkout exports `CARGO_TARGET_DIR=/data/tmp/cargo-target`, so
+  the configured build necessarily takes that custom-target path. RCH 1.0.53
+  therefore still cannot retrieve FrankenSQLite's requested `release-perf`
+  executable; another long build is not needed to establish the missing-pattern
+  mechanism.
+- Retry/closure condition: build an explicitly named `release-perf` binary into
+  a fresh target, require the expected artifact to be absent before the build,
+  verify it is delivered afterward, launch it, and match its self-reported ELF
+  and source hashes. Metadata-only retrieval must fail nonzero.
+
+## 2026-08-02 - RETRACTED TEST-FAILURE ATTRIBUTION: tracing suppresses the fused DML lane, but did not cause the nine pager-routing failures (bd-t56wv)
+
+- Target: nine `connection::pager_routing_tests` failures and the fused
+  prepared-DML fast-lane gate in `crates/fsqlite-core/src/connection.rs`.
+- Initial observation: `asupersync::test_utils::run_test` installs tracing and
+  the one-time warning from `12d6c590` proved that statement tracing suppressed
+  the fused lane. That observation was incorrectly promoted to the cause of the
+  nine failures.
+- Counterfactual: raising the relevant targets with `RUST_LOG=error` left the
+  exact result unchanged: 104 passed and the same nine failed. Retract the
+  test-failure attribution.
+- What survives: production DEBUG/INFO subscribers still select the slower
+  instrumented DML lane; `12d6c590` warns once but does not eliminate that
+  algorithmic deopt.
+- Retry the nine-test diagnosis only against clean HEAD with an A/B that changes
+  one suspected gate and demonstrates the assertions change. Do not use the
+  presence of the tracing warning as causal evidence.
+
 ## 2026-07-28 - LANDED (be8e066d): bd-5zeai parameterized fast path (12.90us->1.01us, tax ELIMINATED to plumbing floor) + bd-gpi5i sync CTE frontier (1.59ms->1.01ms, residual documented)
 
 - bd-5zeai CLOSED: PreparedProbeRowidBound {None, LiteralExclusive,
