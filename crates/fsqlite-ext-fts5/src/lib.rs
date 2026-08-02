@@ -85,6 +85,17 @@ const FTS5_CONFIG_VERSION: i64 = 4;
 const FTS5_CONFIG_VERSION_SECURE_DELETE: i64 = 5;
 const FTS5_DEFAULT_PAGE_SIZE: i64 = 4050;
 const FTS5_MAX_PAGE_SIZE: i64 = 64 * 1024;
+/// cass#369: a single segment leaf stores its term/rowid/footer offsets in u16
+/// fields, so a leaf must encode to <= 65535 bytes. When one flush's combined
+/// terms + doclists would exceed that (a large batch on a big corpus — the
+/// "segment leaf term offset exceeds u16" failure), the writer partitions the
+/// terms across MULTIPLE leaves at term boundaries, each kept under this
+/// conservative bound. The headroom below 65535 absorbs the footer offset array
+/// plus the per-term size estimate's slack, so a leaf accepted by the estimate
+/// always actually encodes within the u16 ceiling.
+const FTS5_SAFE_LEAF_BYTES: usize = 60_000;
+/// Fixed 4-byte segment-leaf header (first_rowid_offset u16 + footer_offset u16).
+const FTS5_LEAF_HEADER_BYTES: usize = 4;
 const FTS5_DEFAULT_AUTOMERGE: i64 = 4;
 const FTS5_DEFAULT_USERMERGE: i64 = 4;
 const FTS5_DEFAULT_CRISISMERGE: i64 = 16;
@@ -1418,10 +1429,34 @@ impl Fts5PendingHash {
         if self.is_empty() {
             return Err(fts5_data_error("cannot flush an empty pending hash"));
         }
-        let leaf = Fts5SegmentLeaf::decode(&self.to_segment_leaf().encode()?)?;
-        let data_row = leaf.to_data_row(segid, 1)?;
+        // cass#369: partition into one-or-more leaves so a batch whose terms +
+        // doclists exceed the u16 leaf-offset ceiling is written as a multi-leaf
+        // segment (pgno 1..=N) instead of failing `encode()`. The reader
+        // (`lazy_segment_exact_postings`) linear-scans pgno_first..=pgno_last, so
+        // a single segment spanning N leaves needs no idx rows and keeps origin
+        // tracking clean (one segment, entry_count = row_count).
+        let leaves = self.to_segment_leaves();
+        if leaves.is_empty() {
+            return Err(fts5_data_error(
+                "pending hash produced no encodable segment leaves",
+            ));
+        }
+        let pgno_last =
+            u32::try_from(leaves.len()).map_err(|_| fts5_data_error("segment leaf count exceeds u32"))?;
+        let mut data_rows = Vec::with_capacity(leaves.len() + 1);
+        let mut decoded_leaves = Vec::with_capacity(leaves.len());
+        for (index, leaf) in leaves.iter().enumerate() {
+            let pgno = u32::try_from(index + 1)
+                .map_err(|_| fts5_data_error("segment leaf pgno exceeds u32"))?;
+            // Round-trip through encode/decode (as the prior single-leaf path
+            // did) so the stored leaf is normalized, then key its `_data` row by
+            // (segid, pgno).
+            let decoded = Fts5SegmentLeaf::decode(&leaf.encode()?)?;
+            data_rows.push(decoded.to_data_row(segid, pgno)?);
+            decoded_leaves.push(decoded);
+        }
         let segment = if structure.uses_origin_tracking() {
-            Fts5StructureSegment::new(segid, 1, 1).with_origin_tracking(
+            Fts5StructureSegment::new(segid, 1, pgno_last).with_origin_tracking(
                 structure.origin_counter,
                 structure.origin_counter,
                 0,
@@ -1429,7 +1464,7 @@ impl Fts5PendingHash {
                 u64::try_from(self.row_count).unwrap_or(u64::MAX),
             )
         } else {
-            Fts5StructureSegment::new(segid, 1, 1)
+            Fts5StructureSegment::new(segid, 1, pgno_last)
         };
 
         if structure.levels.is_empty() {
@@ -1445,39 +1480,84 @@ impl Fts5PendingHash {
         }
 
         let structure_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode());
+        data_rows.push(structure_row);
         Ok(Fts5PendingFlush {
-            data_rows: vec![data_row, structure_row],
+            data_rows,
             idx_rows: Vec::new(),
-            leaf,
+            leaves: decoded_leaves,
             structure,
             pending_bytes: self.pending_bytes,
         })
     }
 
-    fn to_segment_leaf(&self) -> Fts5SegmentLeaf {
-        Fts5SegmentLeaf::new(
-            self.terms
-                .iter()
-                .map(|(term, docs)| {
-                    Fts5SegmentTerm::new(
-                        term.as_bytes().to_vec(),
-                        Fts5Doclist::new(
-                            docs.iter()
-                                .map(|(rowid, doc)| Fts5DoclistEntry::new(*rowid, doc.to_poslist()))
-                                .collect(),
-                        ),
-                    )
-                })
-                .collect(),
-        )
+    /// cass#369: build the segment's terms (already globally sorted, since
+    /// `self.terms` is a `BTreeMap`) into one-or-more leaves, each kept under
+    /// [`FTS5_SAFE_LEAF_BYTES`]. Each leaf holds a contiguous increasing term
+    /// range and the ranges are globally ordered, exactly what the multi-leaf
+    /// reader expects. A single term whose own entry exceeds the leaf ceiling
+    /// (a pathological huge doclist) cannot fit any leaf and is skipped with a
+    /// warning — unqueryable in the SQLite shadow but still present in the
+    /// authoritative Tantivy index — mirroring the gh362 overlong-term skip
+    /// rather than failing the whole segment write.
+    fn to_segment_leaves(&self) -> Vec<Fts5SegmentLeaf> {
+        let mut leaves = Vec::new();
+        let mut current: Vec<Fts5SegmentTerm> = Vec::new();
+        let mut current_bytes = FTS5_LEAF_HEADER_BYTES;
+        for (term, docs) in &self.terms {
+            let seg_term = Fts5SegmentTerm::new(
+                term.as_bytes().to_vec(),
+                Fts5Doclist::new(
+                    docs.iter()
+                        .map(|(rowid, doc)| Fts5DoclistEntry::new(*rowid, doc.to_poslist()))
+                        .collect(),
+                ),
+            );
+            let estimate = estimate_leaf_term_bytes(&seg_term);
+            if estimate > FTS5_SAFE_LEAF_BYTES {
+                tracing::warn!(
+                    term_bytes = seg_term.term.len(),
+                    estimated_entry_bytes = estimate,
+                    safe_leaf_bytes = FTS5_SAFE_LEAF_BYTES,
+                    "fts5: skipping a term whose doclist alone exceeds the segment-leaf u16 offset space (cass#369); it stays searchable via the authoritative Tantivy index"
+                );
+                continue;
+            }
+            if !current.is_empty() && current_bytes + estimate > FTS5_SAFE_LEAF_BYTES {
+                leaves.push(Fts5SegmentLeaf::new(std::mem::take(&mut current)));
+                current_bytes = FTS5_LEAF_HEADER_BYTES;
+            }
+            current_bytes += estimate;
+            current.push(seg_term);
+        }
+        if !current.is_empty() {
+            leaves.push(Fts5SegmentLeaf::new(current));
+        }
+        leaves
     }
+}
+
+/// Upper bound on a term's contribution to an encoded leaf (cass#369): the
+/// term-length varint (<= 9 bytes) + the term bytes + the encoded doclist + a
+/// footer offset varint (<= 3 bytes for an offset <= 65535). Ignores prefix
+/// compression, which only shrinks the real size, so a leaf kept under
+/// [`FTS5_SAFE_LEAF_BYTES`] by this estimate always encodes within the u16
+/// ceiling. A doclist that fails to encode is treated as oversized.
+fn estimate_leaf_term_bytes(term: &Fts5SegmentTerm) -> usize {
+    let doclist_bytes = term.doclist.encode().map_or(usize::MAX, |bytes| bytes.len());
+    9usize
+        .saturating_add(term.term.len())
+        .saturating_add(doclist_bytes)
+        .saturating_add(3)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fts5PendingFlush {
     pub data_rows: Vec<Fts5DataRow>,
     pub idx_rows: Vec<Fts5IdxRow>,
-    pub leaf: Fts5SegmentLeaf,
+    /// cass#369: the segment's leaves, in page order (pgno_first..=pgno_last).
+    /// Usually one; more when the flush was partitioned to stay under the u16
+    /// leaf-offset ceiling.
+    pub leaves: Vec<Fts5SegmentLeaf>,
     pub structure: Fts5StructureRecord,
     pub pending_bytes: usize,
 }
@@ -1494,10 +1574,13 @@ impl Fts5PendingFlush {
 /// inverted index. See [`Fts5Table::encode_incremental_insert_flush`] (bd-sf8dx).
 #[derive(Debug, Clone)]
 pub struct Fts5IncrementalInsertFlush {
-    /// The new segment's leaf `_data` row, to be appended. `None` when the
-    /// inserted rows produced no indexable tokens (e.g. empty/all-unindexed
-    /// content): no segment is created, but averages/docsize still advance.
-    pub leaf_data_row: Option<Fts5DataRow>,
+    /// The new segment's leaf `_data` rows, to be appended (one per leaf page,
+    /// pgno 1..=N). Empty when the inserted rows produced no indexable tokens
+    /// (e.g. empty/all-unindexed content): no segment is created, but
+    /// averages/docsize still advance. Usually one row; more (cass#369) when the
+    /// flush was partitioned across multiple leaves to stay under the u16
+    /// leaf-offset ceiling.
+    pub leaf_data_rows: Vec<Fts5DataRow>,
     /// The updated structure `_data` row (rowid [`FTS5_STRUCTURE_ROWID`]),
     /// replacing the prior structure (now with the appended segment).
     pub structure_data_row: Fts5DataRow,
@@ -8303,7 +8386,7 @@ impl Fts5Table {
     /// wedge (bd-sf8dx).
     ///
     /// The caller passes a fresh `next_segid` (one past the current max) and,
-    /// on success, appends `leaf_data_row`, replaces `structure_data_row` and
+    /// on success, appends `leaf_data_rows`, replaces `structure_data_row` and
     /// `averages_data_row`, and appends `docsize_rows` to `_docsize`. Live
     /// MATCH keeps reading the in-memory `self.index`; reopen rehydrates from
     /// the multi-segment structure via
@@ -8376,7 +8459,7 @@ impl Fts5Table {
         let pending = delta.build_pending_hash(&self.prefix_lengths)?;
         if pending.is_empty() {
             return Ok(Some(Fts5IncrementalInsertFlush {
-                leaf_data_row: None,
+                leaf_data_rows: Vec::new(),
                 structure_data_row: Fts5DataRow::new(
                     FTS5_STRUCTURE_ROWID,
                     existing_structure.encode(),
@@ -8387,12 +8470,15 @@ impl Fts5Table {
         }
         let flush = pending.flush_to_segment(next_segid, existing_structure.clone())?;
         let structure_data_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, flush.structure.encode());
-        let leaf_data_row = flush
+        // cass#369: a partitioned flush yields one leaf `_data` row per leaf
+        // page (pgno 1..=N); append them all.
+        let leaf_data_rows = flush
             .data_rows
             .into_iter()
-            .find(|row| row.id != FTS5_STRUCTURE_ROWID);
+            .filter(|row| row.id != FTS5_STRUCTURE_ROWID)
+            .collect();
         Ok(Some(Fts5IncrementalInsertFlush {
-            leaf_data_row,
+            leaf_data_rows,
             structure_data_row,
             averages_data_row,
             docsize_rows,
@@ -11497,12 +11583,93 @@ mod tests {
             Fts5DataRowid::SegmentLeaf { segid: 4, pgno: 1 }
         );
         assert_eq!(flush.data_rows[1].id, FTS5_STRUCTURE_ROWID);
+        assert_eq!(flush.leaves.len(), 1);
         assert_eq!(
             Fts5SegmentLeaf::decode(&flush.data_rows[0].block).unwrap(),
-            flush.leaf
+            flush.leaves[0]
         );
         assert_eq!(flush.structure.levels[0].segments[0].segid, 4);
         assert_eq!(flush.structure.write_counter, 1);
+    }
+
+    /// cass#369: a flush whose combined terms exceed the u16 leaf-offset ceiling
+    /// is partitioned into MULTIPLE leaves forming one segment (pgno 1..=N),
+    /// every leaf encodes within u16, terms stay globally sorted, and no term is
+    /// dropped.
+    #[test]
+    fn test_cass369_oversized_flush_partitions_into_multiple_leaves() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+        // One document with enough distinct in-cap tokens that the combined
+        // single leaf would exceed 65,535 bytes, forcing a multi-leaf segment.
+        let body = (0..15_000usize)
+            .map(|i| format!("tok{i:06}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        table.insert_document(1, &[body]);
+        let pending = table.build_pending_hash().unwrap();
+        let term_count = pending.term_count();
+        assert!(
+            term_count >= 15_000,
+            "expected >=15000 distinct terms, got {term_count}"
+        );
+
+        let flush = pending
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap();
+
+        assert!(
+            flush.leaves.len() > 1,
+            "an oversized flush must partition into multiple leaves, got {}",
+            flush.leaves.len()
+        );
+        let segment = &flush.structure.levels[0].segments[0];
+        assert_eq!(segment.pgno_first, 1);
+        assert_eq!(
+            u32::try_from(flush.leaves.len()).unwrap(),
+            segment.pgno_last,
+            "the segment page range must cover every leaf"
+        );
+
+        // Every leaf encodes within the u16 ceiling; terms are globally strictly
+        // increasing across leaves; no term is dropped.
+        let mut all_terms = 0usize;
+        let mut previous: Vec<u8> = Vec::new();
+        for leaf in &flush.leaves {
+            let encoded = leaf.encode().expect("each partitioned leaf must encode");
+            assert!(
+                encoded.len() <= 65_535,
+                "partitioned leaf still exceeds the u16 ceiling: {} bytes",
+                encoded.len()
+            );
+            for term in &leaf.terms {
+                assert!(
+                    term.term > previous,
+                    "terms must be globally strictly increasing across leaves"
+                );
+                previous = term.term.clone();
+                all_terms += 1;
+            }
+        }
+        assert_eq!(
+            all_terms, term_count,
+            "partitioning must preserve every term (none dropped)"
+        );
+
+        // Each non-structure `_data` row is a distinct leaf page keyed 1..=N.
+        let leaf_rows: Vec<_> = flush
+            .data_rows
+            .iter()
+            .filter(|row| row.id != FTS5_STRUCTURE_ROWID)
+            .collect();
+        assert_eq!(leaf_rows.len(), flush.leaves.len());
+        for (index, row) in leaf_rows.iter().enumerate() {
+            let pgno = u32::try_from(index + 1).unwrap();
+            assert_eq!(
+                Fts5DataRowid::decode(row.id).unwrap(),
+                Fts5DataRowid::SegmentLeaf { segid: 4, pgno }
+            );
+        }
     }
 
     #[test]
@@ -11676,9 +11843,9 @@ mod tests {
                 .map(|row| (row.id, Fts5DataRowid::decode(row.id).unwrap()))
                 .collect(),
             terms: flush
-                .leaf
-                .terms
+                .leaves
                 .iter()
+                .flat_map(|leaf| leaf.terms.iter())
                 .map(|term| term.term.clone())
                 .collect(),
             structure: flush.structure,
