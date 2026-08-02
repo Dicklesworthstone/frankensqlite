@@ -388,6 +388,10 @@ where
 /// regression test exercises this boundary on an explicit 1 MiB stack.
 const MAX_TRIGGER_DEPTH: usize = 8;
 
+/// Maximum number of rebuilds permitted when a reentrant metadata callback
+/// changes the scalar-function registry while a statement snapshot is formed.
+const FUNCTION_REGISTRY_STABILITY_ATTEMPTS: usize = 4;
+
 /// Maximum aggregate depth of active trigger and FK-action programs.
 ///
 /// SQLite charges trigger bodies and recursive foreign-key actions against one
@@ -17744,9 +17748,7 @@ impl Connection {
     }
 
     async fn prepare_uncached(&self, sql: &str) -> Result<PreparedStatement<'_>> {
-        const REGISTRY_STABILITY_ATTEMPTS: usize = 4;
-
-        for attempt in 0..REGISTRY_STABILITY_ATTEMPTS {
+        for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
             let parsed = {
                 let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                     .then(|| {
@@ -17765,7 +17767,7 @@ impl Connection {
             };
             let snapshot_generation = self.function_registry_generation();
             let statement_snapshot = self.freeze_statement_values_snapshot(parsed.as_ref());
-            let froze_deferred_values = matches!(statement_snapshot, Cow::Owned(_));
+            let froze_deferred_values = matches!(&statement_snapshot, Cow::Owned(_));
 
             // Relation lookup must observe the original parsed AST. Rewriting can
             // eagerly evaluate or erase subqueries, which would otherwise move a
@@ -17775,6 +17777,14 @@ impl Connection {
             self.with_fallback_function_registry(|| {
                 self.validate_statement_select_relations(statement_snapshot.as_ref())
             })?;
+            if froze_deferred_values
+                && self.function_registry_generation() != snapshot_generation
+            {
+                if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                    return Err(FrankenError::SchemaChanged);
+                }
+                continue;
+            }
             let statement = {
                 let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                     .then(|| {
@@ -17832,7 +17842,7 @@ impl Connection {
             {
                 return Ok(prepared);
             }
-            if attempt + 1 == REGISTRY_STABILITY_ATTEMPTS {
+            if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
                 return Err(FrankenError::SchemaChanged);
             }
         }
@@ -18524,7 +18534,7 @@ impl Connection {
                             FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                         }
                         let rows = self
-                            .execute_statement_impl_after_background_status(dml, p, None)
+                            .execute_statement_impl_after_background_status(dml, p, None, false)
                             .await?;
                         self.note_connection_statement_execution_count(1);
                         return Ok(
@@ -18586,6 +18596,7 @@ impl Connection {
                         dml,
                         p,
                         stmt.dispatch_precompiled_program(),
+                        false,
                     )
                     .await?;
                 self.note_connection_statement_execution_count(1);
@@ -25820,15 +25831,17 @@ impl Connection {
         )
     }
 
-    /// Clone a parsed statement into the connection-local preparation or
-    /// execution snapshot and seal every deferred `VALUES` representation.
+    /// Borrow a statement that is already sealed, or clone it into the
+    /// connection-local preparation/execution snapshot when it contains a
+    /// deferred `VALUES` representation.
     ///
     /// Parse-cache entries intentionally remain schema and registry agnostic,
     /// while SQLite's coroutine-versus-`UNION ALL` decision depends on the
-    /// active scalar-function registry. Freezing the clone at this boundary
-    /// gives direct and prepared routing the same immutable donor metadata;
-    /// downstream clones preserve that decision because already-frozen
-    /// clauses are never recomputed.
+    /// active scalar-function registry. Clone-on-deferred at this boundary
+    /// gives direct and prepared routing the same immutable donor metadata
+    /// without copying the common no-VALUES or already-frozen hot path;
+    /// downstream clones preserve the decision because frozen clauses are
+    /// never recomputed.
     fn freeze_statement_values_snapshot<'a>(
         &self,
         statement: &'a Statement,
@@ -25838,8 +25851,24 @@ impl Connection {
         }
         let mut snapshot = statement.clone();
         let function_registry = Arc::clone(&self.func_registry.borrow());
-        freeze_values_donors_in_statement(&mut snapshot, function_registry.as_ref());
+        freeze_values_donors_in_statement(
+            &mut snapshot,
+            function_registry.as_ref(),
+            ValuesFreezeContext::Statement,
+        );
         Cow::Owned(snapshot)
+    }
+
+    /// Freeze a statement reconstructed from `sqlite_schema` using SQLite's
+    /// schema-parse rule, where VALUES coroutines cannot be generated and each
+    /// subsequent row is lowered through `UNION ALL`.
+    fn freeze_stored_schema_values(&self, statement: &mut Statement) {
+        let function_registry = Arc::clone(&self.func_registry.borrow());
+        freeze_values_donors_in_statement(
+            statement,
+            function_registry.as_ref(),
+            ValuesFreezeContext::StoredSchema,
+        );
     }
 
     /// Return a cached parsed single statement, or parse fresh and cache it.
@@ -27373,9 +27402,51 @@ impl Connection {
         Box::pin(async move {
             #[cfg(test)]
             record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
-            let statement = self.freeze_statement_values_snapshot(statement);
-            self.execute_statement_impl_after_background_status(statement.as_ref(), params, None)
-                .await
+            for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                let snapshot_generation = self.function_registry_generation();
+                let statement_snapshot = self.freeze_statement_values_snapshot(statement);
+                let froze_deferred_values = matches!(&statement_snapshot, Cow::Owned(_));
+
+                // Virtual-table metadata callbacks are reentrant and may
+                // replace scalar functions while validating a direct
+                // statement. If the statement's VALUES donor was frozen
+                // before that callback, discard it and freeze a fresh snapshot
+                // from the registry-agnostic parsed AST. The implementation is
+                // told that this snapshot has already passed structural
+                // validation so the callback cannot run a second time after
+                // the generation check.
+                self.with_fallback_function_registry(|| {
+                    self.validate_statement_select_relations(statement_snapshot.as_ref())
+                })?;
+                if froze_deferred_values
+                    && self.function_registry_generation() != snapshot_generation
+                {
+                    if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                        return Err(FrankenError::SchemaChanged);
+                    }
+                    continue;
+                }
+                self.with_fallback_function_registry(|| {
+                    self.validate_statement_select_semantics(statement_snapshot.as_ref())
+                })?;
+                if !froze_deferred_values
+                    || self.function_registry_generation() == snapshot_generation
+                {
+                    return self
+                        .execute_statement_impl_after_background_status(
+                            statement_snapshot.as_ref(),
+                            params,
+                            None,
+                            true,
+                        )
+                        .await;
+                }
+                if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                    return Err(FrankenError::SchemaChanged);
+                }
+            }
+
+            unreachable!("registry-stability loop always returns")
         })
     }
 
@@ -27388,6 +27459,7 @@ impl Connection {
         statement: &'a Statement,
         params: Option<&'a [SqliteValue]>,
         precompiled: Option<&'a VdbeProgram>,
+        select_structure_validated: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
         Box::pin(async move {
             #[cfg(test)]
@@ -27396,9 +27468,11 @@ impl Connection {
                 enter_record_profile_scope(RecordProfileScope::CoreConnection);
             self.clear_table_program_error_state();
             self.sync_change_tracking_context();
-            self.with_fallback_function_registry(|| {
-                self.validate_statement_select_structure(statement)
-            })?;
+            if !select_structure_validated {
+                self.with_fallback_function_registry(|| {
+                    self.validate_statement_select_structure(statement)
+                })?;
+            }
             let statement_kind = match &statement {
                 Statement::Select(_) => "select",
                 Statement::Insert(_) => "insert",
@@ -30140,6 +30214,7 @@ impl InsertSelectReplayEmitter<'_> {
                     returning_statement,
                     Some(row_values),
                     None,
+                    false,
                 )
                 .await
                 .map(|rows| {
@@ -35764,6 +35839,16 @@ impl Connection {
         Ok(())
     }
 
+    fn validate_scalar_subquery_column_count(&self, subquery: &SelectStatement) -> Result<()> {
+        let actual = self.select_result_column_count(subquery, &[], &mut Vec::new());
+        if actual != 1 {
+            return Err(FrankenError::FunctionError(format!(
+                "sub-select returns {actual} columns - expected 1"
+            )));
+        }
+        Ok(())
+    }
+
     fn in_lhs_column_count(&self, lhs: &Expr) -> usize {
         match lhs {
             Expr::RowValue(values, _) => values.len(),
@@ -35788,18 +35873,52 @@ impl Connection {
         if actual <= 1 {
             return Ok(());
         }
-        if values.len() == 1
-            && values
-                .first()
-                .is_some_and(current_singleton_in_rhs_is_constant)
-        {
-            return Err(FrankenError::FunctionError(
-                "row value misused".to_owned(),
-            ));
+        if let [only] = values {
+            if let Expr::Subquery(rhs, _) = only {
+                let rhs_columns = self.select_result_column_count(rhs, &[], &mut Vec::new());
+                if rhs_columns == actual {
+                    return Ok(());
+                }
+                return Err(FrankenError::FunctionError(format!(
+                    "sub-select returns {rhs_columns} columns - expected {actual}"
+                )));
+            }
+            let function_registry = self.func_registry.borrow();
+            if values_expr_is_query_constant(only, function_registry.as_ref()) {
+                return Err(FrankenError::FunctionError(
+                    "row value misused".to_owned(),
+                ));
+            }
         }
         Err(FrankenError::FunctionError(format!(
             "sub-select returns {actual} columns - expected 1"
         )))
+    }
+
+    /// Apply SQLite's early singleton-constant `row value misused` diagnostic.
+    ///
+    /// This one shape check belongs in relation resolution because it precedes
+    /// function/name validation inside a multi-column scalar-subquery LHS.
+    /// Every other list-shape diagnostic waits for the structure resolver so
+    /// errors inside both operands retain their depth-first precedence.
+    fn validate_in_list_early_row_misuse(&self, lhs: &Expr, values: &[Expr]) -> Result<()> {
+        let Expr::Subquery(select, _) = lhs else {
+            return Ok(());
+        };
+        if self.select_result_column_count(select, &[], &mut Vec::new()) <= 1 {
+            return Ok(());
+        }
+        let [only] = values else {
+            return Ok(());
+        };
+        if matches!(only, Expr::Subquery(_, _)) {
+            return Ok(());
+        }
+        let function_registry = self.func_registry.borrow();
+        if values_expr_is_query_constant(only, function_registry.as_ref()) {
+            return Err(FrankenError::FunctionError("row value misused".to_owned()));
+        }
+        Ok(())
     }
 
     fn resolve_in_rhs_donor_metadata(
@@ -35947,6 +36066,76 @@ impl Connection {
                 }
             })
             .collect()
+    }
+
+    /// Materialize the first row of a scalar subquery without erasing vector
+    /// width or comparison affinity when the subquery is an operand of `IN`.
+    /// A one-column scalar subquery keeps its projected collation opaque;
+    /// multi-column scalar subqueries act as vectors and expose each field's
+    /// comparison metadata just like the direct vector execution path.
+    fn materialize_scalar_subquery_in_operand(
+        &self,
+        subquery: &SelectStatement,
+        rows: Vec<Row>,
+        span: Span,
+    ) -> Result<Expr> {
+        let mut expected = self.select_result_column_count(subquery, &[], &mut Vec::new());
+        let donor_metadata = self.resolve_in_rhs_donor_metadata(subquery);
+        if expected == 0 {
+            expected = donor_metadata.columns.len().max(1);
+        }
+        let values = rows.into_iter().next().map_or_else(
+            || vec![SqliteValue::Null; expected],
+            |row| row.values,
+        );
+        if values.len() != expected {
+            return Err(FrankenError::FunctionError(format!(
+                "sub-select returns {} columns - expected {expected}",
+                values.len()
+            )));
+        }
+
+        let schemas = self.schema.borrow();
+        let explicit_collations = in_rhs_donor_explicit_collations(subquery, &schemas);
+        drop(schemas);
+        let mut fields = Vec::with_capacity(expected);
+        for (index, value) in values.into_iter().enumerate() {
+            let mut field = Expr::BoundOuterValue {
+                value,
+                collation: if expected > 1 {
+                    donor_metadata
+                        .columns
+                        .get(index)
+                        .and_then(|column| column.collation.clone())
+                        .map_or(BoundCollation::Unspecified, BoundCollation::Named)
+                } else {
+                    BoundCollation::Unspecified
+                },
+                affinity: donor_metadata
+                    .columns
+                    .get(index)
+                    .and_then(|column| column.affinity),
+                span,
+            };
+            if expected > 1
+                && let Some(collation) = explicit_collations.get(index).and_then(Clone::clone)
+            {
+                field = Expr::Collate {
+                    expr: Box::new(field),
+                    collation,
+                    span,
+                };
+            }
+            fields.push(field);
+        }
+        if expected > 1 {
+            Ok(Expr::RowValue(fields, span))
+        } else {
+            Ok(fields
+                .into_iter()
+                .next()
+                .expect("a scalar subquery operand has one materialized field"))
+        }
     }
 
     #[allow(clippy::wrong_self_convention)]
@@ -61254,6 +61443,9 @@ impl Connection {
     // NOTE: this evaluator recurses into itself for nested expressions, and a
     // plain `async fn` cannot recurse without indirection, so it returns a
     // boxed future explicitly rather than using `async fn` sugar.
+    //
+    // AND/OR chains are special: they must not stack nested BoxFutures one per
+    // operator (see `collect_same_binary_op_operands` + the BinaryOp arm).
     fn eval_expr_with_subqueries<'a>(
         &'a self,
         expr: &'a Expr,
@@ -61282,12 +61474,7 @@ impl Connection {
                     // rejects a multi-column scalar subquery at prepare time rather
                     // than silently taking the first column (bd-fkwtw). Multiple
                     // *rows* are tolerated (the first is taken).
-                    let column_count = self.select_result_column_count(sub, &[], &mut Vec::new());
-                    if column_count != 1 {
-                        return Err(FrankenError::FunctionError(format!(
-                            "sub-select returns {column_count} columns - expected 1"
-                        )));
-                    }
+                    self.validate_scalar_subquery_column_count(sub)?;
                     let mut sub_clone = sub.as_ref().clone();
                     self.substitute_outer_refs_for_current_schema(
                         &mut sub_clone,
@@ -61368,6 +61555,32 @@ impl Connection {
                                 return Ok(SqliteValue::Integer(result));
                             }
                         }
+                    }
+                    // AND/OR are associative under SQLite three-valued logic.
+                    // Nested `Box::pin(async { eval(left).await; eval(right).await })`
+                    // for a left-deep chain of N operators stacks N huge state
+                    // machines on the first poll — enough to overflow the 16 MiB
+                    // fsqlite-worker on mtdt's publication_receipts_immutable_fields
+                    // WHEN (dozens of `OLD.col IS NOT NEW.col OR …`). Flatten the
+                    // chain and fold left-to-right so recursion depth stays O(1)
+                    // async frames per leaf operand, not O(N) per operator.
+                    if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                        let mut chain = Vec::new();
+                        collect_same_binary_op_operands(expr, *op, &mut chain);
+                        debug_assert!(
+                            chain.len() >= 2,
+                            "And/Or BinaryOp must have at least two operands"
+                        );
+                        let mut acc = self
+                            .eval_expr_with_subqueries(chain[0], row, col_map, params)
+                            .await?;
+                        for operand in chain.iter().skip(1) {
+                            let next = self
+                                .eval_expr_with_subqueries(operand, row, col_map, params)
+                                .await?;
+                            acc = eval_binary_op(&acc, *op, &next);
+                        }
+                        return Ok(acc);
                     }
                     let l = self
                         .eval_expr_with_subqueries(left, row, col_map, params)
@@ -61569,6 +61782,8 @@ impl Connection {
                 Expr::In {
                     expr: e, set, not, ..
                 } => {
+                    let normalized_set = normalize_bare_singleton_in_subquery(set);
+                    let set = normalized_set.as_ref();
                     if matches!(set, InSet::List(values) if values.is_empty()) {
                         return Ok(SqliteValue::Integer(i64::from(*not)));
                     }
@@ -69194,6 +69409,7 @@ impl Connection {
             match expr {
                 Expr::Subquery(sub, span) => {
                     if !is_correlated_subquery_with_schema(sub, &self.schema.borrow()) {
+                        self.validate_scalar_subquery_column_count(sub)?;
                         let rows = self
                             .execute_statement(&Statement::Select((**sub).clone()), params)
                             .await?;
@@ -69229,6 +69445,8 @@ impl Connection {
                     not,
                     span,
                 } => {
+                    let normalized_set = normalize_bare_singleton_in_subquery(set);
+                    let set = normalized_set.as_ref();
                     if matches!(set, InSet::List(values) if values.is_empty()) {
                         return Ok(expr.clone());
                     }
@@ -69670,6 +69888,68 @@ impl Connection {
         self.inline_subqueries_in_expr_with_using(expr, row, outer_col_map, None)
     }
 
+    fn inline_in_comparison_operand<'a>(
+        &'a self,
+        expr: &'a Expr,
+        row: &'a [SqliteValue],
+        outer_col_map: &'a [(String, String, bool)],
+        using_skip: Option<&'a HashSet<usize>>,
+        allow_vector_subquery: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Expr>> + 'a>> {
+        Box::pin(async move {
+            match expr {
+                Expr::Subquery(subquery, span) => {
+                    if !allow_vector_subquery {
+                        self.validate_scalar_subquery_column_count(subquery)?;
+                    }
+                    let mut bound_subquery = subquery.as_ref().clone();
+                    self.substitute_outer_refs_for_current_schema(
+                        &mut bound_subquery,
+                        row,
+                        outer_col_map,
+                        using_skip,
+                    );
+                    let donor_subquery = bound_subquery.clone();
+                    let _cache_guard =
+                        BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    let rows = self
+                        .execute_statement(&Statement::Select(bound_subquery), None)
+                        .await?;
+                    self.materialize_scalar_subquery_in_operand(
+                        &donor_subquery,
+                        rows,
+                        *span,
+                    )
+                }
+                Expr::RowValue(fields, span) => {
+                    let mut inlined_fields = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        inlined_fields.push(
+                            self.inline_in_comparison_operand(
+                                field,
+                                row,
+                                outer_col_map,
+                                using_skip,
+                                false,
+                            )
+                            .await?,
+                        );
+                    }
+                    Ok(Expr::RowValue(inlined_fields, *span))
+                }
+                _ => {
+                    self.inline_subqueries_in_expr_with_using(
+                        expr,
+                        row,
+                        outer_col_map,
+                        using_skip,
+                    )
+                    .await
+                }
+            }
+        })
+    }
+
     fn inline_subqueries_in_expr_with_using<'a>(
         &'a self,
         expr: &'a Expr,
@@ -69680,6 +69960,7 @@ impl Connection {
         Box::pin(async move {
             match expr {
                 Expr::Subquery(sub, span) => {
+                    self.validate_scalar_subquery_column_count(sub)?;
                     let mut sub_clone = sub.as_ref().clone();
                     self.substitute_outer_refs_for_current_schema(
                         &mut sub_clone,
@@ -69825,11 +70106,19 @@ impl Connection {
                     not,
                     span,
                 } => {
+                    let normalized_set = normalize_bare_singleton_in_subquery(set);
+                    let set = normalized_set.as_ref();
                     if matches!(set, InSet::List(values) if values.is_empty()) {
                         return Ok(expr.clone());
                     }
                     let new_inner = self
-                        .inline_subqueries_in_expr_with_using(inner, row, outer_col_map, using_skip)
+                        .inline_in_comparison_operand(
+                            inner,
+                            row,
+                            outer_col_map,
+                            using_skip,
+                            true,
+                        )
                         .await?;
                     let new_set = match set {
                         InSet::Subquery(subquery) => {
@@ -69855,11 +70144,12 @@ impl Connection {
                             let mut inlined_items = Vec::with_capacity(exprs.len());
                             for item in exprs {
                                 inlined_items.push(
-                                    self.inline_subqueries_in_expr_with_using(
+                                    self.inline_in_comparison_operand(
                                         item,
                                         row,
                                         outer_col_map,
                                         using_skip,
+                                        false,
                                     )
                                     .await?,
                                 );
@@ -72331,8 +72621,15 @@ impl Connection {
                         SqliteValue::Text(name) => name,
                         _ => unreachable!("sqlite_master binder validates trigger parents"),
                     };
-                    let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql)
-                    else {
+                    let Ok(mut parsed_trigger) = parse_single_statement(&create_sql) else {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "schema reload cannot reconstruct trigger `{trigger_name}`"
+                            ),
+                        });
+                    };
+                    self.freeze_stored_schema_values(&mut parsed_trigger);
+                    let Statement::CreateTrigger(stmt) = parsed_trigger else {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "schema reload cannot reconstruct trigger `{trigger_name}`"
@@ -72419,8 +72716,13 @@ impl Connection {
                         SqliteValue::Text(name) => name,
                         _ => unreachable!("sqlite_master binder validates view parents"),
                     };
-                    let Ok(Statement::CreateView(stmt)) = parse_single_statement(&create_sql)
-                    else {
+                    let Ok(mut parsed_view) = parse_single_statement(&create_sql) else {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("schema reload cannot reconstruct view `{view_name}`"),
+                        });
+                    };
+                    self.freeze_stored_schema_values(&mut parsed_view);
+                    let Statement::CreateView(stmt) = parsed_view else {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!("schema reload cannot reconstruct view `{view_name}`"),
                         });
@@ -88040,6 +88342,9 @@ fn rewrite_in_expr<'a>(
             Expr::In {
                 set, expr: inner, ..
             } => {
+                if let Cow::Owned(normalized) = normalize_bare_singleton_in_subquery(set) {
+                    *set = normalized;
+                }
                 if matches!(set, InSet::List(values) if values.is_empty()) {
                     return Ok(());
                 }
@@ -101875,10 +102180,9 @@ fn expr_folds_to_integer_zero_via_and(expr: &Expr) -> bool {
     }
 }
 
-/// Freeze every deferred `VALUES` clause in one connection-local statement
-/// snapshot. The parser cache deliberately retains deferred clauses because
-/// application function replacement can change SQLite's parse-time
-/// coroutine decision without changing the SQL text.
+/// Return whether a statement contains any connection-local `VALUES` clause
+/// whose representation has not yet been frozen for a function-registry
+/// snapshot.
 fn statement_contains_deferred_values(statement: &Statement) -> bool {
     match statement {
         Statement::Select(select) => select_contains_deferred_values(select),
@@ -102082,11 +102386,11 @@ fn select_core_contains_deferred_values(core: &SelectCore) -> bool {
             result_columns_contain_deferred_values(columns)
                 || from.as_ref().is_some_and(from_contains_deferred_values)
                 || where_clause
-                    .as_ref()
+                    .as_deref()
                     .is_some_and(expr_contains_deferred_values)
                 || group_by.iter().any(expr_contains_deferred_values)
                 || having
-                    .as_ref()
+                    .as_deref()
                     .is_some_and(expr_contains_deferred_values)
                 || windows
                     .iter()
@@ -102256,32 +102560,41 @@ fn frame_bound_contains_deferred_values(bound: &FrameBound) -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValuesFreezeContext {
+    Statement,
+    StoredSchema,
+}
+
 fn freeze_values_donors_in_statement(
     statement: &mut Statement,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     match statement {
-        Statement::Select(select) => freeze_values_donors_in_select(select, function_registry),
+        Statement::Select(select) => {
+            freeze_values_donors_in_select(select, function_registry, context);
+        }
         Statement::Insert(insert) => {
-            freeze_values_donors_in_with(insert.with.as_mut(), function_registry);
+            freeze_values_donors_in_with(insert.with.as_mut(), function_registry, context);
             match &mut insert.source {
                 InsertSource::Values(rows) => {
                     for row in rows {
-                        freeze_values_donors_in_exprs(row, function_registry);
+                        freeze_values_donors_in_exprs(row, function_registry, context);
                     }
                 }
                 InsertSource::Select(select) => {
-                    freeze_values_donors_in_select(select, function_registry);
+                    freeze_values_donors_in_select(select, function_registry, context);
                 }
                 InsertSource::DefaultValues => {}
             }
             for upsert in &mut insert.upsert {
                 if let Some(target) = &mut upsert.target {
                     for column in &mut target.columns {
-                        freeze_values_donors_in_expr(&mut column.expr, function_registry);
+                        freeze_values_donors_in_expr(&mut column.expr, function_registry, context);
                     }
                     if let Some(predicate) = &mut target.where_clause {
-                        freeze_values_donors_in_expr(predicate, function_registry);
+                        freeze_values_donors_in_expr(predicate, function_registry, context);
                     }
                 }
                 if let UpsertAction::Update {
@@ -102290,42 +102603,62 @@ fn freeze_values_donors_in_statement(
                 } = &mut upsert.action
                 {
                     for assignment in assignments {
-                        freeze_values_donors_in_expr(&mut assignment.value, function_registry);
+                        freeze_values_donors_in_expr(
+                            &mut assignment.value,
+                            function_registry,
+                            context,
+                        );
                     }
                     if let Some(predicate) = where_clause {
-                        freeze_values_donors_in_expr(predicate, function_registry);
+                        freeze_values_donors_in_expr(predicate, function_registry, context);
                     }
                 }
             }
-            freeze_values_donors_in_result_columns(&mut insert.returning, function_registry);
+            freeze_values_donors_in_result_columns(
+                &mut insert.returning,
+                function_registry,
+                context,
+            );
         }
         Statement::Update(update) => {
-            freeze_values_donors_in_with(update.with.as_mut(), function_registry);
+            freeze_values_donors_in_with(update.with.as_mut(), function_registry, context);
             for assignment in &mut update.assignments {
-                freeze_values_donors_in_expr(&mut assignment.value, function_registry);
+                freeze_values_donors_in_expr(
+                    &mut assignment.value,
+                    function_registry,
+                    context,
+                );
             }
             if let Some(from) = &mut update.from {
-                freeze_values_donors_in_from(from, function_registry);
+                freeze_values_donors_in_from(from, function_registry, context);
             }
             if let Some(predicate) = &mut update.where_clause {
-                freeze_values_donors_in_expr(predicate, function_registry);
+                freeze_values_donors_in_expr(predicate, function_registry, context);
             }
-            freeze_values_donors_in_result_columns(&mut update.returning, function_registry);
+            freeze_values_donors_in_result_columns(
+                &mut update.returning,
+                function_registry,
+                context,
+            );
             for term in &mut update.order_by {
-                freeze_values_donors_in_expr(&mut term.expr, function_registry);
+                freeze_values_donors_in_expr(&mut term.expr, function_registry, context);
             }
-            freeze_values_donors_in_limit(update.limit.as_mut(), function_registry);
+            freeze_values_donors_in_limit(update.limit.as_mut(), function_registry, context);
         }
         Statement::Delete(delete) => {
-            freeze_values_donors_in_with(delete.with.as_mut(), function_registry);
+            freeze_values_donors_in_with(delete.with.as_mut(), function_registry, context);
             if let Some(predicate) = &mut delete.where_clause {
-                freeze_values_donors_in_expr(predicate, function_registry);
+                freeze_values_donors_in_expr(predicate, function_registry, context);
             }
-            freeze_values_donors_in_result_columns(&mut delete.returning, function_registry);
+            freeze_values_donors_in_result_columns(
+                &mut delete.returning,
+                function_registry,
+                context,
+            );
             for term in &mut delete.order_by {
-                freeze_values_donors_in_expr(&mut term.expr, function_registry);
+                freeze_values_donors_in_expr(&mut term.expr, function_registry, context);
             }
-            freeze_values_donors_in_limit(delete.limit.as_mut(), function_registry);
+            freeze_values_donors_in_limit(delete.limit.as_mut(), function_registry, context);
         }
         Statement::CreateTable(create) => match &mut create.body {
             CreateTableBody::Columns {
@@ -102333,7 +102666,7 @@ fn freeze_values_donors_in_statement(
                 constraints,
             } => {
                 for column in columns {
-                    freeze_values_donors_in_column_def(column, function_registry);
+                    freeze_values_donors_in_column_def(column, function_registry, context);
                 }
                 for constraint in constraints {
                     match &mut constraint.kind {
@@ -102343,59 +102676,72 @@ fn freeze_values_donors_in_statement(
                                 freeze_values_donors_in_expr(
                                     &mut column.expr,
                                     function_registry,
+                                    context,
                                 );
                             }
                         }
                         TableConstraintKind::Check(expr) => {
-                            freeze_values_donors_in_expr(expr, function_registry);
+                            freeze_values_donors_in_expr(expr, function_registry, context);
                         }
                         TableConstraintKind::ForeignKey { .. } => {}
                     }
                 }
             }
             CreateTableBody::AsSelect(select) => {
-                freeze_values_donors_in_select(select, function_registry);
+                freeze_values_donors_in_select(select, function_registry, context);
             }
         },
         Statement::CreateIndex(create) => {
             for column in &mut create.columns {
-                freeze_values_donors_in_expr(&mut column.expr, function_registry);
+                freeze_values_donors_in_expr(&mut column.expr, function_registry, context);
             }
             if let Some(predicate) = &mut create.where_clause {
-                freeze_values_donors_in_expr(predicate, function_registry);
+                freeze_values_donors_in_expr(predicate, function_registry, context);
             }
         }
         Statement::CreateView(create) => {
-            freeze_values_donors_in_select(&mut create.query, function_registry);
+            freeze_values_donors_in_select(
+                &mut create.query,
+                function_registry,
+                ValuesFreezeContext::StoredSchema,
+            );
         }
         Statement::CreateTrigger(create) => {
             if let Some(predicate) = &mut create.when {
-                freeze_values_donors_in_expr(predicate, function_registry);
+                freeze_values_donors_in_expr(
+                    predicate,
+                    function_registry,
+                    ValuesFreezeContext::StoredSchema,
+                );
             }
             for body_statement in &mut create.body {
-                freeze_values_donors_in_statement(body_statement, function_registry);
+                freeze_values_donors_in_statement(
+                    body_statement,
+                    function_registry,
+                    ValuesFreezeContext::StoredSchema,
+                );
             }
         }
         Statement::AlterTable(alter) => {
             if let AlterTableAction::AddColumn(column) = &mut alter.action {
-                freeze_values_donors_in_column_def(column, function_registry);
+                freeze_values_donors_in_column_def(column, function_registry, context);
             }
         }
         Statement::Attach(attach) => {
-            freeze_values_donors_in_expr(&mut attach.expr, function_registry);
+            freeze_values_donors_in_expr(&mut attach.expr, function_registry, context);
         }
         Statement::Pragma(pragma) => {
             if let Some(PragmaValue::Assign(value) | PragmaValue::Call(value)) = &mut pragma.value {
-                freeze_values_donors_in_expr(value, function_registry);
+                freeze_values_donors_in_expr(value, function_registry, context);
             }
         }
         Statement::Vacuum(vacuum) => {
             if let Some(path) = &mut vacuum.into {
-                freeze_values_donors_in_expr(path, function_registry);
+                freeze_values_donors_in_expr(path, function_registry, context);
             }
         }
         Statement::Explain { stmt, .. } => {
-            freeze_values_donors_in_statement(stmt, function_registry);
+            freeze_values_donors_in_statement(stmt, function_registry, context);
         }
         Statement::CreateVirtualTable(_)
         | Statement::Drop(_)
@@ -102413,13 +102759,14 @@ fn freeze_values_donors_in_statement(
 fn freeze_values_donors_in_column_def(
     column: &mut fsqlite_ast::ColumnDef,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     for constraint in &mut column.constraints {
         match &mut constraint.kind {
             ColumnConstraintKind::Check(expr)
             | ColumnConstraintKind::Generated { expr, .. }
             | ColumnConstraintKind::Default(DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr)) => {
-                freeze_values_donors_in_expr(expr, function_registry);
+                freeze_values_donors_in_expr(expr, function_registry, context);
             }
             ColumnConstraintKind::PrimaryKey { .. }
             | ColumnConstraintKind::NotNull { .. }
@@ -102434,10 +102781,11 @@ fn freeze_values_donors_in_column_def(
 fn freeze_values_donors_in_with(
     with: Option<&mut fsqlite_ast::WithClause>,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     if let Some(with) = with {
         for cte in &mut with.ctes {
-            freeze_values_donors_in_select(&mut cte.query, function_registry);
+            freeze_values_donors_in_select(&mut cte.query, function_registry, context);
         }
     }
 }
@@ -102445,21 +102793,23 @@ fn freeze_values_donors_in_with(
 fn freeze_values_donors_in_select(
     select: &mut SelectStatement,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
-    freeze_values_donors_in_with(select.with.as_mut(), function_registry);
-    freeze_values_donors_in_select_core(&mut select.body.select, function_registry);
+    freeze_values_donors_in_with(select.with.as_mut(), function_registry, context);
+    freeze_values_donors_in_select_core(&mut select.body.select, function_registry, context);
     for (_, core) in &mut select.body.compounds {
-        freeze_values_donors_in_select_core(core, function_registry);
+        freeze_values_donors_in_select_core(core, function_registry, context);
     }
     for term in &mut select.order_by {
-        freeze_values_donors_in_expr(&mut term.expr, function_registry);
+        freeze_values_donors_in_expr(&mut term.expr, function_registry, context);
     }
-    freeze_values_donors_in_limit(select.limit.as_mut(), function_registry);
+    freeze_values_donors_in_limit(select.limit.as_mut(), function_registry, context);
 }
 
 fn freeze_values_donors_in_select_core(
     core: &mut SelectCore,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     match core {
         SelectCore::Select {
@@ -102471,28 +102821,33 @@ fn freeze_values_donors_in_select_core(
             windows,
             ..
         } => {
-            freeze_values_donors_in_result_columns(columns, function_registry);
+            freeze_values_donors_in_result_columns(columns, function_registry, context);
             if let Some(from) = from {
-                freeze_values_donors_in_from(from, function_registry);
+                freeze_values_donors_in_from(from, function_registry, context);
             }
             if let Some(predicate) = where_clause {
-                freeze_values_donors_in_expr(predicate, function_registry);
+                freeze_values_donors_in_expr(predicate, function_registry, context);
             }
-            freeze_values_donors_in_exprs(group_by, function_registry);
+            freeze_values_donors_in_exprs(group_by, function_registry, context);
             if let Some(predicate) = having {
-                freeze_values_donors_in_expr(predicate, function_registry);
+                freeze_values_donors_in_expr(predicate, function_registry, context);
             }
             for window in windows {
-                freeze_values_donors_in_window(&mut window.spec, function_registry);
+                freeze_values_donors_in_window(&mut window.spec, function_registry, context);
             }
         }
         SelectCore::Values(values) => {
             if !values.is_frozen() {
-                let donor_index = deferred_values_donor_row_index(values, function_registry);
+                let donor_index = match context {
+                    ValuesFreezeContext::Statement => {
+                        deferred_values_donor_row_index(values, function_registry)
+                    }
+                    ValuesFreezeContext::StoredSchema => values.len().checked_sub(1),
+                };
                 values.freeze_donor_row(donor_index);
             }
             for row in values.iter_mut() {
-                freeze_values_donors_in_exprs(row, function_registry);
+                freeze_values_donors_in_exprs(row, function_registry, context);
             }
         }
     }
@@ -102501,12 +102856,13 @@ fn freeze_values_donors_in_select_core(
 fn freeze_values_donors_in_from(
     from: &mut FromClause,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
-    freeze_values_donors_in_source(&mut from.source, function_registry);
+    freeze_values_donors_in_source(&mut from.source, function_registry, context);
     for join in &mut from.joins {
-        freeze_values_donors_in_source(&mut join.table, function_registry);
+        freeze_values_donors_in_source(&mut join.table, function_registry, context);
         if let Some(JoinConstraint::On(predicate)) = &mut join.constraint {
-            freeze_values_donors_in_expr(predicate, function_registry);
+            freeze_values_donors_in_expr(predicate, function_registry, context);
         }
     }
 }
@@ -102514,16 +102870,17 @@ fn freeze_values_donors_in_from(
 fn freeze_values_donors_in_source(
     source: &mut TableOrSubquery,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     match source {
         TableOrSubquery::Subquery { query, .. } => {
-            freeze_values_donors_in_select(query, function_registry);
+            freeze_values_donors_in_select(query, function_registry, context);
         }
         TableOrSubquery::TableFunction { args, .. } => {
-            freeze_values_donors_in_exprs(args, function_registry);
+            freeze_values_donors_in_exprs(args, function_registry, context);
         }
         TableOrSubquery::ParenJoin(from) => {
-            freeze_values_donors_in_from(from, function_registry);
+            freeze_values_donors_in_from(from, function_registry, context);
         }
         TableOrSubquery::Table { .. } => {}
     }
@@ -102532,10 +102889,11 @@ fn freeze_values_donors_in_source(
 fn freeze_values_donors_in_result_columns(
     columns: &mut [ResultColumn],
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     for column in columns {
         if let ResultColumn::Expr { expr, .. } = column {
-            freeze_values_donors_in_expr(expr, function_registry);
+            freeze_values_donors_in_expr(expr, function_registry, context);
         }
     }
 }
@@ -102543,11 +102901,12 @@ fn freeze_values_donors_in_result_columns(
 fn freeze_values_donors_in_limit(
     limit: Option<&mut LimitClause>,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     if let Some(limit) = limit {
-        freeze_values_donors_in_expr(&mut limit.limit, function_registry);
+        freeze_values_donors_in_expr(&mut limit.limit, function_registry, context);
         if let Some(offset) = &mut limit.offset {
-            freeze_values_donors_in_expr(offset, function_registry);
+            freeze_values_donors_in_expr(offset, function_registry, context);
         }
     }
 }
@@ -102555,13 +102914,18 @@ fn freeze_values_donors_in_limit(
 fn freeze_values_donors_in_exprs(
     exprs: &mut [Expr],
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     for expr in exprs {
-        freeze_values_donors_in_expr(expr, function_registry);
+        freeze_values_donors_in_expr(expr, function_registry, context);
     }
 }
 
-fn freeze_values_donors_in_expr(expr: &mut Expr, function_registry: &FunctionRegistry) {
+fn freeze_values_donors_in_expr(
+    expr: &mut Expr,
+    function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
+) {
     match expr {
         Expr::BoundOuterValue { .. }
         | Expr::Literal(_, _)
@@ -102574,30 +102938,30 @@ fn freeze_values_donors_in_expr(expr: &mut Expr, function_registry: &FunctionReg
             path: right,
             ..
         } => {
-            freeze_values_donors_in_expr(left, function_registry);
-            freeze_values_donors_in_expr(right, function_registry);
+            freeze_values_donors_in_expr(left, function_registry, context);
+            freeze_values_donors_in_expr(right, function_registry, context);
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. } => {
-            freeze_values_donors_in_expr(expr, function_registry);
+            freeze_values_donors_in_expr(expr, function_registry, context);
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            freeze_values_donors_in_expr(expr, function_registry);
-            freeze_values_donors_in_expr(low, function_registry);
-            freeze_values_donors_in_expr(high, function_registry);
+            freeze_values_donors_in_expr(expr, function_registry, context);
+            freeze_values_donors_in_expr(low, function_registry, context);
+            freeze_values_donors_in_expr(high, function_registry, context);
         }
         Expr::In { expr, set, .. } => {
-            freeze_values_donors_in_expr(expr, function_registry);
+            freeze_values_donors_in_expr(expr, function_registry, context);
             match set {
                 InSet::List(values) => {
-                    freeze_values_donors_in_exprs(values, function_registry);
+                    freeze_values_donors_in_exprs(values, function_registry, context);
                 }
                 InSet::Subquery(select) => {
-                    freeze_values_donors_in_select(select, function_registry);
+                    freeze_values_donors_in_select(select, function_registry, context);
                 }
                 InSet::Table(_) => {}
             }
@@ -102608,10 +102972,10 @@ fn freeze_values_donors_in_expr(expr: &mut Expr, function_registry: &FunctionReg
             escape,
             ..
         } => {
-            freeze_values_donors_in_expr(expr, function_registry);
-            freeze_values_donors_in_expr(pattern, function_registry);
+            freeze_values_donors_in_expr(expr, function_registry, context);
+            freeze_values_donors_in_expr(pattern, function_registry, context);
             if let Some(escape) = escape {
-                freeze_values_donors_in_expr(escape, function_registry);
+                freeze_values_donors_in_expr(escape, function_registry, context);
             }
         }
         Expr::Case {
@@ -102621,18 +102985,18 @@ fn freeze_values_donors_in_expr(expr: &mut Expr, function_registry: &FunctionReg
             ..
         } => {
             if let Some(operand) = operand {
-                freeze_values_donors_in_expr(operand, function_registry);
+                freeze_values_donors_in_expr(operand, function_registry, context);
             }
             for (condition, value) in whens {
-                freeze_values_donors_in_expr(condition, function_registry);
-                freeze_values_donors_in_expr(value, function_registry);
+                freeze_values_donors_in_expr(condition, function_registry, context);
+                freeze_values_donors_in_expr(value, function_registry, context);
             }
             if let Some(else_expr) = else_expr {
-                freeze_values_donors_in_expr(else_expr, function_registry);
+                freeze_values_donors_in_expr(else_expr, function_registry, context);
             }
         }
         Expr::Subquery(select, _) | Expr::Exists { subquery: select, .. } => {
-            freeze_values_donors_in_select(select, function_registry);
+            freeze_values_donors_in_select(select, function_registry, context);
         }
         Expr::FunctionCall {
             args,
@@ -102642,20 +103006,20 @@ fn freeze_values_donors_in_expr(expr: &mut Expr, function_registry: &FunctionReg
             ..
         } => {
             if let FunctionArgs::List(args) = args {
-                freeze_values_donors_in_exprs(args, function_registry);
+                freeze_values_donors_in_exprs(args, function_registry, context);
             }
             for term in order_by {
-                freeze_values_donors_in_expr(&mut term.expr, function_registry);
+                freeze_values_donors_in_expr(&mut term.expr, function_registry, context);
             }
             if let Some(filter) = filter {
-                freeze_values_donors_in_expr(filter, function_registry);
+                freeze_values_donors_in_expr(filter, function_registry, context);
             }
             if let Some(window) = over {
-                freeze_values_donors_in_window(window, function_registry);
+                freeze_values_donors_in_window(window, function_registry, context);
             }
         }
         Expr::RowValue(values, _) => {
-            freeze_values_donors_in_exprs(values, function_registry);
+            freeze_values_donors_in_exprs(values, function_registry, context);
         }
     }
 }
@@ -102663,15 +103027,16 @@ fn freeze_values_donors_in_expr(expr: &mut Expr, function_registry: &FunctionReg
 fn freeze_values_donors_in_window(
     window: &mut WindowSpec,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
-    freeze_values_donors_in_exprs(&mut window.partition_by, function_registry);
+    freeze_values_donors_in_exprs(&mut window.partition_by, function_registry, context);
     for term in &mut window.order_by {
-        freeze_values_donors_in_expr(&mut term.expr, function_registry);
+        freeze_values_donors_in_expr(&mut term.expr, function_registry, context);
     }
     if let Some(frame) = &mut window.frame {
-        freeze_values_donors_in_frame_bound(&mut frame.start, function_registry);
+        freeze_values_donors_in_frame_bound(&mut frame.start, function_registry, context);
         if let Some(end) = &mut frame.end {
-            freeze_values_donors_in_frame_bound(end, function_registry);
+            freeze_values_donors_in_frame_bound(end, function_registry, context);
         }
     }
 }
@@ -102679,9 +103044,10 @@ fn freeze_values_donors_in_window(
 fn freeze_values_donors_in_frame_bound(
     bound: &mut FrameBound,
     function_registry: &FunctionRegistry,
+    context: ValuesFreezeContext,
 ) {
     if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
-        freeze_values_donors_in_expr(expr, function_registry);
+        freeze_values_donors_in_expr(expr, function_registry, context);
     }
 }
 
@@ -103721,6 +104087,8 @@ fn validate_expr_collation_consumers(
             Ok(())
         }
         Expr::In { expr, set, .. } => {
+            let normalized_set = normalize_bare_singleton_in_subquery(set);
+            let set = normalized_set.as_ref();
             if matches!(set, InSet::List(values) if values.is_empty()) {
                 return Ok(());
             }
@@ -104002,6 +104370,19 @@ fn vector_comparison_fields(expr: &Expr) -> Option<Vec<&Expr>> {
             select_core_result_exprs(final_core).filter(|values| values.len() > 1)
         }
         _ => None,
+    }
+}
+
+/// SQLite parses `IN ((SELECT ...))` as a one-element expression list, but
+/// treats that exact bare-subquery shape as the set-producing `IN (SELECT ...)`
+/// form. Wrapping the subquery in any other expression keeps scalar semantics.
+fn normalize_bare_singleton_in_subquery(set: &InSet) -> Cow<'_, InSet> {
+    if let InSet::List(values) = set
+        && let [Expr::Subquery(subquery, _)] = values.as_slice()
+    {
+        Cow::Owned(InSet::Subquery(subquery.clone()))
+    } else {
+        Cow::Borrowed(set)
     }
 }
 
@@ -104889,20 +105270,21 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                 if matches!(set, InSet::List(values) if values.is_empty()) {
                     return Ok(());
                 }
-                if let InSet::List(values) = set {
-                    self.connection.validate_in_list_lhs_shape(expr, values)?;
-                }
                 self.validate_expr(expr)?;
                 match set {
                     InSet::List(values) => {
                         for value in values {
                             self.validate_expr(value)?;
                         }
-                        Ok(())
                     }
-                    InSet::Subquery(query) => self.validate_select(query),
-                    InSet::Table(name) => self.validate_relation(name),
+                    InSet::Subquery(query) => self.validate_select(query)?,
+                    InSet::Table(name) => self.validate_relation(name)?,
                 }
+                if let InSet::List(values) = set {
+                    self.connection
+                        .validate_in_list_early_row_misuse(expr, values)?;
+                }
+                Ok(())
             }
             Expr::Like {
                 expr,
@@ -106060,23 +106442,31 @@ impl<'a> SelectStructureResolver<'a> {
                 self.validate_expr(high, named_windows)
             }
             Expr::In { expr, set, .. } => {
-                if matches!(set, InSet::List(values) if values.is_empty()) {
+                let normalized_set = normalize_bare_singleton_in_subquery(set);
+                let normalized_set = normalized_set.as_ref();
+                if matches!(normalized_set, InSet::List(values) if values.is_empty()) {
                     return Ok(());
                 }
-                if let InSet::List(values) = set {
-                    self.connection.validate_in_list_lhs_shape(expr, values)?;
-                }
                 self.validate_expr(expr, named_windows)?;
-                match set {
+                match normalized_set {
                     InSet::List(values) => {
                         for value in values {
                             self.validate_expr(value, named_windows)?;
                         }
-                        Ok(())
                     }
-                    InSet::Subquery(query) => self.validate_select(query),
-                    InSet::Table(name) => self.validate_relation(name),
+                    InSet::Subquery(query) => self.validate_select(query)?,
+                    InSet::Table(name) => self.validate_relation(name)?,
                 }
+                match normalized_set {
+                    InSet::Subquery(subquery) => self
+                        .connection
+                        .validate_in_subquery_column_count(expr, subquery)?,
+                    InSet::List(values) => {
+                        self.connection.validate_in_list_lhs_shape(expr, values)?;
+                    }
+                    InSet::Table(_) => {}
+                }
+                Ok(())
             }
             Expr::Like {
                 expr,
@@ -115766,6 +116156,27 @@ fn literal_to_join_value(lit: &Literal) -> SqliteValue {
 }
 
 /// Evaluate a binary operator on two plain `SqliteValue`s.
+/// Flatten an associative `And`/`Or` tree into left-to-right operand refs.
+///
+/// Used by [`Connection::eval_expr_with_subqueries`] so long WHEN clauses do
+/// not nest one `BoxFuture` state machine per operator. Sync recursion here is
+/// intentional and cheap (pointer frames only); the async stack explosion was
+/// from nested `Box::pin(async { … })` depth proportional to operator count.
+fn collect_same_binary_op_operands<'e>(expr: &'e Expr, op: BinaryOp, out: &mut Vec<&'e Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: node_op,
+            right,
+            ..
+        } if *node_op == op => {
+            collect_same_binary_op_operands(left, op, out);
+            collect_same_binary_op_operands(right, op, out);
+        }
+        other => out.push(other),
+    }
+}
+
 fn eval_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) -> SqliteValue {
     match op {
         BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Gt | BinaryOp::Lt | BinaryOp::Ge | BinaryOp::Le => {
@@ -117968,10 +118379,10 @@ mod tests {
             const { std::cell::Cell::new(None) };
     }
 
-    struct ReentrantVtabConnectionGuard;
+    pub(super) struct ReentrantVtabConnectionGuard;
 
     impl ReentrantVtabConnectionGuard {
-        fn install(connection: &Rc<Connection>) -> Self {
+        pub(super) fn install(connection: &Rc<Connection>) -> Self {
             REENTRANT_VTAB_CONNECTION.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 assert!(
@@ -118061,6 +118472,27 @@ mod tests {
     struct SelfReplacingTableFunctionFactory;
 
     struct ReplacementTableFunctionFactory;
+
+    pub(super) struct ValuesRegistryChangingFactory {
+        pub(super) column_info_calls: Arc<AtomicUsize>,
+        pub(super) replace_on_every_call: bool,
+    }
+
+    pub(super) struct ValuesDonorProbe;
+
+    impl fsqlite_func::ScalarFunction for ValuesDonorProbe {
+        fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(1))
+        }
+
+        fn num_args(&self) -> i32 {
+            0
+        }
+
+        fn name(&self) -> &str {
+            "values_donor_probe"
+        }
+    }
 
     struct DropReentrantModuleFactory {
         minimum_published_generation: Arc<AtomicU64>,
@@ -118556,6 +118988,27 @@ mod tests {
 
         fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
             vec![("replacement".to_owned(), 'T')]
+        }
+    }
+
+    impl VtabModuleFactory for ValuesRegistryChangingFactory {
+        fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(SchemaAwareTestVtab::create(cx, args)?))
+        }
+
+        fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            Ok(Box::new(SchemaAwareTestVtab::connect(cx, args)?))
+        }
+
+        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+            let call_index = self
+                .column_info_calls
+                .fetch_add(1, AtomicOrdering::SeqCst);
+            if self.replace_on_every_call || call_index == 0 {
+                reentrant_vtab_connection()
+                    .register_nondeterministic_scalar_function(ValuesDonorProbe);
+            }
+            vec![("label".to_owned(), 'T'), ("score".to_owned(), 'I')]
         }
     }
 
@@ -135596,6 +136049,66 @@ mod tests {
             let trigger_sql = row_values(&rows[0])[0].to_text();
             assert!(trigger_sql.contains("renamed_table"), "{trigger_sql}");
             assert!(!trigger_sql.contains("source_table"), "{trigger_sql}");
+        });
+    }
+
+    /// Keeper for the mtdt publication_receipts_immutable_fields failure mode:
+    /// a BEFORE UPDATE trigger whose WHEN is a long `OR` chain of
+    /// `OLD.col IS NOT NEW.col` comparisons. Nested BoxFuture recursion used
+    /// to overflow the 16 MiB fsqlite-worker stack during eval of such WHEN
+    /// clauses (mark_cas_verified path).
+    #[test]
+    fn long_or_chain_trigger_when_does_not_stack_overflow() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            // Enough columns to build a WHEN chain comparable to mtdt's
+            // publication_receipts_immutable_fields (~30+ IS NOT terms).
+            let col_defs: String = (0..40)
+                .map(|i| format!("c{i} TEXT"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.execute(&format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {col_defs});"))
+                .await
+                .unwrap();
+
+            let when_chain: String = (0..40)
+                .map(|i| format!("OLD.c{i} IS NOT NEW.c{i}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            conn.execute(&format!(
+                "CREATE TRIGGER t_immutable BEFORE UPDATE ON t
+                 WHEN {when_chain}
+                 BEGIN
+                    SELECT RAISE(ABORT, 'immutable field changed');
+                 END;"
+            ))
+            .await
+            .unwrap();
+
+            let zeros: String = (0..40)
+                .map(|_| "'0'".to_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.execute(&format!("INSERT INTO t VALUES (1, {zeros});"))
+                .await
+                .unwrap();
+
+            // No field changed → WHEN is false → UPDATE succeeds (must not
+            // overflow while evaluating the long OR chain).
+            conn.execute("UPDATE t SET id = id WHERE id = 1;")
+                .await
+                .expect("no-op UPDATE must evaluate long WHEN without stack overflow");
+
+            // One field changed → WHEN is true → RAISE aborts.
+            let err = conn
+                .execute("UPDATE t SET c0 = 'changed' WHERE id = 1;")
+                .await
+                .expect_err("changed immutable field must abort");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("immutable field changed"),
+                "unexpected error: {msg}"
+            );
         });
     }
 
@@ -180679,6 +181192,9 @@ fts5(title, body, content=docs, content_rowid=id)'
 #[cfg(test)]
 mod pager_routing_tests {
     use super::*;
+    use super::tests::{
+        ReentrantVtabConnectionGuard, ValuesDonorProbe, ValuesRegistryChangingFactory,
+    };
     use fsqlite_ast::{ColumnRef, Expr, OrderingTerm, ResultColumn, Span};
     use fsqlite_func::collation::CollationFunction;
     use tracing_subscriber::prelude::*;
@@ -221078,6 +221594,306 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_values_donor_freezes_per_registry_snapshot_and_retries_reentrant_validation() {
+        fn top_level_donor(statement: &Statement) -> Option<usize> {
+            let Statement::Select(select) = statement else {
+                panic!("VALUES fixture parsed as a non-SELECT statement");
+            };
+            let SelectCore::Values(values) = &select.body.select else {
+                panic!("VALUES fixture parsed as a non-VALUES core");
+            };
+            values.donor_row_index()
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
+            let _guard = ReentrantVtabConnectionGuard::install(&connection);
+            connection.register_deterministic_scalar_function(ValuesDonorProbe);
+
+            let three_row_sql =
+                "SELECT (VALUES(1), (values_donor_probe()), \
+                         (CAST(1 AS NUMERIC))) = '1'";
+            let direct_deterministic = connection.query(three_row_sql).await.unwrap();
+            assert_eq!(
+                direct_deterministic[0].values()[0],
+                SqliteValue::Integer(0),
+                "a query-constant middle row must retain the first coroutine donor"
+            );
+            let prepared_deterministic = connection.prepare(three_row_sql).await.unwrap();
+            assert_eq!(
+                prepared_deterministic.query().await.unwrap()[0].values()[0],
+                SqliteValue::Integer(0)
+            );
+
+            let deferred = parse_single_statement(
+                "VALUES(1), (values_donor_probe()), (CAST(1 AS NUMERIC))",
+            )
+            .unwrap();
+            assert!(super::statement_contains_deferred_values(&deferred));
+            let deterministic_snapshot = connection.freeze_statement_values_snapshot(&deferred);
+            assert!(matches!(
+                &deterministic_snapshot,
+                std::borrow::Cow::Owned(_)
+            ));
+            assert_eq!(top_level_donor(deterministic_snapshot.as_ref()), Some(0));
+            assert!(!super::statement_contains_deferred_values(
+                deterministic_snapshot.as_ref()
+            ));
+
+            connection.register_nondeterministic_scalar_function(ValuesDonorProbe);
+            assert!(matches!(
+                prepared_deterministic.query().await,
+                Err(FrankenError::SchemaChanged)
+            ));
+            let already_frozen =
+                connection.freeze_statement_values_snapshot(deterministic_snapshot.as_ref());
+            assert!(matches!(
+                &already_frozen,
+                std::borrow::Cow::Borrowed(_)
+            ));
+            assert_eq!(top_level_donor(already_frozen.as_ref()), Some(0));
+
+            let nondeterministic_snapshot = connection.freeze_statement_values_snapshot(&deferred);
+            assert_eq!(top_level_donor(nondeterministic_snapshot.as_ref()), Some(2));
+            let direct_nondeterministic = connection.query(three_row_sql).await.unwrap();
+            assert_eq!(
+                direct_nondeterministic[0].values()[0],
+                SqliteValue::Integer(1),
+                "a volatile middle row must make the final NUMERIC row the donor"
+            );
+            assert_eq!(
+                connection.prepare(three_row_sql).await.unwrap().query().await.unwrap()[0]
+                    .values()[0],
+                SqliteValue::Integer(1)
+            );
+
+            let restarted_coroutine_sql =
+                "SELECT (VALUES(1), (values_donor_probe()), (2), \
+                         (CAST(1 AS NUMERIC))) = '1'";
+            assert_eq!(
+                connection.query(restarted_coroutine_sql).await.unwrap()[0].values()[0],
+                SqliteValue::Integer(0),
+                "a plain constant after fallback must restart the coroutine and remain donor"
+            );
+            assert_eq!(
+                connection
+                    .prepare(restarted_coroutine_sql)
+                    .await
+                    .unwrap()
+                    .query()
+                    .await
+                    .unwrap()[0]
+                    .values()[0],
+                SqliteValue::Integer(0)
+            );
+
+            connection.register_deterministic_scalar_function(ValuesDonorProbe);
+            let direct_column_info_calls = Arc::new(AtomicUsize::new(0));
+            connection.register_module(
+                "VALUES_REGISTRY_CHURN_DIRECT",
+                Box::new(ValuesRegistryChangingFactory {
+                    column_info_calls: Arc::clone(&direct_column_info_calls),
+                    replace_on_every_call: false,
+                }),
+            );
+            let direct_callback_sql =
+                "SELECT (VALUES(1), (values_donor_probe()), \
+                         (CAST(1 AS NUMERIC))) = '1' AS matched, churn.* \
+                 FROM values_registry_churn_direct() AS churn";
+            let direct_callback_rows = connection.query(direct_callback_sql).await.unwrap();
+            assert!(
+                direct_column_info_calls.load(AtomicOrdering::SeqCst) >= 2,
+                "registry-changing metadata must force a fresh direct-execution snapshot"
+            );
+            assert_eq!(
+                direct_callback_rows[0].values()[0],
+                SqliteValue::Integer(1),
+                "direct execution must not retain the pre-callback donor"
+            );
+
+            connection.register_deterministic_scalar_function(ValuesDonorProbe);
+            let prepare_column_info_calls = Arc::new(AtomicUsize::new(0));
+            connection.register_module(
+                "VALUES_REGISTRY_CHURN_PREPARE",
+                Box::new(ValuesRegistryChangingFactory {
+                    column_info_calls: Arc::clone(&prepare_column_info_calls),
+                    replace_on_every_call: false,
+                }),
+            );
+            let prepare_callback_sql =
+                "SELECT (VALUES(1), (values_donor_probe()), \
+                         (CAST(1 AS NUMERIC))) = '1' AS matched, churn.* \
+                 FROM values_registry_churn_prepare() AS churn";
+            let callback_prepared = connection.prepare(prepare_callback_sql).await.unwrap();
+            assert!(
+                prepare_column_info_calls.load(AtomicOrdering::SeqCst) >= 2,
+                "registry-changing metadata must force a fresh prepare attempt"
+            );
+            assert_eq!(
+                callback_prepared.function_registry_generation,
+                connection.function_registry_generation(),
+                "prepared identity must match the registry that froze its VALUES donor"
+            );
+            let callback_rows = callback_prepared.query().await.unwrap();
+            assert_eq!(
+                callback_rows[0].values()[0],
+                SqliteValue::Integer(1),
+                "reentrant replacement must not cache the pre-callback donor"
+            );
+
+            connection.register_deterministic_scalar_function(ValuesDonorProbe);
+            let perpetual_column_info_calls = Arc::new(AtomicUsize::new(0));
+            connection.register_module(
+                "VALUES_REGISTRY_PERPETUAL_CHURN",
+                Box::new(ValuesRegistryChangingFactory {
+                    column_info_calls: Arc::clone(&perpetual_column_info_calls),
+                    replace_on_every_call: true,
+                }),
+            );
+            let perpetual_callback_sql =
+                "SELECT (VALUES(1), (values_donor_probe()), \
+                         (CAST(1 AS NUMERIC))) = '1' AS matched, churn.* \
+                 FROM values_registry_perpetual_churn() AS churn";
+            assert!(matches!(
+                connection.prepare(perpetual_callback_sql).await,
+                Err(FrankenError::SchemaChanged)
+            ));
+            assert_eq!(
+                perpetual_column_info_calls.load(AtomicOrdering::SeqCst),
+                super::FUNCTION_REGISTRY_STABILITY_ATTEMPTS,
+                "an always-mutating metadata callback must consume the bounded retry budget"
+            );
+            let perpetual_cache_key = connection.prepared_cache_key(perpetual_callback_sql);
+            assert!(
+                connection
+                    .lookup_prepared_cache(perpetual_cache_key, perpetual_callback_sql)
+                    .is_none(),
+                "an incoherent failed preparation must not populate the prepared cache"
+            );
+        });
+    }
+
+    #[test]
+    fn test_values_snapshot_cow_covers_deep_trigger_dml_and_window_positions() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Connection::open(":memory:").await.unwrap();
+            let mut trigger = parse_single_statement(
+                "CREATE TRIGGER values_freeze_probe AFTER INSERT ON t \
+                 BEGIN UPDATE t SET x = 1; END",
+            )
+            .unwrap();
+            let nested_update = parse_single_statement(
+                "UPDATE t SET x = ( \
+                     SELECT row_number() OVER ( \
+                         PARTITION BY (VALUES(1), (2)) \
+                         ORDER BY (VALUES(3), (4)) \
+                         ROWS BETWEEN (VALUES(5), (6)) PRECEDING \
+                              AND (VALUES(7), (8)) FOLLOWING \
+                     ) \
+                 ) \
+                 WHERE x IN (SELECT * FROM (VALUES(9), (10)))",
+            )
+            .unwrap();
+            let Statement::CreateTrigger(create) = &mut trigger else {
+                panic!("trigger fixture parsed as the wrong statement kind");
+            };
+            create.body = vec![nested_update];
+
+            assert!(super::statement_contains_deferred_values(&trigger));
+            let frozen = connection.freeze_statement_values_snapshot(&trigger);
+            assert!(matches!(&frozen, std::borrow::Cow::Owned(_)));
+            assert!(
+                !super::statement_contains_deferred_values(frozen.as_ref()),
+                "the mutable freezer and immutable detector must cover the same deep positions"
+            );
+            assert!(matches!(
+                connection.freeze_statement_values_snapshot(frozen.as_ref()),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_stored_schema_values_use_union_all_donor_immediately_and_after_reload() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("stored_schema_values.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+            let connection = Connection::open(&db_path).await.unwrap();
+            let reference = rusqlite::Connection::open_in_memory().unwrap();
+            let ddl = [
+                "CREATE TABLE values_schema_source(id INTEGER)",
+                "CREATE TABLE values_schema_log(matched INTEGER)",
+                "CREATE VIEW values_schema_view AS \
+                 SELECT (VALUES(1), (CAST(1 AS NUMERIC))) = '1' AS matched",
+                "CREATE TRIGGER values_schema_trigger \
+                 AFTER INSERT ON values_schema_source BEGIN \
+                   INSERT INTO values_schema_log \
+                   SELECT (VALUES(1), (CAST(1 AS NUMERIC))) = '1'; \
+                 END",
+            ];
+            for statement in ddl {
+                connection.execute(statement).await.unwrap();
+                reference.execute_batch(statement).unwrap();
+            }
+            connection
+                .execute("INSERT INTO values_schema_source VALUES (1)")
+                .await
+                .unwrap();
+            reference
+                .execute_batch("INSERT INTO values_schema_source VALUES (1)")
+                .unwrap();
+
+            let queries = [
+                "SELECT (VALUES(1), (CAST(1 AS NUMERIC))) = '1'",
+                "SELECT matched FROM values_schema_view",
+                "SELECT matched FROM values_schema_log ORDER BY rowid",
+            ];
+            let mismatches = oracle_compare(&connection, &reference, &queries).await;
+            assert!(
+                mismatches.is_empty(),
+                "stored-schema VALUES context diverged before reload: {mismatches:#?}"
+            );
+            assert_eq!(
+                connection.query(queries[0]).await.unwrap()[0].values()[0],
+                SqliteValue::Integer(0),
+                "an ordinary statement remains eligible for the VALUES coroutine"
+            );
+            assert_eq!(
+                connection.query(queries[1]).await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+                "a stored view must use schema-parse UNION ALL metadata"
+            );
+            assert_eq!(
+                connection.query(queries[2]).await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+                "a stored trigger must use schema-parse UNION ALL metadata"
+            );
+
+            connection.close().await.unwrap();
+            let reopened = Connection::open(&db_path).await.unwrap();
+            assert_eq!(
+                reopened.query(queries[1]).await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+                "schema reload must freeze the view with the stored-schema donor"
+            );
+            reopened
+                .execute("INSERT INTO values_schema_source VALUES (2)")
+                .await
+                .unwrap();
+            let trigger_rows = reopened.query(queries[2]).await.unwrap();
+            assert_eq!(trigger_rows.len(), 2);
+            assert!(
+                trigger_rows
+                    .iter()
+                    .all(|row| row.values()[0] == SqliteValue::Integer(1)),
+                "schema reload must freeze the trigger with the stored-schema donor"
+            );
+        });
+    }
+
+    #[test]
     fn test_scalar_subquery_affinity_matches_sqlite_scope_and_direct_donor() {
         asupersync::test_utils::run_test(|| async {
             let fconn = Connection::open(":memory:").await.unwrap();
@@ -221115,10 +221931,22 @@ mod pager_routing_tests {
                 // final core. Reversing arms therefore reverses coercion.
                 "SELECT (SELECT CAST(1 AS INTEGER) UNION ALL SELECT 1) = '1'",
                 "SELECT (SELECT 1 UNION ALL SELECT CAST(1 AS INTEGER)) = '1'",
+                // A plain multi-row VALUES starts a coroutine only when the
+                // accumulated root and new row are query-constant and the
+                // current root has no affinity.
+                "SELECT (VALUES(CAST(1 AS NUMERIC)), (1)) = '1'",
+                "SELECT (VALUES(1), (CAST(1 AS NUMERIC))) = '1'",
                 // WITH forces SQLite's compound VALUES representation; the
                 // final VALUES row is the direct scalar metadata donor.
                 "WITH dummy(x) AS (VALUES(0)) SELECT (VALUES(CAST(1 AS INTEGER)), (1)) = '1'",
                 "WITH dummy(x) AS (VALUES(0)) SELECT (VALUES(1), (CAST(1 AS INTEGER))) = '1'",
+                // A volatile row falls back to UNION ALL. A subsequent plain
+                // constant may then restart a coroutine, retaining that plain
+                // row instead of making fallback permanently monotonic.
+                "SELECT (VALUES(1), (random()), (CAST(1 AS NUMERIC))) = '1'",
+                "SELECT (VALUES(1), (random()), (2), (CAST(1 AS NUMERIC))) = '1'",
+                "SELECT (VALUES(1), (random()), (2), (3), (CAST(1 AS NUMERIC))) = '1'",
+                "SELECT (VALUES(1), (abs(1)), (2), (CAST(1 AS NUMERIC))) = '1'",
                 // A correlated IN donor may be a derived outer column that
                 // has no global-schema binding until outer substitution.
                 "SELECT 1 IN (SELECT donor) FROM (SELECT CAST('1' AS TEXT) AS donor) AS outer_row",
@@ -221194,7 +222022,21 @@ mod pager_routing_tests {
                 // NULL tuple when the scalar subquery is empty.
                 "SELECT (SELECT 1, 2) IN (SELECT 1, 2)",
                 "SELECT (SELECT 1, 2) IN (VALUES(1, 2))",
-                "SELECT (SELECT 1, 2) IN ((1, 2))",
+                "SELECT (1, 2) IN ((SELECT 1, 2))",
+                "SELECT (1, 2) IN ((VALUES(1, 2)))",
+                "SELECT (SELECT 1, 2) IN ((SELECT 1, 2))",
+                "SELECT (SELECT 1, 2) IN ((VALUES(1, 2)))",
+                // A bare singleton subquery inside an expression-list parse
+                // retains set semantics: every row participates. Any wrapper
+                // around that subquery would instead make it a scalar value.
+                "WITH rhs(a, b) AS (VALUES(1, 2), (3, 4)) \
+                 SELECT (3, 4) IN ((SELECT a, b FROM rhs))",
+                "WITH rhs(a, b) AS (VALUES(1, 2), (3, 4)) \
+                 SELECT (1, 2) IN ((SELECT a, b FROM rhs ORDER BY a DESC))",
+                "SELECT (1, 2) IN ((SELECT 1, 2 WHERE 0)), \
+                        (1, 2) NOT IN ((SELECT 1, 2 WHERE 0))",
+                "WITH rhs(x) AS (VALUES(1), (3)) SELECT 3 IN ((SELECT x FROM rhs))",
+                "SELECT (SELECT 1, 2) IN (), (SELECT 1, 2) NOT IN ()",
                 "SELECT (SELECT 1, 2 WHERE 0) IN (SELECT 1, 2)",
                 "SELECT (SELECT 1, 2 WHERE 0) IN (SELECT 1, 2 WHERE 0)",
                 "SELECT (SELECT CAST('1' AS TEXT), 2) IN (SELECT 1, 2)",
@@ -221249,6 +222091,17 @@ mod pager_routing_tests {
                 // Grouped projection and HAVING use the same vector semantics.
                 "SELECT a, (a, SUM(b)) IN ((CAST('1' AS TEXT), 2), (3, 4)) FROM pair_source GROUP BY a ORDER BY a",
                 "SELECT a FROM pair_source GROUP BY a HAVING (a, SUM(b)) IN ((CAST('1' AS TEXT), 2), (3, 4)) ORDER BY a",
+                "SELECT a FROM pair_source GROUP BY a HAVING (a, SUM(b)) IN ((a, NULL), (9, 9)) ORDER BY a",
+                "SELECT a FROM pair_source GROUP BY a HAVING (a, SUM(b)) NOT IN ((9, 9), (7, 8)) ORDER BY a",
+                "SELECT a FROM pair_source GROUP BY a HAVING (a, SUM(b)) NOT IN ((a, NULL), (9, 9)) ORDER BY a",
+                // HAVING subquery inlining must preserve scalar-subquery
+                // vector width and each field's donated affinity.
+                "SELECT a FROM pair_source GROUP BY a HAVING \
+                 (SELECT 1, 2) IN ((SELECT 1, 9)) ORDER BY a",
+                "SELECT a FROM pair_source GROUP BY a HAVING \
+                 (SELECT 1, 2) IN (SELECT 1, 2) ORDER BY a",
+                "SELECT a FROM pair_source GROUP BY a HAVING \
+                 (1, 2) IN (((SELECT CAST('1' AS TEXT)), 2)) ORDER BY a",
                 // Correlated vector subqueries must retain result-column
                 // affinity, distinguish empty RHS from NULL LHS, and retain
                 // tuple UNKNOWN when a candidate has no unequal field.
@@ -221270,6 +222123,158 @@ mod pager_routing_tests {
                     prepared.iter().map(row_values).collect::<Vec<_>>(),
                     direct.iter().map(row_values).collect::<Vec<_>>(),
                     "prepared vector-IN execution diverged for `{query}`"
+                );
+            }
+
+            for (query, expected_detail) in [
+                ("SELECT (SELECT 1, 2) IN ((1, 2))", "row value misused"),
+                (
+                    "SELECT (SELECT 1, 2) IN ((SELECT 1))",
+                    "sub-select returns 1 columns - expected 2",
+                ),
+                (
+                    "SELECT (1, 2) IN ((SELECT 1))",
+                    "sub-select returns 1 columns - expected 2",
+                ),
+                (
+                    "SELECT (1, 2) IN ((SELECT 1), (SELECT 2))",
+                    "IN(...) element has 1 term - expected 2",
+                ),
+                (
+                    "SELECT ((SELECT 1, 2), 3) IN ((1, 3))",
+                    "sub-select returns 2 columns - expected 1",
+                ),
+                (
+                    "SELECT (1, 3) IN (((SELECT 1, 2), 3))",
+                    "sub-select returns 2 columns - expected 1",
+                ),
+                (
+                    "SELECT 1 GROUP BY 1 HAVING (SELECT 1, 2)",
+                    "sub-select returns 2 columns - expected 1",
+                ),
+                (
+                    "SELECT (SELECT 1, 2) IN (random())",
+                    "sub-select returns 2 columns - expected 1",
+                ),
+                (
+                    "SELECT (SELECT 1, 2) IN ((1, 2), (3, 4))",
+                    "sub-select returns 2 columns - expected 1",
+                ),
+                (
+                    "SELECT (SELECT nosuch_vector_lhs_function(), 2) IN ((1, 2))",
+                    "row value misused",
+                ),
+                (
+                    "SELECT (SELECT nosuch_vector_lhs_column, 2) IN ((1, 2))",
+                    "row value misused",
+                ),
+            ] {
+                let sqlite_error = match rconn.prepare(query) {
+                    Ok(_) => panic!("SQLite unexpectedly prepared invalid vector shape `{query}`"),
+                    Err(error) => error,
+                };
+                assert!(
+                    sqlite_error.to_string().contains(expected_detail),
+                    "unexpected SQLite error for `{query}`: {sqlite_error}"
+                );
+
+                let direct_error = fconn
+                    .query(query)
+                    .await
+                    .expect_err("direct invalid vector shape must fail");
+                assert!(
+                    matches!(&direct_error, FrankenError::FunctionError(detail) if detail == expected_detail),
+                    "unexpected direct error for `{query}`: {direct_error}"
+                );
+                let prepare_error = match fconn.prepare(query).await {
+                    Ok(_) => panic!("FrankenSQLite unexpectedly prepared `{query}`"),
+                    Err(error) => error,
+                };
+                assert!(
+                    matches!(&prepare_error, FrankenError::FunctionError(detail) if detail == expected_detail),
+                    "unexpected prepare error for `{query}`: {prepare_error}"
+                );
+            }
+
+            let missing_lhs_query =
+                "SELECT (SELECT a, b FROM missing_vector_lhs) IN ((1, 2))";
+            let sqlite_missing_error = match rconn.prepare(missing_lhs_query) {
+                Ok(_) => panic!("SQLite unexpectedly prepared a missing vector-LHS relation"),
+                Err(error) => error,
+            };
+            assert!(
+                sqlite_missing_error
+                    .to_string()
+                    .contains("no such table: missing_vector_lhs"),
+                "SQLite relation error must precede row-value shape diagnostics: {sqlite_missing_error}"
+            );
+            let direct_missing_error = fconn
+                .query(missing_lhs_query)
+                .await
+                .expect_err("direct missing vector-LHS relation must fail");
+            assert!(matches!(
+                &direct_missing_error,
+                FrankenError::NoSuchTable { name } if name == "missing_vector_lhs"
+            ));
+            let prepare_missing_error = match fconn.prepare(missing_lhs_query).await {
+                Ok(_) => panic!("FrankenSQLite unexpectedly prepared a missing vector-LHS relation"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                &prepare_missing_error,
+                FrankenError::NoSuchTable { name } if name == "missing_vector_lhs"
+            ));
+
+            for (query, expected_detail) in [
+                (
+                    "SELECT (SELECT 1, 2) IN ((SELECT a FROM missing_vector_rhs))",
+                    "no such table: missing_vector_rhs",
+                ),
+                (
+                    "SELECT (SELECT 1, 2) IN \
+                     (random(), (SELECT a FROM missing_vector_rhs_late))",
+                    "no such table: missing_vector_rhs_late",
+                ),
+                (
+                    "SELECT (SELECT 1, 2) IN (nosuch_vector_function())",
+                    "no such function: nosuch_vector_function",
+                ),
+                (
+                    "SELECT (SELECT 1, 2) IN ((SELECT nosuch_vector_column))",
+                    "no such column: nosuch_vector_column",
+                ),
+            ] {
+                let sqlite_error = match rconn.prepare(query) {
+                    Ok(_) => panic!(
+                        "SQLite unexpectedly prepared invalid vector RHS precedence fixture \
+                         `{query}`"
+                    ),
+                    Err(error) => error,
+                };
+                assert!(
+                    sqlite_error.to_string().contains(expected_detail),
+                    "SQLite RHS error must precede vector-shape diagnostics for `{query}`: \
+                     {sqlite_error}"
+                );
+
+                let direct_error = fconn
+                    .query(query)
+                    .await
+                    .expect_err("direct invalid vector RHS must fail");
+                assert!(
+                    direct_error.to_string().contains(expected_detail),
+                    "unexpected direct RHS precedence error for `{query}`: {direct_error}"
+                );
+                let prepared_error = match fconn.prepare(query).await {
+                    Ok(statement) => statement
+                        .query()
+                        .await
+                        .expect_err("prepared invalid vector RHS must fail"),
+                    Err(error) => error,
+                };
+                assert!(
+                    prepared_error.to_string().contains(expected_detail),
+                    "unexpected prepared RHS precedence error for `{query}`: {prepared_error}"
                 );
             }
         });
@@ -221403,6 +222408,38 @@ mod pager_routing_tests {
                 calls.load(AtomicOrdering::Relaxed),
                 2,
                 "prepared dispatch must also evaluate each vector LHS field once"
+            );
+
+            conn.execute("CREATE TABLE vector_having_once(a INTEGER, b INTEGER)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO vector_having_once VALUES (1, 2)")
+                .await
+                .unwrap();
+            let having_sql = "SELECT a FROM vector_having_once GROUP BY a \
+                              HAVING (next_vector_value(), next_vector_value()) \
+                                     IN ((9, 9), (1, 2))";
+
+            calls.store(0, AtomicOrdering::Relaxed);
+            let having_rows = conn.query(having_sql).await.unwrap();
+            assert_eq!(having_rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(
+                calls.load(AtomicOrdering::Relaxed),
+                2,
+                "HAVING must evaluate each volatile vector LHS field exactly once per group"
+            );
+
+            calls.store(0, AtomicOrdering::Relaxed);
+            let prepared_having = conn.prepare(having_sql).await.unwrap();
+            let prepared_having_rows = prepared_having.query().await.unwrap();
+            assert_eq!(
+                prepared_having_rows[0].values()[0],
+                SqliteValue::Integer(1)
+            );
+            assert_eq!(
+                calls.load(AtomicOrdering::Relaxed),
+                2,
+                "prepared HAVING must evaluate each volatile vector LHS field once per group"
             );
         });
     }
