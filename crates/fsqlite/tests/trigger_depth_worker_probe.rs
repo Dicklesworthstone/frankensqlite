@@ -1,4 +1,4 @@
-#![cfg(feature = "async-api")]
+#![cfg(all(feature = "async-api", not(target_arch = "wasm32")))]
 // The raw Connection is intentionally !Send, and keeping its composed future
 // on the requested 1 MiB thread is the contract this gate measures.
 #![allow(clippy::future_not_send, clippy::large_futures)]
@@ -35,10 +35,14 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const STACK_GATE_SCENARIO_ENV: &str = "FSQLITE_STACK_GATE_SCENARIO";
+const STACK_GATE_CHILD_ENV: &str = "FSQLITE_STACK_GATE_CHILD";
 const RAW_STACK_BYTES: usize = 1024 * 1024;
 const SCENARIO_DEADLINE: Duration = Duration::from_secs(180);
-const STACK_GATE_SCENARIOS: [&str; 6] = [
+const GATE_DEADLINE: Duration = Duration::from_secs(600);
+const CHILD_REAP_DEADLINE: Duration = Duration::from_secs(5);
+const STACK_GATE_SCENARIOS: [&str; 7] = [
     "raw_fk",
+    "raw_trigger",
     "raw_trigger_fk",
     "raw_fk_trigger_fk",
     "raw_expr_vdbe",
@@ -54,7 +58,7 @@ fn expression_depth_limit() -> usize {
     usize::try_from(MAX_EXPR_DEPTH).expect("MAX_EXPR_DEPTH must fit usize")
 }
 
-fn run_stack_gate_child(scenario: &str) {
+fn run_stack_gate_child(scenario: &str, deadline: Duration) {
     let executable = std::env::current_exe().expect("resolve current test executable");
     let mut child = Command::new(executable)
         .args([
@@ -63,6 +67,7 @@ fn run_stack_gate_child(scenario: &str) {
             "--nocapture",
             "--test-threads=1",
         ])
+        .env(STACK_GATE_CHILD_ENV, "1")
         .env(STACK_GATE_SCENARIO_ENV, scenario)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -94,12 +99,24 @@ fn run_stack_gate_child(scenario: &str) {
         {
             break (status, false);
         }
-        if started.elapsed() >= SCENARIO_DEADLINE {
-            let _ = child.kill();
-            let status = child
-                .wait()
-                .unwrap_or_else(|error| panic!("reap timed-out scenario {scenario}: {error}"));
-            break (status, true);
+        if started.elapsed() >= deadline {
+            child
+                .kill()
+                .unwrap_or_else(|error| panic!("terminate timed-out scenario {scenario}: {error}"));
+            let reap_started = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().unwrap_or_else(|error| {
+                    panic!("reap timed-out scenario {scenario}: {error}")
+                }) {
+                    break (status, true);
+                }
+                assert!(
+                    reap_started.elapsed() < CHILD_REAP_DEADLINE,
+                    "terminated stack-gate scenario {scenario} was not reaped within {}s",
+                    CHILD_REAP_DEADLINE.as_secs()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -116,7 +133,7 @@ fn run_stack_gate_child(scenario: &str) {
     assert!(
         !timed_out,
         "stack-gate scenario {scenario} exceeded {}s\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        SCENARIO_DEADLINE.as_secs()
+        deadline.as_secs()
     );
     assert!(
         status.success(),
@@ -132,20 +149,30 @@ fn run_stack_gate_child(scenario: &str) {
 
 #[test]
 fn physical_stack_release_gate() {
-    if let Ok(scenario) = std::env::var(STACK_GATE_SCENARIO_ENV) {
+    if std::env::var(STACK_GATE_CHILD_ENV).as_deref() == Ok("1")
+        && let Ok(scenario) = std::env::var(STACK_GATE_SCENARIO_ENV)
+    {
         run_stack_gate_scenario(&scenario);
         println!("STACK_GATE_OK scenario={scenario}");
         return;
     }
 
+    let gate_started = Instant::now();
     for scenario in STACK_GATE_SCENARIOS {
-        run_stack_gate_child(scenario);
+        let remaining = GATE_DEADLINE.checked_sub(gate_started.elapsed()).unwrap_or_else(|| {
+            panic!(
+                "physical stack release gate exceeded its aggregate {}s deadline before scenario {scenario}",
+                GATE_DEADLINE.as_secs()
+            )
+        });
+        run_stack_gate_child(scenario, remaining.min(SCENARIO_DEADLINE));
     }
 }
 
 fn run_stack_gate_scenario(scenario: &str) {
     match scenario {
         "raw_fk" => run_on_raw_stack(raw_fk_worker),
+        "raw_trigger" => run_on_raw_stack(raw_trigger_worker),
         "raw_trigger_fk" => run_on_raw_stack(raw_trigger_fk_worker),
         "raw_fk_trigger_fk" => run_on_raw_stack(raw_fk_trigger_fk_worker),
         "raw_expr_vdbe" => run_on_raw_stack(raw_expr_vdbe_worker),
@@ -174,6 +201,10 @@ fn raw_runtime() -> asupersync::runtime::Runtime {
 
 fn raw_fk_worker() {
     raw_runtime().block_on(run_raw_fk());
+}
+
+fn raw_trigger_worker() {
+    raw_runtime().block_on(run_raw_trigger());
 }
 
 fn raw_trigger_fk_worker() {
