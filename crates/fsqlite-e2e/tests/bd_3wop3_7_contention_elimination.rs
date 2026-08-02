@@ -425,10 +425,7 @@ fn test_ebr_no_gc_pauses() {
 #[test]
 #[ignore = "manual timing-sensitive sustained-insert latency stress test"]
 fn test_sustained_insert_p99_latency() {
-    if supervise_ignored_stress_test(
-        "test_sustained_insert_p99_latency",
-        Duration::from_secs(45),
-    ) {
+    if supervise_ignored_stress_test("test_sustained_insert_p99_latency", Duration::from_secs(45)) {
         return;
     }
 
