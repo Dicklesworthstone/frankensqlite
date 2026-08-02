@@ -24,15 +24,19 @@
 //! - S5: Schema cache coherence after concurrent DDL storm
 #![recursion_limit = "512"]
 
+use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
-use std::{env, process::Command};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{env, process::Command, process::Stdio};
 
-use fsqlite::{Connection, FrankenError, Row};
+use fsqlite::{Connection, FrankenError, Row, SqliteValue};
 
 const STRESS_DURATION: Duration = Duration::from_secs(2);
 const SCHEMA_STORM_RETRY_BUDGET: Duration = Duration::from_secs(5);
+const SCHEMA_STORM_CHILD_ENV: &str = "FSQLITE_SCHEMA_STORM_CHILD";
+const SCHEMA_STORM_RECEIPT_ENV: &str = "FSQLITE_SCHEMA_STORM_RECEIPT";
+const SCHEMA_STORM_RECEIPT_PREFIX: &str = "FSQLITE_SCHEMA_STORM_COMPLETE:";
 
 fn test_tmpdir() -> tempfile::TempDir {
     tempfile::tempdir_in(std::env::temp_dir())
@@ -41,34 +45,71 @@ fn test_tmpdir() -> tempfile::TempDir {
 }
 
 fn supervise_schema_storm_test() -> bool {
-    const CHILD_TEST_ENV: &str = "FSQLITE_SCHEMA_STORM_CHILD";
     const TEST_NAME: &str = "s5_schema_coherence_after_storm";
     const TIMEOUT: Duration = Duration::from_secs(90);
 
-    if env::var_os(CHILD_TEST_ENV).is_some() {
+    if env::var_os(SCHEMA_STORM_CHILD_ENV).is_some() {
         return false;
     }
 
+    let receipt_token = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos()
+    );
+    let expected_receipt = format!("{SCHEMA_STORM_RECEIPT_PREFIX}{receipt_token}");
     let test_binary = env::current_exe().expect("resolve current test binary");
     let mut child = Command::new(test_binary)
         .args(["--exact", TEST_NAME, "--include-ignored", "--nocapture"])
-        .env(CHILD_TEST_ENV, "1")
+        .env(SCHEMA_STORM_CHILD_ENV, "1")
+        .env(SCHEMA_STORM_RECEIPT_ENV, receipt_token)
+        .stdout(Stdio::piped())
         .spawn()
         .expect("spawn supervised schema-storm child");
+    let child_stdout = child
+        .stdout
+        .take()
+        .expect("capture supervised schema-storm child stdout");
+    let mut receipt_reader = Some(std::thread::spawn(move || {
+        let mut found = false;
+        for line in BufReader::new(child_stdout).lines() {
+            if line.expect("read supervised schema-storm child stdout") == expected_receipt {
+                found = true;
+            }
+        }
+        found
+    }));
     let deadline = Instant::now() + TIMEOUT;
 
     loop {
         match child.try_wait().expect("poll schema-storm child") {
             Some(status) => {
+                let receipt_found = receipt_reader
+                    .take()
+                    .expect("receipt reader must be present")
+                    .join()
+                    .expect("schema-storm receipt reader must not panic");
                 assert!(
                     status.success(),
                     "supervised schema-storm child failed with {status}"
+                );
+                assert!(
+                    receipt_found,
+                    "supervised schema-storm child exited without its completion receipt"
                 );
                 return true;
             }
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 child.wait().expect("reap timed-out schema-storm child");
+                receipt_reader
+                    .take()
+                    .expect("receipt reader must be present")
+                    .join()
+                    .expect("schema-storm receipt reader must not panic");
                 panic!("supervised schema-storm test exceeded {TIMEOUT:?}");
             }
             None => std::thread::sleep(Duration::from_millis(50)),
@@ -92,17 +133,22 @@ async fn execute_schema_storm_step(
     sql: &str,
     transient_retries: &AtomicU64,
 ) -> Result<usize, FrankenError> {
-    let started = Instant::now();
+    let deadline = Instant::now() + SCHEMA_STORM_RETRY_BUDGET;
     let mut retries = 0_u32;
     loop {
         match conn.execute(sql).await {
             Ok(changed) => return Ok(changed),
-            Err(error)
-                if is_schema_storm_transient(&error)
-                    && started.elapsed() < SCHEMA_STORM_RETRY_BUDGET =>
-            {
+            Err(error) if is_schema_storm_transient(&error) => {
                 transient_retries.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(1_u64 << retries.min(4)));
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                let backoff = Duration::from_millis(1_u64 << retries.min(4));
+                std::thread::sleep(backoff.min(remaining));
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
                 retries = retries.saturating_add(1);
             }
             Err(error) => return Err(error),
@@ -115,17 +161,22 @@ async fn query_schema_storm_step(
     sql: &str,
     transient_retries: &AtomicU64,
 ) -> Result<Vec<Row>, FrankenError> {
-    let started = Instant::now();
+    let deadline = Instant::now() + SCHEMA_STORM_RETRY_BUDGET;
     let mut retries = 0_u32;
     loop {
         match conn.query(sql).await {
             Ok(rows) => return Ok(rows),
-            Err(error)
-                if is_schema_storm_transient(&error)
-                    && started.elapsed() < SCHEMA_STORM_RETRY_BUDGET =>
-            {
+            Err(error) if is_schema_storm_transient(&error) => {
                 transient_retries.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(1_u64 << retries.min(4)));
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                let backoff = Duration::from_millis(1_u64 << retries.min(4));
+                std::thread::sleep(backoff.min(remaining));
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
                 retries = retries.saturating_add(1);
             }
             Err(error) => return Err(error),
@@ -137,22 +188,64 @@ async fn open_schema_storm_connection(
     path: &str,
     transient_retries: &AtomicU64,
 ) -> Result<Connection, FrankenError> {
-    let started = Instant::now();
+    let deadline = Instant::now() + SCHEMA_STORM_RETRY_BUDGET;
     let mut retries = 0_u32;
     loop {
         match Connection::open(path).await {
             Ok(conn) => return Ok(conn),
-            Err(error)
-                if is_schema_storm_transient(&error)
-                    && started.elapsed() < SCHEMA_STORM_RETRY_BUDGET =>
-            {
+            Err(error) if is_schema_storm_transient(&error) => {
                 transient_retries.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(1_u64 << retries.min(4)));
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                let backoff = Duration::from_millis(1_u64 << retries.min(4));
+                std::thread::sleep(backoff.min(remaining));
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
                 retries = retries.saturating_add(1);
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+async fn assert_schema_storm_object_absent(
+    conn: &Connection,
+    sql: &str,
+    expected_name: &str,
+    transient_retries: &AtomicU64,
+) {
+    match query_schema_storm_step(conn, sql, transient_retries).await {
+        Err(FrankenError::NoSuchTable { name }) => {
+            assert_eq!(
+                name, expected_name,
+                "missing-object error named the wrong schema object"
+            );
+        }
+        Err(error) => {
+            panic!("dropped schema object `{expected_name}` returned an unexpected error: {error}");
+        }
+        Ok(rows) => {
+            panic!(
+                "dropped schema object `{expected_name}` remained queryable with {} row(s)",
+                rows.len()
+            );
+        }
+    }
+}
+
+fn assert_anchor_sentinel(rows: &[Row], context: &str) {
+    assert_eq!(rows.len(), 1, "{context}: anchor row count changed");
+    assert_eq!(
+        rows[0].values(),
+        &[
+            SqliteValue::Integer(7),
+            SqliteValue::Text("sentinel".into()),
+        ],
+        "{context}: anchor sentinel changed"
+    );
 }
 
 // ─── S1: Concurrent CREATE VIEW + SELECT ───────────────────────────
@@ -467,7 +560,6 @@ fn s4_view_trigger_interaction_ddl() {
 // ─── S5: Schema cache coherence after DDL storm ────────────────────
 
 #[test]
-#[ignore = "CONFIRMED BUG bd-e6zfc: schema_by_name diverges from schema under concurrent DDL — assertion 'schema_by_name size 8 != schema len 9' in connection.rs:26571"]
 fn s5_schema_coherence_after_storm() {
     if supervise_schema_storm_test() {
         return;
@@ -480,9 +572,12 @@ fn s5_schema_coherence_after_storm() {
 
         {
             let conn = Connection::open(path_str).await.expect("open");
-            conn.execute("CREATE TABLE anchor (id INTEGER PRIMARY KEY)")
+            conn.execute("CREATE TABLE anchor (id INTEGER PRIMARY KEY, marker TEXT NOT NULL)")
                 .await
                 .expect("create anchor");
+            conn.execute("INSERT INTO anchor VALUES (7, 'sentinel')")
+                .await
+                .expect("seed anchor sentinel");
             conn.close().await.expect("close setup connection");
         }
 
@@ -511,8 +606,21 @@ fn s5_schema_coherence_after_storm() {
                             .await
                             .expect("open DDL worker connection");
                         worker_ready.send(()).expect("report DDL worker readiness");
+                        drop(worker_ready);
                         while !worker_start.load(Ordering::Acquire) {
+                            if s.load(Ordering::Acquire) {
+                                conn.close_without_checkpoint()
+                                    .await
+                                    .expect("close cancelled DDL worker connection");
+                                return;
+                            }
                             std::thread::yield_now();
+                        }
+                        if s.load(Ordering::Acquire) {
+                            conn.close_without_checkpoint()
+                                .await
+                                .expect("close cancelled DDL worker connection");
+                            return;
                         }
                         let mut completed_rounds = 0u64;
                         while !s.load(Ordering::Relaxed) {
@@ -588,16 +696,31 @@ fn s5_schema_coherence_after_storm() {
                                 residual_objects.is_empty(),
                                 "worker {tid} round {completed_rounds}: dropped table or view remains visible"
                             );
+                            assert_schema_storm_object_absent(
+                                &conn,
+                                &format!("SELECT * FROM {name}"),
+                                &name,
+                                retries.as_ref(),
+                            )
+                            .await;
+                            assert_schema_storm_object_absent(
+                                &conn,
+                                &format!("SELECT * FROM v_{name}"),
+                                &format!("v_{name}"),
+                                retries.as_ref(),
+                            )
+                            .await;
                             completed_rounds += 1;
                         }
 
-                        query_schema_storm_step(
+                        let anchor_rows = query_schema_storm_step(
                             &conn,
-                            "SELECT COUNT(*) FROM anchor",
+                            "SELECT id, marker FROM anchor",
                             retries.as_ref(),
                         )
                         .await
                         .expect("hot worker cache retains anchor table");
+                        assert_anchor_sentinel(&anchor_rows, "hot worker cache");
                         assert!(
                             completed_rounds > 0,
                             "schema-storm worker {tid} completed no verified rounds"
@@ -616,18 +739,26 @@ fn s5_schema_coherence_after_storm() {
             .collect();
 
         drop(ready_tx);
-        let readiness =
-            (0..4).try_for_each(|_| ready_rx.recv_timeout(Duration::from_secs(30)).map(|_| ()));
-        start.store(true, Ordering::Release);
+        let readiness_deadline = Instant::now() + Duration::from_secs(30);
+        let readiness = (0..4).try_for_each(|_| {
+            ready_rx
+                .recv_timeout(readiness_deadline.saturating_duration_since(Instant::now()))
+                .map(|_| ())
+        });
         if let Err(error) = readiness {
             stop.store(true, Ordering::Release);
+            start.store(true, Ordering::Release);
+            let mut panicked_workers = 0_u64;
             for thread in threads {
-                if thread.is_finished() {
-                    let _ = thread.join();
+                if thread.join().is_err() {
+                    panicked_workers += 1;
                 }
             }
-            panic!("schema-storm workers did not all become ready: {error}");
+            panic!(
+                "schema-storm workers did not all become ready: {error}; panicked_workers={panicked_workers}"
+            );
         }
+        start.store(true, Ordering::Release);
 
         std::thread::sleep(STRESS_DURATION);
         stop.store(true, Ordering::Relaxed);
@@ -648,13 +779,22 @@ fn s5_schema_coherence_after_storm() {
         let verify = open_schema_storm_connection(path_str, transient_retries.as_ref())
             .await
             .expect("open verification connection");
-        query_schema_storm_step(&verify, "SELECT * FROM anchor", transient_retries.as_ref())
-            .await
-            .expect("anchor table missing after DDL storm");
+        let anchor_rows = query_schema_storm_step(
+            &verify,
+            "SELECT id, marker FROM anchor",
+            transient_retries.as_ref(),
+        )
+        .await
+        .expect("anchor table missing after DDL storm");
+        assert_anchor_sentinel(&anchor_rows, "final verifier");
         verify.close().await.expect("close verification connection");
         eprintln!(
             "S5: {completed_rounds} verified DDL rounds across 4 threads with {} transient retries, anchor table intact",
             transient_retries.load(Ordering::Relaxed)
         );
     });
+
+    let receipt = env::var(SCHEMA_STORM_RECEIPT_ENV)
+        .expect("supervised schema-storm child must receive a completion receipt token");
+    println!("{SCHEMA_STORM_RECEIPT_PREFIX}{receipt}");
 }
