@@ -17744,63 +17744,70 @@ impl Connection {
     }
 
     async fn prepare_uncached(&self, sql: &str) -> Result<PreparedStatement<'_>> {
-        let statement = {
-            let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
-                .then(|| {
-                    let span = tracing::span!(
-                        target: "fsqlite.parse",
-                        tracing::Level::TRACE,
-                        "parse",
-                        parse_mode = "prepare_single",
-                        sql_len = sql.len()
-                    );
-                    record_trace_span_created();
-                    span
-                });
-            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
-            let parsed = self.cached_parse_single(sql)?;
-            self.freeze_statement_values_snapshot(parsed.as_ref())
-        };
-        // Relation lookup must observe the original parsed AST. Rewriting can
-        // eagerly evaluate or erase subqueries, which would otherwise move a
-        // missing-relation diagnostic from prepare time to execution (or hide
-        // it entirely). Non-catalog structural semantics still run on the
-        // canonical rewritten statement below.
-        self.with_fallback_function_registry(|| {
-            self.validate_statement_select_relations(&statement)
-        })?;
-        let statement = {
-            let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
-                .then(|| {
-                    let span = tracing::span!(
-                        target: "fsqlite.parse",
-                        tracing::Level::TRACE,
-                        "parse",
-                        parse_mode = "prepare_rewrite"
-                    );
-                    record_trace_span_created();
-                    span
-                });
-            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
-            let profile_enabled = hot_path_profile_enabled();
-            if profile_enabled {
-                FSQLITE_REWRITE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            let start = profile_enabled.then(Instant::now);
-            let statement = self.rewrite_subquery_statement(&statement, None).await?;
-            if let Some(start) = start {
-                FSQLITE_REWRITE_TIME_NS.fetch_add(
-                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    AtomicOrdering::Relaxed,
-                );
-            }
+        const REGISTRY_STABILITY_ATTEMPTS: usize = 4;
+
+        for attempt in 0..REGISTRY_STABILITY_ATTEMPTS {
+            let parsed = {
+                let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+                    .then(|| {
+                        let span = tracing::span!(
+                            target: "fsqlite.parse",
+                            tracing::Level::TRACE,
+                            "parse",
+                            parse_mode = "prepare_single",
+                            sql_len = sql.len()
+                        );
+                        record_trace_span_created();
+                        span
+                    });
+                let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
+                self.cached_parse_single(sql)?
+            };
+            let snapshot_generation = self.function_registry_generation();
+            let statement_snapshot = self.freeze_statement_values_snapshot(parsed.as_ref());
+            let froze_deferred_values = matches!(statement_snapshot, Cow::Owned(_));
+
+            // Relation lookup must observe the original parsed AST. Rewriting can
+            // eagerly evaluate or erase subqueries, which would otherwise move a
+            // missing-relation diagnostic from prepare time to execution (or hide
+            // it entirely). Non-catalog structural semantics still run on the
+            // canonical rewritten statement below.
             self.with_fallback_function_registry(|| {
-                self.validate_statement_select_semantics(&statement)
+                self.validate_statement_select_relations(statement_snapshot.as_ref())
             })?;
-            statement
-        };
-        let canonical_sql = statement.to_string();
-        let prepared = if self.prepared_select_requires_dispatch(&statement) {
+            let statement = {
+                let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+                    .then(|| {
+                        let span = tracing::span!(
+                            target: "fsqlite.parse",
+                            tracing::Level::TRACE,
+                            "parse",
+                            parse_mode = "prepare_rewrite"
+                        );
+                        record_trace_span_created();
+                        span
+                    });
+                let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
+                let profile_enabled = hot_path_profile_enabled();
+                if profile_enabled {
+                    FSQLITE_REWRITE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                let start = profile_enabled.then(Instant::now);
+                let statement = self
+                    .rewrite_subquery_statement(statement_snapshot.as_ref(), None)
+                    .await?;
+                if let Some(start) = start {
+                    FSQLITE_REWRITE_TIME_NS.fetch_add(
+                        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        AtomicOrdering::Relaxed,
+                    );
+                }
+                self.with_fallback_function_registry(|| {
+                    self.validate_statement_select_semantics(&statement)
+                })?;
+                statement
+            };
+            let canonical_sql = statement.to_string();
             let plan_span =
                 tracing::enabled!(target: "fsqlite.plan", tracing::Level::TRACE).then(|| {
                     let span = tracing::span!(
@@ -17813,23 +17820,24 @@ impl Connection {
                     span
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
-            self.compile_and_wrap(&canonical_sql, &statement).await?
-        } else {
-            let plan_span =
-                tracing::enabled!(target: "fsqlite.plan", tracing::Level::TRACE).then(|| {
-                    let span = tracing::span!(
-                        target: "fsqlite.plan",
-                        tracing::Level::TRACE,
-                        "plan",
-                        stage = "compile_prepared_statement"
-                    );
-                    record_trace_span_created();
-                    span
-                });
-            let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
-            self.compile_and_wrap(&canonical_sql, &statement).await?
-        };
-        Ok(prepared)
+            let prepared = self.compile_and_wrap(&canonical_sql, &statement).await?;
+
+            // User module metadata callbacks are deliberately reentrant and
+            // may replace a scalar while preparation is in progress. A VALUES
+            // donor frozen before such a callback must not be cached beneath
+            // the callback's later registry generation. Discard the incoherent
+            // attempt and rebuild from the registry-agnostic parse-cache AST.
+            if !froze_deferred_values
+                || self.function_registry_generation() == snapshot_generation
+            {
+                return Ok(prepared);
+            }
+            if attempt + 1 == REGISTRY_STABILITY_ATTEMPTS {
+                return Err(FrankenError::SchemaChanged);
+            }
+        }
+
+        unreachable!("registry-stability loop always returns")
     }
 
     /// Prepare and execute SQL as a query.
@@ -25821,11 +25829,17 @@ impl Connection {
     /// gives direct and prepared routing the same immutable donor metadata;
     /// downstream clones preserve that decision because already-frozen
     /// clauses are never recomputed.
-    fn freeze_statement_values_snapshot(&self, statement: &Statement) -> Statement {
+    fn freeze_statement_values_snapshot<'a>(
+        &self,
+        statement: &'a Statement,
+    ) -> Cow<'a, Statement> {
+        if !statement_contains_deferred_values(statement) {
+            return Cow::Borrowed(statement);
+        }
         let mut snapshot = statement.clone();
         let function_registry = Arc::clone(&self.func_registry.borrow());
         freeze_values_donors_in_statement(&mut snapshot, function_registry.as_ref());
-        snapshot
+        Cow::Owned(snapshot)
     }
 
     /// Return a cached parsed single statement, or parse fresh and cache it.
@@ -27360,7 +27374,7 @@ impl Connection {
             #[cfg(test)]
             record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
             let statement = self.freeze_statement_values_snapshot(statement);
-            self.execute_statement_impl_after_background_status(&statement, params, None)
+            self.execute_statement_impl_after_background_status(statement.as_ref(), params, None)
                 .await
         })
     }
@@ -35758,6 +35772,34 @@ impl Connection {
             }
             _ => 1,
         }
+    }
+
+    /// Validate the special scalar-subquery shape used on an explicit IN list.
+    ///
+    /// A multi-column subquery is a vector only when the RHS is itself a
+    /// subquery. Against an expression list SQLite first applies its singleton
+    /// constant rewrite (which diagnoses `row value misused`), while every
+    /// other list shape still treats the LHS as one scalar column.
+    fn validate_in_list_lhs_shape(&self, lhs: &Expr, values: &[Expr]) -> Result<()> {
+        let Expr::Subquery(select, _) = lhs else {
+            return Ok(());
+        };
+        let actual = self.select_result_column_count(select, &[], &mut Vec::new());
+        if actual <= 1 {
+            return Ok(());
+        }
+        if values.len() == 1
+            && values
+                .first()
+                .is_some_and(current_singleton_in_rhs_is_constant)
+        {
+            return Err(FrankenError::FunctionError(
+                "row value misused".to_owned(),
+            ));
+        }
+        Err(FrankenError::FunctionError(format!(
+            "sub-select returns {actual} columns - expected 1"
+        )))
     }
 
     fn resolve_in_rhs_donor_metadata(
@@ -97787,6 +97829,70 @@ fn evaluate_having_value(
             if matches!(set, InSet::List(exprs) if exprs.is_empty()) {
                 return Ok(SqliteValue::Integer(i64::from(*not)));
             }
+            if let Expr::RowValue(lhs_exprs, _) = inner.as_ref() {
+                let InSet::List(list_exprs) = set else {
+                    return Ok(SqliteValue::Null);
+                };
+                validate_vector_in_list_arity(lhs_exprs.len(), list_exprs)?;
+                let lhs = lhs_exprs
+                    .iter()
+                    .map(|lhs_expr| {
+                        evaluate_having_value(lhs_expr, values, columns, group_rows, col_map)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let donor_exprs = list_exprs.last().map(|list_item| match list_item {
+                    Expr::RowValue(fields, _) => fields.as_slice(),
+                    other => std::slice::from_ref(other),
+                });
+                let mut saw_null = false;
+                for list_item in list_exprs {
+                    let rhs_exprs = match list_item {
+                        Expr::RowValue(fields, _) => fields.as_slice(),
+                        other => std::slice::from_ref(other),
+                    };
+                    debug_assert_eq!(rhs_exprs.len(), lhs.len());
+                    let mut tuple_has_null = false;
+                    let mut tuple_all_equal = true;
+                    for (field_index, ((lhs_expr, lhs_value), rhs_expr)) in lhs_exprs
+                        .iter()
+                        .zip(&lhs)
+                        .zip(rhs_exprs)
+                        .enumerate()
+                    {
+                        let rhs_value = evaluate_having_value(
+                            rhs_expr, values, columns, group_rows, col_map,
+                        )?;
+                        if lhs_value.is_null() || rhs_value.is_null() {
+                            tuple_has_null = true;
+                        } else if donor_exprs
+                            .and_then(|donors| donors.get(field_index))
+                            .is_none_or(|donor_expr| {
+                                compare_join_expr_values(
+                                    lhs_expr,
+                                    lhs_value,
+                                    donor_expr,
+                                    &rhs_value,
+                                    col_map,
+                                ) != std::cmp::Ordering::Equal
+                            })
+                        {
+                            tuple_all_equal = false;
+                            break;
+                        }
+                    }
+                    if tuple_all_equal && !tuple_has_null {
+                        return Ok(SqliteValue::Integer(i64::from(!*not)));
+                    }
+                    if tuple_all_equal {
+                        saw_null = true;
+                    }
+                }
+                return if saw_null {
+                    Ok(SqliteValue::Null)
+                } else {
+                    Ok(SqliteValue::Integer(i64::from(*not)))
+                };
+            }
             let val = evaluate_having_value(inner, values, columns, group_rows, col_map)?;
             if val.is_null() {
                 return Ok(SqliteValue::Null);
@@ -101773,6 +101879,383 @@ fn expr_folds_to_integer_zero_via_and(expr: &Expr) -> bool {
 /// snapshot. The parser cache deliberately retains deferred clauses because
 /// application function replacement can change SQLite's parse-time
 /// coroutine decision without changing the SQL text.
+fn statement_contains_deferred_values(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(select) => select_contains_deferred_values(select),
+        Statement::Insert(insert) => {
+            with_contains_deferred_values(insert.with.as_ref())
+                || match &insert.source {
+                    InsertSource::Values(rows) => rows
+                        .iter()
+                        .flatten()
+                        .any(expr_contains_deferred_values),
+                    InsertSource::Select(select) => select_contains_deferred_values(select),
+                    InsertSource::DefaultValues => false,
+                }
+                || insert.upsert.iter().any(|upsert| {
+                    upsert.target.as_ref().is_some_and(|target| {
+                        target
+                            .columns
+                            .iter()
+                            .any(|column| expr_contains_deferred_values(&column.expr))
+                            || target
+                                .where_clause
+                                .as_ref()
+                                .is_some_and(expr_contains_deferred_values)
+                    }) || match &upsert.action {
+                        UpsertAction::Nothing => false,
+                        UpsertAction::Update {
+                            assignments,
+                            where_clause,
+                        } => {
+                            assignments.iter().any(|assignment| {
+                                expr_contains_deferred_values(&assignment.value)
+                            }) || where_clause
+                                .as_deref()
+                                .is_some_and(expr_contains_deferred_values)
+                        }
+                    }
+                })
+                || result_columns_contain_deferred_values(&insert.returning)
+        }
+        Statement::Update(update) => {
+            with_contains_deferred_values(update.with.as_ref())
+                || update
+                    .assignments
+                    .iter()
+                    .any(|assignment| expr_contains_deferred_values(&assignment.value))
+                || update
+                    .from
+                    .as_ref()
+                    .is_some_and(from_contains_deferred_values)
+                || update
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(expr_contains_deferred_values)
+                || result_columns_contain_deferred_values(&update.returning)
+                || update
+                    .order_by
+                    .iter()
+                    .any(|term| expr_contains_deferred_values(&term.expr))
+                || update
+                    .limit
+                    .as_ref()
+                    .is_some_and(limit_contains_deferred_values)
+        }
+        Statement::Delete(delete) => {
+            with_contains_deferred_values(delete.with.as_ref())
+                || delete
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(expr_contains_deferred_values)
+                || result_columns_contain_deferred_values(&delete.returning)
+                || delete
+                    .order_by
+                    .iter()
+                    .any(|term| expr_contains_deferred_values(&term.expr))
+                || delete
+                    .limit
+                    .as_ref()
+                    .is_some_and(limit_contains_deferred_values)
+        }
+        Statement::CreateTable(create) => match &create.body {
+            CreateTableBody::Columns {
+                columns,
+                constraints,
+            } => {
+                columns.iter().any(column_def_contains_deferred_values)
+                    || constraints.iter().any(|constraint| match &constraint.kind {
+                        TableConstraintKind::PrimaryKey { columns, .. }
+                        | TableConstraintKind::Unique { columns, .. } => columns
+                            .iter()
+                            .any(|column| expr_contains_deferred_values(&column.expr)),
+                        TableConstraintKind::Check(expr) => {
+                            expr_contains_deferred_values(expr)
+                        }
+                        TableConstraintKind::ForeignKey { .. } => false,
+                    })
+            }
+            CreateTableBody::AsSelect(select) => select_contains_deferred_values(select),
+        },
+        Statement::CreateIndex(create) => {
+            create
+                .columns
+                .iter()
+                .any(|column| expr_contains_deferred_values(&column.expr))
+                || create
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(expr_contains_deferred_values)
+        }
+        Statement::CreateView(create) => select_contains_deferred_values(&create.query),
+        Statement::CreateTrigger(create) => {
+            create
+                .when
+                .as_ref()
+                .is_some_and(expr_contains_deferred_values)
+                || create.body.iter().any(statement_contains_deferred_values)
+        }
+        Statement::AlterTable(alter) => matches!(
+            &alter.action,
+            AlterTableAction::AddColumn(column) if column_def_contains_deferred_values(column)
+        ),
+        Statement::Attach(attach) => expr_contains_deferred_values(&attach.expr),
+        Statement::Pragma(pragma) => pragma.value.as_ref().is_some_and(|value| match value {
+            PragmaValue::Assign(expr) | PragmaValue::Call(expr) => {
+                expr_contains_deferred_values(expr)
+            }
+        }),
+        Statement::Vacuum(vacuum) => vacuum
+            .into
+            .as_ref()
+            .is_some_and(expr_contains_deferred_values),
+        Statement::Explain { stmt, .. } => statement_contains_deferred_values(stmt),
+        Statement::CreateVirtualTable(_)
+        | Statement::Drop(_)
+        | Statement::Begin(_)
+        | Statement::Commit
+        | Statement::Rollback(_)
+        | Statement::Savepoint(_)
+        | Statement::Release(_)
+        | Statement::Detach(_)
+        | Statement::Reindex(_)
+        | Statement::Analyze(_) => false,
+    }
+}
+
+fn column_def_contains_deferred_values(column: &fsqlite_ast::ColumnDef) -> bool {
+    column
+        .constraints
+        .iter()
+        .any(|constraint| match &constraint.kind {
+            ColumnConstraintKind::Check(expr)
+            | ColumnConstraintKind::Generated { expr, .. }
+            | ColumnConstraintKind::Default(
+                DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr),
+            ) => expr_contains_deferred_values(expr),
+            ColumnConstraintKind::PrimaryKey { .. }
+            | ColumnConstraintKind::NotNull { .. }
+            | ColumnConstraintKind::Null
+            | ColumnConstraintKind::Unique { .. }
+            | ColumnConstraintKind::Collate(_)
+            | ColumnConstraintKind::ForeignKey(_) => false,
+        })
+}
+
+fn with_contains_deferred_values(with: Option<&fsqlite_ast::WithClause>) -> bool {
+    with.is_some_and(|with| {
+        with.ctes
+            .iter()
+            .any(|cte| select_contains_deferred_values(&cte.query))
+    })
+}
+
+fn select_contains_deferred_values(select: &SelectStatement) -> bool {
+    with_contains_deferred_values(select.with.as_ref())
+        || select_core_contains_deferred_values(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| select_core_contains_deferred_values(core))
+        || select
+            .order_by
+            .iter()
+            .any(|term| expr_contains_deferred_values(&term.expr))
+        || select
+            .limit
+            .as_ref()
+            .is_some_and(limit_contains_deferred_values)
+}
+
+fn select_core_contains_deferred_values(core: &SelectCore) -> bool {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            result_columns_contain_deferred_values(columns)
+                || from.as_ref().is_some_and(from_contains_deferred_values)
+                || where_clause
+                    .as_ref()
+                    .is_some_and(expr_contains_deferred_values)
+                || group_by.iter().any(expr_contains_deferred_values)
+                || having
+                    .as_ref()
+                    .is_some_and(expr_contains_deferred_values)
+                || windows
+                    .iter()
+                    .any(|window| window_contains_deferred_values(&window.spec))
+        }
+        SelectCore::Values(values) => {
+            !values.is_frozen()
+                || values
+                    .iter()
+                    .flatten()
+                    .any(expr_contains_deferred_values)
+        }
+    }
+}
+
+fn from_contains_deferred_values(from: &FromClause) -> bool {
+    source_contains_deferred_values(&from.source)
+        || from.joins.iter().any(|join| {
+            source_contains_deferred_values(&join.table)
+                || matches!(
+                    &join.constraint,
+                    Some(JoinConstraint::On(expr)) if expr_contains_deferred_values(expr)
+                )
+        })
+}
+
+fn source_contains_deferred_values(source: &TableOrSubquery) -> bool {
+    match source {
+        TableOrSubquery::Subquery { query, .. } => select_contains_deferred_values(query),
+        TableOrSubquery::TableFunction { args, .. } => {
+            args.iter().any(expr_contains_deferred_values)
+        }
+        TableOrSubquery::ParenJoin(from) => from_contains_deferred_values(from),
+        TableOrSubquery::Table { .. } => false,
+    }
+}
+
+fn result_columns_contain_deferred_values(columns: &[ResultColumn]) -> bool {
+    columns.iter().any(|column| {
+        matches!(
+            column,
+            ResultColumn::Expr { expr, .. } if expr_contains_deferred_values(expr)
+        )
+    })
+}
+
+fn limit_contains_deferred_values(limit: &LimitClause) -> bool {
+    expr_contains_deferred_values(&limit.limit)
+        || limit
+            .offset
+            .as_ref()
+            .is_some_and(expr_contains_deferred_values)
+}
+
+fn expr_contains_deferred_values(expr: &Expr) -> bool {
+    match expr {
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => false,
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => expr_contains_deferred_values(left) || expr_contains_deferred_values(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => expr_contains_deferred_values(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_deferred_values(expr)
+                || expr_contains_deferred_values(low)
+                || expr_contains_deferred_values(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_deferred_values(expr)
+                || match set {
+                    InSet::List(values) => values.iter().any(expr_contains_deferred_values),
+                    InSet::Subquery(select) => select_contains_deferred_values(select),
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_deferred_values(expr)
+                || expr_contains_deferred_values(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(expr_contains_deferred_values)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(expr_contains_deferred_values)
+                || whens.iter().any(|(condition, value)| {
+                    expr_contains_deferred_values(condition)
+                        || expr_contains_deferred_values(value)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_deferred_values)
+        }
+        Expr::Subquery(select, _) | Expr::Exists { subquery: select, .. } => {
+            select_contains_deferred_values(select)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            matches!(args, FunctionArgs::List(values) if values
+                .iter()
+                .any(expr_contains_deferred_values))
+                || order_by
+                    .iter()
+                    .any(|term| expr_contains_deferred_values(&term.expr))
+                || filter
+                    .as_deref()
+                    .is_some_and(expr_contains_deferred_values)
+                || over.as_ref().is_some_and(window_contains_deferred_values)
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_contains_deferred_values),
+    }
+}
+
+fn window_contains_deferred_values(window: &WindowSpec) -> bool {
+    window
+        .partition_by
+        .iter()
+        .any(expr_contains_deferred_values)
+        || window
+            .order_by
+            .iter()
+            .any(|term| expr_contains_deferred_values(&term.expr))
+        || window.frame.as_ref().is_some_and(|frame| {
+            frame_bound_contains_deferred_values(&frame.start)
+                || frame
+                    .end
+                    .as_ref()
+                    .is_some_and(frame_bound_contains_deferred_values)
+        })
+}
+
+fn frame_bound_contains_deferred_values(bound: &FrameBound) -> bool {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            expr_contains_deferred_values(expr)
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => false,
+    }
+}
+
 fn freeze_values_donors_in_statement(
     statement: &mut Statement,
     function_registry: &FunctionRegistry,
@@ -104406,6 +104889,9 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                 if matches!(set, InSet::List(values) if values.is_empty()) {
                     return Ok(());
                 }
+                if let InSet::List(values) = set {
+                    self.connection.validate_in_list_lhs_shape(expr, values)?;
+                }
                 self.validate_expr(expr)?;
                 match set {
                     InSet::List(values) => {
@@ -105576,6 +106062,9 @@ impl<'a> SelectStructureResolver<'a> {
             Expr::In { expr, set, .. } => {
                 if matches!(set, InSet::List(values) if values.is_empty()) {
                     return Ok(());
+                }
+                if let InSet::List(values) = set {
+                    self.connection.validate_in_list_lhs_shape(expr, values)?;
                 }
                 self.validate_expr(expr, named_windows)?;
                 match set {
