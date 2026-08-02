@@ -640,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "microbench: run with `cargo test --release -- --ignored bench_gate_hot_path`"]
+    #[ignore = "microbench: run with `cargo test --profile release-perf -- --ignored bench_gate_hot_path`"]
     fn bench_gate_hot_path() {
         // Hot-path microbenchmark. Not a correctness test. Reports
         // nanoseconds per `observe` and per `should_skip_ssi` call to

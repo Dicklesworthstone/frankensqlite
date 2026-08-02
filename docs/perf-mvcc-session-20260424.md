@@ -7,6 +7,13 @@ below come from a single batched run this session:
     cargo test -p fsqlite-mvcc --lib --release -- --ignored --nocapture \
       <bench_name_1> <bench_name_2> ...
 
+The command above is retained as historical provenance; it records the profile
+that produced these numbers and must not be silently rewritten. Under current
+project policy, `release` is size-optimized, so this report is not current
+throughput-release evidence and must not be compared directly with
+`release-perf` results. Any new run must use `--profile release-perf` and record
+any host-tuning `RUSTFLAGS` in its artifact provenance.
+
 Parallel test execution adds some noise to paired before/after numbers,
 but the signs are consistent with each commit's original dedicated run.
 

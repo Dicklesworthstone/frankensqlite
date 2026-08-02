@@ -3259,7 +3259,7 @@ mod tests {
     /// when metrics are disabled and that call is pure waste.
     ///
     /// Run with:
-    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
     ///    bench_resolve_visible_version_metric_gate --ignored --nocapture`
     #[test]
     #[ignore = "microbench — run manually"]

@@ -41455,7 +41455,7 @@ mod tests {
     /// baseline and optimized in one binary avoids cross-build timing noise.
     ///
     /// Run via:
-    ///   cargo test -p fsqlite-pager --lib --release --
+    ///   cargo test -p fsqlite-pager --lib --profile release-perf --
     ///     --ignored --nocapture
     ///     bench_concurrent_published_pages_clear_empty_overflow_microbench
     #[test]
@@ -45417,7 +45417,7 @@ mod tests {
         // 3. Multiple iterations for statistical significance
         // 4. The release-perf profile for meaningful numbers
         //
-        // Run via: cargo test -p fsqlite-pager --release -- \
+        // Run via: cargo test -p fsqlite-pager --profile release-perf -- \
         //          test_16t_throughput_exceeds_sqlite --ignored --nocapture
         //
         // The e2e benchmark harness (fsqlite-e2e) provides the canonical

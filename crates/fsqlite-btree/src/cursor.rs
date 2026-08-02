@@ -21177,9 +21177,9 @@ mod tests {
     }
 
     /// Micro-benchmark: size-dispatched sort vs unconditional std `sort_unstable_by_key`.
-    /// Ignored by default (run with `--release --ignored --nocapture`).
+    /// Ignored by default (run with `--profile release-perf -- --ignored --nocapture`).
     #[test]
-    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    #[ignore = "micro-benchmark; run with `--profile release-perf -- --ignored --nocapture`"]
     fn bench_remove_cell_from_leaf_sort() {
         use std::cmp::Reverse;
 
@@ -21238,11 +21238,11 @@ mod tests {
 
     /// Micro-benchmark for bd-4i4vh: hot-front-entry CellSlotCache insert.
     ///
-    /// Ignored by default (run with `--release --ignored --nocapture`).
+    /// Ignored by default (run with `--profile release-perf -- --ignored --nocapture`).
     /// Simulates the binary-search-on-a-single-page hot path where every
     /// `parse_cell_at` miss calls `insert()` on the same MRU entry.
     #[test]
-    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    #[ignore = "micro-benchmark; run with `--profile release-perf -- --ignored --nocapture`"]
     fn bench_cell_slot_cache_insert_front_entry() {
         const PREFILL: u32 = 32;
         const WARMUP: u32 = 200_000;
@@ -21312,11 +21312,11 @@ mod tests {
 
     /// Micro-benchmark for the hot-front-entry CellSlotCache lookup path.
     ///
-    /// Ignored by default (run with `--release --ignored --nocapture`).
+    /// Ignored by default (run with `--profile release-perf -- --ignored --nocapture`).
     /// Simulates repeated `parse_cell_at` probes on the same leaf page after
     /// the page entry has already been promoted to MRU.
     #[test]
-    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    #[ignore = "micro-benchmark; run with `--profile release-perf -- --ignored --nocapture`"]
     fn bench_cell_slot_cache_get_front_entry() {
         const PREFILL: u32 = 32;
         const WARMUP: u32 = 200_000;
@@ -21430,13 +21430,13 @@ mod tests {
     /// Micro-benchmark for bd-4i4vh.3: `child_page_at` direct-read vs the old
     /// `parse_cell_at + cell.left_child` path on interior table pages.
     ///
-    /// Ignored by default (run with `--release --ignored --nocapture`).
+    /// Ignored by default (run with `--profile release-perf -- --ignored --nocapture`).
     /// Simulates root-to-leaf descent where every interior-page probe only
     /// needs the left-child pointer; the legacy path paid for two varint
     /// decodes + cell-slot cache traffic + a full `CellRef` struct build just
     /// to throw away everything except `left_child`.
     #[test]
-    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    #[ignore = "micro-benchmark; run with `--profile release-perf -- --ignored --nocapture`"]
     fn bench_child_page_at_interior_table() {
         run_async(async {
             const CHILDREN: usize = 128;
@@ -21521,9 +21521,9 @@ mod tests {
     /// 2. Random inserts — table_insert with a pseudo-random rowid sequence.
     /// 3. Read-heavy — monotonic insert then repeated `table_move_to` seeks.
     ///
-    /// Use with `--release --ignored --nocapture`.
+    /// Use with `--profile release-perf -- --ignored --nocapture`.
     #[test]
-    #[ignore = "audit benchmark; run with `--release --ignored --nocapture`"]
+    #[ignore = "audit benchmark; run with `--profile release-perf -- --ignored --nocapture`"]
     fn audit_cell_slot_cache_hit_rate_write_vs_read() {
         run_async(async {
             // bd-9e3xf.5: CellSlotCache hit/miss counters are now gated by the
@@ -21686,7 +21686,7 @@ mod tests {
     /// but targets the DELETE-rebalance separator lookup (≈1 call per leaf
     /// collapse; 99 % cache miss per the bd-k7zd7 audit).
     #[test]
-    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    #[ignore = "micro-benchmark; run with `--profile release-perf -- --ignored --nocapture`"]
     fn bench_replace_separator_inline_vs_parse_cell_at() {
         run_async(async {
             const CHILDREN: usize = 128;
@@ -21765,7 +21765,7 @@ mod tests {
     /// same profile flag that already gates `record_*_copy` etc. restores
     /// the get-fast-path cost to where it was pre-instrumentation.
     #[test]
-    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    #[ignore = "micro-benchmark; run with `--profile release-perf -- --ignored --nocapture`"]
     fn bench_cell_slot_cache_get_gate_on_vs_off() {
         const PREFILL: u32 = 32;
         const WARMUP: u32 = 200_000;

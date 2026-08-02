@@ -17,7 +17,7 @@
 //! The test is `#[ignore]`-gated. Run on demand via:
 //!
 //! ```sh
-//! cargo test --release -p fsqlite-e2e --test swarm_writer_harness \
+//! cargo test --profile release-perf -p fsqlite-e2e --test swarm_writer_harness \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 //!

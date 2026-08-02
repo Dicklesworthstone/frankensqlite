@@ -455,4 +455,4 @@ grow a scenario that proves the refusal actually refuses.
   swarm-writer harness at
   `crates/fsqlite-e2e/tests/swarm_writer_harness.rs`
   (`#[ignore]`-gated; runs via
-  `cargo test --release -p fsqlite-e2e --test swarm_writer_harness -- --ignored --nocapture --test-threads=1`).
+  `cargo test --profile release-perf -p fsqlite-e2e --test swarm_writer_harness -- --ignored --nocapture --test-threads=1`).

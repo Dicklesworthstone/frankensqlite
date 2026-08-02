@@ -7555,7 +7555,7 @@ mod tests {
     /// by default.
     ///
     /// Run with:
-    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
     ///    bench_active_edge_index_build --ignored --nocapture`
     #[test]
     #[ignore = "microbench — run manually"]
@@ -7637,7 +7637,7 @@ mod tests {
     /// that does a single lookup.
     ///
     /// Not a correctness test; ignored by default. Run with:
-    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
     ///    bench_read_path_page_state_lookup --ignored --nocapture`
     #[test]
     #[ignore = "microbench — run manually"]
@@ -7832,7 +7832,7 @@ mod tests {
     /// summary's already-sorted Vecs move in directly.
     ///
     /// Run with:
-    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
     ///    bench_handle_view_new_typical --ignored --nocapture`
     #[test]
     #[ignore = "microbench — run manually"]

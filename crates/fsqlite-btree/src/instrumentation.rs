@@ -2312,7 +2312,7 @@ mod tests {
     ///
     /// Run via:
     /// ```text
-    /// cargo test -p fsqlite-btree --lib --release -- --ignored --nocapture \
+    /// cargo test -p fsqlite-btree --lib --profile release-perf -- --ignored --nocapture \
     ///   bench_btree_metrics_gate_per_op_cost
     /// ```
     /// Wrapper that prevents LLVM from hoisting the gate-load out of the

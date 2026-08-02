@@ -14313,7 +14313,7 @@ mod tests {
     ///   (a per-term docid index) tracked outside this fix.
     ///
     /// Ignored by default (timing-sensitive). Run with:
-    ///   cargo test -p fsqlite-ext-fts5 --release -- --ignored --nocapture \
+    ///   cargo test -p fsqlite-ext-fts5 --profile release-perf -- --ignored --nocapture \
     ///       bench_remove_document_upsert_scaling
     #[test]
     #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]

@@ -7748,7 +7748,7 @@ mod tests {
     /// avoiding cross-binary noise.
     ///
     /// Run via:
-    ///   cargo test -p fsqlite-pager --lib --release --
+    ///   cargo test -p fsqlite-pager --lib --profile release-perf --
     ///     --ignored --nocapture
     ///     bench_sharded_cache_clear_empty_shards_microbench
     #[test]

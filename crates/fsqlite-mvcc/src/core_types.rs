@@ -3508,7 +3508,7 @@ mod tests {
     ///
     /// Not a correctness test; ignored by default. Reports wakes/sec averaged
     /// over N trials. Run with:
-    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
     ///    test_in_process_lock_table_wait_for_holder_change_microbench \
     ///    --ignored --nocapture`
     #[test]
@@ -3614,7 +3614,7 @@ mod tests {
     /// difference between the two columns is the gate's saving.
     ///
     /// Run with:
-    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
     ///    bench_notify_waiters_no_waiters --ignored --nocapture`
     #[test]
     #[ignore = "microbench — run manually"]
@@ -3728,7 +3728,7 @@ mod tests {
     /// drained our entry before we reach unregister).
     ///
     /// Run with:
-    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
     ///    bench_unregister_waiter_drained --ignored --nocapture`
     #[test]
     #[ignore = "microbench — run manually"]
