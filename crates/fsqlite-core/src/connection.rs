@@ -101769,6 +101769,621 @@ fn expr_folds_to_integer_zero_via_and(expr: &Expr) -> bool {
     }
 }
 
+/// Freeze every deferred `VALUES` clause in one connection-local statement
+/// snapshot. The parser cache deliberately retains deferred clauses because
+/// application function replacement can change SQLite's parse-time
+/// coroutine decision without changing the SQL text.
+fn freeze_values_donors_in_statement(
+    statement: &mut Statement,
+    function_registry: &FunctionRegistry,
+) {
+    match statement {
+        Statement::Select(select) => freeze_values_donors_in_select(select, function_registry),
+        Statement::Insert(insert) => {
+            freeze_values_donors_in_with(insert.with.as_mut(), function_registry);
+            match &mut insert.source {
+                InsertSource::Values(rows) => {
+                    for row in rows {
+                        freeze_values_donors_in_exprs(row, function_registry);
+                    }
+                }
+                InsertSource::Select(select) => {
+                    freeze_values_donors_in_select(select, function_registry);
+                }
+                InsertSource::DefaultValues => {}
+            }
+            for upsert in &mut insert.upsert {
+                if let Some(target) = &mut upsert.target {
+                    for column in &mut target.columns {
+                        freeze_values_donors_in_expr(&mut column.expr, function_registry);
+                    }
+                    if let Some(predicate) = &mut target.where_clause {
+                        freeze_values_donors_in_expr(predicate, function_registry);
+                    }
+                }
+                if let UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &mut upsert.action
+                {
+                    for assignment in assignments {
+                        freeze_values_donors_in_expr(&mut assignment.value, function_registry);
+                    }
+                    if let Some(predicate) = where_clause {
+                        freeze_values_donors_in_expr(predicate, function_registry);
+                    }
+                }
+            }
+            freeze_values_donors_in_result_columns(&mut insert.returning, function_registry);
+        }
+        Statement::Update(update) => {
+            freeze_values_donors_in_with(update.with.as_mut(), function_registry);
+            for assignment in &mut update.assignments {
+                freeze_values_donors_in_expr(&mut assignment.value, function_registry);
+            }
+            if let Some(from) = &mut update.from {
+                freeze_values_donors_in_from(from, function_registry);
+            }
+            if let Some(predicate) = &mut update.where_clause {
+                freeze_values_donors_in_expr(predicate, function_registry);
+            }
+            freeze_values_donors_in_result_columns(&mut update.returning, function_registry);
+            for term in &mut update.order_by {
+                freeze_values_donors_in_expr(&mut term.expr, function_registry);
+            }
+            freeze_values_donors_in_limit(update.limit.as_mut(), function_registry);
+        }
+        Statement::Delete(delete) => {
+            freeze_values_donors_in_with(delete.with.as_mut(), function_registry);
+            if let Some(predicate) = &mut delete.where_clause {
+                freeze_values_donors_in_expr(predicate, function_registry);
+            }
+            freeze_values_donors_in_result_columns(&mut delete.returning, function_registry);
+            for term in &mut delete.order_by {
+                freeze_values_donors_in_expr(&mut term.expr, function_registry);
+            }
+            freeze_values_donors_in_limit(delete.limit.as_mut(), function_registry);
+        }
+        Statement::CreateTable(create) => match &mut create.body {
+            CreateTableBody::Columns {
+                columns,
+                constraints,
+            } => {
+                for column in columns {
+                    freeze_values_donors_in_column_def(column, function_registry);
+                }
+                for constraint in constraints {
+                    match &mut constraint.kind {
+                        TableConstraintKind::PrimaryKey { columns, .. }
+                        | TableConstraintKind::Unique { columns, .. } => {
+                            for column in columns {
+                                freeze_values_donors_in_expr(
+                                    &mut column.expr,
+                                    function_registry,
+                                );
+                            }
+                        }
+                        TableConstraintKind::Check(expr) => {
+                            freeze_values_donors_in_expr(expr, function_registry);
+                        }
+                        TableConstraintKind::ForeignKey { .. } => {}
+                    }
+                }
+            }
+            CreateTableBody::AsSelect(select) => {
+                freeze_values_donors_in_select(select, function_registry);
+            }
+        },
+        Statement::CreateIndex(create) => {
+            for column in &mut create.columns {
+                freeze_values_donors_in_expr(&mut column.expr, function_registry);
+            }
+            if let Some(predicate) = &mut create.where_clause {
+                freeze_values_donors_in_expr(predicate, function_registry);
+            }
+        }
+        Statement::CreateView(create) => {
+            freeze_values_donors_in_select(&mut create.query, function_registry);
+        }
+        Statement::CreateTrigger(create) => {
+            if let Some(predicate) = &mut create.when {
+                freeze_values_donors_in_expr(predicate, function_registry);
+            }
+            for body_statement in &mut create.body {
+                freeze_values_donors_in_statement(body_statement, function_registry);
+            }
+        }
+        Statement::AlterTable(alter) => {
+            if let AlterTableAction::AddColumn(column) = &mut alter.action {
+                freeze_values_donors_in_column_def(column, function_registry);
+            }
+        }
+        Statement::Attach(attach) => {
+            freeze_values_donors_in_expr(&mut attach.expr, function_registry);
+        }
+        Statement::Pragma(pragma) => {
+            if let Some(PragmaValue::Assign(value) | PragmaValue::Call(value)) = &mut pragma.value {
+                freeze_values_donors_in_expr(value, function_registry);
+            }
+        }
+        Statement::Vacuum(vacuum) => {
+            if let Some(path) = &mut vacuum.into {
+                freeze_values_donors_in_expr(path, function_registry);
+            }
+        }
+        Statement::Explain { stmt, .. } => {
+            freeze_values_donors_in_statement(stmt, function_registry);
+        }
+        Statement::CreateVirtualTable(_)
+        | Statement::Drop(_)
+        | Statement::Begin(_)
+        | Statement::Commit
+        | Statement::Rollback(_)
+        | Statement::Savepoint(_)
+        | Statement::Release(_)
+        | Statement::Detach(_)
+        | Statement::Reindex(_)
+        | Statement::Analyze(_) => {}
+    }
+}
+
+fn freeze_values_donors_in_column_def(
+    column: &mut fsqlite_ast::ColumnDef,
+    function_registry: &FunctionRegistry,
+) {
+    for constraint in &mut column.constraints {
+        match &mut constraint.kind {
+            ColumnConstraintKind::Check(expr)
+            | ColumnConstraintKind::Generated { expr, .. }
+            | ColumnConstraintKind::Default(DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr)) => {
+                freeze_values_donors_in_expr(expr, function_registry);
+            }
+            ColumnConstraintKind::PrimaryKey { .. }
+            | ColumnConstraintKind::NotNull { .. }
+            | ColumnConstraintKind::Null
+            | ColumnConstraintKind::Unique { .. }
+            | ColumnConstraintKind::Collate(_)
+            | ColumnConstraintKind::ForeignKey(_) => {}
+        }
+    }
+}
+
+fn freeze_values_donors_in_with(
+    with: Option<&mut fsqlite_ast::WithClause>,
+    function_registry: &FunctionRegistry,
+) {
+    if let Some(with) = with {
+        for cte in &mut with.ctes {
+            freeze_values_donors_in_select(&mut cte.query, function_registry);
+        }
+    }
+}
+
+fn freeze_values_donors_in_select(
+    select: &mut SelectStatement,
+    function_registry: &FunctionRegistry,
+) {
+    freeze_values_donors_in_with(select.with.as_mut(), function_registry);
+    freeze_values_donors_in_select_core(&mut select.body.select, function_registry);
+    for (_, core) in &mut select.body.compounds {
+        freeze_values_donors_in_select_core(core, function_registry);
+    }
+    for term in &mut select.order_by {
+        freeze_values_donors_in_expr(&mut term.expr, function_registry);
+    }
+    freeze_values_donors_in_limit(select.limit.as_mut(), function_registry);
+}
+
+fn freeze_values_donors_in_select_core(
+    core: &mut SelectCore,
+    function_registry: &FunctionRegistry,
+) {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            freeze_values_donors_in_result_columns(columns, function_registry);
+            if let Some(from) = from {
+                freeze_values_donors_in_from(from, function_registry);
+            }
+            if let Some(predicate) = where_clause {
+                freeze_values_donors_in_expr(predicate, function_registry);
+            }
+            freeze_values_donors_in_exprs(group_by, function_registry);
+            if let Some(predicate) = having {
+                freeze_values_donors_in_expr(predicate, function_registry);
+            }
+            for window in windows {
+                freeze_values_donors_in_window(&mut window.spec, function_registry);
+            }
+        }
+        SelectCore::Values(values) => {
+            if !values.is_frozen() {
+                let donor_index = deferred_values_donor_row_index(values, function_registry);
+                values.freeze_donor_row(donor_index);
+            }
+            for row in values.iter_mut() {
+                freeze_values_donors_in_exprs(row, function_registry);
+            }
+        }
+    }
+}
+
+fn freeze_values_donors_in_from(
+    from: &mut FromClause,
+    function_registry: &FunctionRegistry,
+) {
+    freeze_values_donors_in_source(&mut from.source, function_registry);
+    for join in &mut from.joins {
+        freeze_values_donors_in_source(&mut join.table, function_registry);
+        if let Some(JoinConstraint::On(predicate)) = &mut join.constraint {
+            freeze_values_donors_in_expr(predicate, function_registry);
+        }
+    }
+}
+
+fn freeze_values_donors_in_source(
+    source: &mut TableOrSubquery,
+    function_registry: &FunctionRegistry,
+) {
+    match source {
+        TableOrSubquery::Subquery { query, .. } => {
+            freeze_values_donors_in_select(query, function_registry);
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            freeze_values_donors_in_exprs(args, function_registry);
+        }
+        TableOrSubquery::ParenJoin(from) => {
+            freeze_values_donors_in_from(from, function_registry);
+        }
+        TableOrSubquery::Table { .. } => {}
+    }
+}
+
+fn freeze_values_donors_in_result_columns(
+    columns: &mut [ResultColumn],
+    function_registry: &FunctionRegistry,
+) {
+    for column in columns {
+        if let ResultColumn::Expr { expr, .. } = column {
+            freeze_values_donors_in_expr(expr, function_registry);
+        }
+    }
+}
+
+fn freeze_values_donors_in_limit(
+    limit: Option<&mut LimitClause>,
+    function_registry: &FunctionRegistry,
+) {
+    if let Some(limit) = limit {
+        freeze_values_donors_in_expr(&mut limit.limit, function_registry);
+        if let Some(offset) = &mut limit.offset {
+            freeze_values_donors_in_expr(offset, function_registry);
+        }
+    }
+}
+
+fn freeze_values_donors_in_exprs(
+    exprs: &mut [Expr],
+    function_registry: &FunctionRegistry,
+) {
+    for expr in exprs {
+        freeze_values_donors_in_expr(expr, function_registry);
+    }
+}
+
+fn freeze_values_donors_in_expr(expr: &mut Expr, function_registry: &FunctionRegistry) {
+    match expr {
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => {}
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            freeze_values_donors_in_expr(left, function_registry);
+            freeze_values_donors_in_expr(right, function_registry);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => {
+            freeze_values_donors_in_expr(expr, function_registry);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            freeze_values_donors_in_expr(expr, function_registry);
+            freeze_values_donors_in_expr(low, function_registry);
+            freeze_values_donors_in_expr(high, function_registry);
+        }
+        Expr::In { expr, set, .. } => {
+            freeze_values_donors_in_expr(expr, function_registry);
+            match set {
+                InSet::List(values) => {
+                    freeze_values_donors_in_exprs(values, function_registry);
+                }
+                InSet::Subquery(select) => {
+                    freeze_values_donors_in_select(select, function_registry);
+                }
+                InSet::Table(_) => {}
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            freeze_values_donors_in_expr(expr, function_registry);
+            freeze_values_donors_in_expr(pattern, function_registry);
+            if let Some(escape) = escape {
+                freeze_values_donors_in_expr(escape, function_registry);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                freeze_values_donors_in_expr(operand, function_registry);
+            }
+            for (condition, value) in whens {
+                freeze_values_donors_in_expr(condition, function_registry);
+                freeze_values_donors_in_expr(value, function_registry);
+            }
+            if let Some(else_expr) = else_expr {
+                freeze_values_donors_in_expr(else_expr, function_registry);
+            }
+        }
+        Expr::Subquery(select, _) | Expr::Exists { subquery: select, .. } => {
+            freeze_values_donors_in_select(select, function_registry);
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(args) = args {
+                freeze_values_donors_in_exprs(args, function_registry);
+            }
+            for term in order_by {
+                freeze_values_donors_in_expr(&mut term.expr, function_registry);
+            }
+            if let Some(filter) = filter {
+                freeze_values_donors_in_expr(filter, function_registry);
+            }
+            if let Some(window) = over {
+                freeze_values_donors_in_window(window, function_registry);
+            }
+        }
+        Expr::RowValue(values, _) => {
+            freeze_values_donors_in_exprs(values, function_registry);
+        }
+    }
+}
+
+fn freeze_values_donors_in_window(
+    window: &mut WindowSpec,
+    function_registry: &FunctionRegistry,
+) {
+    freeze_values_donors_in_exprs(&mut window.partition_by, function_registry);
+    for term in &mut window.order_by {
+        freeze_values_donors_in_expr(&mut term.expr, function_registry);
+    }
+    if let Some(frame) = &mut window.frame {
+        freeze_values_donors_in_frame_bound(&mut frame.start, function_registry);
+        if let Some(end) = &mut frame.end {
+            freeze_values_donors_in_frame_bound(end, function_registry);
+        }
+    }
+}
+
+fn freeze_values_donors_in_frame_bound(
+    bound: &mut FrameBound,
+    function_registry: &FunctionRegistry,
+) {
+    if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
+        freeze_values_donors_in_expr(expr, function_registry);
+    }
+}
+
+/// Resolve the same row that SQLite's parser-built SELECT tree exposes as the
+/// direct scalar/vector comparison donor for a syntactic `VALUES` clause.
+fn deferred_values_donor_row_index(
+    values: &ValuesClause,
+    function_registry: &FunctionRegistry,
+) -> Option<usize> {
+    let rows = values.rows();
+    if rows.is_empty() {
+        return None;
+    }
+
+    let force_union_all_from = values.force_union_all_from();
+    let mut donor_index = 0;
+    let mut coroutine_active = false;
+    for row_index in 1..rows.len() {
+        let sticky_with_forces_union =
+            force_union_all_from.is_some_and(|first_row| row_index >= first_row);
+        let new_row_is_constant = values_row_is_query_constant(
+            rows.get(row_index).expect("VALUES row index is in bounds"),
+            function_registry,
+        );
+        let current_root_allows_coroutine = coroutine_active
+            || values_row_is_constant_without_affinity(
+                rows.get(donor_index).expect("VALUES donor index is in bounds"),
+                function_registry,
+            );
+
+        if sticky_with_forces_union || !new_row_is_constant || !current_root_allows_coroutine {
+            // sqlite3MultiValues() appends this row as the rightmost UNION ALL
+            // core. A later constant/no-affinity row may start a new coroutine
+            // wrapper and retain this row as its donor.
+            donor_index = row_index;
+            coroutine_active = false;
+        } else {
+            coroutine_active = true;
+        }
+    }
+    Some(donor_index)
+}
+
+fn values_row_is_query_constant(row: &[Expr], function_registry: &FunctionRegistry) -> bool {
+    row.iter()
+        .all(|expr| values_expr_is_query_constant(expr, function_registry))
+}
+
+fn values_row_is_constant_without_affinity(
+    row: &[Expr],
+    function_registry: &FunctionRegistry,
+) -> bool {
+    values_row_is_query_constant(row, function_registry)
+        && row.iter().all(|expr| !values_expr_has_affinity(expr))
+}
+
+/// Match `sqlite3ExprIsConstant()` for the VALUES coroutine decision without
+/// invoking application code. Slow-changing built-ins are query-constant;
+/// volatile application replacements are not.
+fn values_expr_is_query_constant(expr: &Expr, function_registry: &FunctionRegistry) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            values_expr_is_query_constant(left, function_registry)
+                && values_expr_is_query_constant(right, function_registry)
+        }
+        Expr::JsonAccess {
+            expr: left,
+            path: right,
+            arrow,
+            ..
+        } => {
+            function_registry
+                .resolve_scalar(json_access_function_name(*arrow), 2)
+                .is_some_and(|resolved| resolved.query_constancy().is_query_constant())
+                && values_expr_is_query_constant(left, function_registry)
+                && values_expr_is_query_constant(right, function_registry)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => {
+            values_expr_is_query_constant(expr, function_registry)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            values_expr_is_query_constant(expr, function_registry)
+                && values_expr_is_query_constant(low, function_registry)
+                && values_expr_is_query_constant(high, function_registry)
+        }
+        Expr::In { expr, set, .. } => {
+            values_expr_is_query_constant(expr, function_registry)
+                && matches!(set, InSet::List(values) if values
+                    .iter()
+                    .all(|value| values_expr_is_query_constant(value, function_registry)))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            op,
+            ..
+        } => {
+            let (name, arity) = match op {
+                LikeOp::Like => ("like", if escape.is_some() { 3 } else { 2 }),
+                LikeOp::Glob => ("glob", 2),
+                LikeOp::Match => ("match", 2),
+                LikeOp::Regexp => ("regexp", 2),
+            };
+            function_registry
+                .resolve_scalar(name, arity)
+                .is_some_and(|resolved| resolved.query_constancy().is_query_constant())
+                && values_expr_is_query_constant(expr, function_registry)
+                && values_expr_is_query_constant(pattern, function_registry)
+                && escape
+                    .as_deref()
+                    .is_none_or(|value| values_expr_is_query_constant(value, function_registry))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(|value| values_expr_is_query_constant(value, function_registry))
+                && whens.iter().all(|(condition, value)| {
+                    values_expr_is_query_constant(condition, function_registry)
+                        && values_expr_is_query_constant(value, function_registry)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(|value| values_expr_is_query_constant(value, function_registry))
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if *distinct || !order_by.is_empty() || filter.is_some() || over.is_some() {
+                return false;
+            }
+            let FunctionArgs::List(args) = args else {
+                return false;
+            };
+            let Ok(arity) = i32::try_from(args.len()) else {
+                return false;
+            };
+            args.iter()
+                .all(|value| values_expr_is_query_constant(value, function_registry))
+                && function_registry
+                    .resolve_scalar(name, arity)
+                    .is_some_and(|resolved| resolved.query_constancy().is_query_constant())
+        }
+        Expr::RowValue(values, _) => values
+            .iter()
+            .all(|value| values_expr_is_query_constant(value, function_registry)),
+        Expr::BoundOuterValue { .. }
+        | Expr::Column(_, _)
+        | Expr::Subquery(_, _)
+        | Expr::Exists { .. }
+        | Expr::Raise { .. } => false,
+    }
+}
+
+/// Return whether `sqlite3ExprAffinity()` observes affinity on a VALUES cell
+/// before name resolution. A top-level CAST is decisive even for BLOB; unary
+/// arithmetic and ordinary computed expressions do not inherit child
+/// affinity. COLLATE is the one parser wrapper that SQLite skips.
+fn values_expr_has_affinity(expr: &Expr) -> bool {
+    match expr {
+        Expr::BoundOuterValue { affinity, .. } => affinity.is_some(),
+        Expr::Column(_, _) | Expr::Cast { .. } | Expr::Subquery(_, _) => true,
+        Expr::Collate { expr, .. } => values_expr_has_affinity(expr),
+        Expr::RowValue(values, _) => values.first().is_some_and(values_expr_has_affinity),
+        _ => false,
+    }
+}
+
 /// Match SQLite's constant-expression eligibility for the one-element IN-list
 /// rewrite that turns `lhs IN (rhs)` into a binary comparison.  The rewrite is
 /// semantically observable because only that form allows an explicit RHS
