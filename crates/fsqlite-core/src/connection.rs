@@ -74520,8 +74520,11 @@ impl<'a> CteResultMetadataResolver<'a> {
                 if name.schema.is_none()
                     && let Some((scope_index, cte)) = self.visible_cte(name)
                 {
-                    // A CTE definition is evaluated in its declaration scope,
-                    // not in any nested scope from which it was referenced.
+                    // CTE-name visibility is fixed at the declaration scope,
+                    // not a nested WITH scope at the reference site. SQLite
+                    // still permits unresolved result expressions to bind to
+                    // the reference's outer name context, so thread that
+                    // metadata separately while hiding only lexical CTE scopes.
                     let hidden_reference_scopes = self.scopes.split_off(scope_index + 1);
                     let metadata = self.resolve_cte(cte, outer_lookup);
                     self.scopes.extend(hidden_reference_scopes);
