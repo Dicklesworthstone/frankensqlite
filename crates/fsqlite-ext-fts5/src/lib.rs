@@ -1441,8 +1441,8 @@ impl Fts5PendingHash {
                 "pending hash produced no encodable segment leaves",
             ));
         }
-        let pgno_last =
-            u32::try_from(leaves.len()).map_err(|_| fts5_data_error("segment leaf count exceeds u32"))?;
+        let pgno_last = u32::try_from(leaves.len())
+            .map_err(|_| fts5_data_error("segment leaf count exceeds u32"))?;
         let mut data_rows = Vec::with_capacity(leaves.len() + 1);
         let mut decoded_leaves = Vec::with_capacity(leaves.len());
         for (index, leaf) in leaves.iter().enumerate() {
@@ -1543,7 +1543,10 @@ impl Fts5PendingHash {
 /// [`FTS5_SAFE_LEAF_BYTES`] by this estimate always encodes within the u16
 /// ceiling. A doclist that fails to encode is treated as oversized.
 fn estimate_leaf_term_bytes(term: &Fts5SegmentTerm) -> usize {
-    let doclist_bytes = term.doclist.encode().map_or(usize::MAX, |bytes| bytes.len());
+    let doclist_bytes = term
+        .doclist
+        .encode()
+        .map_or(usize::MAX, |bytes| bytes.len());
     9usize
         .saturating_add(term.term.len())
         .saturating_add(doclist_bytes)
