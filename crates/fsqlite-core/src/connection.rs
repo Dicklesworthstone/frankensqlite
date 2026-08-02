@@ -61,8 +61,8 @@ use fsqlite_ast::{
     InsertStatement, JoinClause, JoinConstraint, JoinKind, JsonArrow, LikeOp, LimitClause, Literal,
     NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, QualifiedName, ResultColumn,
     SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement, TableConstraintKind,
-    TableOrSubquery, TimeTravelTarget, UnaryOp, UpsertAction, UpsertClause, WindowReference,
-    WindowSpec, ValuesClause,
+    TableOrSubquery, TimeTravelTarget, UnaryOp, UpsertAction, UpsertClause, ValuesClause,
+    WindowReference, WindowSpec,
 };
 use fsqlite_btree::cursor::{
     TableLeafDeleteRun, TableLeafDeleteRunDelete, TableLeafDeleteRunMissReason,
@@ -101,8 +101,7 @@ use fsqlite_func::vtab::{
 use fsqlite_func::{
     ApplicationFunctionKind, ErasedWindowFunction, FunctionArity, FunctionRegistry,
     ResolvedScalarFunction, ScalarSchemaSafety, get_last_changes, get_last_insert_rowid,
-    get_total_changes,
-    sqlite_compile_options,
+    get_total_changes, sqlite_compile_options,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
@@ -13449,14 +13448,19 @@ impl Connection {
         callback_name: &str,
         callback: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
+        let registry_generation = self.function_registry_generation();
         let _callback_guard = self.enter_live_vtab_callback(callback_name)?;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
             Ok(result) => result,
             Err(payload) => Err(FrankenError::Internal(format!(
                 "virtual-table callback {callback_name} panicked: {}",
                 live_vtab_panic_message(payload.as_ref()),
             ))),
+        };
+        if self.function_registry_generation() != registry_generation {
+            return Err(FrankenError::SchemaChanged);
         }
+        result
     }
 
     fn invoke_taken_live_vtab_instance<R>(
@@ -17234,8 +17238,7 @@ impl Connection {
             custom_aggregate_keys.remove(&application_key);
             !custom_aggregate_keys.is_empty()
         };
-        self.custom_aggregate_registered
-            .set(has_custom_aggregate);
+        self.custom_aggregate_registered.set(has_custom_aggregate);
         self.scalar_function_overridden.set(true);
         let replaces_like_or_glob = match application_key.0.as_str() {
             "like" => matches!(func_args, -1 | 2 | 3),
@@ -17584,11 +17587,7 @@ impl Connection {
         })
     }
 
-    fn application_function_kind(
-        &self,
-        name: &str,
-        arity: i32,
-    ) -> Option<ApplicationFunctionKind> {
+    fn application_function_kind(&self, name: &str, arity: i32) -> Option<ApplicationFunctionKind> {
         self.func_registry
             .borrow()
             .resolve_application_function(name, arity)
@@ -17607,10 +17606,8 @@ impl Connection {
     fn aggregate_uses_builtin_empty_default(&self, name: &str, args: &FunctionArgs) -> bool {
         is_agg_fn(name)
             && !is_scalar_max_min(name, args)
-            && !self.application_function_replaces_builtin(
-                name,
-                aggregate_args_len_for_lookup(args),
-            )
+            && !self
+                .application_function_replaces_builtin(name, aggregate_args_len_for_lookup(args))
     }
 
     fn select_uses_builtin_minmax_bare_tracking(
@@ -17767,25 +17764,23 @@ impl Connection {
             };
             let snapshot_generation = self.function_registry_generation();
             let statement_snapshot = self.freeze_statement_values_snapshot(parsed.as_ref());
-            let froze_deferred_values = matches!(&statement_snapshot, Cow::Owned(_));
 
             // Relation lookup must observe the original parsed AST. Rewriting can
             // eagerly evaluate or erase subqueries, which would otherwise move a
             // missing-relation diagnostic from prepare time to execution (or hide
             // it entirely). Non-catalog structural semantics still run on the
             // canonical rewritten statement below.
-            self.with_fallback_function_registry(|| {
+            let relation_result = self.with_fallback_function_registry(|| {
                 self.validate_statement_select_relations(statement_snapshot.as_ref())
-            })?;
-            if froze_deferred_values
-                && self.function_registry_generation() != snapshot_generation
-            {
+            });
+            if self.function_registry_generation() != snapshot_generation {
                 if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
                     return Err(FrankenError::SchemaChanged);
                 }
                 continue;
             }
-            let statement = {
+            relation_result?;
+            let statement_result = {
                 let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                     .then(|| {
                         let span = tracing::span!(
@@ -17803,20 +17798,29 @@ impl Connection {
                     FSQLITE_REWRITE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 let start = profile_enabled.then(Instant::now);
-                let statement = self
+                let rewrite_result = self
                     .rewrite_subquery_statement(statement_snapshot.as_ref(), None)
-                    .await?;
+                    .await;
                 if let Some(start) = start {
                     FSQLITE_REWRITE_TIME_NS.fetch_add(
                         u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
                         AtomicOrdering::Relaxed,
                     );
                 }
-                self.with_fallback_function_registry(|| {
-                    self.validate_statement_select_semantics(&statement)
-                })?;
-                statement
+                rewrite_result.and_then(|statement| {
+                    self.with_fallback_function_registry(|| {
+                        self.validate_statement_select_semantics(&statement)
+                    })?;
+                    Ok(statement)
+                })
             };
+            if self.function_registry_generation() != snapshot_generation {
+                if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                    return Err(FrankenError::SchemaChanged);
+                }
+                continue;
+            }
+            let statement = statement_result?;
             let canonical_sql = statement.to_string();
             let plan_span =
                 tracing::enabled!(target: "fsqlite.plan", tracing::Level::TRACE).then(|| {
@@ -17830,17 +17834,15 @@ impl Connection {
                     span
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
-            let prepared = self.compile_and_wrap(&canonical_sql, &statement).await?;
+            let prepared_result = self.compile_and_wrap(&canonical_sql, &statement).await;
 
             // User module metadata callbacks are deliberately reentrant and
-            // may replace a scalar while preparation is in progress. A VALUES
-            // donor frozen before such a callback must not be cached beneath
-            // the callback's later registry generation. Discard the incoherent
-            // attempt and rebuild from the registry-agnostic parse-cache AST.
-            if !froze_deferred_values
-                || self.function_registry_generation() == snapshot_generation
-            {
-                return Ok(prepared);
+            // may replace a scalar while preparation is in progress. Neither
+            // function bindings nor a VALUES donor from that mixed-generation
+            // attempt may enter the prepared cache. Rebuild from the
+            // registry-agnostic parse-cache AST instead.
+            if self.function_registry_generation() == snapshot_generation {
+                return prepared_result;
             }
             if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
                 return Err(FrankenError::SchemaChanged);
@@ -20778,7 +20780,7 @@ impl Connection {
                     let registry = self.func_registry.borrow();
                     registry.find_aggregate("sum", 1)
                 }
-                    .ok_or_else(|| FrankenError::internal("missing built-in aggregate: sum/1"))?;
+                .ok_or_else(|| FrankenError::internal("missing built-in aggregate: sum/1"))?;
                 let mut sum_state = sum_func.initial_state();
                 let db = self.db.borrow();
                 let Some(table) = db.get_table(root_page) else {
@@ -25842,10 +25844,7 @@ impl Connection {
     /// without copying the common no-VALUES or already-frozen hot path;
     /// downstream clones preserve the decision because frozen clauses are
     /// never recomputed.
-    fn freeze_statement_values_snapshot<'a>(
-        &self,
-        statement: &'a Statement,
-    ) -> Cow<'a, Statement> {
+    fn freeze_statement_values_snapshot<'a>(&self, statement: &'a Statement) -> Cow<'a, Statement> {
         if !statement_contains_deferred_values(statement) {
             return Cow::Borrowed(statement);
         }
@@ -27415,23 +27414,29 @@ impl Connection {
                 // told that this snapshot has already passed structural
                 // validation so the callback cannot run a second time after
                 // the generation check.
-                self.with_fallback_function_registry(|| {
+                let relation_result = self.with_fallback_function_registry(|| {
                     self.validate_statement_select_relations(statement_snapshot.as_ref())
-                })?;
-                if froze_deferred_values
-                    && self.function_registry_generation() != snapshot_generation
-                {
+                });
+                if self.function_registry_generation() != snapshot_generation {
                     if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                        return Err(FrankenError::SchemaChanged);
+                    }
+                    // A borrowed statement may already contain a VALUES donor
+                    // frozen by an enclosing snapshot. It cannot be
+                    // distinguished from a no-VALUES statement here, so fail
+                    // closed instead of executing potentially mixed-generation
+                    // metadata. The caller may retry from SQL text.
+                    if !froze_deferred_values {
                         return Err(FrankenError::SchemaChanged);
                     }
                     continue;
                 }
-                self.with_fallback_function_registry(|| {
+                relation_result?;
+                let semantics_result = self.with_fallback_function_registry(|| {
                     self.validate_statement_select_semantics(statement_snapshot.as_ref())
-                })?;
-                if !froze_deferred_values
-                    || self.function_registry_generation() == snapshot_generation
-                {
+                });
+                if self.function_registry_generation() == snapshot_generation {
+                    semantics_result?;
                     return self
                         .execute_statement_impl_after_background_status(
                             statement_snapshot.as_ref(),
@@ -27442,6 +27447,9 @@ impl Connection {
                         .await;
                 }
                 if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                    return Err(FrankenError::SchemaChanged);
+                }
+                if !froze_deferred_values {
                     return Err(FrankenError::SchemaChanged);
                 }
             }
@@ -28000,8 +28008,7 @@ impl Connection {
                     // aggregates must run through the aggregation-aware join path;
                     // execute_join_select alone returns raw un-grouped rows and
                     // evaluates aggregates (e.g. sum()) as scalars -> NULL.
-                    let needs_grouped_window =
-                        self.select_requires_grouped_window_pipeline(select);
+                    let needs_grouped_window = self.select_requires_grouped_window_pipeline(select);
                     let needs_aggregation = has_group_by(select)
                         || self.has_implicit_aggregation_with_registry(select)
                         || has_ordered_aggregate(select);
@@ -28072,9 +28079,7 @@ impl Connection {
                         || !select.order_by.is_empty()
                         || expression_only_has_subquery(select)
                         || expression_only_limit_requires_dynamic_evaluation(select)
-                        || select_has_in_subquery_operand_requiring_semantic_fallback(
-                            select, self,
-                        ))
+                        || select_has_in_subquery_operand_requiring_semantic_fallback(select, self))
                 {
                     return self
                         .execute_expression_only_with_subqueries(select, params)
@@ -28098,10 +28103,8 @@ impl Connection {
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
                     let registry = self.func_registry.borrow().clone();
-                    let program = compile_expression_select(
-                        rewritten.as_ref(),
-                        Arc::clone(&registry),
-                    )?;
+                    let program =
+                        compile_expression_select(rewritten.as_ref(), Arc::clone(&registry))?;
                     let op_cx = self.op_cx()?;
                     let mut rows = execute_program_with_postprocess(
                         &program,
@@ -30702,8 +30705,7 @@ impl Connection {
                     if !join_hash_pairs_are_binary(&equi_pairs, left_width) {
                         continue;
                     }
-                    let Some(hash_pairs) =
-                        hash_join_pairs_with_modes(&equi_pairs, left_width)
+                    let Some(hash_pairs) = hash_join_pairs_with_modes(&equi_pairs, left_width)
                     else {
                         continue;
                     };
@@ -30828,20 +30830,16 @@ impl Connection {
             loop {
                 if let Some(plan) = prepared.join_plans.get(join_idx) {
                     debug_assert_eq!(current_row.len(), plan.left_width);
-                    let bucket_candidates = build_canonical_hash_join_key(
-                        &current_row,
-                        &plan.hash_pairs,
-                        false,
-                    )
-                    .as_ref()
-                    .and_then(|probe_key| plan.right_index.get(probe_key))
-                    .map(Vec::as_slice);
+                    let bucket_candidates =
+                        build_canonical_hash_join_key(&current_row, &plan.hash_pairs, false)
+                            .as_ref()
+                            .and_then(|probe_key| plan.right_index.get(probe_key))
+                            .map(Vec::as_slice);
                     let len_before_join = current_row.len();
                     let mut matching_right_rows = Vec::new();
                     if let Some(bucket_candidates) = bucket_candidates {
                         for &right_row_index in bucket_candidates {
-                            let right_row =
-                                &prepared.table_rows[join_idx + 1][right_row_index];
+                            let right_row = &prepared.table_rows[join_idx + 1][right_row_index];
                             current_row.extend_from_slice(&right_row[..plan.right_width]);
                             let matches = eval_join_predicate(
                                 &plan.predicate,
@@ -30895,10 +30893,8 @@ impl Connection {
                         .then_some(usize::from(frame.emit_left_null))
                         .unwrap_or_else(|| frame.matching_right_rows.len());
                     if frame.next_candidate < candidate_count {
-                        let right_row_index = frame
-                            .matching_right_rows
-                            .get(frame.next_candidate)
-                            .copied();
+                        let right_row_index =
+                            frame.matching_right_rows.get(frame.next_candidate).copied();
                         frame.next_candidate = frame.next_candidate.saturating_add(1);
                         break Some((frame.join_idx, right_row_index));
                     }
@@ -35599,19 +35595,40 @@ impl Connection {
 
     fn validate_statement_select_semantics(&self, statement: &Statement) -> Result<()> {
         match statement {
-            Statement::Select(select) => SelectStructureResolver::new(self)
-                .validate_select_without_relation_preflight(select),
+            Statement::Select(select) => {
+                let column_reference_preflight =
+                    select_requires_column_reference_preflight(select, self);
+                if column_reference_preflight {
+                    self.validate_select_column_references(select)?;
+                }
+                SelectStructureResolver::new(self)
+                    .validate_select_without_relation_preflight(select, column_reference_preflight)
+            }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
-                    SelectStructureResolver::new(self)
-                        .validate_select_without_relation_preflight(select)?;
+                    let column_reference_preflight =
+                        select_requires_column_reference_preflight(select, self);
+                    if column_reference_preflight {
+                        self.validate_select_column_references(select)?;
+                    }
+                    SelectStructureResolver::new(self).validate_select_without_relation_preflight(
+                        select,
+                        column_reference_preflight,
+                    )?;
                 }
                 Ok(())
             }
             Statement::CreateTable(create) => {
                 if let CreateTableBody::AsSelect(select) = &create.body {
-                    SelectStructureResolver::new(self)
-                        .validate_select_without_relation_preflight(select)?;
+                    let column_reference_preflight =
+                        select_requires_column_reference_preflight(select, self);
+                    if column_reference_preflight {
+                        self.validate_select_column_references(select)?;
+                    }
+                    SelectStructureResolver::new(self).validate_select_without_relation_preflight(
+                        select,
+                        column_reference_preflight,
+                    )?;
                 }
                 Ok(())
             }
@@ -35849,6 +35866,21 @@ impl Connection {
         Ok(())
     }
 
+    /// Resolve every lexical column reference in a SELECT without executing
+    /// it. SQLite completes name and function resolution before diagnosing a
+    /// scalar/vector subquery's result width. This pass therefore covers every
+    /// SELECT clause and nested SELECT scope before callers perform the arity
+    /// check, while never invoking a projected application function.
+    ///
+    /// Runtime callers must first replace valid references to their current
+    /// outer row with `BoundOuterValue`. The resolver still carries lexical
+    /// scopes for subqueries nested inside that bound SELECT.
+    fn validate_select_column_references(&self, select: &SelectStatement) -> Result<()> {
+        self.with_fallback_function_registry(|| {
+            SelectColumnReferenceResolver::new(self).validate_select(select)
+        })
+    }
+
     fn in_lhs_column_count(&self, lhs: &Expr) -> usize {
         match lhs {
             Expr::RowValue(values, _) => values.len(),
@@ -35874,20 +35906,15 @@ impl Connection {
             return Ok(());
         }
         if let [only] = values {
-            if let Expr::Subquery(rhs, _) = only {
-                let rhs_columns = self.select_result_column_count(rhs, &[], &mut Vec::new());
-                if rhs_columns == actual {
-                    return Ok(());
-                }
-                return Err(FrankenError::FunctionError(format!(
-                    "sub-select returns {rhs_columns} columns - expected {actual}"
-                )));
+            if matches!(only, Expr::Subquery(_, _)) {
+                // The RHS subquery's names must resolve before its arity can
+                // win. Runtime materialization or VDBE compilation performs
+                // the eventual width check after name resolution.
+                return Ok(());
             }
             let function_registry = self.func_registry.borrow();
             if values_expr_is_query_constant(only, function_registry.as_ref()) {
-                return Err(FrankenError::FunctionError(
-                    "row value misused".to_owned(),
-                ));
+                return Err(FrankenError::FunctionError("row value misused".to_owned()));
             }
         }
         Err(FrankenError::FunctionError(format!(
@@ -35905,7 +35932,8 @@ impl Connection {
         let Expr::Subquery(select, _) = lhs else {
             return Ok(());
         };
-        if self.select_result_column_count(select, &[], &mut Vec::new()) <= 1 {
+        let actual = self.select_result_column_count(select, &[], &mut Vec::new());
+        if actual <= 1 {
             return Ok(());
         }
         let [only] = values else {
@@ -36044,10 +36072,7 @@ impl Connection {
                             .and_then(|column| column.affinity),
                         span: Span::ZERO,
                     };
-                    if let Some(collation) = explicit_collations
-                        .get(index)
-                        .and_then(Clone::clone)
-                    {
+                    if let Some(collation) = explicit_collations.get(index).and_then(Clone::clone) {
                         donor = Expr::Collate {
                             expr: Box::new(donor),
                             collation,
@@ -36084,10 +36109,10 @@ impl Connection {
         if expected == 0 {
             expected = donor_metadata.columns.len().max(1);
         }
-        let values = rows.into_iter().next().map_or_else(
-            || vec![SqliteValue::Null; expected],
-            |row| row.values,
-        );
+        let values = rows
+            .into_iter()
+            .next()
+            .map_or_else(|| vec![SqliteValue::Null; expected], |row| row.values);
         if values.len() != expected {
             return Err(FrankenError::FunctionError(format!(
                 "sub-select returns {} columns - expected {expected}",
@@ -50836,8 +50861,7 @@ impl Connection {
                                 .await
                         }
                     } else if self.select_requires_grouped_window_pipeline(rewritten.as_ref()) {
-                        self.execute_group_by_window_select(&cx, &bound, None)
-                            .await
+                        self.execute_group_by_window_select(&cx, &bound, None).await
                     } else if has_group_by(rewritten.as_ref())
                         || self.has_implicit_aggregation_with_registry(rewritten.as_ref())
                         || has_ordered_aggregate(rewritten.as_ref())
@@ -51111,8 +51135,7 @@ impl Connection {
             && !has_group_by(select);
         let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
         if self.select_requires_grouped_window_pipeline(select) {
-            self.execute_group_by_window_select(&cx, &bound, None)
-                .await
+            self.execute_group_by_window_select(&cx, &bound, None).await
         } else if has_group_by(select) || implicit_agg || has_ordered_aggregate(select) {
             self.execute_group_by_join_select(&cx, &bound, None).await
         } else if has_window_functions(select) {
@@ -53589,8 +53612,7 @@ impl Connection {
             }
             for expression in key_expressions {
                 let mut expression = expression.clone();
-                if let Some(ipk_column) =
-                    rowid_alias_col_idx.and_then(|idx| table.columns.get(idx))
+                if let Some(ipk_column) = rowid_alias_col_idx.and_then(|idx| table.columns.get(idx))
                 {
                     rewrite_rowid_aliases_in_expr(&mut expression, table, &ipk_column.name);
                 }
@@ -54121,9 +54143,7 @@ impl Connection {
     ) -> Result<()> {
         let mut schema = self.schema.borrow().clone();
         let temp_table_names = self.temp_table_names.borrow();
-        schema.retain(|table| {
-            !temp_table_names.contains(&table.name.to_ascii_lowercase())
-        });
+        schema.retain(|table| !temp_table_names.contains(&table.name.to_ascii_lowercase()));
         drop(temp_table_names);
         schema.extend(self.shadowed_main_tables.borrow().values().cloned());
         if !quick {
@@ -58950,10 +58970,7 @@ impl Connection {
                                         for expression in expressions {
                                             values.push(
                                                 self.eval_row_expr_allowing_subqueries_with_using(
-                                                    expression,
-                                                    row,
-                                                    &col_map,
-                                                    using_skip,
+                                                    expression, row, &col_map, using_skip,
                                                 )
                                                 .await?,
                                             );
@@ -58965,10 +58982,7 @@ impl Connection {
                                 for term in order_by {
                                     keys.push(
                                         self.eval_row_expr_allowing_subqueries_with_using(
-                                            &term.expr,
-                                            row,
-                                            &col_map,
-                                            using_skip,
+                                            &term.expr, row, &col_map, using_skip,
                                         )
                                         .await?,
                                     );
@@ -59157,9 +59171,7 @@ impl Connection {
                             if !order_by.is_empty() {
                                 let order_collations = order_by
                                     .iter()
-                                    .map(|term| {
-                                        join_expr_effective_collation(&term.expr, &col_map)
-                                    })
+                                    .map(|term| join_expr_effective_collation(&term.expr, &col_map))
                                     .collect::<Vec<_>>();
                                 entries.sort_by(|left, right| {
                                     cmp_in_aggregate_order_keys(
@@ -60598,7 +60610,11 @@ impl Connection {
         match upper.as_str() {
             _ if !is_builtin && has_explicit_exclusion => {
                 let args_by_row = [arg_values];
-                let target_rows: &[usize] = if included && filter_matches { &[0] } else { &[] };
+                let target_rows: &[usize] = if included && filter_matches {
+                    &[0]
+                } else {
+                    &[]
+                };
                 evaluate_application_window_finalized_frame(
                     function.as_ref(),
                     &args_by_row,
@@ -60623,8 +60639,7 @@ impl Connection {
             }
             _ => evaluate_single_row_window_lifecycle(
                 function.as_ref(),
-                (included || matches!(upper.as_str(), "NTILE" | "LAG" | "LEAD"))
-                    && filter_matches,
+                (included || matches!(upper.as_str(), "NTILE" | "LAG" | "LEAD")) && filter_matches,
                 &arg_values,
             ),
         }
@@ -61474,7 +61489,6 @@ impl Connection {
                     // rejects a multi-column scalar subquery at prepare time rather
                     // than silently taking the first column (bd-fkwtw). Multiple
                     // *rows* are tolerated (the first is taken).
-                    self.validate_scalar_subquery_column_count(sub)?;
                     let mut sub_clone = sub.as_ref().clone();
                     self.substitute_outer_refs_for_current_schema(
                         &mut sub_clone,
@@ -61482,13 +61496,14 @@ impl Connection {
                         col_map,
                         None,
                     );
+                    self.validate_select_column_references(&sub_clone)?;
+                    self.validate_scalar_subquery_column_count(&sub_clone)?;
                     // BoundOuterValue display intentionally omits affinity and
                     // collation metadata, so its SQL text cannot identify a
                     // reusable program or planner directive. Recompile this
                     // runtime-bound subquery instead of allowing one outer
                     // source's metadata to poison another's result.
-                    let _cache_guard =
-                        BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = execute_nested_select(sub_clone).await?;
                     Ok(rows
                         .into_iter()
@@ -61518,8 +61533,7 @@ impl Connection {
                             offset: None,
                         });
                     }
-                    let _cache_guard =
-                        BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = execute_nested_select(sub_clone).await?;
                     let exists = !rows.is_empty();
                     let truth = if *not { !exists } else { exists };
@@ -61674,10 +61688,8 @@ impl Connection {
                     }
                 }
                 Expr::FunctionCall { name, args, .. } => {
-                    let application_kind = self.application_function_kind(
-                        name,
-                        aggregate_args_len_for_lookup(args),
-                    );
+                    let application_kind =
+                        self.application_function_kind(name, aggregate_args_len_for_lookup(args));
                     if application_kind.is_none() {
                         if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
                             return result;
@@ -61787,14 +61799,80 @@ impl Connection {
                     if matches!(set, InSet::List(values) if values.is_empty()) {
                         return Ok(SqliteValue::Integer(i64::from(*not)));
                     }
-                    if let InSet::Subquery(subquery) = set {
-                        self.validate_in_subquery_column_count(e, subquery)?;
+                    if let InSet::List(values) = set {
+                        self.validate_in_list_early_row_misuse(e, values)?;
                     }
+                    let bound_lhs_subquery = if let Expr::Subquery(select, _) = e.as_ref() {
+                        let mut bound = select.as_ref().clone();
+                        self.substitute_outer_refs_for_current_schema(
+                            &mut bound, row, col_map, None,
+                        );
+                        self.validate_select_column_references(&bound)?;
+                        Some(bound)
+                    } else {
+                        None
+                    };
                     let lhs_width = self.in_lhs_column_count(e);
                     if lhs_width > 1 {
                         if let InSet::List(values) = set {
                             validate_vector_in_list_arity(lhs_width, values)?;
                         }
+                        let materialized_list;
+                        let list_exprs = if let InSet::List(list) = set {
+                            list.as_slice()
+                        } else {
+                            let (subquery, rows) = match set {
+                                InSet::Subquery(subquery) => {
+                                    let mut sub_clone = subquery.as_ref().clone();
+                                    self.substitute_outer_refs_for_current_schema(
+                                        &mut sub_clone,
+                                        row,
+                                        col_map,
+                                        None,
+                                    );
+                                    let donor_subquery = sub_clone.clone();
+                                    self.validate_select_column_references(&donor_subquery)?;
+                                    self.validate_in_subquery_column_count(e, &donor_subquery)?;
+                                    let _cache_guard = BoolCellRestoreGuard::new(
+                                        &self.bypass_compiled_cache,
+                                        true,
+                                    );
+                                    let rows = execute_nested_select(sub_clone).await?;
+                                    (donor_subquery, rows)
+                                }
+                                InSet::Table(name) => {
+                                    let subquery = in_table_name_to_select_statement(name);
+                                    self.validate_select_column_references(&subquery)?;
+                                    self.validate_in_subquery_column_count(e, &subquery)?;
+                                    let rows = execute_nested_select(subquery.clone()).await?;
+                                    (subquery, rows)
+                                }
+                                InSet::List(_) => unreachable!(),
+                            };
+                            materialized_list =
+                                self.materialize_in_subquery_rows(e, &subquery, rows)?;
+                            materialized_list.as_slice()
+                        };
+                        // SQLite materializes every vector RHS tuple before
+                        // evaluating the LHS. This both fixes observable UDF
+                        // order and prevents a matching/unequal early field
+                        // from suppressing later RHS side effects.
+                        let mut rhs_rows = Vec::with_capacity(list_exprs.len());
+                        for list_item in list_exprs {
+                            let rhs_exprs = match list_item {
+                                Expr::RowValue(values, _) => values.as_slice(),
+                                other => std::slice::from_ref(other),
+                            };
+                            let mut rhs = Vec::with_capacity(rhs_exprs.len());
+                            for rhs_expr in rhs_exprs {
+                                rhs.push(
+                                    self.eval_expr_with_subqueries(rhs_expr, row, col_map, params)
+                                        .await?,
+                                );
+                            }
+                            rhs_rows.push(rhs);
+                        }
+
                         let (lhs_exprs, lhs) = match e.as_ref() {
                             Expr::RowValue(lhs_exprs, _) => {
                                 let mut lhs = Vec::with_capacity(lhs_exprs.len());
@@ -61809,13 +61887,9 @@ impl Connection {
                                 (lhs_exprs.clone(), lhs)
                             }
                             Expr::Subquery(select, _) => {
-                                let mut bound_select = select.as_ref().clone();
-                                self.substitute_outer_refs_for_current_schema(
-                                    &mut bound_select,
-                                    row,
-                                    col_map,
-                                    None,
-                                );
+                                let bound_select = bound_lhs_subquery
+                                    .clone()
+                                    .unwrap_or_else(|| select.as_ref().clone());
                                 let donor_select = bound_select.clone();
                                 let rows = {
                                     let _cache_guard = BoolCellRestoreGuard::new(
@@ -61861,9 +61935,8 @@ impl Connection {
                                                 .and_then(|column| column.affinity),
                                             span: Span::ZERO,
                                         };
-                                        if let Some(collation) = explicit_collations
-                                            .get(index)
-                                            .and_then(Clone::clone)
+                                        if let Some(collation) =
+                                            explicit_collations.get(index).and_then(Clone::clone)
                                         {
                                             expr = Expr::Collate {
                                                 expr: Box::new(expr),
@@ -61878,45 +61951,12 @@ impl Connection {
                             }
                             _ => unreachable!("multi-column IN LHS shape checked above"),
                         };
-                        let materialized_list;
-                        let list_exprs = if let InSet::List(list) = set {
-                            list.as_slice()
-                        } else {
-                            let (subquery, rows) = match set {
-                                InSet::Subquery(subquery) => {
-                                    let mut sub_clone = subquery.as_ref().clone();
-                                    self.substitute_outer_refs_for_current_schema(
-                                        &mut sub_clone,
-                                        row,
-                                        col_map,
-                                        None,
-                                    );
-                                    let donor_subquery = sub_clone.clone();
-                                    let _cache_guard = BoolCellRestoreGuard::new(
-                                        &self.bypass_compiled_cache,
-                                        true,
-                                    );
-                                    let rows = execute_nested_select(sub_clone).await?;
-                                    (donor_subquery, rows)
-                                }
-                                InSet::Table(name) => {
-                                    let subquery = in_table_name_to_select_statement(name);
-                                    self.validate_in_subquery_column_count(e, &subquery)?;
-                                    let rows = execute_nested_select(subquery.clone()).await?;
-                                    (subquery, rows)
-                                }
-                                InSet::List(_) => unreachable!(),
-                            };
-                            materialized_list =
-                                self.materialize_in_subquery_rows(e, &subquery, rows)?;
-                            materialized_list.as_slice()
-                        };
                         let donor_exprs = list_exprs.last().map(|list_item| match list_item {
                             Expr::RowValue(values, _) => values.as_slice(),
                             other => std::slice::from_ref(other),
                         });
                         let mut saw_null = false;
-                        for list_item in list_exprs {
+                        for (list_item, rhs) in list_exprs.iter().zip(&rhs_rows) {
                             let rhs_exprs = match list_item {
                                 Expr::RowValue(values, _) => values.as_slice(),
                                 other => std::slice::from_ref(other),
@@ -61924,26 +61964,17 @@ impl Connection {
                             debug_assert_eq!(rhs_exprs.len(), lhs.len());
                             let mut tuple_has_null = false;
                             let mut tuple_all_equal = true;
-                            for (field_index, ((lhs_expr, lhs_value), rhs_expr)) in lhs_exprs
-                                .iter()
-                                .zip(lhs.iter())
-                                .zip(rhs_exprs.iter())
-                                .enumerate()
+                            for (field_index, (lhs_expr, lhs_value)) in
+                                lhs_exprs.iter().zip(lhs.iter()).enumerate()
                             {
-                                let rhs_value = self
-                                    .eval_expr_with_subqueries(rhs_expr, row, col_map, params)
-                                    .await?;
+                                let rhs_value = &rhs[field_index];
                                 if lhs_value.is_null() || rhs_value.is_null() {
                                     tuple_has_null = true;
                                 } else if donor_exprs
                                     .and_then(|donors| donors.get(field_index))
                                     .is_none_or(|donor_expr| {
                                         self.compare_vector_in_field_for_current_row(
-                                            lhs_expr,
-                                            lhs_value,
-                                            donor_expr,
-                                            &rhs_value,
-                                            row,
+                                            lhs_expr, lhs_value, donor_expr, rhs_value, row,
                                             col_map,
                                         ) != std::cmp::Ordering::Equal
                                     })
@@ -61965,9 +61996,6 @@ impl Connection {
                             Ok(SqliteValue::Integer(i64::from(*not)))
                         };
                     }
-                    let val = self
-                        .eval_expr_with_subqueries(e, row, col_map, params)
-                        .await?;
                     // Bind correlated outer references once, then use the
                     // same substituted SELECT for both donor metadata and
                     // execution. Inspecting the original AST here loses the
@@ -61975,10 +62003,7 @@ impl Connection {
                     let bound_in_subquery = if let InSet::Subquery(subquery) = set {
                         let mut bound = subquery.as_ref().clone();
                         self.substitute_outer_refs_for_current_schema(
-                            &mut bound,
-                            row,
-                            col_map,
-                            None,
+                            &mut bound, row, col_map, None,
                         );
                         Some(bound)
                     } else {
@@ -61988,13 +62013,38 @@ impl Connection {
                         InSet::Subquery(_) => bound_in_subquery
                             .as_ref()
                             .map(|subquery| self.resolve_in_rhs_donor_metadata(subquery)),
-                        InSet::Table(name) => Some(
-                            self.resolve_in_rhs_donor_metadata(
-                                &in_table_name_to_select_statement(name),
-                            ),
-                        ),
+                        InSet::Table(name) => Some(self.resolve_in_rhs_donor_metadata(
+                            &in_table_name_to_select_statement(name),
+                        )),
                         InSet::List(_) => None,
                     };
+                    // A subquery RHS is fully materialized before SQLite
+                    // evaluates the scalar LHS. Explicit expression lists use
+                    // the opposite, LHS-first order and remain lazy below.
+                    let materialized_subquery_rows = match set {
+                        InSet::Subquery(_) => {
+                            let subquery = bound_in_subquery
+                                .as_ref()
+                                .expect("subquery binding prepared above");
+                            self.validate_select_column_references(subquery)?;
+                            self.validate_in_subquery_column_count(e, subquery)?;
+                            let _cache_guard =
+                                BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                            let rows = execute_nested_select(subquery.clone()).await?;
+                            Some(rows)
+                        }
+                        InSet::Table(name) => {
+                            let subquery = in_table_name_to_select_statement(name);
+                            self.validate_select_column_references(&subquery)?;
+                            self.validate_in_subquery_column_count(e, &subquery)?;
+                            let rows = execute_nested_select(subquery.clone()).await?;
+                            Some(rows)
+                        }
+                        InSet::List(_) => None,
+                    };
+                    let val = self
+                        .eval_expr_with_subqueries(e, row, col_map, params)
+                        .await?;
                     // A NULL left operand is not enough to determine the
                     // result: `NULL IN (empty-set)` is false (and NOT IN is
                     // true), while any RHS row makes the comparison unknown.
@@ -62029,15 +62079,13 @@ impl Connection {
                                         .and_then(|column| column.collation.clone()),
                                 )
                             }
-                            InSet::Table(_) => {
-                                (
-                                    None,
-                                    in_set_donor_metadata
-                                        .as_ref()
-                                        .and_then(|metadata| metadata.columns.first())
-                                        .and_then(|column| column.collation.clone()),
-                                )
-                            }
+                            InSet::Table(_) => (
+                                None,
+                                in_set_donor_metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.columns.first())
+                                    .and_then(|column| column.collation.clone()),
+                            ),
                             InSet::List(_) => (None, None),
                         };
                         left_explicit_collation
@@ -62050,8 +62098,7 @@ impl Connection {
                     let has_non_binary_collation =
                         coll_ref.is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"));
                     let (left_affinity, subquery_affinity) = {
-                        let left_affinity =
-                            self.operand_affinity_for_current_row(e, row, col_map);
+                        let left_affinity = self.operand_affinity_for_current_row(e, row, col_map);
                         let subquery_affinity = match set {
                             InSet::Subquery(_) | InSet::Table(_) => in_set_donor_metadata
                                 .as_ref()
@@ -62146,14 +62193,24 @@ impl Connection {
                                         let schema = self.schema.borrow();
                                         left_explicit_collation
                                             .clone()
-                                            .or_else(|| singleton_comparison.then(|| {
-                                                operand_explicit_collation(list_expr)
-                                                    .map(str::to_owned)
-                                            }).flatten())
+                                            .or_else(|| {
+                                                singleton_comparison
+                                                    .then(|| {
+                                                        operand_explicit_collation(list_expr)
+                                                            .map(str::to_owned)
+                                                    })
+                                                    .flatten()
+                                            })
                                             .or_else(|| left_effective_collation.clone())
-                                            .or_else(|| singleton_comparison
-                                                .then(|| resolve_operand_collation(list_expr, &schema))
-                                                .flatten())
+                                            .or_else(|| {
+                                                singleton_comparison
+                                                    .then(|| {
+                                                        resolve_operand_collation(
+                                                            list_expr, &schema,
+                                                        )
+                                                    })
+                                                    .flatten()
+                                            })
                                     };
                                     // SQLite treats each RHS expression in an
                                     // explicit IN-list as having no affinity.
@@ -62173,14 +62230,9 @@ impl Connection {
                             }
                         }
                         InSet::Subquery(_) => {
-                            let sub_clone = bound_in_subquery
-                                .as_ref()
-                                .expect("subquery binding prepared above")
-                                .clone();
-                            let _cache_guard =
-                                BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
-                            let rows = execute_nested_select(sub_clone).await?;
-                            for row in rows {
+                            for row in materialized_subquery_rows
+                                .expect("subquery rows materialized before LHS evaluation")
+                            {
                                 let candidate =
                                     row.values.into_iter().next().unwrap_or(SqliteValue::Null);
                                 if candidate.is_null() {
@@ -62205,11 +62257,10 @@ impl Connection {
                                 }
                             }
                         }
-                        InSet::Table(name) => {
-                            let rows =
-                                execute_nested_select(in_table_name_to_select_statement(name))
-                                    .await?;
-                            for row in rows {
+                        InSet::Table(_) => {
+                            for row in materialized_subquery_rows
+                                .expect("table RHS rows materialized before LHS evaluation")
+                            {
                                 let candidate =
                                     row.values.into_iter().next().unwrap_or(SqliteValue::Null);
                                 if candidate.is_null() {
@@ -62924,11 +62975,7 @@ impl Connection {
                             rewrite_rowid_aliases_in_expr(expr, &table_schema, real_col);
                         }
                         for term in order_by {
-                            rewrite_rowid_aliases_in_expr(
-                                &mut term.expr,
-                                &table_schema,
-                                real_col,
-                            );
+                            rewrite_rowid_aliases_in_expr(&mut term.expr, &table_schema, real_col);
                         }
                     }
                 }
@@ -63308,25 +63355,20 @@ impl Connection {
                     } => {
                         if let Some(args) = application_args.as_ref() {
                             let num_args = aggregate_args_len_for_lookup(args);
-                            let filtered_rows: Vec<&Vec<SqliteValue>> =
-                                if let Some(filt) = filter {
-                                    let mut kept = Vec::new();
-                                    for row in group_rows {
-                                        let keep = self
-                                            .eval_row_expr_allowing_subqueries(
-                                                filt,
-                                                row,
-                                                &col_map,
-                                            )
-                                            .await?;
-                                        if is_sqlite_truthy(&keep) {
-                                            kept.push(row);
-                                        }
+                            let filtered_rows: Vec<&Vec<SqliteValue>> = if let Some(filt) = filter {
+                                let mut kept = Vec::new();
+                                for row in group_rows {
+                                    let keep = self
+                                        .eval_row_expr_allowing_subqueries(filt, row, &col_map)
+                                        .await?;
+                                    if is_sqlite_truthy(&keep) {
+                                        kept.push(row);
                                     }
-                                    kept
-                                } else {
-                                    group_rows.iter().collect()
-                                };
+                                }
+                                kept
+                            } else {
+                                group_rows.iter().collect()
+                            };
                             let mut entries = Vec::with_capacity(filtered_rows.len());
                             for row in &filtered_rows {
                                 let argument_values = match args {
@@ -63336,9 +63378,7 @@ impl Connection {
                                         for expression in expressions {
                                             values.push(
                                                 self.eval_row_expr_allowing_subqueries(
-                                                    expression,
-                                                    row,
-                                                    &col_map,
+                                                    expression, row, &col_map,
                                                 )
                                                 .await?,
                                             );
@@ -63350,9 +63390,7 @@ impl Connection {
                                 for term in order_by {
                                     keys.push(
                                         self.eval_row_expr_allowing_subqueries(
-                                            &term.expr,
-                                            row,
-                                            &col_map,
+                                            &term.expr, row, &col_map,
                                         )
                                         .await?,
                                     );
@@ -63584,9 +63622,7 @@ impl Connection {
                             if !order_by.is_empty() {
                                 let order_collations = order_by
                                     .iter()
-                                    .map(|term| {
-                                        join_expr_effective_collation(&term.expr, &col_map)
-                                    })
+                                    .map(|term| join_expr_effective_collation(&term.expr, &col_map))
                                     .collect::<Vec<_>>();
                                 entries.sort_by(|left, right| {
                                     cmp_in_aggregate_order_keys(
@@ -64135,10 +64171,7 @@ impl Connection {
                         .order_by
                         .iter()
                         .map(|term| OrderingTerm {
-                            expr: materialize_window_expr(
-                                &mut extra_window_exprs,
-                                &term.expr,
-                            ),
+                            expr: materialize_window_expr(&mut extra_window_exprs, &term.expr),
                             direction: term.direction,
                             nulls: term.nulls,
                         })
@@ -64220,10 +64253,7 @@ impl Connection {
                         .order_by
                         .iter()
                         .map(|term| OrderingTerm {
-                            expr: materialize_window_expr(
-                                &mut extra_window_exprs,
-                                &term.expr,
-                            ),
+                            expr: materialize_window_expr(&mut extra_window_exprs, &term.expr),
                             direction: term.direction,
                             nulls: term.nulls,
                         })
@@ -64438,9 +64468,7 @@ impl Connection {
                 .map(|row| {
                     rewritten_ob
                         .iter()
-                        .map(|term| {
-                            self.eval_join_expr_with_registry(&term.expr, row, &col_map)
-                        })
+                        .map(|term| self.eval_join_expr_with_registry(&term.expr, row, &col_map))
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -64498,8 +64526,7 @@ impl Connection {
             // arguments first, then FILTER.  Both may call observable scalar
             // functions, so keep them interleaved per row.  Cached arguments
             // are reused unchanged for step and inverse as the frame moves.
-            let mut application_args = (!info.is_builtin)
-                .then(|| Vec::with_capacity(total_rows));
+            let mut application_args = (!info.is_builtin).then(|| Vec::with_capacity(total_rows));
             let mut filter_matches = Vec::with_capacity(total_rows);
             for row in &row_values {
                 if let Some(args_by_row) = application_args.as_mut() {
@@ -64609,8 +64636,8 @@ impl Connection {
                         fname.as_str(),
                         "NTILE" | "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
                     );
-                let uses_inverse_counter = info.is_builtin
-                    && matches!(fname.as_str(), "NTILE" | "LEAD" | "LAG");
+                let uses_inverse_counter =
+                    info.is_builtin && matches!(fname.as_str(), "NTILE" | "LEAD" | "LAG");
                 let frame_sensitive = !info.is_builtin
                     || !matches!(
                         fname.as_str(),
@@ -65379,9 +65406,7 @@ impl Connection {
                 );
                 order_keys.push(
                     ob.iter()
-                        .map(|term| {
-                            self.eval_join_expr_with_registry(&term.expr, row, &col_map)
-                        })
+                        .map(|term| self.eval_join_expr_with_registry(&term.expr, row, &col_map))
                         .collect::<Result<Vec<_>>>()?,
                 );
             }
@@ -65760,10 +65785,7 @@ impl Connection {
                     // Numbering/positional functions (row_number, rank,
                     // dense_rank, lag) always produce per-row values.
                     let is_numbering_or_positional = is_builtin
-                        && matches!(
-                            fname.as_str(),
-                            "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG"
-                        );
+                        && matches!(fname.as_str(), "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG");
                     let is_range_or_groups_frame = has_order
                         && !is_numbering_or_positional
                         && frame.as_ref().is_none_or(|f| {
@@ -67483,7 +67505,7 @@ impl Connection {
             let registry = self.func_registry.borrow();
             registry.find_aggregate("sum", 1)
         }
-            .ok_or_else(|| FrankenError::internal("missing built-in aggregate: sum/1"))?;
+        .ok_or_else(|| FrankenError::internal("missing built-in aggregate: sum/1"))?;
         let mut state = func.initial_state();
         for value in values {
             func.step(&mut state, std::slice::from_ref(*value))?;
@@ -68744,11 +68766,8 @@ impl Connection {
         }
         let col_affinities =
             col_affinities_for_sources(&all_sources, &table_sources, &schema_snapshot);
-        let using_column_projections = self.build_join_using_column_projections(
-            select,
-            &col_collations,
-            &col_affinities,
-        );
+        let using_column_projections =
+            self.build_join_using_column_projections(select, &col_collations, &col_affinities);
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
                 column_collations: col_collations,
@@ -69409,6 +69428,7 @@ impl Connection {
             match expr {
                 Expr::Subquery(sub, span) => {
                     if !is_correlated_subquery_with_schema(sub, &self.schema.borrow()) {
+                        self.validate_select_column_references(sub)?;
                         self.validate_scalar_subquery_column_count(sub)?;
                         let rows = self
                             .execute_statement(&Statement::Select((**sub).clone()), params)
@@ -69450,32 +69470,74 @@ impl Connection {
                     if matches!(set, InSet::List(values) if values.is_empty()) {
                         return Ok(expr.clone());
                     }
-                    let resolved_inner = self
-                        .pre_resolve_non_correlated_subqueries_in_expr(inner, params)
-                        .await?;
-                    let resolved_set = match set {
-                        InSet::Subquery(sub)
-                            if !is_correlated_subquery_with_schema(sub, &self.schema.borrow()) =>
-                        {
-                            self.validate_in_subquery_column_count(inner, sub)?;
-                            let rows = self
-                                .execute_statement(&Statement::Select((**sub).clone()), params)
+                    if let InSet::Subquery(sub) = set {
+                        if is_correlated_subquery_with_schema(sub, &self.schema.borrow()) {
+                            // Preserve the whole comparison for per-row ordered
+                            // evaluation. Pre-resolving an otherwise constant
+                            // LHS here would move it ahead of the correlated RHS.
+                            return Ok(Expr::In {
+                                expr: inner.clone(),
+                                set: set.clone(),
+                                not: *not,
+                                span: *span,
+                            });
+                        }
+                        self.validate_select_column_references(sub)?;
+                        self.validate_in_subquery_column_count(inner, sub)?;
+                        let rows = self
+                            .execute_statement(&Statement::Select((**sub).clone()), params)
+                            .await?;
+                        let resolved_inner = self
+                            .pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                            .await?;
+                        if rows.is_empty() {
+                            return Ok(empty_in_result_after_evaluating_lhs(
+                                resolved_inner,
+                                *not,
+                                *span,
+                            ));
+                        }
+                        let literals = self.materialize_in_subquery_rows(inner, sub, rows)?;
+                        return Ok(Expr::In {
+                            expr: Box::new(resolved_inner),
+                            set: InSet::List(literals),
+                            not: *not,
+                            span: *span,
+                        });
+                    }
+
+                    let resolve_list = async |items: &[Expr]| -> Result<Vec<Expr>> {
+                        let mut resolved_items = Vec::with_capacity(items.len());
+                        for item in items {
+                            resolved_items.push(
+                                self.pre_resolve_non_correlated_subqueries_in_expr(item, params)
+                                    .await?,
+                            );
+                        }
+                        Ok(resolved_items)
+                    };
+                    let (resolved_inner, resolved_set) = match set {
+                        InSet::List(items) if self.in_lhs_column_count(inner) > 1 => {
+                            let resolved_items = resolve_list(items).await?;
+                            let resolved_inner = self
+                                .pre_resolve_non_correlated_subqueries_in_expr(inner, params)
                                 .await?;
-                            let literals =
-                                self.materialize_in_subquery_rows(inner, sub, rows)?;
-                            InSet::List(literals)
+                            (resolved_inner, InSet::List(resolved_items))
                         }
                         InSet::List(items) => {
-                            let mut resolved_items = Vec::with_capacity(items.len());
-                            for e in items {
-                                resolved_items.push(
-                                    self.pre_resolve_non_correlated_subqueries_in_expr(e, params)
-                                        .await?,
-                                );
-                            }
-                            InSet::List(resolved_items)
+                            let resolved_inner = self
+                                .pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                                .await?;
+                            let resolved_items = resolve_list(items).await?;
+                            (resolved_inner, InSet::List(resolved_items))
                         }
-                        other => other.clone(),
+                        InSet::Table(name) => {
+                            let resolved_inner = self
+                                .pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                                .await?;
+                            (resolved_inner, InSet::Table(name.clone()))
+                        }
+                        InSet::Subquery(_) => unreachable!("subquery IN set handled above"),
                     };
                     Ok(Expr::In {
                         expr: Box::new(resolved_inner),
@@ -69899,9 +69961,6 @@ impl Connection {
         Box::pin(async move {
             match expr {
                 Expr::Subquery(subquery, span) => {
-                    if !allow_vector_subquery {
-                        self.validate_scalar_subquery_column_count(subquery)?;
-                    }
                     let mut bound_subquery = subquery.as_ref().clone();
                     self.substitute_outer_refs_for_current_schema(
                         &mut bound_subquery,
@@ -69910,16 +69969,15 @@ impl Connection {
                         using_skip,
                     );
                     let donor_subquery = bound_subquery.clone();
-                    let _cache_guard =
-                        BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    self.validate_select_column_references(&donor_subquery)?;
+                    if !allow_vector_subquery {
+                        self.validate_scalar_subquery_column_count(&donor_subquery)?;
+                    }
+                    let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(bound_subquery), None)
                         .await?;
-                    self.materialize_scalar_subquery_in_operand(
-                        &donor_subquery,
-                        rows,
-                        *span,
-                    )
+                    self.materialize_scalar_subquery_in_operand(&donor_subquery, rows, *span)
                 }
                 Expr::RowValue(fields, span) => {
                     let mut inlined_fields = Vec::with_capacity(fields.len());
@@ -69938,13 +69996,8 @@ impl Connection {
                     Ok(Expr::RowValue(inlined_fields, *span))
                 }
                 _ => {
-                    self.inline_subqueries_in_expr_with_using(
-                        expr,
-                        row,
-                        outer_col_map,
-                        using_skip,
-                    )
-                    .await
+                    self.inline_subqueries_in_expr_with_using(expr, row, outer_col_map, using_skip)
+                        .await
                 }
             }
         })
@@ -69960,7 +70013,6 @@ impl Connection {
         Box::pin(async move {
             match expr {
                 Expr::Subquery(sub, span) => {
-                    self.validate_scalar_subquery_column_count(sub)?;
                     let mut sub_clone = sub.as_ref().clone();
                     self.substitute_outer_refs_for_current_schema(
                         &mut sub_clone,
@@ -69968,8 +70020,9 @@ impl Connection {
                         outer_col_map,
                         using_skip,
                     );
-                    let _cache_guard =
-                        BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    self.validate_select_column_references(&sub_clone)?;
+                    self.validate_scalar_subquery_column_count(&sub_clone)?;
+                    let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(sub_clone), None)
                         .await?;
@@ -69992,8 +70045,7 @@ impl Connection {
                         outer_col_map,
                         using_skip,
                     );
-                    let _cache_guard =
-                        BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(sub_clone), None)
                         .await?;
@@ -70111,18 +70163,9 @@ impl Connection {
                     if matches!(set, InSet::List(values) if values.is_empty()) {
                         return Ok(expr.clone());
                     }
-                    let new_inner = self
-                        .inline_in_comparison_operand(
-                            inner,
-                            row,
-                            outer_col_map,
-                            using_skip,
-                            true,
-                        )
-                        .await?;
+                    let mut runtime_empty_subquery = false;
                     let new_set = match set {
                         InSet::Subquery(subquery) => {
-                            self.validate_in_subquery_column_count(inner, subquery)?;
                             let mut sub_clone = subquery.as_ref().clone();
                             self.substitute_outer_refs_for_current_schema(
                                 &mut sub_clone,
@@ -70131,13 +70174,16 @@ impl Connection {
                                 using_skip,
                             );
                             let donor_subquery = sub_clone.clone();
+                            self.validate_select_column_references(&donor_subquery)?;
+                            self.validate_in_subquery_column_count(inner, &donor_subquery)?;
                             let _cache_guard =
                                 BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                             let rows = self
                                 .execute_statement(&Statement::Select(sub_clone), None)
                                 .await?;
-                            let literals = self
-                                .materialize_in_subquery_rows(inner, &donor_subquery, rows)?;
+                            runtime_empty_subquery = rows.is_empty();
+                            let literals =
+                                self.materialize_in_subquery_rows(inner, &donor_subquery, rows)?;
                             InSet::List(literals)
                         }
                         InSet::List(exprs) => {
@@ -70158,6 +70204,12 @@ impl Connection {
                         }
                         other => other.clone(),
                     };
+                    let new_inner = self
+                        .inline_in_comparison_operand(inner, row, outer_col_map, using_skip, true)
+                        .await?;
+                    if runtime_empty_subquery {
+                        return Ok(empty_in_result_after_evaluating_lhs(new_inner, *not, *span));
+                    }
                     Ok(Expr::In {
                         expr: Box::new(new_inner),
                         set: new_set,
@@ -70591,9 +70643,8 @@ impl Connection {
                         let mut new_insert = insert.clone();
                         let mut new_sel = sel.as_ref().clone();
                         let mut new_values = rows.clone();
-                        new_values.replace_rows_preserving_representation(
-                            resolve_rows(rows).await?,
-                        );
+                        new_values
+                            .replace_rows_preserving_representation(resolve_rows(rows).await?);
                         new_sel.body.select = SelectCore::Values(new_values);
                         new_insert.source = fsqlite_ast::InsertSource::Select(Box::new(new_sel));
                         return Ok(Cow::Owned(new_insert));
@@ -74012,11 +74063,8 @@ fn collect_from_clause_collation_lookup(
                         .using_output_collations
                         .get(&key)
                         .cloned()
-                        .unwrap_or_else(|| {
-                            lookup.collations.get(left_idx).cloned().flatten()
-                        });
-                    let right_collation =
-                        lookup.collations.get(right_idx).cloned().flatten();
+                        .unwrap_or_else(|| lookup.collations.get(left_idx).cloned().flatten());
+                    let right_collation = lookup.collations.get(right_idx).cloned().flatten();
                     let output_collation = match join.join_type.kind {
                         JoinKind::Right => right_collation,
                         JoinKind::Full => None,
@@ -74417,9 +74465,10 @@ impl<'a> CteResultMetadataResolver<'a> {
         if !cte.columns.is_empty() {
             metadata.names.clone_from(&cte.columns);
         }
-        metadata
-            .columns
-            .resize(metadata.names.len(), MaterializedResultColumnMetadata::default());
+        metadata.columns.resize(
+            metadata.names.len(),
+            MaterializedResultColumnMetadata::default(),
+        );
         metadata.columns.truncate(metadata.names.len());
         if outer_lookup.is_none() {
             self.cache.insert(key, metadata.clone());
@@ -74465,9 +74514,10 @@ impl<'a> CteResultMetadataResolver<'a> {
         if !view.columns.is_empty() {
             metadata.names = view.columns;
         }
-        metadata
-            .columns
-            .resize(metadata.names.len(), MaterializedResultColumnMetadata::default());
+        metadata.columns.resize(
+            metadata.names.len(),
+            MaterializedResultColumnMetadata::default(),
+        );
         metadata.columns.truncate(metadata.names.len());
 
         self.active_views.borrow_mut().remove(&view_index);
@@ -74543,13 +74593,14 @@ impl<'a> CteResultMetadataResolver<'a> {
         let (collations, affinity_terms) = match donor_core {
             SelectCore::Values(rows) => {
                 let donor_index = rows.donor_row_index();
-                let collations = donor_index
-                    .and_then(|index| rows.get(index))
-                    .map_or_else(Vec::new, |row| {
-                        row.iter()
-                            .map(|expr| self.resolve_expr_collation(expr, None, None))
-                            .collect()
-                    });
+                let collations =
+                    donor_index
+                        .and_then(|index| rows.get(index))
+                        .map_or_else(Vec::new, |row| {
+                            row.iter()
+                                .map(|expr| self.resolve_expr_collation(expr, None, None))
+                                .collect()
+                        });
                 let affinity_terms = donor_index
                     .and_then(|index| affinity_rows.get(index))
                     .cloned()
@@ -74593,7 +74644,9 @@ impl<'a> CteResultMetadataResolver<'a> {
             };
             let width = rows.first().map_or(0, Vec::len);
             return CteCoreResultMetadata {
-                names: (0..width).map(|index| format!("column{}", index + 1)).collect(),
+                names: (0..width)
+                    .map(|index| format!("column{}", index + 1))
+                    .collect(),
                 collations: rows.first().map_or_else(Vec::new, |row| {
                     row.iter()
                         .map(|expr| self.resolve_expr_collation(expr, None, outer_lookup))
@@ -74748,11 +74801,8 @@ impl<'a> CteResultMetadataResolver<'a> {
                             .cloned()
                             .or_else(|| lookup.columns.get(left_index).cloned())
                             .unwrap_or_default();
-                        let right_column = lookup
-                            .columns
-                            .get(right_index)
-                            .cloned()
-                            .unwrap_or_default();
+                        let right_column =
+                            lookup.columns.get(right_index).cloned().unwrap_or_default();
                         let output_column = match join.join_type.kind {
                             JoinKind::Right => right_column,
                             JoinKind::Full => MaterializedResultColumnMetadata::default(),
@@ -74825,30 +74875,27 @@ impl<'a> CteResultMetadataResolver<'a> {
                 if let Some(view_index) = self.connection.local_view_index_for_relation(name) {
                     return self.resolve_view(view_index);
                 }
-                self.table_schema_for_relation(name)
-                    .map_or_else(
-                        || MaterializedCteResultMetadata {
-                            names: vec![name.name.clone()],
-                            columns: vec![MaterializedResultColumnMetadata::default()],
-                        },
-                        |schema| MaterializedCteResultMetadata {
-                            names: schema
-                                .columns
-                                .iter()
-                                .map(|column| column.name.clone())
-                                .collect(),
-                            columns: schema
-                                .columns
-                                .iter()
-                                .map(|column| MaterializedResultColumnMetadata {
-                                    affinity: Some(affinity_char_to_type(column.affinity)),
-                                    collation: normalize_column_collation(
-                                        column.collation.as_deref(),
-                                    ),
-                                })
-                                .collect(),
-                        },
-                    )
+                self.table_schema_for_relation(name).map_or_else(
+                    || MaterializedCteResultMetadata {
+                        names: vec![name.name.clone()],
+                        columns: vec![MaterializedResultColumnMetadata::default()],
+                    },
+                    |schema| MaterializedCteResultMetadata {
+                        names: schema
+                            .columns
+                            .iter()
+                            .map(|column| column.name.clone())
+                            .collect(),
+                        columns: schema
+                            .columns
+                            .iter()
+                            .map(|column| MaterializedResultColumnMetadata {
+                                affinity: Some(affinity_char_to_type(column.affinity)),
+                                collation: normalize_column_collation(column.collation.as_deref()),
+                            })
+                            .collect(),
+                    },
+                )
             }
             TableOrSubquery::Subquery { query, .. } => self.resolve_select(query, None),
             TableOrSubquery::TableFunction { name, .. } => {
@@ -74912,9 +74959,7 @@ impl<'a> CteResultMetadataResolver<'a> {
             Expr::Column(column, _) => cte_lookup_column_metadata(from_lookup, column)
                 .or_else(|| cte_lookup_column_metadata(outer_lookup, column))
                 .and_then(|metadata| metadata.affinity),
-            Expr::Cast { type_name, .. } => {
-                Some(TypeAffinity::from_type_name(&type_name.name))
-            }
+            Expr::Cast { type_name, .. } => Some(TypeAffinity::from_type_name(&type_name.name)),
             Expr::Collate { expr, .. } => {
                 self.resolve_expr_affinity_term(expr, from_lookup, outer_lookup)
                     .affinity
@@ -74960,10 +75005,7 @@ impl<'a> CteResultMetadataResolver<'a> {
             Expr::Literal(Literal::String(_), _) => CTE_TYPE_TEXT,
             Expr::Literal(Literal::Blob(_), _) => CTE_TYPE_BLOB,
             Expr::Literal(
-                Literal::Integer(_)
-                | Literal::Float(_)
-                | Literal::True
-                | Literal::False,
+                Literal::Integer(_) | Literal::Float(_) | Literal::True | Literal::False,
                 _,
             ) => CTE_TYPE_NUMERIC,
             Expr::Literal(
@@ -75020,9 +75062,7 @@ impl<'a> CteResultMetadataResolver<'a> {
                 .or_else(|| cte_lookup_column_metadata(outer_lookup, column))
                 .map_or(CollationCandidate::Absent, |metadata| {
                     CollationCandidate::Named(
-                        metadata
-                            .collation
-                            .unwrap_or_else(|| "BINARY".to_owned()),
+                        metadata.collation.unwrap_or_else(|| "BINARY".to_owned()),
                     )
                 }),
             Expr::Cast { expr, .. }
@@ -75031,10 +75071,11 @@ impl<'a> CteResultMetadataResolver<'a> {
                 expr,
                 ..
             } => self.resolve_expr_collation(expr, from_lookup, outer_lookup),
-            Expr::RowValue(values, _) => values.first().map_or(
-                CollationCandidate::Absent,
-                |value| self.resolve_expr_collation(value, from_lookup, outer_lookup),
-            ),
+            Expr::RowValue(values, _) => {
+                values.first().map_or(CollationCandidate::Absent, |value| {
+                    self.resolve_expr_collation(value, from_lookup, outer_lookup)
+                })
+            }
             // A projected COLLATE inside a direct scalar subquery does not
             // cross the scalar-expression boundary in SQLite.
             _ => CollationCandidate::Absent,
@@ -75072,10 +75113,7 @@ impl<'a> CteResultMetadataResolver<'a> {
         affinity
     }
 
-    fn visible_cte(
-        &self,
-        name: &QualifiedName,
-    ) -> Option<(usize, &'a fsqlite_ast::Cte)> {
+    fn visible_cte(&self, name: &QualifiedName) -> Option<(usize, &'a fsqlite_ast::Cte)> {
         if name.schema.is_some() {
             return None;
         }
@@ -75116,18 +75154,11 @@ fn resolve_select_metadata_with_view_state<'a>(
     view_cache: Rc<RefCell<HashMap<usize, MaterializedCteResultMetadata>>>,
     active_views: Rc<RefCell<HashSet<usize>>>,
 ) -> MaterializedCteResultMetadata {
-    CteResultMetadataResolver::with_view_state(
-        connection,
-        schemas,
-        view_cache,
-        active_views,
-    )
-    .resolve_select(select, None)
+    CteResultMetadataResolver::with_view_state(connection, schemas, view_cache, active_views)
+        .resolve_select(select, None)
 }
 
-fn cte_conservative_result_metadata(
-    cte: &fsqlite_ast::Cte,
-) -> MaterializedCteResultMetadata {
+fn cte_conservative_result_metadata(cte: &fsqlite_ast::Cte) -> MaterializedCteResultMetadata {
     let names = if cte.columns.is_empty() {
         infer_select_column_names(&cte.query)
     } else {
@@ -75182,9 +75213,7 @@ fn cte_compound_column_affinity(
     }
 
     for row in affinity_rows.iter().skip(donor_index + 1) {
-        other_types |= row
-            .get(column_index)
-            .map_or(0, |term| term.possible_types);
+        other_types |= row.get(column_index).map_or(0, |term| term.possible_types);
     }
     if affinity == TypeAffinity::Text && other_types & CTE_TYPE_NUMERIC != 0
         || matches!(
@@ -75268,10 +75297,7 @@ fn cte_extend_projected_metadata(
     }
 }
 
-fn select_core_result_affinities(
-    core: &SelectCore,
-    schemas: &[TableSchema],
-) -> Vec<TypeAffinity> {
+fn select_core_result_affinities(core: &SelectCore, schemas: &[TableSchema]) -> Vec<TypeAffinity> {
     let SelectCore::Select { columns, from, .. } = core else {
         return Vec::new();
     };
@@ -75842,9 +75868,7 @@ fn expr_has_ordered_aggregate(expr: &Expr) -> bool {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            false
-        }
+        | Expr::Placeholder(_, _) => false,
     }
 }
 
@@ -75870,9 +75894,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
                 FunctionArgs::Star => false,
             };
             args_have_aggregate
-                || order_by
-                    .iter()
-                    .any(|term| expr_has_aggregate(&term.expr))
+                || order_by.iter().any(|term| expr_has_aggregate(&term.expr))
                 || filter.as_deref().is_some_and(expr_has_aggregate)
                 || over
                     .as_ref()
@@ -75917,9 +75939,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
                     .any(|(w, t)| expr_has_aggregate(w) || expr_has_aggregate(t))
                 || else_expr.as_deref().is_some_and(expr_has_aggregate)
         }
-        Expr::JsonAccess { expr, path, .. } => {
-            expr_has_aggregate(expr) || expr_has_aggregate(path)
-        }
+        Expr::JsonAccess { expr, path, .. } => expr_has_aggregate(expr) || expr_has_aggregate(path),
         Expr::RowValue(values, _) => values.iter().any(expr_has_aggregate),
         Expr::BoundOuterValue { .. }
         | Expr::Literal(_, _)
@@ -76037,10 +76057,9 @@ fn expr_has_nested_aggregate(expr: &Expr) -> bool {
         } => {
             let args_have_aggregate =
                 matches!(args, FunctionArgs::List(exprs) if exprs.iter().any(expr_has_aggregate));
-            let modifiers_have_aggregate = order_by
-                .iter()
-                .any(|term| expr_has_aggregate(&term.expr))
-                || filter.as_deref().is_some_and(expr_has_aggregate);
+            let modifiers_have_aggregate =
+                order_by.iter().any(|term| expr_has_aggregate(&term.expr))
+                    || filter.as_deref().is_some_and(expr_has_aggregate);
             if over.is_none()
                 && is_current_aggregate_fn(name, args)
                 && !is_scalar_max_min(name, args)
@@ -76057,9 +76076,9 @@ fn expr_has_nested_aggregate(expr: &Expr) -> bool {
                     .iter()
                     .any(|term| expr_has_nested_aggregate(&term.expr))
                 || filter.as_deref().is_some_and(expr_has_nested_aggregate)
-                || over.as_ref().is_some_and(|window| {
-                    window_spec_has_expr(window, expr_has_nested_aggregate)
-                })
+                || over
+                    .as_ref()
+                    .is_some_and(|window| window_spec_has_expr(window, expr_has_nested_aggregate))
         }
         Expr::BinaryOp { left, right, .. } => {
             expr_has_nested_aggregate(left) || expr_has_nested_aggregate(right)
@@ -76347,9 +76366,7 @@ fn validate_used_window_specs_in_expr(
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            Ok(())
-        }
+        | Expr::Placeholder(_, _) => Ok(()),
         Expr::BinaryOp { left, right, .. } => {
             validate_used_window_specs_in_expr(left, named_windows)?;
             validate_used_window_specs_in_expr(right, named_windows)
@@ -76417,8 +76434,8 @@ fn validate_used_window_specs_in_expr(
             name,
             ..
         } => {
-            let is_aggregate = is_current_aggregate_or_json_fn(name, args)
-                && !is_scalar_max_min(name, args);
+            let is_aggregate =
+                is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args);
             if over.is_none()
                 && is_aggregate
                 && (matches!(
@@ -76602,9 +76619,7 @@ fn validate_dead_empty_in_window_modifiers(expr: &Expr) -> Result<()> {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            Ok(())
-        }
+        | Expr::Placeholder(_, _) => Ok(()),
     }
 }
 
@@ -76928,15 +76943,13 @@ fn validate_function_call_resolution(
 ) -> Result<()> {
     let num_args = aggregate_args_len_for_lookup(args);
     let application_kind = current_application_function_kind(name, num_args);
-    if over.is_some()
-        && application_kind.is_some_and(|kind| !kind.is_window_callable())
-    {
+    if over.is_some() && application_kind.is_some_and(|kind| !kind.is_window_callable()) {
         return Err(FrankenError::FunctionError(format!(
             "{name}() may not be used as a window function"
         )));
     }
-    let is_aggregate = is_current_aggregate_or_json_fn(name, args)
-        && !is_scalar_max_min(name, args);
+    let is_aggregate =
+        is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args);
     let accepted = if application_kind.is_some() {
         // Resolution already selected a compatible application overload.  In
         // particular, it must take precedence over name-only JSON and FTS5
@@ -76992,8 +77005,8 @@ fn validate_function_call_header(
     filter: Option<&Expr>,
     over: Option<&WindowSpec>,
 ) -> Result<()> {
-    let is_aggregate = is_current_aggregate_or_json_fn(name, args)
-        && !is_scalar_max_min(name, args);
+    let is_aggregate =
+        is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args);
     if filter.is_some() && !is_aggregate {
         return Err(FrankenError::FunctionError(format!(
             "FILTER may not be used with non-aggregate {name}()"
@@ -77024,9 +77037,7 @@ fn validate_function_call_modifiers_in_expr(expr: &Expr) -> Result<()> {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            Ok(())
-        }
+        | Expr::Placeholder(_, _) => Ok(()),
         Expr::BinaryOp { left, right, .. } => {
             validate_function_call_modifiers_in_expr(left)?;
             validate_function_call_modifiers_in_expr(right)
@@ -78609,8 +78620,7 @@ fn qualify_persistent_view_expr(expr: &mut Expr, scopes: &mut Vec<HashSet<String
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-        }
+        | Expr::Placeholder(_, _) => {}
         Expr::BinaryOp { left, right, .. }
         | Expr::JsonAccess {
             expr: left,
@@ -78950,9 +78960,7 @@ fn visit_expr_qualified_names(
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            Ok(())
-        }
+        | Expr::Placeholder(_, _) => Ok(()),
         Expr::BinaryOp { left, right, .. } => {
             visit_expr_qualified_names(left, f)?;
             visit_expr_qualified_names(right, f)
@@ -79206,8 +79214,7 @@ fn visit_expr_qualified_names_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Quali
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-        }
+        | Expr::Placeholder(_, _) => {}
         Expr::BinaryOp { left, right, .. } => {
             visit_expr_qualified_names_mut(left, f);
             visit_expr_qualified_names_mut(right, f);
@@ -79818,9 +79825,7 @@ fn expr_contains_match_operator(expr: &Expr) -> bool {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Placeholder(_, _)
-        | Expr::Raise { .. } => {
-            false
-        }
+        | Expr::Raise { .. } => false,
     }
 }
 
@@ -82403,6 +82408,201 @@ fn select_has_unsupported_correlated_scalar_subquery(
     select_contains_subquery_matching(select, conn, unsupported)
 }
 
+/// Whether a SELECT needs the lexical preflight used before subquery-width and
+/// source-layout diagnostics. CTE and derived-table scopes matter even when
+/// their bodies contain no scalar/EXISTS/IN expression node.
+fn select_requires_column_reference_preflight(select: &SelectStatement, conn: &Connection) -> bool {
+    select.with.is_some()
+        || select_core_has_derived_source(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| select_core_has_derived_source(core))
+        || select_contains_subquery_matching(select, conn, |_, _| true)
+}
+
+fn select_core_has_derived_source(core: &SelectCore) -> bool {
+    matches!(
+        core,
+        SelectCore::Select {
+            from: Some(from), ..
+        } if from_has_derived_source(from)
+    )
+}
+
+fn from_has_derived_source(from: &FromClause) -> bool {
+    table_or_subquery_is_or_contains_derived_source(&from.source)
+        || from
+            .joins
+            .iter()
+            .any(|join| table_or_subquery_is_or_contains_derived_source(&join.table))
+}
+
+fn table_or_subquery_is_or_contains_derived_source(source: &TableOrSubquery) -> bool {
+    match source {
+        TableOrSubquery::Subquery { .. } => true,
+        TableOrSubquery::ParenJoin(from) => from_has_derived_source(from),
+        TableOrSubquery::Table { .. } | TableOrSubquery::TableFunction { .. } => false,
+    }
+}
+
+/// Whether source metadata can expose a layout error before LIMIT/OFFSET name
+/// resolution. Ordinary `SELECT ... FROM table LIMIT ...` statements need no
+/// metadata-only pass; relation validation and the normal executor already own
+/// their diagnostics.
+fn select_requires_layout_preflight_before_limit(select: &SelectStatement) -> bool {
+    std::iter::once(&select.body.select)
+        .chain(select.body.compounds.iter().map(|(_, core)| core))
+        .any(select_core_requires_layout_preflight_before_limit)
+}
+
+fn select_core_requires_layout_preflight_before_limit(core: &SelectCore) -> bool {
+    match core {
+        SelectCore::Values(rows) => rows
+            .first()
+            .is_some_and(|first| rows.iter().any(|row| row.len() != first.len())),
+        SelectCore::Select { columns, from, .. } => {
+            columns.iter().any(|column| {
+                matches!(column, ResultColumn::TableStar(_))
+                    || matches!(column, ResultColumn::Star) && from.is_none()
+            }) || from.as_ref().is_some_and(from_has_explicit_using)
+        }
+    }
+}
+
+fn from_has_explicit_using(from: &FromClause) -> bool {
+    table_or_subquery_contains_explicit_using(&from.source)
+        || from.joins.iter().any(|join| {
+            matches!(join.constraint.as_ref(), Some(JoinConstraint::Using(_)))
+                || table_or_subquery_contains_explicit_using(&join.table)
+        })
+}
+
+fn table_or_subquery_contains_explicit_using(source: &TableOrSubquery) -> bool {
+    matches!(source, TableOrSubquery::ParenJoin(from) if from_has_explicit_using(from))
+}
+
+fn select_references_view_for_layout(
+    select: &SelectStatement,
+    connection: &Connection,
+) -> Result<bool> {
+    for core in std::iter::once(&select.body.select)
+        .chain(select.body.compounds.iter().map(|(_, core)| core))
+    {
+        if let SelectCore::Select {
+            from: Some(from), ..
+        } = core
+            && from_references_view_for_layout(from, connection)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn from_references_view_for_layout(from: &FromClause, connection: &Connection) -> Result<bool> {
+    if table_or_subquery_references_view_for_layout(&from.source, connection)? {
+        return Ok(true);
+    }
+    for join in &from.joins {
+        if table_or_subquery_references_view_for_layout(&join.table, connection)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn table_or_subquery_references_view_for_layout(
+    source: &TableOrSubquery,
+    connection: &Connection,
+) -> Result<bool> {
+    match source {
+        TableOrSubquery::Table { name, .. } => named_relation_is_view_for_layout(name, connection),
+        TableOrSubquery::Subquery { query, .. } => {
+            select_references_view_for_layout(query, connection)
+        }
+        TableOrSubquery::ParenJoin(from) => from_references_view_for_layout(from, connection),
+        TableOrSubquery::TableFunction { .. } => Ok(false),
+    }
+}
+
+fn named_relation_is_view_for_layout(
+    name: &QualifiedName,
+    connection: &Connection,
+) -> Result<bool> {
+    match name.schema.as_deref() {
+        None => {
+            if connection.table_exists_for_scope(&name.name, PragmaSchemaScope::Temp) {
+                return Ok(false);
+            }
+            if connection
+                .view_index_for_scope(&name.name, PragmaSchemaScope::Temp)
+                .is_some()
+            {
+                return Ok(true);
+            }
+            if connection.table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+                || connection.has_live_vtab_instance(&name.name)
+            {
+                return Ok(false);
+            }
+            if connection
+                .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                .is_some()
+            {
+                return Ok(true);
+            }
+            let schema_names = connection
+                .attached_schemas
+                .borrow()
+                .all_schemas()
+                .into_iter()
+                .skip(2)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            for schema_name in schema_names {
+                let found = connection.with_attached_connection(&schema_name, |attached| {
+                    if attached.table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+                        || attached.has_live_vtab_instance(&name.name)
+                    {
+                        Ok(Some(false))
+                    } else {
+                        Ok(attached
+                            .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                            .map(|_| true))
+                    }
+                })?;
+                if let Some(is_view) = found {
+                    return Ok(is_view);
+                }
+            }
+            Ok(false)
+        }
+        Some(schema) if schema.eq_ignore_ascii_case("main") => Ok(!connection
+            .table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+            && !connection.has_live_vtab_instance(&name.name)
+            && connection
+                .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                .is_some()),
+        Some(schema) if schema.eq_ignore_ascii_case("temp") => Ok(!connection
+            .table_exists_for_scope(&name.name, PragmaSchemaScope::Temp)
+            && connection
+                .view_index_for_scope(&name.name, PragmaSchemaScope::Temp)
+                .is_some()),
+        Some(schema) if is_builtin_schema(schema) => Ok(false),
+        Some(schema) => connection.with_attached_connection(schema, |attached| {
+            Ok(
+                !attached.table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+                    && !attached.has_live_vtab_instance(&name.name)
+                    && attached
+                        .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                        .is_some(),
+            )
+        }),
+    }
+}
+
 /// Walk every expression-bearing SELECT position, including nested FROM
 /// sources, and apply `predicate` to each scalar/EXISTS/IN subquery.
 ///
@@ -82616,9 +82816,7 @@ fn expr_contains_subquery_match(
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            false
-        }
+        | Expr::Placeholder(_, _) => false,
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_subquery_match(left, matcher)
                 || expr_contains_subquery_match(right, matcher)
@@ -83153,12 +83351,12 @@ fn expr_has_in_subquery_operand_requiring_semantic_fallback(
         Expr::In { expr, set, .. } => {
             (conn.in_lhs_column_count(expr) > 1 && matches!(set, InSet::List(_)))
                 || (matches!(set, InSet::Subquery(_))
-                && in_probe_expr_requires_semantic_fallback(expr)
-                && !matches!(
-                    set,
-                    InSet::Subquery(subquery)
-                        if scalar_in_operand_supported_by_complex_vdbe(expr, subquery, conn)
-                ))
+                    && in_probe_expr_requires_semantic_fallback(expr)
+                    && !matches!(
+                        set,
+                        InSet::Subquery(subquery)
+                            if scalar_in_operand_supported_by_complex_vdbe(expr, subquery, conn)
+                    ))
                 || expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)
                 || match set {
                     InSet::List(values) => values.iter().any(|value| {
@@ -84390,9 +84588,7 @@ fn expr_contains_relation_reference(
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            false
-        }
+        | Expr::Placeholder(_, _) => false,
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_relation_reference(left, predicate)
                 || expr_contains_relation_reference(right, predicate)
@@ -84831,9 +85027,7 @@ fn expr_contains_rewritable_in_table_name(expr: &Expr) -> bool {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            false
-        }
+        | Expr::Placeholder(_, _) => false,
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_rewritable_in_table_name(left)
                 || expr_contains_rewritable_in_table_name(right)
@@ -85991,8 +86185,7 @@ fn collect_main_qualified_expr(expr: &Expr, out: &mut HashSet<String>) {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-        }
+        | Expr::Placeholder(_, _) => {}
         Expr::BinaryOp { left, right, .. } => {
             collect_main_qualified_expr(left, out);
             collect_main_qualified_expr(right, out);
@@ -86420,13 +86613,8 @@ fn try_correlated_pair(
     {
         return None;
     }
-    let outer_index = find_col_in_map(
-        col_map,
-        Some(outer_qualifier),
-        &outer_ref.column,
-        None,
-    )
-    .ok()?;
+    let outer_index =
+        find_col_in_map(col_map, Some(outer_qualifier), &outer_ref.column, None).ok()?;
     let outer_value = row.get(outer_index)?.clone();
     Some(CorrelatedEqualityProbe {
         inner_column: inner_ref.column.to_string(),
@@ -87124,13 +87312,7 @@ fn resolve_outer_column_expr(
     }
     if column.table.is_none()
         && lookup.using_skip.is_some()
-        && find_col_in_map(
-            lookup.col_map,
-            None,
-            &column.column,
-            lookup.using_skip,
-        )
-        .is_ok()
+        && find_col_in_map(lookup.col_map, None, &column.column, lookup.using_skip).is_ok()
         && let Some(projection) = current_join_using_column_projection(&column.column)
     {
         let value = projection.value(lookup.row);
@@ -88340,7 +88522,10 @@ fn rewrite_in_expr<'a>(
     Box::pin(async move {
         match expr {
             Expr::In {
-                set, expr: inner, ..
+                set,
+                expr: inner,
+                not,
+                span,
             } => {
                 if let Cow::Owned(normalized) = normalize_bare_singleton_in_subquery(set) {
                     *set = normalized;
@@ -88348,12 +88533,10 @@ fn rewrite_in_expr<'a>(
                 if matches!(set, InSet::List(values) if values.is_empty()) {
                     return Ok(());
                 }
-                rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
                 if let InSet::Table(name) = set {
                     *set = InSet::Subquery(Box::new(in_table_name_to_select_statement(name)));
                 }
                 if let InSet::Subquery(sub) = set {
-                    conn.validate_in_subquery_column_count(inner, sub)?;
                     // Correlated IN subqueries reference outer table columns and
                     // must be evaluated per-row; skip eager rewrite.
                     let vdbe_supported = in_subquery_supported_by_vdbe(sub, conn);
@@ -88384,11 +88567,27 @@ fn rewrite_in_expr<'a>(
                         // temporarily install mirrored temp tables keep supported
                         // IN subqueries intact so recursive rewrite-time dispatch
                         // does not lose those ephemeral relations.
+                        conn.validate_select_column_references(sub)?;
+                        conn.validate_in_subquery_column_count(inner, sub)?;
                         let rows = conn
                             .execute_statement(&Statement::Select(*sub.clone()), params)
                             .await?;
-                        let literals =
-                            conn.materialize_in_subquery_rows(inner, sub, rows)?;
+                        if rows.is_empty() {
+                            // The RHS has already run once. Keep its empty-set
+                            // result without retaining the live subquery AST,
+                            // which would execute it a second time downstream.
+                            // SQLite still evaluates the LHS after a runtime-
+                            // empty subquery (unlike a syntactic `IN ()`).
+                            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
+                            let replacement = empty_in_result_after_evaluating_lhs(
+                                inner.as_ref().clone(),
+                                *not,
+                                *span,
+                            );
+                            *expr = replacement;
+                            return Ok(());
+                        }
+                        let literals = conn.materialize_in_subquery_rows(inner, sub, rows)?;
                         *set = InSet::List(literals);
                     }
                 }
@@ -88397,6 +88596,7 @@ fn rewrite_in_expr<'a>(
                         rewrite_in_expr(e, conn, rewrite_in_subqueries, params).await?;
                     }
                 }
+                rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
                 // Keep vector IN intact. The connection evaluator compares a
                 // row operand once, preserves three-valued tuple semantics,
                 // and applies the final RHS row's per-field affinity/collation
@@ -88617,10 +88817,7 @@ fn builtin_aggregate_accepts_arity(name: &str, arity: i32) -> bool {
         || (name.eq_ignore_ascii_case("group_concat") && matches!(arity, 1 | 2))
 }
 
-fn current_application_function_kind(
-    name: &str,
-    arity: i32,
-) -> Option<ApplicationFunctionKind> {
+fn current_application_function_kind(name: &str, arity: i32) -> Option<ApplicationFunctionKind> {
     with_current_sync_function_registry(|registry| {
         registry
             .and_then(|registry| registry.resolve_application_function(name, arity))
@@ -88693,9 +88890,7 @@ fn validate_nonaggregate_index_function(
             };
         }
         Some(false) => {
-            return Err(format!(
-                "wrong number of arguments to function {name}()"
-            ));
+            return Err(format!("wrong number of arguments to function {name}()"));
         }
         None => {}
     }
@@ -88718,12 +88913,12 @@ fn visit_index_expr_function_calls(
     visit: &mut impl FnMut(&str, &FunctionArgs) -> std::result::Result<(), String>,
 ) -> std::result::Result<(), String> {
     match expr {
-        Expr::BoundOuterValue { .. } => Err(
-            "internal bound outer value is not valid in persisted index expressions".to_owned(),
-        ),
+        Expr::BoundOuterValue { .. } => {
+            Err("internal bound outer value is not valid in persisted index expressions".to_owned())
+        }
         Expr::Literal(
             Literal::CurrentDate | Literal::CurrentTime | Literal::CurrentTimestamp,
-            ..
+            ..,
         ) => Err(format!(
             "non-deterministic functions prohibited in index expressions: {expr}"
         )),
@@ -88868,9 +89063,7 @@ fn is_current_aggregate_fn(name: &str, args: &FunctionArgs) -> bool {
     }
     is_agg_fn(name)
         || with_current_sync_custom_aggregate_keys(|keys| {
-            keys.is_some_and(|keys| {
-                custom_aggregate_overrides_builtin(keys, name, arity)
-            })
+            keys.is_some_and(|keys| custom_aggregate_overrides_builtin(keys, name, arity))
         })
 }
 
@@ -88890,9 +89083,7 @@ fn is_current_aggregate_or_json_fn(name: &str, args: &FunctionArgs) -> bool {
 fn expr_contains_agg(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
-            if is_current_aggregate_or_json_fn(name, args)
-                && !is_scalar_max_min(name, args)
-            {
+            if is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args) {
                 return true;
             }
             match args {
@@ -89065,10 +89256,7 @@ fn expr_contains_custom_registered_agg(expr: &Expr) -> bool {
                     },
                     ApplicationFunctionKind::is_aggregate_callable,
                 );
-            if over.is_none()
-                && !is_scalar_max_min(name, args)
-                && custom_or_json_aggregate
-            {
+            if over.is_none() && !is_scalar_max_min(name, args) && custom_or_json_aggregate {
                 return true;
             }
             match args {
@@ -89432,9 +89620,7 @@ fn expr_may_observe_change_tracking(expr: &Expr) -> bool {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Placeholder(_, _)
-        | Expr::Raise { .. } => {
-            false
-        }
+        | Expr::Raise { .. } => false,
     }
 }
 
@@ -89469,8 +89655,7 @@ fn cmp_in_aggregate_order_keys(
             }
         } else {
             let collation = order_collations.get(i).and_then(|value| value.as_deref());
-            let mut o =
-                cmp_sqlite_values_collated_snapshot(av, bv, collation, collation_registry);
+            let mut o = cmp_sqlite_values_collated_snapshot(av, bv, collation, collation_registry);
             if term.direction == Some(SortDirection::Desc) {
                 o = o.reverse();
             }
@@ -89501,12 +89686,8 @@ fn prepare_application_aggregate_rows(
                 return keep;
             };
             if seen.iter().any(|previous| {
-                cmp_sqlite_values_collated_snapshot(
-                    previous,
-                    value,
-                    collation,
-                    collation_registry,
-                ) == std::cmp::Ordering::Equal
+                cmp_sqlite_values_collated_snapshot(previous, value, collation, collation_registry)
+                    == std::cmp::Ordering::Equal
             }) {
                 false
             } else {
@@ -89588,8 +89769,7 @@ fn eval_group_agg_join_expr(
                 // DISTINCT removes duplicate values (first occurrence wins). (GH #268)
                 if *distinct {
                     let mut seen: Vec<SqliteValue> = Vec::new();
-                    let distinct_collation =
-                        join_expr_effective_collation(arg, col_map);
+                    let distinct_collation = join_expr_effective_collation(arg, col_map);
                     items.retain(|(v, _)| {
                         if seen.iter().any(|s| {
                             cmp_sqlite_values_collated_snapshot(
@@ -89726,8 +89906,7 @@ fn eval_group_agg_join_expr(
                         }
                         aggregate_rows.push((values, keys));
                     }
-                    let collation_registry =
-                        current_join_eval_collation_registry_snapshot();
+                    let collation_registry = current_join_eval_collation_registry_snapshot();
                     let distinct_collation = exprs
                         .first()
                         .and_then(|expr| join_expr_effective_collation(expr, col_map));
@@ -89830,13 +90009,8 @@ fn eval_group_agg_join_expr(
                 {
                     !b.is_null()
                         && !when_val.is_null()
-                        && compare_join_expr_values(
-                            operand_expr,
-                            b,
-                            when_expr,
-                            &when_val,
-                            col_map,
-                        ) == std::cmp::Ordering::Equal
+                        && compare_join_expr_values(operand_expr, b, when_expr, &when_val, col_map)
+                            == std::cmp::Ordering::Equal
                 } else {
                     is_sqlite_truthy(&when_val)
                 };
@@ -89897,18 +90071,29 @@ fn eval_group_agg_join_expr(
             }
             if let Expr::RowValue(lhs_exprs, _) = expr.as_ref() {
                 validate_vector_in_list_arity(lhs_exprs.len(), list)?;
+                let rhs_rows = list
+                    .iter()
+                    .map(|list_item| {
+                        let rhs_exprs = match list_item {
+                            Expr::RowValue(values, _) => values.as_slice(),
+                            other => std::slice::from_ref(other),
+                        };
+                        rhs_exprs
+                            .iter()
+                            .map(|rhs_expr| eval_group_agg_join_expr(rhs_expr, group_rows, col_map))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let lhs = lhs_exprs
                     .iter()
-                    .map(|lhs_expr| {
-                        eval_group_agg_join_expr(lhs_expr, group_rows, col_map)
-                    })
+                    .map(|lhs_expr| eval_group_agg_join_expr(lhs_expr, group_rows, col_map))
                     .collect::<Result<Vec<_>>>()?;
                 let donor_exprs = list.last().map(|list_item| match list_item {
                     Expr::RowValue(values, _) => values.as_slice(),
                     other => std::slice::from_ref(other),
                 });
                 let mut saw_null = false;
-                for list_item in list {
+                for (list_item, rhs) in list.iter().zip(&rhs_rows) {
                     let rhs_exprs = match list_item {
                         Expr::RowValue(values, _) => values.as_slice(),
                         other => std::slice::from_ref(other),
@@ -89916,25 +90101,17 @@ fn eval_group_agg_join_expr(
                     debug_assert_eq!(rhs_exprs.len(), lhs.len());
                     let mut tuple_has_null = false;
                     let mut tuple_all_equal = true;
-                    for (field_index, ((lhs_expr, lhs_value), rhs_expr)) in lhs_exprs
-                        .iter()
-                        .zip(&lhs)
-                        .zip(rhs_exprs)
-                        .enumerate()
+                    for (field_index, (lhs_expr, lhs_value)) in
+                        lhs_exprs.iter().zip(&lhs).enumerate()
                     {
-                        let rhs_value =
-                            eval_group_agg_join_expr(rhs_expr, group_rows, col_map)?;
+                        let rhs_value = &rhs[field_index];
                         if lhs_value.is_null() || rhs_value.is_null() {
                             tuple_has_null = true;
                         } else if donor_exprs
                             .and_then(|donors| donors.get(field_index))
                             .is_none_or(|donor_expr| {
                                 compare_join_expr_values(
-                                    lhs_expr,
-                                    lhs_value,
-                                    donor_expr,
-                                    &rhs_value,
-                                    col_map,
+                                    lhs_expr, lhs_value, donor_expr, rhs_value, col_map,
                                 ) != std::cmp::Ordering::Equal
                             })
                         {
@@ -89977,8 +90154,7 @@ fn eval_group_agg_join_expr(
                     continue;
                 }
                 let singleton_list_expr = singleton_constant.then_some(list_expr);
-                let ordering =
-                    compare_join_in_values(expr, &val, singleton_list_expr, lv, col_map);
+                let ordering = compare_join_in_values(expr, &val, singleton_list_expr, lv, col_map);
                 if ordering == std::cmp::Ordering::Equal {
                     found = true;
                     break;
@@ -96012,17 +96188,11 @@ fn rows_frame_bounds(pos: usize, partition_size: usize, frame: &FrameSpec) -> (u
         FrameBound::CurrentRow => pos.saturating_add(1).min(partition_size),
         FrameBound::Following(expr) => {
             let n = resolve_frame_bound_offset(&FrameBound::Following(expr.clone())).unwrap_or(0);
-            pos.saturating_add(n)
-                .saturating_add(1)
-                .min(partition_size)
+            pos.saturating_add(n).saturating_add(1).min(partition_size)
         }
         FrameBound::Preceding(expr) => {
             let n = resolve_frame_bound_offset(&FrameBound::Preceding(expr.clone())).unwrap_or(0);
-            if n > pos {
-                0
-            } else {
-                pos - n + 1
-            }
+            if n > pos { 0 } else { pos - n + 1 }
         }
         FrameBound::UnboundedPreceding => usize::from(partition_size > 0),
     };
@@ -96314,11 +96484,7 @@ fn groups_frame_bounds(group_pos: usize, num_groups: usize, frame: &FrameSpec) -
         }
         FrameBound::Preceding(expr) => {
             let n = resolve_frame_bound_offset(&FrameBound::Preceding(expr.clone())).unwrap_or(0);
-            if n > group_pos {
-                0
-            } else {
-                group_pos - n + 1
-            }
+            if n > group_pos { 0 } else { group_pos - n + 1 }
         }
         FrameBound::UnboundedPreceding => usize::from(num_groups > 0),
     };
@@ -96550,19 +96716,18 @@ fn range_value_frame_raw_bounds(
         })
         .map_or(pos + 1, |idx| idx + 1);
 
-    let boundary_test =
-        |lhs: &SqliteValue, bound: &FrameBound, rhs: &SqliteValue, comparison| {
-            sqlite_range_boundary_test(
-                lhs,
-                bound,
-                rhs,
-                comparison,
-                order_desc,
-                big_null,
-                order_collation,
-                registry,
-            )
-        };
+    let boundary_test = |lhs: &SqliteValue, bound: &FrameBound, rhs: &SqliteValue, comparison| {
+        sqlite_range_boundary_test(
+            lhs,
+            bound,
+            rhs,
+            comparison,
+            order_desc,
+            big_null,
+            order_collation,
+            registry,
+        )
+    };
 
     let start = match &frame.start {
         FrameBound::UnboundedPreceding => 0,
@@ -96790,15 +96955,11 @@ fn evaluate_application_window_partition(
                 &peer_groups,
             );
             let peer_rows = peer_rows_for_current_row(&peer_groups, current_row);
-            let target_rows = apply_frame_exclusion(
-                frame_rows,
-                current_row,
-                &peer_rows,
-                frame.exclude,
-            )
-            .into_iter()
-            .filter(|&row_index| filter_matches[row_index])
-            .collect::<Vec<_>>();
+            let target_rows =
+                apply_frame_exclusion(frame_rows, current_row, &peer_rows, frame.exclude)
+                    .into_iter()
+                    .filter(|&row_index| filter_matches[row_index])
+                    .collect::<Vec<_>>();
             values.push(evaluate_application_window_finalized_frame(
                 function,
                 args_by_row,
@@ -97063,15 +97224,11 @@ fn evaluate_application_window_partition(
                 previous_current_row = Some(current_row);
                 continue;
             }
-            let target_rows = apply_frame_exclusion(
-                frame_rows,
-                current_row,
-                &peer_rows,
-                frame.exclude,
-            )
-            .into_iter()
-            .filter(|&row_index| row_is_included(row_index))
-            .collect::<Vec<_>>();
+            let target_rows =
+                apply_frame_exclusion(frame_rows, current_row, &peer_rows, frame.exclude)
+                    .into_iter()
+                    .filter(|&row_index| row_is_included(row_index))
+                    .collect::<Vec<_>>();
 
             if position == 0 {
                 match frame.frame_type {
@@ -97093,10 +97250,7 @@ fn evaluate_application_window_partition(
                             {
                                 for &row_index in &peer_groups[removed_group] {
                                     if row_is_included(row_index) {
-                                        function.inverse(
-                                            &mut state,
-                                            &args_by_row[row_index],
-                                        )?;
+                                        function.inverse(&mut state, &args_by_row[row_index])?;
                                     }
                                 }
                                 removed_group += 1;
@@ -97912,54 +98066,42 @@ fn evaluate_having_value(
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(i64::from(
-                            comparison() == std::cmp::Ordering::Greater,
-                        ))
+                        SqliteValue::Integer(i64::from(comparison() == std::cmp::Ordering::Greater))
                     }
                 }
                 fsqlite_ast::BinaryOp::Lt => {
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(i64::from(
-                            comparison() == std::cmp::Ordering::Less,
-                        ))
+                        SqliteValue::Integer(i64::from(comparison() == std::cmp::Ordering::Less))
                     }
                 }
                 fsqlite_ast::BinaryOp::Ge => {
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(i64::from(
-                            comparison() != std::cmp::Ordering::Less,
-                        ))
+                        SqliteValue::Integer(i64::from(comparison() != std::cmp::Ordering::Less))
                     }
                 }
                 fsqlite_ast::BinaryOp::Le => {
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(i64::from(
-                            comparison() != std::cmp::Ordering::Greater,
-                        ))
+                        SqliteValue::Integer(i64::from(comparison() != std::cmp::Ordering::Greater))
                     }
                 }
                 fsqlite_ast::BinaryOp::Eq => {
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(i64::from(
-                            comparison() == std::cmp::Ordering::Equal,
-                        ))
+                        SqliteValue::Integer(i64::from(comparison() == std::cmp::Ordering::Equal))
                     }
                 }
                 fsqlite_ast::BinaryOp::Ne => {
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(i64::from(
-                            comparison() != std::cmp::Ordering::Equal,
-                        ))
+                        SqliteValue::Integer(i64::from(comparison() != std::cmp::Ordering::Equal))
                     }
                 }
                 fsqlite_ast::BinaryOp::Is | fsqlite_ast::BinaryOp::IsNot => {
@@ -97968,13 +98110,11 @@ fn evaluate_having_value(
                         (true, false) | (false, true) => false,
                         (false, false) => comparison() == std::cmp::Ordering::Equal,
                     };
-                    SqliteValue::Integer(i64::from(
-                        if matches!(op, fsqlite_ast::BinaryOp::IsNot) {
-                            !equal
-                        } else {
-                            equal
-                        },
-                    ))
+                    SqliteValue::Integer(i64::from(if matches!(op, fsqlite_ast::BinaryOp::IsNot) {
+                        !equal
+                    } else {
+                        equal
+                    }))
                 }
                 fsqlite_ast::BinaryOp::And => {
                     // OP_And uses sqlite3VdbeIntValue (integer truncation).
@@ -98139,6 +98279,23 @@ fn evaluate_having_value(
                     return Ok(SqliteValue::Null);
                 };
                 validate_vector_in_list_arity(lhs_exprs.len(), list_exprs)?;
+                let rhs_rows = list_exprs
+                    .iter()
+                    .map(|list_item| {
+                        let rhs_exprs = match list_item {
+                            Expr::RowValue(fields, _) => fields.as_slice(),
+                            other => std::slice::from_ref(other),
+                        };
+                        rhs_exprs
+                            .iter()
+                            .map(|rhs_expr| {
+                                evaluate_having_value(
+                                    rhs_expr, values, columns, group_rows, col_map,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let lhs = lhs_exprs
                     .iter()
                     .map(|lhs_expr| {
@@ -98150,7 +98307,7 @@ fn evaluate_having_value(
                     other => std::slice::from_ref(other),
                 });
                 let mut saw_null = false;
-                for list_item in list_exprs {
+                for (list_item, rhs) in list_exprs.iter().zip(&rhs_rows) {
                     let rhs_exprs = match list_item {
                         Expr::RowValue(fields, _) => fields.as_slice(),
                         other => std::slice::from_ref(other),
@@ -98158,26 +98315,17 @@ fn evaluate_having_value(
                     debug_assert_eq!(rhs_exprs.len(), lhs.len());
                     let mut tuple_has_null = false;
                     let mut tuple_all_equal = true;
-                    for (field_index, ((lhs_expr, lhs_value), rhs_expr)) in lhs_exprs
-                        .iter()
-                        .zip(&lhs)
-                        .zip(rhs_exprs)
-                        .enumerate()
+                    for (field_index, (lhs_expr, lhs_value)) in
+                        lhs_exprs.iter().zip(&lhs).enumerate()
                     {
-                        let rhs_value = evaluate_having_value(
-                            rhs_expr, values, columns, group_rows, col_map,
-                        )?;
+                        let rhs_value = &rhs[field_index];
                         if lhs_value.is_null() || rhs_value.is_null() {
                             tuple_has_null = true;
                         } else if donor_exprs
                             .and_then(|donors| donors.get(field_index))
                             .is_none_or(|donor_expr| {
                                 compare_join_expr_values(
-                                    lhs_expr,
-                                    lhs_value,
-                                    donor_expr,
-                                    &rhs_value,
-                                    col_map,
+                                    lhs_expr, lhs_value, donor_expr, rhs_value, col_map,
                                 ) != std::cmp::Ordering::Equal
                             })
                         {
@@ -98259,13 +98407,8 @@ fn evaluate_having_value(
                     // Simple CASE: NULL base never matches (NULL = x is NULL).
                     !b.is_null()
                         && !when_val.is_null()
-                        && compare_join_expr_values(
-                            operand_expr,
-                            b,
-                            when_expr,
-                            &when_val,
-                            col_map,
-                        ) == std::cmp::Ordering::Equal
+                        && compare_join_expr_values(operand_expr, b, when_expr, &when_val, col_map)
+                            == std::cmp::Ordering::Equal
                 } else {
                     // Searched CASE: evaluate condition truthiness.
                     is_sqlite_truthy(&when_val)
@@ -98391,7 +98534,8 @@ fn evaluate_having_value(
                     .collect::<Result<Vec<_>>>()?,
             };
             #[cfg(feature = "ext-fts5")]
-            if current_application_function_kind(name, aggregate_args_len_for_lookup(args)).is_none()
+            if current_application_function_kind(name, aggregate_args_len_for_lookup(args))
+                .is_none()
             {
                 if let Some(value) = eval_fts5_scalar_fallback(name, &arg_values)? {
                     return Ok(value);
@@ -98778,8 +98922,7 @@ mod exists_value_set_tests {
                         if matches!(outer, SqliteValue::Null) {
                             continue;
                         }
-                        let expected =
-                            exists_probe_values_equal(cell, outer, mode, collation);
+                        let expected = exists_probe_values_equal(cell, outer, mode, collation);
                         let got = set.contains(outer);
                         assert_eq!(
                             got, expected,
@@ -100589,9 +100732,7 @@ fn expr_contains_function_call(expr: &Expr) -> bool {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Placeholder(_, _)
-        | Expr::Raise { .. } => {
-            false
-        }
+        | Expr::Raise { .. } => false,
     }
 }
 
@@ -102189,10 +102330,9 @@ fn statement_contains_deferred_values(statement: &Statement) -> bool {
         Statement::Insert(insert) => {
             with_contains_deferred_values(insert.with.as_ref())
                 || match &insert.source {
-                    InsertSource::Values(rows) => rows
-                        .iter()
-                        .flatten()
-                        .any(expr_contains_deferred_values),
+                    InsertSource::Values(rows) => {
+                        rows.iter().flatten().any(expr_contains_deferred_values)
+                    }
                     InsertSource::Select(select) => select_contains_deferred_values(select),
                     InsertSource::DefaultValues => false,
                 }
@@ -102212,11 +102352,12 @@ fn statement_contains_deferred_values(statement: &Statement) -> bool {
                             assignments,
                             where_clause,
                         } => {
-                            assignments.iter().any(|assignment| {
-                                expr_contains_deferred_values(&assignment.value)
-                            }) || where_clause
-                                .as_deref()
-                                .is_some_and(expr_contains_deferred_values)
+                            assignments
+                                .iter()
+                                .any(|assignment| expr_contains_deferred_values(&assignment.value))
+                                || where_clause
+                                    .as_deref()
+                                    .is_some_and(expr_contains_deferred_values)
                         }
                     }
                 })
@@ -102273,9 +102414,7 @@ fn statement_contains_deferred_values(statement: &Statement) -> bool {
                         | TableConstraintKind::Unique { columns, .. } => columns
                             .iter()
                             .any(|column| expr_contains_deferred_values(&column.expr)),
-                        TableConstraintKind::Check(expr) => {
-                            expr_contains_deferred_values(expr)
-                        }
+                        TableConstraintKind::Check(expr) => expr_contains_deferred_values(expr),
                         TableConstraintKind::ForeignKey { .. } => false,
                     })
             }
@@ -102389,19 +102528,13 @@ fn select_core_contains_deferred_values(core: &SelectCore) -> bool {
                     .as_deref()
                     .is_some_and(expr_contains_deferred_values)
                 || group_by.iter().any(expr_contains_deferred_values)
-                || having
-                    .as_deref()
-                    .is_some_and(expr_contains_deferred_values)
+                || having.as_deref().is_some_and(expr_contains_deferred_values)
                 || windows
                     .iter()
                     .any(|window| window_contains_deferred_values(&window.spec))
         }
         SelectCore::Values(values) => {
-            !values.is_frozen()
-                || values
-                    .iter()
-                    .flatten()
-                    .any(expr_contains_deferred_values)
+            !values.is_frozen() || values.iter().flatten().any(expr_contains_deferred_values)
         }
     }
 }
@@ -102485,9 +102618,7 @@ fn expr_contains_deferred_values(expr: &Expr) -> bool {
         } => {
             expr_contains_deferred_values(expr)
                 || expr_contains_deferred_values(pattern)
-                || escape
-                    .as_deref()
-                    .is_some_and(expr_contains_deferred_values)
+                || escape.as_deref().is_some_and(expr_contains_deferred_values)
         }
         Expr::Case {
             operand,
@@ -102499,16 +102630,16 @@ fn expr_contains_deferred_values(expr: &Expr) -> bool {
                 .as_deref()
                 .is_some_and(expr_contains_deferred_values)
                 || whens.iter().any(|(condition, value)| {
-                    expr_contains_deferred_values(condition)
-                        || expr_contains_deferred_values(value)
+                    expr_contains_deferred_values(condition) || expr_contains_deferred_values(value)
                 })
                 || else_expr
                     .as_deref()
                     .is_some_and(expr_contains_deferred_values)
         }
-        Expr::Subquery(select, _) | Expr::Exists { subquery: select, .. } => {
-            select_contains_deferred_values(select)
-        }
+        Expr::Subquery(select, _)
+        | Expr::Exists {
+            subquery: select, ..
+        } => select_contains_deferred_values(select),
         Expr::FunctionCall {
             args,
             order_by,
@@ -102522,9 +102653,7 @@ fn expr_contains_deferred_values(expr: &Expr) -> bool {
                 || order_by
                     .iter()
                     .any(|term| expr_contains_deferred_values(&term.expr))
-                || filter
-                    .as_deref()
-                    .is_some_and(expr_contains_deferred_values)
+                || filter.as_deref().is_some_and(expr_contains_deferred_values)
                 || over.as_ref().is_some_and(window_contains_deferred_values)
         }
         Expr::RowValue(values, _) => values.iter().any(expr_contains_deferred_values),
@@ -102623,11 +102752,7 @@ fn freeze_values_donors_in_statement(
         Statement::Update(update) => {
             freeze_values_donors_in_with(update.with.as_mut(), function_registry, context);
             for assignment in &mut update.assignments {
-                freeze_values_donors_in_expr(
-                    &mut assignment.value,
-                    function_registry,
-                    context,
-                );
+                freeze_values_donors_in_expr(&mut assignment.value, function_registry, context);
             }
             if let Some(from) = &mut update.from {
                 freeze_values_donors_in_from(from, function_registry, context);
@@ -102765,7 +102890,9 @@ fn freeze_values_donors_in_column_def(
         match &mut constraint.kind {
             ColumnConstraintKind::Check(expr)
             | ColumnConstraintKind::Generated { expr, .. }
-            | ColumnConstraintKind::Default(DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr)) => {
+            | ColumnConstraintKind::Default(
+                DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr),
+            ) => {
                 freeze_values_donors_in_expr(expr, function_registry, context);
             }
             ColumnConstraintKind::PrimaryKey { .. }
@@ -102995,7 +103122,10 @@ fn freeze_values_donors_in_expr(
                 freeze_values_donors_in_expr(else_expr, function_registry, context);
             }
         }
-        Expr::Subquery(select, _) | Expr::Exists { subquery: select, .. } => {
+        Expr::Subquery(select, _)
+        | Expr::Exists {
+            subquery: select, ..
+        } => {
             freeze_values_donors_in_select(select, function_registry, context);
         }
         Expr::FunctionCall {
@@ -103074,7 +103204,8 @@ fn deferred_values_donor_row_index(
         );
         let current_root_allows_coroutine = coroutine_active
             || values_row_is_constant_without_affinity(
-                rows.get(donor_index).expect("VALUES donor index is in bounds"),
+                rows.get(donor_index)
+                    .expect("VALUES donor index is in bounds"),
                 function_registry,
             );
 
@@ -103108,6 +103239,11 @@ fn values_row_is_constant_without_affinity(
 /// invoking application code. Slow-changing built-ins are query-constant;
 /// volatile application replacements are not.
 fn values_expr_is_query_constant(expr: &Expr, function_registry: &FunctionRegistry) -> bool {
+    if expr_folds_to_integer_zero_via_and(expr)
+        || matches!(expr, Expr::In { set: InSet::List(values), .. } if values.is_empty())
+    {
+        return true;
+    }
     match expr {
         Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
         Expr::BinaryOp { left, right, .. } => {
@@ -103129,9 +103265,7 @@ fn values_expr_is_query_constant(expr: &Expr, function_registry: &FunctionRegist
         Expr::UnaryOp { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. }
-        | Expr::IsNull { expr, .. } => {
-            values_expr_is_query_constant(expr, function_registry)
-        }
+        | Expr::IsNull { expr, .. } => values_expr_is_query_constant(expr, function_registry),
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -103475,20 +103609,14 @@ fn index_declared_collation_source_expr(expr: &Expr) -> &Expr {
     }
 }
 
-fn index_expr_effective_collation<'a>(
-    expr: &'a Expr,
-    table: &'a TableSchema,
-) -> Option<&'a str> {
+fn index_expr_effective_collation<'a>(expr: &'a Expr, table: &'a TableSchema) -> Option<&'a str> {
     if let Some(collation) = first_explicit_collation_name(expr) {
         return Some(collation);
     }
     index_expr_declared_collation(expr, table)
 }
 
-fn index_expr_declared_collation<'a>(
-    expr: &Expr,
-    table: &'a TableSchema,
-) -> Option<&'a str> {
+fn index_expr_declared_collation<'a>(expr: &Expr, table: &'a TableSchema) -> Option<&'a str> {
     let Expr::Column(column, _) = index_declared_collation_source_expr(expr) else {
         return None;
     };
@@ -103635,9 +103763,7 @@ fn index_expr_uses_collation_dependency(
                 })
                 || whens.iter().any(|(condition, value)| {
                     index_expr_uses_collation_dependency(connection, condition, table, target)
-                        || index_expr_uses_collation_dependency(
-                            connection, value, table, target,
-                        )
+                        || index_expr_uses_collation_dependency(connection, value, table, target)
                 })
                 || else_expr.as_deref().is_some_and(|else_expr| {
                     index_expr_uses_collation_dependency(connection, else_expr, table, target)
@@ -103655,36 +103781,25 @@ fn index_expr_uses_collation_dependency(
                 FunctionArgs::Star => &[][..],
                 FunctionArgs::List(values) => values.as_slice(),
             };
-            let function_consumes = function_consumes_argument_collation(
-                connection,
-                name,
-                args,
-                over.as_ref(),
-            ) && values
-                .iter()
-                .find_map(|value| index_expr_effective_collation(value, table))
-                .is_some_and(|collation| collation.eq_ignore_ascii_case(target));
+            let function_consumes =
+                function_consumes_argument_collation(connection, name, args, over.as_ref())
+                    && values
+                        .iter()
+                        .find_map(|value| index_expr_effective_collation(value, table))
+                        .is_some_and(|collation| collation.eq_ignore_ascii_case(target));
             function_consumes
                 || values.iter().any(|value| {
                     index_expr_uses_collation_dependency(connection, value, table, target)
                 })
                 || order_by.iter().any(|term| {
-                    index_expr_uses_collation_dependency(
-                        connection,
-                        &term.expr,
-                        table,
-                        target,
-                    )
+                    index_expr_uses_collation_dependency(connection, &term.expr, table, target)
                 })
                 || filter.as_deref().is_some_and(|filter| {
                     index_expr_uses_collation_dependency(connection, filter, table, target)
                 })
         }
         Expr::JsonAccess {
-            expr,
-            path,
-            arrow,
-            ..
+            expr, path, arrow, ..
         } => {
             let function_consumes = connection
                 .func_registry
@@ -103699,9 +103814,9 @@ fn index_expr_uses_collation_dependency(
                 || index_expr_uses_collation_dependency(connection, expr, table, target)
                 || index_expr_uses_collation_dependency(connection, path, table, target)
         }
-        Expr::RowValue(values, _) => values.iter().any(|value| {
-            index_expr_uses_collation_dependency(connection, value, table, target)
-        }),
+        Expr::RowValue(values, _) => values
+            .iter()
+            .any(|value| index_expr_uses_collation_dependency(connection, value, table, target)),
     }
 }
 
@@ -103732,9 +103847,7 @@ fn validate_index_expr_inherited_collation_consumers(
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            Ok(())
-        }
+        | Expr::Placeholder(_, _) => Ok(()),
         Expr::BinaryOp {
             left, op, right, ..
         } => {
@@ -103858,14 +103971,10 @@ fn validate_index_expr_inherited_collation_consumers(
             ..
         } => {
             if let FunctionArgs::List(values) = args {
-                if function_consumes_argument_collation(
-                    connection,
-                    name,
-                    args,
-                    over.as_ref(),
-                ) && let Some(collation) = values
-                    .iter()
-                    .find_map(|value| index_expr_effective_collation(value, table))
+                if function_consumes_argument_collation(connection, name, args, over.as_ref())
+                    && let Some(collation) = values
+                        .iter()
+                        .find_map(|value| index_expr_effective_collation(value, table))
                 {
                     validate_registered_collation(collation, registry)?;
                 }
@@ -103877,10 +103986,7 @@ fn validate_index_expr_inherited_collation_consumers(
             }
             for term in order_by {
                 validate_index_expr_inherited_collation_consumers(
-                    connection,
-                    &term.expr,
-                    table,
-                    registry,
+                    connection, &term.expr, table, registry,
                 )?;
             }
             if let Some(filter) = filter {
@@ -103891,10 +103997,7 @@ fn validate_index_expr_inherited_collation_consumers(
             Ok(())
         }
         Expr::JsonAccess {
-            expr,
-            path,
-            arrow,
-            ..
+            expr, path, arrow, ..
         } => {
             if connection
                 .func_registry
@@ -104052,9 +104155,7 @@ fn validate_expr_collation_consumers(
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            Ok(())
-        }
+        | Expr::Placeholder(_, _) => Ok(()),
         Expr::BinaryOp {
             left, op, right, ..
         } => {
@@ -104094,12 +104195,7 @@ fn validate_expr_collation_consumers(
             }
             match set {
                 InSet::List(values) => {
-                    validate_in_list_membership_collations(
-                        connection,
-                        expr,
-                        values,
-                        registry,
-                    )?;
+                    validate_in_list_membership_collations(connection, expr, values, registry)?;
                     validate_expr_collation_consumers(connection, expr, registry)?;
                     for value in values {
                         validate_expr_collation_consumers(connection, value, registry)?;
@@ -104118,7 +104214,6 @@ fn validate_expr_collation_consumers(
                             registry,
                         )?;
                     }
-                    connection.validate_in_subquery_column_count(expr, subquery)?;
                     validate_expr_collation_consumers(connection, expr, registry)?;
                     if !multirow_values {
                         validate_select_collation_consumers(
@@ -104237,10 +104332,7 @@ fn validate_expr_collation_consumers(
             registry,
         ),
         Expr::JsonAccess {
-            expr,
-            path,
-            arrow,
-            ..
+            expr, path, arrow, ..
         } => {
             if connection
                 .func_registry
@@ -104248,10 +104340,7 @@ fn validate_expr_collation_consumers(
                 .scalar_consumes_argument_collation(json_access_function_name(*arrow), 2)
                 .unwrap_or(false)
             {
-                validate_function_argument_collation(
-                    [expr.as_ref(), path.as_ref()],
-                    registry,
-                )?;
+                validate_function_argument_collation([expr.as_ref(), path.as_ref()], registry)?;
             }
             validate_expr_collation_consumers(connection, expr, registry)?;
             validate_expr_collation_consumers(connection, path, registry)
@@ -104383,6 +104472,65 @@ fn normalize_bare_singleton_in_subquery(set: &InSet) -> Cow<'_, InSet> {
         Cow::Owned(InSet::Subquery(subquery.clone()))
     } else {
         Cow::Borrowed(set)
+    }
+}
+
+/// Preserve the runtime evaluation of an `IN` LHS after an executed subquery
+/// produces no rows. A syntactic `IN ()` is folded earlier and skips its LHS,
+/// while a runtime-empty subquery still evaluates every LHS field before
+/// returning false (or true for `NOT IN`).
+fn empty_in_result_after_evaluating_lhs(lhs: Expr, not: bool, span: Span) -> Expr {
+    let fields = match lhs {
+        Expr::RowValue(fields, _) => fields,
+        scalar => vec![scalar],
+    };
+    let mut evaluations = fields
+        .into_iter()
+        .map(|field| Expr::IsNull {
+            expr: Box::new(field),
+            not: false,
+            span,
+        })
+        .collect::<Vec<_>>();
+    // Build a balanced arithmetic tree. Binary arithmetic evaluates both
+    // operands from left to right, so every field remains observable without
+    // recreating the deep, left-nested expression trees that previously
+    // overflowed the worker stack for generated predicates.
+    while evaluations.len() > 1 {
+        let mut next = Vec::with_capacity(evaluations.len().div_ceil(2));
+        let mut pairs = evaluations.into_iter();
+        while let Some(left) = pairs.next() {
+            if let Some(right) = pairs.next() {
+                next.push(Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOp::Add,
+                    right: Box::new(right),
+                    span,
+                });
+            } else {
+                next.push(left);
+            }
+        }
+        evaluations = next;
+    }
+    let evaluated = evaluations
+        .pop()
+        .unwrap_or(Expr::Literal(Literal::Integer(0), span));
+    let false_result = Expr::BinaryOp {
+        left: Box::new(evaluated),
+        op: BinaryOp::Multiply,
+        right: Box::new(Expr::Literal(Literal::Integer(0), span)),
+        span,
+    };
+    if not {
+        Expr::BinaryOp {
+            left: Box::new(false_result),
+            op: BinaryOp::Add,
+            right: Box::new(Expr::Literal(Literal::Integer(1), span)),
+            span,
+        }
+    } else {
+        false_result
     }
 }
 
@@ -105280,10 +105428,6 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                     InSet::Subquery(query) => self.validate_select(query)?,
                     InSet::Table(name) => self.validate_relation(name)?,
                 }
-                if let InSet::List(values) = set {
-                    self.connection
-                        .validate_in_list_early_row_misuse(expr, values)?;
-                }
                 Ok(())
             }
             Expr::Like {
@@ -105654,7 +105798,21 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                 active_views,
             )
         };
-        let result = resolver.validate_select(&view.query);
+        let result = resolver.validate_select(&view.query).and_then(|()| {
+            // View expansion is part of SQLite's relation/name-resolution
+            // phase, so a broken referenced view must outrank an enclosing
+            // SELECT's LIMIT/OFFSET diagnostic even when the reference is
+            // nested in a scalar subquery or derived table. Relation-only
+            // traversal is insufficient here: validate the expanded view's
+            // lexical columns before returning to the outer SELECT.
+            let mut query = view.query.clone();
+            if !view.temporary {
+                qualify_persistent_view_relations(&mut query);
+            }
+            self.connection.with_fallback_function_registry(|| {
+                SelectColumnReferenceResolver::new(self.connection).validate_select(&query)
+            })
+        });
         self.active_views.remove(&view_key);
         result
     }
@@ -105772,12 +105930,2106 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
     }
 }
 
+#[derive(Clone)]
+struct SelectOutputAlias {
+    name: String,
+    aggregate_name: Option<String>,
+    is_aggregate: bool,
+    is_window: bool,
+}
+
+struct SelectSourceColumnMetadata {
+    names: Vec<String>,
+    hidden_rowid: Option<String>,
+    is_live_fts5: bool,
+    approximate_names: Vec<bool>,
+    generated_suffix_upper_bounds: Vec<Option<usize>>,
+    width_is_exact: bool,
+}
+
+#[derive(Clone)]
+struct SelectResultColumnMetadata {
+    names: Vec<String>,
+    approximate_names: Vec<bool>,
+    generated_suffix_upper_bounds: Vec<Option<usize>>,
+    width_is_exact: bool,
+}
+
+#[derive(Clone)]
+struct SelectVisibleColumnMetadata {
+    name: String,
+    col_map_index: Option<usize>,
+    approximate: bool,
+    expression_key: Option<String>,
+    generated_suffix_upper_bound: Option<usize>,
+}
+
+#[derive(Clone)]
+struct SelectApproximateColumn {
+    table: String,
+    display_name: String,
+    expression_key: Option<String>,
+    generated_suffix_upper_bound: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectOutputAliasUse {
+    None,
+    Where,
+    GroupBy,
+    Having,
+    JoinOn,
+    OrderBy,
+}
+
+#[derive(Clone, Default)]
+struct SelectColumnReferenceScope {
+    identity: usize,
+    col_map: Vec<(String, String, bool)>,
+    using_skip: HashSet<usize>,
+    output_aliases: Vec<SelectOutputAlias>,
+    valid_qualifiers: Vec<String>,
+    match_table_names: Vec<String>,
+    fts5_rank_table_names: Vec<String>,
+    approximate_col_map: Vec<SelectApproximateColumn>,
+}
+
+fn normalize_uncertain_sqlite_result_column_names(
+    names: &mut [String],
+    approximate_names: &mut Vec<bool>,
+    generated_suffix_upper_bounds: &mut Vec<Option<usize>>,
+) {
+    approximate_names.resize(names.len(), true);
+    approximate_names.truncate(names.len());
+    generated_suffix_upper_bounds.resize(names.len(), None);
+    generated_suffix_upper_bounds.truncate(names.len());
+
+    let mut used = HashSet::new();
+    let mut exact_names = Vec::new();
+    let mut uncertain_names: Vec<(String, Option<String>, Option<usize>)> = Vec::new();
+    for index in 0..names.len() {
+        let target_keys = approximate_target_name_keys(&names[index]);
+        let prior_uncertain_collision = uncertain_names.iter().any(
+            |(display_name, expression_key, generated_suffix_upper_bound)| {
+                approximate_source_name_may_match(
+                    display_name,
+                    expression_key.as_deref(),
+                    *generated_suffix_upper_bound,
+                    &names[index],
+                    &target_keys,
+                )
+            },
+        );
+        if !approximate_names[index] && prior_uncertain_collision {
+            approximate_names[index] = true;
+            generated_suffix_upper_bounds[index] = Some(index);
+        }
+
+        if approximate_names[index] {
+            let expression_key = approximate_result_name_key(&names[index]);
+            let collides_with_exact = exact_names.iter().any(|exact_name: &String| {
+                let exact_target_keys = approximate_target_name_keys(exact_name);
+                approximate_source_name_may_match(
+                    &names[index],
+                    expression_key.as_deref(),
+                    generated_suffix_upper_bounds[index],
+                    exact_name,
+                    &exact_target_keys,
+                )
+            });
+            if collides_with_exact || prior_uncertain_collision {
+                generated_suffix_upper_bounds[index] = Some(
+                    generated_suffix_upper_bounds[index]
+                        .unwrap_or_default()
+                        .max(index),
+                );
+            }
+            uncertain_names.push((
+                names[index].clone(),
+                expression_key,
+                generated_suffix_upper_bounds[index],
+            ));
+            continue;
+        }
+
+        let key = names[index].to_ascii_lowercase();
+        if used.insert(key) {
+            exact_names.push(names[index].clone());
+            continue;
+        }
+        let original = names[index].clone();
+        let mut base = original
+            .rsplit_once(':')
+            .filter(|(_, suffix)| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            .map_or_else(|| original.clone(), |(base, _)| base.to_owned());
+        let mut suffix = 1usize;
+        loop {
+            let candidate = format!("{base}:{suffix}");
+            if used.insert(candidate.to_ascii_lowercase()) {
+                names[index] = candidate;
+                exact_names.push(names[index].clone());
+                break;
+            }
+            if let Some(next) = suffix.checked_add(1) {
+                suffix = next;
+            } else {
+                base = candidate;
+                suffix = 1;
+            }
+        }
+    }
+}
+
+fn approximate_result_name_key(name: &str) -> Option<String> {
+    fsqlite_parser::expr::parse_expr(name)
+        .ok()
+        .map(|expr| expr.to_string())
+}
+
+fn approximate_target_name_keys(target: &str) -> (Option<String>, Option<(String, usize)>) {
+    let direct = approximate_result_name_key(target);
+    let suffix_base = target
+        .rsplit_once(':')
+        .filter(|(_, suffix)| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .and_then(|(base, suffix)| {
+            let parsed_suffix = suffix.parse::<usize>().ok()?;
+            if parsed_suffix.to_string() != suffix {
+                return None;
+            }
+            approximate_result_name_key(base).map(|base| (base, parsed_suffix))
+        });
+    (direct, suffix_base)
+}
+
+fn approximate_source_name_may_match(
+    display_name: &str,
+    expression_key: Option<&str>,
+    generated_suffix_upper_bound: Option<usize>,
+    target: &str,
+    target_keys: &(Option<String>, Option<(String, usize)>),
+) -> bool {
+    display_name.eq_ignore_ascii_case(target)
+        || expression_key.is_some_and(|candidate| {
+            target_keys
+                .0
+                .as_deref()
+                .is_some_and(|target_key| candidate.eq_ignore_ascii_case(target_key))
+                || generated_suffix_upper_bound.is_some_and(|upper_bound| {
+                    target_keys.1.as_ref().is_some_and(|(target_key, suffix)| {
+                        (1..=upper_bound).contains(suffix)
+                            && candidate.eq_ignore_ascii_case(target_key)
+                    })
+                })
+        })
+}
+
+fn visible_source_names_may_match(
+    left: &SelectVisibleColumnMetadata,
+    right: &SelectVisibleColumnMetadata,
+) -> bool {
+    if !left.approximate && !right.approximate {
+        return left.name.eq_ignore_ascii_case(&right.name);
+    }
+    left.name.eq_ignore_ascii_case(&right.name)
+        || left
+            .expression_key
+            .as_deref()
+            .zip(right.expression_key.as_deref())
+            .is_some_and(|(left_key, right_key)| left_key.eq_ignore_ascii_case(right_key))
+}
+
+fn visible_source_name_may_match_target(
+    candidate: &SelectVisibleColumnMetadata,
+    target: &str,
+    target_keys: &(Option<String>, Option<(String, usize)>),
+) -> bool {
+    if candidate.approximate {
+        approximate_source_name_may_match(
+            &candidate.name,
+            candidate.expression_key.as_deref(),
+            candidate.generated_suffix_upper_bound,
+            target,
+            target_keys,
+        )
+    } else {
+        candidate.name.eq_ignore_ascii_case(target)
+    }
+}
+
+impl SelectColumnReferenceScope {
+    fn resolves_approximate_column(&self, column: &ColumnRef) -> bool {
+        let target_keys = approximate_target_name_keys(&column.column);
+        self.approximate_col_map.iter().any(|candidate| {
+            column
+                .table
+                .as_deref()
+                .is_none_or(|qualifier| qualifier.eq_ignore_ascii_case(&candidate.table))
+                && approximate_source_name_may_match(
+                    &candidate.display_name,
+                    candidate.expression_key.as_deref(),
+                    candidate.generated_suffix_upper_bound,
+                    &column.column,
+                    &target_keys,
+                )
+        })
+    }
+
+    fn resolves_fts5_rank_column(&self, column: &ColumnRef) -> bool {
+        if !column.column.eq_ignore_ascii_case("rank") {
+            return false;
+        }
+        column
+            .table
+            .as_deref()
+            .map_or(!self.fts5_rank_table_names.is_empty(), |prefix| {
+                self.fts5_rank_table_names
+                    .iter()
+                    .any(|table_name| prefix.eq_ignore_ascii_case(table_name))
+            })
+    }
+
+    fn for_core<'source, F>(
+        connection: &Connection,
+        core: &'source SelectCore,
+        mut source_column_names: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&'source TableOrSubquery) -> Result<SelectSourceColumnMetadata>,
+    {
+        let mut col_map = Vec::new();
+        let mut using_skip = HashSet::new();
+        let mut match_table_names = Vec::new();
+        let mut fts5_rank_table_names = Vec::new();
+        let mut approximate_col_map = Vec::new();
+        let mut layout_width_is_exact = true;
+        if let SelectCore::Select {
+            from: Some(from), ..
+        } = core
+        {
+            Self::append_from_layout(
+                connection,
+                from,
+                &mut source_column_names,
+                &mut col_map,
+                &mut using_skip,
+                &mut match_table_names,
+                &mut fts5_rank_table_names,
+                &mut approximate_col_map,
+                &mut layout_width_is_exact,
+            )?;
+        }
+        let mut output_aliases = Vec::new();
+        if let SelectCore::Select { columns, .. } = core {
+            for column in columns {
+                let ResultColumn::Expr {
+                    expr,
+                    alias: Some(alias),
+                } = column
+                else {
+                    continue;
+                };
+                if output_aliases
+                    .iter()
+                    .any(|candidate: &SelectOutputAlias| candidate.name.eq_ignore_ascii_case(alias))
+                {
+                    continue;
+                }
+                let is_aggregate = connection.expr_contains_aggregate_with_registry(expr);
+                let aggregate_name = is_aggregate
+                    .then(|| {
+                        let mut names = BTreeSet::new();
+                        collect_aggregate_kind_names(expr, &mut names);
+                        names.into_iter().next()
+                    })
+                    .flatten();
+                output_aliases.push(SelectOutputAlias {
+                    name: alias.clone(),
+                    aggregate_name,
+                    is_aggregate,
+                    is_window: expr_has_window_function(expr),
+                });
+            }
+        }
+        if let SelectCore::Values(rows) = core
+            && let Some(width) = rows.first().map(Vec::len)
+        {
+            output_aliases.extend((1..=width).map(|index| SelectOutputAlias {
+                name: format!("column{index}"),
+                aggregate_name: None,
+                is_aggregate: false,
+                is_window: false,
+            }));
+        }
+
+        let mut scope = Self {
+            identity: std::ptr::from_ref(core).addr(),
+            col_map,
+            using_skip,
+            output_aliases,
+            valid_qualifiers: Vec::new(),
+            match_table_names,
+            fts5_rank_table_names,
+            approximate_col_map,
+        };
+        if let SelectCore::Select {
+            from: Some(from), ..
+        } = core
+        {
+            scope.record_from_qualifiers(from);
+        }
+        Ok(scope)
+    }
+
+    fn append_from_layout<'source, F>(
+        connection: &Connection,
+        from: &'source FromClause,
+        source_column_names: &mut F,
+        col_map: &mut Vec<(String, String, bool)>,
+        using_skip: &mut HashSet<usize>,
+        match_table_names: &mut Vec<String>,
+        fts5_rank_table_names: &mut Vec<String>,
+        approximate_col_map: &mut Vec<SelectApproximateColumn>,
+        layout_width_is_exact: &mut bool,
+    ) -> Result<Vec<SelectVisibleColumnMetadata>>
+    where
+        F: FnMut(&'source TableOrSubquery) -> Result<SelectSourceColumnMetadata>,
+    {
+        let mut left_visible = Self::append_source_layout(
+            connection,
+            &from.source,
+            source_column_names,
+            col_map,
+            using_skip,
+            match_table_names,
+            fts5_rank_table_names,
+            approximate_col_map,
+            layout_width_is_exact,
+        )?;
+        for join in &from.joins {
+            let right_visible = Self::append_source_layout(
+                connection,
+                &join.table,
+                source_column_names,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+                approximate_col_map,
+                layout_width_is_exact,
+            )?;
+            let using_columns = if join.join_type.natural {
+                if right_visible.iter().any(|right| {
+                    left_visible.iter().any(|left| {
+                        (left.approximate || right.approximate)
+                            && visible_source_names_may_match(left, right)
+                    })
+                }) {
+                    *layout_width_is_exact = false;
+                }
+                right_visible
+                    .iter()
+                    .filter(|right| {
+                        !right.approximate
+                            && left_visible.iter().any(|left| {
+                                !left.approximate && left.name.eq_ignore_ascii_case(&right.name)
+                            })
+                    })
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>()
+            } else if let Some(JoinConstraint::Using(columns)) = &join.constraint {
+                columns.clone()
+            } else {
+                Vec::new()
+            };
+            if !join.join_type.natural {
+                for using_column in &using_columns {
+                    let target_keys = approximate_target_name_keys(using_column);
+                    let left_matches = left_visible.iter().filter(|candidate| {
+                        visible_source_name_may_match_target(candidate, using_column, &target_keys)
+                    });
+                    let right_matches = right_visible.iter().filter(|candidate| {
+                        visible_source_name_may_match_target(candidate, using_column, &target_keys)
+                    });
+                    if left_matches.clone().next().is_none()
+                        || right_matches.clone().next().is_none()
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "cannot join using column {using_column} - column not present in both tables"
+                        )));
+                    }
+                    if left_matches
+                        .chain(right_matches)
+                        .any(|column| column.approximate)
+                    {
+                        *layout_width_is_exact = false;
+                    }
+                }
+            }
+            for using_column in &using_columns {
+                if let Some(index) = right_visible
+                    .iter()
+                    .find(|column| {
+                        !column.approximate && column.name.eq_ignore_ascii_case(using_column)
+                    })
+                    .and_then(|column| column.col_map_index)
+                {
+                    using_skip.insert(index);
+                }
+            }
+            left_visible.extend(right_visible.into_iter().filter(|column| {
+                column.approximate
+                    || !using_columns
+                        .iter()
+                        .any(|using_column| column.name.eq_ignore_ascii_case(using_column))
+            }));
+        }
+        Ok(left_visible)
+    }
+
+    fn append_source_layout<'source, F>(
+        connection: &Connection,
+        source: &'source TableOrSubquery,
+        source_column_names: &mut F,
+        col_map: &mut Vec<(String, String, bool)>,
+        using_skip: &mut HashSet<usize>,
+        match_table_names: &mut Vec<String>,
+        fts5_rank_table_names: &mut Vec<String>,
+        approximate_col_map: &mut Vec<SelectApproximateColumn>,
+        layout_width_is_exact: &mut bool,
+    ) -> Result<Vec<SelectVisibleColumnMetadata>>
+    where
+        F: FnMut(&'source TableOrSubquery) -> Result<SelectSourceColumnMetadata>,
+    {
+        if let TableOrSubquery::ParenJoin(from) = source {
+            return Self::append_from_layout(
+                connection,
+                from,
+                source_column_names,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+                approximate_col_map,
+                layout_width_is_exact,
+            );
+        }
+        let label = match source {
+            TableOrSubquery::Table { name, alias, .. } => alias.as_deref().unwrap_or(&name.name),
+            TableOrSubquery::Subquery { alias, .. } => alias.as_deref().unwrap_or(""),
+            TableOrSubquery::TableFunction { name, alias, .. } => alias.as_deref().unwrap_or(name),
+            TableOrSubquery::ParenJoin(_) => {
+                unreachable!("parenthesized joins recurse before leaf layout")
+            }
+        };
+        let SelectSourceColumnMetadata {
+            mut names,
+            hidden_rowid,
+            is_live_fts5,
+            mut approximate_names,
+            mut generated_suffix_upper_bounds,
+            width_is_exact,
+        } = source_column_names(source)?;
+        if is_live_fts5 && let TableOrSubquery::Table { name, alias, .. } = source {
+            match_table_names.push(name.name.clone());
+            fts5_rank_table_names.push(alias.as_ref().unwrap_or(&name.name).clone());
+        }
+        *layout_width_is_exact &= width_is_exact;
+        if !width_is_exact {
+            approximate_names.resize(names.len(), true);
+            approximate_names.fill(true);
+        }
+        normalize_uncertain_sqlite_result_column_names(
+            &mut names,
+            &mut approximate_names,
+            &mut generated_suffix_upper_bounds,
+        );
+        let visible = names
+            .into_iter()
+            .zip(
+                approximate_names
+                    .into_iter()
+                    .zip(generated_suffix_upper_bounds),
+            )
+            .map(|(name, (approximate, generated_suffix_upper_bound))| {
+                let expression_key = approximate
+                    .then(|| approximate_result_name_key(&name))
+                    .flatten();
+                let col_map_index = if approximate {
+                    approximate_col_map.push(SelectApproximateColumn {
+                        table: label.to_owned(),
+                        display_name: name.clone(),
+                        expression_key: expression_key.clone(),
+                        generated_suffix_upper_bound,
+                    });
+                    None
+                } else {
+                    let index = col_map.len();
+                    col_map.push((label.to_owned(), name.clone(), false));
+                    Some(index)
+                };
+                SelectVisibleColumnMetadata {
+                    name,
+                    col_map_index,
+                    approximate,
+                    expression_key,
+                    generated_suffix_upper_bound,
+                }
+            })
+            .collect();
+        if let Some(column_name) = hidden_rowid {
+            col_map.push((label.to_owned(), column_name, true));
+        }
+        Ok(visible)
+    }
+
+    fn record_from_qualifiers(&mut self, from: &FromClause) {
+        self.record_source_qualifiers(&from.source);
+        for join in &from.joins {
+            self.record_source_qualifiers(&join.table);
+        }
+    }
+
+    fn record_source_qualifiers(&mut self, source: &TableOrSubquery) {
+        match source {
+            TableOrSubquery::Table { name, alias, .. } => {
+                self.valid_qualifiers
+                    .push(alias.as_ref().unwrap_or(&name.name).clone());
+            }
+            TableOrSubquery::Subquery {
+                alias: Some(alias), ..
+            } => self.valid_qualifiers.push(alias.clone()),
+            TableOrSubquery::TableFunction { name, alias, .. } => self
+                .valid_qualifiers
+                .push(alias.as_ref().unwrap_or(name).clone()),
+            TableOrSubquery::ParenJoin(from) => {
+                self.record_from_qualifiers(from);
+            }
+            TableOrSubquery::Subquery { alias: None, .. } => {}
+        }
+    }
+
+    fn using_skip(&self) -> Option<&HashSet<usize>> {
+        (!self.using_skip.is_empty()).then_some(&self.using_skip)
+    }
+
+    fn output_alias(&self, name: &str) -> Option<&SelectOutputAlias> {
+        self.output_aliases
+            .iter()
+            .find(|alias| alias.name.eq_ignore_ascii_case(name))
+    }
+
+    fn is_match_table_operand(&self, expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Column(column, _)
+                if column.table.is_none()
+                    && self
+                        .match_table_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&column.column))
+        )
+    }
+
+    fn from_contains_source(from: &FromClause, target: &QualifiedName) -> bool {
+        Self::source_contains_name(&from.source, target)
+            || from
+                .joins
+                .iter()
+                .any(|join| Self::source_contains_name(&join.table, target))
+    }
+
+    fn source_contains_name(source: &TableOrSubquery, target: &QualifiedName) -> bool {
+        match source {
+            TableOrSubquery::ParenJoin(from) => Self::from_contains_source(from, target),
+            _ => source_matches_name(source, target),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SelectCteValidationKey {
+    cte: *const fsqlite_ast::Cte,
+    outer_scope_ids: Vec<usize>,
+}
+
+#[derive(Default)]
+struct SelectViewValidationState {
+    active: HashSet<String>,
+    validated: HashSet<String>,
+}
+
+/// Non-executing lexical column resolver used before scalar/vector subquery
+/// width checks. The normal join evaluator validates only the clauses it is
+/// about to execute and deliberately skips nested SELECT scopes; this resolver
+/// instead walks the complete SELECT tree and carries outer scopes explicitly.
+struct SelectColumnReferenceResolver<'connection, 'select> {
+    connection: &'connection Connection,
+    outer_scopes: Vec<SelectColumnReferenceScope>,
+    cte_scopes: Vec<&'select [fsqlite_ast::Cte]>,
+    active_ctes: HashSet<*const fsqlite_ast::Cte>,
+    metadata_active_ctes: HashSet<*const fsqlite_ast::Cte>,
+    metadata_cte_columns: HashMap<*const fsqlite_ast::Cte, SelectResultColumnMetadata>,
+    metadata_select_columns: HashMap<*const SelectStatement, SelectResultColumnMetadata>,
+    validated_ctes: HashSet<SelectCteValidationKey>,
+    view_state: Rc<RefCell<SelectViewValidationState>>,
+    named_window_scopes: Vec<&'select [fsqlite_ast::WindowDef]>,
+}
+
+impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
+    fn new(connection: &'connection Connection) -> Self {
+        Self {
+            connection,
+            outer_scopes: Vec::new(),
+            cte_scopes: Vec::new(),
+            active_ctes: HashSet::new(),
+            metadata_active_ctes: HashSet::new(),
+            metadata_cte_columns: HashMap::new(),
+            metadata_select_columns: HashMap::new(),
+            validated_ctes: HashSet::new(),
+            view_state: Rc::new(RefCell::new(SelectViewValidationState::default())),
+            named_window_scopes: Vec::new(),
+        }
+    }
+
+    fn with_view_state(
+        connection: &'connection Connection,
+        view_state: Rc<RefCell<SelectViewValidationState>>,
+    ) -> Self {
+        Self {
+            connection,
+            outer_scopes: Vec::new(),
+            cte_scopes: Vec::new(),
+            active_ctes: HashSet::new(),
+            metadata_active_ctes: HashSet::new(),
+            metadata_cte_columns: HashMap::new(),
+            metadata_select_columns: HashMap::new(),
+            validated_ctes: HashSet::new(),
+            view_state,
+            named_window_scopes: Vec::new(),
+        }
+    }
+
+    fn validate_select_layout(&mut self, select: &'select SelectStatement) -> Result<()> {
+        let cte_scope_depth = self.cte_scopes.len();
+        if let Some(with) = &select.with {
+            self.cte_scopes.push(&with.ctes);
+        }
+        let result = (0..=select.body.compounds.len())
+            .rev()
+            .try_for_each(|index| {
+                let core = if index == 0 {
+                    &select.body.select
+                } else {
+                    &select.body.compounds[index - 1].1
+                };
+                self.prepare_core_scope(core)?;
+                if let SelectCore::Select {
+                    from: Some(from), ..
+                } = core
+                {
+                    self.validate_from_sources(from)?;
+                }
+                Ok(())
+            });
+        self.cte_scopes.truncate(cte_scope_depth);
+        result
+    }
+
+    fn validate_select(&mut self, select: &'select SelectStatement) -> Result<()> {
+        let cte_scope_depth = self.cte_scopes.len();
+        if let Some(with) = &select.with {
+            self.cte_scopes.push(&with.ctes);
+        }
+        let result: Result<()> = (|| {
+            if select.body.compounds.is_empty() {
+                // SQLite establishes source layout before resolving LIMIT. This
+                // exposes non-semantic shape errors (CTE declared-column arity,
+                // malformed VALUES rows, star expansion, and JOIN USING) first,
+                // while expressions inside those sources still wait until after
+                // LIMIT/OFFSET name resolution.
+                let scope = self.prepare_core_scope(&select.body.select)?;
+                self.validate_limit(select)?;
+                self.validate_core_before_order(&select.body.select, &scope)?;
+                let saved_outer_scopes = std::mem::take(&mut self.outer_scopes);
+                self.named_window_scopes
+                    .push(select_core_named_windows(&select.body.select));
+                let order_result: Result<()> = (|| {
+                    for term in &select.order_by {
+                        if let Expr::Column(column, _) = strip_collate_wrappers(&term.expr)
+                            && column.table.is_none()
+                            && scope.output_alias(&column.column).is_some()
+                        {
+                            continue;
+                        }
+                        self.validate_expr(&term.expr, &scope, SelectOutputAliasUse::OrderBy)?;
+                    }
+                    Ok(())
+                })();
+                self.named_window_scopes.pop();
+                self.outer_scopes = saved_outer_scopes;
+                order_result?;
+                self.validate_core_after_order(&select.body.select, &scope)?;
+                return Ok(());
+            }
+
+            let mut prepared_cores = Vec::with_capacity(select.body.compounds.len() + 1);
+            for index in (0..=select.body.compounds.len()).rev() {
+                let core = if index == 0 {
+                    &select.body.select
+                } else {
+                    &select.body.compounds[index - 1].1
+                };
+                let scope = self.prepare_core_scope(core)?;
+                prepared_cores.push((core, scope));
+            }
+            self.validate_limit(select)?;
+            for (core, scope) in &prepared_cores {
+                self.validate_core_before_order(core, scope)?;
+                self.validate_core_after_order(core, scope)?;
+            }
+            // Compound ORDER BY terms resolve against the output expressions of
+            // every core rather than the primary core's FROM scope. The structure
+            // resolver performs that authoritative cross-core match after this
+            // lexical pass has already walked each projected expression.
+            Ok(())
+        })();
+        self.cte_scopes.truncate(cte_scope_depth);
+        result
+    }
+
+    fn validate_limit(&mut self, select: &'select SelectStatement) -> Result<()> {
+        let Some(limit) = &select.limit else {
+            return Ok(());
+        };
+        // LIMIT/OFFSET is not correlated to either this SELECT's source
+        // columns or any outer SELECT. SQLite reports those names missing.
+        let saved_outer_scopes = std::mem::take(&mut self.outer_scopes);
+        let empty_scope = SelectColumnReferenceScope::default();
+        self.named_window_scopes.push(&[]);
+        let result: Result<()> = (|| {
+            self.validate_expr(&limit.limit, &empty_scope, SelectOutputAliasUse::None)?;
+            if let Some(offset) = &limit.offset {
+                self.validate_expr(offset, &empty_scope, SelectOutputAliasUse::None)?;
+            }
+            Ok(())
+        })();
+        self.named_window_scopes.pop();
+        self.outer_scopes = saved_outer_scopes;
+        result
+    }
+
+    fn prepare_core_scope(
+        &mut self,
+        core: &'select SelectCore,
+    ) -> Result<SelectColumnReferenceScope> {
+        let connection = self.connection;
+        let scope = SelectColumnReferenceScope::for_core(connection, core, |source| {
+            self.metadata_source_column_names(source)
+        })?;
+        match core {
+            SelectCore::Values(rows) => {
+                if let Some(width) = rows.first().map(Vec::len)
+                    && rows.iter().any(|row| row.len() != width)
+                {
+                    return Err(FrankenError::FunctionError(
+                        "all VALUES must have the same number of terms".to_owned(),
+                    ));
+                }
+            }
+            SelectCore::Select { columns, from, .. } => {
+                for column in columns {
+                    match column {
+                        ResultColumn::Star if from.is_none() => {
+                            return Err(FrankenError::ParseError {
+                                offset: 0,
+                                detail: "no tables specified".to_owned(),
+                            });
+                        }
+                        ResultColumn::TableStar(name)
+                            if from.as_ref().is_none_or(|from| {
+                                !SelectColumnReferenceScope::from_contains_source(from, name)
+                            }) =>
+                        {
+                            return Err(FrankenError::NoSuchTable {
+                                name: name.name.clone(),
+                            });
+                        }
+                        ResultColumn::Expr { .. }
+                        | ResultColumn::Star
+                        | ResultColumn::TableStar(_) => {}
+                    }
+                }
+            }
+        }
+        Ok(scope)
+    }
+
+    fn validate_core_before_order(
+        &mut self,
+        core: &'select SelectCore,
+        scope: &SelectColumnReferenceScope,
+    ) -> Result<()> {
+        match core {
+            SelectCore::Values(rows) => {
+                self.named_window_scopes.push(&[]);
+                let result: Result<()> = (|| {
+                    for row in rows.iter().rev() {
+                        for expression in row {
+                            self.validate_expr(expression, scope, SelectOutputAliasUse::None)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                self.named_window_scopes.pop();
+                result?;
+            }
+            SelectCore::Select {
+                columns,
+                from,
+                where_clause,
+                having,
+                windows,
+                ..
+            } => {
+                self.named_window_scopes.push(windows);
+                let result: Result<()> = (|| {
+                    if let Some(from) = from {
+                        self.validate_from_sources(from)?;
+                    }
+                    for column in columns {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            self.validate_expr(expr, scope, SelectOutputAliasUse::None)?;
+                        }
+                    }
+                    if let Some(predicate) = having {
+                        self.validate_expr(predicate, scope, SelectOutputAliasUse::Having)?;
+                    }
+                    if let Some(predicate) = where_clause {
+                        self.validate_expr(predicate, scope, SelectOutputAliasUse::Where)?;
+                    }
+                    if let Some(from) = from {
+                        self.validate_join_on_expressions(from, scope)?;
+                        self.validate_table_function_args(from, scope)?;
+                    }
+                    Ok(())
+                })();
+                self.named_window_scopes.pop();
+                result?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_core_after_order(
+        &mut self,
+        core: &'select SelectCore,
+        scope: &SelectColumnReferenceScope,
+    ) -> Result<()> {
+        if let SelectCore::Select {
+            group_by, windows, ..
+        } = core
+        {
+            let saved_outer_scopes = std::mem::take(&mut self.outer_scopes);
+            self.named_window_scopes.push(windows);
+            let result = group_by.iter().try_for_each(|expression| {
+                self.validate_expr(expression, scope, SelectOutputAliasUse::GroupBy)
+            });
+            self.named_window_scopes.pop();
+            self.outer_scopes = saved_outer_scopes;
+            result?;
+        }
+        Ok(())
+    }
+
+    fn validate_from_sources(&mut self, from: &'select FromClause) -> Result<()> {
+        self.validate_source_relations(&from.source)?;
+        for join in &from.joins {
+            self.validate_source_relations(&join.table)?;
+        }
+        Ok(())
+    }
+
+    fn validate_source_relations(&mut self, source: &'select TableOrSubquery) -> Result<()> {
+        match source {
+            TableOrSubquery::Table { name, .. } => {
+                if name.schema.is_none()
+                    && let Some((scope_index, cte)) = self.visible_cte(name)
+                {
+                    self.validate_cte(cte, scope_index)?;
+                    return Ok(());
+                }
+                self.validate_referenced_view(name)
+            }
+            TableOrSubquery::Subquery { query, .. } => self.validate_select(query),
+            TableOrSubquery::TableFunction { .. } => Ok(()),
+            TableOrSubquery::ParenJoin(from) => self.validate_from_sources(from),
+        }
+    }
+
+    fn validate_join_on_expressions(
+        &mut self,
+        from: &'select FromClause,
+        scope: &SelectColumnReferenceScope,
+    ) -> Result<()> {
+        if let TableOrSubquery::ParenJoin(nested) = &from.source {
+            self.validate_join_on_expressions(nested, scope)?;
+        }
+        for join in &from.joins {
+            if let TableOrSubquery::ParenJoin(nested) = &join.table {
+                self.validate_join_on_expressions(nested, scope)?;
+            }
+            if let Some(JoinConstraint::On(predicate)) = &join.constraint {
+                self.validate_expr(predicate, scope, SelectOutputAliasUse::JoinOn)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_table_function_args(
+        &mut self,
+        from: &'select FromClause,
+        scope: &SelectColumnReferenceScope,
+    ) -> Result<()> {
+        self.validate_source_table_function_args(&from.source, scope)?;
+        for join in &from.joins {
+            self.validate_source_table_function_args(&join.table, scope)?;
+        }
+        Ok(())
+    }
+
+    fn validate_source_table_function_args(
+        &mut self,
+        source: &'select TableOrSubquery,
+        scope: &SelectColumnReferenceScope,
+    ) -> Result<()> {
+        match source {
+            TableOrSubquery::TableFunction { args, .. } => {
+                for argument in args {
+                    self.validate_expr(argument, scope, SelectOutputAliasUse::None)?;
+                }
+                Ok(())
+            }
+            TableOrSubquery::ParenJoin(from) => self.validate_table_function_args(from, scope),
+            TableOrSubquery::Table { .. } | TableOrSubquery::Subquery { .. } => Ok(()),
+        }
+    }
+
+    fn validate_cte(&mut self, cte: &'select fsqlite_ast::Cte, scope_index: usize) -> Result<()> {
+        let key = std::ptr::from_ref(cte);
+        if self.active_ctes.contains(&key) {
+            return Ok(());
+        }
+        let validation_key = SelectCteValidationKey {
+            cte: key,
+            outer_scope_ids: self
+                .outer_scopes
+                .iter()
+                .map(|scope| scope.identity)
+                .collect(),
+        };
+        if self.validated_ctes.contains(&validation_key) {
+            return Ok(());
+        }
+        self.active_ctes.insert(key);
+        let hidden_scopes = self.cte_scopes.split_off(scope_index + 1);
+        let result = self.validate_select(&cte.query);
+        self.cte_scopes.extend(hidden_scopes);
+        self.active_ctes.remove(&key);
+        if result.is_ok() {
+            self.validated_ctes.insert(validation_key);
+        }
+        result
+    }
+
+    fn visible_cte(&self, name: &QualifiedName) -> Option<(usize, &'select fsqlite_ast::Cte)> {
+        if name.schema.is_some() {
+            return None;
+        }
+        self.cte_scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(scope_index, scope)| {
+                scope
+                    .iter()
+                    .find(|cte| cte.name.eq_ignore_ascii_case(&name.name))
+                    .map(|cte| (scope_index, cte))
+            })
+    }
+
+    fn validate_referenced_view(&mut self, name: &QualifiedName) -> Result<()> {
+        match name.schema.as_deref() {
+            None => {
+                if self.validate_local_referenced_relation(
+                    &name.name,
+                    PragmaSchemaScope::Unqualified,
+                )? {
+                    return Ok(());
+                }
+                let attached_schemas = self
+                    .connection
+                    .attached_schemas
+                    .borrow()
+                    .all_schemas()
+                    .into_iter()
+                    .skip(2)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                for schema_name in attached_schemas {
+                    let view_state = Rc::clone(&self.view_state);
+                    let found =
+                        self.connection
+                            .with_attached_connection(&schema_name, |attached| {
+                                SelectColumnReferenceResolver::with_view_state(attached, view_state)
+                                    .validate_local_referenced_relation(
+                                        &name.name,
+                                        PragmaSchemaScope::Main,
+                                    )
+                            })?;
+                    if found {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            Some(schema) if schema.eq_ignore_ascii_case("main") => {
+                self.validate_local_referenced_relation(&name.name, PragmaSchemaScope::Main)?;
+                Ok(())
+            }
+            Some(schema) if schema.eq_ignore_ascii_case("temp") => {
+                self.validate_local_referenced_relation(&name.name, PragmaSchemaScope::Temp)?;
+                Ok(())
+            }
+            Some(schema) if is_builtin_schema(schema) => Ok(()),
+            Some(schema) => {
+                let view_state = Rc::clone(&self.view_state);
+                self.connection
+                    .with_attached_connection(schema, |attached| {
+                        SelectColumnReferenceResolver::with_view_state(attached, view_state)
+                            .validate_local_referenced_relation(
+                                &name.name,
+                                PragmaSchemaScope::Main,
+                            )?;
+                        Ok(())
+                    })
+            }
+        }
+    }
+
+    fn validate_local_referenced_relation(
+        &mut self,
+        relation_name: &str,
+        requested_scope: PragmaSchemaScope,
+    ) -> Result<bool> {
+        let resolved_scope = if requested_scope == PragmaSchemaScope::Unqualified
+            && (self
+                .connection
+                .table_exists_for_scope(relation_name, PragmaSchemaScope::Temp)
+                || self
+                    .connection
+                    .view_index_for_scope(relation_name, PragmaSchemaScope::Temp)
+                    .is_some())
+        {
+            PragmaSchemaScope::Temp
+        } else if requested_scope == PragmaSchemaScope::Unqualified {
+            PragmaSchemaScope::Main
+        } else {
+            requested_scope
+        };
+        if self
+            .connection
+            .table_exists_for_scope(relation_name, resolved_scope)
+            || (resolved_scope == PragmaSchemaScope::Main
+                && self.connection.has_live_vtab_instance(relation_name))
+        {
+            return Ok(true);
+        }
+        let view = self
+            .connection
+            .view_index_for_scope(relation_name, resolved_scope)
+            .and_then(|index| self.connection.views.borrow().get(index).cloned());
+        let Some(view) = view else {
+            return Ok(false);
+        };
+
+        let view_key = format!(
+            "{:p}:{resolved_scope:?}:{}",
+            self.connection,
+            relation_name.to_ascii_lowercase()
+        );
+        {
+            let mut state = self.view_state.borrow_mut();
+            if state.validated.contains(&view_key) {
+                return Ok(true);
+            }
+            if !state.active.insert(view_key.clone()) {
+                return Err(FrankenError::FunctionError(format!(
+                    "view {relation_name} is circularly defined"
+                )));
+            }
+        }
+
+        let mut query = view.query.clone();
+        if !view.temporary {
+            qualify_persistent_view_relations(&mut query);
+        }
+        let view_state = Rc::clone(&self.view_state);
+        let result = self.connection.with_fallback_function_registry(|| {
+            SelectColumnReferenceResolver::with_view_state(self.connection, view_state)
+                .validate_select(&query)
+        });
+        let mut state = self.view_state.borrow_mut();
+        state.active.remove(&view_key);
+        if result.is_ok() {
+            state.validated.insert(view_key);
+        }
+        result?;
+        Ok(true)
+    }
+
+    fn metadata_source_column_names(
+        &mut self,
+        source: &'select TableOrSubquery,
+    ) -> Result<SelectSourceColumnMetadata> {
+        match source {
+            TableOrSubquery::Table { name, .. } => {
+                if let Some((scope_index, cte)) = self.visible_cte(name) {
+                    let metadata = self.metadata_cte_column_names(cte, scope_index)?;
+                    return Ok(SelectSourceColumnMetadata {
+                        names: metadata.names,
+                        hidden_rowid: None,
+                        is_live_fts5: false,
+                        approximate_names: metadata.approximate_names,
+                        generated_suffix_upper_bounds: metadata.generated_suffix_upper_bounds,
+                        width_is_exact: metadata.width_is_exact,
+                    });
+                }
+                if name.schema.is_none()
+                    && !self.local_unqualified_relation_exists_for_metadata(&name.name)
+                    && let Some(metadata) =
+                        self.metadata_unqualified_attached_table_source(source, &name.name)?
+                {
+                    return Ok(metadata);
+                }
+                if let Some(metadata) = self.metadata_table_view_column_names(name)? {
+                    return Ok(SelectSourceColumnMetadata {
+                        names: metadata.names,
+                        hidden_rowid: None,
+                        is_live_fts5: false,
+                        approximate_names: metadata.approximate_names,
+                        generated_suffix_upper_bounds: metadata.generated_suffix_upper_bounds,
+                        width_is_exact: metadata.width_is_exact,
+                    });
+                }
+                let names = self.connection.table_or_subquery_result_column_names(
+                    source,
+                    &[],
+                    &mut Vec::new(),
+                );
+                Ok(SelectSourceColumnMetadata {
+                    hidden_rowid: self
+                        .connection
+                        .hidden_rowid_projection_for_source(source, &names),
+                    is_live_fts5: self.table_source_is_live_fts5(name)?,
+                    approximate_names: vec![false; names.len()],
+                    generated_suffix_upper_bounds: vec![None; names.len()],
+                    width_is_exact: true,
+                    names,
+                })
+            }
+            TableOrSubquery::Subquery { query, .. } => {
+                let metadata = self.metadata_select_column_names(query)?;
+                Ok(SelectSourceColumnMetadata {
+                    names: metadata.names,
+                    hidden_rowid: None,
+                    is_live_fts5: false,
+                    approximate_names: metadata.approximate_names,
+                    generated_suffix_upper_bounds: metadata.generated_suffix_upper_bounds,
+                    width_is_exact: metadata.width_is_exact,
+                })
+            }
+            TableOrSubquery::TableFunction { .. } => {
+                let names = self.connection.table_or_subquery_result_column_names(
+                    source,
+                    &[],
+                    &mut Vec::new(),
+                );
+                Ok(SelectSourceColumnMetadata {
+                    hidden_rowid: self
+                        .connection
+                        .hidden_rowid_projection_for_source(source, &names),
+                    is_live_fts5: false,
+                    approximate_names: vec![false; names.len()],
+                    generated_suffix_upper_bounds: vec![None; names.len()],
+                    width_is_exact: true,
+                    names,
+                })
+            }
+            TableOrSubquery::ParenJoin(from) => {
+                let metadata = self.metadata_from_column_names(from)?;
+                Ok(SelectSourceColumnMetadata {
+                    names: metadata.names,
+                    hidden_rowid: None,
+                    is_live_fts5: false,
+                    approximate_names: metadata.approximate_names,
+                    generated_suffix_upper_bounds: metadata.generated_suffix_upper_bounds,
+                    width_is_exact: metadata.width_is_exact,
+                })
+            }
+        }
+    }
+
+    fn metadata_table_view_column_names(
+        &self,
+        name: &QualifiedName,
+    ) -> Result<Option<SelectResultColumnMetadata>> {
+        match name.schema.as_deref() {
+            None => {
+                if self
+                    .connection
+                    .table_exists_for_scope(&name.name, PragmaSchemaScope::Temp)
+                {
+                    return Ok(None);
+                }
+                if let Some(index) = self
+                    .connection
+                    .view_index_for_scope(&name.name, PragmaSchemaScope::Temp)
+                {
+                    return self.metadata_stored_view_column_names(index).map(Some);
+                }
+                if self
+                    .connection
+                    .table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+                    || self.connection.has_live_vtab_instance(&name.name)
+                {
+                    return Ok(None);
+                }
+                if let Some(index) = self
+                    .connection
+                    .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                {
+                    return self.metadata_stored_view_column_names(index).map(Some);
+                }
+                Ok(None)
+            }
+            Some(schema) if schema.eq_ignore_ascii_case("main") => self
+                .connection
+                .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                .map(|index| self.metadata_stored_view_column_names(index))
+                .transpose(),
+            Some(schema) if schema.eq_ignore_ascii_case("temp") => self
+                .connection
+                .view_index_for_scope(&name.name, PragmaSchemaScope::Temp)
+                .map(|index| self.metadata_stored_view_column_names(index))
+                .transpose(),
+            Some(schema) if is_builtin_schema(schema) => Ok(None),
+            Some(schema) => {
+                let view_state = Rc::clone(&self.view_state);
+                self.connection
+                    .with_attached_connection(schema, |attached| {
+                        let Some(index) =
+                            attached.view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                        else {
+                            return Ok(None);
+                        };
+                        SelectColumnReferenceResolver::with_view_state(attached, view_state)
+                            .metadata_stored_view_column_names(index)
+                            .map(Some)
+                    })
+            }
+        }
+    }
+
+    fn metadata_stored_view_column_names(
+        &self,
+        index: usize,
+    ) -> Result<SelectResultColumnMetadata> {
+        let view = self
+            .connection
+            .views
+            .borrow()
+            .get(index)
+            .cloned()
+            .ok_or_else(|| FrankenError::Internal("view metadata index is stale".to_owned()))?;
+        if !view.columns.is_empty() {
+            return Ok(SelectResultColumnMetadata {
+                approximate_names: vec![false; view.columns.len()],
+                generated_suffix_upper_bounds: vec![None; view.columns.len()],
+                names: view.columns,
+                width_is_exact: true,
+            });
+        }
+        let mut query = view.query;
+        if !view.temporary {
+            qualify_persistent_view_relations(&mut query);
+        }
+        let view_state = Rc::clone(&self.view_state);
+        SelectColumnReferenceResolver::with_view_state(self.connection, view_state)
+            .metadata_select_column_names(&query)
+    }
+
+    fn local_unqualified_relation_exists_for_metadata(&self, relation_name: &str) -> bool {
+        SelectRelationResolver::new(self.connection)
+            .builtin_schema_relation_exists(relation_name, PragmaSchemaScope::Unqualified)
+            || self
+                .connection
+                .table_exists_for_scope(relation_name, PragmaSchemaScope::Temp)
+            || self
+                .connection
+                .table_exists_for_scope(relation_name, PragmaSchemaScope::Main)
+            || self
+                .connection
+                .view_index_for_scope(relation_name, PragmaSchemaScope::Temp)
+                .is_some()
+            || self
+                .connection
+                .view_index_for_scope(relation_name, PragmaSchemaScope::Main)
+                .is_some()
+            || self.connection.has_live_vtab_instance(relation_name)
+    }
+
+    fn metadata_unqualified_attached_table_source(
+        &self,
+        source: &TableOrSubquery,
+        relation_name: &str,
+    ) -> Result<Option<SelectSourceColumnMetadata>> {
+        let schema_names = self
+            .connection
+            .attached_schemas
+            .borrow()
+            .all_schemas()
+            .into_iter()
+            .skip(2)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for schema_name in schema_names {
+            let metadata = self
+                .connection
+                .with_attached_connection(&schema_name, |attached| {
+                    let relation_exists = SelectRelationResolver::new(attached)
+                        .builtin_schema_relation_exists(relation_name, PragmaSchemaScope::Main)
+                        || attached.table_exists_for_scope(relation_name, PragmaSchemaScope::Main)
+                        || attached
+                            .view_index_for_scope(relation_name, PragmaSchemaScope::Main)
+                            .is_some()
+                        || attached.has_live_vtab_instance(relation_name);
+                    if !relation_exists {
+                        return Ok(None);
+                    }
+
+                    let view_index =
+                        attached.view_index_for_scope(relation_name, PragmaSchemaScope::Main);
+                    let view_metadata = view_index
+                        .map(|index| {
+                            SelectColumnReferenceResolver::with_view_state(
+                                attached,
+                                Rc::clone(&self.view_state),
+                            )
+                            .metadata_stored_view_column_names(index)
+                        })
+                        .transpose()?;
+                    let (names, approximate_names, generated_suffix_upper_bounds, width_is_exact) =
+                        if let Some(metadata) = view_metadata {
+                            (
+                                metadata.names,
+                                metadata.approximate_names,
+                                metadata.generated_suffix_upper_bounds,
+                                metadata.width_is_exact,
+                            )
+                        } else {
+                            let mut active_ctes = Vec::new();
+                            let names = attached.named_relation_result_column_names(
+                                relation_name,
+                                PragmaSchemaScope::Main,
+                                &[],
+                                &mut active_ctes,
+                            );
+                            let width = names.len();
+                            (names, vec![false; width], vec![None; width], true)
+                        };
+                    let qualified_source = match source {
+                        TableOrSubquery::Table {
+                            alias,
+                            index_hint,
+                            time_travel,
+                            ..
+                        } => TableOrSubquery::Table {
+                            name: QualifiedName::qualified("main", relation_name),
+                            alias: alias.clone(),
+                            index_hint: index_hint.clone(),
+                            time_travel: time_travel.clone(),
+                        },
+                        _ => unreachable!("attached metadata source must be a named table"),
+                    };
+                    Ok(Some(SelectSourceColumnMetadata {
+                        hidden_rowid: attached
+                            .hidden_rowid_projection_for_source(&qualified_source, &names),
+                        is_live_fts5: view_index.is_none()
+                            && attached.has_live_fts5_instance(relation_name),
+                        approximate_names,
+                        generated_suffix_upper_bounds,
+                        width_is_exact,
+                        names,
+                    }))
+                })?;
+            if metadata.is_some() {
+                return Ok(metadata);
+            }
+        }
+        Ok(None)
+    }
+
+    fn table_source_is_live_fts5(&self, name: &QualifiedName) -> Result<bool> {
+        match name.schema.as_deref() {
+            None => {
+                if self
+                    .connection
+                    .table_exists_for_scope(&name.name, PragmaSchemaScope::Temp)
+                    || self
+                        .connection
+                        .view_index_for_scope(&name.name, PragmaSchemaScope::Temp)
+                        .is_some()
+                    || self
+                        .connection
+                        .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                        .is_some()
+                {
+                    return Ok(false);
+                }
+                Ok(self.connection.has_live_fts5_instance(&name.name))
+            }
+            Some(schema) if schema.eq_ignore_ascii_case("main") => Ok(self
+                .connection
+                .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                .is_none()
+                && self.connection.has_live_fts5_instance(&name.name)),
+            Some(schema) if schema.eq_ignore_ascii_case("temp") || is_builtin_schema(schema) => {
+                Ok(false)
+            }
+            Some(schema) => self
+                .connection
+                .with_attached_connection(schema, |attached| {
+                    Ok(attached
+                        .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                        .is_none()
+                        && attached.has_live_fts5_instance(&name.name))
+                }),
+        }
+    }
+
+    fn metadata_select_column_names(
+        &mut self,
+        select: &'select SelectStatement,
+    ) -> Result<SelectResultColumnMetadata> {
+        let key = std::ptr::from_ref(select);
+        if let Some(metadata) = self.metadata_select_columns.get(&key) {
+            return Ok(metadata.clone());
+        }
+        let cte_scope_depth = self.cte_scopes.len();
+        if let Some(with) = &select.with {
+            self.cte_scopes.push(&with.ctes);
+        }
+        let metadata_result: Result<SelectResultColumnMetadata> = (|| {
+            for (_, core) in select.body.compounds.iter().rev() {
+                self.metadata_select_core_column_names(core)?;
+            }
+            self.metadata_select_core_column_names(&select.body.select)
+        })();
+        self.cte_scopes.truncate(cte_scope_depth);
+        if let Ok(metadata) = &metadata_result {
+            self.metadata_select_columns.insert(key, metadata.clone());
+        }
+        metadata_result
+    }
+
+    fn metadata_select_core_column_names(
+        &mut self,
+        core: &'select SelectCore,
+    ) -> Result<SelectResultColumnMetadata> {
+        match core {
+            SelectCore::Values(rows) => {
+                let width = rows.first().map_or(0, Vec::len);
+                if rows.iter().any(|row| row.len() != width) {
+                    return Err(FrankenError::FunctionError(
+                        "all VALUES must have the same number of terms".to_owned(),
+                    ));
+                }
+                Ok(SelectResultColumnMetadata {
+                    names: (1..=width)
+                        .map(|index| format!("column{index}"))
+                        .collect::<Vec<_>>(),
+                    approximate_names: vec![false; width],
+                    generated_suffix_upper_bounds: vec![None; width],
+                    width_is_exact: true,
+                })
+            }
+            SelectCore::Select { columns, from, .. } => {
+                // Source layout is established even when the projection does
+                // not contain `*`. In particular, an invalid nested USING
+                // must precede an enclosing SELECT's LIMIT/OFFSET error.
+                let from_column_names = from
+                    .as_ref()
+                    .map(|from| self.metadata_from_column_names(from))
+                    .transpose()?;
+                let mut names = Vec::with_capacity(columns.len());
+                let mut approximate_names = Vec::with_capacity(columns.len());
+                let mut generated_suffix_upper_bounds = Vec::with_capacity(columns.len());
+                let mut width_is_exact = true;
+                for column in columns {
+                    match column {
+                        ResultColumn::Star => {
+                            if let Some(from_column_names) = &from_column_names {
+                                names.extend(from_column_names.names.iter().cloned());
+                                approximate_names
+                                    .extend(from_column_names.approximate_names.iter().copied());
+                                generated_suffix_upper_bounds.extend(
+                                    from_column_names
+                                        .generated_suffix_upper_bounds
+                                        .iter()
+                                        .copied(),
+                                );
+                                width_is_exact &= from_column_names.width_is_exact;
+                            } else {
+                                return Err(FrankenError::ParseError {
+                                    offset: 0,
+                                    detail: "no tables specified".to_owned(),
+                                });
+                            }
+                        }
+                        ResultColumn::TableStar(name) => {
+                            if let Some(from) = from
+                                && let Some(source_metadata) =
+                                    self.metadata_named_source_column_names(from, name)?
+                            {
+                                let source_width = source_metadata.names.len();
+                                names.extend(source_metadata.names);
+                                approximate_names.extend(
+                                    source_metadata
+                                        .approximate_names
+                                        .into_iter()
+                                        .chain(std::iter::repeat(true))
+                                        .take(source_width),
+                                );
+                                generated_suffix_upper_bounds.extend(
+                                    source_metadata
+                                        .generated_suffix_upper_bounds
+                                        .into_iter()
+                                        .chain(std::iter::repeat(None))
+                                        .take(source_width),
+                                );
+                                width_is_exact &= source_metadata.width_is_exact;
+                            } else {
+                                return Err(FrankenError::NoSuchTable {
+                                    name: name.name.clone(),
+                                });
+                            }
+                        }
+                        ResultColumn::Expr {
+                            alias: Some(alias), ..
+                        } => {
+                            names.push(alias.clone());
+                            approximate_names.push(false);
+                            generated_suffix_upper_bounds.push(None);
+                        }
+                        ResultColumn::Expr { expr, .. } => match strip_collate_wrappers(expr) {
+                            Expr::Column(column, _) => {
+                                names.push(column.column.to_string());
+                                approximate_names.push(false);
+                                generated_suffix_upper_bounds.push(None);
+                            }
+                            _ => {
+                                names.push(expr.to_string());
+                                approximate_names.push(true);
+                                generated_suffix_upper_bounds.push(None);
+                            }
+                        },
+                    }
+                }
+                Ok(SelectResultColumnMetadata {
+                    names,
+                    approximate_names,
+                    generated_suffix_upper_bounds,
+                    width_is_exact,
+                })
+            }
+        }
+    }
+
+    fn metadata_from_column_names(
+        &mut self,
+        from: &'select FromClause,
+    ) -> Result<SelectResultColumnMetadata> {
+        let connection = self.connection;
+        let mut col_map = Vec::new();
+        let mut using_skip = HashSet::new();
+        let mut match_table_names = Vec::new();
+        let mut fts5_rank_table_names = Vec::new();
+        let mut approximate_col_map = Vec::new();
+        let mut width_is_exact = true;
+        let visible = SelectColumnReferenceScope::append_from_layout(
+            connection,
+            from,
+            &mut |source| self.metadata_source_column_names(source),
+            &mut col_map,
+            &mut using_skip,
+            &mut match_table_names,
+            &mut fts5_rank_table_names,
+            &mut approximate_col_map,
+            &mut width_is_exact,
+        )?;
+        Ok(SelectResultColumnMetadata {
+            names: visible.iter().map(|column| column.name.clone()).collect(),
+            approximate_names: visible.iter().map(|column| column.approximate).collect(),
+            generated_suffix_upper_bounds: visible
+                .into_iter()
+                .map(|column| column.generated_suffix_upper_bound)
+                .collect(),
+            width_is_exact,
+        })
+    }
+
+    fn metadata_named_source_column_names(
+        &mut self,
+        from: &'select FromClause,
+        target: &QualifiedName,
+    ) -> Result<Option<SelectResultColumnMetadata>> {
+        for source in std::iter::once(&from.source).chain(from.joins.iter().map(|join| &join.table))
+        {
+            if source_matches_name(source, target) {
+                let source_metadata = self.metadata_source_column_names(source)?;
+                let mut names = source_metadata.names;
+                let mut approximate_names = source_metadata.approximate_names;
+                let mut generated_suffix_upper_bounds =
+                    source_metadata.generated_suffix_upper_bounds;
+                if !source_metadata.width_is_exact {
+                    approximate_names.resize(names.len(), true);
+                    approximate_names.fill(true);
+                }
+                normalize_uncertain_sqlite_result_column_names(
+                    &mut names,
+                    &mut approximate_names,
+                    &mut generated_suffix_upper_bounds,
+                );
+                return Ok(Some(SelectResultColumnMetadata {
+                    names,
+                    approximate_names,
+                    generated_suffix_upper_bounds,
+                    width_is_exact: source_metadata.width_is_exact,
+                }));
+            }
+            if let TableOrSubquery::ParenJoin(nested) = source
+                && let Some(names) = self.metadata_named_source_column_names(nested, target)?
+            {
+                return Ok(Some(names));
+            }
+        }
+        Ok(None)
+    }
+
+    fn metadata_cte_column_names(
+        &mut self,
+        cte: &'select fsqlite_ast::Cte,
+        scope_index: usize,
+    ) -> Result<SelectResultColumnMetadata> {
+        let key = std::ptr::from_ref(cte);
+        if let Some(metadata) = self.metadata_cte_columns.get(&key) {
+            return Ok(metadata.clone());
+        }
+        if !self.metadata_active_ctes.insert(key) {
+            if !cte.columns.is_empty() {
+                return Ok(SelectResultColumnMetadata {
+                    names: cte.columns.clone(),
+                    approximate_names: vec![false; cte.columns.len()],
+                    generated_suffix_upper_bounds: vec![None; cte.columns.len()],
+                    width_is_exact: true,
+                });
+            }
+            let inferred = infer_select_column_names(&cte.query);
+            let width = inferred.len().max(1);
+            return Ok(SelectResultColumnMetadata {
+                names: if inferred.is_empty() {
+                    vec!["_c0".to_owned()]
+                } else {
+                    inferred
+                },
+                approximate_names: vec![true; width],
+                generated_suffix_upper_bounds: vec![None; width],
+                width_is_exact: false,
+            });
+        }
+        let hidden_scopes = self.cte_scopes.split_off(scope_index + 1);
+        let names_result = self.metadata_select_column_names(&cte.query);
+        self.cte_scopes.extend(hidden_scopes);
+        self.metadata_active_ctes.remove(&key);
+        let mut metadata = names_result?;
+        let mut names = metadata.names;
+        if !cte.columns.is_empty() && metadata.width_is_exact && names.len() != cte.columns.len() {
+            return Err(FrankenError::FunctionError(format!(
+                "table {} has {} values for {} columns",
+                cte.name,
+                names.len(),
+                cte.columns.len()
+            )));
+        }
+        if !cte.columns.is_empty() {
+            names = cte.columns.clone();
+            metadata.approximate_names = vec![false; names.len()];
+            metadata.generated_suffix_upper_bounds = vec![None; names.len()];
+            metadata.width_is_exact = true;
+        }
+        if names.is_empty() {
+            names.push("_c0".to_owned());
+            metadata.approximate_names = vec![true];
+            metadata.generated_suffix_upper_bounds = vec![None];
+            metadata.width_is_exact = false;
+        }
+        metadata.approximate_names.resize(names.len(), true);
+        metadata.approximate_names.truncate(names.len());
+        if !metadata.width_is_exact {
+            metadata.approximate_names.fill(true);
+        }
+        normalize_uncertain_sqlite_result_column_names(
+            &mut names,
+            &mut metadata.approximate_names,
+            &mut metadata.generated_suffix_upper_bounds,
+        );
+        metadata.names = names;
+        self.metadata_cte_columns.insert(key, metadata.clone());
+        Ok(metadata)
+    }
+
+    fn validate_nested_select(
+        &mut self,
+        select: &'select SelectStatement,
+        scope: &SelectColumnReferenceScope,
+    ) -> Result<()> {
+        self.outer_scopes.push(scope.clone());
+        let result = self.validate_select(select);
+        self.outer_scopes.pop();
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_expr(
+        &mut self,
+        expr: &'select Expr,
+        scope: &SelectColumnReferenceScope,
+        alias_use: SelectOutputAliasUse,
+    ) -> Result<()> {
+        if expr_folds_to_integer_zero_via_and(expr) {
+            return Ok(());
+        }
+        match expr {
+            Expr::BoundOuterValue { .. }
+            | Expr::Literal(_, _)
+            | Expr::Raise { .. }
+            | Expr::Placeholder(_, _) => Ok(()),
+            Expr::Column(column, _) => self.validate_column(column, scope, alias_use),
+            Expr::BinaryOp { left, right, .. }
+            | Expr::JsonAccess {
+                expr: left,
+                path: right,
+                ..
+            } => {
+                self.validate_expr(left, scope, alias_use)?;
+                self.validate_expr(right, scope, alias_use)
+            }
+            Expr::UnaryOp { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Collate { expr, .. } => self.validate_expr(expr, scope, alias_use),
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.validate_expr(expr, scope, alias_use)?;
+                self.validate_expr(low, scope, alias_use)?;
+                self.validate_expr(high, scope, alias_use)
+            }
+            Expr::In { expr, set, .. } => {
+                if matches!(set, InSet::List(values) if values.is_empty()) {
+                    return Ok(());
+                }
+                if let InSet::List(values) = set {
+                    self.connection
+                        .validate_in_list_early_row_misuse(expr, values)?;
+                }
+                let singleton_subquery = match set {
+                    InSet::Subquery(select) => Some(select.as_ref()),
+                    InSet::List(values) => match values.as_slice() {
+                        [Expr::Subquery(select, _)] => Some(select.as_ref()),
+                        _ => None,
+                    },
+                    InSet::Table(_) => None,
+                };
+                if let Some(select) = singleton_subquery {
+                    // SQLite resolves an IN-subquery's SELECT before the LHS;
+                    // an ordinary expression list retains LHS-first order.
+                    self.validate_nested_select(select, scope)?;
+                    return self.validate_expr(expr, scope, alias_use);
+                }
+                if let (Expr::RowValue(lhs_values, _), InSet::List(values)) = (expr.as_ref(), set)
+                    && values.len() > 1
+                {
+                    validate_vector_in_list_arity(lhs_values.len(), values)?;
+                    // Multi-row vector lists are resolved in the same order
+                    // SQLite materializes them: rightmost tuple first, each
+                    // tuple's fields left-to-right, and only then the LHS.
+                    for value in values.iter().rev() {
+                        self.validate_expr(value, scope, alias_use)?;
+                    }
+                    return self.validate_expr(expr, scope, alias_use);
+                }
+                self.validate_expr(expr, scope, alias_use)?;
+                match set {
+                    InSet::List(values) => {
+                        for value in values {
+                            self.validate_expr(value, scope, alias_use)?;
+                        }
+                        Ok(())
+                    }
+                    InSet::Subquery(_) => {
+                        unreachable!("subquery IN sets are handled before the LHS")
+                    }
+                    InSet::Table(_) => Ok(()),
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                op,
+                escape,
+                ..
+            } => {
+                self.validate_expr(pattern, scope, alias_use)?;
+                if !matches!(op, LikeOp::Match) || !scope.is_match_table_operand(expr) {
+                    self.validate_expr(expr, scope, alias_use)?;
+                }
+                if let Some(escape) = escape {
+                    self.validate_expr(escape, scope, alias_use)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    self.validate_expr(operand, scope, alias_use)?;
+                }
+                for (condition, value) in whens {
+                    self.validate_expr(condition, scope, alias_use)?;
+                    self.validate_expr(value, scope, alias_use)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    self.validate_expr(else_expr, scope, alias_use)?;
+                }
+                Ok(())
+            }
+            Expr::Subquery(select, _)
+            | Expr::Exists {
+                subquery: select, ..
+            } => self.validate_nested_select(select, scope),
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                order_by,
+                filter,
+                over,
+                ..
+            } => {
+                let resolved_aggregate_or_window =
+                    validate_function_call_resolution(name, args, over.as_ref()).is_ok()
+                        && ((is_current_aggregate_or_json_fn(name, args)
+                            && !is_scalar_max_min(name, args))
+                            || over.is_some());
+                if !resolved_aggregate_or_window {
+                    self.validate_function_arguments(name, args, scope, alias_use)?;
+                }
+                validate_function_call_header(
+                    name,
+                    args,
+                    *distinct,
+                    order_by,
+                    filter.as_deref(),
+                    over.as_ref(),
+                )?;
+                if let Some(filter) = filter {
+                    self.validate_expr(filter, scope, alias_use)?;
+                }
+                if let Some(window) = over {
+                    self.validate_window(window, scope)?;
+                }
+                for term in order_by {
+                    self.validate_expr(&term.expr, scope, alias_use)?;
+                }
+                if resolved_aggregate_or_window {
+                    self.validate_function_arguments(name, args, scope, alias_use)?;
+                }
+                Ok(())
+            }
+            Expr::RowValue(values, _) => {
+                for value in values {
+                    self.validate_expr(value, scope, alias_use)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_function_arguments(
+        &mut self,
+        name: &str,
+        args: &'select FunctionArgs,
+        scope: &SelectColumnReferenceScope,
+        alias_use: SelectOutputAliasUse,
+    ) -> Result<()> {
+        let FunctionArgs::List(arguments) = args else {
+            return Ok(());
+        };
+        for (index, argument) in arguments.iter().enumerate() {
+            if index == 0
+                && is_fts5_aux_function_name(name)
+                && scope.is_match_table_operand(argument)
+            {
+                continue;
+            }
+            self.validate_expr(argument, scope, alias_use)?;
+        }
+        Ok(())
+    }
+
+    fn validate_window(
+        &mut self,
+        window: &'select WindowSpec,
+        scope: &SelectColumnReferenceScope,
+    ) -> Result<()> {
+        let named_windows = self.named_window_scopes.last().copied().unwrap_or_default();
+        for definition in resolved_window_spec_chain(window, named_windows)? {
+            self.validate_window_clauses(definition, scope)?;
+        }
+        self.validate_window_clauses(window, scope)
+    }
+
+    fn validate_window_clauses(
+        &mut self,
+        window: &'select WindowSpec,
+        scope: &SelectColumnReferenceScope,
+    ) -> Result<()> {
+        for term in &window.order_by {
+            self.validate_expr(&term.expr, scope, SelectOutputAliasUse::None)?;
+        }
+        for expression in &window.partition_by {
+            self.validate_expr(expression, scope, SelectOutputAliasUse::None)?;
+        }
+        // SQLite treats frame offsets as runtime constant expressions rather
+        // than ordinary lexical SELECT expressions. Do not resolve columns,
+        // functions, or nested SELECTs here; the window executor applies the
+        // dedicated non-negative-offset check if a row reaches the frame.
+        Ok(())
+    }
+
+    fn validate_column(
+        &self,
+        column: &ColumnRef,
+        scope: &SelectColumnReferenceScope,
+        alias_use: SelectOutputAliasUse,
+    ) -> Result<()> {
+        if self.scope_resolves_column(scope, column)? {
+            return Ok(());
+        }
+        if alias_use != SelectOutputAliasUse::None
+            && column.table.is_none()
+            && let Some(alias) = scope.output_alias(&column.column)
+        {
+            if alias.is_window && !matches!(alias_use, SelectOutputAliasUse::OrderBy) {
+                return Err(FrankenError::FunctionError(format!(
+                    "misuse of aliased window function {}",
+                    alias.name
+                )));
+            }
+            if alias.is_aggregate {
+                match alias_use {
+                    SelectOutputAliasUse::GroupBy => {
+                        return Err(FrankenError::FunctionError(
+                            "aggregate functions are not allowed in the GROUP BY clause".to_owned(),
+                        ));
+                    }
+                    SelectOutputAliasUse::Where | SelectOutputAliasUse::JoinOn => {
+                        let detail = alias.aggregate_name.as_ref().map_or_else(
+                            || "misuse of aggregate function".to_owned(),
+                            |name| format!("misuse of aggregate: {name}()"),
+                        );
+                        return Err(FrankenError::FunctionError(detail));
+                    }
+                    SelectOutputAliasUse::None
+                    | SelectOutputAliasUse::Having
+                    | SelectOutputAliasUse::OrderBy => {}
+                }
+            }
+            return Ok(());
+        }
+        for outer_scope in self.outer_scopes.iter().rev() {
+            if self.scope_resolves_column(outer_scope, column)? {
+                return Ok(());
+            }
+        }
+        let name = column.table.as_ref().map_or_else(
+            || column.column.to_string(),
+            |table| format!("{table}.{}", column.column),
+        );
+        Err(FrankenError::NoSuchColumn { name })
+    }
+
+    fn scope_resolves_column(
+        &self,
+        scope: &SelectColumnReferenceScope,
+        column: &ColumnRef,
+    ) -> Result<bool> {
+        if let Some(table) = column.table.as_deref()
+            && !scope
+                .valid_qualifiers
+                .iter()
+                .any(|qualifier| qualifier.eq_ignore_ascii_case(table))
+        {
+            return Ok(false);
+        }
+        match find_col_in_map(
+            &scope.col_map,
+            column.table.as_deref(),
+            &column.column,
+            scope.using_skip(),
+        ) {
+            Ok(_) => Ok(true),
+            Err(error @ FrankenError::AmbiguousColumn { .. }) => {
+                // An approximate source-name candidate can participate in a
+                // NATURAL/USING coalescence that the AST alone cannot prove.
+                // Defer the ambiguous outcome instead of manufacturing a
+                // false prepare-time rejection from pretty-printed names.
+                if scope.resolves_approximate_column(column) {
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(FrankenError::Internal(_)) => Ok(scope.resolves_approximate_column(column)
+                || scope.resolves_fts5_rank_column(column)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 struct SelectStructureResolver<'a> {
     connection: &'a Connection,
     scopes: Vec<&'a [fsqlite_ast::Cte]>,
     visits: HashMap<*const fsqlite_ast::Cte, CteCollationVisit>,
     semantic_depth: usize,
     view_definition_mode: bool,
+    column_reference_preflight_completed: bool,
 }
 
 impl<'a> SelectStructureResolver<'a> {
@@ -105788,6 +108040,7 @@ impl<'a> SelectStructureResolver<'a> {
             visits: HashMap::new(),
             semantic_depth: 0,
             view_definition_mode: false,
+            column_reference_preflight_completed: false,
         }
     }
 
@@ -105801,7 +108054,9 @@ impl<'a> SelectStructureResolver<'a> {
     fn validate_select_without_relation_preflight(
         &mut self,
         select: &'a SelectStatement,
+        column_reference_preflight_completed: bool,
     ) -> Result<()> {
+        self.column_reference_preflight_completed = column_reference_preflight_completed;
         self.validate_select_semantics(select)
     }
 
@@ -105826,6 +108081,23 @@ impl<'a> SelectStructureResolver<'a> {
         }
 
         let result = (|| {
+            if !self.view_definition_mode
+                && !self.column_reference_preflight_completed
+                && select.limit.is_some()
+                && (select_requires_layout_preflight_before_limit(select)
+                    || select_references_view_for_layout(select, self.connection)?)
+            {
+                SelectColumnReferenceResolver::new(self.connection)
+                    .validate_select_layout(select)?;
+            }
+            for index in (0..=select.body.compounds.len()).rev() {
+                let core = if index == 0 {
+                    &select.body.select
+                } else {
+                    &select.body.compounds[index - 1].1
+                };
+                Self::validate_core_shape_before_limit(core)?;
+            }
             let top_windows = select_core_named_windows(&select.body.select);
             if let Some(limit) = &select.limit {
                 self.validate_expr(&limit.limit, top_windows)?;
@@ -105901,6 +108173,18 @@ impl<'a> SelectStructureResolver<'a> {
         self.scopes.truncate(scope_depth);
         self.semantic_depth = semantic_depth;
         result
+    }
+
+    fn validate_core_shape_before_limit(core: &SelectCore) -> Result<()> {
+        if let SelectCore::Values(rows) = core
+            && let Some(width) = rows.first().map(Vec::len)
+            && rows.iter().any(|row| row.len() != width)
+        {
+            return Err(FrankenError::FunctionError(
+                "all VALUES must have the same number of terms".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_core_before_order(
@@ -106442,29 +108726,47 @@ impl<'a> SelectStructureResolver<'a> {
                 self.validate_expr(high, named_windows)
             }
             Expr::In { expr, set, .. } => {
-                let normalized_set = normalize_bare_singleton_in_subquery(set);
-                let normalized_set = normalized_set.as_ref();
-                if matches!(normalized_set, InSet::List(values) if values.is_empty()) {
+                if matches!(set, InSet::List(values) if values.is_empty()) {
                     return Ok(());
                 }
-                self.validate_expr(expr, named_windows)?;
-                match normalized_set {
-                    InSet::List(values) => {
-                        for value in values {
-                            self.validate_expr(value, named_windows)?;
-                        }
-                    }
-                    InSet::Subquery(query) => self.validate_select(query)?,
-                    InSet::Table(name) => self.validate_relation(name)?,
+                if let InSet::List(values) = set {
+                    self.connection
+                        .validate_in_list_early_row_misuse(expr, values)?;
                 }
-                match normalized_set {
-                    InSet::Subquery(subquery) => self
-                        .connection
-                        .validate_in_subquery_column_count(expr, subquery)?,
-                    InSet::List(values) => {
+                self.validate_expr(expr, named_windows)?;
+                let singleton_subquery = match set {
+                    InSet::List(values) => match values.as_slice() {
+                        [Expr::Subquery(query, _)] => Some(query.as_ref()),
+                        _ => None,
+                    },
+                    InSet::Subquery(query) => Some(query.as_ref()),
+                    InSet::Table(_) => None,
+                };
+                if let Some(query) = singleton_subquery {
+                    self.validate_select(query)?;
+                    if !is_correlated_subquery_with_schema(query, &self.connection.schema.borrow())
+                    {
+                        self.connection
+                            .validate_in_subquery_column_count(expr, query)?;
+                    }
+                } else {
+                    match set {
+                        InSet::List(values) => {
+                            for value in values {
+                                self.validate_expr(value, named_windows)?;
+                            }
+                        }
+                        InSet::Subquery(_) => {
+                            unreachable!("subquery IN sets are handled above")
+                        }
+                        InSet::Table(name) => self.validate_relation(name)?,
+                    }
+                }
+                match set {
+                    InSet::List(values) if singleton_subquery.is_none() => {
                         self.connection.validate_in_list_lhs_shape(expr, values)?;
                     }
-                    InSet::Table(_) => {}
+                    InSet::List(_) | InSet::Subquery(_) | InSet::Table(_) => {}
                 }
                 Ok(())
             }
@@ -106565,28 +108867,7 @@ impl<'a> SelectStructureResolver<'a> {
         for term in &window.order_by {
             self.validate_expr(&term.expr, named_windows)?;
         }
-        if let Some(frame) = &window.frame {
-            self.validate_frame_bound(&frame.start, named_windows)?;
-            if let Some(end) = &frame.end {
-                self.validate_frame_bound(end, named_windows)?;
-            }
-        }
         Ok(())
-    }
-
-    fn validate_frame_bound(
-        &mut self,
-        bound: &'a FrameBound,
-        named_windows: &'a [fsqlite_ast::WindowDef],
-    ) -> Result<()> {
-        match bound {
-            FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-                self.validate_expr(expr, named_windows)
-            }
-            FrameBound::UnboundedPreceding
-            | FrameBound::CurrentRow
-            | FrameBound::UnboundedFollowing => Ok(()),
-        }
     }
 
     fn visible_cte(&self, name: &QualifiedName) -> Option<(usize, &'a fsqlite_ast::Cte)> {
@@ -107675,9 +109956,7 @@ fn validate_window_frame_expr_collation_consumers(
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            Ok(())
-        }
+        | Expr::Placeholder(_, _) => Ok(()),
         Expr::BinaryOp {
             left, op, right, ..
         } => {
@@ -107827,9 +110106,7 @@ fn window_frame_explicit_collation_name(expr: &Expr) -> Option<&str> {
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _) => {
-            None
-        }
+        | Expr::Placeholder(_, _) => None,
         Expr::BinaryOp { left, right, .. } => window_frame_explicit_collation_name(left)
             .or_else(|| window_frame_explicit_collation_name(right)),
         Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
@@ -108026,8 +110303,7 @@ fn expr_has_fromless_outside_window_aggregate(expr: &Expr) -> bool {
             over: None,
             ..
         } => {
-            (is_current_aggregate_or_json_fn(name, args)
-                && !is_scalar_max_min(name, args))
+            (is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args))
                 || matches!(
                     args,
                     FunctionArgs::List(values)
@@ -110365,8 +112641,7 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
 }
 
 fn fromless_comparison_metadata(left: &Expr, right: &Expr) -> (P4, u16) {
-    let collation = join_comparison_collation(left, right, &[])
-        .map_or(P4::None, P4::Collation);
+    let collation = join_comparison_collation(left, right, &[]).map_or(P4::None, P4::Collation);
     let affinity = TypeAffinity::comparison_affinity(
         resolve_operand_affinity(left, &[]),
         resolve_operand_affinity(right, &[]),
@@ -110596,10 +112871,7 @@ fn emit_function_call(
         .function_registry
         .as_ref()
         .and_then(|registry| {
-            registry.scalar_consumes_argument_collation(
-                &canonical_name,
-                i32::from(arg_count_u16),
-            )
+            registry.scalar_consumes_argument_collation(&canonical_name, i32::from(arg_count_u16))
         })
         .unwrap_or(false);
     let selected_collation = if consumes_argument_collation {
@@ -110690,14 +112962,7 @@ fn emit_sqlite_value(builder: &mut ProgramBuilder, value: &SqliteValue, target_r
             );
         }
         SqliteValue::Blob(value) => {
-            builder.emit_op(
-                Opcode::Blob,
-                0,
-                target_reg,
-                0,
-                P4::Blob(value.to_vec()),
-                0,
-            );
+            builder.emit_op(Opcode::Blob, 0, target_reg, 0, P4::Blob(value.to_vec()), 0);
         }
     }
 }
@@ -112217,14 +114482,7 @@ fn emit_case_expr(
             builder.emit_jump_to_label(Opcode::IsNull, r_op, 0, next_when, P4::None, 0);
             builder.emit_jump_to_label(Opcode::IsNull, r_when, 0, next_when, P4::None, 0);
             let (collation, affinity) = fromless_comparison_metadata(op_expr, when_expr);
-            builder.emit_jump_to_label(
-                Opcode::Ne,
-                r_when,
-                r_op,
-                next_when,
-                collation,
-                affinity,
-            );
+            builder.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, collation, affinity);
             builder.free_temp(r_when);
         } else {
             emit_expr(builder, when_expr, target_reg, bind_state)?;
@@ -112423,8 +114681,7 @@ fn emit_in_expr(
     let elem_reg = builder.alloc_temp();
     for elem in list {
         emit_expr(builder, elem, elem_reg, bind_state)?;
-        let (collation, affinity) =
-            fromless_in_comparison_metadata(expr, elem, singleton_constant);
+        let (collation, affinity) = fromless_in_comparison_metadata(expr, elem, singleton_constant);
         builder.emit_jump_to_label(
             Opcode::Eq,
             elem_reg,
@@ -112801,16 +115058,14 @@ impl JoinEvalCollationContextGuard {
     }
 
     fn push_shared(context: Arc<JoinEvalCollationContext>) -> Self {
-        CURRENT_JOIN_EVAL_COLLATION_CONTEXT
-            .with(|stack| stack.borrow_mut().push(context));
+        CURRENT_JOIN_EVAL_COLLATION_CONTEXT.with(|stack| stack.borrow_mut().push(context));
         Self
     }
 }
 
 impl Drop for JoinEvalCollationContextGuard {
     fn drop(&mut self) {
-        let popped =
-            CURRENT_JOIN_EVAL_COLLATION_CONTEXT.with(|stack| stack.borrow_mut().pop());
+        let popped = CURRENT_JOIN_EVAL_COLLATION_CONTEXT.with(|stack| stack.borrow_mut().pop());
         drop(popped);
     }
 }
@@ -112826,9 +115081,7 @@ fn current_join_eval_collation_context_snapshot() -> Option<Arc<JoinEvalCollatio
     CURRENT_JOIN_EVAL_COLLATION_CONTEXT.with(|stack| stack.borrow().last().cloned())
 }
 
-fn current_join_using_column_projection(
-    column_name: &str,
-) -> Option<JoinUsingProjection> {
+fn current_join_using_column_projection(column_name: &str) -> Option<JoinUsingProjection> {
     with_current_join_eval_collation_context(|context| {
         context.and_then(|context| {
             context
@@ -113258,9 +115511,7 @@ impl PartialEq for CanonicalHashJoinKey {
                 .0
                 .iter()
                 .zip(&other.0)
-                .all(|(left, right)| {
-                    cmp_sqlite_values(left, right) == std::cmp::Ordering::Equal
-                })
+                .all(|(left, right)| cmp_sqlite_values(left, right) == std::cmp::Ordering::Equal)
     }
 }
 
@@ -113289,15 +115540,12 @@ fn hash_join_pairs_with_modes(
                     .column_affinities
                     .get(left_width + right_idx)
                     .copied()?;
-                let mode = match TypeAffinity::comparison_affinity(
-                    left_affinity,
-                    right_affinity,
-                ) {
+                let mode = match TypeAffinity::comparison_affinity(left_affinity, right_affinity) {
                     None => HashJoinKeyMode::Raw,
                     Some(TypeAffinity::Text) => HashJoinKeyMode::Text,
-                    Some(
-                        TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Numeric,
-                    ) => HashJoinKeyMode::NumericCandidate,
+                    Some(TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Numeric) => {
+                        HashJoinKeyMode::NumericCandidate
+                    }
                     Some(TypeAffinity::Blob) => HashJoinKeyMode::Raw,
                 };
                 Some(HashJoinPair {
@@ -113314,9 +115562,7 @@ fn canonical_hash_join_value(value: &SqliteValue, mode: HashJoinKeyMode) -> Sqli
     match mode {
         HashJoinKeyMode::Raw => value.clone(),
         HashJoinKeyMode::Text => value.clone().apply_affinity(TypeAffinity::Text),
-        HashJoinKeyMode::NumericCandidate => {
-            value.clone().apply_affinity(TypeAffinity::Numeric)
-        }
+        HashJoinKeyMode::NumericCandidate => value.clone().apply_affinity(TypeAffinity::Numeric),
     }
 }
 
@@ -113446,9 +115692,9 @@ fn execute_hash_join(
                             continue;
                         }
                     }
-                    if using_recheck.is_some_and(|indices| {
-                        !eval_using_constraint_indices(indices, &combined)
-                    }) {
+                    if using_recheck
+                        .is_some_and(|indices| !eval_using_constraint_indices(indices, &combined))
+                    {
                         continue;
                     }
 
@@ -113623,16 +115869,15 @@ fn join_expr_declared_collation(
         Expr::BoundOuterValue { collation, .. } => join_resolved_bound_collation(collation),
         Expr::Column(col_ref, _) => {
             if col_ref.table.is_none()
-                && let Some(projection) =
-                    current_join_using_column_projection(&col_ref.column)
+                && let Some(projection) = current_join_using_column_projection(&col_ref.column)
             {
                 return join_resolved_bound_collation(&projection.collation);
             }
             let index = resolve_join_expr_column_index(col_ref, col_map).ok()?;
-            Some(current_join_eval_column_collation(index).map_or(
-                JoinResolvedCollation::Binary,
-                JoinResolvedCollation::Named,
-            ))
+            Some(
+                current_join_eval_column_collation(index)
+                    .map_or(JoinResolvedCollation::Binary, JoinResolvedCollation::Named),
+            )
         }
         _ => None,
     }
@@ -113657,10 +115902,7 @@ fn join_expr_effective_collation(
     }
 }
 
-fn join_expr_defining_collation(
-    expr: &Expr,
-    col_map: &[(String, String, bool)],
-) -> Option<String> {
+fn join_expr_defining_collation(expr: &Expr, col_map: &[(String, String, bool)]) -> Option<String> {
     match join_expr_resolved_collation(expr, col_map) {
         JoinResolvedCollation::Binary => Some("BINARY".to_owned()),
         JoinResolvedCollation::Named(name) => Some(name),
@@ -113784,9 +116026,7 @@ fn execute_single_join(
     // ── Hash-join fast path for equi-joins (O(n+m) vs O(n*m)) ──
     if let Some(JoinConstraint::On(expr)) = constraint {
         if let Some(plan) = plan_hash_join_predicate(expr, col_map, left_width) {
-            if let Some(hash_pairs) =
-                hash_join_pairs_with_modes(&plan.equi_pairs, left_width)
-            {
+            if let Some(hash_pairs) = hash_join_pairs_with_modes(&plan.equi_pairs, left_width) {
                 let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
                 #[cfg(test)]
                 FSQLITE_JOIN_HASH_FAST_PATH_HITS
@@ -114863,8 +117103,7 @@ fn join_expr_affinity(
         Expr::BoundOuterValue { affinity, .. } => affinity.unwrap_or(TypeAffinity::Blob),
         Expr::Column(col_ref, _) => {
             if col_ref.table.is_none()
-                && let Some(projection) =
-                    current_join_using_column_projection(&col_ref.column)
+                && let Some(projection) = current_join_using_column_projection(&col_ref.column)
             {
                 return projection.affinity;
             }
@@ -114917,9 +117156,7 @@ fn coerce_values_for_comparison_affinity<'a>(
         // malformed numeric text remains TEXT while parseable numeric text
         // becomes INTEGER/REAL, which changes their storage-class ordering.
         let to_numeric = |value: &SqliteValue| match value {
-            SqliteValue::Text(_) => {
-                Some(value.clone().apply_affinity(TypeAffinity::Numeric))
-            }
+            SqliteValue::Text(_) => Some(value.clone().apply_affinity(TypeAffinity::Numeric)),
             _ => None,
         };
         return (
@@ -114947,9 +117184,8 @@ fn cmp_values_with_comparison_affinity(
     // `None` is the compact representation of default BINARY in the common
     // built-in case. If an application has replaced BINARY, it is no longer
     // valid to bypass the registry comparator under that representation.
-    let collation = collation.or_else(|| {
-        (!registry.uses_builtin_implementation("BINARY")).then_some("BINARY")
-    });
+    let collation =
+        collation.or_else(|| (!registry.uses_builtin_implementation("BINARY")).then_some("BINARY"));
     if let (Some(collation), SqliteValue::Text(left_text), SqliteValue::Text(right_text)) =
         (collation, left.as_ref(), right.as_ref())
     {
@@ -115007,17 +117243,17 @@ fn compare_join_in_values(
             |context| {
                 let affinity = join_expr_affinity(operand_expr, col_map, context);
                 let affinity = (affinity != TypeAffinity::Blob).then_some(affinity);
-                let (operand_value, list_value) = coerce_values_for_comparison_affinity(
-                    operand_value,
-                    list_value,
-                    affinity,
-                );
+                let (operand_value, list_value) =
+                    coerce_values_for_comparison_affinity(operand_value, list_value, affinity);
                 if let (
                     Some(collation),
                     SqliteValue::Text(left_text),
                     SqliteValue::Text(right_text),
-                ) = (collation.as_deref(), operand_value.as_ref(), list_value.as_ref())
-                {
+                ) = (
+                    collation.as_deref(),
+                    operand_value.as_ref(),
+                    list_value.as_ref(),
+                ) {
                     compare_text_bytes_collated_snapshot(
                         left_text.as_bytes(),
                         right_text.as_bytes(),
@@ -115167,9 +117403,7 @@ fn invoke_current_registered_scalar(
     let builtin = shared_builtin_function_registry();
     builtin
         .resolve_scalar(name, args.len() as i32)
-        .map(|resolved| {
-            invoke_scalar_for_sync_evaluation(name, &resolved, args, collation_name)
-        })
+        .map(|resolved| invoke_scalar_for_sync_evaluation(name, &resolved, args, collation_name))
 }
 
 fn function_argument_collation(
@@ -115275,13 +117509,8 @@ fn invoke_resolved_pattern_operator(
     if let Some(escape) = escape {
         args.push(escape.clone());
     }
-    invoke_resolved_scalar(
-        resolved.function_name,
-        &resolved.scalar,
-        &args,
-        collation,
-    )
-    .map(|value| apply_pattern_operator_not(value, not))
+    invoke_resolved_scalar(resolved.function_name, &resolved.scalar, &args, collation)
+        .map(|value| apply_pattern_operator_not(value, not))
 }
 
 fn pattern_operator_argument_collation(
@@ -115313,23 +117542,18 @@ fn invoke_current_registered_pattern_operator(
     })?;
     Some(resolved.and_then(|resolved| {
         let collation = if resolved.scalar.consumes_argument_collation() {
-            pattern_operator_argument_collation(
-                pattern_expr,
-                source_expr,
-                escape_expr,
-                col_map,
-            )
-            .map(|collation_name| {
-                with_current_join_eval_collation_context(|context| {
-                    context.and_then(|context| context.registry.find(&collation_name))
+            pattern_operator_argument_collation(pattern_expr, source_expr, escape_expr, col_map)
+                .map(|collation_name| {
+                    with_current_join_eval_collation_context(|context| {
+                        context.and_then(|context| context.registry.find(&collation_name))
+                    })
+                    .ok_or_else(|| {
+                        FrankenError::function_error(format!(
+                            "no such collation sequence: {collation_name}"
+                        ))
+                    })
                 })
-                .ok_or_else(|| {
-                    FrankenError::function_error(format!(
-                        "no such collation sequence: {collation_name}"
-                    ))
-                })
-            })
-            .transpose()?
+                .transpose()?
         } else {
             None
         };
@@ -115510,6 +117734,19 @@ pub(crate) fn eval_join_expr(
                     ));
                 };
                 validate_vector_in_list_arity(rv_exprs.len(), list_exprs)?;
+                let rhs_rows = list_exprs
+                    .iter()
+                    .map(|list_item| {
+                        let rhs_exprs = match list_item {
+                            Expr::RowValue(values, _) => values.as_slice(),
+                            other => std::slice::from_ref(other),
+                        };
+                        rhs_exprs
+                            .iter()
+                            .map(|rhs_expr| eval_join_expr(rhs_expr, row, col_map))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let lhs: Vec<SqliteValue> = rv_exprs
                     .iter()
                     .map(|e| eval_join_expr(e, row, col_map))
@@ -115520,40 +117757,28 @@ pub(crate) fn eval_join_expr(
                 });
                 let mut saw_null = false;
                 let mut found = false;
-                for list_item in list_exprs {
+                for (list_item, rhs) in list_exprs.iter().zip(&rhs_rows) {
                     let rhs_exprs = match list_item {
                         Expr::RowValue(rv, _) => rv.as_slice(),
                         _ => std::slice::from_ref(list_item),
                     };
                     debug_assert_eq!(rhs_exprs.len(), lhs.len());
-                    let rhs: Vec<SqliteValue> = rhs_exprs
-                        .iter()
-                        .map(|e| eval_join_expr(e, row, col_map))
-                        .collect::<Result<Vec<_>>>()?;
                     // Element-wise three-valued comparison:
                     // - If any pair is FALSE (not equal), this tuple is FALSE.
                     // - If no pair is FALSE but some are NULL, this tuple is NULL.
                     // - If all pairs are TRUE (equal), this tuple matches.
                     let mut tuple_has_null = false;
                     let mut tuple_all_equal = true;
-                    for (field_index, ((l_expr, l), r)) in rv_exprs
-                        .iter()
-                        .zip(lhs.iter())
-                        .zip(rhs.iter())
-                        .enumerate()
+                    for (field_index, ((l_expr, l), r)) in
+                        rv_exprs.iter().zip(lhs.iter()).zip(rhs.iter()).enumerate()
                     {
                         if l.is_null() || r.is_null() {
                             tuple_has_null = true;
                         } else if donor_exprs
                             .and_then(|donors| donors.get(field_index))
                             .is_none_or(|donor_expr| {
-                                compare_join_expr_values(
-                                    l_expr,
-                                    l,
-                                    donor_expr,
-                                    r,
-                                    col_map,
-                                ) != std::cmp::Ordering::Equal
+                                compare_join_expr_values(l_expr, l, donor_expr, r, col_map)
+                                    != std::cmp::Ordering::Equal
                             })
                         {
                             tuple_all_equal = false;
@@ -115587,8 +117812,8 @@ pub(crate) fn eval_join_expr(
             let found = match set {
                 InSet::List(exprs) => {
                     let mut found = false;
-                    let singleton_comparison = exprs.len() == 1
-                        && current_singleton_in_rhs_is_constant(&exprs[0]);
+                    let singleton_comparison =
+                        exprs.len() == 1 && current_singleton_in_rhs_is_constant(&exprs[0]);
                     for e in exprs {
                         let set_val = eval_join_expr(e, row, col_map)?;
                         if set_val.is_null() {
@@ -118202,24 +120427,22 @@ pub(crate) fn fsqlite_core_test_serializer() -> std::sync::MutexGuard<'static, (
 mod tests {
     use super::{
         BoundPagerPublication, CanonicalHashJoinKey, CommitSeq, Connection, ConnectionEnv,
-        DifferentialEvent,
-        FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS, FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS,
-        FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS, FSQLITE_JOIN_EXPR_BINDING_HITS,
-        FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_FAST_PATH_HITS,
-        FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
+        DifferentialEvent, FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS,
+        FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS, FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS,
+        FSQLITE_JOIN_EXPR_BINDING_HITS, FSQLITE_JOIN_EXPR_FALLBACK_SCANS,
+        FSQLITE_JOIN_HASH_FAST_PATH_HITS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
         FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, HashJoinKeyMode, HashJoinPair,
         ImplicitAutoindexSlot, InProcessPageLockTable, IoPollStrategy, LiveVtabRegistryUndo,
         MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope, Row,
         RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
         arm_trigger_stack_probe, bind_placeholders_in_select_for_fallback,
-        build_canonical_hash_join_key, canonical_hash_join_value,
-        canonicalize_select_placeholders,
-        cmp_values_with_comparison_affinity,
-        implicit_autoindex_layout, init_global_runtime, is_correlated_subquery,
-        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
-        join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
-        parse_single_statement, qualify_persistent_view_relations, resolve_used_window_spec,
+        build_canonical_hash_join_key, canonical_hash_join_value, canonicalize_select_placeholders,
+        cmp_values_with_comparison_affinity, implicit_autoindex_layout, init_global_runtime,
+        is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
+        join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
+        memdb_row_matches_like_fast_path, parse_single_statement,
+        qualify_persistent_view_relations, resolve_used_window_spec,
         select_contains_any_placeholder, set_trigger_depth_limit_override,
         statement_contains_rewritable_subquery, substitute_outer_refs_in_select,
         take_trigger_stack_probe, validate_named_window_definitions, visit_select_qualified_names,
@@ -118880,8 +121103,7 @@ mod tests {
         }
 
         fn min_args(&self) -> i32 {
-            self.min_args_calls
-                .fetch_add(1, AtomicOrdering::SeqCst);
+            self.min_args_calls.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_nested_min_args",
@@ -118891,8 +121113,7 @@ mod tests {
         }
 
         fn max_args(&self) -> Option<i32> {
-            self.max_args_calls
-                .fetch_add(1, AtomicOrdering::SeqCst);
+            self.max_args_calls.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_nested_max_args",
@@ -119001,9 +121222,7 @@ mod tests {
         }
 
         fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
-            let call_index = self
-                .column_info_calls
-                .fetch_add(1, AtomicOrdering::SeqCst);
+            let call_index = self.column_info_calls.fetch_add(1, AtomicOrdering::SeqCst);
             if self.replace_on_every_call || call_index == 0 {
                 reentrant_vtab_connection()
                     .register_nondeterministic_scalar_function(ValuesDonorProbe);
@@ -124177,13 +126396,13 @@ mod tests {
             );
             assert_eq!(
                 exact
-                .prepare(builtin_sql)
-                .await
-                .unwrap()
-                .query()
-                .await
-                .unwrap()[0]
-                .values(),
+                    .prepare(builtin_sql)
+                    .await
+                    .unwrap()
+                    .query()
+                    .await
+                    .unwrap()[0]
+                    .values(),
                 &[SqliteValue::Integer(42)]
             );
             assert_eq!(
@@ -126602,16 +128821,10 @@ mod tests {
             }];
             for left in &values {
                 for right in &values {
-                    let left_key = build_canonical_hash_join_key(
-                        std::slice::from_ref(left),
-                        &pairs,
-                        false,
-                    );
-                    let right_key = build_canonical_hash_join_key(
-                        std::slice::from_ref(right),
-                        &pairs,
-                        true,
-                    );
+                    let left_key =
+                        build_canonical_hash_join_key(std::slice::from_ref(left), &pairs, false);
+                    let right_key =
+                        build_canonical_hash_join_key(std::slice::from_ref(right), &pairs, true);
                     if let (Some(left_key), Some(right_key)) = (left_key, right_key)
                         && left_key == right_key
                     {
@@ -126636,12 +128849,8 @@ mod tests {
             mode: HashJoinKeyMode::NumericCandidate,
         }];
         assert!(
-            build_canonical_hash_join_key(
-                &[SqliteValue::Float(f64::NAN)],
-                &numeric_pairs,
-                false,
-            )
-            .is_none(),
+            build_canonical_hash_join_key(&[SqliteValue::Float(f64::NAN)], &numeric_pairs, false,)
+                .is_none(),
             "NaN must never enter an equality hash bucket"
         );
     }
@@ -126698,22 +128907,18 @@ mod tests {
             }];
             for left in &values {
                 for right in &values {
-                    let actual = build_canonical_hash_join_key(
-                        std::slice::from_ref(left),
-                        &pairs,
-                        false,
-                    )
-                    .zip(build_canonical_hash_join_key(
-                        std::slice::from_ref(right),
-                        &pairs,
-                        true,
-                    ))
-                    .is_some_and(|(left_key, right_key)| left_key == right_key);
+                    let actual =
+                        build_canonical_hash_join_key(std::slice::from_ref(left), &pairs, false)
+                            .zip(build_canonical_hash_join_key(
+                                std::slice::from_ref(right),
+                                &pairs,
+                                true,
+                            ))
+                            .is_some_and(|(left_key, right_key)| left_key == right_key);
                     let canonical_left = canonical_hash_join_value(left, mode);
                     let canonical_right = canonical_hash_join_value(right, mode);
-                    let has_canonical_nan =
-                        matches!(canonical_left, SqliteValue::Float(value) if value.is_nan())
-                            || matches!(canonical_right, SqliteValue::Float(value) if value.is_nan());
+                    let has_canonical_nan = matches!(canonical_left, SqliteValue::Float(value) if value.is_nan())
+                        || matches!(canonical_right, SqliteValue::Float(value) if value.is_nan());
                     let expected = !left.is_null()
                         && !right.is_null()
                         && !has_canonical_nan
@@ -136067,9 +138272,11 @@ mod tests {
                 .map(|i| format!("c{i} TEXT"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            conn.execute(&format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {col_defs});"))
-                .await
-                .unwrap();
+            conn.execute(&format!(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, {col_defs});"
+            ))
+            .await
+            .unwrap();
 
             let when_chain: String = (0..40)
                 .map(|i| format!("OLD.c{i} IS NOT NEW.c{i}"))
@@ -142897,8 +145104,7 @@ mod tests {
 
             let view_index = fconn.view_index_of("view_metadata").unwrap();
             let schema_snapshot = fconn.schema.borrow().clone();
-            let mut resolver =
-                super::CteResultMetadataResolver::new(&fconn, &schema_snapshot);
+            let mut resolver = super::CteResultMetadataResolver::new(&fconn, &schema_snapshot);
             let metadata = resolver.resolve_view(view_index);
             assert_eq!(
                 metadata.names,
@@ -142922,16 +145128,13 @@ mod tests {
             assert_eq!(collated_column.affinity, 'B');
             assert_eq!(collated_column.collation.as_deref(), Some("NOCASE"));
 
-            let Statement::Select(donor_select) = parse_single_statement(
-                "SELECT n_alias, c_alias FROM view_metadata",
-            )
-            .unwrap()
+            let Statement::Select(donor_select) =
+                parse_single_statement("SELECT n_alias, c_alias FROM view_metadata").unwrap()
             else {
                 unreachable!("SELECT parser returned a non-SELECT statement");
             };
-            let donor_metadata =
-                super::CteResultMetadataResolver::new(&fconn, &schema_snapshot)
-                    .resolve_in_rhs_donor(&donor_select);
+            let donor_metadata = super::CteResultMetadataResolver::new(&fconn, &schema_snapshot)
+                .resolve_in_rhs_donor(&donor_select);
             assert_eq!(donor_metadata.columns[0].affinity, Some(TypeAffinity::Text));
             assert_eq!(donor_metadata.columns[0].collation, None);
             assert_eq!(donor_metadata.columns[1].affinity, Some(TypeAffinity::Text));
@@ -142944,17 +145147,15 @@ mod tests {
                 "VALUES (CAST('1' AS TEXT) COLLATE NOCASE), \
                         (CAST(1 AS NUMERIC) COLLATE RTRIM)",
             )
-            .unwrap()
-            else {
+            .unwrap() else {
                 unreachable!("VALUES parser returned a non-SELECT statement");
             };
             let SelectCore::Values(values) = &mut frozen_donor_select.body.select else {
                 unreachable!("VALUES parser returned a non-VALUES core");
             };
             values.freeze_donor_row(Some(0));
-            let frozen_metadata =
-                super::CteResultMetadataResolver::new(&fconn, &schema_snapshot)
-                    .resolve_in_rhs_donor(&frozen_donor_select);
+            let frozen_metadata = super::CteResultMetadataResolver::new(&fconn, &schema_snapshot)
+                .resolve_in_rhs_donor(&frozen_donor_select);
             assert_eq!(
                 frozen_metadata.columns[0].affinity,
                 Some(TypeAffinity::Text)
@@ -142964,17 +145165,11 @@ mod tests {
                 Some("NOCASE")
             );
             assert_eq!(
-                super::in_rhs_donor_explicit_collations(
-                    &frozen_donor_select,
-                    &schema_snapshot,
-                ),
+                super::in_rhs_donor_explicit_collations(&frozen_donor_select, &schema_snapshot,),
                 vec![Some("NOCASE".to_owned())]
             );
             assert_eq!(
-                super::scalar_subquery_result_affinity(
-                    &frozen_donor_select,
-                    &schema_snapshot,
-                ),
+                super::scalar_subquery_result_affinity(&frozen_donor_select, &schema_snapshot,),
                 TypeAffinity::Text
             );
 
@@ -146692,10 +148887,7 @@ mod tests {
                     .await
                     .expect_err("indexed writes must fail while the collation is unresolved");
                 assert!(
-                    error
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains("collation"),
+                    error.to_string().to_ascii_lowercase().contains("collation"),
                     "unexpected unresolved-collation error for `{sql}`: {error}"
                 );
             }
@@ -146813,10 +149005,7 @@ mod tests {
                     .await
                     .expect_err("indexed writes must fail while inherited collation is unresolved");
                 assert!(
-                    error
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains("collation"),
+                    error.to_string().to_ascii_lowercase().contains("collation"),
                     "unexpected unresolved-collation error for `{sql}`: {error}"
                 );
             }
@@ -155786,9 +157975,11 @@ mod tests {
                 fn drop(&mut self) {
                     let connection = reentrant_vtab_connection();
                     let registry_was_unborrowed = connection.func_registry.try_borrow_mut().is_ok();
-                    connection.register_deterministic_scalar_function(MetadataNestedScalarFunction {
-                        function_name: "nested_from_scalar_drop",
-                    });
+                    connection.register_deterministic_scalar_function(
+                        MetadataNestedScalarFunction {
+                            function_name: "nested_from_scalar_drop",
+                        },
+                    );
                     let nested_was_published = connection
                         .func_registry
                         .borrow()
@@ -171667,11 +173858,10 @@ mod autocommit_txn_tests {
             conn.execute("INSERT INTO t VALUES (2, 'dup');")
                 .await
                 .unwrap();
-            let page_count_before = conn.query("PRAGMA page_count;").await.unwrap()[0].values()[0]
-                .clone();
-            let freelist_count_before = conn.query("PRAGMA freelist_count;").await.unwrap()[0]
-                .values()[0]
-                .clone();
+            let page_count_before =
+                conn.query("PRAGMA page_count;").await.unwrap()[0].values()[0].clone();
+            let freelist_count_before =
+                conn.query("PRAGMA freelist_count;").await.unwrap()[0].values()[0].clone();
 
             let err = conn
                 .execute("CREATE UNIQUE INDEX idx_name ON t(name);")
@@ -171745,24 +173935,19 @@ mod autocommit_txn_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
                 .await
                 .unwrap();
-            let page_count_before = conn.query("PRAGMA page_count;").await.unwrap()[0].values()[0]
-                .clone();
-            let freelist_count_before = conn.query("PRAGMA freelist_count;").await.unwrap()[0]
-                .values()[0]
-                .clone();
-            let schema_version_before = conn.query("PRAGMA schema_version;").await.unwrap()[0]
-                .values()[0]
-                .clone();
+            let page_count_before =
+                conn.query("PRAGMA page_count;").await.unwrap()[0].values()[0].clone();
+            let freelist_count_before =
+                conn.query("PRAGMA freelist_count;").await.unwrap()[0].values()[0].clone();
+            let schema_version_before =
+                conn.query("PRAGMA schema_version;").await.unwrap()[0].values()[0].clone();
 
             let error = conn
                 .execute("CREATE INDEX idx_bad_collation ON t(name COLLATE no_such_collation);")
                 .await
                 .expect_err("an unregistered index collation must fail before allocation");
             assert!(
-                error
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("collation"),
+                error.to_string().to_ascii_lowercase().contains("collation"),
                 "unexpected CREATE INDEX error: {error}"
             );
 
@@ -171807,14 +173992,12 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
-            let page_count_before = conn.query("PRAGMA page_count;").await.unwrap()[0].values()[0]
-                .clone();
-            let freelist_count_before = conn.query("PRAGMA freelist_count;").await.unwrap()[0]
-                .values()[0]
-                .clone();
-            let schema_version_before = conn.query("PRAGMA schema_version;").await.unwrap()[0]
-                .values()[0]
-                .clone();
+            let page_count_before =
+                conn.query("PRAGMA page_count;").await.unwrap()[0].values()[0].clone();
+            let freelist_count_before =
+                conn.query("PRAGMA freelist_count;").await.unwrap()[0].values()[0].clone();
+            let schema_version_before =
+                conn.query("PRAGMA schema_version;").await.unwrap()[0].values()[0].clone();
 
             for (sql, expected) in [
                 (
@@ -171844,10 +174027,7 @@ mod autocommit_txn_tests {
                     .await
                     .expect_err("invalid index function must fail on an empty table");
                 assert!(
-                    error
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains(expected),
+                    error.to_string().to_ascii_lowercase().contains(expected),
                     "unexpected CREATE INDEX error for `{sql}`: {error}"
                 );
             }
@@ -181191,10 +183371,10 @@ fts5(title, body, content=docs, content_rowid=id)'
 
 #[cfg(test)]
 mod pager_routing_tests {
-    use super::*;
     use super::tests::{
         ReentrantVtabConnectionGuard, ValuesDonorProbe, ValuesRegistryChangingFactory,
     };
+    use super::*;
     use fsqlite_ast::{ColumnRef, Expr, OrderingTerm, ResultColumn, Span};
     use fsqlite_func::collation::CollationFunction;
     use tracing_subscriber::prelude::*;
@@ -188352,9 +190532,10 @@ mod pager_routing_tests {
                 .unwrap();
 
             assert_eq!(rows.len(), 2);
-            assert!(rows
-                .iter()
-                .all(|row| row.values() == [SqliteValue::Integer(1)]));
+            assert!(
+                rows.iter()
+                    .all(|row| row.values() == [SqliteValue::Integer(1)])
+            );
             assert_eq!(
                 FSQLITE_EXISTS_PROBE_MEMO_BUILDS.with(Cell::get),
                 0,
@@ -213199,11 +215380,9 @@ mod pager_routing_tests {
     fn test_pragma_integrity_check_evaluates_expression_and_mixed_index_keys() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute(
-                "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, category TEXT);",
-            )
-            .await
-            .unwrap();
+            conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, category TEXT);")
+                .await
+                .unwrap();
             conn.execute(
                 "INSERT INTO items VALUES
                  (1, 'Alpha', 'One'),
@@ -213214,11 +215393,9 @@ mod pager_routing_tests {
             conn.execute("CREATE INDEX idx_items_lower ON items(lower(label));")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE INDEX idx_items_mixed ON items(category, lower(label));",
-            )
-            .await
-            .unwrap();
+            conn.execute("CREATE INDEX idx_items_mixed ON items(category, lower(label));")
+                .await
+                .unwrap();
 
             let rows = conn.query("PRAGMA integrity_check;").await.unwrap();
             assert_eq!(rows.len(), 1);
@@ -221611,8 +223788,7 @@ mod pager_routing_tests {
             let _guard = ReentrantVtabConnectionGuard::install(&connection);
             connection.register_deterministic_scalar_function(ValuesDonorProbe);
 
-            let three_row_sql =
-                "SELECT (VALUES(1), (values_donor_probe()), \
+            let three_row_sql = "SELECT (VALUES(1), (values_donor_probe()), \
                          (CAST(1 AS NUMERIC))) = '1'";
             let direct_deterministic = connection.query(three_row_sql).await.unwrap();
             assert_eq!(
@@ -221626,10 +223802,9 @@ mod pager_routing_tests {
                 SqliteValue::Integer(0)
             );
 
-            let deferred = parse_single_statement(
-                "VALUES(1), (values_donor_probe()), (CAST(1 AS NUMERIC))",
-            )
-            .unwrap();
+            let deferred =
+                parse_single_statement("VALUES(1), (values_donor_probe()), (CAST(1 AS NUMERIC))")
+                    .unwrap();
             assert!(super::statement_contains_deferred_values(&deferred));
             let deterministic_snapshot = connection.freeze_statement_values_snapshot(&deferred);
             assert!(matches!(
@@ -221648,10 +223823,7 @@ mod pager_routing_tests {
             ));
             let already_frozen =
                 connection.freeze_statement_values_snapshot(deterministic_snapshot.as_ref());
-            assert!(matches!(
-                &already_frozen,
-                std::borrow::Cow::Borrowed(_)
-            ));
+            assert!(matches!(&already_frozen, std::borrow::Cow::Borrowed(_)));
             assert_eq!(top_level_donor(already_frozen.as_ref()), Some(0));
 
             let nondeterministic_snapshot = connection.freeze_statement_values_snapshot(&deferred);
@@ -221663,13 +223835,18 @@ mod pager_routing_tests {
                 "a volatile middle row must make the final NUMERIC row the donor"
             );
             assert_eq!(
-                connection.prepare(three_row_sql).await.unwrap().query().await.unwrap()[0]
+                connection
+                    .prepare(three_row_sql)
+                    .await
+                    .unwrap()
+                    .query()
+                    .await
+                    .unwrap()[0]
                     .values()[0],
                 SqliteValue::Integer(1)
             );
 
-            let restarted_coroutine_sql =
-                "SELECT (VALUES(1), (values_donor_probe()), (2), \
+            let restarted_coroutine_sql = "SELECT (VALUES(1), (values_donor_probe()), (2), \
                          (CAST(1 AS NUMERIC))) = '1'";
             assert_eq!(
                 connection.query(restarted_coroutine_sql).await.unwrap()[0].values()[0],
@@ -221697,8 +223874,7 @@ mod pager_routing_tests {
                     replace_on_every_call: false,
                 }),
             );
-            let direct_callback_sql =
-                "SELECT (VALUES(1), (values_donor_probe()), \
+            let direct_callback_sql = "SELECT (VALUES(1), (values_donor_probe()), \
                          (CAST(1 AS NUMERIC))) = '1' AS matched, churn.* \
                  FROM values_registry_churn_direct() AS churn";
             let direct_callback_rows = connection.query(direct_callback_sql).await.unwrap();
@@ -221721,8 +223897,7 @@ mod pager_routing_tests {
                     replace_on_every_call: false,
                 }),
             );
-            let prepare_callback_sql =
-                "SELECT (VALUES(1), (values_donor_probe()), \
+            let prepare_callback_sql = "SELECT (VALUES(1), (values_donor_probe()), \
                          (CAST(1 AS NUMERIC))) = '1' AS matched, churn.* \
                  FROM values_registry_churn_prepare() AS churn";
             let callback_prepared = connection.prepare(prepare_callback_sql).await.unwrap();
@@ -221751,8 +223926,7 @@ mod pager_routing_tests {
                     replace_on_every_call: true,
                 }),
             );
-            let perpetual_callback_sql =
-                "SELECT (VALUES(1), (values_donor_probe()), \
+            let perpetual_callback_sql = "SELECT (VALUES(1), (values_donor_probe()), \
                          (CAST(1 AS NUMERIC))) = '1' AS matched, churn.* \
                  FROM values_registry_perpetual_churn() AS churn";
             assert!(matches!(
@@ -221947,6 +224121,11 @@ mod pager_routing_tests {
                 "SELECT (VALUES(1), (random()), (2), (CAST(1 AS NUMERIC))) = '1'",
                 "SELECT (VALUES(1), (random()), (2), (3), (CAST(1 AS NUMERIC))) = '1'",
                 "SELECT (VALUES(1), (abs(1)), (2), (CAST(1 AS NUMERIC))) = '1'",
+                // Parser-time zero/empty-IN folds are query-constant even if
+                // their dead operand contains a volatile function.
+                "SELECT (VALUES(1), (random() IN ()), (CAST(1 AS NUMERIC))) = '1'",
+                "SELECT (VALUES(1), (random() AND 0), (CAST(1 AS NUMERIC))) = '1'",
+                "SELECT (VALUES(1), (0 AND random()), (CAST(1 AS NUMERIC))) = '1'",
                 // A correlated IN donor may be a derived outer column that
                 // has no global-schema binding until outer substitution.
                 "SELECT 1 IN (SELECT donor) FROM (SELECT CAST('1' AS TEXT) AS donor) AS outer_row",
@@ -221963,10 +224142,7 @@ mod pager_routing_tests {
                 for mismatch in &mismatches {
                     eprintln!("{mismatch}\n");
                 }
-                panic!(
-                    "{} scalar-subquery affinity mismatch(es)",
-                    mismatches.len()
-                );
+                panic!("{} scalar-subquery affinity mismatch(es)", mismatches.len());
             }
 
             for query in queries {
@@ -222196,8 +224372,7 @@ mod pager_routing_tests {
                 );
             }
 
-            let missing_lhs_query =
-                "SELECT (SELECT a, b FROM missing_vector_lhs) IN ((1, 2))";
+            let missing_lhs_query = "SELECT (SELECT a, b FROM missing_vector_lhs) IN ((1, 2))";
             let sqlite_missing_error = match rconn.prepare(missing_lhs_query) {
                 Ok(_) => panic!("SQLite unexpectedly prepared a missing vector-LHS relation"),
                 Err(error) => error,
@@ -222217,7 +224392,9 @@ mod pager_routing_tests {
                 FrankenError::NoSuchTable { name } if name == "missing_vector_lhs"
             ));
             let prepare_missing_error = match fconn.prepare(missing_lhs_query).await {
-                Ok(_) => panic!("FrankenSQLite unexpectedly prepared a missing vector-LHS relation"),
+                Ok(_) => {
+                    panic!("FrankenSQLite unexpectedly prepared a missing vector-LHS relation")
+                }
                 Err(error) => error,
             };
             assert!(matches!(
@@ -222240,8 +224417,41 @@ mod pager_routing_tests {
                     "no such function: nosuch_vector_function",
                 ),
                 (
+                    "SELECT (SELECT nosuch_vector_lhs_column, 2) IN (random())",
+                    "no such column: nosuch_vector_lhs_column",
+                ),
+                (
+                    "SELECT (SELECT nosuch_vector_lhs_column, 2) IN ((random(), 2))",
+                    "no such column: nosuch_vector_lhs_column",
+                ),
+                (
                     "SELECT (SELECT 1, 2) IN ((SELECT nosuch_vector_column))",
                     "no such column: nosuch_vector_column",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT 1 WHERE nosuch_vector_where)",
+                    "no such column: nosuch_vector_where",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT 1 GROUP BY nosuch_vector_group)",
+                    "no such column: nosuch_vector_group",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT 1 ORDER BY nosuch_vector_order)",
+                    "no such column: nosuch_vector_order",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT 1 LIMIT nosuch_vector_limit)",
+                    "no such column: nosuch_vector_limit",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT (SELECT nosuch_vector_nested))",
+                    "no such column: nosuch_vector_nested",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT 1 FROM (SELECT 1 AS a) AS x \
+                     JOIN (SELECT 1 AS b) AS y ON nosuch_vector_join)",
+                    "no such column: nosuch_vector_join",
                 ),
             ] {
                 let sqlite_error = match rconn.prepare(query) {
@@ -222281,6 +224491,208 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_subquery_name_resolution_preserves_source_shape_and_binding_precedence() {
+        asupersync::test_utils::run_test(|| async {
+            let fconn = Connection::open(":memory:").await.unwrap();
+            let rconn = rusqlite::Connection::open_in_memory().unwrap();
+            for statement in [
+                "CREATE VIEW resolver_broken_view AS SELECT resolver_missing_view_column",
+                "CREATE TABLE resolver_left(a INTEGER)",
+                "CREATE TABLE resolver_right(b INTEGER)",
+                "CREATE TABLE resolver_string_name(\"'ab'\" INTEGER)",
+                "CREATE VIEW resolver_broken_using_view AS SELECT 1 FROM resolver_left \
+                 JOIN resolver_right USING(resolver_view_missing_using)",
+                "ATTACH ':memory:' AS resolver_aux",
+                "CREATE TABLE resolver_aux.resolver_attached_source(a INTEGER, b INTEGER)",
+                "INSERT INTO resolver_aux.resolver_attached_source VALUES (7, 8)",
+            ] {
+                fconn.execute(statement).await.unwrap();
+                rconn.execute_batch(statement).unwrap();
+            }
+
+            // These fixtures exercise the lexical metadata boundary directly.
+            // Some of the corresponding execution paths still have unrelated
+            // result-name or attached-schema limitations, but the pre-arity
+            // resolver must neither reject valid SQLite bindings nor infer the
+            // wrong source width while those runtime gaps remain.
+            for query in [
+                "SELECT [1+1], (SELECT 1) FROM (SELECT 1+1)",
+                "SELECT [01], (SELECT 1) FROM (SELECT 01)",
+                "SELECT [1+1:1], (SELECT 1) FROM (SELECT 1+1, 1+1)",
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL \
+                 SELECT x+1 FROM c JOIN (SELECT 1 AS x) r USING(x) WHERE x<2) \
+                 SELECT x,(SELECT 1) FROM c",
+                "SELECT a, (SELECT 1) FROM resolver_attached_source",
+                "WITH c(x, y) AS (SELECT * FROM resolver_attached_source) \
+                 SELECT y, (SELECT 1) FROM c",
+                "WITH c(x, y) AS (SELECT * FROM (SELECT 1 AS a) AS l \
+                 JOIN (SELECT 1 AS a, 3 AS a) AS r USING(a)) \
+                 SELECT y, (SELECT 1) FROM c",
+                "SELECT a, (SELECT 1) FROM \
+                 (SELECT a COLLATE nocase FROM resolver_left)",
+                "WITH c(\"a:2\", \"a:2\") AS (VALUES(1, 2)) \
+                 SELECT \"a:1\", (SELECT 1) FROM c",
+            ] {
+                let Statement::Select(approximate_name_select) =
+                    parse_single_statement(query).unwrap()
+                else {
+                    panic!("approximate-name fixture parsed as a non-SELECT statement");
+                };
+                fconn
+                    .validate_select_column_references(&approximate_name_select)
+                    .unwrap_or_else(|error| {
+                        panic!("valid approximate-name fixture `{query}` failed: {error}")
+                    });
+            }
+
+            for (query, expected_detail) in [
+                (
+                    "WITH c(a) AS (SELECT 1, 2) SELECT * FROM c LIMIT resolver_bad_limit",
+                    "table c has 2 values for 1 columns",
+                ),
+                (
+                    "SELECT * FROM (VALUES(1, 2), (3)) LIMIT resolver_bad_limit",
+                    "all VALUES must have the same number of terms",
+                ),
+                (
+                    "SELECT * FROM resolver_left JOIN resolver_right \
+                     USING(resolver_missing_using) LIMIT resolver_bad_limit",
+                    "cannot join using column resolver_missing_using - column not present in both tables",
+                ),
+                (
+                    "WITH c AS (SELECT * FROM resolver_left JOIN resolver_right \
+                     USING(resolver_missing_nested_using)) \
+                     SELECT * FROM c LIMIT resolver_bad_limit",
+                    "cannot join using column resolver_missing_nested_using - column not present in both tables",
+                ),
+                (
+                    "SELECT * FROM (SELECT * FROM resolver_left JOIN resolver_right \
+                     USING(resolver_missing_nested_using)) LIMIT resolver_bad_limit",
+                    "cannot join using column resolver_missing_nested_using - column not present in both tables",
+                ),
+                (
+                    "SELECT * FROM (SELECT 1 FROM resolver_left JOIN resolver_right \
+                     USING(resolver_missing_nested_using)) LIMIT resolver_bad_limit",
+                    "cannot join using column resolver_missing_nested_using - column not present in both tables",
+                ),
+                ("SELECT * LIMIT resolver_bad_limit", "no tables specified"),
+                (
+                    "SELECT resolver_missing_qualifier.* FROM resolver_left \
+                     LIMIT resolver_bad_limit",
+                    "no such table: resolver_missing_qualifier",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT * FROM resolver_broken_view)",
+                    "no such column: resolver_missing_view_column",
+                ),
+                (
+                    "SELECT 1 FROM (SELECT 1 FROM resolver_broken_view) AS q \
+                     LIMIT resolver_bad_limit",
+                    "no such column: resolver_missing_view_column",
+                ),
+                (
+                    "SELECT (SELECT 1 FROM resolver_broken_view) \
+                     LIMIT resolver_bad_limit",
+                    "no such column: resolver_missing_view_column",
+                ),
+                (
+                    "SELECT 1 FROM resolver_broken_using_view LIMIT resolver_bad_limit",
+                    "cannot join using column resolver_view_missing_using - column not present in both tables",
+                ),
+                (
+                    "SELECT 1 FROM (SELECT 'a b') AS x JOIN resolver_string_name \
+                     USING(\"'ab'\") LIMIT resolver_bad_limit",
+                    "cannot join using column 'ab' - column not present in both tables",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT [1+1:1] FROM (SELECT 1+1))",
+                    "no such column: 1+1:1",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT [1+1:999] FROM \
+                     (SELECT 1+1, 2 AS [1+1]))",
+                    "no such column: 1+1:999",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT [1+1:0] FROM \
+                     (SELECT 1+1, 2 AS [1+1]))",
+                    "no such column: 1+1:0",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT [a:01] FROM (SELECT 1 AS a, 2 AS a))",
+                    "no such column: a:01",
+                ),
+                (
+                    "SELECT (1, 2) IN (SELECT a FROM \
+                     (SELECT 1 AS a, 1+1) AS x JOIN \
+                     (SELECT 2 AS a, 2+2) AS y)",
+                    "ambiguous column name: a",
+                ),
+                (
+                    "SELECT (SELECT (WITH c AS (SELECT a) SELECT * FROM c) \
+                     FROM (SELECT 1 AS a)), (WITH c AS (SELECT a) SELECT * FROM c)",
+                    "no such column: a",
+                ),
+            ] {
+                let sqlite_error = match rconn.prepare(query) {
+                    Ok(_) => panic!("SQLite unexpectedly prepared invalid fixture `{query}`"),
+                    Err(error) => error,
+                };
+                assert!(
+                    sqlite_error.to_string().contains(expected_detail),
+                    "unexpected SQLite oracle error for `{query}`: {sqlite_error}"
+                );
+
+                let direct_error = fconn
+                    .query(query)
+                    .await
+                    .expect_err("direct invalid metadata fixture must fail");
+                assert!(
+                    direct_error.to_string().contains(expected_detail),
+                    "unexpected direct metadata error for `{query}`: {direct_error}"
+                );
+                let prepared_error = match fconn.prepare(query).await {
+                    Ok(statement) => statement
+                        .query()
+                        .await
+                        .expect_err("prepared invalid metadata fixture must fail"),
+                    Err(error) => error,
+                };
+                assert!(
+                    prepared_error.to_string().contains(expected_detail),
+                    "unexpected prepared metadata error for `{query}`: {prepared_error}"
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_subquery_name_resolution_does_not_leak_shadowed_fts_metadata() {
+        asupersync::test_utils::run_test(|| async {
+            let fconn = Connection::open(":memory:").await.unwrap();
+            fconn
+                .execute("CREATE VIRTUAL TABLE resolver_fts USING fts5(x)")
+                .await
+                .unwrap();
+            fconn
+                .execute("CREATE TEMP TABLE resolver_fts(x TEXT)")
+                .await
+                .unwrap();
+
+            let query = "SELECT resolver_fts MATCH 'x', (SELECT 1) FROM resolver_fts";
+            let error = fconn
+                .query(query)
+                .await
+                .expect_err("TEMP shadow must not inherit MAIN FTS MATCH metadata");
+            assert!(
+                matches!(&error, FrankenError::NoSuchColumn { name } if name == "resolver_fts"),
+                "unexpected shadowed FTS error: {error}"
+            );
+        });
+    }
+
+    #[test]
     fn test_cte_materialization_shadows_and_preserves_persistent_temp_table() {
         asupersync::test_utils::run_test(|| async {
             let fconn = Connection::open(":memory:").await.unwrap();
@@ -222310,10 +224722,7 @@ mod pager_routing_tests {
                 for mismatch in &mismatches {
                     eprintln!("{mismatch}\n");
                 }
-                panic!(
-                    "{} CTE/TEMP shadow-cleanup mismatch(es)",
-                    mismatches.len()
-                );
+                panic!("{} CTE/TEMP shadow-cleanup mismatch(es)", mismatches.len());
             }
 
             let reference_main_value = rconn
@@ -222325,9 +224734,7 @@ mod pager_routing_tests {
                 .unwrap();
             assert_eq!(reference_main_value, 73);
             let qualified_error = fconn
-                .query(
-                    "WITH cte_main_shadow(v) AS (VALUES(1)) SELECT v FROM main.cte_main_shadow",
-                )
+                .query("WITH cte_main_shadow(v) AS (VALUES(1)) SELECT v FROM main.cte_main_shadow")
                 .await
                 .expect_err("qualified MAIN/CTE name collision must fail closed");
             assert!(
@@ -222377,15 +224784,38 @@ mod pager_routing_tests {
             }
         }
 
+        struct RecordValue(Arc<std::sync::Mutex<Vec<i64>>>);
+
+        impl ScalarFunction for RecordValue {
+            fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+                let value = args.first().map(SqliteValue::to_integer).ok_or_else(|| {
+                    FrankenError::internal("record_vector_value lost its argument")
+                })?;
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(value);
+                Ok(SqliteValue::Integer(value))
+            }
+
+            fn num_args(&self) -> i32 {
+                1
+            }
+
+            fn name(&self) -> &str {
+                "record_vector_value"
+            }
+        }
+
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
             conn.register_nondeterministic_scalar_function(NextValue(Arc::clone(&calls)));
+            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+            conn.register_nondeterministic_scalar_function(RecordValue(Arc::clone(&order)));
 
             let rows = conn
-                .query(
-                    "SELECT (next_vector_value(), next_vector_value()) IN ((9, 9), (1, 2))",
-                )
+                .query("SELECT (next_vector_value(), next_vector_value()) IN ((9, 9), (1, 2))")
                 .await
                 .unwrap();
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
@@ -222397,9 +224827,7 @@ mod pager_routing_tests {
 
             calls.store(0, AtomicOrdering::Relaxed);
             let prepared = conn
-                .prepare(
-                    "SELECT (next_vector_value(), next_vector_value()) IN ((9, 9), (1, 2))",
-                )
+                .prepare("SELECT (next_vector_value(), next_vector_value()) IN ((9, 9), (1, 2))")
                 .await
                 .unwrap();
             let prepared_rows = prepared.query().await.unwrap();
@@ -222432,14 +224860,96 @@ mod pager_routing_tests {
             calls.store(0, AtomicOrdering::Relaxed);
             let prepared_having = conn.prepare(having_sql).await.unwrap();
             let prepared_having_rows = prepared_having.query().await.unwrap();
-            assert_eq!(
-                prepared_having_rows[0].values()[0],
-                SqliteValue::Integer(1)
-            );
+            assert_eq!(prepared_having_rows[0].values()[0], SqliteValue::Integer(1));
             assert_eq!(
                 calls.load(AtomicOrdering::Relaxed),
                 2,
                 "prepared HAVING must evaluate each volatile vector LHS field once per group"
+            );
+
+            let ordered_sql = "SELECT \
+                (record_vector_value(11), record_vector_value(12)) IN \
+                ((record_vector_value(1), record_vector_value(2)), \
+                 (record_vector_value(11), record_vector_value(12)))";
+            let expected_order = vec![1, 2, 11, 12, 11, 12];
+
+            order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let ordered_rows = conn.query(ordered_sql).await.unwrap();
+            assert_eq!(ordered_rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(
+                *order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                expected_order,
+                "vector IN must materialize every RHS field before evaluating the LHS"
+            );
+
+            order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let ordered_prepared = conn.prepare(ordered_sql).await.unwrap();
+            assert!(
+                order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "preparation must not invoke a nondeterministic vector operand"
+            );
+            let ordered_prepared_rows = ordered_prepared.query().await.unwrap();
+            assert_eq!(
+                ordered_prepared_rows[0].values()[0],
+                SqliteValue::Integer(1)
+            );
+            assert_eq!(
+                *order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                expected_order,
+                "prepared vector IN must retain RHS-first exhaustive evaluation"
+            );
+
+            order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let empty_scalar_rows = conn
+                .query(
+                    "SELECT record_vector_value(9) IN \
+                     (SELECT 1 WHERE record_vector_value(0) = 1)",
+                )
+                .await
+                .unwrap();
+            assert_eq!(empty_scalar_rows[0].values()[0], SqliteValue::Integer(0));
+            assert_eq!(
+                *order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![0, 9],
+                "a runtime-empty scalar RHS must execute once before its LHS"
+            );
+
+            order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let empty_vector_rows = conn
+                .query(
+                    "SELECT (record_vector_value(7), record_vector_value(8)) IN \
+                     (SELECT 1, 2 WHERE record_vector_value(0) = 1)",
+                )
+                .await
+                .unwrap();
+            assert_eq!(empty_vector_rows[0].values()[0], SqliteValue::Integer(0));
+            assert_eq!(
+                *order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![0, 7, 8],
+                "a runtime-empty vector RHS must execute once before every LHS field"
             );
         });
     }
@@ -222656,9 +225166,7 @@ mod pager_routing_tests {
 
             FSQLITE_JOIN_HASH_FAST_PATH_HITS.with(|counter| counter.set(0));
             let joined = conn
-                .query(
-                    "SELECT l.v, r.v FROM left_words AS l JOIN right_words AS r ON l.v = r.v",
-                )
+                .query("SELECT l.v, r.v FROM left_words AS l JOIN right_words AS r ON l.v = r.v")
                 .await
                 .unwrap();
             assert_eq!(joined.len(), 2, "custom BINARY comparator must govern JOIN");
@@ -222680,10 +225188,11 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             assert_eq!(exists.len(), 2);
-            assert!(exists.iter().all(|row| matches!(
-                row.values()[0],
-                SqliteValue::Text(_)
-            )));
+            assert!(
+                exists
+                    .iter()
+                    .all(|row| matches!(row.values()[0], SqliteValue::Text(_)))
+            );
             assert_eq!(FSQLITE_EXISTS_PROBE_MEMO_BUILDS.with(Cell::get), 0);
             assert_eq!(FSQLITE_EXISTS_PROBE_MEMO_ROWS_INDEXED.with(Cell::get), 0);
             assert_eq!(FSQLITE_EXISTS_PROBE_MEMO_HITS.with(Cell::get), 0);
