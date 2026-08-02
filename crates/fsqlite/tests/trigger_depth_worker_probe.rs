@@ -105,9 +105,10 @@ fn run_stack_gate_child(scenario: &str, deadline: Duration) {
                 .unwrap_or_else(|error| panic!("terminate timed-out scenario {scenario}: {error}"));
             let reap_started = Instant::now();
             loop {
-                if let Some(status) = child.try_wait().unwrap_or_else(|error| {
-                    panic!("reap timed-out scenario {scenario}: {error}")
-                }) {
+                if let Some(status) = child
+                    .try_wait()
+                    .unwrap_or_else(|error| panic!("reap timed-out scenario {scenario}: {error}"))
+                {
                     break (status, true);
                 }
                 assert!(
@@ -481,6 +482,131 @@ async fn run_raw_fk() {
     conn.execute("COMMIT;").await.expect("commit raw FK gate");
     assert!(!conn.in_transaction(), "raw FK COMMIT state stayed active");
     conn.close().await.expect("close raw FK connection");
+}
+
+fn pure_trigger_schema_sql(depth: usize) -> String {
+    let rejected_depth = depth
+        .checked_add(1)
+        .expect("trigger depth fixture must fit usize");
+    format!(
+        "PRAGMA recursive_triggers = ON;
+         CREATE TABLE pure_ok (n INTEGER NOT NULL);
+         CREATE TABLE pure_bad (n INTEGER NOT NULL);
+         CREATE TABLE pure_audit (lane TEXT NOT NULL, n INTEGER NOT NULL);
+         CREATE TABLE gate_marker (marker TEXT NOT NULL);
+         INSERT INTO pure_ok VALUES (0);
+         INSERT INTO pure_bad VALUES (0);
+         CREATE TRIGGER pure_ok_au AFTER UPDATE ON pure_ok
+         WHEN NEW.n < {depth}
+         BEGIN
+             INSERT INTO pure_audit VALUES ('ok', NEW.n);
+             UPDATE pure_ok SET n = NEW.n + 1;
+         END;
+         CREATE TRIGGER pure_bad_au AFTER UPDATE ON pure_bad
+         WHEN NEW.n < {rejected_depth}
+         BEGIN
+             INSERT INTO pure_audit VALUES ('bad', NEW.n);
+             UPDATE pure_bad SET n = NEW.n + 1;
+         END;"
+    )
+}
+
+async fn run_raw_trigger() {
+    let depth = trigger_depth_limit();
+    let conn = Connection::open(":memory:")
+        .await
+        .expect("raw pure-trigger connection should open");
+    conn.execute_batch(&pure_trigger_schema_sql(depth))
+        .await
+        .expect("create raw pure-trigger fixture");
+
+    conn.execute("BEGIN;")
+        .await
+        .expect("begin raw pure-trigger gate");
+    let before_success = raw_change_state(&conn, "raw pure trigger before success").await;
+    assert_eq!(
+        conn.execute("UPDATE pure_ok SET n = 1;")
+            .await
+            .expect("D nested trigger programs must succeed"),
+        1
+    );
+    let after_success = raw_change_state(&conn, "raw pure trigger exact success").await;
+    assert_eq!(
+        after_success.1 - before_success.1,
+        i64::try_from(depth.saturating_mul(2).saturating_sub(1))
+            .expect("pure-trigger success delta fits i64"),
+        "raw pure-trigger total_changes() must include nested updates and audit rows"
+    );
+    let rows = conn
+        .query("SELECT n FROM pure_ok;")
+        .await
+        .expect("query pure-trigger final value");
+    assert_eq!(
+        only_integer(&rows, 0, "raw pure-trigger final value"),
+        i64::try_from(depth).expect("trigger depth fits i64")
+    );
+    let rows = conn
+        .query("SELECT COUNT(*) FROM pure_audit WHERE lane = 'ok';")
+        .await
+        .expect("query exact pure-trigger audit count");
+    assert_eq!(
+        only_integer(&rows, 0, "raw pure-trigger audit count"),
+        i64::try_from(depth.saturating_sub(1)).expect("trigger audit count fits i64")
+    );
+
+    conn.execute("SAVEPOINT caller;")
+        .await
+        .expect("create raw pure-trigger caller savepoint");
+    conn.execute("INSERT INTO gate_marker VALUES ('before-failure');")
+        .await
+        .expect("seed raw pure-trigger reuse marker");
+    let before_failure = raw_change_state(&conn, "raw pure trigger before failure").await;
+    let before_rollbacks = raw_txn_rollback_stats(&conn, "raw pure trigger before failure").await;
+    let error = conn
+        .execute("UPDATE pure_bad SET n = 1;")
+        .await
+        .expect_err("D+1 nested trigger programs must be rejected");
+    assert!(
+        matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+        "raw pure trigger returned wrong over-depth error: {error:?}"
+    );
+    assert_raw_failure_envelope(
+        &conn,
+        before_failure,
+        before_rollbacks,
+        "raw pure trigger over-depth",
+    )
+    .await;
+    let rows = conn
+        .query("SELECT n FROM pure_bad;")
+        .await
+        .expect("query rolled-back pure-trigger row");
+    assert_eq!(only_integer(&rows, 0, "raw pure-trigger rejected row"), 0);
+    let rows = conn
+        .query("SELECT COUNT(*) FROM pure_audit WHERE lane = 'bad';")
+        .await
+        .expect("query rolled-back pure-trigger audit count");
+    assert_eq!(
+        only_integer(&rows, 0, "raw pure-trigger rejected audit count"),
+        0
+    );
+    conn.execute("RELEASE SAVEPOINT caller;")
+        .await
+        .expect("failed pure-trigger statement must preserve caller savepoint");
+    conn.execute("INSERT INTO gate_marker VALUES ('after-failure');")
+        .await
+        .expect("raw pure-trigger connection must be reusable after rejection");
+    assert_raw_markers(&conn, "raw pure-trigger markers").await;
+    conn.execute("COMMIT;")
+        .await
+        .expect("commit raw pure-trigger gate");
+    assert!(
+        !conn.in_transaction(),
+        "raw pure-trigger COMMIT state stayed active"
+    );
+    conn.close()
+        .await
+        .expect("close raw pure-trigger connection");
 }
 
 async fn run_raw_trigger_fk() {

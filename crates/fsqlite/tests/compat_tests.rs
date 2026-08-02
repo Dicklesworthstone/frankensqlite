@@ -952,6 +952,138 @@ fn open_with_flags_read_only_opens_stock_database_without_touching_it() {
     });
 }
 
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn open_with_flags_rebinds_copied_or_corrupt_namespace_sidecars() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("readonly_namespace_source.db");
+        let source_str = source.to_str().unwrap();
+        let external = RusqliteConnection::open(source_str).expect("create source SQLite database");
+        external
+            .execute_batch(
+                "CREATE TABLE copied_probe(value INTEGER NOT NULL);
+                 INSERT INTO copied_probe VALUES (17);",
+            )
+            .expect("seed source SQLite database");
+        drop(external);
+
+        let source_connection = open_with_flags(source_str, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .await
+            .expect("publish source namespace identity");
+        let source_row = source_connection
+            .query_row("SELECT value FROM copied_probe")
+            .await
+            .expect("read source row through FrankenSQLite");
+        assert_eq!(source_row.get(0), Some(&SqliteValue::Integer(17)));
+        source_connection
+            .close()
+            .await
+            .expect("close source connection before copying its namespace state");
+
+        let target = dir.path().join("readonly_namespace_copy.db");
+        std::fs::copy(&source, &target).expect("copy database to a distinct file identity");
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            std::fs::copy(
+                suffixed_path(&source, suffix),
+                suffixed_path(&target, suffix),
+            )
+            .expect("copy namespace sidecar");
+        }
+        let target_bytes_before = std::fs::read(&target).expect("snapshot copied database bytes");
+
+        let target_str = target.to_str().unwrap();
+        let readonly = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .expect("copied namespace state must not block read-only open");
+        let row = readonly
+            .query_row("SELECT value FROM copied_probe")
+            .await
+            .expect("query copied database");
+        assert_eq!(row.get(0), Some(&SqliteValue::Integer(17)));
+        readonly
+            .close_without_checkpoint()
+            .await
+            .expect("close read-only copied-database connection");
+
+        let target_use_path = suffixed_path(&target, "-fsqlite-ns-use");
+        std::fs::write(&target_use_path, b"corrupt copied namespace state")
+            .expect("corrupt the quiescent machine-local namespace record");
+        let repaired = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .expect("corrupt quiescent namespace state must be repairable");
+        let repaired_row = repaired
+            .query_row("SELECT value FROM copied_probe")
+            .await
+            .expect("query database after corrupt namespace repair");
+        assert_eq!(repaired_row.get(0), Some(&SqliteValue::Integer(17)));
+        repaired
+            .close_without_checkpoint()
+            .await
+            .expect("close repaired read-only connection");
+
+        assert_eq!(
+            std::fs::read(&target).expect("re-read copied database bytes"),
+            target_bytes_before,
+            "namespace re-admission must not modify the read-only main database"
+        );
+        for suffix in ["-wal", "-shm", "-journal", "-wal-fec"] {
+            assert!(
+                !suffixed_path(&target, suffix).exists(),
+                "read-only re-admission must not create a {suffix} companion"
+            );
+        }
+        assert!(
+            !suffixed_path(&target, "-wal-fec")
+                .with_extension("wal-fec.tmp")
+                .exists(),
+            "read-only re-admission must not create a WAL-FEC rewrite temporary"
+        );
+
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            std::fs::copy(
+                suffixed_path(&source, suffix),
+                suffixed_path(&target, suffix),
+            )
+            .expect("restore copied namespace sidecar");
+        }
+        let writable = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .await
+            .expect("copied namespace state must not block read-write open");
+        let writable_row = writable
+            .query_row("SELECT value FROM copied_probe")
+            .await
+            .expect("query copied database read-write");
+        assert_eq!(writable_row.get(0), Some(&SqliteValue::Integer(17)));
+        writable
+            .close()
+            .await
+            .expect("close copied-database read-write connection");
+
+        let missing = dir.path().join("readonly_namespace_missing_main.db");
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            std::fs::copy(
+                suffixed_path(&source, suffix),
+                suffixed_path(&missing, suffix),
+            )
+            .expect("copy orphan namespace sidecar");
+        }
+        let missing_result = open_with_flags(
+            missing.to_str().unwrap(),
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .await;
+        assert!(matches!(
+            missing_result,
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(
+            !missing.exists(),
+            "stale namespace state must not create a replacement for a missing main database"
+        );
+    });
+}
+
 #[test]
 fn open_with_flags_accepts_common_sqlite_ancillary_flags_like_rusqlite() {
     asupersync::test_utils::run_test(|| async {

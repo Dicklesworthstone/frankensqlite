@@ -199,13 +199,19 @@ or caller-reserved empty database retains exclusive admission through pager,
 schema, rollback-journal, and WAL initialization. Only the successfully
 initialized `Connection` boundary publishes that generation for shared use.
 
-Connections joining an existing generation omit `CREATE` and must open the
-recorded file identity before inspecting recovery companions. Path replacement,
-identity drift, and unexpected reserved-bootstrap companions therefore fail
-before recovery or mutation. This is a cooperative trusted-parent protocol:
-native processes that bypass FrankenSQLite can ignore advisory locks, Unix can
-unlink or rename an open file, and the same database must not be opened through
-multiple hard-link aliases.
+Connections joining a live generation omit `CREATE` and must open the recorded
+file identity before inspecting recovery companions. Path replacement, identity
+drift while a generation is live, incomplete namespace transitions, and
+unexpected reserved-bootstrap companions therefore fail before recovery or
+mutation. The sidecar records are machine-local runtime state: when no live
+generation owns them and their transition ledger is terminal, an open may
+rebind a copied or corrupt record to the identity of the validated current main
+file. This recovery never creates a missing main file from a nonempty stale
+record, and a read-only database open does not modify the main file. This is a
+cooperative trusted-parent protocol: native processes that bypass
+FrankenSQLite can ignore advisory locks, Unix can unlink or rename an open
+file, and the same database must not be opened through multiple hard-link
+aliases.
 
 ---
 

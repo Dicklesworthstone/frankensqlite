@@ -719,10 +719,7 @@ impl WindowFunction for EventLogWindow {
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> fsqlite_error::Result<()> {
         let value = args.first().map_or(0, SqliteValue::to_integer);
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("step({value})"));
+        self.events.lock().unwrap().push(format!("step({value})"));
         *state += value;
         Ok(())
     }
@@ -738,10 +735,7 @@ impl WindowFunction for EventLogWindow {
     }
 
     fn value(&self, state: &Self::State) -> fsqlite_error::Result<SqliteValue> {
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("value({state})"));
+        self.events.lock().unwrap().push(format!("value({state})"));
         Ok(SqliteValue::Integer(*state))
     }
 
@@ -762,9 +756,7 @@ impl WindowFunction for EventLogWindow {
     }
 }
 
-fn snapshot_lifecycle_counts(
-    counts: &Arc<Mutex<WindowLifecycleCounts>>,
-) -> WindowLifecycleCounts {
+fn snapshot_lifecycle_counts(counts: &Arc<Mutex<WindowLifecycleCounts>>) -> WindowLifecycleCounts {
     counts.lock().unwrap().clone()
 }
 
@@ -1581,11 +1573,9 @@ fn test_table_backed_builtin_named_windows_use_custom_lifecycle() {
 fn test_application_window_sliding_lifecycle_is_one_state_per_partition() {
     asupersync::test_utils::run_test(|| async {
         let conn = open_mem().await;
-        conn.execute(
-            "CREATE TABLE udf_window_lifecycle (g INTEGER NOT NULL, v INTEGER NOT NULL)",
-        )
-        .await
-        .expect("create lifecycle table");
+        conn.execute("CREATE TABLE udf_window_lifecycle (g INTEGER NOT NULL, v INTEGER NOT NULL)")
+            .await
+            .expect("create lifecycle table");
         conn.execute(
             "INSERT INTO udf_window_lifecycle VALUES \
              (1, 1), (1, 2), (1, 3), (2, 10), (2, 20), (2, 30)",
@@ -2017,11 +2007,7 @@ fn test_application_window_range_preserves_sqlite_numeric_and_storage_order() {
             .await
             .expect("seed precise RANGE table");
         assert_eq!(
-            query_integer_column(
-                &precise,
-                "SELECT v FROM udf_precise_range ORDER BY v",
-            )
-            .await,
+            query_integer_column(&precise, "SELECT v FROM udf_precise_range ORDER BY v",).await,
             vec![
                 9_007_199_254_740_992,
                 9_007_199_254_740_993,
@@ -2598,9 +2584,11 @@ fn test_application_window_exclusion_preserves_argument_order() {
             )
             .await
             .expect("query empty excluded frames");
-        assert!(empty_frame_rows
-            .iter()
-            .all(|row| row.values()[0] == SqliteValue::Integer(0)));
+        assert!(
+            empty_frame_rows
+                .iter()
+                .all(|row| row.values()[0] == SqliteValue::Integer(0))
+        );
         assert_eq!(
             snapshot_lifecycle_counts(&counts),
             WindowLifecycleCounts {
@@ -2659,11 +2647,7 @@ fn test_application_window_finalize_errors_and_callback_failures_are_observable(
             fail_step: false,
             fail_finalize: true,
         });
-        assert_finalize_error(
-            &fromless,
-            "SELECT fromless_finalize_failure(1) OVER ()",
-        )
-        .await;
+        assert_finalize_error(&fromless, "SELECT fromless_finalize_failure(1) OVER ()").await;
         assert_eq!(
             snapshot_lifecycle_counts(&fromless_counts),
             WindowLifecycleCounts {
@@ -2989,11 +2973,7 @@ fn test_json_operators_resolve_their_sql_visible_application_names() {
     asupersync::test_utils::run_test(|| async {
         let builtin = open_mem().await;
         assert_eq!(
-            query_first_text(
-                &builtin,
-                r#"SELECT json_array('{"a":1}' -> '$')"#,
-            )
-            .await,
+            query_first_text(&builtin, r#"SELECT json_array('{"a":1}' -> '$')"#,).await,
             r#"[{"a":1}]"#,
             "the built-in -> result must retain the JSON subtype when nested",
         );
@@ -3002,9 +2982,7 @@ fn test_json_operators_resolve_their_sql_visible_application_names() {
             .await
             .expect("create JSON scan-dependency table");
         builtin
-            .execute(
-                r#"INSERT INTO udf_json_scan VALUES ('{"a":7}', 1), ('{"a":7}', 2)"#,
-            )
+            .execute(r#"INSERT INTO udf_json_scan VALUES ('{"a":7}', 1), ('{"a":7}', 2)"#)
             .await
             .expect("seed JSON scan-dependency table");
         let aggregate_json = builtin
@@ -3095,18 +3073,9 @@ fn test_json_operators_resolve_their_sql_visible_application_names() {
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
             vec![
-                vec![
-                    SqliteValue::Integer(181_110),
-                    SqliteValue::Integer(182_001),
-                ],
-                vec![
-                    SqliteValue::Integer(181_210),
-                    SqliteValue::Integer(182_002),
-                ],
-                vec![
-                    SqliteValue::Integer(181_310),
-                    SqliteValue::Integer(182_003),
-                ],
+                vec![SqliteValue::Integer(181_110), SqliteValue::Integer(182_001),],
+                vec![SqliteValue::Integer(181_210), SqliteValue::Integer(182_002),],
+                vec![SqliteValue::Integer(181_310), SqliteValue::Integer(182_003),],
             ],
             "prepared correlated evaluation must preserve outer references in both JSON operands",
         );
@@ -3257,11 +3226,7 @@ fn test_application_scalars_disable_only_their_matching_record_shortcuts() {
             "ColumnSubstrPrefix must not bypass an application substr/3",
         );
         assert_eq!(
-            query_first_int(
-                &conn,
-                "SELECT substring(v, 1, 2) FROM udf_record_shortcuts",
-            )
-            .await,
+            query_first_int(&conn, "SELECT substring(v, 1, 2) FROM udf_record_shortcuts",).await,
             196_348,
             "ColumnSubstrPrefix must not bypass an application substring/3",
         );
@@ -3338,7 +3303,11 @@ fn test_fromless_count_zero_uses_application_scalar_in_direct_and_prepared_execu
             .await
             .expect("prepare application count/0");
         assert_eq!(
-            prepared.query_row().await.expect("execute prepared count/0").get(0),
+            prepared
+                .query_row()
+                .await
+                .expect("execute prepared count/0")
+                .get(0),
             Some(&SqliteValue::Integer(191_000)),
             "prepared execution must resolve the application count/0 scalar",
         );
@@ -3552,11 +3521,7 @@ fn test_pattern_operator_scalar_honors_collation_and_schema_metadata() {
         });
 
         assert_eq!(
-            query_first_int(
-                &conn,
-                "SELECT v LIKE 'pattern' FROM udf_pattern_collation",
-            )
-            .await,
+            query_first_int(&conn, "SELECT v LIKE 'pattern' FROM udf_pattern_collation",).await,
             1,
             "ordinary VDBE codegen must attach the source column's collation",
         );
@@ -3632,18 +3597,13 @@ fn test_pattern_operator_scalar_honors_collation_and_schema_metadata() {
         .await
         .expect("execute collation-consuming application LIKE in UPSERT");
         assert_eq!(
-            query_first_int(
-                &conn,
-                "SELECT matched FROM udf_pattern_upsert WHERE id = 1",
-            )
-            .await,
+            query_first_int(&conn, "SELECT matched FROM udf_pattern_upsert WHERE id = 1",).await,
             1,
             "UPSERT codegen must attach an explicit application-function collation",
         );
         let observations = observed.lock().unwrap();
         assert!(
-            observations.len() >= 6
-                && observations.iter().all(|name| name == "UDF_PATTERN"),
+            observations.len() >= 6 && observations.iter().all(|name| name == "UDF_PATTERN"),
             "every application LIKE dispatch must receive UDF_PATTERN, got {observations:?}",
         );
         drop(observations);
@@ -3690,11 +3650,9 @@ fn test_correlated_outer_values_preserve_declared_collation_and_affinity() {
         )
         .await
         .expect("create bound-outer metadata table");
-        conn.execute(
-            "INSERT INTO udf_bound_outer_metadata VALUES ('A', '01', '01', 'A', 'a')",
-        )
-        .await
-        .expect("seed bound-outer metadata table");
+        conn.execute("INSERT INTO udf_bound_outer_metadata VALUES ('A', '01', '01', 'A', 'a')")
+            .await
+            .expect("seed bound-outer metadata table");
 
         const METADATA_SQL: &str = "SELECT \
              (SELECT nocase_v = ('a' COLLATE RTRIM)), \
