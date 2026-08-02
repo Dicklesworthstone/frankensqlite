@@ -9135,6 +9135,13 @@ pub struct Connection {
     /// whose mutation and auxiliary-command semantics are broader than the
     /// repair-oriented lazy contract.
     allow_lazy_contentless_fts5: bool,
+    /// #368 defect 3: when set, the schema reload keeps the bare (empty) FTS5
+    /// vtab instance and does NOT read/validate its `%_data` shadow structure,
+    /// so a database whose FTS5 shadow is corrupt (e.g. "structure segment
+    /// count exceeds FTS5 maximum") can still be OPENED for a drop+recreate
+    /// repair instead of failing during the schema reload. Enabled only by the
+    /// dedicated `open_existing_schema_only_deferred_fts5` family.
+    defer_fts5_hydration: bool,
     /// Internal execution guard for statements that temporarily install
     /// mirrored temp tables into the MemDatabase. The ordinary read-path
     /// refresh would rebuild MemDB from pager state and discard those tables
@@ -9488,6 +9495,26 @@ impl Connection {
         Self::open_existing_schema_only_with_env(path, ConnectionEnv::default())
     }
 
+    /// #368 defect 3: like [`open_existing_schema_only`](Self::open_existing_schema_only)
+    /// but DEFERS FTS5 shadow validation/hydration at open. The schema reload
+    /// keeps bare, empty FTS5 vtab instances and never reads/validates `%_data`,
+    /// so a database whose FTS5 shadow structure is corrupt (which otherwise
+    /// fails every open) can still be opened to drop+recreate the corrupt
+    /// shadow. Use ONLY for FTS repair: FTS5 queries against such a connection
+    /// see an empty index until the shadow is rebuilt.
+    pub fn open_existing_schema_only_deferred_fts5(path: impl Into<String>) -> Result<Self> {
+        Self::open_existing_schema_only_deferred_fts5_with_env(path, ConnectionEnv::default())
+    }
+
+    /// [`open_existing_schema_only_deferred_fts5`](Self::open_existing_schema_only_deferred_fts5)
+    /// with an explicit runtime environment.
+    pub fn open_existing_schema_only_deferred_fts5_with_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, true, true)
+    }
+
     /// Open a schema-only connection only if the read-only VFS handle has
     /// `expected_identity`.
     ///
@@ -9531,7 +9558,7 @@ impl Connection {
     /// Behaves like [`open_schema_only`](Self::open_schema_only) but allows
     /// specifying a custom [`ConnectionEnv`].
     pub fn open_schema_only_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, false)
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, false, false)
     }
 
     /// Open a writable, existing-only schema connection with an explicit
@@ -9540,7 +9567,7 @@ impl Connection {
         path: impl Into<String>,
         env: ConnectionEnv,
     ) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, true)
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, true, false)
     }
 
     /// Open an identity-bound schema-only connection with an explicit runtime
@@ -9558,6 +9585,7 @@ impl Connection {
             Some(expected_identity),
             env,
             false,
+            false,
         )
     }
 
@@ -9573,6 +9601,7 @@ impl Connection {
             Some(expected_identity),
             env,
             true,
+            false,
         )
     }
 
@@ -9581,6 +9610,7 @@ impl Connection {
         expected_identity: Option<FileIdentity>,
         env: ConnectionEnv,
         writable: bool,
+        defer_fts5_hydration: bool,
     ) -> Result<Self> {
         let path = path.into();
         if path.is_empty()
@@ -9766,6 +9796,7 @@ impl Connection {
             // cursors); the MemDatabase is deliberately left empty.
             reject_mem_fallback: RefCell::new(true),
             allow_lazy_contentless_fts5: true,
+            defer_fts5_hydration,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
             vtab_modules: RefCell::new(default_vtab_module_registry()),
@@ -10185,6 +10216,7 @@ impl Connection {
             // `PRAGMA fsqlite.parity_cert = OFF`.
             reject_mem_fallback: RefCell::new(true),
             allow_lazy_contentless_fts5: false,
+            defer_fts5_hydration: false,
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
@@ -62595,6 +62627,20 @@ impl Connection {
                 let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
                 factory.connect(cx, &full_arg_refs)?
             };
+
+            // #368 defect 3: a deferred-hydration (repair) open keeps the bare,
+            // empty FTS5 instance from `connect()` above and skips ALL `%_data`
+            // reads/validation, so a corrupt FTS5 shadow can be opened for
+            // drop+recreate instead of failing the reload. The mutable borrow
+            // from `downcast_mut` ends at `.is_some()`, so `instance` is free to
+            // move into `reloaded`.
+            #[cfg(feature = "ext-fts5")]
+            if self.defer_fts5_hydration
+                && instance.as_any_mut().downcast_mut::<Fts5Table>().is_some()
+            {
+                reloaded.insert(table_key, instance);
+                continue;
+            }
 
             #[cfg(feature = "ext-fts5")]
             if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
