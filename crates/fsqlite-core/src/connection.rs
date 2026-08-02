@@ -37442,9 +37442,10 @@ impl Connection {
 
         // Append the new segment leaf and replace the structure + averages rows
         // (point upserts — O(new), never touching the existing leaves).
-        let mut data_rows: Vec<(i64, Vec<SqliteValue>)> = Vec::with_capacity(3);
+        let mut data_rows: Vec<(i64, Vec<SqliteValue>)> =
+            Vec::with_capacity(flush.leaf_data_rows.len() + 2);
         for row in flush
-            .leaf_data_row
+            .leaf_data_rows
             .into_iter()
             .chain([flush.structure_data_row, flush.averages_data_row])
         {
