@@ -12,6 +12,8 @@ pub mod rebase;
 use std::fmt;
 use std::sync::Arc;
 
+use fsqlite_types::{SqliteValue, TypeAffinity};
+
 // ---------------------------------------------------------------------------
 // Span — source location tracking
 // ---------------------------------------------------------------------------
@@ -349,9 +351,83 @@ pub enum JsonArrow {
     DoubleArrow,
 }
 
+impl JsonArrow {
+    /// Return the SQL function name that implements this JSON operator.
+    #[must_use]
+    pub const fn sql_function_name(self) -> &'static str {
+        match self {
+            Self::Arrow => "->",
+            Self::DoubleArrow => "->>",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Expressions (§10.3 Expr enum)
 // ---------------------------------------------------------------------------
+
+/// Collation metadata retained by a value bound from an outer query.
+///
+/// This is deliberately tri-state. A physical column with no named collation
+/// still has the known [`Self::Binary`] collation and therefore wins SQLite's
+/// left-to-right declared-collation precedence. [`Self::Unspecified`] is
+/// metadata-neutral and is reserved for synthesized values, such as a `FULL
+/// JOIN ... USING` coalesced output, that must not donate a collation.
+#[derive(Debug, Clone)]
+pub enum BoundCollation {
+    /// The synthesized value does not define a comparison collation.
+    Unspecified,
+    /// The source is known to use SQLite's default `BINARY` collation.
+    Binary,
+    /// The source uses the named collation.
+    Named(String),
+}
+
+impl BoundCollation {
+    /// Convert schema-level declared metadata into a bound-value collation.
+    ///
+    /// A missing schema declaration means the physical column is known to use
+    /// `BINARY`; it does not mean that the bound expression is metadata-neutral.
+    #[must_use]
+    pub fn from_declared_name(name: Option<String>) -> Self {
+        match name {
+            Some(name) if name.eq_ignore_ascii_case("BINARY") => Self::Binary,
+            Some(name) => Self::Named(name),
+            None => Self::Binary,
+        }
+    }
+
+    /// Return the collation name donated to comparison resolution.
+    ///
+    /// [`Self::Unspecified`] returns `None`; both other states return a known
+    /// collation, including `BINARY`.
+    #[must_use]
+    pub fn as_name(&self) -> Option<&str> {
+        match self {
+            Self::Unspecified => None,
+            Self::Binary => Some("BINARY"),
+            Self::Named(name) => Some(name),
+        }
+    }
+}
+
+impl From<Option<String>> for BoundCollation {
+    fn from(name: Option<String>) -> Self {
+        Self::from_declared_name(name)
+    }
+}
+
+impl PartialEq for BoundCollation {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.as_name(), other.as_name()) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+}
+
+impl Eq for BoundCollation {}
 
 /// An expression node in the AST.
 ///
@@ -361,6 +437,23 @@ pub enum JsonArrow {
 pub enum Expr {
     /// A literal constant.
     Literal(Literal, Span),
+
+    /// An outer-query value bound into a correlated expression.
+    ///
+    /// This is an internal execution node rather than parser output. It keeps
+    /// the source expression's comparison metadata after the runtime value has
+    /// been substituted. `affinity: None` denotes no declared affinity.
+    #[doc(hidden)]
+    BoundOuterValue {
+        /// Runtime value copied from the outer row.
+        value: SqliteValue,
+        /// Collation metadata inherited from the source expression.
+        collation: BoundCollation,
+        /// Declared source affinity, when one exists.
+        affinity: Option<TypeAffinity>,
+        /// Source span of the outer-column reference being replaced.
+        span: Span,
+    },
 
     /// A column reference (possibly table-qualified).
     Column(ColumnRef, Span),
@@ -490,7 +583,8 @@ impl Expr {
             | Self::Subquery(_, s)
             | Self::RowValue(_, s)
             | Self::Placeholder(_, s) => *s,
-            Self::BinaryOp { span, .. }
+            Self::BoundOuterValue { span, .. }
+            | Self::BinaryOp { span, .. }
             | Self::UnaryOp { span, .. }
             | Self::Between { span, .. }
             | Self::In { span, .. }
@@ -527,6 +621,25 @@ impl PartialEq for Expr {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Literal(a, _), Self::Literal(b, _)) => a == b,
+            (
+                Self::BoundOuterValue {
+                    value: v1,
+                    collation: c1,
+                    affinity: a1,
+                    ..
+                },
+                Self::BoundOuterValue {
+                    value: v2,
+                    collation: c2,
+                    affinity: a2,
+                    ..
+                },
+            ) => {
+                v1.storage_class() == v2.storage_class()
+                    && v1 == v2
+                    && c1 == c2
+                    && a1 == a2
+            }
             (Self::Column(a, _), Self::Column(b, _)) => a == b,
             (
                 Self::BinaryOp {
@@ -737,6 +850,197 @@ pub enum FunctionArgs {
     List(Vec<Expr>),
 }
 
+/// A borrowed view of SQL function arguments.
+///
+/// [`Self::Pair`] exposes the operands of [`Expr::JsonAccess`] as function
+/// arguments without allocating or changing the parser's owned AST shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SqlFunctionArgsRef<'a> {
+    /// `func(*)` — distinct from an empty argument list even though its arity is zero.
+    Star,
+    /// A contiguous argument list borrowed from [`FunctionArgs::List`].
+    List(&'a [Expr]),
+    /// Two non-contiguous arguments, used by the JSON access operators.
+    Pair(&'a Expr, &'a Expr),
+}
+
+impl<'a> SqlFunctionArgsRef<'a> {
+    /// Return the number of expressions supplied to the function.
+    ///
+    /// `func(*)` has zero expression arguments. Use [`Self::is_star`] when the
+    /// distinction between `Star` and an empty `List` matters.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        match self {
+            Self::Star => 0,
+            Self::List(args) => args.len(),
+            Self::Pair(_, _) => 2,
+        }
+    }
+
+    /// Return whether there are no expression arguments.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the registry-compatible signed arity, saturating at `i32::MAX`.
+    #[must_use]
+    pub fn arity_i32(self) -> i32 {
+        i32::try_from(self.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Return whether these arguments represent `func(*)`.
+    #[must_use]
+    pub const fn is_star(self) -> bool {
+        matches!(self, Self::Star)
+    }
+
+    /// Borrow the argument at `index`, if one exists.
+    #[must_use]
+    pub fn get(self, index: usize) -> Option<&'a Expr> {
+        match self {
+            Self::List(args) => args.get(index),
+            Self::Pair(first, _) if index == 0 => Some(first),
+            Self::Pair(_, second) if index == 1 => Some(second),
+            Self::Star | Self::Pair(_, _) => None,
+        }
+    }
+
+    /// Borrow the first argument, if one exists.
+    #[must_use]
+    pub fn first(self) -> Option<&'a Expr> {
+        self.get(0)
+    }
+
+    /// Iterate over the argument expressions without allocating.
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = &'a Expr> + ExactSizeIterator + Clone {
+        SqlFunctionArgsIter {
+            args: self,
+            indices: 0..self.len(),
+        }
+    }
+
+    /// Return the underlying contiguous list, when this view is a list.
+    ///
+    /// `Star` and `Pair` return `None`; callers that only need traversal should
+    /// use [`Self::iter`].
+    #[must_use]
+    pub const fn as_list(self) -> Option<&'a [Expr]> {
+        match self {
+            Self::List(args) => Some(args),
+            Self::Star | Self::Pair(_, _) => None,
+        }
+    }
+
+    /// Materialize this borrowed view as the parser's owned argument type.
+    #[must_use]
+    pub fn to_owned(self) -> FunctionArgs {
+        match self {
+            Self::Star => FunctionArgs::Star,
+            Self::List(args) => FunctionArgs::List(args.to_vec()),
+            Self::Pair(first, second) => FunctionArgs::List(vec![first.clone(), second.clone()]),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SqlFunctionArgsIter<'a> {
+    args: SqlFunctionArgsRef<'a>,
+    indices: std::ops::Range<usize>,
+}
+
+impl<'a> Iterator for SqlFunctionArgsIter<'a> {
+    type Item = &'a Expr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.indices.next().and_then(|index| self.args.get(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for SqlFunctionArgsIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.indices
+            .next_back()
+            .and_then(|index| self.args.get(index))
+    }
+}
+
+impl ExactSizeIterator for SqlFunctionArgsIter<'_> {
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+}
+
+impl std::iter::FusedIterator for SqlFunctionArgsIter<'_> {}
+
+/// A borrowed semantic view of an expression that invokes a SQL function.
+///
+/// This view normalizes ordinary [`Expr::FunctionCall`] nodes and JSON access
+/// operators while retaining the metadata that applies only to explicit
+/// function-call syntax.
+#[derive(Debug, Clone, Copy)]
+pub struct SqlFunctionCallRef<'a> {
+    /// Function name used for registry lookup.
+    pub name: &'a str,
+    /// Borrowed function arguments.
+    pub args: SqlFunctionArgsRef<'a>,
+    /// Whether the explicit call uses `DISTINCT`.
+    pub distinct: bool,
+    /// In-aggregate `ORDER BY` terms.
+    pub order_by: &'a [OrderingTerm],
+    /// Optional aggregate filter expression.
+    pub filter: Option<&'a Expr>,
+    /// Optional window specification.
+    pub over: Option<&'a WindowSpec>,
+}
+
+impl Expr {
+    /// View this expression as a semantic SQL function call, when applicable.
+    ///
+    /// JSON access operators are exposed as two-argument calls named `->` or
+    /// `->>`. This does not alter their parser AST representation or display.
+    #[must_use]
+    pub fn as_sql_function_call(&self) -> Option<SqlFunctionCallRef<'_>> {
+        match self {
+            Self::FunctionCall {
+                name,
+                args,
+                distinct,
+                order_by,
+                filter,
+                over,
+                ..
+            } => Some(SqlFunctionCallRef {
+                name,
+                args: match args {
+                    FunctionArgs::Star => SqlFunctionArgsRef::Star,
+                    FunctionArgs::List(args) => SqlFunctionArgsRef::List(args),
+                },
+                distinct: *distinct,
+                order_by,
+                filter: filter.as_deref(),
+                over: over.as_ref(),
+            }),
+            Self::JsonAccess {
+                expr, path, arrow, ..
+            } => Some(SqlFunctionCallRef {
+                name: arrow.sql_function_name(),
+                args: SqlFunctionArgsRef::Pair(expr, path),
+                distinct: false,
+                order_by: &[],
+                filter: None,
+                over: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Bind parameter types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PlaceholderType {
@@ -911,6 +1215,188 @@ pub enum CompoundOp {
     Except,
 }
 
+/// How SQLite will execute a syntactic `VALUES` clause.
+///
+/// SQLite may implement the rows as a coroutine or lower some rows through a
+/// `UNION ALL` path. That choice determines which row donates comparison
+/// affinity and collation metadata. Parsing records the first row forced onto
+/// the `UNION ALL` path; execution later freezes the concrete donor after
+/// consulting the active function registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValuesRepresentation {
+    /// Donor selection has not yet consulted the active function registry.
+    Deferred {
+        /// First row at which a previously parsed `WITH` clause forces the
+        /// `UNION ALL` representation, or `None` when no such row was seen.
+        force_union_all_from: Option<usize>,
+    },
+    /// Donor selection has been resolved for one execution or preparation.
+    Frozen {
+        /// Row donating comparison metadata, or `None` for an empty
+        /// programmatically constructed clause.
+        donor_row: Option<usize>,
+    },
+}
+
+/// Rows and representation metadata for a first-class `VALUES` clause.
+///
+/// The outer row collection is private so a frozen donor index cannot be
+/// invalidated by inserting or removing rows. Expressions and columns remain
+/// mutable through the slice-based accessors because those rewrites preserve
+/// row identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValuesClause {
+    rows: Vec<Vec<Expr>>,
+    representation: ValuesRepresentation,
+}
+
+impl ValuesClause {
+    /// Construct a deferred clause that has not observed a preceding `WITH`.
+    #[must_use]
+    pub fn new(rows: Vec<Vec<Expr>>) -> Self {
+        Self::parsed(rows, None)
+    }
+
+    /// Construct a deferred clause with parser-derived representation state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `force_union_all_from` does not identify a row in `rows`.
+    #[must_use]
+    pub fn parsed(rows: Vec<Vec<Expr>>, force_union_all_from: Option<usize>) -> Self {
+        assert!(
+            force_union_all_from.is_none_or(|index| index < rows.len()),
+            "forced VALUES row must be present"
+        );
+        Self {
+            rows,
+            representation: ValuesRepresentation::Deferred {
+                force_union_all_from,
+            },
+        }
+    }
+
+    /// Return the current representation state.
+    #[must_use]
+    pub const fn representation(&self) -> ValuesRepresentation {
+        self.representation
+    }
+
+    /// Return the first parser-forced `UNION ALL` row while still deferred.
+    #[must_use]
+    pub const fn force_union_all_from(&self) -> Option<usize> {
+        match self.representation {
+            ValuesRepresentation::Deferred {
+                force_union_all_from,
+            } => force_union_all_from,
+            ValuesRepresentation::Frozen { .. } => None,
+        }
+    }
+
+    /// Return whether donor selection has been frozen.
+    #[must_use]
+    pub const fn is_frozen(&self) -> bool {
+        matches!(self.representation, ValuesRepresentation::Frozen { .. })
+    }
+
+    /// Freeze the row that donates comparison affinity and collation metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on an already-frozen clause, when a donor index is
+    /// outside `rows`, or when donor presence does not match row presence.
+    pub fn freeze_donor_row(&mut self, donor_row: Option<usize>) {
+        assert!(!self.is_frozen(), "VALUES donor is already frozen");
+        assert_eq!(
+            donor_row.is_some(),
+            !self.rows.is_empty(),
+            "non-empty VALUES clauses require a donor row"
+        );
+        assert!(
+            donor_row.is_none_or(|index| index < self.rows.len()),
+            "VALUES donor row must be present"
+        );
+        self.representation = ValuesRepresentation::Frozen { donor_row };
+    }
+
+    /// Return the frozen donor row index, if one exists.
+    #[must_use]
+    pub const fn donor_row_index(&self) -> Option<usize> {
+        match self.representation {
+            ValuesRepresentation::Frozen { donor_row } => donor_row,
+            ValuesRepresentation::Deferred { .. } => None,
+        }
+    }
+
+    /// Return the frozen donor row, if one exists.
+    #[must_use]
+    pub fn donor_row(&self) -> Option<&[Expr]> {
+        self.donor_row_index()
+            .and_then(|index| self.rows.get(index))
+            .map(Vec::as_slice)
+    }
+
+    /// Borrow all rows without permitting the outer collection to be resized.
+    #[must_use]
+    pub fn rows(&self) -> &[Vec<Expr>] {
+        &self.rows
+    }
+
+    /// Iterate over mutable row contents without exposing whole-row replacement.
+    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut [Expr]> + ExactSizeIterator {
+        self.rows.iter_mut().map(Vec::as_mut_slice)
+    }
+
+    /// Consume the wrapper and return its rows.
+    #[must_use]
+    pub fn into_rows(self) -> Vec<Vec<Expr>> {
+        self.rows
+    }
+
+    /// Replace rows while retaining representation metadata and row identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replacement changes the number of rows.
+    pub fn replace_rows_preserving_representation(&mut self, rows: Vec<Vec<Expr>>) {
+        assert_eq!(
+            self.rows.len(),
+            rows.len(),
+            "VALUES rewrites must preserve row identity"
+        );
+        self.rows = rows;
+    }
+}
+
+impl Default for ValuesClause {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl From<Vec<Vec<Expr>>> for ValuesClause {
+    fn from(rows: Vec<Vec<Expr>>) -> Self {
+        Self::new(rows)
+    }
+}
+
+impl std::ops::Deref for ValuesClause {
+    type Target = [Vec<Expr>];
+
+    fn deref(&self) -> &Self::Target {
+        self.rows()
+    }
+}
+
+impl<'a> IntoIterator for &'a ValuesClause {
+    type Item = &'a Vec<Expr>;
+    type IntoIter = std::slice::Iter<'a, Vec<Expr>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows.iter()
+    }
+}
+
 /// A single SELECT core or VALUES clause.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -926,7 +1412,7 @@ pub enum SelectCore {
         windows: Vec<WindowDef>,
     },
     /// `VALUES (row), (row), ...` — first-class in SQLite.
-    Values(Vec<Vec<Expr>>),
+    Values(ValuesClause),
 }
 
 /// DISTINCT / ALL modifier on SELECT.
@@ -1928,10 +2414,9 @@ mod tests {
         let _ = Statement::Select(SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(vec![vec![Expr::Literal(
-                    Literal::Integer(1),
-                    Span::ZERO,
-                )]]),
+                select: SelectCore::Values(
+                    vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]].into(),
+                ),
                 compounds: vec![],
             },
             order_by: vec![],
@@ -2007,7 +2492,7 @@ mod tests {
             query: SelectStatement {
                 with: None,
                 body: SelectBody {
-                    select: SelectCore::Values(vec![]),
+                    select: SelectCore::Values(vec![].into()),
                     compounds: vec![],
                 },
                 order_by: vec![],
@@ -2081,9 +2566,12 @@ mod tests {
 
     #[test]
     fn test_ast_select_body_with_compounds() {
-        let core1 = SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]]);
-        let core2 = SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(2), Span::ZERO)]]);
-        let core3 = SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(3), Span::ZERO)]]);
+        let core1 =
+            SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]].into());
+        let core2 =
+            SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(2), Span::ZERO)]].into());
+        let core3 =
+            SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(3), Span::ZERO)]].into());
 
         let body = SelectBody {
             select: core1,
@@ -2097,16 +2585,19 @@ mod tests {
 
     #[test]
     fn test_ast_values_as_first_class() {
-        let values = SelectCore::Values(vec![
+        let values = SelectCore::Values(
             vec![
-                Expr::Literal(Literal::Integer(1), Span::ZERO),
-                Expr::Literal(Literal::Integer(2), Span::ZERO),
-            ],
-            vec![
-                Expr::Literal(Literal::Integer(3), Span::ZERO),
-                Expr::Literal(Literal::Integer(4), Span::ZERO),
-            ],
-        ]);
+                vec![
+                    Expr::Literal(Literal::Integer(1), Span::ZERO),
+                    Expr::Literal(Literal::Integer(2), Span::ZERO),
+                ],
+                vec![
+                    Expr::Literal(Literal::Integer(3), Span::ZERO),
+                    Expr::Literal(Literal::Integer(4), Span::ZERO),
+                ],
+            ]
+            .into(),
+        );
 
         assert!(matches!(values, SelectCore::Values(ref rows) if rows.len() == 2));
 
@@ -2121,6 +2612,76 @@ mod tests {
             windows: vec![],
         };
         assert!(!matches!(select, SelectCore::Values(_)));
+    }
+
+    #[test]
+    fn values_clause_preserves_deferred_and_frozen_representation_invariants() {
+        let rows = vec![
+            vec![Expr::Literal(Literal::Integer(1), Span::ZERO)],
+            vec![Expr::Literal(Literal::Integer(2), Span::ZERO)],
+        ];
+        let mut values = ValuesClause::parsed(rows.clone(), Some(1));
+
+        assert_eq!(values.rows(), rows.as_slice());
+        assert_eq!(values.force_union_all_from(), Some(1));
+        assert_eq!(
+            values.representation(),
+            ValuesRepresentation::Deferred {
+                force_union_all_from: Some(1),
+            }
+        );
+        assert!(!values.is_frozen());
+        assert_eq!(values.donor_row_index(), None);
+        assert_eq!(values.donor_row(), None);
+
+        let first_row = values.iter_mut().next().expect("first row must exist");
+        first_row[0] = Expr::Literal(Literal::Integer(9), Span::ZERO);
+        assert_eq!(values[0][0], Expr::Literal(Literal::Integer(9), Span::ZERO));
+
+        let replacement = vec![
+            vec![Expr::Literal(Literal::Integer(3), Span::ZERO)],
+            vec![Expr::Literal(Literal::Integer(4), Span::ZERO)],
+        ];
+        values.replace_rows_preserving_representation(replacement.clone());
+        values.freeze_donor_row(Some(1));
+
+        assert!(values.is_frozen());
+        assert_eq!(values.force_union_all_from(), None);
+        assert_eq!(values.donor_row_index(), Some(1));
+        assert_eq!(values.donor_row(), Some(replacement[1].as_slice()));
+        assert_eq!(
+            values.representation(),
+            ValuesRepresentation::Frozen { donor_row: Some(1) }
+        );
+        assert_eq!(values.clone().into_rows(), replacement);
+    }
+
+    #[test]
+    fn empty_values_clause_can_freeze_without_a_donor() {
+        let mut values = ValuesClause::default();
+        values.freeze_donor_row(None);
+
+        assert!(values.is_empty());
+        assert!(values.is_frozen());
+        assert_eq!(values.donor_row(), None);
+        assert!(values.into_rows().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "forced VALUES row must be present")]
+    fn values_clause_rejects_an_invalid_forced_row() {
+        let _ = ValuesClause::parsed(
+            vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]],
+            Some(1),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "VALUES donor row must be present")]
+    fn values_clause_rejects_an_invalid_donor_row() {
+        let mut values =
+            ValuesClause::new(vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]]);
+        values.freeze_donor_row(Some(1));
     }
 
     #[test]
@@ -2212,7 +2773,7 @@ mod tests {
         let empty_select = SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(vec![]),
+                select: SelectCore::Values(vec![].into()),
                 compounds: vec![],
             },
             order_by: vec![],
@@ -2352,6 +2913,159 @@ mod tests {
                 }
             )
         ));
+    }
+
+    #[test]
+    fn test_sql_function_args_ref_preserves_shape_and_order() {
+        let args = [
+            Expr::Literal(Literal::Integer(10), Span::ZERO),
+            Expr::Literal(Literal::Integer(20), Span::ZERO),
+            Expr::Literal(Literal::Integer(30), Span::ZERO),
+        ];
+
+        let star = SqlFunctionArgsRef::Star;
+        assert_eq!(star.len(), 0);
+        assert_eq!(star.arity_i32(), 0);
+        assert!(star.is_empty());
+        assert!(star.is_star());
+        assert_eq!(star.first(), None);
+        assert_eq!(star.iter().len(), 0);
+        assert_eq!(star.as_list(), None);
+        assert_eq!(star.to_owned(), FunctionArgs::Star);
+
+        let empty: [Expr; 0] = [];
+        let empty_list = SqlFunctionArgsRef::List(&empty);
+        assert!(empty_list.is_empty());
+        assert!(!empty_list.is_star());
+        assert_eq!(empty_list.as_list(), Some(empty.as_slice()));
+        assert_eq!(empty_list.to_owned(), FunctionArgs::List(vec![]));
+
+        let list = SqlFunctionArgsRef::List(&args);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.arity_i32(), 3);
+        assert_eq!(list.first(), Some(&args[0]));
+        assert_eq!(list.get(2), Some(&args[2]));
+        assert_eq!(list.get(3), None);
+        assert_eq!(list.iter().collect::<Vec<_>>(), args.iter().collect::<Vec<_>>());
+        assert_eq!(list.as_list(), Some(args.as_slice()));
+        assert_eq!(list.to_owned(), FunctionArgs::List(args.to_vec()));
+
+        let pair = SqlFunctionArgsRef::Pair(&args[0], &args[2]);
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair.arity_i32(), 2);
+        assert!(!pair.is_star());
+        assert_eq!(pair.as_list(), None);
+        assert_eq!(pair.get(0), Some(&args[0]));
+        assert_eq!(pair.get(1), Some(&args[2]));
+        assert_eq!(pair.get(2), None);
+
+        let mut iter = pair.iter();
+        assert_eq!(iter.len(), 2);
+        assert_eq!(iter.next(), Some(&args[0]));
+        assert_eq!(iter.next_back(), Some(&args[2]));
+        assert_eq!(iter.next(), None);
+        assert_eq!(
+            pair.to_owned(),
+            FunctionArgs::List(vec![args[0].clone(), args[2].clone()])
+        );
+    }
+
+    #[test]
+    fn test_explicit_function_call_has_borrowed_semantic_view() {
+        let span = Span::new(4, 24);
+        let expr = Expr::FunctionCall {
+            name: "total".to_owned(),
+            args: FunctionArgs::List(vec![Expr::Column(ColumnRef::bare("amount"), span)]),
+            distinct: true,
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("sequence"), span),
+                direction: Some(SortDirection::Desc),
+                nulls: Some(NullsOrder::Last),
+            }],
+            filter: Some(Box::new(Expr::Literal(Literal::Integer(1), span))),
+            over: Some(WindowSpec {
+                window_ref: None,
+                partition_by: vec![],
+                order_by: vec![],
+                frame: None,
+            }),
+            span,
+        };
+
+        let Some(call) = expr.as_sql_function_call() else {
+            panic!("explicit function call must have a semantic call view");
+        };
+        assert_eq!(call.name, "total");
+        assert_eq!(call.args.len(), 1);
+        assert!(!call.args.is_star());
+        assert!(call.distinct);
+        assert_eq!(call.order_by.len(), 1);
+        assert!(matches!(
+            call.filter,
+            Some(Expr::Literal(Literal::Integer(1), _))
+        ));
+        assert!(call.over.is_some());
+
+        let star_expr = Expr::FunctionCall {
+            name: "count".to_owned(),
+            args: FunctionArgs::Star,
+            distinct: false,
+            order_by: vec![],
+            filter: None,
+            over: None,
+            span,
+        };
+        let Some(star_call) = star_expr.as_sql_function_call() else {
+            panic!("star function call must have a semantic call view");
+        };
+        assert!(star_call.args.is_star());
+        assert_eq!(star_call.args.len(), 0);
+    }
+
+    #[test]
+    fn test_json_access_has_borrowed_semantic_function_call_view() {
+        for (arrow, expected_name) in [
+            (JsonArrow::Arrow, "->"),
+            (JsonArrow::DoubleArrow, "->>"),
+        ] {
+            assert_eq!(arrow.sql_function_name(), expected_name);
+
+            let expr = Expr::JsonAccess {
+                expr: Box::new(Expr::Column(ColumnRef::bare("document"), Span::ZERO)),
+                path: Box::new(Expr::Literal(
+                    Literal::String("$.field".to_owned()),
+                    Span::ZERO,
+                )),
+                arrow,
+                span: Span::ZERO,
+            };
+
+            let Some(call) = expr.as_sql_function_call() else {
+                panic!("JSON access must have a semantic call view");
+            };
+            assert_eq!(call.name, expected_name);
+            assert_eq!(call.args.len(), 2);
+            assert!(!call.args.is_star());
+            assert!(!call.distinct);
+            assert!(call.order_by.is_empty());
+            assert_eq!(call.filter, None);
+            assert_eq!(call.over, None);
+
+            let SqlFunctionArgsRef::Pair(document, path) = call.args else {
+                panic!("JSON access must expose its operands as a borrowed pair");
+            };
+            assert!(matches!(
+                document,
+                Expr::Column(column, _) if column.column.as_ref() == "document"
+            ));
+            assert!(matches!(
+                path,
+                Expr::Literal(Literal::String(value), _) if value == "$.field"
+            ));
+        }
+
+        let literal = Expr::Literal(Literal::Integer(1), Span::ZERO);
+        assert!(literal.as_sql_function_call().is_none());
     }
 
     #[test]
@@ -3261,5 +3975,66 @@ mod tests {
         // Different values must still be unequal.
         let e = Expr::Literal(Literal::Integer(99), Span::ZERO);
         assert_ne!(a, e);
+    }
+
+    #[test]
+    fn test_bound_outer_value_equality_preserves_storage_and_metadata() {
+        let bound = |value, collation, affinity, span| {
+            Expr::BoundOuterValue {
+                value,
+                collation,
+                affinity,
+                span,
+            }
+        };
+
+        let integer = bound(
+            SqliteValue::Integer(42),
+            BoundCollation::Binary,
+            Some(TypeAffinity::Integer),
+            Span::new(0, 2),
+        );
+        let same_semantics = bound(
+            SqliteValue::Integer(42),
+            BoundCollation::Named("binary".to_owned()),
+            Some(TypeAffinity::Integer),
+            Span::new(100, 102),
+        );
+        assert_eq!(integer.span(), Span::new(0, 2));
+        assert_eq!(integer, same_semantics);
+
+        let real = bound(
+            SqliteValue::Float(42.0),
+            BoundCollation::Binary,
+            Some(TypeAffinity::Integer),
+            Span::ZERO,
+        );
+        assert_ne!(integer, real, "INTEGER and REAL storage must stay distinct");
+
+        let nocase = bound(
+            SqliteValue::Integer(42),
+            BoundCollation::Named("NOCASE".to_owned()),
+            Some(TypeAffinity::Integer),
+            Span::ZERO,
+        );
+        assert_ne!(integer, nocase);
+
+        let unspecified = bound(
+            SqliteValue::Integer(42),
+            BoundCollation::Unspecified,
+            Some(TypeAffinity::Integer),
+            Span::ZERO,
+        );
+        assert_ne!(integer, unspecified);
+        assert_eq!(BoundCollation::Unspecified.as_name(), None);
+        assert_eq!(BoundCollation::Binary.as_name(), Some("BINARY"));
+
+        let numeric = bound(
+            SqliteValue::Integer(42),
+            BoundCollation::Binary,
+            Some(TypeAffinity::Numeric),
+            Span::ZERO,
+        );
+        assert_ne!(integer, numeric);
     }
 }

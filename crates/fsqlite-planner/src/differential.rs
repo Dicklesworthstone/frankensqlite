@@ -746,12 +746,13 @@ fn extract_column_expr(expr: &Expr) -> Option<&ColumnRef> {
 
 /// Extract a literal value from an expression, including signed numeric
 /// literals that the parser represents as `UnaryOp(Negate|Plus, Literal)`.
-/// NULL and time-function constants (CURRENT_TIME/DATE/TIMESTAMP) are
-/// intentionally rejected so that downstream code can continue to assume
-/// differential filters carry concrete bindable values.
+/// Source-level NULL and time-function constants (CURRENT_TIME/DATE/TIMESTAMP)
+/// are intentionally rejected. An internal bound outer value is already a
+/// concrete runtime value, so it is returned verbatim, including bound NULL.
 fn extract_literal_value(expr: &Expr) -> Option<SqliteValue> {
     match expr {
         Expr::Literal(literal, _) => literal_to_sqlite_value(literal),
+        Expr::BoundOuterValue { value, .. } => Some(value.clone()),
         Expr::UnaryOp {
             op: UnaryOp::Plus,
             expr: operand,
@@ -841,7 +842,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    use fsqlite_ast::Statement;
+    use fsqlite_ast::{BoundCollation, Statement};
     use fsqlite_parser::Parser;
     use proptest::prelude::*;
 
@@ -1497,6 +1498,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn bound_outer_values_are_lossless_differential_literals() {
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(i64::MIN),
+            SqliteValue::Float(-0.0),
+            SqliteValue::Text("outer text".into()),
+            SqliteValue::Blob(vec![0, 1, 2, 255].into()),
+        ];
+
+        for value in values {
+            let expr = Expr::BoundOuterValue {
+                value: value.clone(),
+                collation: BoundCollation::Named("NOCASE".to_owned()),
+                affinity: Some(fsqlite_types::TypeAffinity::Text),
+                span: fsqlite_ast::Span::ZERO,
+            };
+            assert_eq!(extract_literal_value(&expr), Some(value));
+        }
     }
 
     #[test]

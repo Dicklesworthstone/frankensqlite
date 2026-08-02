@@ -196,6 +196,7 @@ pub fn expr_is_rebase_safe(
 
         // All other forms are not rebase-safe.
         Expr::Subquery(..)
+        | Expr::BoundOuterValue { .. }
         | Expr::Exists { .. }
         | Expr::In { .. }
         | Expr::Between { .. }
@@ -365,7 +366,7 @@ mod tests {
         SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(vec![]),
+                select: SelectCore::Values(vec![].into()),
                 compounds: vec![],
             },
             order_by: vec![],
@@ -516,6 +517,19 @@ mod tests {
         assert!(
             expr_is_rebase_safe(&placeholder, &accept_all, &test_resolve).is_none(),
             "bind parameters must be rejected"
+        );
+
+        // Correlated values are already bound to a particular outer row and
+        // therefore cannot be replayed as transaction-independent input.
+        let bound_outer = Expr::BoundOuterValue {
+            value: SqliteValue::Integer(1),
+            collation: crate::BoundCollation::Unspecified,
+            affinity: None,
+            span: span(),
+        };
+        assert!(
+            expr_is_rebase_safe(&bound_outer, &accept_all, &test_resolve).is_none(),
+            "bound outer values must be rejected"
         );
     }
 

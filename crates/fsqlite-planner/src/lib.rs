@@ -20,7 +20,7 @@ use fsqlite_ast::{
     JoinConstraint, JoinKind, LikeOp, Literal, NullsOrder, OrderingTerm, ResultColumn, SelectBody,
     SelectCore, SortDirection, Span, TableOrSubquery,
 };
-use fsqlite_types::sync_primitives::Instant;
+use fsqlite_types::{SqliteValue, sync_primitives::Instant};
 use lru::LruCache;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -2319,7 +2319,11 @@ fn direct_comparison_guarantees_non_null(
         let mut candidate = candidate;
         loop {
             match candidate {
-                Expr::Literal(Literal::Null, _) => break true,
+                Expr::Literal(Literal::Null, _)
+                | Expr::BoundOuterValue {
+                    value: SqliteValue::Null,
+                    ..
+                } => break true,
                 Expr::UnaryOp { expr: inner, .. }
                 | Expr::Cast { expr: inner, .. }
                 | Expr::Collate { expr: inner, .. } => candidate = inner,
@@ -2698,9 +2702,7 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
             right,
             ..
         } => {
-            if matches!(left.as_ref(), Expr::Literal(Literal::Null, _))
-                || matches!(right.as_ref(), Expr::Literal(Literal::Null, _))
-            {
+            if expr_is_null_constant(left) || expr_is_null_constant(right) {
                 return WhereTerm {
                     expr,
                     column: None,
@@ -2868,6 +2870,17 @@ fn extract_where_column(expr: &Expr) -> Option<WhereColumn> {
     } else {
         None
     }
+}
+
+fn expr_is_null_constant(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(Literal::Null, _)
+            | Expr::BoundOuterValue {
+                value: SqliteValue::Null,
+                ..
+            }
+    )
 }
 
 /// Check if a `WhereColumn` is a rowid alias.
@@ -3506,8 +3519,8 @@ fn analyze_expression_index_usability(
             // cannot drive an index seek (SQL semantics), so skip the
             // `x = NULL` / `NULL = x` degenerate forms exactly like
             // classify_where_term does for plain columns.
-            let left_is_null = matches!(left.as_ref(), Expr::Literal(Literal::Null, _));
-            let right_is_null = matches!(right.as_ref(), Expr::Literal(Literal::Null, _));
+            let left_is_null = expr_is_null_constant(left);
+            let right_is_null = expr_is_null_constant(right);
             if left_is_null || right_is_null {
                 continue;
             }
@@ -3569,6 +3582,9 @@ fn expression_matches_index_key(query: &Expr, key: &Expr, index_table: &str) -> 
 fn normalize_expression_index_columns(expr: &mut Expr, index_table: &str) -> bool {
     match expr {
         Expr::Literal(..) | Expr::Placeholder(..) => true,
+        // Bound values are runtime-only nodes and can never be part of a
+        // parser-authored expression-index or partial-index definition.
+        Expr::BoundOuterValue { .. } => false,
         Expr::Column(column, _) => {
             if column
                 .table
@@ -4858,7 +4874,7 @@ fn expr_is_table_local_index_key(expr: &Expr, table_name: &str) -> bool {
 
 fn expr_columns_satisfy(expr: &Expr, column_allowed: &impl Fn(&ColumnRef) -> bool) -> bool {
     match expr {
-        Expr::Literal(..) | Expr::Placeholder(..) => true,
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } | Expr::Placeholder(..) => true,
         Expr::Column(column, _) => column_allowed(column),
         Expr::BinaryOp { left, right, .. }
         | Expr::JsonAccess {
@@ -5666,8 +5682,9 @@ fn collect_table_refs(expr: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
-        // Literals, placeholders — no column refs to collect.
-        _ => {}
+        // Constant leaves and parser placeholders contain no column refs.
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } | Expr::Placeholder(..) => {}
+        Expr::Raise { .. } => {}
     }
 }
 
@@ -6175,9 +6192,9 @@ fn fold_binary_literals(op: AstBinaryOp, left: FoldResult, right: FoldResult) ->
 mod tests {
     use super::*;
     use fsqlite_ast::{
-        ColumnRef, CompoundOp, Distinctness, Expr, FromClause, InSet, IndexHint, Literal,
-        OrderingTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStatement,
-        SortDirection, Span, TableOrSubquery,
+        BoundCollation, ColumnRef, CompoundOp, Distinctness, Expr, FromClause, InSet, IndexHint,
+        Literal, OrderingTerm, QualifiedName, ResultColumn, SelectBody, SelectCore,
+        SelectStatement, SortDirection, Span, TableOrSubquery,
     };
     use std::{cell::Cell, path::PathBuf, time::Instant};
 
@@ -6446,21 +6463,24 @@ mod tests {
         );
 
         // VALUES: width comes from the first row; every column is unnamed.
-        let values = SelectCore::Values(vec![
+        let values = SelectCore::Values(
             vec![
-                Expr::Literal(Literal::Integer(1), Span::ZERO),
-                Expr::Literal(Literal::Integer(2), Span::ZERO),
-            ],
-            vec![
-                Expr::Literal(Literal::Integer(3), Span::ZERO),
-                Expr::Literal(Literal::Integer(4), Span::ZERO),
-            ],
-        ]);
+                vec![
+                    Expr::Literal(Literal::Integer(1), Span::ZERO),
+                    Expr::Literal(Literal::Integer(2), Span::ZERO),
+                ],
+                vec![
+                    Expr::Literal(Literal::Integer(3), Span::ZERO),
+                    Expr::Literal(Literal::Integer(4), Span::ZERO),
+                ],
+            ]
+            .into(),
+        );
         assert_eq!(count_output_columns(&values), 2);
         assert_eq!(extract_output_aliases(&values), vec![None, None]);
 
         // Empty VALUES -> zero columns.
-        let empty = SelectCore::Values(vec![]);
+        let empty = SelectCore::Values(vec![].into());
         assert_eq!(count_output_columns(&empty), 0);
         assert!(extract_output_aliases(&empty).is_empty());
     }
@@ -6664,10 +6684,13 @@ mod tests {
 
     #[test]
     fn test_extract_output_aliases_values() {
-        let core = SelectCore::Values(vec![vec![
-            Expr::Literal(Literal::Integer(1), Span::ZERO),
-            Expr::Literal(Literal::Integer(2), Span::ZERO),
-        ]]);
+        let core = SelectCore::Values(
+            vec![vec![
+                Expr::Literal(Literal::Integer(1), Span::ZERO),
+                Expr::Literal(Literal::Integer(2), Span::ZERO),
+            ]]
+            .into(),
+        );
         let aliases = extract_output_aliases(&core);
         assert_eq!(aliases, vec![None, None]);
     }
@@ -8405,6 +8428,38 @@ mod tests {
             span: Span::ZERO,
         };
         assert_eq!(extract_where_column(&binop), None);
+    }
+
+    #[test]
+    fn test_bound_outer_value_is_a_runtime_constant_leaf() {
+        let bound_null = Expr::BoundOuterValue {
+            value: SqliteValue::Null,
+            collation: BoundCollation::Named("NOCASE".to_owned()),
+            affinity: Some(fsqlite_types::TypeAffinity::Text),
+            span: Span::ZERO,
+        };
+
+        assert!(expr_columns_satisfy(&bound_null, &|_| false));
+        let mut table_refs = HashSet::new();
+        collect_table_refs(&bound_null, &mut table_refs);
+        assert!(table_refs.is_empty());
+
+        let mut index_definition_expr = bound_null.clone();
+        assert!(!normalize_expression_index_columns(
+            &mut index_definition_expr,
+            "t"
+        ));
+
+        let comparison = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(bound_null),
+            span: Span::ZERO,
+        };
+        assert!(matches!(
+            classify_where_term(&comparison).kind,
+            WhereTermKind::Other
+        ));
     }
 
     #[test]
@@ -10708,16 +10763,19 @@ mod tests {
 
     #[test]
     fn test_count_output_columns_values() {
-        let core = SelectCore::Values(vec![vec![
-            Expr::Literal(Literal::Integer(1), Span::ZERO),
-            Expr::Literal(Literal::Integer(2), Span::ZERO),
-        ]]);
+        let core = SelectCore::Values(
+            vec![vec![
+                Expr::Literal(Literal::Integer(1), Span::ZERO),
+                Expr::Literal(Literal::Integer(2), Span::ZERO),
+            ]]
+            .into(),
+        );
         assert_eq!(count_output_columns(&core), 2);
     }
 
     #[test]
     fn test_count_output_columns_empty_values() {
-        let core = SelectCore::Values(vec![]);
+        let core = SelectCore::Values(vec![].into());
         assert_eq!(count_output_columns(&core), 0);
     }
 
@@ -10770,7 +10828,8 @@ mod tests {
 
     #[test]
     fn test_resolve_projection_values_core_error() {
-        let core = SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]]);
+        let core =
+            SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]].into());
         let err = resolve_single_table_result_columns(&core, &["a".to_owned()])
             .expect_err("VALUES should fail");
         assert_eq!(err, SingleTableProjectionError::NotSelectCore);

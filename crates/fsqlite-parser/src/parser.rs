@@ -19,13 +19,13 @@ use fsqlite_ast::{
     ResultColumn, RollbackStatement, SelectCore, SelectStatement, SortDirection, Span, Statement,
     TableConstraint, TableConstraintKind, TimeTravelClause, TimeTravelTarget, TransactionMode,
     TriggerEvent, TriggerTiming, TypeName, UpdateStatement, UpsertAction, UpsertClause,
-    UpsertTarget, VacuumStatement, WithClause,
+    UpsertTarget, VacuumStatement, ValuesClause, WithClause,
 };
 #[cfg(test)]
 use fsqlite_ast::{
     CompoundOp, CteMaterialized, Distinctness, FrameBound, FrameExclude, FrameSpec, FrameType,
-    FromClause, JoinClause, JoinConstraint, SelectBody, TableOrSubquery, UnaryOp, WindowDef,
-    WindowReference, WindowSpec,
+    FromClause, JoinClause, JoinConstraint, SelectBody, TableOrSubquery, UnaryOp,
+    ValuesRepresentation, WindowDef, WindowReference, WindowSpec,
 };
 
 #[cfg(test)]
@@ -253,6 +253,7 @@ pub struct Parser {
     pub(crate) pos: usize,
     pub(crate) errors: Vec<ParseError>,
     pub(crate) depth: u32,
+    pub(crate) has_with: bool,
 }
 
 impl Parser {
@@ -288,6 +289,7 @@ impl Parser {
             pos: 0,
             errors: Vec::new(),
             depth: 0,
+            has_with: false,
         }
     }
 
@@ -403,6 +405,10 @@ impl Parser {
     }
 
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        // SQLite's WITH marker is sticky within one statement because it can
+        // change how later VALUES rows are represented. It must not leak into
+        // the next statement parsed from the same token stream.
+        self.has_with = false;
         self.parse_statement_inner()
     }
 
@@ -1102,6 +1108,7 @@ impl Parser {
     fn parse_values_core_tracked(&mut self) -> Result<HeightTracked<SelectCore>, ParseError> {
         let mut rows = Vec::new();
         let mut height = 0;
+        let mut force_union_all_from = None;
         loop {
             self.expect_token(&TokenKind::LeftParen)?;
             let parsed = self.parse_comma_sep(Self::parse_expr_tracked)?;
@@ -1111,13 +1118,16 @@ impl Parser {
                 row.push(tracked.expr);
             }
             self.expect_token(&TokenKind::RightParen)?;
+            if force_union_all_from.is_none() && self.has_with {
+                force_union_all_from = Some(rows.len());
+            }
             rows.push(row);
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
         }
         Ok(HeightTracked {
-            value: SelectCore::Values(rows),
+            value: SelectCore::Values(ValuesClause::parsed(rows, force_union_all_from)),
             height,
         })
     }
@@ -1469,7 +1479,7 @@ impl Parser {
             InsertSource::DefaultValues
         } else if self.eat_kw(&TokenKind::KwValues) {
             match self.parse_values_core()? {
-                SelectCore::Values(rows) => InsertSource::Values(rows),
+                SelectCore::Values(rows) => InsertSource::Values(rows.into_rows()),
                 SelectCore::Select { .. } => unreachable!("parse_values_core must return VALUES"),
             }
         } else {
@@ -2689,6 +2699,7 @@ fn parse_statements_with_scratch_inner(
         pos: 0,
         errors: std::mem::take(&mut scratch.errors),
         depth: 0,
+        has_with: false,
     };
     let (statements, errors) = parser.parse_all();
     scratch.tokens = parser.tokens;
@@ -3170,6 +3181,26 @@ mod tests {
             panic!("expected SELECT AST");
         };
         select
+    }
+
+    fn top_level_values(statement: &Statement) -> &ValuesClause {
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT statement");
+        };
+        let SelectCore::Values(values) = &select.body.select else {
+            panic!("expected top-level VALUES core");
+        };
+        values
+    }
+
+    fn scalar_subquery_values(expr: &Expr) -> &ValuesClause {
+        let Expr::Subquery(select, _) = expr else {
+            panic!("expected scalar subquery");
+        };
+        let SelectCore::Values(values) = &select.body.select else {
+            panic!("expected VALUES scalar subquery");
+        };
+        values
     }
 
     fn only_join(select: &SelectStatement) -> &JoinClause {
@@ -5266,6 +5297,108 @@ mod tests {
         } else {
             unreachable!("expected Select");
         }
+    }
+
+    #[test]
+    fn test_values_representation_captures_leading_and_nested_with_timing() {
+        let plain = parse_one("VALUES (1), (2), (3)");
+        assert_eq!(
+            top_level_values(&plain).representation(),
+            ValuesRepresentation::Deferred {
+                force_union_all_from: None,
+            }
+        );
+
+        let leading = parse_one("WITH c(x) AS (SELECT 1) VALUES (2), (3)");
+        assert_eq!(top_level_values(&leading).force_union_all_from(), Some(0));
+
+        let nested_first =
+            parse_one("VALUES ((WITH c(x) AS (SELECT 1) SELECT x FROM c)), (2), (3)");
+        assert_eq!(
+            top_level_values(&nested_first).force_union_all_from(),
+            Some(0)
+        );
+
+        let nested_second =
+            parse_one("VALUES (1), ((WITH c(x) AS (SELECT 2) SELECT x FROM c)), (3)");
+        assert_eq!(
+            top_level_values(&nested_second).force_union_all_from(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_values_representation_is_sticky_but_not_retroactive_within_a_statement() {
+        let later_with = parse_full_select(
+            "SELECT (VALUES (1), (2)), (WITH c(x) AS (SELECT 3) SELECT x FROM c)",
+        );
+        let SelectCore::Select { columns, .. } = &later_with.body.select else {
+            panic!("expected SELECT core");
+        };
+        let ResultColumn::Expr { expr, .. } = &columns[0] else {
+            panic!("expected expression result column");
+        };
+        assert_eq!(scalar_subquery_values(expr).force_union_all_from(), None);
+
+        let earlier_with = parse_full_select(
+            "SELECT (WITH c(x) AS (SELECT 3) SELECT x FROM c), (VALUES (1), (2))",
+        );
+        let SelectCore::Select { columns, .. } = &earlier_with.body.select else {
+            panic!("expected SELECT core");
+        };
+        let ResultColumn::Expr { expr, .. } = &columns[1] else {
+            panic!("expected expression result column");
+        };
+        assert_eq!(scalar_subquery_values(expr).force_union_all_from(), Some(0));
+    }
+
+    #[test]
+    fn test_values_with_state_resets_between_parse_all_statements() {
+        let statements = parse_ok("WITH c(x) AS (SELECT 1) VALUES (2), (3); VALUES (4), (5);");
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            top_level_values(&statements[0]).force_union_all_from(),
+            Some(0)
+        );
+        assert_eq!(
+            top_level_values(&statements[1]).force_union_all_from(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_direct_values_parser_captures_nested_with_row_boundary() {
+        let mut parser =
+            Parser::from_sql("VALUES (1), ((WITH c(x) AS (SELECT 2) SELECT x FROM c)), (3)");
+        let parsed = parser
+            .parse_select_core_tracked()
+            .expect("direct VALUES parser must succeed");
+        let SelectCore::Values(values) = parsed.value else {
+            panic!("direct parser must return VALUES");
+        };
+
+        assert_eq!(values.force_union_all_from(), Some(1));
+        assert_eq!(values.len(), 3);
+    }
+
+    #[test]
+    fn test_insert_values_extraction_retains_nested_values_representation() {
+        let statement =
+            parse_one("WITH c(x) AS (SELECT 1) INSERT INTO t VALUES ((VALUES (2), (3)))");
+        let Statement::Insert(insert) = statement else {
+            panic!("expected INSERT statement");
+        };
+        let InsertSource::Values(rows) = insert.source else {
+            panic!("expected INSERT VALUES source");
+        };
+        let [row] = rows.as_slice() else {
+            panic!("expected one INSERT row");
+        };
+        let [expr] = row.as_slice() else {
+            panic!("expected one INSERT column");
+        };
+
+        assert_eq!(scalar_subquery_values(expr).force_union_all_from(), Some(0));
     }
 
     #[test]

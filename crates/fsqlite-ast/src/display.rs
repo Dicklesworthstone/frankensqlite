@@ -6,6 +6,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use crate::*;
+use fsqlite_types::SqliteValue;
 use smallvec::SmallVec;
 use std::fmt;
 
@@ -312,12 +313,21 @@ fn expr_precedence(expr: &Expr) -> u8 {
         Expr::Literal(Literal::Float(value), _) if !value.is_nan() && value.is_sign_negative() => {
             PREC_UNARY
         }
+        Expr::BoundOuterValue {
+            value: SqliteValue::Integer(value),
+            ..
+        } if *value < 0 => PREC_UNARY,
+        Expr::BoundOuterValue {
+            value: SqliteValue::Float(value),
+            ..
+        } if !value.is_nan() && value.is_sign_negative() => PREC_UNARY,
         Expr::Between { .. } | Expr::In { .. } | Expr::Like { .. } | Expr::IsNull { .. } => {
             PREC_EQUALITY
         }
         Expr::JsonAccess { .. } => PREC_CONCAT,
         Expr::Collate { .. } => PREC_COLLATE,
         Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
         | Expr::Column(..)
         | Expr::Case { .. }
         | Expr::Cast { .. }
@@ -391,6 +401,7 @@ enum ExprWriteTask<'a> {
     Text(&'static str),
     Ident(&'a str),
     Literal(&'a Literal),
+    BoundOuterValue(&'a SqliteValue),
     Column(&'a ColumnRef),
     BinaryOp(&'a BinaryOp),
     CompoundOp(&'a CompoundOp),
@@ -570,6 +581,7 @@ fn write_expr_tasks(f: &mut fmt::Formatter<'_>, root: ExprWriteTask<'_>) -> fmt:
             ExprWriteTask::Text(text) => f.write_str(text)?,
             ExprWriteTask::Ident(name) => write_ident(f, name)?,
             ExprWriteTask::Literal(literal) => write!(f, "{literal}")?,
+            ExprWriteTask::BoundOuterValue(value) => write_sqlite_value_literal(f, value)?,
             ExprWriteTask::Column(column) => write!(f, "{column}")?,
             ExprWriteTask::BinaryOp(op) => write!(f, "{op}")?,
             ExprWriteTask::CompoundOp(op) => write!(f, "{op}")?,
@@ -1028,6 +1040,9 @@ fn write_expr_tasks(f: &mut fmt::Formatter<'_>, root: ExprWriteTask<'_>) -> fmt:
             },
             ExprWriteTask::Expr(expr) => match expr {
                 Expr::Literal(literal, _) => tasks.push(ExprWriteTask::Literal(literal)),
+                Expr::BoundOuterValue { value, .. } => {
+                    tasks.push(ExprWriteTask::BoundOuterValue(value));
+                }
                 Expr::Column(column, _) => tasks.push(ExprWriteTask::Column(column)),
                 Expr::BinaryOp {
                     left, op, right, ..
@@ -1301,40 +1316,57 @@ fn write_expr_tasks(f: &mut fmt::Formatter<'_>, root: ExprWriteTask<'_>) -> fmt:
 // Literal
 // ---------------------------------------------------------------------------
 
+fn write_sqlite_float_literal(f: &mut fmt::Formatter<'_>, value: f64) -> fmt::Result {
+    if value.is_nan() {
+        // SQLite never surfaces NaN as a REAL value. Arithmetic and register
+        // writes normalize it to SQL NULL.
+        f.write_str("NULL")
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            f.write_str("-9e999")
+        } else {
+            f.write_str("9e999")
+        }
+    // Ensure a finite integral float always has a decimal point.
+    } else if value.fract() == 0.0 {
+        write!(f, "{value:.1}")
+    } else {
+        write!(f, "{value}")
+    }
+}
+
+fn write_sql_string_literal(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
+    write!(f, "'{}'", value.replace('\'', "''"))
+}
+
+fn write_sql_blob_literal(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    f.write_str("X'")?;
+    for byte in bytes {
+        write!(f, "{byte:02X}")?;
+    }
+    f.write_str("'")
+}
+
+fn write_sqlite_value_literal(
+    f: &mut fmt::Formatter<'_>,
+    value: &SqliteValue,
+) -> fmt::Result {
+    match value {
+        SqliteValue::Null => f.write_str("NULL"),
+        SqliteValue::Integer(value) => write!(f, "{value}"),
+        SqliteValue::Float(value) => write_sqlite_float_literal(f, *value),
+        SqliteValue::Text(value) => write_sql_string_literal(f, value.as_str()),
+        SqliteValue::Blob(value) => write_sql_blob_literal(f, value),
+    }
+}
+
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Integer(n) => write!(f, "{n}"),
-            Self::Float(v) => {
-                if v.is_nan() {
-                    // SQLite never surfaces NaN as a REAL value. Arithmetic
-                    // and register writes normalize it to SQL NULL, so the
-                    // executable SQL rendering must preserve that policy
-                    // instead of emitting the identifier `NaN`.
-                    f.write_str("NULL")
-                } else if v.is_infinite() {
-                    if v.is_sign_negative() {
-                        f.write_str("-9e999")
-                    } else {
-                        f.write_str("9e999")
-                    }
-                // Ensure a finite integral float always has a decimal point.
-                } else if v.fract() == 0.0 && !v.is_nan() {
-                    write!(f, "{v:.1}")
-                } else {
-                    write!(f, "{v}")
-                }
-            }
-            Self::String(s) => {
-                write!(f, "'{}'", s.replace('\'', "''"))
-            }
-            Self::Blob(bytes) => {
-                f.write_str("X'")?;
-                for b in bytes {
-                    write!(f, "{b:02X}")?;
-                }
-                f.write_str("'")
-            }
+            Self::Float(v) => write_sqlite_float_literal(f, *v),
+            Self::String(s) => write_sql_string_literal(f, s),
+            Self::Blob(bytes) => write_sql_blob_literal(f, bytes),
             Self::Null => f.write_str("NULL"),
             Self::True => f.write_str("TRUE"),
             Self::False => f.write_str("FALSE"),
@@ -2921,15 +2953,15 @@ mod expr_display_tests {
         );
 
         let compounds = SelectBody {
-            select: SelectCore::Values(vec![vec![integer(1)]]),
+            select: SelectCore::Values(vec![vec![integer(1)]].into()),
             compounds: vec![
                 (
                     CompoundOp::UnionAll,
-                    SelectCore::Values(vec![vec![integer(2)]]),
+                    SelectCore::Values(vec![vec![integer(2)]].into()),
                 ),
                 (
                     CompoundOp::Except,
-                    SelectCore::Values(vec![vec![integer(3)]]),
+                    SelectCore::Values(vec![vec![integer(3)]].into()),
                 ),
             ],
         };
@@ -3005,7 +3037,7 @@ mod expr_display_tests {
         let cte_query = SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(vec![vec![integer(1)]]),
+                select: SelectCore::Values(vec![vec![integer(1)]].into()),
                 compounds: Vec::new(),
             },
             order_by: Vec::new(),
@@ -3230,6 +3262,18 @@ mod expr_display_tests {
             span: Span::ZERO,
         };
         assert_eq!(negative_zero.to_string(), "-(-0.0)");
+
+        let bound = Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: Box::new(Expr::BoundOuterValue {
+                value: SqliteValue::Integer(-1),
+                collation: BoundCollation::Unspecified,
+                affinity: None,
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        };
+        assert_eq!(bound.to_string(), "-(-1)");
     }
 
     #[test]
@@ -3249,6 +3293,28 @@ mod expr_display_tests {
         assert_eq!(
             expr.to_string(),
             "value LIKE pattern ESCAPE (lower < upper)"
+        );
+    }
+
+    #[test]
+    fn bound_outer_values_render_as_safe_literals_without_metadata() {
+        let bound = |value| Expr::BoundOuterValue {
+            value,
+            collation: BoundCollation::Named("NOCASE".to_owned()),
+            affinity: Some(fsqlite_types::TypeAffinity::Text),
+            span: Span::new(7, 19),
+        };
+
+        assert_eq!(bound(SqliteValue::Null).to_string(), "NULL");
+        assert_eq!(bound(SqliteValue::Integer(-7)).to_string(), "-7");
+        assert_eq!(bound(SqliteValue::Float(1.0)).to_string(), "1.0");
+        assert_eq!(
+            bound(SqliteValue::Text("O'Brien".into())).to_string(),
+            "'O''Brien'"
+        );
+        assert_eq!(
+            bound(SqliteValue::Blob(vec![0x00, 0xAB].into())).to_string(),
+            "X'00AB'"
         );
     }
 

@@ -1368,8 +1368,11 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(e, scope);
                 }
             }
-            // Literals, placeholders, and RAISE don't need resolution.
-            Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => {}
+            // Constants, placeholders, and RAISE don't need resolution.
+            Expr::Literal(_, _)
+            | Expr::BoundOuterValue { .. }
+            | Expr::Placeholder(_, _)
+            | Expr::Raise { .. } => {}
         }
     }
 

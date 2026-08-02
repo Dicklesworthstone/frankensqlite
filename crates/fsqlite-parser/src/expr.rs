@@ -24,7 +24,7 @@ use fsqlite_ast::{
     JoinConstraint, JoinKind, JoinType, JsonArrow, LikeOp, LimitClause, Literal, NullsOrder,
     OrderingTerm, PlaceholderType, QualifiedName, RaiseAction, ResultColumn, SelectBody,
     SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery, TypeName, UnaryOp,
-    WindowDef, WindowReference, WindowSpec, WithClause,
+    ValuesClause, WindowDef, WindowReference, WindowSpec, WithClause,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -51,6 +51,54 @@ enum CachedRoot {
     UnaryPlus,
     Vector,
     ScalarSubquery,
+}
+
+fn syntactically_known_select_core_arity(core: &SelectCore) -> Option<usize> {
+    match core {
+        SelectCore::Select { columns, .. } => columns
+            .iter()
+            .all(|column| matches!(column, ResultColumn::Expr { .. }))
+            .then_some(columns.len()),
+        SelectCore::Values(rows) => {
+            let arity = rows.first()?.len();
+            rows.iter().all(|row| row.len() == arity).then_some(arity)
+        }
+    }
+}
+
+fn syntactically_known_select_arity(select: &SelectStatement) -> Option<usize> {
+    let arity = syntactically_known_select_core_arity(&select.body.select)?;
+    select
+        .body
+        .compounds
+        .iter()
+        .all(|(_, core)| syntactically_known_select_core_arity(core) == Some(arity))
+        .then_some(arity)
+}
+
+fn vector_in_list_element_arity_error(lhs: &Expr, element: &Expr) -> Option<String> {
+    let expected = match lhs {
+        Expr::RowValue(lhs_terms, _) => lhs_terms.len(),
+        Expr::Subquery(select, _) => {
+            syntactically_known_select_arity(select).filter(|arity| *arity > 1)?
+        }
+        _ => return None,
+    };
+    let actual = match element {
+        Expr::RowValue(element_terms, _) => element_terms.len(),
+        // A parenthesized SELECT inside an explicit list can itself return a
+        // row value, for example `(a, b) IN ((SELECT 1, 2))`. Its arity is a
+        // subquery semantic concern rather than a scalar list-element arity.
+        Expr::Subquery(..) => return None,
+        _ => 1,
+    };
+    if actual == expected {
+        return None;
+    }
+    let term_suffix = if actual == 1 { "" } else { "s" };
+    Some(format!(
+        "IN(...) element has {actual} term{term_suffix} - expected {expected}"
+    ))
 }
 
 #[cfg(test)]
@@ -445,11 +493,13 @@ enum ParseControl {
     ValuesRowStart {
         rows: Vec<Vec<Expr>>,
         height: u32,
+        force_union_all_from: Option<usize>,
     },
     ValuesItemDone {
         rows: Vec<Vec<Expr>>,
         row: Vec<Expr>,
         height: u32,
+        force_union_all_from: Option<usize>,
     },
     FromStart,
     FromSourceDone,
@@ -486,7 +536,7 @@ impl ParsedExpr {
                 Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
                 _,
             ) => (false, true),
-            Expr::Literal(..) => (true, false),
+            Expr::Literal(..) | Expr::BoundOuterValue { .. } => (true, false),
             _ => (false, false),
         };
         Self {
@@ -712,7 +762,9 @@ fn cached_facts_from_tasks(mut pending: Vec<CachedHeightTask<'_>>) -> CachedFact
                     Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
                     _,
                 ) => values.push(CachedFacts::leaf(false, true)),
-                Expr::Literal(..) => values.push(CachedFacts::leaf(true, false)),
+                Expr::Literal(..) | Expr::BoundOuterValue { .. } => {
+                    values.push(CachedFacts::leaf(true, false));
+                }
                 Expr::Column(column, _) if column.table.is_some() => {
                     values.push(CachedFacts {
                         height: 2,
@@ -1680,7 +1732,11 @@ impl<'a> ParseMachine<'a> {
                 mut items,
                 start,
             } => {
-                items.push(self.pop_expr()?);
+                let item = self.pop_expr()?;
+                if let Some(message) = vector_in_list_element_arity_error(&lhs.expr, &item.expr) {
+                    return Err(self.parser.err_here(message));
+                }
+                items.push(item);
                 if self.parser.eat_kind(&TokenKind::Comma) {
                     self.controls.push(ParseControl::InItemDone {
                         outer_min_bp,
@@ -2930,12 +2986,17 @@ impl<'a> ParseMachine<'a> {
                 }
                 Ok(())
             }
-            ParseControl::ValuesRowStart { rows, height } => {
+            ParseControl::ValuesRowStart {
+                rows,
+                height,
+                force_union_all_from,
+            } => {
                 self.parser.expect_token(&TokenKind::LeftParen)?;
                 self.controls.push(ParseControl::ValuesItemDone {
                     rows,
                     row: Vec::new(),
                     height,
+                    force_union_all_from,
                 });
                 self.controls.push(ParseControl::ExprStart { min_bp: 0 });
                 Ok(())
@@ -2944,23 +3005,37 @@ impl<'a> ParseMachine<'a> {
                 mut rows,
                 mut row,
                 mut height,
+                mut force_union_all_from,
             } => {
                 let expr = self.pop_expr()?;
                 height = height.max(expr.height);
                 row.push(expr.expr);
                 if self.parser.eat_kind(&TokenKind::Comma) {
-                    self.controls
-                        .push(ParseControl::ValuesItemDone { rows, row, height });
+                    self.controls.push(ParseControl::ValuesItemDone {
+                        rows,
+                        row,
+                        height,
+                        force_union_all_from,
+                    });
                     self.controls.push(ParseControl::ExprStart { min_bp: 0 });
                 } else {
                     self.parser.expect_token(&TokenKind::RightParen)?;
+                    if force_union_all_from.is_none() && self.parser.has_with {
+                        force_union_all_from = Some(rows.len());
+                    }
                     rows.push(row);
                     if self.parser.eat_kind(&TokenKind::Comma) {
-                        self.controls
-                            .push(ParseControl::ValuesRowStart { rows, height });
+                        self.controls.push(ParseControl::ValuesRowStart {
+                            rows,
+                            height,
+                            force_union_all_from,
+                        });
                     } else {
                         self.values.push(MachineValue::Core(HeightTracked {
-                            value: SelectCore::Values(rows),
+                            value: SelectCore::Values(ValuesClause::parsed(
+                                rows,
+                                force_union_all_from,
+                            )),
                             height,
                         }));
                     }
@@ -3155,6 +3230,7 @@ impl<'a> ParseMachine<'a> {
             self.controls.push(ParseControl::ValuesRowStart {
                 rows: Vec::new(),
                 height: 0,
+                force_union_all_from: None,
             });
             return Ok(());
         }
@@ -3383,6 +3459,7 @@ impl<'a> ParseMachine<'a> {
 
     fn with_start(&mut self) -> Result<(), ParseError> {
         self.parser.expect_kw(&TokenKind::KwWith)?;
+        self.parser.has_with = true;
         let recursive = self.parser.eat_kind(&TokenKind::KwRecursive);
         self.start_cte(recursive, Vec::new())
     }
@@ -4547,9 +4624,17 @@ impl Parser {
 
         let mut parsed_items = Vec::new();
         if !self.at_kind(&TokenKind::RightParen) {
-            parsed_items.push(self.parse_expr_bp(0)?);
+            let item = self.parse_expr_bp(0)?;
+            if let Some(message) = vector_in_list_element_arity_error(&lhs.expr, &item.expr) {
+                return Err(self.err_here(message));
+            }
+            parsed_items.push(item);
             while self.eat_kind(&TokenKind::Comma) {
-                parsed_items.push(self.parse_expr_bp(0)?);
+                let item = self.parse_expr_bp(0)?;
+                if let Some(message) = vector_in_list_element_arity_error(&lhs.expr, &item.expr) {
+                    return Err(self.err_here(message));
+                }
+                parsed_items.push(item);
             }
         }
         let end = self.expect_kind(&TokenKind::RightParen)?;
@@ -4903,7 +4988,8 @@ pub fn parse_expr(sql: &str) -> Result<Expr, ParseError> {
 mod tests {
     use super::*;
     use crate::parser::ParseErrorKind;
-    use fsqlite_ast::{SelectCore, TableOrSubquery};
+    use fsqlite_ast::{BoundCollation, SelectCore, TableOrSubquery};
+    use fsqlite_types::{SqliteValue, TypeAffinity};
 
     fn parse(sql: &str) -> Expr {
         match parse_expr(sql) {
@@ -4989,6 +5075,26 @@ mod tests {
             "tracked expression height diverged from the normalized AST test oracle: {sql}"
         );
         parsed.height
+    }
+
+    #[test]
+    fn bound_outer_value_has_constant_leaf_facts() {
+        let expr = Expr::BoundOuterValue {
+            value: SqliteValue::Integer(42),
+            collation: BoundCollation::Named("NOCASE".to_owned()),
+            affinity: Some(TypeAffinity::Integer),
+            span: Span::ZERO,
+        };
+
+        let parsed = ParsedExpr::leaf(expr.clone());
+        assert_eq!(parsed.height, 1);
+        assert!(parsed.is_constant);
+        assert!(!parsed.has_function);
+
+        let facts = cached_facts_from_tasks(vec![CachedHeightTask::Expr(&expr)]);
+        assert_eq!(facts.height, 1);
+        assert!(facts.is_constant);
+        assert!(!facts.has_function);
     }
 
     fn mixed_deep_expression(height: usize) -> String {
@@ -5138,6 +5244,8 @@ mod tests {
             "CASE x WHEN 1 THEN y ELSE z END",
             "x NOT BETWEEN 1 AND 2",
             "x IN (1, 2 + 3)",
+            "(SELECT 1, 2) IN ((1, 2))",
+            "(SELECT * FROM t) IN (1)",
             "x IN (SELECT y FROM t WHERE z > 0 ORDER BY y LIMIT 1)",
             "EXISTS (SELECT 1 FROM t WHERE x = y)",
             "(1, 2 + 3)",
@@ -5168,6 +5276,12 @@ mod tests {
             "transaction.x",
             "a BETWEEN 1 2",
             "a IN (1,)",
+            "(a, b) IN (1)",
+            "(a, b) IN ((1, 2), 3)",
+            "(a, b) NOT IN ((1, 2, 3))",
+            "(SELECT 1, 2) IN (1)",
+            "(SELECT 1, 2) IN ((1, 2), 3)",
+            "(SELECT 1, 2) NOT IN ((1, 2, 3))",
             "a LIKE",
             "EXISTS (SELECT)",
             "count(* ORDER BY x)",
@@ -5747,7 +5861,7 @@ mod tests {
             ("1 NOT IN (2, 3)", 3),
             ("1 IN (SELECT 1 + 2)", 3),
             ("1 IN ((SELECT 1 + 2))", 3),
-            ("(1, 2) IN (3)", 2),
+            ("(1, 2) IN ((3, 4))", 2),
             ("+1", 2),
             ("++1", 2),
             ("-+1", 2),
@@ -6100,6 +6214,134 @@ mod tests {
                 ..
             } => assert_eq!(items.len(), 3),
             other => unreachable!("expected IN list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_vector_in_list_rejects_mismatched_element_arities() {
+        for (sql, expected_message) in [
+            (
+                "(a, b, c) IN ((1, 2))",
+                "IN(...) element has 2 terms - expected 3",
+            ),
+            (
+                "(a, b) IN ((1, 2, 3))",
+                "IN(...) element has 3 terms - expected 2",
+            ),
+            ("(a, b) IN (1)", "IN(...) element has 1 term - expected 2"),
+            (
+                "(a, b) IN ((1, 2), 3)",
+                "IN(...) element has 1 term - expected 2",
+            ),
+            (
+                "(a, b) NOT IN ((1, 2), (3, 4, 5))",
+                "IN(...) element has 3 terms - expected 2",
+            ),
+            (
+                "0 AND (a, b) IN (1)",
+                "IN(...) element has 1 term - expected 2",
+            ),
+            (
+                "(SELECT 1, 2) IN (1)",
+                "IN(...) element has 1 term - expected 2",
+            ),
+            (
+                "(SELECT 1, 2) IN ((1, 2, 3))",
+                "IN(...) element has 3 terms - expected 2",
+            ),
+            (
+                "(VALUES (1, 2, 3)) IN ((1, 2))",
+                "IN(...) element has 2 terms - expected 3",
+            ),
+            (
+                "(SELECT 1, 2 UNION ALL SELECT 3, 4) NOT IN (5)",
+                "IN(...) element has 1 term - expected 2",
+            ),
+            (
+                "0 AND (SELECT 1, 2) IN (1)",
+                "IN(...) element has 1 term - expected 2",
+            ),
+        ] {
+            let error = parse_expr(sql).expect_err("mismatched vector IN arity must fail parsing");
+            assert_eq!(
+                error.kind,
+                ParseErrorKind::Syntax,
+                "unexpected kind for `{sql}`"
+            );
+            assert_eq!(
+                error.message, expected_message,
+                "unexpected error for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vector_in_list_accepts_matching_elements_and_empty_lists() {
+        for sql in [
+            "(a, b) IN ((1, 2), (3, 4))",
+            "(a, b) NOT IN ((1, 2), (3, 4))",
+            "(a, b) IN ()",
+            "(a, b) IN ((SELECT 1, 2))",
+            "(SELECT 1, 2) IN ((1, 2), (3, 4))",
+            "(VALUES (1, 2), (3, 4)) NOT IN ((1, 2))",
+            "(SELECT 1, 2 UNION ALL SELECT 3, 4) IN ((1, 2))",
+            // Star widths require schema lookup and must not be guessed here.
+            "(SELECT * FROM t) IN (1)",
+            "(SELECT t.* FROM t) IN ((1, 2, 3))",
+            // Preserve subquery column-count diagnostics for both RHS forms.
+            "(SELECT 1, 2) IN ((SELECT 1))",
+            "(SELECT 1, 2) IN (SELECT 1)",
+        ] {
+            let expr = parse_expr(sql).unwrap_or_else(|error| {
+                panic!("matching vector IN list must parse for `{sql}`: {error}")
+            });
+            assert!(
+                matches!(expr, Expr::In { .. }),
+                "unexpected AST for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_statement_parsers_reject_vector_in_list_arity_mismatches() {
+        for (sql, expected_message) in [
+            (
+                "SELECT (a, b) IN (1) FROM t",
+                "IN(...) element has 1 term - expected 2",
+            ),
+            (
+                "UPDATE t SET flag = (a, b) IN ((1, 2, 3))",
+                "IN(...) element has 3 terms - expected 2",
+            ),
+            (
+                "DELETE FROM t WHERE (a, b) NOT IN ((1, 2), 3)",
+                "IN(...) element has 1 term - expected 2",
+            ),
+            (
+                "SELECT (SELECT 1, 2) IN (1)",
+                "IN(...) element has 1 term - expected 2",
+            ),
+            (
+                "UPDATE t SET flag = (SELECT 1, 2) IN ((1, 2, 3))",
+                "IN(...) element has 3 terms - expected 2",
+            ),
+            (
+                "DELETE FROM t WHERE 0 AND (SELECT 1, 2) NOT IN ((1, 2), 3)",
+                "IN(...) element has 1 term - expected 2",
+            ),
+        ] {
+            let error = Parser::from_sql(sql)
+                .parse_statement()
+                .expect_err("statement parser must reject mismatched vector IN arity");
+            assert_eq!(
+                error.kind,
+                ParseErrorKind::Syntax,
+                "unexpected kind for `{sql}`"
+            );
+            assert_eq!(
+                error.message, expected_message,
+                "unexpected error for `{sql}`"
+            );
         }
     }
 
