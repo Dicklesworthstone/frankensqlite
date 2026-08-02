@@ -108,7 +108,6 @@ fn printf_null_format_is_null() {
 }
 
 #[test]
-#[ignore = "bd-13ivh: empty format string returns '' instead of NULL (SQLite folds empty-format-string to NULL like NULL-format)"]
 fn printf_empty_format_is_null() {
     asupersync::test_utils::run_test(|| async {
         assert_scalar(

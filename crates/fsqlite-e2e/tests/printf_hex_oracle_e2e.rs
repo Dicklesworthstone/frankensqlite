@@ -100,7 +100,6 @@ fn printf_hex_case_and_padding() {
 }
 
 #[test]
-#[ignore = "bd-w54bm: printf %#x / %#X alternate-form flag unrecognized; frank emits the format text literally instead of the 0x/0X prefix"]
 fn printf_hex_alternate_form_flag() {
     asupersync::test_utils::run_test(|| async {
         assert_scalar(
