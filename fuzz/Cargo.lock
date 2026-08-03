@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "fsqlite-types",
  "smallvec",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -702,14 +702,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-func"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "asupersync",
  "blake3",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "asupersync",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "asupersync",
  "bitflags",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "asupersync",
  "blake3",

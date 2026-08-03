@@ -1,6 +1,6 @@
 {
   "name": "@frankensqlite/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Async TypeScript SDK for FrankenSQLite browser bindings",
   "type": "module",
   "main": "dist/index.js",
@@ -16,10 +16,10 @@
     "README.md"
   ],
   "peerDependencies": {
-    "@frankensqlite/core": "^0.1.0"
+    "@frankensqlite/core": "^0.2.0"
   },
   "dependencies": {
-    "@frankensqlite/worker": "0.1.0"
+    "@frankensqlite/worker": "0.2.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
