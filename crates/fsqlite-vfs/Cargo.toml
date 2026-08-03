@@ -8,10 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["linux-asupersync-uring"]
-native = ["fsqlite-types/native", "linux-asupersync-uring"]
+default = ["native"]
+native = ["fsqlite-types/native", "dep:asupersync"]
 wasm = ["fsqlite-types/wasm"]
-linux-asupersync-uring = ["native", "dep:asupersync"]
+linux-asupersync-uring = ["native", "dep:io-uring"]
 
 [dependencies]
 smallvec = "1.15"
@@ -26,7 +26,7 @@ nix = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7.12"
+io-uring = { version = "0.7.12", optional = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 advisory-lock = "0.3.0"

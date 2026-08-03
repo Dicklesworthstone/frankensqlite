@@ -58,7 +58,7 @@ wasm-bindgen = "0.2.125"
 wasm-bindgen-futures = "0.4"
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "linux"))'.dependencies]
-fsqlite-core = { version = "0.2.0", path = "../fsqlite-core", default-features = false, features = ["linux-asupersync-uring"] }
+fsqlite-core = { version = "0.2.0", path = "../fsqlite-core", default-features = false, features = ["native"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))'.dependencies]
 fsqlite-core = { version = "0.2.0", path = "../fsqlite-core", default-features = false, features = ["native"] }
