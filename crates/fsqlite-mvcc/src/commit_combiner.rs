@@ -51,13 +51,6 @@ const SPIN_BEFORE_YIELD: u32 = 1024;
 // Metrics
 // ---------------------------------------------------------------------------
 
-static COMMIT_COMBINE_BATCHES: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_OPS: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_BATCH_SIZE_SUM: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_BATCH_SIZE_MAX: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_WAIT_NS_MAX: AtomicU64 = AtomicU64::new(0);
-
 /// Snapshot of commit combining metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct CommitCombineMetrics {
@@ -69,27 +62,55 @@ pub struct CommitCombineMetrics {
     pub wait_ns_max: u64,
 }
 
-/// Read current commit combining metrics.
-#[must_use]
-pub fn commit_combine_metrics() -> CommitCombineMetrics {
-    CommitCombineMetrics {
-        batches_total: COMMIT_COMBINE_BATCHES.load(Ordering::Relaxed),
-        ops_total: COMMIT_COMBINE_OPS.load(Ordering::Relaxed),
-        batch_size_sum: COMMIT_COMBINE_BATCH_SIZE_SUM.load(Ordering::Relaxed),
-        batch_size_max: COMMIT_COMBINE_BATCH_SIZE_MAX.load(Ordering::Relaxed),
-        wait_ns_total: COMMIT_COMBINE_WAIT_NS_TOTAL.load(Ordering::Relaxed),
-        wait_ns_max: COMMIT_COMBINE_WAIT_NS_MAX.load(Ordering::Relaxed),
-    }
+/// Per-combiner metric recorder.
+///
+/// Keeping these counters beside their owning combiner makes a test or
+/// diagnostic snapshot independent of unrelated database instances. The
+/// recording work is unchanged from the former process-global counters.
+struct CommitCombineMetricRecorder {
+    batches_total: AtomicU64,
+    ops_total: AtomicU64,
+    batch_size_sum: AtomicU64,
+    batch_size_max: AtomicU64,
+    wait_ns_total: AtomicU64,
+    wait_ns_max: AtomicU64,
 }
 
-/// Reset metrics (for tests).
-pub fn reset_commit_combine_metrics() {
-    COMMIT_COMBINE_BATCHES.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_OPS.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_BATCH_SIZE_SUM.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_BATCH_SIZE_MAX.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_WAIT_NS_MAX.store(0, Ordering::Relaxed);
+impl CommitCombineMetricRecorder {
+    const fn new() -> Self {
+        Self {
+            batches_total: AtomicU64::new(0),
+            ops_total: AtomicU64::new(0),
+            batch_size_sum: AtomicU64::new(0),
+            batch_size_max: AtomicU64::new(0),
+            wait_ns_total: AtomicU64::new(0),
+            wait_ns_max: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> CommitCombineMetrics {
+        CommitCombineMetrics {
+            batches_total: self.batches_total.load(Ordering::Relaxed),
+            ops_total: self.ops_total.load(Ordering::Relaxed),
+            batch_size_sum: self.batch_size_sum.load(Ordering::Relaxed),
+            batch_size_max: self.batch_size_max.load(Ordering::Relaxed),
+            wait_ns_total: self.wait_ns_total.load(Ordering::Relaxed),
+            wait_ns_max: self.wait_ns_max.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_wait(&self, elapsed_ns: u64) {
+        self.wait_ns_total.fetch_add(elapsed_ns, Ordering::Relaxed);
+        update_max(&self.wait_ns_max, elapsed_ns);
+    }
+
+    fn record_batch(&self, pending_count: u64) {
+        self.batches_total.fetch_add(1, Ordering::Relaxed);
+        self.ops_total.fetch_add(pending_count, Ordering::Relaxed);
+        self.batch_size_sum
+            .fetch_add(pending_count, Ordering::Relaxed);
+        update_max(&self.batch_size_max, pending_count);
+    }
 }
 
 fn update_max(metric: &AtomicU64, val: u64) {
@@ -156,6 +177,8 @@ pub struct CommitSequenceCombiner {
     /// this registry before signaling waiters, ensuring sequences are registered
     /// as active atomically with allocation (no gap for `finish_commit_seq`).
     active_registry: Option<Arc<Mutex<SmallVec<[u64; 16]>>>>,
+    /// Instance-local observability for this combiner's batches and wait time.
+    metrics: CommitCombineMetricRecorder,
 }
 
 impl CommitSequenceCombiner {
@@ -167,6 +190,7 @@ impl CommitSequenceCombiner {
             owners: std::array::from_fn(|_| AtomicU64::new(0)),
             combiner_lock: Mutex::new(()),
             active_registry: None,
+            metrics: CommitCombineMetricRecorder::new(),
         }
     }
 
@@ -186,6 +210,7 @@ impl CommitSequenceCombiner {
             owners: std::array::from_fn(|_| AtomicU64::new(0)),
             combiner_lock: Mutex::new(()),
             active_registry: Some(registry),
+            metrics: CommitCombineMetricRecorder::new(),
         }
     }
 
@@ -228,6 +253,12 @@ impl CommitSequenceCombiner {
             .iter()
             .filter(|o| o.load(Ordering::Relaxed) != 0)
             .count()
+    }
+
+    /// Snapshot metric counters for this combiner instance only.
+    #[must_use]
+    pub fn metrics(&self) -> CommitCombineMetrics {
+        self.metrics.snapshot()
     }
 
     /// Claim a temporary slot for one-shot allocation.
@@ -299,8 +330,7 @@ impl CommitSequenceCombiner {
 
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ns = start.elapsed().as_nanos() as u64;
-        COMMIT_COMBINE_WAIT_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
-        update_max(&COMMIT_COMBINE_WAIT_NS_MAX, elapsed_ns);
+        self.metrics.record_wait(elapsed_ns);
 
         seq
     }
@@ -378,10 +408,7 @@ impl CommitSequenceCombiner {
         debug_assert_eq!(assigned, pending_count);
 
         // Update metrics.
-        COMMIT_COMBINE_BATCHES.fetch_add(1, Ordering::Relaxed);
-        COMMIT_COMBINE_OPS.fetch_add(pending_count, Ordering::Relaxed);
-        COMMIT_COMBINE_BATCH_SIZE_SUM.fetch_add(pending_count, Ordering::Relaxed);
-        update_max(&COMMIT_COMBINE_BATCH_SIZE_MAX, pending_count);
+        self.metrics.record_batch(pending_count);
 
         tracing::debug!(
             target: "fsqlite.commit_combine",
@@ -447,8 +474,7 @@ impl CommitCombineHandle<'_> {
 
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
-                COMMIT_COMBINE_WAIT_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
-                update_max(&COMMIT_COMBINE_WAIT_NS_MAX, elapsed_ns);
+                self.combiner.metrics.record_wait(elapsed_ns);
 
                 return CommitSeq::new(seq);
             }
@@ -527,6 +553,52 @@ mod tests {
 
         drop(handle);
         assert_eq!(combiner.next_seq(), 103);
+    }
+
+    #[test]
+    fn test_combiner_reduces_atomic_ops() {
+        let combiner = CommitSequenceCombiner::new(100);
+
+        // Stage a full batch before a single combining cycle. This avoids any
+        // scheduler-dependent race between request publication and combining.
+        for slot in combiner.slots.iter().take(8) {
+            slot.state.store(SLOT_PENDING, Ordering::Release);
+        }
+        let guard = combiner.combiner_lock.lock();
+        combiner.combine_locked();
+        drop(guard);
+
+        let metrics = combiner.metrics();
+        assert_eq!(metrics.ops_total, 8);
+        assert_eq!(metrics.batches_total, 1);
+        assert_eq!(metrics.batch_size_sum, 8);
+        assert_eq!(metrics.batch_size_max, 8);
+        assert_eq!(combiner.next_seq(), 108);
+
+        // Eight direct allocations would require eight fetch_add operations;
+        // the staged batch performs exactly one allocation operation.
+        assert!(metrics.batches_total < metrics.ops_total);
+    }
+
+    #[test]
+    fn test_combiner_metrics_are_instance_local() {
+        let active = CommitSequenceCombiner::new(0);
+        let untouched = CommitSequenceCombiner::new(0);
+
+        active.alloc_one_shot();
+
+        assert_eq!(active.metrics().ops_total, 1);
+        assert_eq!(
+            untouched.metrics(),
+            CommitCombineMetrics {
+                batches_total: 0,
+                ops_total: 0,
+                batch_size_sum: 0,
+                batch_size_max: 0,
+                wait_ns_total: 0,
+                wait_ns_max: 0,
+            }
+        );
     }
 
     #[test]

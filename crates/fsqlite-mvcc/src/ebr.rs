@@ -1513,6 +1513,30 @@ mod tests {
     }
 
     #[test]
+    fn test_ebr_no_gc_pauses() {
+        let registry = Arc::new(VersionGuardRegistry::default());
+        let queue = EbrRetireQueue::new();
+        let reader = VersionGuard::pin(Arc::clone(&registry));
+        let retired = VersionIdx::new(1, 2, 3);
+
+        queue.retire(retired, registry.current_epoch());
+        let blocked = queue.drain_if_safe(registry.advance_epoch(), registry.min_pinned_epoch());
+        assert!(
+            blocked.is_empty(),
+            "a live reader retains the staged retirement"
+        );
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.total_retired(), 1);
+        assert_eq!(queue.total_recycled(), 0);
+
+        drop(reader);
+        let recycled = queue.drain_if_safe(registry.advance_epoch(), registry.min_pinned_epoch());
+        assert_eq!(recycled, vec![retired]);
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(queue.total_recycled(), 1);
+    }
+
+    #[test]
     fn ebr_retire_queue_multiple_epochs() {
         let queue = EbrRetireQueue::new();
 
