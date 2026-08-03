@@ -469,7 +469,7 @@ If the record exceeds the page's usable space minus overhead, the excess spills 
 
 When an INSERT would cause a leaf page to exceed capacity:
 
-1. Allocate a new page from the freelist (or extend the database file).
+1. Allocate a snapshot-safe reusable page from the freelist (or extend the database file).
 2. Find the median cell by accumulated payload size (not count), favoring a split point that keeps the new cell on the less-full side.
 3. Move cells above the median to the new page.
 4. Insert a new cell in the parent interior page pointing to the new page. If the parent overflows, recurse upward.
@@ -490,7 +490,7 @@ Each cursor maintains a stack of `(page_number, cell_index)` pairs representing 
 
 ### Freelist Management
 
-Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. When allocating, pages are drawn from the freelist first. VACUUM rewrites the entire database to reclaim freelist space and defragment pages.
+Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. Default file-backed concurrent transactions do not reuse committed free pages at or below the current database size, even when no reader is active; snapshot-safe versioned reclamation is not yet implemented ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)), so steady-state churn may grow the file. VACUUM rewrites the entire database to reclaim freelist space and defragment pages.
 
 ---
 

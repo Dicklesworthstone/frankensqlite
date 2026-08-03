@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.2.0] -- Unreleased (async storage stack, adaptive skip-scan execution, durable WAL certificates)
+## [0.2.0] -- Unreleased (async storage stack, adaptive skip-scan execution, parallel-WAL durability certificates)
 
 Next full-workspace lockstep release (`0.1.19 -> 0.2.0`).
 
@@ -82,8 +82,11 @@ Next full-workspace lockstep release (`0.1.19 -> 0.2.0`).
 - **Batched async VFS I/O.** New batched read/write traits with an io_uring
   backend and fault-injection coverage, multiplexed through canonical
   descriptors with preserved uring-to-Unix fallback semantics.
-- **Durable-certificate parallel WAL publication**, including a db-fsync
-  recovery fence before WAL truncation over an async checkpoint target.
+- **Durable-certificate parallel WAL publication for the certificate/checkpoint
+  path**, including a db-fsync recovery fence before WAL truncation over an
+  async checkpoint target. This does not yet provide a cross-process
+  `PerCommit` durable-visibility fence for the WAL-adapter path
+  ([#187](https://github.com/Dicklesworthstone/frankensqlite/issues/187)).
 - **Durable `.fsqlite-history` commit-snapshot sidecar** for MVCC.
 - `Connection::open_existing_schema_only` and identity/environment variants
   provide an existing-only, writable database open that loads schema metadata
@@ -139,7 +142,10 @@ Next full-workspace lockstep release (`0.1.19 -> 0.2.0`).
 - `WITHOUT ROWID` index locators are preserved across schema reload.
 - `REPLACE` now removes victim rows from *all* indexes, not just the one that
   detected the conflict.
-- `VACUUM INTO` preserves `UNIQUE` constraints.
+- `VACUUM INTO` preserves `UNIQUE` constraints for quiescent source and target
+  databases. It does not yet provide a receipt-bound single-generation source
+  snapshot or candidate-content compare-and-swap under cooperating concurrent
+  writers ([#141](https://github.com/Dicklesworthstone/frankensqlite/issues/141)).
 - An invalid WAL header is treated as an empty WAL, matching stock SQLite
   ([#292](https://github.com/Dicklesworthstone/frankensqlite/issues/292)).
 - Explicit `INDEXED BY` is honored in the composite prefix-range seek
@@ -428,7 +434,7 @@ lossy values.
   regression reproduces the reported leaf geometry, closes FrankenSQLite,
   reopens the database with stock SQLite, and requires all rows plus
   `PRAGMA integrity_check = 'ok'`.
-- **`VACUUM` is now failure-atomic for explicit reserved-prefix indexes and
+- **In-place `VACUUM` is now failure-atomic for explicit reserved-prefix indexes and
   database-image replacement**
   ([#138](https://github.com/Dicklesworthstone/frankensqlite/issues/138)).
   `sqlite_autoindex_*` entries are considered implicit only when their stored
@@ -436,7 +442,7 @@ lossy values.
   that table, preserving explicit index definitions even under
   reserved-looking names. Rebuilt images are receipt-bound, reopened, and
   required to pass both `quick_check` and `integrity_check` before publication.
-  Repeated, shrinking, and non-empty-WAL `VACUUM` operations reopen
+  Repeated, shrinking, and non-empty-WAL in-place `VACUUM` operations reopen
   successfully with both FrankenSQLite and stock SQLite.
 - **Rollback-journal publication and recovery now fail closed under partial
   writes, silent corruption, cancellation, and cleanup failures.** Candidate
