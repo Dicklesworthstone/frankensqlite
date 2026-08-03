@@ -431,7 +431,7 @@ fn persistent_phase_capture_provenance(
             .filter(|hostname| !hostname.is_empty())
             .or_else(|| read_trimmed_file("/etc/hostname")),
         kernel_release: read_trimmed_file("/proc/sys/kernel/osrelease"),
-        criterion_emission_scope: "one final sample per engine is retained in memory during Criterion execution and written only after group.finish(); warmup and measurement phases are not distinguished by this harness".to_owned(),
+        criterion_emission_scope: "every completed iteration sample is captured after its run_wall is fixed; all capture, logging, hashing, serialization, and IO are excluded from the Duration returned to Criterion; warmup and measurement phases are not distinguished by this harness".to_owned(),
     })
 }
 

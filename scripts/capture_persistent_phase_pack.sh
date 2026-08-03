@@ -226,7 +226,33 @@ validate_benchmark_timing_contract() {
     [[ "$capture_sites" == "2" ]] \
         || die "expected exactly two phase-capture sites (one per engine arm), found ${capture_sites}"
 
+    validate_emission_scope_is_truthful
     validate_frankensqlite_reset_before_timing
+}
+
+# The emitted provenance must describe what the harness actually does. The
+# earlier text claimed one sample per engine was retained and written only after
+# `group.finish()`; custom timing instead writes every completed sample as soon
+# as its `run_wall` is fixed. A stale claim here is worse than none, because the
+# receipt is what a reader trusts when the code is no longer in front of them.
+#
+# These tokens are checked against the whole benchmark source rather than the
+# timed region: the provenance builder sits above the engine arms.
+validate_emission_scope_is_truthful() {
+    local source_file="$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs"
+    local source
+    source="$(cat "$source_file")"
+    local after_run_wall excluded_from_duration stale_group_finish
+    after_run_wall="$(count_fixed_occurrences 'captured after its run_wall is fixed' "$source")"
+    excluded_from_duration="$(count_fixed_occurrences 'excluded from the Duration returned to Criterion' "$source")"
+    stale_group_finish="$(count_fixed_occurrences 'written only after group.finish()' "$source")"
+
+    (( after_run_wall >= 1 )) \
+        || die "provenance does not state that samples are captured after run_wall is fixed"
+    (( excluded_from_duration >= 1 )) \
+        || die "provenance does not state that capture work is excluded from the returned Duration"
+    [[ "$stale_group_finish" == "0" ]] \
+        || die "provenance still carries the stale group.finish() emission claim"
 }
 
 validate_citation_contract() {
@@ -598,7 +624,9 @@ verify_run_artifacts() {
          .concurrency == $expected_threads and
          .rows_per_thread == $expected_rows and
          .synchronous == "NORMAL" and
-         (.criterion_emission_scope | contains("written only after group.finish()"))' \
+         (.criterion_emission_scope | contains("captured after its run_wall is fixed")) and
+         (.criterion_emission_scope
+            | contains("excluded from the Duration returned to Criterion"))' \
         "$provenance" >/dev/null \
         || die "${thread_count}t provenance lacks the required binary SHA-256/build-nonce/workload binding"
     grep -F -- "--sample-size ${CRITERION_SAMPLE_SIZE}" "$run_dir/criterion_stdout.log" >/dev/null \
