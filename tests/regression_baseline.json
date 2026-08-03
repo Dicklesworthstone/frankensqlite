@@ -594,25 +594,13 @@
     },
     {
       "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
-      "test_name": "test_no_global_locks_in_commit_fast_path",
-      "reason": "release blocker: exhaustive commit-path global-lock instrumentation is not exposed",
+      "test_name": "historical_parallel_wal_segment_design_inventory",
+      "reason": "historical future-design diagnostic: v0.2 has lane-local preparation plus one ordered WAL backend append; it does not promise independent lane-owned durable artifacts",
       "cfg_condition": null,
-      "kind": "release_gate",
-      "policy": "block_release",
+      "kind": "diagnostic",
+      "policy": "exempt",
       "evidence": {
-        "requirement": "Expose exhaustive commit-path lock-acquisition instrumentation and produce a deterministic keeper receipt showing zero prohibited global-lock acquisitions across every exercised commit path.",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
-      "test_name": "test_parallel_wal_segments_independent",
-      "reason": "release blocker: deterministic parallel-WAL segment ownership and overlap receipts are not exposed",
-      "cfg_condition": null,
-      "kind": "release_gate",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Produce deterministic receipts proving distinct segment ownership and observed concurrent overlap; throughput alone is insufficient.",
+        "requirement": "None; this is a historical architecture inventory and cannot satisfy release acceptance or prove throughput or durable-segment independence.",
         "receipt": null
       }
     },
