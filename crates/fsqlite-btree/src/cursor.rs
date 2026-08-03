@@ -12031,13 +12031,26 @@ mod tests {
     struct CancelAfterFirstOverflowFreeStore {
         inner: Rc<RefCell<MemPageStore>>,
         cancelled: Rc<RefCell<bool>>,
+        /// Context that this store cancels once overflow cleanup has begun.
+        ///
+        /// This must be an explicit clone of the caller's transaction context,
+        /// not the `&Cx` handed to `free_page`. `free_overflow_chain` runs the
+        /// cleanup loop on a masked *child* context (`Cx::create_child`), and
+        /// per `INV-CANCEL-PROPAGATES` cancellation flows only parent -> child.
+        /// Cancelling the child would therefore be invisible to the caller and
+        /// would prove nothing about the masking contract. Cancelling the
+        /// parent instead reproduces a real mid-chain interrupt: it propagates
+        /// down into the masked cleanup context, which must still finish the
+        /// chain, and remains observable on the caller afterwards.
+        cancel_target: Cx,
     }
 
     impl CancelAfterFirstOverflowFreeStore {
-        fn new(inner: Rc<RefCell<MemPageStore>>) -> Self {
+        fn new(inner: Rc<RefCell<MemPageStore>>, cancel_target: Cx) -> Self {
             Self {
                 inner,
                 cancelled: Rc::new(RefCell::new(false)),
+                cancel_target,
             }
         }
     }
@@ -12090,7 +12103,10 @@ mod tests {
 
                 let mut cancelled = self.cancelled.borrow_mut();
                 if !*cancelled {
-                    cx.cancel();
+                    // Cancel the caller's context, not `cx`: `cx` is the masked
+                    // cleanup child, and cancelling it would not be observable
+                    // by the caller. See `cancel_target`.
+                    self.cancel_target.cancel();
                     *cancelled = true;
                 }
                 Ok(())
@@ -15176,7 +15192,13 @@ mod tests {
             base.init_leaf_table_root(root_page);
             let shared = Rc::new(RefCell::new(base));
 
-            let store = CancelAfterFirstOverflowFreeStore::new(Rc::clone(&shared));
+            // The delete context must exist before the store so the store can
+            // hold a clone of it as its cancellation target; cancelling the
+            // masked cleanup child it is handed at `free_page` time would be
+            // invisible to this caller.
+            let delete_cx = Cx::new();
+            let store =
+                CancelAfterFirstOverflowFreeStore::new(Rc::clone(&shared), delete_cx.clone());
             let mut cursor = BtCursor::new(store, root_page, USABLE, true);
 
             let insert_cx = Cx::new();
@@ -15189,7 +15211,6 @@ mod tests {
                 "test requires a multi-page overflow chain, found pages {pages_before:?}"
             );
 
-            let delete_cx = Cx::new();
             assert!(
                 cursor
                     .table_move_to(&delete_cx, 7)
