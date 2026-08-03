@@ -1,0 +1,720 @@
+# Selective Turso Testing Adaptation Plan
+
+Status: proposed
+
+Research date: 2026-08-03
+
+FrankenSQLite baseline: local `main` at the start of this investigation
+
+Turso source baseline: commit
+[`19d1952c62b17012cba6392e14581b48db05ec1e`](https://github.com/tursodatabase/turso/commit/19d1952c62b17012cba6392e14581b48db05ec1e)
+(2026-08-03)
+
+Design comparison source: [May 9, 2026 X post](https://x.com/doodlestein/status/2052922541367291929)
+
+## 1. Decision
+
+Selectively adapt Turso's test-system ideas. Do not port the `testing/`
+directory, vendor its runners, or treat its expected results as authoritative
+without independent review.
+
+The highest-value additions are:
+
+1. A test-only, typed, capability-aware SQL generator that feeds the existing
+   FrankenSQLite differential, replay, minimization, and corpus pipelines.
+2. Transaction-history capture plus a serializability oracle for deterministic
+   concurrent-writer campaigns. Turso's Elle history work is useful as a
+   transport and workload reference, but its snapshot-isolation acceptance
+   model is too weak for FrankenSQLite's SSI contract.
+3. A small external-oracle lane using SQLancer first, with SQLRight evaluated
+   separately, to add generator and oracle independence.
+4. Coverage accounting that joins generator capabilities to the existing
+   supported-surface and feature ledgers.
+
+The following should not be adopted as-is:
+
+- Turso's Tokio-based `sqltest` runner or any Tokio dependency.
+- Turso MVCC assumptions, file formats, lock rules, transaction modes, or
+  snapshot-isolation acceptance thresholds.
+- A second failure-bundle, replay, seed, corpus, or minimization subsystem.
+- Broad copying of Turso test cases without scope, provenance, and value
+  classification.
+- Product-specific JavaScript, Go, PostgreSQL, cloud, or Turso extension tests
+  unless the corresponding FrankenSQLite surface is explicitly in scope.
+
+This is an accretive program only if each adopted piece proves that it finds
+new defect classes or materially improves reduction/replay. Test-count growth
+is not a success metric.
+
+## 2. Research Basis
+
+### 2.1 Sources read
+
+The assessment used the complete FrankenSQLite `AGENTS.md` and `README.md`, the
+current architecture and test infrastructure, the canonical parity contracts,
+CI workflows, the X comparison post, and Turso's current `testing/` tree pinned
+to the commit above.
+
+Primary Turso sources include:
+
+- [`testing/`](https://github.com/tursodatabase/turso/tree/19d1952c62b17012cba6392e14581b48db05ec1e/testing)
+- [`testing/simulator/README.md`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/simulator/README.md)
+- [`testing/simulator/COVERAGE.md`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/simulator/COVERAGE.md)
+- [`testing/concurrent-simulator/README.md`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/concurrent-simulator/README.md)
+- [`testing/concurrent-simulator/properties.rs`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/concurrent-simulator/properties.rs)
+- [`testing/concurrent-simulator/elle.rs`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/concurrent-simulator/elle.rs)
+- [`testing/concurrent-simulator/yield_injection.rs`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/concurrent-simulator/yield_injection.rs)
+- [`testing/differential-oracle/sql_gen`](https://github.com/tursodatabase/turso/tree/19d1952c62b17012cba6392e14581b48db05ec1e/testing/differential-oracle/sql_gen)
+- [`testing/sqltest/docs`](https://github.com/tursodatabase/turso/tree/19d1952c62b17012cba6392e14581b48db05ec1e/testing/sqltest/docs)
+- [`testing/sqlancer/README.md`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/sqlancer/README.md)
+- [`testing/sqlright/README.md`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/sqlright/README.md)
+- [`testing/antithesis/README.md`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/testing/antithesis/README.md)
+- [`LICENSE.md`](https://github.com/tursodatabase/turso/blob/19d1952c62b17012cba6392e14581b48db05ec1e/LICENSE.md)
+
+The pinned `testing/` tree contains 373 entries across differential generation,
+deterministic simulation, concurrent simulation, a declarative SQL runner,
+SQLancer, SQLRight, Antithesis, stress tools, CLI/system/conformance tests, and
+support code. The count is an inventory fact, not an adoption target.
+
+### 2.2 Time-sensitive interpretation
+
+The X post is a design comparison from 2026-05-09. It is useful for the
+project-level distinction between FrankenSQLite's page-level SSI/default
+concurrent-writer goal and Turso's then-described logical MVCC/snapshot
+isolation work. Turso has changed since that post. Current source is the
+authority for what Turso's tests do now; FrankenSQLite's checked-in contracts
+are the authority for what FrankenSQLite must prove.
+
+The post also discusses broader semantic intent merging. Current FrankenSQLite
+documentation says the safe merge ladder is dormant/test-only and the live path
+aborts/retries on same-page drift. Concurrency tests must assert that live
+behavior until a separately reviewed implementation and contract change enables
+more of the ladder; they must not turn a design aspiration into a current claim.
+
+This plan therefore borrows test methods, not architectural conclusions.
+
+## 3. FrankenSQLite Baseline
+
+This is not a greenfield test effort. Existing infrastructure already covers
+most of the mechanics that a naive port would duplicate.
+
+### 3.1 Existing assets to extend
+
+| Capability | Existing owner | Consequence for this plan |
+|---|---|---|
+| Differential execution against C SQLite | `fsqlite-harness::differential_v2` and E2E executors | New generators must emit the existing envelope. |
+| Seeded workload generation | `fsqlite-e2e::workload` | Reuse seed derivation and operation logs. |
+| Corpus normalization and coverage | `fsqlite-harness::corpus_ingest` | Imported or generated cases become corpus entries. |
+| Replay and failure bundles | `replay_harness`, `failure_bundle` | Extend bundle schemas; do not fork them. |
+| Mismatch minimization | `mismatch_minimizer` | Add structured reducers behind the existing interface. |
+| Metamorphic testing | `metamorphic` | Typed generation complements, rather than replaces, transformations. |
+| Adversarial campaigns | `adversarial_search` | External generators are additional campaign producers. |
+| Deterministic runtime and faults | `FsLab`, `LabRuntime`, `FaultVfs` | Use asupersync scheduling and VFS faults. |
+| Parity scope | `docs/canonical_parity_contract.md` and TOML contracts | Generation is scope-driven and fail-closed. |
+| CI target accounting | current verification workflows | New lanes must be discoverable, budgeted, and artifact-producing. |
+
+The current test-realism inventory reports a very large suite spanning unit,
+memory-backed, file-backed, end-to-end, and property tests. Its numeric totals
+must be refreshed before this campaign uses them as a baseline. The key point
+is already verified from the tree: hundreds of integration targets and mature
+harness modules exist, so one-file-per-import expansion would make CI worse.
+
+### 3.2 Architecture-sensitive test requirements
+
+Every new test must declare the execution lane it intends to exercise.
+`Connection` currently dispatches work among pager-backed/direct-VDBE and
+selected compatibility/fallback paths. A result can be correct while missing
+the storage, planner, VDBE, WAL, or MVCC code the test claims to validate.
+
+Required lane evidence:
+
+- `sql_result_only`: semantic SQL comparison may use the normal public path.
+- `pager_backed_required`: the test fails if it falls back to `MemDatabase` or
+  another compatibility-only lane.
+- `planner_required`: the test proves planner participation.
+- `vdbe_required`: the test proves VDBE bytecode execution.
+- `mvcc_required`: concurrent mode remains enabled and page-level MVCC is
+  exercised.
+- `recovery_required`: the scenario crosses real file/WAL close, crash, and
+  reopen boundaries.
+
+The lane identifier and fallback reason belong in failure bundles and coverage
+reports. Storage and concurrency campaigns must fail closed when their required
+lane was not observed.
+
+### 3.3 Non-negotiable invariants
+
+1. `BEGIN` continues to promote to concurrent mode by default.
+2. No SQLite-style global writer serialization is introduced.
+3. Async work uses asupersync with explicit `Cx`; Tokio and its ecosystem are
+   forbidden even in new first-party test tooling.
+4. The current target is SQLite 3.52.0 and encoding 1 (UTF-8).
+5. Excluded or partial features remain excluded or partial unless a separate
+   implementation decision changes the canonical contract.
+6. Test adapters may not silently normalize away type, error, order, or
+   transaction-outcome differences.
+7. A failed/aborted transaction is part of the concurrency history, not noise.
+
+## 4. Turso Portfolio Portability Matrix
+
+| Turso area | Distinct value | Existing overlap | Decision | Priority |
+|---|---|---|---|---|
+| `differential-oracle/sql_gen` | Independent typed AST, hard capabilities, weighted policy, generation trace, proptest strategies | Existing differential runner and string/workload generation, but no equivalently broad typed SQL generator was found | Adapt concepts into the existing harness; keep a test-owned AST independent of production AST | P0 |
+| `simulator` | Stateful interaction plans, model properties, double-check mode, plan shrink, bugbase, I/O profiles | Strong overlap in `FsLab`, corpus, replay, minimizer, FaultVfs | Adapt stateful-plan and hierarchical reduction ideas only | P0/P1 |
+| `concurrent-simulator` (Whopper) | Operation histories, deterministic yield selection, multiprocess restarts, inline invariants, Elle export | Existing seeded concurrent workloads, crash tests, LabRuntime work, pending DPOR bead | Adapt history schema and oracle integration; coordinate with existing DPOR work | P0/P1 |
+| Elle integration | Independent anomaly analysis | No named Elle integration found | Pilot serializability checking; never use snapshot isolation as the acceptance model | P0 |
+| `sqltest` DSL | Readable cases, isolated DBs, setup reuse, comparison modes, capability annotations, snapshot support | JSON conformance fixtures, Rust integration tests, snapshots, target accounting | Run a bounded format pilot; do not port the Tokio runner | P1, gated |
+| SQLancer | Independent query synthesis and metamorphic/query-partitioning oracles | No integration found | Add a pinned, time-bounded external campaign after a provider spike | P1 |
+| SQLRight | Coverage-guided mutation plus NoREC/TLP/index oracles | No integration found; high toolchain cost | Separate feasibility and value gate after SQLancer | P2 |
+| Antithesis | Deterministic external fault exploration and multiverse debugging | Strong local deterministic/fault infrastructure; service access required | Optional feasibility spike only; local campaign must remain authoritative | P2 |
+| `unreliable-libc` | Faults below the VFS abstraction | FaultVfs already covers deterministic logical I/O faults | Unix-native VFS gap experiment, not a default lane | P2 |
+| Rust stress/Shuttle | Scheduling perturbation and long-running mixed workloads | asupersync LabRuntime is mandatory and better aligned | Mine workload shapes; reject Shuttle/Tokio runtime code | P1 ideas only |
+| CLI tests | End-user shell behavior | FrankenSQLite CLI parity is partial and already tracked | Import only confirmed gaps into the existing CLI harness | P2 |
+| system/TCL/large DB fixtures | Broad legacy and file-format cases | SQLite corpus/TCL accounting and generated DB tests already exist | Deduplicate; import only missing, in-scope cases | P2 |
+| JS conformance and Go stress | Binding/product coverage | Different product surface | Defer until those APIs are declared targets | Not now |
+| Turso extensions and MVCC format tests | Turso-specific behavior | Architectural mismatch | Reject | Never |
+
+## 5. What To Borrow, Precisely
+
+### 5.1 Typed SQL generation
+
+Build a harness-owned generator, not a production parser helper. Using a
+separate test AST preserves oracle independence and allows syntactically valid,
+schema-aware generation without coupling expected behavior to production AST
+logic.
+
+The generator contract should include:
+
+- A deterministic seed and stable derivation algorithm.
+- Schema state updated only after an operation is accepted by both engines.
+- Hard capabilities derived from canonical support state.
+- Weighted profiles for read-only, DML, DDL, transaction-heavy, expression,
+  planner, VDBE, and MVCC workloads.
+- Maximum AST depth, statement count, row count, value size, and execution
+  budget.
+- A generation trace listing every selected construct and origin path.
+- Feature IDs from `supported_surface_matrix.toml`,
+  `feature_universe_ledger.toml`, and `parity_taxonomy.toml`.
+- Required execution lane and forbidden fallbacks.
+- Strict result/error/transaction comparison policy.
+
+Do not copy Turso's capability table directly. Generate FrankenSQLite's table
+from its canonical contracts or validate a checked-in table against them.
+`supported`, `partial`, and `excluded` are distinct states:
+
+- `supported`: eligible for required differential pass/fail coverage.
+- `partial`: eligible only in a named profile with explicit expected gaps.
+- `excluded`: generator rejects it unless a feature-development campaign opts
+  in under a separate bead.
+
+The first profile should deliberately be narrow: core tables, indexes, DML,
+expressions, joins, aggregates, subqueries/compound SELECT where declared, and
+transactions. DDL churn, partial extensions, window functions, maintenance
+PRAGMAs, and recovery sequences enter later profiles.
+
+### 5.2 Structured reduction
+
+The existing minimizer removes workload statements. Extend it with reducers
+that understand generated structure:
+
+1. Remove transactions or statements while preserving setup dependencies.
+2. Remove clauses, joins, projections, predicates, order terms, and indexes.
+3. Replace expressions with children or typed literals.
+4. Reduce table/column cardinality and value sizes.
+5. Reduce schedule events, yield points, crash points, and worker count.
+6. Revalidate the exact mismatch signature after every reduction.
+
+The existing failure bundle remains canonical. Add original and minimized AST
+traces, generator profile hash, lane evidence, schedule, environment, and
+upstream provenance. A minimized case must replay through the public verifier,
+not only an in-memory reducer callback.
+
+### 5.3 Stateful deterministic simulation
+
+Adapt Turso's interaction-plan concept as a producer for FrankenSQLite's
+existing operation log. Each plan maintains independent model state and emits
+preconditions, operation, expected state transition, and postconditions.
+
+Initial properties:
+
+- successful committed rows do not disappear absent a modeled delete;
+- rollback and savepoint rollback leave no unmodeled effects;
+- uniqueness, foreign-key, and index state agree with table state;
+- reopen preserves committed state and discards uncommitted state;
+- `integrity_check` remains clean where supported;
+- differential result and error categories agree under the existing strict
+  comparator;
+- required execution lane was observed.
+
+FrankenSQLite should not inherit Turso simulator behavior that treats two
+arbitrary errors as equivalent. Error-category comparison must be explicit and
+unknown pairs must be mismatches requiring classification.
+
+### 5.4 Concurrent histories and serializability
+
+Use a small, typed transaction history independent of tracing text:
+
+- run ID, seed, schedule ID, process/connection/transaction IDs;
+- invocation and completion logical times;
+- begin mode actually selected;
+- reads with observed values or versions;
+- writes with keys/pages when observable;
+- commit, rollback, cancellation, retry, and conflict outcomes;
+- crash/restart/checkpoint events;
+- required/observed execution lane;
+- final logical state and integrity evidence.
+
+The first oracle should target histories that are cheap to check independently:
+read/write registers, append-only lists, bank transfers, unique allocation, and
+write-skew patterns. Acceptance is serializability/SSI plus the documented
+first-committer-wins behavior, not snapshot isolation.
+
+An Elle adapter is useful only if a pinned checker can evaluate the intended
+serializable model and its handling of aborted/unknown transactions is verified
+against golden histories. Otherwise, build or reuse a small internal
+serialization-graph checker and optionally export Elle EDN as a secondary
+diagnostic.
+
+Coordinate schedule exploration with existing beads `bd-2lt76` and
+`bd-28z4i.5`. This campaign owns SQL-level history semantics and workload
+oracles; those beads own LabRuntime determinism and DPOR machinery. No new
+runtime or scheduler should be created here.
+
+### 5.5 Multiprocess and fault campaigns
+
+After in-process histories are stable, run the same operation schema across
+multiple processes using real files. Start with bounded cases:
+
+- two processes with disjoint-page writes;
+- two processes with same-page conflicts;
+- process death before/after WAL publication and commit acknowledgement;
+- checkpoint racing readers and writers;
+- reopen after killed writer;
+- cancellation at reserved asupersync yield points.
+
+Fault schedules must be seed-derived and replayable. Prefer FaultVfs and
+LabRuntime hooks. A native syscall or allocator-fault lane requires a separate
+design review because the workspace forbids unsafe code except in explicitly
+allowed boundary crates and because platform-only failure modes can destabilize
+merge CI.
+
+### 5.6 External generator diversity
+
+SQLancer is the first external candidate because it provides an independent
+generator and well-known SQLite oracles without becoming a Rust runtime
+dependency. The provider must:
+
+- invoke FrankenSQLite through a stable CLI or C API boundary;
+- pin the SQLancer revision and container/toolchain digest;
+- declare supported constructs and expected errors from canonical contracts;
+- preserve every statement, seed, oracle, engine build SHA, and timeout;
+- deduplicate crashes and semantic mismatches into existing bundles;
+- produce one-command local replay;
+- distinguish unsupported input, harness error, timeout, crash, and semantic
+  mismatch.
+
+SQLRight is evaluated later because AFL/LLVM instrumentation, Linux-only setup,
+patch maintenance, and corpus management are materially more expensive. It is
+accepted only if a fixed-budget trial finds unique coverage or defects beyond
+the native generator and SQLancer.
+
+### 5.7 Declarative case-format pilot
+
+Turso's `.sqltest` format has useful ergonomics: named setup blocks, isolated
+databases, exact/error/pattern/unordered results, capability requirements,
+backend selection, and plan snapshots. Its implementation depends on Tokio and
+duplicates substantial FrankenSQLite infrastructure.
+
+The pilot should therefore test the need before implementing a new parser:
+
+1. Select 20-50 representative existing FrankenSQLite cases that are currently
+   verbose or duplicated.
+2. Express them in the least new syntax possible, first considering the
+   existing JSON conformance format and SLT conventions.
+3. Compare reviewability, line count, diagnostics, execution time, target
+   accounting, and ability to express lane requirements.
+4. Proceed only if the format removes meaningful maintenance cost and remains
+   asupersync-native.
+
+No mass conversion is part of this plan. Snapshot output must mask unstable
+addresses/IDs and must not normalize meaningful opcode or plan changes.
+
+## 6. Provenance And Intake Policy
+
+Turso is MIT-licensed at the pinned source commit. That permits adaptation but
+requires preservation of the copyright and permission notice for copied or
+substantial derived portions.
+
+Every imported or derived case must record:
+
+- source repository and pinned commit;
+- source path and, where useful, source test name;
+- classification: `concept_only`, `translated`, `substantial_derivative`, or
+  `verbatim_fixture`;
+- applicable upstream license;
+- FrankenSQLite surface/feature IDs;
+- architectural adaptations made;
+- reason the case is non-duplicative;
+- reviewer and review date;
+- expected update policy.
+
+Default to concept-level reimplementation. If substantial Turso code or fixture
+content is copied, add the required notice through a separately reviewed
+licensing change. Never mechanically translate the directory.
+
+The intake triage for each candidate is:
+
+1. Is the behavior in FrankenSQLite's declared supported or named partial
+   surface?
+2. Does an existing test already cover the same defect class and execution
+   lane?
+3. Is the expected result valid for page-level SSI and default concurrent mode?
+4. Can the case use the existing harness and failure bundle?
+5. Does it exercise real code rather than a compatibility fallback?
+6. Is provenance complete?
+7. Is its runtime stable enough for the intended CI tier?
+
+Only candidates answering all required questions proceed.
+
+## 7. Delivery Phases
+
+### Phase 0: Baseline and governance
+
+Deliverables:
+
+- Recompute current test inventory and CI runtime/resource baseline.
+- Produce a machine-readable overlap map from Turso areas to FrankenSQLite
+  owners, contracts, and existing tests.
+- Define provenance schema and licensing decision record.
+- Define lane-evidence vocabulary and demonstrate how the current dispatcher
+  exposes it.
+- Record explicit non-goals and owners.
+
+Exit gate:
+
+- Every proposed later deliverable has a non-duplicative owner and measurable
+  baseline.
+- No source copying has occurred.
+- Concurrency work is coordinated with `bd-2lt76` and `bd-28z4i.5`.
+
+### Phase 1: Typed differential generator pilot
+
+Deliverables:
+
+- Independent test AST for a narrow supported core.
+- Capability/profile mapping validated against canonical contracts.
+- Deterministic generation trace and coverage report.
+- Adapter into `differential_v2` and corpus intake.
+- Strict error/result comparator use.
+- Unit tests for generation validity, determinism, caps, and contract drift.
+
+Pilot matrix:
+
+- 100 fixed seeds per profile in presubmit smoke.
+- A larger bounded nightly seed set.
+- In-memory semantic lane and temporary-file pager-backed lane.
+- Ordered and unordered result cases selected from SQL semantics, never by
+  blanket sorting.
+
+Exit gate:
+
+- At least 99 percent of generated supported-core cases parse and execute on
+  both engines; the remainder is fully classified and does not silently skip.
+- Same seed/profile/schema produces byte-identical SQL and trace artifacts.
+- At least one demonstrated coverage gap or unique defect/reproducer, or a
+  documented stop decision if the generator adds no value.
+
+### Phase 2: Structured reduction and corpus promotion
+
+Deliverables:
+
+- AST-aware and schedule-aware reducers behind the current minimizer contract.
+- Exact-signature preservation.
+- Bundle schema extensions and stable replay commands.
+- Promotion policy from random failure to reviewed regression corpus.
+- Regression tests with deliberately reducible synthetic failures.
+
+Exit gate:
+
+- A representative mismatch corpus is reduced materially without signature
+  drift.
+- Original and minimized cases replay from a clean process.
+- Existing bundles remain readable or receive a direct schema migration with
+  no compatibility shim.
+
+### Phase 3: SQL-level concurrency oracle
+
+Deliverables:
+
+- Typed operation/history schema.
+- Independent model for register, list-append, bank, allocation, and write-skew
+  workloads.
+- Serializability/SSI checker and first-committer-wins assertions.
+- LabRuntime schedule adapter owned jointly with existing determinism/DPOR
+  work.
+- Golden valid and invalid history fixtures.
+
+Exit gate:
+
+- The oracle rejects known G1/G2/write-skew/lost-update fixtures and accepts
+  known serializable fixtures.
+- Aborted, cancelled, timed-out, and indeterminate transactions have explicit
+  semantics.
+- Failures emit deterministic seed, schedule, history, lane evidence, and
+  replay command.
+- Concurrent mode is asserted true at setup and after reopen.
+
+### Phase 4: Real-file and multiprocess campaigns
+
+Deliverables:
+
+- Same history protocol across process boundaries.
+- Real-file/WAL restart and kill-point campaigns.
+- Checkpoint and crash matrices with bounded schedules.
+- File integrity plus logical-state oracles after reopen.
+
+Exit gate:
+
+- Disjoint-page writers demonstrate concurrent progress rather than serialized
+  admission.
+- Same-page conflicts match documented retry/abort behavior.
+- Acknowledged commits survive; unacknowledged outcomes are classified rather
+  than guessed.
+- All failures replay from captured artifacts.
+
+### Phase 5: External oracle lane
+
+Deliverables:
+
+- SQLancer provider/container spike, then a time-bounded nightly campaign if
+  accepted.
+- Intake bridge from external logs to canonical failure bundles.
+- Unique-finding and coverage comparison against native campaigns.
+- Separate SQLRight feasibility report and go/no-go decision.
+
+Exit gate:
+
+- External-tool revision and environment are pinned.
+- No expected-error list can expand without a linked feature/contract reason.
+- A four-week trial reports unique defects, unique coverage, false-positive
+  rate, runtime, and maintenance burden.
+- SQLRight proceeds only if the result justifies its toolchain cost.
+
+### Phase 6: Optional ergonomics and hosted testing
+
+Deliverables:
+
+- Declarative case-format pilot decision.
+- Antithesis access/cost/value feasibility report.
+- Native VFS syscall-fault gap report.
+- CLI/system corpus gap report.
+
+Exit gate:
+
+- Each optional item has an evidence-based adopt/defer/reject decision.
+- None is required for the core campaign to remain reproducible locally.
+
+## 8. CI And Resource Policy
+
+Use three tiers:
+
+| Tier | Trigger | Budget | Contents |
+|---|---|---|---|
+| Presubmit | every relevant change | target under 10 minutes for this campaign | fixed seeds, generator contracts, reducer fixtures, small exhaustive histories |
+| Nightly | scheduled | bounded per lane, initially 30-60 minutes | expanded seeds, multiprocess schedules, SQLancer |
+| Campaign | manual/release | explicit operator budget | large DPOR, SQLRight, Antithesis, long fault and stress runs |
+
+Rules:
+
+- Add a small number of runner targets, not hundreds of Rust integration files.
+- Shard by stable seed ranges and profiles.
+- Emit counts for generated, executed, unsupported, invalid, timed out, skipped,
+  mismatched, crashed, reduced, and promoted cases.
+- A skipped/unsupported count increase fails contract drift validation unless
+  approved with a bead.
+- A timeout is not a semantic pass.
+- Budget exhaustion reports incomplete exploration, never proof.
+- Coverage is reported by feature, construct, execution lane, fault kind, and
+  concurrency workload, not just lines.
+- Numeric performance claims remain outside this plan unless measured by a
+  named benchmark artifact under the README performance-claim rules.
+
+## 9. Observability And Artifacts
+
+Every failure must preserve:
+
+- engine SHA and dirty-state indicator;
+- Turso/external source revision where applicable;
+- generator and profile version/hash;
+- seed and derived seed path;
+- original and minimized SQL/AST;
+- schema and setup;
+- result/error classification from both oracles;
+- transaction history and schedule;
+- required and observed execution lanes;
+- fault/crash/yield schedule;
+- database, WAL, and checksum artifacts when relevant;
+- one-command local replay;
+- minimizer result and signature.
+
+Structured tracing should include `run_id`, `trace_id`, `scenario_id`, `seed`,
+`profile`, `feature_ids`, `lane_required`, `lane_observed`, `worker`, `txn_id`,
+`schedule_step`, `oracle`, and `outcome`. Avoid per-operation INFO logs in
+large campaigns; detailed events belong in bounded artifacts or DEBUG traces.
+
+## 10. Test Strategy For The Test Infrastructure
+
+The new harness code itself needs tests.
+
+### Unit
+
+- capability mapping for supported/partial/excluded features;
+- deterministic generation and seed splitting;
+- schema-state transitions;
+- AST printer/parser round trip on the supported subset;
+- budget enforcement and depth limits;
+- comparison rules for NULL, integers/reals, blobs, text, order, and errors;
+- every reducer preserves syntax and required dependencies;
+- history serialization and stable ordering;
+- serializability oracle golden accept/reject cases;
+- provenance validation and contract-drift failure.
+
+### Integration
+
+- known-good and deliberately divergent fake backends for comparator tests;
+- public FrankenSQLite and C SQLite differential execution;
+- forced fallback proving a pager-required case fails closed;
+- generated mismatch through bundle, minimization, replay, and promotion;
+- cancellation at generation, execution, reduction, and artifact-write stages;
+- corrupt/truncated artifacts fail clearly.
+
+### End to end
+
+- fixed-seed typed SQL campaign;
+- fixed invalid serializability history;
+- small LabRuntime concurrent campaign;
+- real-file crash/reopen campaign;
+- external-provider smoke using a pinned image when that phase is accepted.
+
+## 11. Risks And Controls
+
+| Risk | Control |
+|---|---|
+| Test volume increases without new information | Value gates use unique defects, coverage, reduction, and replay, not count. |
+| Common-mode oracle bug | Test AST/model stays independent of production AST; retain C SQLite and external oracles. |
+| Fallback masks storage defects | Required-lane evidence fails closed. |
+| Turso semantics weaken FrankenSQLite guarantees | Canonical FrankenSQLite contracts win; serializability replaces SI acceptance. |
+| Tokio enters dev graph | Dependency policy test plus cargo-tree audit; implement with asupersync. |
+| Imported unsupported tests create skip debt | Contract-driven capability map and skip-count drift gate. |
+| Flaky randomized tests | Fixed seed derivation, deterministic schedules, bounded time, replay artifact. |
+| Minimizer changes failure identity | Exact signature revalidation after every reduction. |
+| External tools become release blockers | Start nightly/advisory; promote only after stability and ownership evidence. |
+| License/provenance is lost | Required intake metadata and review before substantial copying. |
+| CI target explosion | Corpus-driven runners and target accounting rather than one target per case. |
+
+## 12. Explicit Non-Goals
+
+- Replacing SQLite's upstream TCL corpus or FrankenSQLite's native harness.
+- Claiming full SQLite compatibility from imported test counts.
+- Matching Turso's storage format, MVCC implementation, cloud protocol, or
+  product bindings.
+- Making snapshot isolation an acceptable FrankenSQLite concurrency result.
+- Changing concurrent mode defaults or adding connection/file writer locks.
+- Adding Tokio, Shuttle, or a second async runtime for tests.
+- Expanding excluded features by accident through generator support.
+- Rewriting current Rust tests into a new DSL en masse.
+- Making Antithesis or any hosted service necessary for local reproduction.
+
+## 13. Stop/Go Metrics
+
+Each phase ends with a written keep/defer/reject decision.
+
+Keep a component when it demonstrates at least one of:
+
+- a unique confirmed defect class;
+- materially new feature/lane/fault coverage;
+- a substantially smaller reproducer with preserved signature;
+- deterministic reproduction of a previously non-reproducible failure;
+- a measurable maintenance reduction in the DSL pilot.
+
+Reject or defer when:
+
+- findings duplicate existing campaigns;
+- invalid/unsupported generation remains above the agreed threshold;
+- failures cannot replay deterministically;
+- false positives dominate triage;
+- required execution lanes cannot be proven;
+- runtime or dependency cost exceeds the lane budget;
+- the work pressures the project toward serialized writers, weaker isolation,
+  Tokio, or unsupported parity claims.
+
+## 14. Recommended Order
+
+1. Baseline, provenance, overlap map, and execution-lane evidence.
+2. Narrow typed differential generator.
+3. Structured reducer integration.
+4. SQL-level serializability histories coordinated with existing LabRuntime and
+   DPOR work.
+5. Real-file/multiprocess schedules.
+6. SQLancer trial.
+7. Coverage-ledger and CI promotion decision.
+8. Optional SQLRight, declarative DSL, Antithesis, and syscall-fault decisions.
+
+This order maximizes independent correctness signal early while containing
+dependency, CI, and maintenance costs.
+
+## 15. Definition Of Done
+
+The program is complete when:
+
+- every Turso testing area has an evidence-backed adopt/defer/reject record;
+- adopted work is integrated into existing FrankenSQLite harness ownership;
+- generated cases are scope-aware, deterministic, minimized, and replayable;
+- SQL-level concurrent histories are checked against serializability/SSI;
+- pager/MVCC/recovery claims include execution-lane evidence;
+- external campaigns, if retained, have pinned provenance and bounded CI lanes;
+- the canonical ledgers expose generated and imported coverage without skip
+  inflation;
+- concurrent writer mode remains true by default everywhere;
+- no Tokio dependency is introduced;
+- all implementation beads meet their stated unit, integration, E2E, logging,
+  and artifact acceptance criteria.
+
+## 16. Beads Map
+
+Epic: `bd-turso-test-adaptation-zu081`
+
+| Phase | Bead | Deliverable |
+|---|---|---|
+| 0 | `bd-turso-test-adaptation-zu081.1` | Baseline, overlap map, and provenance policy |
+| 0 | `bd-turso-test-adaptation-zu081.2` | Fail-closed execution-lane evidence |
+| 1 | `bd-turso-test-adaptation-zu081.3` | Independent typed SQL generator core |
+| 1 | `bd-turso-test-adaptation-zu081.4` | Contract-derived profiles and coverage |
+| 1 | `bd-turso-test-adaptation-zu081.5` | Differential, corpus, and replay adapters |
+| 2 | `bd-turso-test-adaptation-zu081.6` | AST and schedule-aware reduction |
+| 3 | `bd-turso-test-adaptation-zu081.7` | SSI/serializability history oracle |
+| 3 | `bd-turso-test-adaptation-zu081.8` | LabRuntime/DPOR history integration |
+| 4 | `bd-turso-test-adaptation-zu081.9` | Real-file multiprocess crash/recovery |
+| 5 | `bd-turso-test-adaptation-zu081.10` | SQLancer provider spike |
+| 5 | `bd-turso-test-adaptation-zu081.11` | Bounded SQLancer nightly trial |
+| 5 | `bd-turso-test-adaptation-zu081.12` | SQLRight feasibility decision |
+| 6 | `bd-turso-test-adaptation-zu081.13` | Declarative case-format pilot |
+| 6 | `bd-turso-test-adaptation-zu081.14` | Antithesis feasibility decision |
+| 6 | `bd-turso-test-adaptation-zu081.15` | Allocator/syscall fault-gap decision |
+| 6 | `bd-turso-test-adaptation-zu081.16` | CLI/system/fixed-database gap audit |
+| cross-phase | `bd-turso-test-adaptation-zu081.17` | CI, coverage, and phase-promotion gates |
+
+The blocking spine is:
+
+```text
+.1 baseline -> .2 lane evidence
+            -> .3 generator -> .4 profiles -> .5 adapters -> .6 reducers
+.1 + .2     -> .7 history oracle -> .8 LabRuntime integration -> .9 multiprocess
+.1 + .2     -> .10 SQLancer spike -> .11 trial -> .12 SQLRight decision
+.5 + .6 + .8 + .10 -> .17 CI and promotion gates
+```
+
+The LabRuntime integration has non-blocking `related` edges to `bd-2lt76` and
+`bd-28z4i.5`. It must consume their determinism/DPOR interfaces but does not
+duplicate or wait for unrelated scope in those large existing beads. Optional
+beads `.13` through `.16` do not block the core delivery spine.
