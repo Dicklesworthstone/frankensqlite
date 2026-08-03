@@ -15,15 +15,17 @@ locations, public-key material, or momentary service status.
 
 Local-tree facts checked for this revision:
 
-- The workspace has 27 members, all locally declared at `0.1.19`; two members
+- The workspace has 27 members, all locally declared at `0.2.0`; two members
   are marked `publish = false`.
-- `v0.1.19` exists, and the current tree is 392 commits beyond that tag. This
-  count is a snapshot, not a release-readiness metric.
+- `v0.1.19` is the preceding release tag. A commit count relative to that tag
+  is intentionally omitted because it changes as release preparation lands and
+  is not a release-readiness metric.
 - `CHANGELOG.md` contains an unreleased `0.2.0` section describing the next
   lockstep release.
-- The checked-in release workflow contains an explicit 25-crate publish order
-  and validates that order and every crate version against workspace metadata
-  before publishing.
+- The checked-in release workflow contains an explicit 25-crate publish order,
+  checks that its crate set matches the publishable workspace set, and checks
+  every crate version against the tag before publishing. Its dependency order
+  requires an independent review; the workflow does not validate topology.
 - The Unix and PowerShell installers both resolve an unspecified version from
   the latest GitHub Release and require a SHA-256 manifest; when `minisign` is
   available they also verify its signature.
@@ -41,17 +43,19 @@ the workspace crates, internal dependency requirements, the changelog heading,
 and the release tag as one coherent line. The tag version is the provenance
 anchor used by the publish workflow's validation.
 
-Before a `0.2.x` cut, review every internal dependency requirement rather than
-assuming its old semver upper bound admits the new minor line. In particular,
-dev-dependencies can be invisible to normal publish ordering while still
-becoming permanent registry metadata after publication.
+For every lockstep minor cut, review each internal dependency requirement
+rather than assuming its old semver upper bound admits the new line. In
+particular, dev-dependencies can be invisible to normal publish ordering while
+still becoming permanent registry metadata after publication.
 
 ### Publish DAG
 
-The checked-in release workflow lists 25 publishable crates in normal
-dependency order, checks that the list exactly matches Cargo metadata, then
-requires every package version to equal the release tag. Two workspace members
-are intentionally non-publishable.
+The checked-in release workflow lists 25 publishable crates in an order that an
+independent manifest review found consistent with normal-dependency topology.
+The workflow itself checks that the crate set exactly matches Cargo metadata,
+then requires every package version to equal the release tag; it does not prove
+that the configured order is topological. Two workspace members are
+intentionally non-publishable.
 
 That validation is useful, but it is not evidence that a release is ready:
 metadata, lockfile, credentials, registry state, and the actual workflow policy
