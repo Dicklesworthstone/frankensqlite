@@ -66,11 +66,14 @@ pub struct CommitCombineMetrics {
     pub wait_ns_max: u64,
 }
 
-/// Quiescent, instance-local receipt for the feature-gated combiner keeper.
+/// Quiescent, instance-local receipt for the feature-gated staged combiner
+/// keeper.
 ///
-/// Callers must join all registered allocation callers before taking this
-/// receipt. It proves which public allocation route was used without reaching
-/// into combiner slots or process-global counters.
+/// Callers must join all staged allocation callers before taking this receipt.
+/// It proves which public allocation route was used without reaching into
+/// combiner slots or process-global counters. Combiners without a staging
+/// control report zero route counts so feature-unified benchmark builds do not
+/// pay route-counter atomics.
 #[cfg(feature = "commit-combiner-test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitCombineTestReceipt {
@@ -121,6 +124,7 @@ pub struct CommitCombineStagingControl {
     state: StdMutex<CommitCombineStagingState>,
     all_staged: Condvar,
     release_waiters: Condvar,
+    route_metrics: CommitCombineTestMetricRecorder,
 }
 
 #[cfg(feature = "commit-combiner-test-support")]
@@ -141,6 +145,7 @@ impl CommitCombineStagingControl {
             }),
             all_staged: Condvar::new(),
             release_waiters: Condvar::new(),
+            route_metrics: CommitCombineTestMetricRecorder::new(),
         }
     }
 
@@ -221,6 +226,29 @@ impl CommitCombineStagingControl {
         let mut state = self.lock_state();
         state.released = true;
         self.release_waiters.notify_all();
+    }
+
+    fn record_registered_allocation(&self) {
+        self.route_metrics
+            .registered_allocations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_one_shot_allocation(&self) {
+        self.route_metrics
+            .one_shot_allocations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn route_metrics(&self) -> (u64, u64) {
+        (
+            self.route_metrics
+                .registered_allocations
+                .load(Ordering::Acquire),
+            self.route_metrics
+                .one_shot_allocations
+                .load(Ordering::Acquire),
+        )
     }
 }
 
@@ -357,9 +385,6 @@ pub struct CommitSequenceCombiner {
     /// Deterministic staging exists only for test-support consumers.
     #[cfg(feature = "commit-combiner-test-support")]
     staging_control: Option<Arc<CommitCombineStagingControl>>,
-    /// Test-only route counters make a keeper receipt self-contained.
-    #[cfg(feature = "commit-combiner-test-support")]
-    test_metrics: CommitCombineTestMetricRecorder,
 }
 
 impl CommitSequenceCombiner {
@@ -374,8 +399,6 @@ impl CommitSequenceCombiner {
             metrics: CommitCombineMetricRecorder::new(),
             #[cfg(feature = "commit-combiner-test-support")]
             staging_control: None,
-            #[cfg(feature = "commit-combiner-test-support")]
-            test_metrics: CommitCombineTestMetricRecorder::new(),
         }
     }
 
@@ -398,8 +421,6 @@ impl CommitSequenceCombiner {
             metrics: CommitCombineMetricRecorder::new(),
             #[cfg(feature = "commit-combiner-test-support")]
             staging_control: None,
-            #[cfg(feature = "commit-combiner-test-support")]
-            test_metrics: CommitCombineTestMetricRecorder::new(),
         }
     }
 
@@ -469,17 +490,15 @@ impl CommitSequenceCombiner {
     #[cfg(feature = "commit-combiner-test-support")]
     #[must_use]
     pub fn test_support_receipt(&self) -> CommitCombineTestReceipt {
+        let (registered_allocations, one_shot_allocations) = self
+            .staging_control
+            .as_ref()
+            .map_or((0, 0), |staging_control| staging_control.route_metrics());
         CommitCombineTestReceipt {
             next_seq: self.next_seq(),
             metrics: self.metrics(),
-            registered_allocations: self
-                .test_metrics
-                .registered_allocations
-                .load(Ordering::Acquire),
-            one_shot_allocations: self
-                .test_metrics
-                .one_shot_allocations
-                .load(Ordering::Acquire),
+            registered_allocations,
+            one_shot_allocations,
         }
     }
 
@@ -555,9 +574,9 @@ impl CommitSequenceCombiner {
         self.metrics.record_wait(elapsed_ns);
 
         #[cfg(feature = "commit-combiner-test-support")]
-        self.test_metrics
-            .one_shot_allocations
-            .fetch_add(1, Ordering::Relaxed);
+        if let Some(staging_control) = &self.staging_control {
+            staging_control.record_one_shot_allocation();
+        }
 
         seq
     }
@@ -681,7 +700,10 @@ impl CommitCombineHandle<'_> {
             .store(SLOT_PENDING, Ordering::Release);
 
         #[cfg(feature = "commit-combiner-test-support")]
-        if let Some(staging_control) = &self.combiner.staging_control {
+        let staging_control = self.combiner.staging_control.as_ref();
+
+        #[cfg(feature = "commit-combiner-test-support")]
+        if let Some(staging_control) = staging_control {
             staging_control.stage_registered_call();
         }
 
@@ -709,10 +731,9 @@ impl CommitCombineHandle<'_> {
                 self.combiner.metrics.record_wait(elapsed_ns);
 
                 #[cfg(feature = "commit-combiner-test-support")]
-                self.combiner
-                    .test_metrics
-                    .registered_allocations
-                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(staging_control) = staging_control {
+                    staging_control.record_registered_allocation();
+                }
 
                 return CommitSeq::new(seq);
             }
@@ -839,6 +860,22 @@ mod tests {
                 wait_ns_max: 0,
             }
         );
+    }
+
+    #[cfg(feature = "commit-combiner-test-support")]
+    #[test]
+    fn test_support_receipt_route_counts_require_staging_control() {
+        let combiner = CommitSequenceCombiner::new(100);
+
+        assert_eq!(combiner.alloc_one_shot().get(), 100);
+        let handle = combiner.register().expect("first slot must be available");
+        assert_eq!(handle.alloc_commit_seq().get(), 101);
+        drop(handle);
+
+        let receipt = combiner.test_support_receipt();
+        assert_eq!(receipt.next_seq, 102);
+        assert_eq!(receipt.registered_allocations, 0);
+        assert_eq!(receipt.one_shot_allocations, 0);
     }
 
     #[test]
