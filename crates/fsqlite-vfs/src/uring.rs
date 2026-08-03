@@ -1491,9 +1491,73 @@ mod tests {
     use fsqlite_observability::{io_uring_latency_snapshot, reset_io_uring_latency_metrics};
     use fsqlite_types::flags::VfsOpenFlags;
     use std::future::Future;
+    use std::io::Write;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
     static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    const ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES: usize = 64 * 1024;
+
+    #[derive(Clone)]
+    struct BoundedTraceWriter {
+        bytes: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl BoundedTraceWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Arc::new(StdMutex::new(Vec::with_capacity(
+                    ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES,
+                ))),
+            }
+        }
+
+        fn flush_to_stderr(&self) {
+            let bytes = self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = std::io::stderr().write_all(&bytes);
+        }
+
+        fn has_events(&self) -> bool {
+            !self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        }
+    }
+
+    struct BoundedTraceWriteGuard<'a> {
+        bytes: StdMutexGuard<'a, Vec<u8>>,
+    }
+
+    impl Write for BoundedTraceWriteGuard<'_> {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let remaining = ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES.saturating_sub(self.bytes.len());
+            self.bytes
+                .extend_from_slice(&buffer[..buffer.len().min(remaining)]);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BoundedTraceWriter {
+        type Writer = BoundedTraceWriteGuard<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BoundedTraceWriteGuard {
+                bytes: self
+                    .bytes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            }
+        }
+    }
 
     fn test_runtime() -> &'static Runtime {
         static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -1746,7 +1810,10 @@ mod tests {
         const READ_SIZE: usize = 4096;
 
         let _guard = io_uring_test_guard();
-        init_async_vfs_test_tracing();
+        if run_async_vfs_trace_in_subprocess() {
+            return;
+        }
+        let trace_writer = init_async_vfs_test_tracing();
         test_runtime().block_on(async {
             let native_cx = NativeCx::current().expect("runtime block_on should install Cx");
             let cx = Cx::new();
@@ -1817,17 +1884,73 @@ mod tests {
                 "all one hundred reads must reach one submission queue batch"
             );
         });
+        if let Some(trace_writer) = trace_writer {
+            assert!(
+                trace_writer.has_events(),
+                "FSQLITE_ASYNC_VFS_TRACE must retain bounded JSON trace output"
+            );
+            trace_writer.flush_to_stderr();
+        }
     }
 
-    /// Retains the legacy trace opt-in call site without mutating the test
-    /// process's global tracing dispatcher.
+    const ASYNC_VFS_TRACE_ENV: &str = "FSQLITE_ASYNC_VFS_TRACE";
+    const ASYNC_VFS_TRACE_SUBPROCESS_ENV: &str = "FSQLITE_ASYNC_VFS_TRACE_SUBPROCESS";
+    const SHARED_RING_TRACE_TEST: &str =
+        "uring::tests::test_shared_ring_multiplexes_one_hundred_concurrent_reads";
+
+    /// Installs the verbose JSON subscriber only in the dedicated trace child.
     ///
-    /// A `tracing_subscriber::fmt().try_init()` here would make the first
-    /// test that sets `FSQLITE_ASYNC_VFS_TRACE` select the subscriber for every
-    /// later test in this binary. This workload does not assert trace events,
-    /// so it must not install a subscriber at all.
-    fn init_async_vfs_test_tracing() {
-        let _ = std::env::var_os("FSQLITE_ASYNC_VFS_TRACE");
+    /// The 100-read workload spans runtime threads, so a thread-local
+    /// subscriber would omit events. The parent test therefore starts a child
+    /// filtered to this one test when tracing is requested; no later test can
+    /// observe this process-global subscriber.
+    fn init_async_vfs_test_tracing() -> Option<BoundedTraceWriter> {
+        if std::env::var_os(ASYNC_VFS_TRACE_ENV).is_none()
+            || std::env::var_os(ASYNC_VFS_TRACE_SUBPROCESS_ENV).is_none()
+        {
+            return None;
+        }
+
+        let writer = BoundedTraceWriter::new();
+        assert!(
+            !tracing::dispatcher::has_been_set(),
+            "the dedicated async-VFS trace process must start without a subscriber"
+        );
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(writer.clone())
+            .try_init()
+            .expect("the dedicated async-VFS trace process must install its subscriber");
+        Some(writer)
+    }
+
+    /// Runs trace-enabled async-VFS work in a process that executes no other
+    /// libtest test, retaining the opt-in trace contract without polluting the
+    /// normal shared test binary.
+    fn run_async_vfs_trace_in_subprocess() -> bool {
+        if std::env::var_os(ASYNC_VFS_TRACE_ENV).is_none()
+            || std::env::var_os(ASYNC_VFS_TRACE_SUBPROCESS_ENV).is_some()
+        {
+            return false;
+        }
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the libtest binary path must be available"),
+        )
+        .arg(SHARED_RING_TRACE_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(ASYNC_VFS_TRACE_ENV, "1")
+        .env(ASYNC_VFS_TRACE_SUBPROCESS_ENV, "1")
+        .status()
+        .expect("the dedicated async-VFS trace process must start");
+
+        assert!(
+            status.success(),
+            "the dedicated async-VFS trace process must complete successfully"
+        );
+        true
     }
 
     #[test]
@@ -1841,10 +1964,13 @@ mod tests {
                 !tracing::dispatcher::has_been_set(),
                 "the fresh keeper process must start without a tracing subscriber"
             );
-            init_async_vfs_test_tracing();
+            assert!(
+                run_async_vfs_trace_in_subprocess(),
+                "the trace opt-in must isolate the traced workload in a child process"
+            );
             assert!(
                 !tracing::dispatcher::has_been_set(),
-                "the async-VFS trace opt-in must not leak a subscriber to a later test"
+                "the trace-enabled child must not leak a subscriber to a later parent test"
             );
             return;
         }
@@ -1854,7 +1980,7 @@ mod tests {
         )
         .arg(TEST_FILTER)
         .arg("--test-threads=1")
-        .env("FSQLITE_ASYNC_VFS_TRACE", "1")
+        .env(ASYNC_VFS_TRACE_ENV, "1")
         .env(PROBE_ENV, "1")
         .status()
         .expect("the fresh keeper process must start");
