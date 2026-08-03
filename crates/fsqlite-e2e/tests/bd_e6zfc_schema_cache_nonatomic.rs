@@ -23,6 +23,13 @@
 //! - S4: View + trigger interaction under concurrent DDL
 //! - S5: Schema cache coherence after concurrent DDL storm
 #![recursion_limit = "512"]
+// Each worker drives its thread-local, non-Sync connection to completion on
+// the same OS thread. Requiring these futures to be Send would reject the
+// connection model this keeper is specifically exercising.
+#![allow(clippy::future_not_send)]
+// Connection operations intentionally stay inline so this concurrency keeper
+// exercises their real scheduling shape instead of adding test-only boxing.
+#![allow(clippy::large_futures)]
 
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -796,9 +803,7 @@ fn s5_schema_coherence_after_storm() {
         drop(ready_tx);
         let readiness_deadline = Instant::now() + Duration::from_secs(30);
         let readiness = (0..4).try_for_each(|_| {
-            ready_rx
-                .recv_timeout(readiness_deadline.saturating_duration_since(Instant::now()))
-                .map(|_| ())
+            ready_rx.recv_timeout(readiness_deadline.saturating_duration_since(Instant::now()))
         });
         if let Err(error) = readiness {
             stop.store(true, Ordering::Release);
