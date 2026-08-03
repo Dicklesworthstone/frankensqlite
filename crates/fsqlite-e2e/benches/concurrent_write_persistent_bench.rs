@@ -44,7 +44,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -393,9 +393,16 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 fn running_executable_identity() -> std::io::Result<(String, String)> {
-    let executable = std::env::current_exe()?;
-    let binary_sha256 = sha256_file(&executable)?;
-    Ok((executable.display().to_string(), binary_sha256))
+    static IDENTITY: OnceLock<std::io::Result<(String, String)>> = OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            let executable = std::env::current_exe()?;
+            let binary_sha256 = sha256_file(&executable)?;
+            Ok((executable.display().to_string(), binary_sha256))
+        })
+        .as_ref()
+        .map(Clone::clone)
+        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
 }
 
 fn persistent_phase_capture_provenance(
@@ -424,7 +431,7 @@ fn persistent_phase_capture_provenance(
             .filter(|hostname| !hostname.is_empty())
             .or_else(|| read_trimmed_file("/etc/hostname")),
         kernel_release: read_trimmed_file("/proc/sys/kernel/osrelease"),
-        criterion_emission_scope: "every completed Criterion batched iteration appends one record; warmup and measurement phases are not distinguished by this harness".to_owned(),
+        criterion_emission_scope: "one final sample per engine is retained in memory during Criterion execution and written only after group.finish(); warmup and measurement phases are not distinguished by this harness".to_owned(),
     })
 }
 
@@ -642,6 +649,39 @@ fn maybe_write_persistent_phase_capture(sample: &PersistentPhaseCaptureSample) {
     }
 }
 
+fn pending_persistent_phase_capture_samples()
+-> &'static Mutex<BTreeMap<(String, &'static str), PersistentPhaseCaptureSample>> {
+    static PENDING: OnceLock<
+        Mutex<BTreeMap<(String, &'static str), PersistentPhaseCaptureSample>>,
+    > = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Retain at most one sample per engine while Criterion is timing.  This performs
+/// no filesystem, hashing, serialization, or report-refresh work.
+fn queue_persistent_phase_capture(sample: PersistentPhaseCaptureSample) {
+    if persistent_phase_capture_dir().is_none() {
+        return;
+    }
+    let key = (sample.benchmark_group.clone(), sample.engine);
+    pending_persistent_phase_capture_samples()
+        .lock()
+        .expect("persistent phase capture queue mutex poisoned")
+        .insert(key, sample);
+}
+
+/// Flush citation artifacts only after Criterion has finished timing the group.
+fn flush_persistent_phase_capture() {
+    let samples = std::mem::take(
+        &mut *pending_persistent_phase_capture_samples()
+            .lock()
+            .expect("persistent phase capture queue mutex poisoned"),
+    );
+    for sample in samples.values() {
+        maybe_write_persistent_phase_capture(sample);
+    }
+}
+
 // ─── C SQLite concurrent writers (file-backed WAL) ──────────────────────
 
 // BENCH-META: engine=csqlite, lifecycle=prepared, storage=file, concurrency=concurrent
@@ -650,8 +690,6 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
     #[allow(clippy::cast_possible_wrap)]
     let total_rows = n_threads as u64 * ROWS_PER_THREAD as u64;
     let mut group = c.benchmark_group(label);
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(45));
     group.throughput(Throughput::Elements(total_rows));
 
     group.bench_function("csqlite_concurrent_persistent", |b| {
@@ -850,7 +888,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     "[C SQLite {n_threads}t wall audit] {}",
                     format_operation_wall_time_audit(&metrics.operation_wall_time_audit)
                 );
-                maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
+                queue_persistent_phase_capture(PersistentPhaseCaptureSample {
                     schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/csqlite_concurrent_persistent"),
@@ -1198,7 +1236,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         &benchmark_metrics.operation_wall_time_audit
                     )
                 );
-                maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
+                queue_persistent_phase_capture(PersistentPhaseCaptureSample {
                     schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/frankensqlite_concurrent_persistent"),
@@ -1224,6 +1262,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
     });
 
     group.finish();
+    flush_persistent_phase_capture();
 }
 
 fn bench_persistent_1t(c: &mut Criterion) {
@@ -1276,6 +1315,28 @@ mod tests {
         assert_eq!(
             sha256_file(file.path()).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn citation_capture_and_criterion_configuration_stay_outside_timed_group_work() {
+        let source = include_str!("concurrent_write_persistent_bench.rs");
+        assert!(!source.contains("group.sample_size("));
+        assert!(!source.contains("group.measurement_time("));
+
+        let group_finish = source
+            .rfind("group.finish();")
+            .expect("benchmark must finish its Criterion group");
+        let capture_flush = source[group_finish..]
+            .find("flush_persistent_phase_capture();")
+            .expect("citation capture must flush after Criterion group completion");
+        assert!(capture_flush > 0);
+        assert_eq!(
+            source
+                .matches("maybe_write_persistent_phase_capture(")
+                .count(),
+            2,
+            "the only artifact write must be the function definition and post-group flush"
         );
     }
 

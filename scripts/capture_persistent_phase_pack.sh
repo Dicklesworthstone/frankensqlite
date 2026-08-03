@@ -131,7 +131,9 @@ validate_citation_contract() {
     [[ "$RENDER_ONLY" == "0" ]] || die "RENDER_ONLY is not valid for a citation-grade capture"
     [[ "$SKIP_RUN" == "0" ]] || die "SKIP_RUN is not valid for a citation-grade capture"
     [[ "$THREAD_COUNTS_CSV" == "1,8,16" ]] || die "THREAD_COUNTS must be exactly 1,8,16 for the release contract"
-    [[ -d "$OUTPUT_DIR" && -z "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit)" ]] \
+    [[ ! -e "$OUTPUT_DIR" || -d "$OUTPUT_DIR" ]] \
+        || die "citation output path exists but is not a directory: $OUTPUT_DIR"
+    [[ ! -d "$OUTPUT_DIR" || -z "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit)" ]] \
         || die "citation output directory must be empty; refusing stale provenance or measurements"
     [[ "$FSQLITE_USE_RCH" == "1" ]] || die "FSQLITE_USE_RCH=1 is required for release capture"
     [[ "${RCH_REQUIRE_REMOTE:-}" == "1" ]] || die "RCH_REQUIRE_REMOTE=1 is required"
@@ -159,6 +161,15 @@ validate_citation_contract() {
     grep -Fq 'FSQLITE_BENCH_BUILD_NONCE' \
         "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs" \
         || die "benchmark provenance does not consume FSQLITE_BENCH_BUILD_NONCE; refuse to run an uncitable pack"
+    ! rg -Fq 'group.sample_size(' \
+        "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs" \
+        || die "benchmark overrides Criterion sample-size; receipt inputs would not be authoritative"
+    ! rg -Fq 'group.measurement_time(' \
+        "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs" \
+        || die "benchmark overrides Criterion measurement-time; receipt inputs would not be authoritative"
+    grep -Fq 'flush_persistent_phase_capture();' \
+        "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs" \
+        || die "benchmark lacks post-timing capture flush; refuse timing-contaminated estimates"
 }
 
 run_synthetic_contract_checks() {
@@ -487,9 +498,16 @@ verify_run_artifacts() {
          .build_nonce == $expected_nonce and
          .concurrency == $expected_threads and
          .rows_per_thread == $expected_rows and
-         .synchronous == "NORMAL"' \
+         .synchronous == "NORMAL" and
+         (.criterion_emission_scope | contains("written only after group.finish()"))' \
         "$provenance" >/dev/null \
         || die "${thread_count}t provenance lacks the required binary SHA-256/build-nonce/workload binding"
+    grep -F -- "--sample-size ${CRITERION_SAMPLE_SIZE}" "$run_dir/criterion_stdout.log" >/dev/null \
+        || die "${thread_count}t retained RCH transcript lacks the requested Criterion sample size"
+    grep -F -- "--warm-up-time ${CRITERION_WARMUP_SECS}" "$run_dir/criterion_stdout.log" >/dev/null \
+        || die "${thread_count}t retained RCH transcript lacks the requested Criterion warmup"
+    grep -F -- "--measurement-time ${CRITERION_MEASUREMENT_SECS}" "$run_dir/criterion_stdout.log" >/dev/null \
+        || die "${thread_count}t retained RCH transcript lacks the requested Criterion measurement time"
     jq -s -e \
         --argjson expected_threads "$thread_count" \
         --argjson expected_rows "$EXPECTED_ROWS_PER_THREAD" \
