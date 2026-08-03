@@ -22921,29 +22921,29 @@ mod tests {
     /// frankensqlite#299 regression: the publication tracing helper must not
     /// install, or otherwise disturb, a process-global subscriber.
     ///
-    /// The equality assertion is the load-bearing one: it compares global
-    /// dispatcher state across the call, so it proves the helper itself is
-    /// inert no matter what order libtest runs tests in and no matter what any
-    /// other test did first. It cannot be tainted.
+    /// Comparing global dispatcher state across the call is the only sound
+    /// assertion available: it proves the helper itself is inert regardless of
+    /// libtest ordering or of what any other test did first, so it cannot be
+    /// tainted.
     ///
-    /// The absolute assertion is additionally safe here because
-    /// `init_publication_test_tracing` was the only global-subscriber
-    /// installation site in this crate, so nothing in this test binary can set
-    /// one. If a future change adds another installer, this assertion is meant
-    /// to fail — that is the regression being guarded.
+    /// An absolute `!has_been_set()` assertion is deliberately NOT made, and an
+    /// earlier revision of this test was wrong to make one. It cannot hold in
+    /// this binary: `asupersync::test_utils` installs a process-global
+    /// dispatcher via `tracing::dispatcher::set_global_default`, and these
+    /// tests run under that harness, so a global subscriber already exists
+    /// before this body starts. That is unrelated to frankensqlite#299, whose
+    /// defect was this helper installing a `TRACE` subscriber with
+    /// `with_test_writer()` and thereby routing the global trace stream through
+    /// libtest capture for every later test in the binary.
     #[test]
     fn pager_test_tracing_helper_installs_no_global_subscriber() {
         let before = tracing::dispatcher::has_been_set();
         init_publication_test_tracing();
-        let after = tracing::dispatcher::has_been_set();
 
         assert_eq!(
-            before, after,
+            before,
+            tracing::dispatcher::has_been_set(),
             "init_publication_test_tracing must not install or alter a global subscriber"
-        );
-        assert!(
-            !after,
-            "no global subscriber may be installed in the fsqlite-pager test binary"
         );
     }
 
