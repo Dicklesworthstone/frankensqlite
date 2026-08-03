@@ -1315,6 +1315,191 @@ fn multi_row_upsert_with_foreign_keys_uses_fallback_without_failing() {
     });
 }
 
+/// GH #290: connection-local TEMP tables and indexes must never allocate roots
+/// in the main database pager.
+///
+/// The original incident left `Page 19 is never used` behind in the main file
+/// after a connection that had only created TEMP objects closed. The existing
+/// TEMP coverage (`attach_temp_oracle_e2e::temp_table_basic` /
+/// `temp_table_shadows_main`) only checks SQL-level shadowing semantics and
+/// would still pass if TEMP roots were allocated from the main pager, because
+/// nothing there inspects physical page accounting.
+///
+/// This keeper closes that gap: it pins the main file's `page_count` and
+/// `freelist_count` across TEMP table creation, an implicit TEMP index (UNIQUE),
+/// an explicit TEMP index create/drop, and TEMP inserts — then hands the closed
+/// file to stock SQLite, which is the authority that reported the orphan in the
+/// first place.
+#[test]
+fn temp_ddl_leaves_main_page_accounting_unchanged() {
+    asupersync::test_utils::run_test(|| async {
+        async fn pragma_i64(conn: &Connection, sql: &str) -> i64 {
+            let rows = conn.query(sql).await.unwrap();
+            match rows[0].get(0) {
+                Some(SqliteValue::Integer(value)) => *value,
+                other => panic!("expected integer pragma value from {sql}, got {other:?}"),
+            }
+        }
+
+        async fn page_stats(conn: &Connection) -> (i64, i64) {
+            (
+                pragma_i64(conn, "PRAGMA page_count").await,
+                pragma_i64(conn, "PRAGMA freelist_count").await,
+            )
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("temp_ddl_main_pages.db");
+        let db = db_path.to_str().unwrap();
+
+        // Establish a persistent main-database baseline first, so any TEMP
+        // allocation that leaks into the main pager shows up as drift.
+        let (baseline_pages, baseline_freelist) = {
+            let conn = Connection::open(db).await.unwrap();
+            conn.execute("CREATE TABLE keep (id INTEGER PRIMARY KEY, v TEXT)")
+                .await
+                .unwrap();
+            for i in 1..=64_i64 {
+                conn.execute_with_params(
+                    "INSERT INTO keep (id, v) VALUES (?1, ?2)",
+                    &[
+                        SqliteValue::Integer(i),
+                        SqliteValue::Text(format!("row-{i}").into()),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            let stats = page_stats(&conn).await;
+            conn.close().await.unwrap();
+            stats
+        };
+        assert!(
+            baseline_pages > 1,
+            "baseline main database should span multiple pages, got {baseline_pages}"
+        );
+
+        // TEMP-only session: every object below is connection-local and must
+        // leave the main database byte-for-byte unchanged in page accounting.
+        {
+            let conn = Connection::open(db).await.unwrap();
+
+            // TEMP table with a UNIQUE column -> implicit TEMP index root.
+            conn.execute("CREATE TEMP TABLE t_tmp (id INTEGER PRIMARY KEY, u TEXT UNIQUE)")
+                .await
+                .unwrap();
+            for i in 1..=48_i64 {
+                conn.execute_with_params(
+                    "INSERT INTO t_tmp (id, u) VALUES (?1, ?2)",
+                    &[
+                        SqliteValue::Integer(i),
+                        SqliteValue::Text(format!("u-{i}").into()),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+
+            // UNIQUE enforcement must actually be live on the TEMP index.
+            let duplicate = conn
+                .execute_with_params(
+                    "INSERT INTO t_tmp (id, u) VALUES (?1, ?2)",
+                    &[SqliteValue::Integer(9_999), SqliteValue::Text("u-1".into())],
+                )
+                .await;
+            assert!(
+                duplicate.is_err(),
+                "TEMP UNIQUE index must reject a duplicate key"
+            );
+
+            // Explicit TEMP index create -> drop, the other root-allocating path.
+            conn.execute("CREATE INDEX temp.idx_t_tmp_u ON t_tmp(u)")
+                .await
+                .unwrap();
+            conn.execute("DROP INDEX temp.idx_t_tmp_u").await.unwrap();
+
+            // A second TEMP table exercised after the drop, so a recycled root
+            // cannot silently come from the main pager's freelist.
+            conn.execute("CREATE TEMP TABLE t_tmp2 (x INTEGER)")
+                .await
+                .unwrap();
+            for i in 1..=32_i64 {
+                conn.execute_with_params(
+                    "INSERT INTO t_tmp2 (x) VALUES (?1)",
+                    &[SqliteValue::Integer(i)],
+                )
+                .await
+                .unwrap();
+            }
+
+            let (pages, freelist) = page_stats(&conn).await;
+            assert_eq!(
+                pages, baseline_pages,
+                "TEMP DDL must not change main page_count \
+                 (baseline {baseline_pages}, after TEMP {pages})"
+            );
+            assert_eq!(
+                freelist, baseline_freelist,
+                "TEMP DDL must not change main freelist_count \
+                 (baseline {baseline_freelist}, after TEMP {freelist})"
+            );
+
+            conn.close().await.unwrap();
+        }
+
+        // Stock SQLite is the authority that reported "Page N: never used".
+        let stock = RusqliteConnection::open(&db_path).unwrap();
+
+        let quick: String = stock
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick, "ok", "stock SQLite quick_check after TEMP DDL");
+
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity, "ok",
+            "stock SQLite integrity_check after TEMP DDL must not report orphaned pages"
+        );
+
+        let stock_pages: i64 = stock
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            stock_pages, baseline_pages,
+            "stock SQLite must observe the same main page_count as before TEMP DDL"
+        );
+
+        let stock_freelist: i64 = stock
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            stock_freelist, baseline_freelist,
+            "stock SQLite must observe the same main freelist_count as before TEMP DDL; \
+             a TEMP root retired into the main freelist during teardown would show up here"
+        );
+
+        // No TEMP object may have been persisted into the main schema.
+        let leaked: i64 = stock
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 't_tmp%' OR name LIKE '%idx_t_tmp%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0, "TEMP objects must not appear in the main schema");
+
+        let kept: i64 = stock
+            .query_row("SELECT COUNT(*) FROM keep", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            kept, 64,
+            "persistent table must survive the TEMP-only session"
+        );
+    });
+}
+
 #[test]
 fn upsert_do_update_after_leaf_split_does_not_double_free_page() {
     asupersync::test_utils::run_test(|| async {
