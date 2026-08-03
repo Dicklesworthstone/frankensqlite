@@ -69,7 +69,7 @@ struct PagerFaultHookState {
     next_trigger_seq: u64,
     after_flush_before_publish: Option<OwnedFaultHookArm>,
     during_phase_c: Option<OwnedFaultHookArm>,
-    drop_condvar_notify: Option<OwnedFaultHookArm>,
+    drop_waiter_notify: Option<OwnedFaultHookArm>,
     vacuum_after_target_page: Option<OwnedFaultHookArm>,
     vacuum_before_commit_marker: Option<OwnedFaultHookArm>,
     records: Vec<FaultInjectionRecord>,
@@ -415,36 +415,45 @@ pub(crate) fn maybe_inject_during_phase_c(commit_seq: u64, db_size: u32) -> Resu
     ))))
 }
 
-/// Arm the dropped-condvar-notify fault hook (F11 / H11).
+/// Arm the dropped waiter-notification fault hook (F11 / H11).
 ///
-/// When armed, `maybe_inject_drop_condvar_notify()` returns true,
-/// signaling the caller to suppress the `Condvar::notify_all()` that normally
-/// follows a successful `publish_completed_epoch()` store.  The completed epoch
-/// is still published; only the wakeup is dropped so waiters must recover via
-/// timeout-based rechecks.
-pub fn arm_drop_condvar_notify(arm: FaultHookArm) {
+/// When armed, `maybe_inject_drop_waiter_notify()` returns true,
+/// signaling the caller to suppress the active wait strategy's direct delivery
+/// after a successful `publish_completed_epoch()` store. The completed epoch is
+/// still published and every live targeted keyed slot's generation still
+/// advances; only direct delivery is dropped, so waiters must recover via
+/// timeout-based rechecks. Late waiters observe the already-published completed
+/// epoch directly.
+pub fn arm_drop_waiter_notify(arm: FaultHookArm) {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(owner_session_id) = current_fault_hook_session_id() else {
         return;
     };
-    state.drop_condvar_notify = Some(OwnedFaultHookArm::new(owner_session_id, arm));
+    state.drop_waiter_notify = Some(OwnedFaultHookArm::new(owner_session_id, arm));
 }
 
-/// Check and fire the dropped-condvar-notify hook.
+/// Check and fire the dropped waiter-notification hook.
 ///
 /// Returns `true` if the hook fires (caller should suppress the notify).
-pub(crate) fn maybe_inject_drop_condvar_notify(completed_epoch: u64) -> bool {
+pub(crate) fn maybe_inject_drop_waiter_notify(
+    completed_epoch: u64,
+    wait_strategy: &str,
+    notification_surface: &str,
+) -> bool {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(arm) = take_owned_hook_for_current_thread(&mut state.drop_condvar_notify) else {
+    let Some(arm) = take_owned_hook_for_current_thread(&mut state.drop_waiter_notify) else {
         return false;
     };
 
-    let detail = format!("completed_epoch={completed_epoch}");
-    record_trigger(&mut state, &arm, "drop_condvar_notify", detail);
+    let detail = format!(
+        "completed_epoch={completed_epoch} wait_strategy={wait_strategy} \
+         suppressed_delivery={notification_surface}"
+    );
+    record_trigger(&mut state, &arm, "drop_waiter_notify", detail);
     true
 }
 
@@ -686,7 +695,7 @@ mod tests {
 
         arm_after_flush_before_publish(arm("flush"));
         arm_during_phase_c(arm("phase_c"));
-        arm_drop_condvar_notify(arm("condvar"));
+        arm_drop_waiter_notify(arm("waiter"));
         let _ = maybe_inject_after_flush_before_publish(1, 1, 1);
         assert_eq!(take_records().len(), 1);
 
@@ -700,8 +709,8 @@ mod tests {
             "cleared phase_c hook must not fire"
         );
         assert!(
-            !maybe_inject_drop_condvar_notify(1),
-            "cleared condvar hook must not fire"
+            !maybe_inject_drop_waiter_notify(1, "keyed_eventcount", "keyed_notify"),
+            "cleared waiter-notification hook must not fire"
         );
         assert!(take_records().is_empty(), "clear must reset records");
     }
@@ -729,16 +738,19 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_condvar_notify_returns_true_once() {
+    fn test_drop_waiter_notify_returns_true_once() {
         let _g = TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
-        arm_drop_condvar_notify(arm("condvar"));
-        assert!(maybe_inject_drop_condvar_notify(1), "first call fires");
+        arm_drop_waiter_notify(arm("waiter"));
         assert!(
-            !maybe_inject_drop_condvar_notify(2),
+            maybe_inject_drop_waiter_notify(1, "keyed_eventcount", "keyed_notify"),
+            "first call fires"
+        );
+        assert!(
+            !maybe_inject_drop_waiter_notify(2, "keyed_eventcount", "keyed_notify"),
             "second call does not fire"
         );
     }
@@ -797,22 +809,32 @@ mod tests {
     }
 
     #[test]
-    fn test_condvar_notify_record_captures_detail() {
+    fn test_waiter_notify_record_captures_detail() {
         let _g = TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
-        arm_drop_condvar_notify(FaultHookArm::new("run-cv", "scen-cv", "inv-cv"));
-        assert!(maybe_inject_drop_condvar_notify(77));
+        arm_drop_waiter_notify(FaultHookArm::new("run-waiter", "scen-waiter", "inv-waiter"));
+        assert!(maybe_inject_drop_waiter_notify(
+            77,
+            "keyed_eventcount",
+            "keyed_notify"
+        ));
 
         let records = take_records();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].point, "drop_condvar_notify");
-        assert_eq!(records[0].run_id, "run-cv");
-        assert_eq!(records[0].scenario_id, "scen-cv");
-        assert_eq!(records[0].invariant_family, "inv-cv");
+        assert_eq!(records[0].point, "drop_waiter_notify");
+        assert_eq!(records[0].run_id, "run-waiter");
+        assert_eq!(records[0].scenario_id, "scen-waiter");
+        assert_eq!(records[0].invariant_family, "inv-waiter");
         assert!(records[0].detail.contains("completed_epoch=77"));
+        assert!(records[0].detail.contains("wait_strategy=keyed_eventcount"));
+        assert!(
+            records[0]
+                .detail
+                .contains("suppressed_delivery=keyed_notify")
+        );
     }
 
     #[test]
@@ -824,17 +846,21 @@ mod tests {
 
         arm_after_flush_before_publish(arm("flush"));
         arm_during_phase_c(arm("phase_c"));
-        arm_drop_condvar_notify(arm("condvar"));
+        arm_drop_waiter_notify(arm("waiter"));
 
         assert!(maybe_inject_after_flush_before_publish(1, 1, 1).is_err());
         assert!(maybe_inject_during_phase_c(2, 2).is_err());
-        assert!(maybe_inject_drop_condvar_notify(3));
+        assert!(maybe_inject_drop_waiter_notify(
+            3,
+            "keyed_eventcount",
+            "keyed_notify"
+        ));
 
         let records = take_records();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].point, "after_flush_before_publish");
         assert_eq!(records[1].point, "during_phase_c");
-        assert_eq!(records[2].point, "drop_condvar_notify");
+        assert_eq!(records[2].point, "drop_waiter_notify");
         assert_eq!(records[0].trigger_seq, 1);
         assert_eq!(records[1].trigger_seq, 2);
         assert_eq!(records[2].trigger_seq, 3);
@@ -849,7 +875,11 @@ mod tests {
 
         assert!(maybe_inject_after_flush_before_publish(1, 1, 1).is_ok());
         assert!(maybe_inject_during_phase_c(1, 1).is_ok());
-        assert!(!maybe_inject_drop_condvar_notify(1));
+        assert!(!maybe_inject_drop_waiter_notify(
+            1,
+            "keyed_eventcount",
+            "keyed_notify"
+        ));
         assert!(take_records().is_empty());
     }
 
@@ -869,8 +899,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
-        arm_drop_condvar_notify(arm("condvar"));
-        let _ = maybe_inject_drop_condvar_notify(1);
+        arm_drop_waiter_notify(arm("waiter"));
+        let _ = maybe_inject_drop_waiter_notify(1, "keyed_eventcount", "keyed_notify");
 
         let first = take_records();
         assert_eq!(first.len(), 1);
@@ -924,19 +954,23 @@ mod tests {
     }
 
     #[test]
-    fn test_fault_injection_record_fields_from_condvar_hook() {
+    fn test_fault_injection_record_fields_from_waiter_notify_hook() {
         let _g = TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
-        arm_drop_condvar_notify(FaultHookArm::new("r", "s", "i"));
-        assert!(maybe_inject_drop_condvar_notify(999));
+        arm_drop_waiter_notify(FaultHookArm::new("r", "s", "i"));
+        assert!(maybe_inject_drop_waiter_notify(
+            999,
+            "keyed_eventcount",
+            "keyed_notify"
+        ));
 
         let records = take_records();
         assert_eq!(records.len(), 1);
         let rec = &records[0];
-        assert_eq!(rec.point, "drop_condvar_notify");
+        assert_eq!(rec.point, "drop_waiter_notify");
         assert_eq!(rec.run_id, "r");
         assert_eq!(rec.scenario_id, "s");
         assert_eq!(rec.invariant_family, "i");

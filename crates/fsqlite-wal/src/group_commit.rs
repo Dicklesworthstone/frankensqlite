@@ -476,9 +476,10 @@ pub struct PhasePercentiles {
 
 /// Tracks why a waiter woke up during epoch wait.
 pub struct WakeReasonCounters {
-    /// Woken by condvar notify (normal completion).
+    /// Normal non-timeout completion, observed either before parking or after
+    /// direct delivery from the active waiter-notification strategy.
     pub notify: AtomicU64,
-    /// Woken by condvar timeout.
+    /// Woken by a bounded timeout before rechecking the terminal epoch state.
     pub timeout: AtomicU64,
     /// Waiter took over as flusher (flusher died or slow).
     pub flusher_takeover: AtomicU64,

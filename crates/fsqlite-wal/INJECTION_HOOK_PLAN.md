@@ -170,17 +170,17 @@ pub(crate) static FAULT_INJECT_WAL_APPEND_ERROR_COUNTDOWN: std::sync::atomic::At
 
 ---
 
-### H11. `FAULT_INJECT_DROP_CONDVAR_NOTIFY`
+### H11. `drop_waiter_notify`
 
 | Field | Value |
 |-------|-------|
-| **Fault case** | F11 — suppressed Condvar notification |
+| **Fault case** | F11 — suppressed delivery to an active group-commit waiter |
 | **File** | `crates/fsqlite-pager/src/pager.rs` |
-| **Insertion point** | Line 3771, before `queue.publish_completed_epoch(completed_epoch)` |
-| **Guard code** | `#[cfg(test)] if FAULT_INJECT_DROP_CONDVAR_NOTIFY.load(Ordering::Acquire) { /* skip publish — simulates lost notification */ return Ok(()); }` |
-| **Effect** | Waiters never receive Condvar notification. Must rely on timed wait (100ms timeout) to unblock. |
-| **Proof obligation** | All waiters eventually unblock via timeout. No permanent hangs. Transactions complete (possibly after delay). |
-| **Test name** | `test_fault_lost_condvar_notify_waiters_recover_via_timeout` |
+| **Insertion point** | `GroupCommitQueue::publish_completed_epoch()`, after the completed-epoch store and before targeted waiter delivery |
+| **Guard code** | `maybe_inject_drop_waiter_notify(completed_epoch, wait_strategy, notification_surface)` selects delivery suppression; `signal_completed_epoch_waiters(..., false)` still advances every live targeted keyed slot's generation. |
+| **Effect** | The active wait strategy's direct notification is suppressed. The keyed waiter must use its 200ms bounded timeout, observe the generation change, and recheck the completed epoch. |
+| **Proof obligation** | Once the publisher reaches the completed-epoch seam, a waiter held after its fast generation check and before timeout construction recovers exactly once through its bounded timeout path. The publisher is joined before assertions so the test leaves no background worker. Arbitrary synchronous publisher deadlocks require separate process-isolated timeout coverage. |
+| **Test name** | `test_fault_drop_waiter_notify_recovers_via_timeout` |
 
 ---
 
@@ -259,5 +259,5 @@ fn test_fault_crash_after_wal_append_recovers_cleanly() {
 3. **H3** + **H4** (group-commit publish) — publish path integrity
 4. **H5** (append error retry) — flusher resilience
 5. **H9** (header/truncate race) — checkpoint safety
-6. **H11** (Condvar loss) — liveness under fault
+6. **H11** (waiter-delivery loss) — liveness under fault
 7. **H6**, **H7**, **H10** — secondary / rare paths
