@@ -141,7 +141,7 @@ pub struct WalFile<F: VfsFile> {
     /// `&mut self`, so reuse stays serialized per handle without reintroducing
     /// any cross-writer coordination.
     frame_scratch: Vec<u8>,
-    /// Frame count at which the last successful durable_sync completed.
+    /// Frame count covered by the last successful WAL sync.
     /// Used by debug-assertions and FRANKENSQLITE_PARANOID_DURABILITY to
     /// verify the two-phase commit invariant: fsync must complete before
     /// any CommitIndex publish for the same frames.
@@ -1479,12 +1479,15 @@ impl<F: VfsFile> WalFile<F> {
         Ok(self.last_commit_frame)
     }
 
-    /// Sync the WAL file to stable storage.
+    /// Sync the WAL file to stable storage and record every appended frame
+    /// covered by the successful sync for the two-phase publish invariant.
     pub fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
 
-        self.file.sync(cx, flags)
+        self.file.sync(cx, flags)?;
+        self.last_fsynced_frame_count = self.frame_count;
+        Ok(())
     }
 
     /// Remove every physical byte after the checksum-valid committed prefix
@@ -1522,8 +1525,8 @@ impl<F: VfsFile> WalFile<F> {
     /// Durability-intent sync: makes all appended frames durable and records
     /// the fsynced frame count for the two-phase commit invariant.
     ///
-    /// Callers that will publish a CommitIndex MUST call this (not raw `sync`)
-    /// so the invariant tracker can verify ordering.
+    /// This is the intent-preserving form of [`Self::sync`]. Both successful
+    /// sync paths advance the invariant tracker before a caller can publish.
     pub fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
         #[cfg(any(test, feature = "fault-injection"))]
         {
@@ -1554,7 +1557,7 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     /// Assert that it is safe to publish frames up to `publish_frame_count`
-    /// — i.e. that a durable_sync has already completed covering those frames.
+    /// — i.e. that a successful sync has already completed covering those frames.
     ///
     /// Under debug-assertions this panics. In release mode, it returns an error
     /// only when `FRANKENSQLITE_PARANOID_DURABILITY=1` is set.
@@ -1584,7 +1587,7 @@ impl<F: VfsFile> WalFile<F> {
         Ok(())
     }
 
-    /// The frame count at which the last successful durable sync completed.
+    /// The frame count covered by the last successful WAL sync.
     #[must_use]
     pub fn last_fsynced_frame_count(&self) -> usize {
         self.last_fsynced_frame_count
@@ -2340,7 +2343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_does_not_panic() {
+    fn sync_records_fsynced_frame_count_for_production_flags() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
@@ -2349,7 +2352,12 @@ mod tests {
         wal.append_frame(&cx, 1, &sample_page(0), 1)
             .expect("append");
         wal.sync(&cx, SyncFlags::NORMAL).expect("sync");
+        assert_eq!(wal.last_fsynced_frame_count(), 1);
+
+        wal.append_frame(&cx, 2, &sample_page(1), 2)
+            .expect("append");
         wal.sync(&cx, SyncFlags::FULL).expect("full sync");
+        assert_eq!(wal.last_fsynced_frame_count(), 2);
 
         wal.close(&cx).expect("close WAL");
     }
@@ -2378,6 +2386,11 @@ mod tests {
         assert!(
             error.to_string().contains("fault_inject:wal_sync_failure"),
             "fault error should identify the sync hook: {error}"
+        );
+        assert_eq!(
+            wal.last_fsynced_frame_count(),
+            0,
+            "a failed sync must not advance the durable-barrier accounting"
         );
 
         let records = crate::fault_hooks::take_records();
