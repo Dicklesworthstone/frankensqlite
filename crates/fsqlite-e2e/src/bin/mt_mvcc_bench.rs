@@ -64,11 +64,13 @@
 // timed window.
 #![allow(clippy::large_futures)]
 
-use std::collections::BTreeMap;
-use std::io::Write as _;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::io::{Read as _, Write as _};
+use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
     fmt::{Display, Write as _},
     fs,
@@ -171,7 +173,7 @@ const SHARED_INSERT_SQL: &str = "INSERT INTO bench (id, payload) VALUES (?1, ?2)
 const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
 const PASS_OVER_PASS_MAX_RATIO_DROP_PCT: f64 = 5.0;
-const REPORT_SCHEMA_V6: &str = "fsqlite-e2e.mt_mvcc_bench_report.v6";
+const REPORT_SCHEMA_V7: &str = "fsqlite-e2e.mt_mvcc_bench_report.v7";
 const SETTINGS_INTERPRETATION: &str = "Both engines proved the listed effective PRAGMA values; \
     equal names and readbacks do not establish cross-engine semantic equivalence.";
 const ACCOUNTING_INTERPRETATION: &str = "offered and committed writes share one row unit; \
@@ -180,10 +182,27 @@ const ACCOUNTING_INTERPRETATION: &str = "offered and committed writes share one 
 const TIMING_INTERPRETATION: &str = "workload_elapsed_ns begins only after every worker has \
     opened and proved its effective settings, and ends at the last worker's transaction terminal \
     point before connection teardown; worker_startup_elapsed_ns is reported separately.";
-const NON_CITABLE_REASON: &str = "v6 adds fail-closed settings, committed-work, integrity, timing, \
-    retry-policy, and configuration receipts, but bd-uh1fv still requires external watchdog, \
-    sanitized environment, matched retry/deadline semantics, complete build/toolchain provenance, \
-    counterbalanced topology receipts, immutable manifest, and independent verification.";
+const NON_CITABLE_REASON: &str = "v7 binds the running executable, build/runtime source identity, \
+    Cargo.lock, invocation, toolchain, and measurement host to this same-invocation comparison, \
+    but bd-uh1fv still requires external watchdog, sanitized environment, matched retry/deadline \
+    semantics, a build-attested resolved dependency/feature-graph digest, counterbalanced topology \
+    receipts, immutable manifest, retained baseline history, and independent verification.";
+const RELEASE_REGRESSION_SCOPE: &str = "Narrow same-process, same-host F/C writer-throughput \
+    comparison for only the requested mt-mvcc-bench workload/configurations; this report does not \
+    cover the shipped release profile, other workloads or platforms, long-term baseline retention, \
+    independent reproduction, or overall release eligibility.";
+const EMBEDDED_BUILD_CARGO_LOCK: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+
+macro_rules! human_output {
+    ($json_stdout:expr, $($arg:tt)*) => {
+        if $json_stdout {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
 
 fn bytes_to_lower_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -193,15 +212,18 @@ fn bytes_to_lower_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    bytes_to_lower_hex(&Sha256::digest(bytes))
+}
+
 fn file_identity(path: &Path) -> String {
     let Ok(bytes) = fs::read(path) else {
         return format!("unavailable:{}", path.display());
     };
-    let digest = Sha256::digest(&bytes);
     format!(
         "{}:{}:{}",
         path.display(),
-        bytes_to_lower_hex(&digest),
+        sha256_bytes(&bytes),
         bytes.len()
     )
 }
@@ -213,13 +235,885 @@ fn self_identity() -> String {
     let Ok(bytes) = fs::read(&path) else {
         return format!("unavailable read_error {}", path.display());
     };
-    let digest = Sha256::digest(&bytes);
     format!(
         "{} ({} bytes) {}",
-        bytes_to_lower_hex(&digest),
+        sha256_bytes(&bytes),
         bytes.len(),
         path.display()
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct FileSnapshotReceipt {
+    sha256: Option<String>,
+    bytes_read: Option<u64>,
+    metadata_size_bytes: Option<u64>,
+    unix_device: Option<u64>,
+    unix_inode: Option<u64>,
+    error: Option<String>,
+}
+
+impl FileSnapshotReceipt {
+    fn unavailable(error: impl Into<String>) -> Self {
+        Self {
+            sha256: None,
+            bytes_read: None,
+            metadata_size_bytes: None,
+            unix_device: None,
+            unix_inode: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExecutableIdentityStart {
+    current_exe_path: Option<PathBuf>,
+    canonical_path: Option<PathBuf>,
+    path_resolution_error: Option<String>,
+    path_used: Option<PathBuf>,
+    before_measurement: FileSnapshotReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ExecutableIdentityReceipt {
+    current_exe_path: Option<String>,
+    canonical_path: Option<String>,
+    path_resolution_error: Option<String>,
+    process_id: u32,
+    before_measurement: FileSnapshotReceipt,
+    after_measurement: FileSnapshotReceipt,
+    unchanged_during_measurement: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BuildSourceIdentityReceipt {
+    workspace_root: String,
+    git_sha: String,
+    git_branch: String,
+    git_tree_state: String,
+    build_nonce: String,
+    build_input_tracking: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RuntimeSourceIdentityReceipt {
+    workspace_root: String,
+    canonical_workspace_root: Option<String>,
+    git_sha: Option<String>,
+    git_branch: Option<String>,
+    git_tree_state: String,
+    matches_build_git_sha: Option<bool>,
+    discovery_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RuntimeSourceStabilityReceipt {
+    before_measurement: RuntimeSourceIdentityReceipt,
+    after_measurement: RuntimeSourceIdentityReceipt,
+    same_clean_git_identity_at_capture_points: Option<bool>,
+    stability_limitation: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CargoLockIdentityStart {
+    embedded_build_sha256: String,
+    embedded_build_size_bytes: u64,
+    runtime_path: PathBuf,
+    before_measurement: FileSnapshotReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CargoLockIdentityReceipt {
+    embedded_build_sha256: String,
+    embedded_build_size_bytes: u64,
+    runtime_path: String,
+    before_measurement: FileSnapshotReceipt,
+    after_measurement: FileSnapshotReceipt,
+    before_matches_embedded_build: Option<bool>,
+    after_matches_embedded_build: Option<bool>,
+    unchanged_at_capture_points: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SubjectIdentityReceipt {
+    executable: ExecutableIdentityReceipt,
+    build_source: BuildSourceIdentityReceipt,
+    runtime_source: RuntimeSourceStabilityReceipt,
+    cargo_lock: CargoLockIdentityReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RustflagsReceipt {
+    cargo_encoded_rustflags_present: bool,
+    encoded_hex: String,
+    decoded_arguments: Option<Vec<String>>,
+    decode_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BuildConfigurationReceipt {
+    cargo_profile: String,
+    selected_profile: String,
+    profile_label: String,
+    opt_level: String,
+    debug: String,
+    target: String,
+    build_host: String,
+    enabled_features: Vec<String>,
+    rustflags: RustflagsReceipt,
+    profile_overrides_hex: String,
+    native_build_overrides_hex: String,
+    rustc_version_verbose: String,
+    cargo_version: String,
+    resolved_dependency_feature_graph_sha256: Option<String>,
+    resolved_dependency_feature_graph_limitation: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct InvocationReceipt {
+    argv_lossy: Vec<String>,
+    argv_raw_hex: Vec<String>,
+    raw_encoding: &'static str,
+    length_prefixed_argv_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CpuTopologyReceipt {
+    logical_cpu_directories: Option<usize>,
+    physical_package_count: Option<usize>,
+    physical_core_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StaticMeasurementHostReceipt {
+    hostname: Option<String>,
+    cpu_model: Option<String>,
+    available_parallelism: Option<usize>,
+    cpu_online: Option<String>,
+    cpu_present: Option<String>,
+    cpu_possible: Option<String>,
+    cpu_isolated: Option<String>,
+    cpu_topology: CpuTopologyReceipt,
+    scaling_governors_by_cpu: BTreeMap<String, String>,
+    kernel_release: Option<String>,
+    kernel_version: Option<String>,
+    numa_online_nodes: Option<String>,
+    numa_possible_nodes: Option<String>,
+    numa_node_directories: Option<usize>,
+    unavailable_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DynamicMeasurementHostReceipt {
+    unix_epoch_millis: Option<u64>,
+    process_cpu_affinity_mask: Option<String>,
+    process_cpu_affinity_list: Option<String>,
+    proc_self_cgroup: Option<String>,
+    cpuset_cpus_effective: Option<String>,
+    cpuset_mems_effective: Option<String>,
+    load_average: Option<String>,
+    pressure_cpu: Option<String>,
+    pressure_memory: Option<String>,
+    pressure_io: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MeasurementHostReceipt {
+    host: StaticMeasurementHostReceipt,
+    before_measurement: DynamicMeasurementHostReceipt,
+    after_measurement: DynamicMeasurementHostReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ComparisonEnvironmentReceipt {
+    build_configuration: BuildConfigurationReceipt,
+    invocation: InvocationReceipt,
+    measurement_host: MeasurementHostReceipt,
+}
+
+#[derive(Debug, Clone)]
+struct ProvenanceCapture {
+    executable: ExecutableIdentityStart,
+    build_source: BuildSourceIdentityReceipt,
+    runtime_source_before_measurement: RuntimeSourceIdentityReceipt,
+    cargo_lock: CargoLockIdentityStart,
+    build_configuration: BuildConfigurationReceipt,
+    invocation: InvocationReceipt,
+    host: StaticMeasurementHostReceipt,
+    host_before_measurement: DynamicMeasurementHostReceipt,
+}
+
+fn snapshot_file(path: &Path) -> FileSnapshotReceipt {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return FileSnapshotReceipt::unavailable(format!("open {}: {error}", path.display()));
+        }
+    };
+    let mut errors = Vec::new();
+    // Both metadata and bytes come from this one open handle. A concurrent
+    // path replacement therefore cannot splice one file's digest together
+    // with another file's device/inode identity.
+    let metadata = file.metadata();
+    let mut bytes = Vec::new();
+    let (sha256, bytes_read) = match file.read_to_end(&mut bytes) {
+        Ok(bytes_read) => (Some(sha256_bytes(&bytes)), u64::try_from(bytes_read).ok()),
+        Err(error) => {
+            errors.push(format!("read open handle for {}: {error}", path.display()));
+            (None, None)
+        }
+    };
+    let (metadata_size_bytes, unix_device, unix_inode) = match metadata {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                (
+                    Some(metadata.len()),
+                    Some(metadata.dev()),
+                    Some(metadata.ino()),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                (Some(metadata.len()), None, None)
+            }
+        }
+        Err(error) => {
+            errors.push(format!("metadata {}: {error}", path.display()));
+            (None, None, None)
+        }
+    };
+    FileSnapshotReceipt {
+        sha256,
+        bytes_read,
+        metadata_size_bytes,
+        unix_device,
+        unix_inode,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
+fn begin_executable_identity() -> ExecutableIdentityStart {
+    match std::env::current_exe() {
+        Ok(current_exe_path) => {
+            let (canonical_path, path_resolution_error) = match current_exe_path.canonicalize() {
+                Ok(path) => (Some(path), None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "canonicalize {}: {error}",
+                        current_exe_path.display()
+                    )),
+                ),
+            };
+            let path_used = canonical_path
+                .as_ref()
+                .unwrap_or(&current_exe_path)
+                .to_path_buf();
+            let before_measurement = snapshot_file(&path_used);
+            ExecutableIdentityStart {
+                current_exe_path: Some(current_exe_path),
+                canonical_path,
+                path_resolution_error,
+                path_used: Some(path_used),
+                before_measurement,
+            }
+        }
+        Err(error) => ExecutableIdentityStart {
+            current_exe_path: None,
+            canonical_path: None,
+            path_resolution_error: Some(format!("current_exe: {error}")),
+            path_used: None,
+            before_measurement: FileSnapshotReceipt::unavailable(format!("current_exe: {error}")),
+        },
+    }
+}
+
+fn finish_executable_identity(start: ExecutableIdentityStart) -> ExecutableIdentityReceipt {
+    let after_measurement = start.path_used.as_ref().map_or_else(
+        || FileSnapshotReceipt::unavailable("running executable path unavailable"),
+        |path| snapshot_file(path),
+    );
+    let unchanged_during_measurement =
+        file_snapshots_match(&start.before_measurement, &after_measurement);
+    ExecutableIdentityReceipt {
+        current_exe_path: start
+            .current_exe_path
+            .map(|path| path.to_string_lossy().into_owned()),
+        canonical_path: start
+            .canonical_path
+            .map(|path| path.to_string_lossy().into_owned()),
+        path_resolution_error: start.path_resolution_error,
+        process_id: std::process::id(),
+        before_measurement: start.before_measurement,
+        after_measurement,
+        unchanged_during_measurement,
+    }
+}
+
+fn build_tree_state(dirty: &str) -> String {
+    match dirty {
+        "false" => "clean".to_owned(),
+        "true" => "dirty".to_owned(),
+        other => format!("unknown:{other}"),
+    }
+}
+
+fn collect_build_source_identity() -> BuildSourceIdentityReceipt {
+    BuildSourceIdentityReceipt {
+        workspace_root: env!("FSQLITE_BENCH_BUILD_WORKSPACE_ROOT").to_owned(),
+        git_sha: env!("FSQLITE_BENCH_BUILD_GIT_SHA").to_owned(),
+        git_branch: env!("FSQLITE_BENCH_BUILD_GIT_BRANCH").to_owned(),
+        git_tree_state: build_tree_state(env!("FSQLITE_BENCH_BUILD_GIT_DIRTY")),
+        build_nonce: env!("FSQLITE_BENCH_BUILD_NONCE").to_owned(),
+        build_input_tracking: env!("FSQLITE_BENCH_BUILD_INPUT_TRACKING").to_owned(),
+    }
+}
+
+fn command_stdout(mut command: Command) -> Result<String, String> {
+    let debug_command = format!("{command:?}");
+    let output = command
+        .output()
+        .map_err(|error| format!("execute {debug_command}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{debug_command} exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|stdout| stdout.trim().to_owned())
+        .map_err(|error| format!("decode stdout from {debug_command}: {error}"))
+}
+
+fn git_stdout(workspace_root: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(workspace_root).args(args);
+    command_stdout(command)
+}
+
+fn collect_runtime_source_identity(
+    build_source: &BuildSourceIdentityReceipt,
+) -> RuntimeSourceIdentityReceipt {
+    let workspace_root = PathBuf::from(&build_source.workspace_root);
+    let mut discovery_errors = Vec::new();
+    let canonical_workspace_root = match workspace_root.canonicalize() {
+        Ok(path) => Some(path),
+        Err(error) => {
+            discovery_errors.push(format!(
+                "canonicalize runtime workspace {}: {error}",
+                workspace_root.display()
+            ));
+            None
+        }
+    };
+    let git_root = canonical_workspace_root
+        .as_deref()
+        .unwrap_or(workspace_root.as_path());
+    let git_sha = match git_stdout(git_root, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(value) if !value.is_empty() => Some(value),
+        Ok(_) => {
+            discovery_errors.push("runtime git SHA was empty".to_owned());
+            None
+        }
+        Err(error) => {
+            discovery_errors.push(error);
+            None
+        }
+    };
+    let git_branch = match git_stdout(git_root, &["branch", "--show-current"]) {
+        Ok(value) if !value.is_empty() => Some(value),
+        Ok(_) => Some("detached".to_owned()),
+        Err(error) => {
+            discovery_errors.push(error);
+            None
+        }
+    };
+    let git_tree_state = match git_stdout(
+        git_root,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    ) {
+        Ok(status) if status.is_empty() => "clean".to_owned(),
+        Ok(_) => "dirty".to_owned(),
+        Err(error) => {
+            discovery_errors.push(error);
+            "unavailable".to_owned()
+        }
+    };
+    RuntimeSourceIdentityReceipt {
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        canonical_workspace_root: canonical_workspace_root
+            .map(|path| path.to_string_lossy().into_owned()),
+        matches_build_git_sha: git_sha.as_deref().map(|sha| sha == build_source.git_sha),
+        git_sha,
+        git_branch,
+        git_tree_state,
+        discovery_errors,
+    }
+}
+
+fn begin_cargo_lock_identity(build_source: &BuildSourceIdentityReceipt) -> CargoLockIdentityStart {
+    let runtime_path = PathBuf::from(&build_source.workspace_root).join("Cargo.lock");
+    CargoLockIdentityStart {
+        embedded_build_sha256: sha256_bytes(EMBEDDED_BUILD_CARGO_LOCK),
+        embedded_build_size_bytes: u64::try_from(EMBEDDED_BUILD_CARGO_LOCK.len())
+            .expect("Cargo.lock length fits u64"),
+        before_measurement: snapshot_file(&runtime_path),
+        runtime_path,
+    }
+}
+
+fn file_snapshots_match(before: &FileSnapshotReceipt, after: &FileSnapshotReceipt) -> Option<bool> {
+    if before.error.is_some() || after.error.is_some() {
+        return None;
+    }
+    let unix_identity_matches = |before: Option<u64>, after: Option<u64>| match (before, after) {
+        (Some(before), Some(after)) => before == after,
+        (None, None) => true,
+        _ => false,
+    };
+    match (
+        before.sha256.as_ref(),
+        after.sha256.as_ref(),
+        before.bytes_read,
+        after.bytes_read,
+        before.metadata_size_bytes,
+        after.metadata_size_bytes,
+    ) {
+        (
+            Some(before_hash),
+            Some(after_hash),
+            Some(before_bytes),
+            Some(after_bytes),
+            Some(before_metadata_size),
+            Some(after_metadata_size),
+        ) => Some(
+            before_hash == after_hash
+                && before_bytes == after_bytes
+                && before_metadata_size == after_metadata_size
+                && before_metadata_size == before_bytes
+                && after_metadata_size == after_bytes
+                && unix_identity_matches(before.unix_device, after.unix_device)
+                && unix_identity_matches(before.unix_inode, after.unix_inode),
+        ),
+        _ => None,
+    }
+}
+
+fn finish_cargo_lock_identity(start: CargoLockIdentityStart) -> CargoLockIdentityReceipt {
+    let after_measurement = snapshot_file(&start.runtime_path);
+    let before_matches_embedded_build = start
+        .before_measurement
+        .sha256
+        .as_deref()
+        .map(|sha| sha == start.embedded_build_sha256);
+    let after_matches_embedded_build = after_measurement
+        .sha256
+        .as_deref()
+        .map(|sha| sha == start.embedded_build_sha256);
+    let unchanged_at_capture_points =
+        file_snapshots_match(&start.before_measurement, &after_measurement);
+    CargoLockIdentityReceipt {
+        embedded_build_sha256: start.embedded_build_sha256,
+        embedded_build_size_bytes: start.embedded_build_size_bytes,
+        runtime_path: start.runtime_path.to_string_lossy().into_owned(),
+        before_measurement: start.before_measurement,
+        after_measurement,
+        before_matches_embedded_build,
+        after_matches_embedded_build,
+        unchanged_at_capture_points,
+    }
+}
+
+fn runtime_source_stability(
+    before_measurement: RuntimeSourceIdentityReceipt,
+    after_measurement: RuntimeSourceIdentityReceipt,
+) -> RuntimeSourceStabilityReceipt {
+    let same_clean_git_identity_at_capture_points = match (
+        before_measurement.git_sha.as_deref(),
+        after_measurement.git_sha.as_deref(),
+    ) {
+        (Some(before_sha), Some(after_sha))
+            if before_sha != after_sha
+                || before_measurement.git_tree_state != after_measurement.git_tree_state =>
+        {
+            Some(false)
+        }
+        (Some(_), Some(_))
+            if before_measurement.git_tree_state == "clean"
+                && after_measurement.git_tree_state == "clean" =>
+        {
+            Some(true)
+        }
+        _ => None,
+    };
+    RuntimeSourceStabilityReceipt {
+        before_measurement,
+        after_measurement,
+        same_clean_git_identity_at_capture_points,
+        stability_limitation: "dirty worktree content is not hashed by the existing build \
+            attestation, so equality is asserted only for the same clean Git commit at both \
+            capture points",
+    }
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let mut chunks = encoded.as_bytes().chunks_exact(2);
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for chunk in &mut chunks {
+        let high = nibble(chunk[0]).ok_or_else(|| format!("non-hex byte 0x{:02x}", chunk[0]))?;
+        let low = nibble(chunk[1]).ok_or_else(|| format!("non-hex byte 0x{:02x}", chunk[1]))?;
+        decoded.push((high << 4) | low);
+    }
+    if chunks.remainder().is_empty() {
+        Ok(decoded)
+    } else {
+        Err("hex value has odd length".to_owned())
+    }
+}
+
+fn collect_rustflags() -> RustflagsReceipt {
+    let encoded_hex = env!("FSQLITE_BENCH_BUILD_RUSTFLAGS_HEX").to_owned();
+    let present = env!("FSQLITE_BENCH_BUILD_ENCODED_RUSTFLAGS_PRESENT") == "true";
+    match decode_hex(&encoded_hex).and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|error| format!("RUSTFLAGS are not UTF-8: {error}"))
+    }) {
+        Ok(decoded) => RustflagsReceipt {
+            cargo_encoded_rustflags_present: present,
+            encoded_hex,
+            decoded_arguments: Some(
+                decoded
+                    .split('\u{1f}')
+                    .filter(|argument| !argument.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            decode_error: None,
+        },
+        Err(error) => RustflagsReceipt {
+            cargo_encoded_rustflags_present: present,
+            encoded_hex,
+            decoded_arguments: None,
+            decode_error: Some(error),
+        },
+    }
+}
+
+fn collect_build_configuration() -> BuildConfigurationReceipt {
+    BuildConfigurationReceipt {
+        cargo_profile: env!("FSQLITE_BENCH_BUILD_PROFILE").to_owned(),
+        selected_profile: env!("FSQLITE_BENCH_BUILD_SELECTED_PROFILE").to_owned(),
+        profile_label: env!("FSQLITE_BENCH_BUILD_PROFILE_LABEL").to_owned(),
+        opt_level: env!("FSQLITE_BENCH_BUILD_OPT_LEVEL").to_owned(),
+        debug: env!("FSQLITE_BENCH_BUILD_DEBUG").to_owned(),
+        target: env!("FSQLITE_BENCH_BUILD_TARGET").to_owned(),
+        build_host: env!("FSQLITE_BENCH_BUILD_HOST").to_owned(),
+        enabled_features: env!("FSQLITE_BENCH_BUILD_FEATURES")
+            .split(',')
+            .filter(|feature| !feature.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        rustflags: collect_rustflags(),
+        profile_overrides_hex: env!("FSQLITE_BENCH_BUILD_PROFILE_OVERRIDES_HEX").to_owned(),
+        native_build_overrides_hex: env!("FSQLITE_BENCH_BUILD_NATIVE_OVERRIDES_HEX").to_owned(),
+        rustc_version_verbose: env!("FSQLITE_BENCH_BUILD_RUSTC_VERSION").to_owned(),
+        cargo_version: env!("FSQLITE_BENCH_BUILD_CARGO_VERSION").to_owned(),
+        resolved_dependency_feature_graph_sha256: None,
+        resolved_dependency_feature_graph_limitation: "the existing fsqlite-e2e build attestation \
+            exposes this crate's enabled features but not Cargo's resolved dependency/feature \
+            graph; v7 therefore leaves the digest explicitly unavailable",
+    }
+}
+
+#[cfg(unix)]
+fn os_str_raw_bytes(value: &OsStr) -> (&'static str, Vec<u8>) {
+    use std::os::unix::ffi::OsStrExt as _;
+    ("unix_os_str_bytes", value.as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn os_str_raw_bytes(value: &OsStr) -> (&'static str, Vec<u8>) {
+    use std::os::windows::ffi::OsStrExt as _;
+    let bytes = value
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    ("windows_utf16le", bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_str_raw_bytes(value: &OsStr) -> (&'static str, Vec<u8>) {
+    ("lossy_utf8", value.to_string_lossy().as_bytes().to_vec())
+}
+
+fn collect_invocation(argv: Vec<OsString>) -> InvocationReceipt {
+    let mut raw_encoding = "empty_argv";
+    let mut canonical = Vec::new();
+    let mut argv_raw_hex = Vec::with_capacity(argv.len());
+    let mut argv_lossy = Vec::with_capacity(argv.len());
+    for argument in argv {
+        let (encoding, raw) = os_str_raw_bytes(&argument);
+        raw_encoding = encoding;
+        let raw_len = u64::try_from(raw.len()).expect("argument length fits u64");
+        canonical.extend_from_slice(&raw_len.to_le_bytes());
+        canonical.extend_from_slice(&raw);
+        argv_raw_hex.push(bytes_to_lower_hex(&raw));
+        argv_lossy.push(argument.to_string_lossy().into_owned());
+    }
+    InvocationReceipt {
+        argv_lossy,
+        argv_raw_hex,
+        raw_encoding,
+        length_prefixed_argv_sha256: sha256_bytes(&canonical),
+    }
+}
+
+fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn cpu_model() -> Option<String> {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
+    for key in ["model name", "Hardware", "Processor"] {
+        if let Some(value) = cpuinfo.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim() == key).then(|| value.trim().to_owned())
+        }) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn numeric_directories(path: &Path, prefix: &str) -> Option<Vec<String>> {
+    let mut names = fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            name.strip_prefix(prefix).is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    Some(names)
+}
+
+fn collect_cpu_topology() -> (CpuTopologyReceipt, BTreeMap<String, String>) {
+    let cpu_root = Path::new("/sys/devices/system/cpu");
+    let Some(cpu_names) = numeric_directories(cpu_root, "cpu") else {
+        return (
+            CpuTopologyReceipt {
+                logical_cpu_directories: None,
+                physical_package_count: None,
+                physical_core_count: None,
+            },
+            BTreeMap::new(),
+        );
+    };
+    let mut packages = BTreeSet::new();
+    let mut cores = BTreeSet::new();
+    let mut governors = BTreeMap::new();
+    for cpu_name in &cpu_names {
+        let cpu_path = cpu_root.join(cpu_name);
+        let package = read_trimmed(cpu_path.join("topology/physical_package_id"));
+        let core = read_trimmed(cpu_path.join("topology/core_id"));
+        if let Some(package) = package.as_ref() {
+            packages.insert(package.clone());
+        }
+        if let (Some(package), Some(core)) = (package, core) {
+            cores.insert((package, core));
+        }
+        if let Some(governor) = read_trimmed(cpu_path.join("cpufreq/scaling_governor")) {
+            governors.insert(cpu_name.clone(), governor);
+        }
+    }
+    (
+        CpuTopologyReceipt {
+            logical_cpu_directories: Some(cpu_names.len()),
+            physical_package_count: (!packages.is_empty()).then_some(packages.len()),
+            physical_core_count: (!cores.is_empty()).then_some(cores.len()),
+        },
+        governors,
+    )
+}
+
+fn collect_static_measurement_host() -> StaticMeasurementHostReceipt {
+    let hostname = read_trimmed("/etc/hostname").or_else(|| {
+        let command = Command::new("hostname");
+        command_stdout(command)
+            .ok()
+            .filter(|value| !value.is_empty())
+    });
+    let cpu_model = cpu_model();
+    let available_parallelism = std::thread::available_parallelism()
+        .ok()
+        .map(|value| value.get());
+    let cpu_online = read_trimmed("/sys/devices/system/cpu/online");
+    let cpu_present = read_trimmed("/sys/devices/system/cpu/present");
+    let cpu_possible = read_trimmed("/sys/devices/system/cpu/possible");
+    let cpu_isolated = read_trimmed("/sys/devices/system/cpu/isolated");
+    let (cpu_topology, scaling_governors_by_cpu) = collect_cpu_topology();
+    let kernel_release = read_trimmed("/proc/sys/kernel/osrelease");
+    let kernel_version = read_trimmed("/proc/version");
+    let numa_online_nodes = read_trimmed("/sys/devices/system/node/online");
+    let numa_possible_nodes = read_trimmed("/sys/devices/system/node/possible");
+    let numa_node_directories =
+        numeric_directories(Path::new("/sys/devices/system/node"), "node").map(|nodes| nodes.len());
+    let mut unavailable_fields = Vec::new();
+    for (name, available) in [
+        ("hostname", hostname.is_some()),
+        ("cpu_model", cpu_model.is_some()),
+        ("available_parallelism", available_parallelism.is_some()),
+        ("cpu_online", cpu_online.is_some()),
+        ("cpu_present", cpu_present.is_some()),
+        ("cpu_possible", cpu_possible.is_some()),
+        ("kernel_release", kernel_release.is_some()),
+        ("kernel_version", kernel_version.is_some()),
+        ("numa_online_nodes", numa_online_nodes.is_some()),
+        ("numa_possible_nodes", numa_possible_nodes.is_some()),
+        ("numa_node_directories", numa_node_directories.is_some()),
+    ] {
+        if !available {
+            unavailable_fields.push(name.to_owned());
+        }
+    }
+    if cpu_isolated.is_none() {
+        unavailable_fields.push("cpu_isolated".to_owned());
+    }
+    if scaling_governors_by_cpu.is_empty() {
+        unavailable_fields.push("scaling_governors_by_cpu".to_owned());
+    }
+    StaticMeasurementHostReceipt {
+        hostname,
+        cpu_model,
+        available_parallelism,
+        cpu_online,
+        cpu_present,
+        cpu_possible,
+        cpu_isolated,
+        cpu_topology,
+        scaling_governors_by_cpu,
+        kernel_release,
+        kernel_version,
+        numa_online_nodes,
+        numa_possible_nodes,
+        numa_node_directories,
+        unavailable_fields,
+    }
+}
+
+fn proc_status_value(name: &str) -> Option<String> {
+    fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key == name).then(|| value.trim().to_owned())
+        })
+}
+
+fn current_cgroup_path(proc_self_cgroup: &str) -> Option<PathBuf> {
+    for line in proc_self_cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let relative_path = fields.next()?.trim_start_matches('/');
+        if hierarchy == "0" && controllers.is_empty() {
+            return Some(Path::new("/sys/fs/cgroup").join(relative_path));
+        }
+        if controllers
+            .split(',')
+            .any(|controller| controller == "cpuset")
+        {
+            return Some(Path::new("/sys/fs/cgroup/cpuset").join(relative_path));
+        }
+    }
+    None
+}
+
+fn collect_dynamic_measurement_host() -> DynamicMeasurementHostReceipt {
+    let unix_epoch_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+    let proc_self_cgroup = read_trimmed("/proc/self/cgroup");
+    let cgroup_path = proc_self_cgroup.as_deref().and_then(current_cgroup_path);
+    let cpuset_cpus_effective = cgroup_path.as_deref().and_then(|path| {
+        read_trimmed(path.join("cpuset.cpus.effective"))
+            .or_else(|| read_trimmed(path.join("cpuset.cpus")))
+    });
+    let cpuset_mems_effective = cgroup_path.as_deref().and_then(|path| {
+        read_trimmed(path.join("cpuset.mems.effective"))
+            .or_else(|| read_trimmed(path.join("cpuset.mems")))
+    });
+    DynamicMeasurementHostReceipt {
+        unix_epoch_millis,
+        process_cpu_affinity_mask: proc_status_value("Cpus_allowed"),
+        process_cpu_affinity_list: proc_status_value("Cpus_allowed_list"),
+        proc_self_cgroup,
+        cpuset_cpus_effective,
+        cpuset_mems_effective,
+        load_average: read_trimmed("/proc/loadavg"),
+        pressure_cpu: read_trimmed("/proc/pressure/cpu"),
+        pressure_memory: read_trimmed("/proc/pressure/memory"),
+        pressure_io: read_trimmed("/proc/pressure/io"),
+    }
+}
+
+impl ProvenanceCapture {
+    fn begin() -> Self {
+        let build_source = collect_build_source_identity();
+        Self {
+            executable: begin_executable_identity(),
+            runtime_source_before_measurement: collect_runtime_source_identity(&build_source),
+            cargo_lock: begin_cargo_lock_identity(&build_source),
+            build_source,
+            build_configuration: collect_build_configuration(),
+            invocation: collect_invocation(std::env::args_os().collect()),
+            host: collect_static_measurement_host(),
+            host_before_measurement: collect_dynamic_measurement_host(),
+        }
+    }
+
+    fn finish(self) -> (SubjectIdentityReceipt, ComparisonEnvironmentReceipt) {
+        let runtime_source_after_measurement = collect_runtime_source_identity(&self.build_source);
+        let subject_identity = SubjectIdentityReceipt {
+            executable: finish_executable_identity(self.executable),
+            build_source: self.build_source,
+            runtime_source: runtime_source_stability(
+                self.runtime_source_before_measurement,
+                runtime_source_after_measurement,
+            ),
+            cargo_lock: finish_cargo_lock_identity(self.cargo_lock),
+        };
+        let comparison_environment = ComparisonEnvironmentReceipt {
+            build_configuration: self.build_configuration,
+            invocation: self.invocation,
+            measurement_host: MeasurementHostReceipt {
+                host: self.host,
+                before_measurement: self.host_before_measurement,
+                after_measurement: collect_dynamic_measurement_host(),
+            },
+        };
+        (subject_identity, comparison_environment)
+    }
 }
 
 // ─── CLI parsing (manual — no clap in workspace) ─────────────────────────
@@ -230,6 +1124,7 @@ struct Options {
     threads: Vec<usize>,
     iters: usize,
     json_output: Option<PathBuf>,
+    json_stdout: bool,
     summary_md: Option<PathBuf>,
     history_json: PathBuf,
     apples_to_apples: bool,
@@ -246,6 +1141,7 @@ impl Default for Options {
             threads: DEFAULT_THREADS.to_vec(),
             iters: DEFAULT_ITERS,
             json_output: None,
+            json_stdout: false,
             summary_md: None,
             history_json: PathBuf::from(DEFAULT_HISTORY_JSON),
             apples_to_apples: false,
@@ -258,7 +1154,8 @@ impl Default for Options {
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
-         [--json-output=PATH] [--summary-md=PATH] [--history-json=PATH] [--apples-to-apples] \\\n\
+         [--json-output=PATH] [--json-stdout] [--summary-md=PATH] [--history-json=PATH] \\\n\
+         [--apples-to-apples] \\\n\
          [--separate-tables] [--retry-timeout-secs=N]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
@@ -289,9 +1186,19 @@ fn parse_thread_count(raw: &str) -> Result<usize, String> {
     Ok(threads)
 }
 
-fn parse_args() -> Options {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParseArgsError {
+    Help,
+    Message(String),
+}
+
+fn parse_args_from<I, S>(args: I) -> Result<Options, ParseArgsError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut opts = Options::default();
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
         if arg == "--apples-to-apples" {
             opts.apples_to_apples = true;
@@ -301,45 +1208,49 @@ fn parse_args() -> Options {
             opts.separate_tables = true;
             continue;
         }
+        if arg == "--json-stdout" {
+            opts.json_stdout = true;
+            continue;
+        }
         let (key, val) = if let Some(eq) = arg.find('=') {
             (arg[..eq].to_owned(), arg[eq + 1..].to_owned())
         } else if arg == "--help" || arg == "-h" {
-            print_usage_and_exit(0);
+            return Err(ParseArgsError::Help);
         } else {
             // Support space-separated form.
-            let v = args.next().unwrap_or_else(|| {
-                print_usage_error(format!("missing value for argument `{arg}`"))
-            });
+            let v = args.next().ok_or_else(|| {
+                ParseArgsError::Message(format!("missing value for argument `{arg}`"))
+            })?;
             (arg, v)
         };
         match key.as_str() {
             "--rows-per-thread" => {
-                opts.rows_per_thread = val.parse().unwrap_or_else(|_| {
-                    print_usage_error(format!("invalid --rows-per-thread: {val}"))
-                });
+                opts.rows_per_thread = val.parse().map_err(|_| {
+                    ParseArgsError::Message(format!("invalid --rows-per-thread: {val}"))
+                })?;
             }
             "--retry-timeout-secs" => {
-                opts.retry_timeout_secs = Some(val.parse().unwrap_or_else(|_| {
-                    print_usage_error(format!("invalid --retry-timeout-secs: {val}"))
-                }));
+                opts.retry_timeout_secs = Some(val.parse().map_err(|_| {
+                    ParseArgsError::Message(format!("invalid --retry-timeout-secs: {val}"))
+                })?);
             }
             "--threads" => {
                 opts.threads = val
                     .split(',')
-                    .map(|s| {
-                        parse_thread_count(s).unwrap_or_else(|message| print_usage_error(message))
-                    })
-                    .collect();
+                    .map(|value| parse_thread_count(value).map_err(ParseArgsError::Message))
+                    .collect::<Result<Vec<_>, _>>()?;
                 if opts.threads.is_empty() {
-                    print_usage_error("--threads must contain at least one value");
+                    return Err(ParseArgsError::Message(
+                        "--threads must contain at least one value".to_owned(),
+                    ));
                 }
             }
             "--iters" => {
                 opts.iters = val
                     .parse()
-                    .unwrap_or_else(|_| print_usage_error(format!("invalid --iters: {val}")));
+                    .map_err(|_| ParseArgsError::Message(format!("invalid --iters: {val}")))?;
                 if opts.iters == 0 {
-                    print_usage_error("--iters must be >= 1");
+                    return Err(ParseArgsError::Message("--iters must be >= 1".to_owned()));
                 }
             }
             "--json-output" => {
@@ -352,15 +1263,24 @@ fn parse_args() -> Options {
                 opts.history_json = PathBuf::from(val);
             }
             other => {
-                eprintln!("unknown argument: {other}");
-                print_usage_and_exit(2);
+                return Err(ParseArgsError::Message(format!(
+                    "unknown argument: {other}"
+                )));
             }
         }
     }
     if opts.separate_tables && opts.history_json == Path::new(DEFAULT_HISTORY_JSON) {
         opts.history_json = PathBuf::from(DEFAULT_SEPARATE_TABLES_HISTORY_JSON);
     }
-    opts
+    Ok(opts)
+}
+
+fn parse_args() -> Options {
+    match parse_args_from(std::env::args().skip(1)) {
+        Ok(options) => options,
+        Err(ParseArgsError::Help) => print_usage_and_exit(0),
+        Err(ParseArgsError::Message(message)) => print_usage_error(message),
+    }
 }
 
 // ─── Reported per-config result ───────────────────────────────────────────
@@ -666,7 +1586,11 @@ struct ThreadComparisonReport {
 struct MtMvccBenchReport {
     schema_version: &'static str,
     citable: bool,
+    measurement_evidence_valid: bool,
     non_citable_reason: &'static str,
+    release_regression_scope: &'static str,
+    subject_identity: SubjectIdentityReceipt,
+    comparison_environment: ComparisonEnvironmentReceipt,
     settings_interpretation: &'static str,
     accounting_interpretation: &'static str,
     timing_interpretation: &'static str,
@@ -700,6 +1624,10 @@ struct RatioRegression {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoricalMtMvccBenchReport {
     schema_version: Option<String>,
+    citable: Option<bool>,
+    measurement_evidence_valid: Option<bool>,
+    subject_identity: Option<serde_json::Value>,
+    comparison_environment: Option<serde_json::Value>,
     settings_interpretation: Option<String>,
     accounting_interpretation: Option<String>,
     timing_interpretation: Option<String>,
@@ -1130,7 +2058,25 @@ fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# mt-mvcc-bench Summary\n");
     let _ = writeln!(out, "- Citable: `{}`", report.citable);
+    let _ = writeln!(
+        out,
+        "- Measurement evidence valid: `{}`",
+        report.measurement_evidence_valid
+    );
     let _ = writeln!(out, "- Non-citable reason: {}", report.non_citable_reason);
+    let _ = writeln!(
+        out,
+        "- Release regression scope: {}",
+        report.release_regression_scope
+    );
+    let _ = writeln!(
+        out,
+        "- Executable unchanged during measurement: `{:?}`",
+        report
+            .subject_identity
+            .executable
+            .unchanged_during_measurement
+    );
     let _ = writeln!(
         out,
         "- Settings interpretation: {}",
@@ -1283,6 +2229,31 @@ fn write_json_report(path: &Path, report: &MtMvccBenchReport) -> Result<(), Stri
     let json = serde_json::to_vec_pretty(report)
         .map_err(|error| format!("serialize mt-mvcc bench report: {error}"))?;
     fs::write(path, json).map_err(|error| format!("write json report {}: {error}", path.display()))
+}
+
+fn write_canonical_json_stdout(report: &MtMvccBenchReport) -> Result<(), String> {
+    // Serialize fully before touching stdout so serialization failure cannot
+    // leave a partial JSON value in a machine-consumed stream. Struct field
+    // order and BTreeMap ordering make this representation deterministic.
+    let mut json = serde_json::to_vec(report)
+        .map_err(|error| format!("serialize mt-mvcc bench stdout report: {error}"))?;
+    json.push(b'\n');
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    lock.write_all(&json)
+        .map_err(|error| format!("write mt-mvcc bench stdout report: {error}"))?;
+    lock.flush()
+        .map_err(|error| format!("flush mt-mvcc bench stdout report: {error}"))
+}
+
+fn history_update_is_allowed(report: &MtMvccBenchReport) -> bool {
+    // V7 deliberately carries diagnostic provenance but is not independently
+    // citable. Its own `citable` bit cannot authenticate the report, so even a
+    // hand-edited v7 document must never become a trusted baseline. A future
+    // schema may re-enable updates once it has an external verification path.
+    report.schema_version != REPORT_SCHEMA_V7
+        && report.citable
+        && report.measurement_evidence_valid
 }
 
 fn write_markdown_summary(path: &Path, report: &MtMvccBenchReport) -> Result<(), String> {
@@ -1575,7 +2546,19 @@ fn historical_report_matches_contract(
     let Some(configuration_receipts) = previous.configuration_receipts.as_deref() else {
         return false;
     };
-    previous.schema_version.as_deref() == Some(REPORT_SCHEMA_V6)
+    previous.schema_version.as_deref() == Some(REPORT_SCHEMA_V7)
+        && previous.citable == Some(true)
+        && previous.measurement_evidence_valid == Some(true)
+        && previous
+            .subject_identity
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|identity| !identity.is_empty())
+        && previous
+            .comparison_environment
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|environment| !environment.is_empty())
         && previous.settings_interpretation.as_deref() == Some(SETTINGS_INTERPRETATION)
         && previous.accounting_interpretation.as_deref() == Some(ACCOUNTING_INTERPRETATION)
         && previous.timing_interpretation.as_deref() == Some(TIMING_INTERPRETATION)
@@ -1598,6 +2581,7 @@ fn historical_report_matches_contract(
 struct PassOverPassGateInput<'a> {
     history_json: &'a Path,
     previous: Option<&'a HistoricalMtMvccBenchReport>,
+    historical_baseline_authentication: HistoricalBaselineAuthentication,
     current_rows: &'a [ThreadComparisonReport],
     current_configuration_receipts: &'a [ConfigurationReceipt],
     current_workload_shape: &'a str,
@@ -1607,10 +2591,28 @@ struct PassOverPassGateInput<'a> {
     current_retry_timeout_overridden: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoricalBaselineAuthentication {
+    Unavailable,
+    #[cfg(test)]
+    VerifiedTestFixture,
+}
+
+impl HistoricalBaselineAuthentication {
+    const fn is_independently_verified(self) -> bool {
+        match self {
+            Self::Unavailable => false,
+            #[cfg(test)]
+            Self::VerifiedTestFixture => true,
+        }
+    }
+}
+
 fn build_pass_over_pass_gate(input: PassOverPassGateInput<'_>) -> PassOverPassGateReport {
     let PassOverPassGateInput {
         history_json,
         previous,
+        historical_baseline_authentication,
         current_rows,
         current_configuration_receipts,
         current_workload_shape,
@@ -1619,6 +2621,18 @@ fn build_pass_over_pass_gate(input: PassOverPassGateInput<'_>) -> PassOverPassGa
         current_wal_autocheckpoint_overridden,
         current_retry_timeout_overridden,
     } = input;
+    let previous_report_found = previous.is_some();
+    if !historical_baseline_authentication.is_independently_verified() {
+        return PassOverPassGateReport {
+            schema_version: PASS_OVER_PASS_SCHEMA_V1,
+            history_json_path: history_json.display().to_string(),
+            threshold_ratio_drop_pct: PASS_OVER_PASS_MAX_RATIO_DROP_PCT,
+            status: "disabled_non_citable",
+            previous_report_found,
+            comparable_pair_count: 0,
+            regressions: Vec::new(),
+        };
+    }
     let previous = previous.filter(|previous| {
         historical_report_matches_contract(
             previous,
@@ -1688,7 +2702,7 @@ fn build_pass_over_pass_gate(input: PassOverPassGateInput<'_>) -> PassOverPassGa
         history_json_path: history_json.display().to_string(),
         threshold_ratio_drop_pct: PASS_OVER_PASS_MAX_RATIO_DROP_PCT,
         status,
-        previous_report_found: previous.is_some(),
+        previous_report_found,
         comparable_pair_count,
         regressions,
     }
@@ -2943,29 +3957,25 @@ where
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn main() {
-    {
-        let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        writeln!(lock, "bench_elf_sha256={}", self_identity()).expect("write executable identity");
-        lock.flush().expect("flush executable identity");
-    }
-    println!(
-        "bench_source_sha256 {}",
-        file_identity(Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/bin/mt_mvcc_bench.rs"
-        )))
-    );
-
-    if let Err(error) = run() {
+    let opts = parse_args();
+    if let Err(error) = run(opts) {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn run() -> Result<(), String> {
-    let opts = parse_args();
+fn run(opts: Options) -> Result<(), String> {
+    let provenance = ProvenanceCapture::begin();
+    human_output!(opts.json_stdout, "bench_elf_sha256={}", self_identity());
+    human_output!(
+        opts.json_stdout,
+        "bench_source_sha256 {}",
+        file_identity(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/mt_mvcc_bench.rs"
+        )))
+    );
     validate_workload_bounds(opts.rows_per_thread, opts.separate_tables)?;
     let (wal_autocheckpoint_pages, wal_autocheckpoint_overridden) =
         bench_wal_autocheckpoint_pages()?;
@@ -2994,7 +4004,8 @@ fn run() -> Result<(), String> {
         );
     }
 
-    println!(
+    human_output!(
+        opts.json_stdout,
         "threads | configuration | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed"
     );
     let mut thread_results = Vec::new();
@@ -3013,7 +4024,8 @@ fn run() -> Result<(), String> {
             wal_autocheckpoint_overridden,
             retry_policy,
         );
-        println!(
+        human_output!(
+            opts.json_stdout,
             "case={} threads={n} configuration_status={} comparison_eligible={} measured={} available_parallelism={:?} max_supported_writers={} offered_writes_per_sample={:?} wal_autocheckpoint_pages={:?} wal_autocheckpoint_overridden={:?} retry_policy={:?} reason={:?}",
             workload_shape(opts.separate_tables),
             configuration.status,
@@ -3094,7 +4106,8 @@ fn run() -> Result<(), String> {
             .as_ref()
             .expect("current report always carries median-CI evidence");
 
-        println!(
+        human_output!(
+            opts.json_stdout,
             "{n:>7} | {configuration_status:>13} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {fs_wps_p95:>15.0} | {fs_wps_p99:>15.0} | {sqlite_wps_p95:>14.0} | {sqlite_wps_p99:>14.0} | {fs_ms_p50:>14.2} | {fs_ms_p95:>14.2} | {fs_ms_p99:>14.2} | {sqlite_ms_p50:>13.2} | {sqlite_ms_p95:>13.2} | {sqlite_ms_p99:>13.2} | {time_ratio:>10.2}x | {fs_failed:>14} | {sqlite_failed:>13}",
             configuration_status = configuration.status,
             fs_wps = report.fsqlite_wps_p50,
@@ -3114,7 +4127,8 @@ fn run() -> Result<(), String> {
             fs_failed = report.fsqlite_failed_rows,
             sqlite_failed = report.sqlite_failed_rows
         );
-        println!(
+        human_output!(
+            opts.json_stdout,
             "case={} threads={n} synchronous=NORMAL null_c_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} cv_gate=never null_a_offered={} null_a_attempted={} null_a_committed={} null_a_retried={} null_a_failed={} null_b_offered={} null_b_attempted={} null_b_committed={} null_b_retried={} null_b_failed={}",
             workload_shape(opts.separate_tables),
             contract.null_ratio_median,
@@ -3133,7 +4147,8 @@ fn run() -> Result<(), String> {
             null.arm_b.total_retried_operations(),
             null.arm_b.total_failed_rows(),
         );
-        println!(
+        human_output!(
+            opts.json_stdout,
             "case={} threads={n} synchronous=NORMAL claim_f_over_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} fsqlite_p50_wps={:.3} sqlite_p50_wps={:.3} fsqlite_offered={} fsqlite_attempted={} fsqlite_committed={} fsqlite_retried={} fsqlite_failed={} sqlite_offered={} sqlite_attempted={} sqlite_committed={} sqlite_retried={} sqlite_failed={}",
             workload_shape(opts.separate_tables),
             contract.claim_ratio_median,
@@ -3166,11 +4181,13 @@ fn run() -> Result<(), String> {
             .first()
             .expect("paired claim has at least one FrankenSQLite sample")
             .settings;
-        println!(
+        human_output!(
+            opts.json_stdout,
             "case={} threads={n} effective_settings_readback c={c_settings:?} f={f_settings:?} note=equal_named_values_do_not_claim_cross_engine_semantic_equivalence",
             workload_shape(opts.separate_tables),
         );
-        println!(
+        human_output!(
+            opts.json_stdout,
             "case={} threads={n} configuration_status={} median_ci_gate={} rule=claim_ci95_beyond_2x_null_radius cv_gate={} null_radius={:.6} claim_margin={} min_decidable_gain={:.6} max_decidable_regression={:.6}",
             workload_shape(opts.separate_tables),
             configuration.status,
@@ -3191,6 +4208,7 @@ fn run() -> Result<(), String> {
     let pass_over_pass_gate = build_pass_over_pass_gate(PassOverPassGateInput {
         history_json: &opts.history_json,
         previous: previous_report.as_ref(),
+        historical_baseline_authentication: HistoricalBaselineAuthentication::Unavailable,
         current_rows: &thread_results,
         current_configuration_receipts: &configuration_receipts,
         current_workload_shape: workload_shape,
@@ -3205,11 +4223,24 @@ fn run() -> Result<(), String> {
         pass_over_pass_gate.comparable_pair_count,
         pass_over_pass_gate.previous_report_found,
     );
+    let measurement_evidence_valid = !history_evidence_is_invalid(
+        wal_autocheckpoint_overridden,
+        opts.retry_timeout_secs.is_some(),
+        opts.rows_per_thread,
+        opts.iters,
+        &thread_results,
+        &configuration_receipts,
+    );
+    let (subject_identity, comparison_environment) = provenance.finish();
 
     let full_report = MtMvccBenchReport {
-        schema_version: REPORT_SCHEMA_V6,
+        schema_version: REPORT_SCHEMA_V7,
         citable: false,
+        measurement_evidence_valid,
         non_citable_reason: NON_CITABLE_REASON,
+        release_regression_scope: RELEASE_REGRESSION_SCOPE,
+        subject_identity,
+        comparison_environment,
         settings_interpretation: SETTINGS_INTERPRETATION,
         accounting_interpretation: ACCOUNTING_INTERPRETATION,
         timing_interpretation: TIMING_INTERPRETATION,
@@ -3229,15 +4260,10 @@ fn run() -> Result<(), String> {
         write_markdown_summary(path, &full_report)?;
         eprintln!("mt-mvcc-bench: wrote markdown summary {}", path.display());
     }
-    let invalid_evidence = history_evidence_is_invalid(
-        wal_autocheckpoint_overridden,
-        opts.retry_timeout_secs.is_some(),
-        opts.rows_per_thread,
-        opts.iters,
-        &full_report.thread_results,
-        &full_report.configuration_receipts,
-    );
-    if !invalid_evidence {
+    if opts.json_stdout {
+        write_canonical_json_stdout(&full_report)?;
+    }
+    if history_update_is_allowed(&full_report) {
         write_json_report(&opts.history_json, &full_report)?;
         eprintln!(
             "mt-mvcc-bench: updated pass-over-pass history {}",
@@ -3262,7 +4288,7 @@ fn run() -> Result<(), String> {
                 .join(", ")
         );
     }
-    if invalid_evidence {
+    if !full_report.measurement_evidence_valid {
         return Err(
             "benchmark evidence is non-comparable or invalid; inspect configuration receipts, \
              committed-state oracles, and work accounting"
@@ -3276,6 +4302,276 @@ fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_file_snapshot(hash: &str) -> FileSnapshotReceipt {
+        FileSnapshotReceipt {
+            sha256: Some(hash.to_owned()),
+            bytes_read: Some(3),
+            metadata_size_bytes: Some(3),
+            unix_device: Some(7),
+            unix_inode: Some(11),
+            error: None,
+        }
+    }
+
+    fn test_subject_identity() -> SubjectIdentityReceipt {
+        SubjectIdentityReceipt {
+            executable: ExecutableIdentityReceipt {
+                current_exe_path: Some("/test/mt-mvcc-bench".to_owned()),
+                canonical_path: Some("/test/mt-mvcc-bench".to_owned()),
+                path_resolution_error: None,
+                process_id: 42,
+                before_measurement: test_file_snapshot("abc123"),
+                after_measurement: test_file_snapshot("abc123"),
+                unchanged_during_measurement: Some(true),
+            },
+            build_source: BuildSourceIdentityReceipt {
+                workspace_root: "/test/workspace".to_owned(),
+                git_sha: "deadbeef".to_owned(),
+                git_branch: "main".to_owned(),
+                git_tree_state: "clean".to_owned(),
+                build_nonce: "nonce".to_owned(),
+                build_input_tracking: "complete".to_owned(),
+            },
+            runtime_source: RuntimeSourceStabilityReceipt {
+                before_measurement: test_runtime_source_identity(),
+                after_measurement: test_runtime_source_identity(),
+                same_clean_git_identity_at_capture_points: Some(true),
+                stability_limitation: "test limitation",
+            },
+            cargo_lock: CargoLockIdentityReceipt {
+                embedded_build_sha256: "lockhash".to_owned(),
+                embedded_build_size_bytes: 3,
+                runtime_path: "/test/workspace/Cargo.lock".to_owned(),
+                before_measurement: test_file_snapshot("lockhash"),
+                after_measurement: test_file_snapshot("lockhash"),
+                before_matches_embedded_build: Some(true),
+                after_matches_embedded_build: Some(true),
+                unchanged_at_capture_points: Some(true),
+            },
+        }
+    }
+
+    fn test_runtime_source_identity() -> RuntimeSourceIdentityReceipt {
+        RuntimeSourceIdentityReceipt {
+            workspace_root: "/test/workspace".to_owned(),
+            canonical_workspace_root: Some("/test/workspace".to_owned()),
+            git_sha: Some("deadbeef".to_owned()),
+            git_branch: Some("main".to_owned()),
+            git_tree_state: "clean".to_owned(),
+            matches_build_git_sha: Some(true),
+            discovery_errors: Vec::new(),
+        }
+    }
+
+    fn test_comparison_environment() -> ComparisonEnvironmentReceipt {
+        ComparisonEnvironmentReceipt {
+            build_configuration: BuildConfigurationReceipt {
+                cargo_profile: "release".to_owned(),
+                selected_profile: "release-perf".to_owned(),
+                profile_label: "release-perf".to_owned(),
+                opt_level: "3".to_owned(),
+                debug: "false".to_owned(),
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                build_host: "x86_64-unknown-linux-gnu".to_owned(),
+                enabled_features: Vec::new(),
+                rustflags: RustflagsReceipt {
+                    cargo_encoded_rustflags_present: false,
+                    encoded_hex: String::new(),
+                    decoded_arguments: Some(Vec::new()),
+                    decode_error: None,
+                },
+                profile_overrides_hex: String::new(),
+                native_build_overrides_hex: String::new(),
+                rustc_version_verbose: "rustc test".to_owned(),
+                cargo_version: "cargo test".to_owned(),
+                resolved_dependency_feature_graph_sha256: None,
+                resolved_dependency_feature_graph_limitation: "test limitation",
+            },
+            invocation: InvocationReceipt {
+                argv_lossy: vec!["mt-mvcc-bench".to_owned(), "--json-stdout".to_owned()],
+                argv_raw_hex: vec!["6d74".to_owned(), "2d2d".to_owned()],
+                raw_encoding: "unix_os_str_bytes",
+                length_prefixed_argv_sha256: "argvhash".to_owned(),
+            },
+            measurement_host: MeasurementHostReceipt {
+                host: StaticMeasurementHostReceipt {
+                    hostname: Some("test-host".to_owned()),
+                    cpu_model: Some("test-cpu".to_owned()),
+                    available_parallelism: Some(8),
+                    cpu_online: Some("0-7".to_owned()),
+                    cpu_present: Some("0-7".to_owned()),
+                    cpu_possible: Some("0-7".to_owned()),
+                    cpu_isolated: None,
+                    cpu_topology: CpuTopologyReceipt {
+                        logical_cpu_directories: Some(8),
+                        physical_package_count: Some(1),
+                        physical_core_count: Some(4),
+                    },
+                    scaling_governors_by_cpu: BTreeMap::new(),
+                    kernel_release: Some("test-kernel".to_owned()),
+                    kernel_version: Some("test-version".to_owned()),
+                    numa_online_nodes: Some("0".to_owned()),
+                    numa_possible_nodes: Some("0".to_owned()),
+                    numa_node_directories: Some(1),
+                    unavailable_fields: vec![
+                        "cpu_isolated".to_owned(),
+                        "scaling_governors_by_cpu".to_owned(),
+                    ],
+                },
+                before_measurement: DynamicMeasurementHostReceipt {
+                    unix_epoch_millis: Some(1),
+                    process_cpu_affinity_mask: Some("ff".to_owned()),
+                    process_cpu_affinity_list: Some("0-7".to_owned()),
+                    proc_self_cgroup: Some("0::/test".to_owned()),
+                    cpuset_cpus_effective: Some("0-7".to_owned()),
+                    cpuset_mems_effective: Some("0".to_owned()),
+                    load_average: Some("0.00 0.00 0.00 1/1 1".to_owned()),
+                    pressure_cpu: Some("some avg10=0.00".to_owned()),
+                    pressure_memory: Some("some avg10=0.00".to_owned()),
+                    pressure_io: Some("some avg10=0.00".to_owned()),
+                },
+                after_measurement: DynamicMeasurementHostReceipt {
+                    unix_epoch_millis: Some(2),
+                    process_cpu_affinity_mask: Some("ff".to_owned()),
+                    process_cpu_affinity_list: Some("0-7".to_owned()),
+                    proc_self_cgroup: Some("0::/test".to_owned()),
+                    cpuset_cpus_effective: Some("0-7".to_owned()),
+                    cpuset_mems_effective: Some("0".to_owned()),
+                    load_average: Some("0.00 0.00 0.00 1/1 1".to_owned()),
+                    pressure_cpu: Some("some avg10=0.00".to_owned()),
+                    pressure_memory: Some("some avg10=0.00".to_owned()),
+                    pressure_io: Some("some avg10=0.00".to_owned()),
+                },
+            },
+        }
+    }
+
+    fn minimal_v7_report() -> MtMvccBenchReport {
+        MtMvccBenchReport {
+            schema_version: REPORT_SCHEMA_V7,
+            citable: false,
+            measurement_evidence_valid: true,
+            non_citable_reason: NON_CITABLE_REASON,
+            release_regression_scope: RELEASE_REGRESSION_SCOPE,
+            subject_identity: test_subject_identity(),
+            comparison_environment: test_comparison_environment(),
+            settings_interpretation: SETTINGS_INTERPRETATION,
+            accounting_interpretation: ACCOUNTING_INTERPRETATION,
+            timing_interpretation: TIMING_INTERPRETATION,
+            workload_shape: "shared_table",
+            rows_per_thread: 1,
+            iterations: 1,
+            configuration_receipts: Vec::new(),
+            thread_results: Vec::new(),
+            pass_over_pass_gate: PassOverPassGateReport {
+                schema_version: PASS_OVER_PASS_SCHEMA_V1,
+                history_json_path: DEFAULT_HISTORY_JSON.to_owned(),
+                threshold_ratio_drop_pct: PASS_OVER_PASS_MAX_RATIO_DROP_PCT,
+                status: "disabled_non_citable",
+                previous_report_found: false,
+                comparable_pair_count: 0,
+                regressions: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn subject_identity_hashing_uses_sha256_and_file_metadata() {
+        assert_eq!(
+            sha256_bytes(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let cargo_toml = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let bytes = fs::read(&cargo_toml).expect("test Cargo.toml must be readable");
+        let snapshot = snapshot_file(&cargo_toml);
+
+        assert_eq!(
+            snapshot.sha256.as_deref(),
+            Some(sha256_bytes(&bytes).as_str())
+        );
+        assert_eq!(snapshot.bytes_read, u64::try_from(bytes.len()).ok());
+        assert_eq!(snapshot.metadata_size_bytes, snapshot.bytes_read);
+        assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn file_snapshot_stability_fails_closed_on_incomplete_or_errored_identity() {
+        let stable = test_file_snapshot("abc123");
+        assert_eq!(file_snapshots_match(&stable, &stable), Some(true));
+
+        let mut errored = stable.clone();
+        errored.error = Some("metadata unavailable".to_owned());
+        assert_eq!(file_snapshots_match(&stable, &errored), None);
+
+        let mut incomplete = stable.clone();
+        incomplete.metadata_size_bytes = None;
+        assert_eq!(file_snapshots_match(&stable, &incomplete), None);
+
+        let mut wrong_size = stable.clone();
+        wrong_size.metadata_size_bytes = Some(4);
+        assert_eq!(file_snapshots_match(&stable, &wrong_size), Some(false));
+
+        let mut portable_before = stable.clone();
+        portable_before.unix_device = None;
+        portable_before.unix_inode = None;
+        let portable_after = portable_before.clone();
+        assert_eq!(
+            file_snapshots_match(&portable_before, &portable_after),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn v7_report_serializes_split_identity_environment_and_narrow_scope() {
+        let value = serde_json::to_value(minimal_v7_report()).expect("v7 report must serialize");
+
+        assert_eq!(value["schema_version"], REPORT_SCHEMA_V7);
+        assert_eq!(value["citable"], false);
+        assert_eq!(value["release_regression_scope"], RELEASE_REGRESSION_SCOPE);
+        assert_eq!(
+            value["subject_identity"]["executable"]["unchanged_during_measurement"],
+            true
+        );
+        assert_eq!(
+            value["subject_identity"]["runtime_source"]["same_clean_git_identity_at_capture_points"],
+            true
+        );
+        assert_eq!(
+            value["subject_identity"]["cargo_lock"]["unchanged_at_capture_points"],
+            true
+        );
+        assert_eq!(
+            value["comparison_environment"]["build_configuration"]["selected_profile"],
+            "release-perf"
+        );
+        assert!(
+            value["comparison_environment"]["build_configuration"]
+                ["resolved_dependency_feature_graph_sha256"]
+                .is_null()
+        );
+        assert_eq!(
+            value["comparison_environment"]["measurement_host"]["host"]["hostname"],
+            "test-host"
+        );
+        assert!(value.get("release_eligible").is_none());
+    }
+
+    #[test]
+    fn json_stdout_argument_is_a_boolean_flag() {
+        let options = parse_args_from(["--json-stdout", "--threads=1,8", "--iters", "2"])
+            .expect("json stdout arguments must parse");
+
+        assert!(options.json_stdout);
+        assert_eq!(options.threads, vec![1, 8]);
+        assert_eq!(options.iters, 2);
+        assert!(!Options::default().json_stdout);
+        assert!(matches!(
+            parse_args_from(["--json-stdout=true"]),
+            Err(ParseArgsError::Message(message)) if message.contains("unknown argument")
+        ));
+    }
 
     fn sample_result(elapsed_ms: u64, total_rows: usize, failed_rows: usize) -> RunResult {
         let committed_rows = total_rows - failed_rows;
@@ -3408,7 +4704,11 @@ mod tests {
             .filter_map(|row| row.truth.as_ref().map(|truth| truth.configuration.clone()))
             .collect();
         HistoricalMtMvccBenchReport {
-            schema_version: Some(REPORT_SCHEMA_V6.to_owned()),
+            schema_version: Some(REPORT_SCHEMA_V7.to_owned()),
+            citable: Some(true),
+            measurement_evidence_valid: Some(true),
+            subject_identity: Some(serde_json::json!({"fixture": "verified subject"})),
+            comparison_environment: Some(serde_json::json!({"fixture": "verified environment"})),
             settings_interpretation: Some(SETTINGS_INTERPRETATION.to_owned()),
             accounting_interpretation: Some(ACCOUNTING_INTERPRETATION.to_owned()),
             timing_interpretation: Some(TIMING_INTERPRETATION.to_owned()),
@@ -3439,6 +4739,8 @@ mod tests {
         build_pass_over_pass_gate(PassOverPassGateInput {
             history_json: Path::new(DEFAULT_HISTORY_JSON),
             previous: Some(&previous),
+            historical_baseline_authentication:
+                HistoricalBaselineAuthentication::VerifiedTestFixture,
             current_rows,
             current_configuration_receipts: &current_configuration_receipts,
             current_workload_shape: "shared_table",
@@ -3458,6 +4760,8 @@ mod tests {
         build_pass_over_pass_gate(PassOverPassGateInput {
             history_json: Path::new(DEFAULT_HISTORY_JSON),
             previous: Some(&previous),
+            historical_baseline_authentication:
+                HistoricalBaselineAuthentication::VerifiedTestFixture,
             current_rows: &current_rows,
             current_configuration_receipts: &current_configuration_receipts,
             current_workload_shape: "shared_table",
@@ -3493,9 +4797,13 @@ mod tests {
     #[test]
     fn markdown_summary_renders_thread_rows() {
         let report = MtMvccBenchReport {
-            schema_version: REPORT_SCHEMA_V6,
+            schema_version: REPORT_SCHEMA_V7,
             citable: false,
+            measurement_evidence_valid: true,
             non_citable_reason: NON_CITABLE_REASON,
+            release_regression_scope: RELEASE_REGRESSION_SCOPE,
+            subject_identity: test_subject_identity(),
+            comparison_environment: test_comparison_environment(),
             settings_interpretation: SETTINGS_INTERPRETATION,
             accounting_interpretation: ACCOUNTING_INTERPRETATION,
             timing_interpretation: TIMING_INTERPRETATION,
@@ -3528,9 +4836,9 @@ mod tests {
                 schema_version: PASS_OVER_PASS_SCHEMA_V1,
                 history_json_path: DEFAULT_HISTORY_JSON.to_owned(),
                 threshold_ratio_drop_pct: PASS_OVER_PASS_MAX_RATIO_DROP_PCT,
-                status: "passed",
-                previous_report_found: true,
-                comparable_pair_count: 1,
+                status: "disabled_non_citable",
+                previous_report_found: false,
+                comparable_pair_count: 0,
                 regressions: Vec::new(),
             },
         };
@@ -3854,6 +5162,8 @@ mod tests {
         let gate = build_pass_over_pass_gate(PassOverPassGateInput {
             history_json: Path::new(DEFAULT_HISTORY_JSON),
             previous: None,
+            historical_baseline_authentication:
+                HistoricalBaselineAuthentication::VerifiedTestFixture,
             current_rows: &[],
             current_configuration_receipts: &[],
             current_workload_shape: "shared_table",
@@ -3897,6 +5207,8 @@ mod tests {
         let gate = build_pass_over_pass_gate(PassOverPassGateInput {
             history_json: Path::new(DEFAULT_HISTORY_JSON),
             previous: Some(&previous),
+            historical_baseline_authentication:
+                HistoricalBaselineAuthentication::VerifiedTestFixture,
             current_rows: &current,
             current_configuration_receipts: &current_configuration_receipts,
             current_workload_shape: "shared_table",
@@ -3912,7 +5224,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_history_requires_exact_top_level_v6_contract() {
+    fn loaded_history_requires_exact_top_level_v7_contract() {
         let previous_row = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
         let current_rows = vec![valid_history_row(
             8,
@@ -4052,6 +5364,8 @@ mod tests {
         let gate = build_pass_over_pass_gate(PassOverPassGateInput {
             history_json: Path::new(DEFAULT_HISTORY_JSON),
             previous: Some(&previous),
+            historical_baseline_authentication:
+                HistoricalBaselineAuthentication::VerifiedTestFixture,
             current_rows: &current_rows,
             current_configuration_receipts: &current_receipts,
             current_workload_shape: "shared_table",
