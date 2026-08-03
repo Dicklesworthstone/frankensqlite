@@ -26,6 +26,10 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+#[cfg(feature = "commit-combiner-test-support")]
+use std::sync::{Condvar, Mutex as StdMutex, MutexGuard};
+#[cfg(feature = "commit-combiner-test-support")]
+use std::time::{Duration, Instant as StdInstant};
 
 use smallvec::SmallVec;
 
@@ -60,6 +64,177 @@ pub struct CommitCombineMetrics {
     pub batch_size_max: u64,
     pub wait_ns_total: u64,
     pub wait_ns_max: u64,
+}
+
+/// Quiescent, instance-local receipt for the feature-gated combiner keeper.
+///
+/// Callers must join all registered allocation callers before taking this
+/// receipt. It proves which public allocation route was used without reaching
+/// into combiner slots or process-global counters.
+#[cfg(feature = "commit-combiner-test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitCombineTestReceipt {
+    pub next_seq: u64,
+    pub metrics: CommitCombineMetrics,
+    pub registered_allocations: u64,
+    pub one_shot_allocations: u64,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+struct CommitCombineTestMetricRecorder {
+    registered_allocations: AtomicU64,
+    one_shot_allocations: AtomicU64,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+impl CommitCombineTestMetricRecorder {
+    const fn new() -> Self {
+        Self {
+            registered_allocations: AtomicU64::new(0),
+            one_shot_allocations: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Snapshot of a completed deterministic staging phase.
+#[cfg(feature = "commit-combiner-test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitCombineStagingReceipt {
+    pub expected_callers: usize,
+    pub staged_callers: usize,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+struct CommitCombineStagingState {
+    staged_callers: usize,
+    released: bool,
+}
+
+/// Test-only control that holds real registered callers after they publish a
+/// pending allocation and before they attempt the normal combining path.
+///
+/// It is available only with `commit-combiner-test-support`. Production builds
+/// do not contain the controller, its wait path, or its counters.
+#[cfg(feature = "commit-combiner-test-support")]
+pub struct CommitCombineStagingControl {
+    expected_callers: usize,
+    state: StdMutex<CommitCombineStagingState>,
+    all_staged: Condvar,
+    release_waiters: Condvar,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+impl CommitCombineStagingControl {
+    /// Create one staging control for exactly `expected_callers` registered
+    /// allocation calls.
+    #[must_use]
+    pub fn new(expected_callers: usize) -> Self {
+        assert!(
+            expected_callers > 0 && expected_callers <= MAX_COMMIT_THREADS,
+            "staging control requires 1..=MAX_COMMIT_THREADS callers"
+        );
+        Self {
+            expected_callers,
+            state: StdMutex::new(CommitCombineStagingState {
+                staged_callers: 0,
+                released: false,
+            }),
+            all_staged: Condvar::new(),
+            release_waiters: Condvar::new(),
+        }
+    }
+
+    /// Wait until every expected caller has published a real pending request.
+    #[must_use]
+    pub fn wait_until_all_staged(&self, timeout: Duration) -> bool {
+        let deadline = StdInstant::now() + timeout;
+        let mut state = self.lock_state();
+        while state.staged_callers < self.expected_callers {
+            let Some(remaining) = deadline.checked_duration_since(StdInstant::now()) else {
+                return false;
+            };
+            let (next_state, timeout_result) = self
+                .all_staged
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if timeout_result.timed_out() && state.staged_callers < self.expected_callers {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Release an entirely staged batch into the existing combiner path.
+    #[must_use]
+    pub fn release_when_all_staged(&self) -> CommitCombineStagingReceipt {
+        let mut state = self.lock_state();
+        assert_eq!(
+            state.staged_callers, self.expected_callers,
+            "cannot release a partial staged batch"
+        );
+        state.released = true;
+        self.release_waiters.notify_all();
+        CommitCombineStagingReceipt {
+            expected_callers: self.expected_callers,
+            staged_callers: state.staged_callers,
+        }
+    }
+
+    /// Create an RAII fallback that releases waiters if a keeper assertion
+    /// fails before the normal release point.
+    #[must_use]
+    pub fn release_guard(self: &Arc<Self>) -> CommitCombineStagingReleaseGuard {
+        CommitCombineStagingReleaseGuard {
+            control: Arc::clone(self),
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, CommitCombineStagingState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn stage_registered_call(&self) {
+        let mut state = self.lock_state();
+        if state.released {
+            return;
+        }
+        assert!(
+            state.staged_callers < self.expected_callers,
+            "staging control received more callers than configured"
+        );
+        state.staged_callers += 1;
+        if state.staged_callers == self.expected_callers {
+            self.all_staged.notify_all();
+        }
+        while !state.released {
+            state = self
+                .release_waiters
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release_for_drop(&self) {
+        let mut state = self.lock_state();
+        state.released = true;
+        self.release_waiters.notify_all();
+    }
+}
+
+/// RAII release for a [`CommitCombineStagingControl`] keeper.
+#[cfg(feature = "commit-combiner-test-support")]
+pub struct CommitCombineStagingReleaseGuard {
+    control: Arc<CommitCombineStagingControl>,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+impl Drop for CommitCombineStagingReleaseGuard {
+    fn drop(&mut self) {
+        self.control.release_for_drop();
+    }
 }
 
 /// Per-combiner metric recorder.
@@ -179,6 +354,12 @@ pub struct CommitSequenceCombiner {
     active_registry: Option<Arc<Mutex<SmallVec<[u64; 16]>>>>,
     /// Instance-local observability for this combiner's batches and wait time.
     metrics: CommitCombineMetricRecorder,
+    /// Deterministic staging exists only for test-support consumers.
+    #[cfg(feature = "commit-combiner-test-support")]
+    staging_control: Option<Arc<CommitCombineStagingControl>>,
+    /// Test-only route counters make a keeper receipt self-contained.
+    #[cfg(feature = "commit-combiner-test-support")]
+    test_metrics: CommitCombineTestMetricRecorder,
 }
 
 impl CommitSequenceCombiner {
@@ -191,6 +372,10 @@ impl CommitSequenceCombiner {
             combiner_lock: Mutex::new(()),
             active_registry: None,
             metrics: CommitCombineMetricRecorder::new(),
+            #[cfg(feature = "commit-combiner-test-support")]
+            staging_control: None,
+            #[cfg(feature = "commit-combiner-test-support")]
+            test_metrics: CommitCombineTestMetricRecorder::new(),
         }
     }
 
@@ -211,7 +396,24 @@ impl CommitSequenceCombiner {
             combiner_lock: Mutex::new(()),
             active_registry: Some(registry),
             metrics: CommitCombineMetricRecorder::new(),
+            #[cfg(feature = "commit-combiner-test-support")]
+            staging_control: None,
+            #[cfg(feature = "commit-combiner-test-support")]
+            test_metrics: CommitCombineTestMetricRecorder::new(),
         }
+    }
+
+    /// Create a combiner whose registered callers can be staged by the
+    /// feature-gated test controller before entering the existing combine path.
+    #[cfg(feature = "commit-combiner-test-support")]
+    #[must_use]
+    pub fn new_with_staging_control(
+        initial_commit_seq: u64,
+        staging_control: Arc<CommitCombineStagingControl>,
+    ) -> Self {
+        let mut combiner = Self::new(initial_commit_seq);
+        combiner.staging_control = Some(staging_control);
+        combiner
     }
 
     /// Register a thread. Returns a handle with an assigned slot,
@@ -259,6 +461,20 @@ impl CommitSequenceCombiner {
     #[must_use]
     pub fn metrics(&self) -> CommitCombineMetrics {
         self.metrics.snapshot()
+    }
+
+    /// Return a quiescent, instance-local keeper receipt.
+    ///
+    /// Callers must join all allocation callers before sampling it.
+    #[cfg(feature = "commit-combiner-test-support")]
+    #[must_use]
+    pub fn test_support_receipt(&self) -> CommitCombineTestReceipt {
+        CommitCombineTestReceipt {
+            next_seq: self.next_seq(),
+            metrics: self.metrics(),
+            registered_allocations: self.test_metrics.registered_allocations.load(Ordering::Acquire),
+            one_shot_allocations: self.test_metrics.one_shot_allocations.load(Ordering::Acquire),
+        }
     }
 
     /// Claim a temporary slot for one-shot allocation.
@@ -331,6 +547,11 @@ impl CommitSequenceCombiner {
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         self.metrics.record_wait(elapsed_ns);
+
+        #[cfg(feature = "commit-combiner-test-support")]
+        self.test_metrics
+            .one_shot_allocations
+            .fetch_add(1, Ordering::Relaxed);
 
         seq
     }
@@ -453,6 +674,11 @@ impl CommitCombineHandle<'_> {
             .state
             .store(SLOT_PENDING, Ordering::Release);
 
+        #[cfg(feature = "commit-combiner-test-support")]
+        if let Some(staging_control) = &self.combiner.staging_control {
+            staging_control.stage_registered_call();
+        }
+
         // Try to become the combiner.
         if let Some(_guard) = self.combiner.combiner_lock.try_lock() {
             self.combiner.combine_locked();
@@ -475,6 +701,12 @@ impl CommitCombineHandle<'_> {
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
                 self.combiner.metrics.record_wait(elapsed_ns);
+
+                #[cfg(feature = "commit-combiner-test-support")]
+                self.combiner
+                    .test_metrics
+                    .registered_allocations
+                    .fetch_add(1, Ordering::Relaxed);
 
                 return CommitSeq::new(seq);
             }
