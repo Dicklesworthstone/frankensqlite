@@ -218,6 +218,109 @@ fn record_pager_commit_call(enabled: bool) {
     }
 }
 
+// The production WAL path deliberately has no bookkeeping for this receipt.
+// Unit keepers install the scope around one real transaction commit so they can
+// distinguish process-wide registry mutexes from per-pager/per-database
+// coordination without turning the release build into an instrumentation build.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitFastPathLockClass {
+    ProcessGlobalRegistry,
+    PagerInner,
+    QueueConsolidator,
+    QueueEpochState,
+    ExactHandleCoordination,
+    WalBackendSlot,
+    WalBackendRead,
+    WalBackendWrite,
+    PublishedPagerState,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CommitFastPathLockReceipt {
+    process_global_registry: AtomicUsize,
+    pager_inner: AtomicUsize,
+    queue_consolidator: AtomicUsize,
+    queue_epoch_state: AtomicUsize,
+    exact_handle_coordination: AtomicUsize,
+    wal_backend_slot: AtomicUsize,
+    wal_backend_read: AtomicUsize,
+    wal_backend_write: AtomicUsize,
+    published_pager_state: AtomicUsize,
+}
+
+#[cfg(test)]
+impl CommitFastPathLockReceipt {
+    fn record(&self, class: CommitFastPathLockClass) {
+        let counter = match class {
+            CommitFastPathLockClass::ProcessGlobalRegistry => &self.process_global_registry,
+            CommitFastPathLockClass::PagerInner => &self.pager_inner,
+            CommitFastPathLockClass::QueueConsolidator => &self.queue_consolidator,
+            CommitFastPathLockClass::QueueEpochState => &self.queue_epoch_state,
+            CommitFastPathLockClass::ExactHandleCoordination => {
+                &self.exact_handle_coordination
+            }
+            CommitFastPathLockClass::WalBackendSlot => &self.wal_backend_slot,
+            CommitFastPathLockClass::WalBackendRead => &self.wal_backend_read,
+            CommitFastPathLockClass::WalBackendWrite => &self.wal_backend_write,
+            CommitFastPathLockClass::PublishedPagerState => &self.published_pager_state,
+        };
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn count(&self, class: CommitFastPathLockClass) -> usize {
+        let counter = match class {
+            CommitFastPathLockClass::ProcessGlobalRegistry => &self.process_global_registry,
+            CommitFastPathLockClass::PagerInner => &self.pager_inner,
+            CommitFastPathLockClass::QueueConsolidator => &self.queue_consolidator,
+            CommitFastPathLockClass::QueueEpochState => &self.queue_epoch_state,
+            CommitFastPathLockClass::ExactHandleCoordination => {
+                &self.exact_handle_coordination
+            }
+            CommitFastPathLockClass::WalBackendSlot => &self.wal_backend_slot,
+            CommitFastPathLockClass::WalBackendRead => &self.wal_backend_read,
+            CommitFastPathLockClass::WalBackendWrite => &self.wal_backend_write,
+            CommitFastPathLockClass::PublishedPagerState => &self.published_pager_state,
+        };
+        counter.load(AtomicOrdering::Acquire)
+    }
+
+    fn scope(receipt: &Arc<Self>) -> CommitFastPathLockReceiptScope {
+        COMMIT_FAST_PATH_LOCK_RECEIPT.with(|active| CommitFastPathLockReceiptScope {
+            previous: active.borrow_mut().replace(Arc::clone(receipt)),
+        })
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMMIT_FAST_PATH_LOCK_RECEIPT: RefCell<Option<Arc<CommitFastPathLockReceipt>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct CommitFastPathLockReceiptScope {
+    previous: Option<Arc<CommitFastPathLockReceipt>>,
+}
+
+#[cfg(test)]
+impl Drop for CommitFastPathLockReceiptScope {
+    fn drop(&mut self) {
+        COMMIT_FAST_PATH_LOCK_RECEIPT.with(|active| {
+            *active.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn record_commit_fast_path_lock(class: CommitFastPathLockClass) {
+    COMMIT_FAST_PATH_LOCK_RECEIPT.with(|active| {
+        if let Some(receipt) = active.borrow().as_ref() {
+            receipt.record(class);
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Group Commit Queue (D1: replaces global WAL_APPEND_GATES mutex)
 // ---------------------------------------------------------------------------
@@ -1768,6 +1871,8 @@ impl GroupCommitQueue {
         initial_visible_commit_seq: CommitSeq,
         initial_db_size: u32,
     ) -> Arc<ParallelWalDurabilityCombiner> {
+        #[cfg(test)]
+        record_commit_fast_path_lock(CommitFastPathLockClass::QueueEpochState);
         let mut slot = self
             .durability_combiner
             .lock()
@@ -1923,6 +2028,8 @@ impl GroupCommitQueue {
 
     fn register_epoch_consumer(self: &Arc<Self>, epoch: u64) -> Arc<GroupCommitEpochConsumer> {
         let tracked = {
+            #[cfg(test)]
+            record_commit_fast_path_lock(CommitFastPathLockClass::QueueEpochState);
             let mut counts = self
                 .epoch_consumer_counts
                 .lock()
@@ -1954,6 +2061,8 @@ impl GroupCommitQueue {
     ) -> Result<()> {
         use std::collections::hash_map::Entry;
 
+        #[cfg(test)]
+        record_commit_fast_path_lock(CommitFastPathLockClass::QueueEpochState);
         let mut attempts = self
             .pending_txn_attempts
             .lock()
@@ -1984,6 +2093,8 @@ impl GroupCommitQueue {
         complete_group_pages: &HashMap<PageNumber, PageData>,
     ) -> Result<()> {
         let (attempts, registered_for_epoch) = {
+            #[cfg(test)]
+            record_commit_fast_path_lock(CommitFastPathLockClass::QueueEpochState);
             let attempts = self
                 .pending_txn_attempts
                 .lock()
@@ -2053,6 +2164,8 @@ impl GroupCommitQueue {
             )?;
         }
 
+        #[cfg(test)]
+        record_commit_fast_path_lock(CommitFastPathLockClass::QueueEpochState);
         let mut registered = self
             .pending_txn_attempts
             .lock()
@@ -3683,6 +3796,8 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
             &complete_group_pages,
         )?;
         let publish_update = {
+            #[cfg(test)]
+            record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
             let mut inner = self
                 .inner
                 .lock()
@@ -3835,6 +3950,8 @@ impl GroupCommitPhysicalLockWindow {
     }
 
     fn try_register(queue: &Arc<GroupCommitQueue>, handle_key: SharedDbFileKey) -> Option<Self> {
+        #[cfg(test)]
+        record_commit_fast_path_lock(CommitFastPathLockClass::ExactHandleCoordination);
         let mut coordination = queue
             .external_lock_coordination
             .lock()
@@ -4821,6 +4938,8 @@ fn new_shared_wal_backend() -> SharedWalBackend {
 }
 
 fn wal_backend_handle(wal_backend: &SharedWalBackend) -> Result<WalBackendHandle> {
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendSlot);
     wal_backend
         .read()
         .map_err(|_| FrankenError::internal("SharedWalBackend registry lock poisoned"))?
@@ -4842,6 +4961,8 @@ async fn with_wal_backend_read<T>(
     f: impl for<'a> FnOnce(&'a dyn WalBackend, &'a Cx) -> LocalPagerFuture<'a, T>,
 ) -> Result<T> {
     let backend = wal_backend_handle(wal_backend)?;
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendRead);
     let guard = async_rwlock_read(&backend, cx, "WAL backend").await?;
     f(guard.as_ref(), cx).await
 }
@@ -4883,6 +5004,8 @@ async fn with_wal_backend<T>(
     f: impl for<'a> FnOnce(&'a mut dyn WalBackend, &'a Cx) -> LocalPagerFuture<'a, T>,
 ) -> Result<T> {
     let backend = wal_backend_handle(wal_backend)?;
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendWrite);
     let mut guard = async_rwlock_write(&backend, cx, "WAL backend").await?;
     f(guard.as_mut(), cx).await
 }
@@ -4958,6 +5081,8 @@ static PROCESS_ROOT_FINALIZATION_REGISTRY: OnceLock<Mutex<ProcessRootFinalizatio
     OnceLock::new();
 
 fn process_root_finalization_registry() -> &'static Mutex<ProcessRootFinalizationRegistry> {
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::ProcessGlobalRegistry);
     PROCESS_ROOT_FINALIZATION_REGISTRY
         .get_or_init(|| Mutex::new(ProcessRootFinalizationRegistry::default()))
 }
@@ -5889,6 +6014,8 @@ fn shared_file_state_key(db_path: &Path) -> PathBuf {
 fn recovery_fence_for_path(db_path: &Path) -> Arc<RecoveryFence> {
     let key = shared_file_state_key(db_path);
     let fences = RECOVERY_FENCES.get_or_init(|| Mutex::new(HashMap::new()));
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::ProcessGlobalRegistry);
     let mut fences = fences
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5912,6 +6039,8 @@ fn recovery_fence_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> Arc<RecoveryFe
 fn recovery_fence_for_identity(identity: FileIdentity) -> Arc<RecoveryFence> {
     let fences =
         RECOVERY_IDENTITY_FENCES.get_or_init(|| Mutex::new(IdentityWeakRegistry::default()));
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::ProcessGlobalRegistry);
     let mut fences = fences
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5932,6 +6061,8 @@ fn identity_bound_recovery_fence<V: Vfs>(
 fn maintenance_gate_for_path(db_path: &Path) -> Arc<PagerMaintenanceGate> {
     let key = shared_file_state_key(db_path);
     let gates = MAINTENANCE_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::ProcessGlobalRegistry);
     let mut gates = gates
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5953,6 +6084,8 @@ fn maintenance_gate_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> Arc<PagerMai
 fn maintenance_gate_for_identity(identity: FileIdentity) -> Arc<PagerMaintenanceGate> {
     let gates =
         MAINTENANCE_IDENTITY_GATES.get_or_init(|| Mutex::new(IdentityWeakRegistry::default()));
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::ProcessGlobalRegistry);
     let mut gates = gates
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5974,6 +6107,8 @@ fn identity_bound_maintenance_gate<V: Vfs>(
 fn group_commit_queue_for_path(db_path: &Path) -> GroupCommitQueueRef {
     let key = shared_file_state_key(db_path);
     let queues = GROUP_COMMIT_QUEUES.get_or_init(|| Mutex::new(HashMap::new()));
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::ProcessGlobalRegistry);
     let mut queues = queues
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6005,6 +6140,8 @@ fn group_commit_queue_for_identity(
 ) -> GroupCommitQueueRef {
     let queues =
         GROUP_COMMIT_IDENTITY_QUEUES.get_or_init(|| Mutex::new(IdentityWeakRegistry::default()));
+    #[cfg(test)]
+    record_commit_fast_path_lock(CommitFastPathLockClass::ProcessGlobalRegistry);
     let mut queues = queues
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6991,6 +7128,8 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
         if state.transaction_exit_complete {
             return Ok(());
         }
+        #[cfg(test)]
+        record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(error) => {
@@ -10277,6 +10416,8 @@ impl PublishedPagerState {
         update: PublishedPagerUpdate,
         complete_group_pages: HashMap<PageNumber, PageData>,
     ) {
+        #[cfg(test)]
+        record_commit_fast_path_lock(CommitFastPathLockClass::PublishedPagerState);
         let _publish_guard = self
             .publish_lock
             .lock()
@@ -17917,6 +18058,8 @@ where
         let current_handle_key = if let Some(attempt) = txn_attempt {
             shared_db_file_key(&attempt.db_file)
         } else {
+            #[cfg(test)]
+            record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
             let inner = inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
@@ -18081,6 +18224,8 @@ where
             flushing_wait_us,
             _epoch_consumer,
         ) = {
+            #[cfg(test)]
+            record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
             let mut consolidator = queue
                 .consolidator
                 .lock()
@@ -18129,6 +18274,8 @@ where
             'flusher_loop: loop {
                 let arrival_wait_decision = {
                     let (observation, max_wait) = {
+                        #[cfg(test)]
+                        record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
                         let consolidator = queue
                             .consolidator
                             .lock()
@@ -18166,6 +18313,8 @@ where
                     let deadline = t_arrival_wait_start + arrival_wait_decision.wait_budget;
                     loop {
                         let should_flush = {
+                            #[cfg(test)]
+                            record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
                             let consolidator = queue
                                 .consolidator
                                 .lock()
@@ -18193,6 +18342,8 @@ where
                         prefetched
                     } else {
                         let maybe_flush = {
+                            #[cfg(test)]
+                            record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
                             let mut consolidator = queue
                                 .consolidator
                                 .lock()
@@ -18314,6 +18465,8 @@ where
                 // db_size carried by the final WAL commit marker.
                 let batch_count = batches.len();
                 let flush_base_db_size = {
+                    #[cfg(test)]
+                    record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
                     let inner = inner_arc
                         .lock()
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
@@ -18449,6 +18602,8 @@ where
                     )
                 {
                     let backend = wal_backend_handle(wal_backend)?;
+                    #[cfg(test)]
+                    record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendRead);
                     let wal = async_rwlock_read(&backend, cx, "WAL backend").await?;
                     let mut prepared = wal.prepare_append_frames(&frame_refs)?;
                     if let Some(prepared) = prepared.as_mut() {
@@ -18477,6 +18632,8 @@ where
                 for attempt in 0..MAX_FLUSH_RETRIES {
                     let t_inner_lock_start = phase_timing.then(Instant::now);
                     let db_file = {
+                        #[cfg(test)]
+                        record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
                         let inner = inner_arc.lock().map_err(|_| {
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
@@ -18492,6 +18649,8 @@ where
                     )
                     .await?;
                     let (restore_lock_level, initial_visible_commit_seq, checkpoint_active) = {
+                        #[cfg(test)]
+                        record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
                         let inner = inner_arc.lock().map_err(|_| {
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
@@ -18535,6 +18694,8 @@ where
 
                         let flush_io_result = async {
                             let backend = wal_backend_handle(wal_backend)?;
+                            #[cfg(test)]
+                            record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendWrite);
                             let mut wal_guard =
                                 async_rwlock_write(&backend, cx, "WAL backend").await?;
                             let wal = wal_guard.as_mut();
@@ -18970,6 +19131,8 @@ where
                             }
                         }
                         let (completed_epoch, has_promoted) = {
+                            #[cfg(test)]
+                            record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
                             let mut consolidator = queue
                                 .consolidator
                                 .lock()
@@ -18989,6 +19152,8 @@ where
                                 break 'flusher_loop;
                             }
                             let claimed_promoted = {
+                                #[cfg(test)]
+                                record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
                                 let mut consolidator = queue
                                     .consolidator
                                     .lock()
@@ -20331,6 +20496,8 @@ where
             // Phase A: Prepare write_set under inner lock (~20us)
             // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
             let inner_arc = Arc::clone(&self.inner);
+            #[cfg(test)]
+            record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
             let mut inner = inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
@@ -20554,6 +20721,8 @@ where
                 record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
 
                 // Re-acquire inner lock for Phase C (finalize).
+                #[cfg(test)]
+                record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
                 inner = match inner_arc
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
@@ -49057,6 +49226,9 @@ mod tests {
             txn.write_page(&cx, page_no, &sample_page(0xA7))
                 .await
                 .unwrap();
+
+            let receipt = Arc::new(CommitFastPathLockReceipt::default());
+            let _receipt_scope = CommitFastPathLockReceipt::scope(&receipt);
             txn.commit(&cx).await.unwrap();
 
             assert!(
@@ -49067,6 +49239,26 @@ mod tests {
                 all_append_probes_unlocked.load(AtomicOrdering::Acquire),
                 "bead_id={BEAD} case=phase_b_append_releases_phase_a_mutex"
             );
+            assert_eq!(
+                receipt.count(CommitFastPathLockClass::ProcessGlobalRegistry),
+                0,
+                "bead_id={BEAD} case=normal_wal_commit_avoids_process_global_registry"
+            );
+            for lock_class in [
+                CommitFastPathLockClass::PagerInner,
+                CommitFastPathLockClass::QueueConsolidator,
+                CommitFastPathLockClass::QueueEpochState,
+                CommitFastPathLockClass::ExactHandleCoordination,
+                CommitFastPathLockClass::WalBackendSlot,
+                CommitFastPathLockClass::WalBackendRead,
+                CommitFastPathLockClass::WalBackendWrite,
+                CommitFastPathLockClass::PublishedPagerState,
+            ] {
+                assert!(
+                    receipt.count(lock_class) > 0,
+                    "bead_id={BEAD} case=expected_local_wal_commit_lock_not_observed class={lock_class:?}"
+                );
+            }
         });
     }
 
