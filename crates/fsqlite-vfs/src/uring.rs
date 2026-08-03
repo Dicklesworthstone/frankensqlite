@@ -65,6 +65,8 @@ static FORCE_ASUPERSYNC_READ_ABORT: AtomicBool = AtomicBool::new(false);
 static FORCE_ASUPERSYNC_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_WRITE_ABORT: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+static TEST_DRIVER_START_AFTER_PENDING: AtomicU64 = AtomicU64::new(0);
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -554,7 +556,18 @@ impl IoUringRuntime {
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if queue.active || queue.pending.is_empty() {
+            #[cfg(test)]
+            let pending_start_barrier = TEST_DRIVER_START_AFTER_PENDING.load(Ordering::Acquire);
+            #[cfg(not(test))]
+            let pending_start_barrier = 0;
+
+            if queue.active
+                || queue.pending.is_empty()
+                || (pending_start_barrier != 0
+                    && u64::try_from(queue.pending.len())
+                        .expect("pending request count must fit in u64")
+                        < pending_start_barrier)
+            {
                 false
             } else {
                 queue.active = true;
@@ -1493,14 +1506,17 @@ mod tests {
     use std::future::Future;
     use std::io::Write;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+    use tracing_subscriber::prelude::*;
 
     static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
-    const ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES: usize = 64 * 1024;
+    const ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES: usize = 512 * 1024;
+    const ASYNC_VFS_TRACE_TARGET: &str = "fsqlite_vfs::uring";
 
     #[derive(Clone)]
     struct BoundedTraceWriter {
         bytes: Arc<StdMutex<Vec<u8>>>,
+        truncated: Arc<AtomicBool>,
     }
 
     impl BoundedTraceWriter {
@@ -1509,6 +1525,7 @@ mod tests {
                 bytes: Arc::new(StdMutex::new(Vec::with_capacity(
                     ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES,
                 ))),
+                truncated: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -1517,7 +1534,9 @@ mod tests {
                 .bytes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = std::io::stderr().write_all(&bytes);
+            std::io::stderr()
+                .write_all(&bytes)
+                .expect("the bounded async-VFS trace must be written to stderr");
         }
 
         fn has_events(&self) -> bool {
@@ -1527,10 +1546,25 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty()
         }
+
+        fn is_truncated(&self) -> bool {
+            self.truncated.load(Ordering::Acquire)
+        }
+
+        fn event_count(&self, event: &str) -> usize {
+            let needle = format!(r#"\"event\":\"{event}\""#);
+            self.bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .windows(needle.len())
+                .filter(|window| *window == needle.as_bytes())
+                .count()
+        }
     }
 
     struct BoundedTraceWriteGuard<'a> {
         bytes: StdMutexGuard<'a, Vec<u8>>,
+        truncated: &'a AtomicBool,
     }
 
     impl Write for BoundedTraceWriteGuard<'_> {
@@ -1538,6 +1572,9 @@ mod tests {
             let remaining = ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES.saturating_sub(self.bytes.len());
             self.bytes
                 .extend_from_slice(&buffer[..buffer.len().min(remaining)]);
+            if buffer.len() > remaining {
+                self.truncated.store(true, Ordering::Release);
+            }
             Ok(buffer.len())
         }
 
@@ -1555,6 +1592,7 @@ mod tests {
                     .bytes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
+                truncated: &self.truncated,
             }
         }
     }
@@ -1602,6 +1640,30 @@ mod tests {
     impl Drop for ScopedAtomicFlag<'_> {
         fn drop(&mut self) {
             self.flag.store(false, Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    struct ScopedDriverStartAfterPending {
+        previous: u64,
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    impl ScopedDriverStartAfterPending {
+        fn set(pending: u64) -> Self {
+            let previous = TEST_DRIVER_START_AFTER_PENDING.swap(pending, Ordering::AcqRel);
+            assert_eq!(
+                previous, 0,
+                "the shared-ring test must not inherit a driver-start barrier"
+            );
+            Self { previous }
+        }
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    impl Drop for ScopedDriverStartAfterPending {
+        fn drop(&mut self) {
+            TEST_DRIVER_START_AFTER_PENDING.store(self.previous, Ordering::Release);
         }
     }
 
@@ -1810,6 +1872,9 @@ mod tests {
         const READ_SIZE: usize = 4096;
 
         let _guard = io_uring_test_guard();
+        let _driver_start_barrier = ScopedDriverStartAfterPending::set(
+            u64::try_from(READ_COUNT).expect("read count fits u64"),
+        );
         if run_async_vfs_trace_in_subprocess() {
             return;
         }
@@ -1889,6 +1954,20 @@ mod tests {
                 trace_writer.has_events(),
                 "FSQLITE_ASYNC_VFS_TRACE must retain bounded JSON trace output"
             );
+            assert!(
+                !trace_writer.is_truncated(),
+                "FSQLITE_ASYNC_VFS_TRACE must retain the complete bounded JSON trace"
+            );
+            assert_eq!(
+                trace_writer.event_count("read_at_start"),
+                READ_COUNT,
+                "FSQLITE_ASYNC_VFS_TRACE must retain every read start"
+            );
+            assert_eq!(
+                trace_writer.event_count("read_at_complete"),
+                READ_COUNT,
+                "FSQLITE_ASYNC_VFS_TRACE must retain every read completion"
+            );
             trace_writer.flush_to_stderr();
         }
     }
@@ -1916,10 +1995,15 @@ mod tests {
             !tracing::dispatcher::has_been_set(),
             "the dedicated async-VFS trace process must start without a subscriber"
         );
-        tracing_subscriber::fmt()
-            .json()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(writer.clone())
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(writer.clone())
+                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                        metadata.target() == ASYNC_VFS_TRACE_TARGET
+                    })),
+            )
             .try_init()
             .expect("the dedicated async-VFS trace process must install its subscriber");
         Some(writer)
