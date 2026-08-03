@@ -318,6 +318,12 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     async fn rebuild_state_from_file(&mut self, cx: &Cx) -> Result<()> {
+        // A rebuild is entered only when the old in-memory view no longer
+        // describes this file (generation change or shrink). Its prior sync
+        // watermark cannot authorize frames in the rebuilt view, so clear it
+        // before any fallible I/O and fail closed if rebuilding fails.
+        self.last_fsynced_frame_count = 0;
+
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         let header_read = self.file.read(cx, &mut header_buf, 0).await?;
         if header_read < WAL_HEADER_SIZE {
@@ -2359,6 +2365,11 @@ mod tests {
         wal.sync(&cx, SyncFlags::FULL).expect("full sync");
         assert_eq!(wal.last_fsynced_frame_count(), 2);
 
+        wal.append_frame(&cx, 3, &sample_page(2), 3)
+            .expect("append");
+        wal.sync(&cx, SyncFlags::DATAONLY).expect("data-only sync");
+        assert_eq!(wal.last_fsynced_frame_count(), 3);
+
         wal.close(&cx).expect("close WAL");
     }
 
@@ -2373,6 +2384,11 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 1, test_salts()).expect("create WAL");
         wal.append_frame(&cx, 1, &sample_page(0x44), 1)
             .expect("append frame");
+        wal.sync(&cx, SyncFlags::NORMAL)
+            .expect("establish durable watermark");
+        assert_eq!(wal.last_fsynced_frame_count(), 1);
+        wal.append_frame(&cx, 2, &sample_page(0x45), 2)
+            .expect("append unsynced frame");
 
         crate::fault_hooks::arm_sync_failure(crate::fault_hooks::FaultHookArm::new(
             "bd-db300.7.2.2-sync-failure",
@@ -2389,8 +2405,8 @@ mod tests {
         );
         assert_eq!(
             wal.last_fsynced_frame_count(),
-            0,
-            "a failed sync must not advance the durable-barrier accounting"
+            1,
+            "a failed sync must preserve the prior durable-barrier accounting"
         );
 
         let records = crate::fault_hooks::take_records();
@@ -2402,7 +2418,7 @@ mod tests {
         assert_eq!(records[0].point, "wal_sync_failure");
         assert_eq!(records[0].run_id, "bd-db300.7.2.2-sync-failure");
         assert!(
-            records[0].detail.contains("frame_count_before=1"),
+            records[0].detail.contains("frame_count_before=2"),
             "record should capture sync context: {}",
             records[0].detail
         );
@@ -3179,6 +3195,8 @@ mod tests {
         let mut reader = WalFile::open(&cx, file_reader).expect("open reader");
         assert_eq!(reader.frame_count(), 3);
         assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(2));
+        reader.sync(&cx, SyncFlags::NORMAL).expect("sync reader");
+        assert_eq!(reader.last_fsynced_frame_count(), 3);
 
         // "Second writer" appends 2 more frames (frames 4,5 with commit at 5).
         let file_w2 = open_wal_file(&vfs, &cx);
@@ -3198,13 +3216,18 @@ mod tests {
             5,
             "after refresh, reader must see the 2 new committed frames"
         );
+        assert_eq!(
+            reader.last_fsynced_frame_count(),
+            3,
+            "same-generation incremental refresh preserves only the known watermark"
+        );
         assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(4));
 
         reader.close(&cx).expect("close reader");
     }
 
     #[test]
-    fn test_refresh_after_reset_detects_new_generation() {
+    fn refresh_after_reset_clears_stale_durable_watermark() {
         // After a checkpoint reset, refresh should detect the salt change
         // and rebuild state.
         let cx = test_cx();
@@ -3222,6 +3245,10 @@ mod tests {
         let mut reader = WalFile::open(&cx, file_r).expect("open reader");
         assert_eq!(reader.frame_count(), 1);
         assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(0));
+        reader
+            .sync(&cx, SyncFlags::NORMAL)
+            .expect("sync old generation");
+        assert_eq!(reader.last_fsynced_frame_count(), 1);
 
         // "Checkpointer" opens, resets with new salts.
         let file_cp = open_wal_file(&vfs, &cx);
@@ -3238,6 +3265,11 @@ mod tests {
         // Reader refresh: should rebuild and see the new generation.
         reader.refresh(&cx).expect("refresh");
         assert_eq!(reader.frame_count(), 1);
+        assert_eq!(
+            reader.last_fsynced_frame_count(),
+            0,
+            "a new generation's unsynced frame must not inherit the old generation watermark"
+        );
         assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(0));
         assert_eq!(
             reader.header().salts,
@@ -4692,7 +4724,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_sync_reset_clears_fsynced_count() {
+    fn raw_sync_reset_clears_fsynced_count() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
@@ -4701,8 +4733,7 @@ mod tests {
         let page = vec![0x11u8; PAGE_SIZE as usize];
         let frames = [frame_ref(1, &page, 1)];
         wal.append_frames(&cx, &frames).expect("append");
-        wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
-            .expect("durable_sync");
+        wal.sync(&cx, SyncFlags::NORMAL).expect("sync");
         assert_eq!(wal.last_fsynced_frame_count(), 1);
 
         let new_salts = WalSalts {
