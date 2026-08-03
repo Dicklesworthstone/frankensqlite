@@ -24,7 +24,9 @@
 //!
 //! Optional machine-readable capture:
 //! - Set `FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR=/path/to/dir`
-//! - The benchmark writes `provenance.json` once, appends per-iteration
+//! - Citation capture is opt-in: setting the directory also requires the
+//!   compile-time `FSQLITE_BENCH_BUILD_NONCE` identity. The benchmark writes
+//!   `provenance.json` once, appends per-iteration
 //!   records to `samples.jsonl`, and refreshes paired SQLite-vs-FrankenSQLite
 //!   `component_comparison.{json,md}` artifacts without changing default
 //!   stderr output
@@ -39,7 +41,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -59,8 +61,10 @@ use fsqlite_e2e::persistent_phase_audit::{
 };
 use fsqlite_wal::ConsolidationMetricsSnapshot;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const ROWS_PER_THREAD: i64 = 1000;
+const PERSISTENT_BENCH_SYNCHRONOUS: &str = "NORMAL";
 /// Maximum retries before giving up on a transaction (applies to both engines).
 ///
 /// With the deliberately zero SQLite busy timeout, 100 retries represented
@@ -71,8 +75,9 @@ const ROWS_PER_THREAD: i64 = 1000;
 const MAX_TXN_RETRIES: u32 = 100_000;
 const RETRY_BACKOFF: Duration = Duration::from_micros(100);
 const PERSISTENT_PHASE_CAPTURE_DIR_ENV: &str = "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR";
-const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1: &str =
-    "fsqlite-e2e.persistent_phase_capture_provenance.v1";
+const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V2: &str =
+    "fsqlite-e2e.persistent_phase_capture_provenance.v2";
+const BENCH_BUILD_NONCE_ENV: &str = "FSQLITE_BENCH_BUILD_NONCE";
 const PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3: &str =
     "fsqlite-e2e.persistent_phase_capture_sample.v3";
 const SQLITE_ENGINE_ID: &str = "sqlite3";
@@ -163,7 +168,10 @@ fn insert_sql(table_id: usize) -> String {
 }
 
 fn criterion_config() -> Criterion {
-    Criterion::default().configure_from_args()
+    let criterion = Criterion::default().configure_from_args();
+    persistent_phase_capture_dir().map_or(criterion, |capture_dir| {
+        criterion.output_directory(capture_dir.join("criterion_measurements"))
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,19 +188,23 @@ struct PersistentBenchmarkMetrics {
     operation_wall_time_audit: PersistentOperationWallTimeAudit,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct PersistentPhaseCaptureProvenance {
-    schema_version: &'static str,
-    benchmark: &'static str,
-    output_dir_env: &'static str,
+    schema_version: String,
+    benchmark: String,
+    output_dir_env: String,
     rows_per_thread: i64,
+    concurrency: usize,
+    synchronous: String,
     max_txn_retries: u32,
     current_dir: String,
-    current_exe: Option<String>,
+    current_exe: String,
+    build_nonce: String,
+    running_binary_sha256: String,
     argv: Vec<String>,
     hostname: Option<String>,
     kernel_release: Option<String>,
-    criterion_emission_scope: &'static str,
+    criterion_emission_scope: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -203,6 +215,7 @@ struct PersistentPhaseCaptureSample {
     engine: &'static str,
     contention_label: &'static str,
     concurrency: usize,
+    synchronous: &'static str,
     rows_per_thread: i64,
     total_rows: u64,
     metrics: PersistentBenchmarkMetrics,
@@ -334,19 +347,75 @@ fn read_trimmed_file(path: &str) -> Option<String> {
         .filter(|contents| !contents.is_empty())
 }
 
-fn persistent_phase_capture_provenance() -> PersistentPhaseCaptureProvenance {
-    PersistentPhaseCaptureProvenance {
-        schema_version: PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1,
-        benchmark: "concurrent_write_persistent_bench",
-        output_dir_env: PERSISTENT_PHASE_CAPTURE_DIR_ENV,
+fn require_lowercase_hex_64(value: &str, field: &str) -> std::io::Result<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{field} must be exactly 64 lowercase hexadecimal characters"),
+    ))
+}
+
+fn compiled_build_nonce_from(value: Option<&str>) -> std::io::Result<String> {
+    let nonce = value.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{BENCH_BUILD_NONCE_ENV} was absent while this benchmark was compiled"),
+        )
+    })?;
+    require_lowercase_hex_64(nonce, BENCH_BUILD_NONCE_ENV)?;
+    Ok(nonce.to_owned())
+}
+
+fn compiled_build_nonce() -> std::io::Result<String> {
+    compiled_build_nonce_from(option_env!("FSQLITE_BENCH_BUILD_NONCE"))
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    require_lowercase_hex_64(&digest, "running binary SHA-256")?;
+    Ok(digest)
+}
+
+fn running_executable_identity() -> std::io::Result<(String, String)> {
+    let executable = std::env::current_exe()?;
+    let binary_sha256 = sha256_file(&executable)?;
+    Ok((executable.display().to_string(), binary_sha256))
+}
+
+fn persistent_phase_capture_provenance(
+    concurrency: usize,
+) -> std::io::Result<PersistentPhaseCaptureProvenance> {
+    let (current_exe, running_binary_sha256) = running_executable_identity()?;
+    Ok(PersistentPhaseCaptureProvenance {
+        schema_version: PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V2.to_owned(),
+        benchmark: "concurrent_write_persistent_bench".to_owned(),
+        output_dir_env: PERSISTENT_PHASE_CAPTURE_DIR_ENV.to_owned(),
         rows_per_thread: ROWS_PER_THREAD,
+        concurrency,
+        synchronous: PERSISTENT_BENCH_SYNCHRONOUS.to_owned(),
         max_txn_retries: MAX_TXN_RETRIES,
         current_dir: std::env::current_dir()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| ".".to_owned()),
-        current_exe: std::env::current_exe()
-            .ok()
-            .map(|path| path.display().to_string()),
+        current_exe,
+        build_nonce: compiled_build_nonce()?,
+        running_binary_sha256,
         argv: std::env::args_os()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect(),
@@ -355,19 +424,53 @@ fn persistent_phase_capture_provenance() -> PersistentPhaseCaptureProvenance {
             .filter(|hostname| !hostname.is_empty())
             .or_else(|| read_trimmed_file("/etc/hostname")),
         kernel_release: read_trimmed_file("/proc/sys/kernel/osrelease"),
-        criterion_emission_scope: "every completed Criterion batched iteration appends one record; warmup and measurement phases are not distinguished by this harness",
-    }
+        criterion_emission_scope: "every completed Criterion batched iteration appends one record; warmup and measurement phases are not distinguished by this harness".to_owned(),
+    })
 }
 
-fn ensure_persistent_phase_capture_provenance(output_dir: &Path) -> std::io::Result<()> {
+fn ensure_persistent_phase_capture_provenance(
+    output_dir: &Path,
+    concurrency: usize,
+) -> std::io::Result<()> {
     fs::create_dir_all(output_dir)?;
     let provenance_path = output_dir.join("provenance.json");
+    let current = persistent_phase_capture_provenance(concurrency)?;
     if provenance_path.exists() {
-        return Ok(());
+        let existing: PersistentPhaseCaptureProvenance =
+            serde_json::from_slice(&fs::read(&provenance_path)?).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "existing {} is not citation-grade provenance: {error}",
+                        provenance_path.display()
+                    ),
+                )
+            })?;
+        if has_same_capture_identity(&existing, &current) {
+            return Ok(());
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "existing {} belongs to a different build identity; refusing stale capture reuse",
+                provenance_path.display()
+            ),
+        ));
     }
-    let payload = serde_json::to_string_pretty(&persistent_phase_capture_provenance())
-        .map_err(std::io::Error::other)?;
+    let payload = serde_json::to_string_pretty(&current).map_err(std::io::Error::other)?;
     fs::write(provenance_path, payload.as_bytes())
+}
+
+fn has_same_capture_identity(
+    existing: &PersistentPhaseCaptureProvenance,
+    current: &PersistentPhaseCaptureProvenance,
+) -> bool {
+    existing.schema_version == PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V2
+        && existing.build_nonce == current.build_nonce
+        && existing.concurrency == current.concurrency
+        && existing.synchronous == current.synchronous
+        && existing.current_exe == current.current_exe
+        && existing.running_binary_sha256 == current.running_binary_sha256
 }
 
 fn unix_timestamp_ms() -> u64 {
@@ -500,13 +603,14 @@ fn maybe_write_persistent_phase_capture(sample: &PersistentPhaseCaptureSample) {
     let Some(output_dir) = persistent_phase_capture_dir() else {
         return;
     };
-    if let Err(error) = ensure_persistent_phase_capture_provenance(&output_dir) {
-        eprintln!(
-            "[persistent phase capture] failed to write provenance in {}: {error}",
-            output_dir.display()
-        );
-        return;
-    }
+    ensure_persistent_phase_capture_provenance(&output_dir, sample.concurrency).unwrap_or_else(
+        |error| {
+            panic!(
+                "[persistent phase capture] citation provenance failed in {}: {error}",
+                output_dir.display()
+            )
+        },
+    );
     let sample_path = output_dir.join("samples.jsonl");
     let encoded = match serde_json::to_string(sample) {
         Ok(encoded) => encoded,
@@ -753,6 +857,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     engine: SQLITE_ENGINE_ID,
                     contention_label: "retry",
                     concurrency: n_threads,
+                    synchronous: PERSISTENT_BENCH_SYNCHRONOUS,
                     rows_per_thread: ROWS_PER_THREAD,
                     total_rows,
                     metrics,
@@ -1100,6 +1205,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     engine: FSQLITE_ENGINE_ID,
                     contention_label: "conflict",
                     concurrency: n_threads,
+                    synchronous: PERSISTENT_BENCH_SYNCHRONOUS,
                     rows_per_thread: ROWS_PER_THREAD,
                     total_rows,
                     metrics: benchmark_metrics,
@@ -1120,6 +1226,10 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
     group.finish();
 }
 
+fn bench_persistent_1t(c: &mut Criterion) {
+    bench_concurrent_csqlite_persistent(c, 1, "persistent_concurrent_write_1t");
+}
+
 fn bench_persistent_2t(c: &mut Criterion) {
     bench_concurrent_csqlite_persistent(c, 2, "persistent_concurrent_write_2t");
 }
@@ -1136,9 +1246,74 @@ fn bench_persistent_16t(c: &mut Criterion) {
     bench_concurrent_csqlite_persistent(c, 16, "persistent_concurrent_write_16t");
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        PersistentPhaseCaptureProvenance, compiled_build_nonce_from, has_same_capture_identity,
+        require_lowercase_hex_64, sha256_file,
+    };
+    use std::io::Write;
+
+    #[test]
+    fn citation_nonce_requires_exact_lowercase_hex() {
+        let valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(compiled_build_nonce_from(Some(valid)).unwrap(), valid);
+        assert!(compiled_build_nonce_from(None).is_err());
+        assert!(compiled_build_nonce_from(Some("not-a-nonce")).is_err());
+        assert!(
+            require_lowercase_hex_64(
+                "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+                "test nonce",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn running_binary_digest_is_sha256() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"abc").unwrap();
+        assert_eq!(
+            sha256_file(file.path()).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn stale_capture_provenance_identity_is_rejected() {
+        let current = PersistentPhaseCaptureProvenance {
+            schema_version: "fsqlite-e2e.persistent_phase_capture_provenance.v2".to_owned(),
+            benchmark: "concurrent_write_persistent_bench".to_owned(),
+            output_dir_env: "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR".to_owned(),
+            rows_per_thread: 1000,
+            concurrency: 8,
+            synchronous: "NORMAL".to_owned(),
+            max_txn_retries: 100,
+            current_dir: "/worker/project".to_owned(),
+            current_exe: "/worker/project/target/bench".to_owned(),
+            build_nonce: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            running_binary_sha256:
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned(),
+            argv: Vec::new(),
+            hostname: Some("worker".to_owned()),
+            kernel_release: Some("kernel".to_owned()),
+            criterion_emission_scope: "measurement".to_owned(),
+        };
+        let decoded: PersistentPhaseCaptureProvenance =
+            serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert!(has_same_capture_identity(&decoded, &current));
+
+        let mut stale = decoded;
+        stale.build_nonce =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        assert!(!has_same_capture_identity(&stale, &current));
+    }
+}
+
 criterion_group!(
     name = persistent_concurrent_write;
     config = criterion_config();
-    targets = bench_persistent_2t, bench_persistent_4t, bench_persistent_8t, bench_persistent_16t
+    targets = bench_persistent_1t, bench_persistent_2t, bench_persistent_4t, bench_persistent_8t, bench_persistent_16t
 );
 criterion_main!(persistent_concurrent_write);

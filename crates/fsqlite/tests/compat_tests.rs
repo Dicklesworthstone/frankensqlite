@@ -17,6 +17,8 @@ use rusqlite::Connection as RusqliteConnection;
 struct FileSnapshot {
     bytes: Vec<u8>,
     modified: std::time::SystemTime,
+    #[cfg(unix)]
+    changed: (i64, i64),
 }
 
 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -41,6 +43,12 @@ fn snapshot_directory_files(
                     modified: metadata
                         .modified()
                         .expect("read artifact modification time"),
+                    #[cfg(unix)]
+                    changed: {
+                        use std::os::unix::fs::MetadataExt as _;
+
+                        (metadata.ctime(), metadata.ctime_nsec())
+                    },
                 },
             )
         })
@@ -900,7 +908,7 @@ fn open_with_flags_read_only_query_preserves_every_database_artifact() {
         assert_eq!(
             snapshot_directory_files(dir.path()),
             before,
-            "read-only open/query must preserve the complete DB, namespace, WAL, and companion file set byte-for-byte without touching modification times"
+            "read-only open/query must preserve the complete DB, namespace, WAL, and companion file set byte-for-byte without touching modification or change times"
         );
     });
 }
