@@ -47,6 +47,17 @@ Next full-workspace lockstep release (`0.1.19 -> 0.2.0`).
 - Tests and doc examples that drive the engine need an executor.
   `asupersync::test_utils::run_test(|| async { ... })` is the supported entry
   point and is available behind asupersync's `test-internals` feature.
+- **Existing FTS5 `porter` indexes must be rebuilt after upgrading.** Porter
+  tokenization now leaves tokens longer than 64 bytes unstemmed and enforces
+  the 1,024-byte term limit before stemming. An index built by an earlier
+  version may therefore contain terms that current queries no longer produce.
+  For each ordinary or external-content porter-tokenized FTS5 table, run
+  `INSERT INTO table_name(table_name) VALUES('rebuild')` after upgrading. For a
+  contentless table, run
+  `INSERT INTO table_name(table_name) VALUES('delete-all')` and then reinsert
+  every document with its original rowid and indexed text, preferably in one
+  transaction.
+  No rebuild is required solely for `unicode61`, `ascii`, or `trigram` indexes.
 
 ### Added
 

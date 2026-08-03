@@ -1880,11 +1880,12 @@ Tier 3 — Cryptographic authentication (trust boundaries):
 **Policy rules that prevent misuse:**
 
 ```
-✗ NO SHA-256 on hot paths      (too slow — 1.5 GB/s vs XXH3's 50 GB/s)
+✗ NO SHA-256 on hot paths      (hot-path integrity uses XXH3-128; measured
+                                 throughput remains release-evidence-only)
 ✗ NO XXH3 for content addressing (not cryptographic — vulnerable to preimage attacks)
 ✗ NO rolling own crypto         (security tier uses asupersync's vetted primitives)
-✓ BLAKE3 is the bridge          (fast enough for per-object identity, strong enough
-                                  for collision resistance in non-adversarial settings)
+✓ BLAKE3 bridges integrity tiers (cryptographic content identity without substituting
+                                  for keyed authentication at trust boundaries)
 ```
 
 **WAL checksum chain (cumulative hash):**
@@ -1913,7 +1914,10 @@ Each frame's checksum incorporates the previous frame's checksum, creating a has
 | 4 | Cross-reference | Every page accounted for, no page in multiple B-trees, freelist consistent, pointer map matches |
 | 5 | Schema | sqlite_master readable, root page numbers match existing B-trees, index entries match table data |
 
-**Result:** The three-tier architecture lets the hot path run at 50 GB/s while still providing cryptographic guarantees at trust boundaries. The WAL checksum chain detects corruption at the exact byte, and five levels of integrity check give you surgical precision for diagnosing problems.
+**Result:** The three-tier architecture keeps hot-path integrity separate from
+cryptographic authentication at trust boundaries. The WAL checksum chain
+detects corruption at the affected frame. Five levels of integrity check give
+you surgical precision for diagnosing problems.
 
 ### E-Processes: Anytime-Valid Invariant Monitoring
 
