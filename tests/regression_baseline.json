@@ -151,6 +151,78 @@
       }
     },
     {
+      "source_path": "crates/fsqlite-core/tests/codegen_gap_probe.rs",
+      "test_name": "codegen_gap_probe",
+      "reason": "diagnostic triage harness; run with --ignored --nocapture",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run the exact ignored probe with --nocapture only for investigation; convert any conclusion into an asserted keeper or retained immutable artifact before release use.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/codegen_gap_probe.rs",
+      "test_name": "codegen_gap_probe_select_window_aggregate",
+      "reason": "diagnostic triage harness; run with --ignored --nocapture",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run the exact ignored probe with --nocapture only for investigation; convert any conclusion into an asserted keeper or retained immutable artifact before release use.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/fast_path_separation.rs",
+      "test_name": "manual_profile_bench_shape_prepared_direct_insert_1000",
+      "reason": "manual perf probe for operation_baseline_bench batch insert shape",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "None; this is a manual profiler entrypoint and cannot satisfy release acceptance.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/fast_path_separation.rs",
+      "test_name": "manual_profile_full_op_batch_insert_1000_lifecycle",
+      "reason": "manual perf probe for full operation_baseline_bench batch insert lifecycle",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "None; this is a manual profiler entrypoint and cannot satisfy release acceptance.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/fast_path_separation.rs",
+      "test_name": "manual_profile_large_prepared_direct_insert_single_txn_10k",
+      "reason": "manual perf probe for wide prepared direct INSERT hot path",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "None; this is a manual profiler entrypoint and cannot satisfy release acceptance.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/fast_path_separation.rs",
+      "test_name": "manual_profile_simple_prepared_direct_insert_autocommit_512",
+      "reason": "manual perf probe for sequential_inserts autocommit prepared direct insert shape",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "None; this is a manual profiler entrypoint and cannot satisfy release acceptance.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite-e2e/src/perf_runner.rs",
       "test_name": "tests::focused_disjoint_c8_release_perf_triplet_emits_results",
       "reason": "manual remote perf evidence for the flagship c8 row",

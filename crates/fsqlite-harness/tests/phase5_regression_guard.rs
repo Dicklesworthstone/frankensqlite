@@ -3395,47 +3395,47 @@ fn test_ignore_source_collector_rejects_macro_generated_test_boundaries() {
     let cases = [
         (
             "forwarded_attribute",
-            r#"
+            r"
 macro_rules! forwarded_attribute {
     ($attr:meta) => { #[$attr] fn generated_case() {} };
 }
-"#,
+",
             "macro-forwarded attribute",
         ),
         (
             "repeated_attributes",
-            r#"
+            r"
 macro_rules! repeated_attributes {
     ($(#[$attr:meta])*) => { $(#[$attr])* fn generated_case() {} };
 }
-"#,
+",
             "macro-forwarded attribute",
         ),
         (
             "nested_forwarding",
-            r#"
+            r"
 macro_rules! nested_forwarding {
     ($attr:meta) => { #[cfg_attr(unix, $attr)] fn generated_case() {} };
 }
-"#,
+",
             "macro-forwarded attribute",
         ),
         (
             "generated_test",
-            r#"
+            r"
 macro_rules! generated_test {
     () => { #[test] fn generated_case() {} };
 }
-"#,
+",
             "test attribute",
         ),
         (
             "dynamic_callee",
-            r#"
+            r"
 macro_rules! dynamic_callee {
     ($callee:ident) => { $callee! { fn generated_case() {} } };
 }
-"#,
+",
             "dynamically selected macro invocation",
         ),
     ];
@@ -3470,24 +3470,24 @@ fn active_case() {
 
 #[test]
 fn test_ignore_source_collector_allows_active_proptest_but_rejects_ignored_proptest() {
-    let active = r#"
+    let active = r"
 proptest! {
     #[test]
     fn generated_case(value in 0_u8..10) {
         prop_assert!(value < 10);
     }
 }
-"#;
+";
     let records = collect_ignored_tests(Path::new("tests/active_proptest.rs"), active)
         .expect("audited active proptest boundaries should be allowed");
     assert!(records.is_empty());
 
-    let namespaced_impostor = r#"
+    let namespaced_impostor = r"
 local::proptest! {
     #[test]
     fn generated_case() {}
 }
-"#;
+";
     let error = collect_ignored_tests(Path::new("tests/impostor_proptest.rs"), namespaced_impostor)
         .expect_err("an arbitrary namespaced macro must not inherit the proptest exception");
     assert!(error.contains("test attribute"));
@@ -3668,9 +3668,7 @@ fn test_ignore_source_collector_exact_uninspected_boundary_never_reads_the_sourc
 
 #[test]
 fn test_ignore_source_collector_rejects_invalid_uninspected_boundaries() {
-    fn empty_reader(_: &str) -> Result<String, String> {
-        Ok(String::new())
-    }
+    let empty_reader = |_: &str| Ok::<String, String>(String::new());
 
     let duplicate_sources = vec!["tests/a.rs".to_owned(), "tests/a.rs".to_owned()];
     assert!(
