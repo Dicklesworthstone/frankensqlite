@@ -556,11 +556,12 @@ mod tests {
     }
 
     #[test]
-    fn test_combiner_reduces_atomic_ops() {
+    fn test_combiner_private_staged_batch_records_one_batch() {
         let combiner = CommitSequenceCombiner::new(100);
 
-        // Stage a full batch before a single combining cycle. This avoids any
-        // scheduler-dependent race between request publication and combining.
+        // This is a private unit-level setup, not production-shaped staged
+        // control. It avoids scheduler-dependent publication races while
+        // checking how one already-staged batch is recorded.
         for slot in combiner.slots.iter().take(8) {
             slot.state.store(SLOT_PENDING, Ordering::Release);
         }
@@ -575,8 +576,9 @@ mod tests {
         assert_eq!(metrics.batch_size_max, 8);
         assert_eq!(combiner.next_seq(), 108);
 
-        // Eight direct allocations would require eight fetch_add operations;
-        // the staged batch performs exactly one allocation operation.
+        // The private batch uses one sequence allocation for eight requests.
+        // Public e2e release gates remain blocked on production-shaped staged
+        // control and a receipt that external gates can consume.
         assert!(metrics.batches_total < metrics.ops_total);
     }
 
