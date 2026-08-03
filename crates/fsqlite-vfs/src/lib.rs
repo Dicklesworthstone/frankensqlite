@@ -8,11 +8,7 @@ pub mod shm;
 pub mod traits;
 #[cfg(all(feature = "native", unix))]
 pub mod unix;
-#[cfg(all(
-    feature = "native",
-    feature = "linux-asupersync-uring",
-    target_os = "linux"
-))]
+#[cfg(all(feature = "native", target_os = "linux"))]
 pub mod uring;
 #[cfg(all(feature = "native", target_os = "windows"))]
 pub mod windows;
@@ -245,11 +241,7 @@ pub use traits::{
 };
 #[cfg(all(feature = "native", unix))]
 pub use unix::{UnixFile, UnixVfs};
-#[cfg(all(
-    feature = "native",
-    feature = "linux-asupersync-uring",
-    target_os = "linux"
-))]
+#[cfg(all(feature = "native", target_os = "linux"))]
 pub use uring::{IoUringFile, IoUringVfs};
 #[cfg(all(feature = "native", target_os = "windows"))]
 pub use windows::{WindowsFile, WindowsVfs};

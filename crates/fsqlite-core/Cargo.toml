@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["native"]
+default = ["native", "linux-asupersync-uring"]
 bench-internals = []
 native = [
     "fsqlite-types/native",
