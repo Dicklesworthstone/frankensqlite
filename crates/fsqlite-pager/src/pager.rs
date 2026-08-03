@@ -22726,19 +22726,56 @@ mod tests {
         ObservedUnlockTraceIds,
     );
 
-    fn init_publication_test_tracing() {
-        static TRACING_INIT: OnceLock<()> = OnceLock::new();
-        TRACING_INIT.get_or_init(|| {
-            if tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::TRACE)
-                .with_test_writer()
-                .try_init()
-                .is_err()
-            {
-                // Another test already installed a global subscriber.
-            }
-        });
+    /// Deliberate no-op (frankensqlite#299).
+    ///
+    /// This helper previously installed a process-global `TRACE` subscriber via
+    /// `tracing_subscriber::fmt()...with_test_writer().try_init()`. Because
+    /// `try_init()` is process-wide and first-caller-wins, the first of the 39
+    /// callers changed tracing enablement — and libtest output capture — for
+    /// every unrelated test that ran afterwards in this binary. When any such
+    /// test later failed, libtest replayed the entire captured global trace
+    /// stream for it; one reported run produced a 9.2 GB, 29.7M-line archive
+    /// and terminated in `EDQUOT` without a trustworthy summary.
+    ///
+    /// `fsqlite-core` fixed the identical pattern in b262b6a6; the pager helper
+    /// kept it. No caller asserts on emitted trace events — the trace-shaped
+    /// assertions in this module read `ObservedUnlockTraceIds`, a mock-VFS
+    /// field populated by the mock itself, not by a subscriber — so the body is
+    /// simply removed. The call sites are retained so the diff stays test-only
+    /// and reviewable.
+    ///
+    /// A test that genuinely needs events should scope a target-filtered
+    /// subscriber with `tracing::subscriber::set_default(..)` and a guard, and
+    /// bound its capture. See `pager_test_tracing_helper_installs_no_global_subscriber`.
+    fn init_publication_test_tracing() {}
+
+    /// frankensqlite#299 regression: the publication tracing helper must not
+    /// install, or otherwise disturb, a process-global subscriber.
+    ///
+    /// The equality assertion is the load-bearing one: it compares global
+    /// dispatcher state across the call, so it proves the helper itself is
+    /// inert no matter what order libtest runs tests in and no matter what any
+    /// other test did first. It cannot be tainted.
+    ///
+    /// The absolute assertion is additionally safe here because
+    /// `init_publication_test_tracing` was the only global-subscriber
+    /// installation site in this crate, so nothing in this test binary can set
+    /// one. If a future change adds another installer, this assertion is meant
+    /// to fail — that is the regression being guarded.
+    #[test]
+    fn pager_test_tracing_helper_installs_no_global_subscriber() {
+        let before = tracing::dispatcher::has_been_set();
+        init_publication_test_tracing();
+        let after = tracing::dispatcher::has_been_set();
+
+        assert_eq!(
+            before, after,
+            "init_publication_test_tracing must not install or alter a global subscriber"
+        );
+        assert!(
+            !after,
+            "no global subscriber may be installed in the fsqlite-pager test binary"
+        );
     }
 
     async fn test_pager() -> (SimplePager<MemoryVfs>, PathBuf) {

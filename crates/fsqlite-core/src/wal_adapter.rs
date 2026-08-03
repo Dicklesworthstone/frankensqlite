@@ -3361,7 +3361,7 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     use fsqlite_pager::MockCheckpointPageWriter;
     use fsqlite_pager::traits::WalFrameRef;
@@ -3674,19 +3674,42 @@ mod tests {
         }
     }
 
-    fn init_wal_publication_test_tracing() {
-        static TRACING_INIT: OnceLock<()> = OnceLock::new();
-        TRACING_INIT.get_or_init(|| {
-            if tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::TRACE)
-                .with_test_writer()
-                .try_init()
-                .is_err()
-            {
-                // Another test already installed a global subscriber.
-            }
-        });
+    /// Deliberate no-op (frankensqlite#299).
+    ///
+    /// This helper previously installed a process-global `TRACE` subscriber via
+    /// `tracing_subscriber::fmt()...with_test_writer().try_init()`. `try_init()`
+    /// is process-wide and first-caller-wins, so the first of the 9 callers
+    /// changed tracing enablement — and libtest output capture — for every
+    /// unrelated test running afterwards in this binary, making a later failure
+    /// replay the whole captured global trace stream.
+    ///
+    /// `fsqlite-core` already fixed the identical pattern in b262b6a6 for its
+    /// other helpers; this one was missed. No caller here asserts on emitted
+    /// trace events, so the body is simply removed and the call sites are kept
+    /// so the diff stays test-only.
+    ///
+    /// See `wal_publication_tracing_helper_installs_no_global_subscriber`.
+    fn init_wal_publication_test_tracing() {}
+
+    /// frankensqlite#299 regression: the WAL publication tracing helper must not
+    /// install, or otherwise disturb, a process-global subscriber.
+    ///
+    /// Only the equality assertion is made, deliberately. Unlike the pager
+    /// crate, this test binary contains another global-subscriber installation
+    /// site outside this file, so an absolute `!has_been_set()` assertion would
+    /// be order-dependent and could fail for reasons unrelated to this helper.
+    /// Comparing dispatcher state across the call is untaintable and proves the
+    /// exact property under test: that this helper is inert.
+    #[test]
+    fn wal_publication_tracing_helper_installs_no_global_subscriber() {
+        let before = tracing::dispatcher::has_been_set();
+        init_wal_publication_test_tracing();
+
+        assert_eq!(
+            before,
+            tracing::dispatcher::has_been_set(),
+            "init_wal_publication_test_tracing must not install or alter a global subscriber"
+        );
     }
 
     fn test_cx() -> Cx {
