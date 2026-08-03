@@ -11523,6 +11523,33 @@ mod tests {
             *self.probe.borrow_mut() = PrefetchProbeState::default();
         }
 
+        /// Record a read against the probe and settle any pending prefetch hint
+        /// for `page_no`.
+        ///
+        /// This is deliberately a synchronous helper: keeping the `RefMut` inside
+        /// a non-async fn guarantees the borrow cannot reach the coroutine
+        /// interior of `read_page`, which awaits the inner store afterwards.
+        fn note_read(&self, page_no: PageNumber) {
+            let mut probe = self.probe.borrow_mut();
+            probe.read_pages.push(page_no);
+            let mut counted_prefetch_hit = false;
+            let remove_pending = if let Some(pending) = probe.pending_hints.get_mut(&page_no.get())
+                && *pending > 0
+            {
+                *pending -= 1;
+                counted_prefetch_hit = true;
+                *pending == 0
+            } else {
+                false
+            };
+            if counted_prefetch_hit {
+                probe.prefetch_hit_count = probe.prefetch_hit_count.saturating_add(1);
+            }
+            if remove_pending {
+                probe.pending_hints.remove(&page_no.get());
+            }
+        }
+
         fn snapshot(&self) -> PrefetchProbeSnapshot {
             let probe = self.probe.borrow();
             PrefetchProbeSnapshot {
@@ -11546,26 +11573,7 @@ mod tests {
             page_no: PageNumber,
         ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
             async move {
-                let mut probe = self.probe.borrow_mut();
-                probe.read_pages.push(page_no);
-                let mut counted_prefetch_hit = false;
-                let remove_pending = if let Some(pending) =
-                    probe.pending_hints.get_mut(&page_no.get())
-                    && *pending > 0
-                {
-                    *pending -= 1;
-                    counted_prefetch_hit = true;
-                    *pending == 0
-                } else {
-                    false
-                };
-                if counted_prefetch_hit {
-                    probe.prefetch_hit_count = probe.prefetch_hit_count.saturating_add(1);
-                }
-                if remove_pending {
-                    probe.pending_hints.remove(&page_no.get());
-                }
-                drop(probe);
+                self.note_read(page_no);
                 self.inner.read_page(cx, page_no).await
             }
         }
@@ -11898,7 +11906,12 @@ mod tests {
         }
     }
 
-    #[allow(clippy::manual_async_fn)]
+    // This test double delegates straight through to the shared `MemPageStore`,
+    // whose futures borrow the guarded value, so the `Ref` must span the await by
+    // construction. That is sound here: the store is a single-threaded
+    // `Rc<RefCell<_>>` and `MemPageStore`'s futures are leaf operations over an
+    // in-memory map that never suspend, so no re-entrant borrow can occur.
+    #[allow(clippy::manual_async_fn, clippy::await_holding_refcell_ref)]
     impl PageReader for FailingOverflowStore {
         fn read_page<'a>(
             &'a self,
@@ -11909,7 +11922,8 @@ mod tests {
         }
     }
 
-    #[allow(clippy::manual_async_fn)]
+    // Same delegation constraint as the `PageReader` impl above.
+    #[allow(clippy::manual_async_fn, clippy::await_holding_refcell_ref)]
     impl PageWriter for FailingOverflowStore {
         fn write_page<'a>(
             &'a mut self,
@@ -12028,7 +12042,11 @@ mod tests {
         }
     }
 
-    #[allow(clippy::manual_async_fn)]
+    // Delegating test double over a single-threaded `Rc<RefCell<MemPageStore>>`;
+    // the inner future borrows the guarded value, so the `Ref` must span the
+    // await. `MemPageStore`'s futures never suspend, so no re-entrant borrow can
+    // occur.
+    #[allow(clippy::manual_async_fn, clippy::await_holding_refcell_ref)]
     impl PageReader for CancelAfterFirstOverflowFreeStore {
         fn read_page<'a>(
             &'a self,
@@ -12042,7 +12060,8 @@ mod tests {
         }
     }
 
-    #[allow(clippy::manual_async_fn)]
+    // Same delegation constraint as the `PageReader` impl above.
+    #[allow(clippy::manual_async_fn, clippy::await_holding_refcell_ref)]
     impl PageWriter for CancelAfterFirstOverflowFreeStore {
         fn write_page<'a>(
             &'a mut self,
@@ -12589,10 +12608,14 @@ mod tests {
 
     #[test]
     fn test_btree_observability_operation_totals() {
+        // The metrics gate is process-global, so this guard must cover the whole
+        // test body. Acquire it around `run_async` rather than inside the async
+        // block: identical hold duration, but the guard never enters the
+        // coroutine interior.
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let before = btree_metrics_snapshot();
 
@@ -12666,10 +12689,12 @@ mod tests {
 
     #[test]
     fn test_btree_observability_split_counter_and_depth_gauge() {
+        // Held across the whole test body; see the note on the operation-totals
+        // test for why acquisition sits outside the async block.
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let before = btree_metrics_snapshot();
 
@@ -15836,14 +15861,16 @@ mod tests {
 
     #[test]
     fn test_balance_for_delete_defers_until_leaf_empties() {
+        // bd-yywuv (K2 deferred delete): prove balance_for_delete (the rebalance
+        // fixup) fires ONLY when a leaf empties, not per DELETE. Deleting every
+        // cell of the leftmost leaf EXCEPT the last must trigger zero rebalances;
+        // the final delete that empties the leaf triggers the rebalance.
+        // Held across the whole test body; acquired outside the async block so the
+        // guard never enters the coroutine interior.
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            // bd-yywuv (K2 deferred delete): prove balance_for_delete (the rebalance
-            // fixup) fires ONLY when a leaf empties, not per DELETE. Deleting every
-            // cell of the leftmost leaf EXCEPT the last must trigger zero rebalances;
-            // the final delete that empties the leaf triggers the rebalance.
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
 
             let mut store = MemPageStore::new(USABLE);
@@ -17500,13 +17527,16 @@ mod tests {
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_handles_split_fallback() {
+        // Both locks are process-global and must cover the whole test body;
+        // acquiring them outside the async block keeps them out of the
+        // coroutine interior without changing how long they are held.
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             const SMALL_USABLE: u32 = 256;
 
             let cx = Cx::new();
@@ -17566,13 +17596,15 @@ mod tests {
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_split_reads_only_parent_after_root_split() {
+        // Process-global locks held across the whole body; see the sibling
+        // split-fallback test for why acquisition sits outside the async block.
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             const SMALL_USABLE: u32 = 256;
 
             let cx = Cx::new();
@@ -17792,14 +17824,15 @@ mod tests {
 
     #[test]
     fn test_table_insert_sequential_fast_path_records_append_metrics_without_reloads() {
+        // Process-global locks held across the whole body; acquired outside the
+        // async block so they never enter the coroutine interior.
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-
             crate::instrumentation::reset_btree_copy_profile();
             crate::instrumentation::set_btree_copy_profile_enabled(true);
 
@@ -18150,16 +18183,18 @@ mod tests {
 
     #[test]
     fn test_table_insert_from_current_position_reuses_leaf_state_without_reload() {
+        // Process-global locks held across the whole body; acquired outside the
+        // async block so they never enter the coroutine interior.
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let cx = Cx::new();
             let root = pn(2);
@@ -18263,16 +18298,18 @@ mod tests {
 
     #[test]
     fn test_index_insert_from_current_position_reuses_leaf_state_without_reload() {
+        // Process-global locks held across the whole body; acquired outside the
+        // async block so they never enter the coroutine interior.
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let cx = Cx::new();
             let root = pn(2);
@@ -18418,16 +18455,18 @@ mod tests {
 
     #[test]
     fn test_table_insert_from_current_position_after_delete_reuses_leaf_state() {
+        // Process-global locks held across the whole body; acquired outside the
+        // async block so they never enter the coroutine interior.
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             let cx = Cx::new();
             let root = pn(2);
@@ -18495,16 +18534,18 @@ mod tests {
 
     #[test]
     fn test_table_insert_from_current_position_records_fallback_when_balance_needed() {
+        // Process-global locks held across the whole body; acquired outside the
+        // async block so they never enter the coroutine interior.
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_async(async {
-            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             set_btree_metrics_enabled(true);
             const SMALL_USABLE: u32 = 256;
 
