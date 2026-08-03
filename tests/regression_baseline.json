@@ -725,18 +725,6 @@
       }
     },
     {
-      "source_path": "crates/fsqlite-e2e/tests/bd_misnw_schema_epoch_parity.rs",
-      "test_name": "s31_savepoint_nested_dml_ddl_mix",
-      "reason": "MVCC assertion: prepared write staging must clear conflict-only tracking first (begin_concurrent.rs:1308)",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Remove the ignore only after the unchanged exact test passes three consecutive runs at the release commit and the receipt preserves its nested savepoint and mixed DML/DDL assertions.",
-        "receipt": null
-      }
-    },
-    {
       "source_path": "crates/fsqlite-e2e/tests/bd_qayid_track_t_append_path.rs",
       "test_name": "bd_qayid_track_t_append_throughput_probe_emits_metrics",
       "reason": "manual perf probe; run via rch when investigating Track T append throughput",

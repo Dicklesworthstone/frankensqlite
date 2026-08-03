@@ -90,6 +90,16 @@ const AUDITED_COVERED_PARENT_CONTRACT: &[(&str, &[&str])] = &[
     ),
 ];
 const UNINSPECTED_RUST_SOURCE_PATHS: &[&str] = &["crates/fsqlite-core/src/connection.rs"];
+/// Library sources reached through a `#[path = "..."]` module declaration.
+/// Their libtest runtime module path is decided by the *declaring* module, not
+/// by their own file path, so the file-derived derivation in
+/// [`canonical_runtime_test_name`] cannot address them. They fail closed until
+/// a typed declaration contract exists. `phase5_path_remapped_library_sources_are_audited`
+/// keeps this list exactly in sync with the tree.
+const PATH_REMAPPED_LIBRARY_SOURCES: &[&str] = &[
+    "crates/fsqlite-core/src/policy_controller.rs",
+    "crates/fsqlite-parser/src/semantic_test.rs",
+];
 const SOURCE_INVENTORY_SOUNDNESS_LIMITATIONS: &[&str] = &[
     "attribute and opaque item-macro expansions are not compiler-audited",
     "out-of-line modules and include sites do not propagate cfg, identity, or multiplicity",
@@ -98,7 +108,8 @@ const SOURCE_INVENTORY_SOUNDNESS_LIMITATIONS: &[&str] = &[
     "run_for_release prose requirements are not yet represented as machine-auditable typed contracts",
     "run_for_release source-to-Cargo-package mapping is convention-derived rather than metadata-audited",
     "exact-test transcripts do not carry a trusted runner attestation of Cargo package identity",
-    "baseline numeric counts lack an immutable command-bound provenance artifact",
+    "the baseline workspace transcript is content- and command-bound but carries no trusted runner attestation that the canonical command produced it",
+    "library runtime module paths are derived from file paths, so `#[path]`-remapped sources are refused rather than addressed",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1791,6 +1802,8 @@ struct RegressionBaseline {
     failed: u64,
     ignored: u64,
     baseline_commit: String,
+    #[serde(default)]
+    baseline_evidence: Option<BaselineEvidence>,
     ignored_tests: Vec<IgnoredTestBaseline>,
 }
 
@@ -1820,10 +1833,15 @@ impl RegressionBaseline {
                 self.failed
             ));
         }
+        // The provenance anchor must be a full object name. An abbreviated
+        // anchor cannot be compared for exact equality against the 40-digit
+        // `source_commit` carried by a typed workspace receipt, so accepting
+        // one makes the receipt contract unsatisfiable rather than merely
+        // unproven.
         let commit = &self.baseline_commit;
-        if !(7..=40).contains(&commit.len()) || !is_lowercase_hex(commit) {
+        if commit.len() != 40 || !is_lowercase_hex(commit) {
             return Err(format!(
-                "baseline_commit must be an untrimmed 7-40 digit lowercase hexadecimal Git object name, found `{commit}`"
+                "baseline_commit must be a full untrimmed 40-digit lowercase hexadecimal Git object name, found `{commit}`"
             ));
         }
 
@@ -1905,6 +1923,13 @@ struct CommandEvidence {
     capture_status: i32,
     artifact_path: String,
     artifact_blake3: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BaselineEvidence {
+    source_commit: String,
+    workspace: CommandEvidence,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -2081,6 +2106,82 @@ fn expected_test_target(source_path: &str) -> Result<CargoTestTarget, String> {
     }
 }
 
+/// libtest reports a library unit test under its full module path, which
+/// includes the module implied by the source file itself. The baseline stores
+/// the in-file identity (`tests::foo`) so that locators and the source
+/// inventory stay anchored to what the file literally declares, but an exact
+/// `--exact` filter and the transcript success line must both use the
+/// file-derived runtime name (`page_cache::tests::foo`). Using the entry name
+/// verbatim selects zero tests for every library source other than
+/// `src/lib.rs`, which makes a canonical command silently vacuous.
+///
+/// An integration test is its own crate root, so its runtime name is the entry
+/// name unchanged.
+fn canonical_runtime_test_name(source_path: &str, test_name: &str) -> Result<String, String> {
+    if test_name.trim().is_empty() {
+        return Err(format!(
+            "test name must not be empty for source `{source_path}`"
+        ));
+    }
+    match expected_test_target(source_path)? {
+        CargoTestTarget::Integration(_) => Ok(test_name.to_owned()),
+        CargoTestTarget::Library => {
+            // A `#[path]`-remapped source is mounted under the module path of
+            // whichever module declares it, which this file-derived
+            // reconstruction cannot see. Refuse it instead of emitting a
+            // confidently wrong `--exact` filter that would select no tests.
+            if PATH_REMAPPED_LIBRARY_SOURCES.contains(&source_path) {
+                return Err(format!(
+                    "library test source is mounted through a `#[path]` declaration and has no file-derived runtime module path: `{source_path}`"
+                ));
+            }
+            // `expected_test_target` already proved the shape
+            // `crates/<package>/src/<relative...>`.
+            let components = source_path.split('/').collect::<Vec<_>>();
+            let relative = &components[3..];
+            let mut modules = Vec::new();
+            for (index, component) in relative.iter().enumerate() {
+                let is_final = index + 1 == relative.len();
+                if is_final {
+                    let stem = component.strip_suffix(".rs").ok_or_else(|| {
+                        format!("library test source is not a Rust file: `{source_path}`")
+                    })?;
+                    match stem {
+                        // Only `src/lib.rs` is the crate root; a nested
+                        // `lib.rs` is an ordinary module named `lib`.
+                        "lib" if relative.len() == 1 => {}
+                        // `foo/mod.rs` is the module `foo`, already pushed by
+                        // its parent directory component.
+                        "mod" if relative.len() > 1 => {}
+                        "mod" => {
+                            return Err(format!(
+                                "library test source has no addressable module path: `{source_path}`"
+                            ));
+                        }
+                        "" => {
+                            return Err(format!(
+                                "library test source has an empty module name: `{source_path}`"
+                            ));
+                        }
+                        named => modules.push(named.to_owned()),
+                    }
+                } else if component.is_empty() || component.ends_with(".rs") {
+                    return Err(format!(
+                        "library test source has a malformed module directory: `{source_path}`"
+                    ));
+                } else {
+                    modules.push((*component).to_owned());
+                }
+            }
+            if modules.is_empty() {
+                Ok(test_name.to_owned())
+            } else {
+                Ok(format!("{}::{test_name}", modules.join("::")))
+            }
+        }
+    }
+}
+
 fn expected_current_run_target(entry: &IgnoredTestBaseline) -> Result<CargoTestTarget, String> {
     expected_test_target(&entry.source_path)
 }
@@ -2119,7 +2220,7 @@ fn expected_current_run_argv(entry: &IgnoredTestBaseline) -> Result<Vec<String>,
         }
     }
     argv.extend([
-        entry.test_name.clone(),
+        canonical_runtime_test_name(&entry.source_path, &entry.test_name)?,
         "--".to_owned(),
         "--exact".to_owned(),
     ]);
@@ -2524,6 +2625,59 @@ fn read_regular_evidence_file(
     Ok(bytes)
 }
 
+fn validate_baseline_workspace_evidence(
+    root: &Path,
+    baseline: &RegressionBaseline,
+) -> Result<(), String> {
+    let evidence = baseline.baseline_evidence.as_ref().ok_or_else(|| {
+        "release regression baseline lacks a typed workspace receipt; recover it from a clean ancestor-bound run"
+            .to_owned()
+    })?;
+    if evidence.source_commit.len() != 40 || !is_lowercase_hex(&evidence.source_commit) {
+        return Err(
+            "baseline workspace receipt source_commit must be a 40-digit lowercase hexadecimal commit"
+                .to_owned(),
+        );
+    }
+    if evidence.source_commit != baseline.baseline_commit {
+        return Err(format!(
+            "baseline workspace receipt source_commit `{}` does not exactly match baseline_commit `{}`",
+            evidence.source_commit, baseline.baseline_commit
+        ));
+    }
+    validate_command_evidence_shape(&evidence.workspace, "baseline workspace receipt")?;
+    let expected_argv = CANONICAL_WORKSPACE_TEST_ARGV
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect::<Vec<_>>();
+    if evidence.workspace.argv != expected_argv {
+        return Err(format!(
+            "baseline workspace receipt.argv must exactly equal the canonical command: {expected_argv:?}"
+        ));
+    }
+    let bytes = read_regular_evidence_file(
+        root,
+        &evidence.workspace.artifact_path,
+        &evidence.workspace.artifact_blake3,
+        "baseline workspace transcript",
+    )?;
+    let transcript = String::from_utf8(bytes)
+        .map_err(|error| format!("baseline workspace transcript is not UTF-8: {error}"))?;
+    let actual = parse_workspace_test_counts(&transcript)?;
+    let expected = RegressionCounts {
+        total_tests: baseline.total_tests,
+        passed: baseline.passed,
+        failed: baseline.failed,
+        ignored: baseline.ignored,
+    };
+    if actual != expected {
+        return Err(format!(
+            "baseline workspace transcript counts {actual:?} do not match declared baseline counts {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn release_status_record_is_allowed(record: &[u8]) -> bool {
     record.starts_with(b"!! target/")
 }
@@ -2668,7 +2822,11 @@ fn validate_single_test_transcript(
             "exact-test receipt for `{test_name}` does not identify its canonical Cargo target"
         ));
     }
-    let expected_result = format!("test {test_name} ... ok");
+    // libtest prints the file-derived runtime module path, not the in-file
+    // identity the baseline stores, so the success line must be matched
+    // against the same canonical name the argv filter selects.
+    let runtime_test_name = canonical_runtime_test_name(&entry.source_path, test_name)?;
+    let expected_result = format!("test {runtime_test_name} ... ok");
     if transcript
         .lines()
         .filter(|line| line.trim() == expected_result)
@@ -2676,7 +2834,7 @@ fn validate_single_test_transcript(
         != 1
     {
         return Err(format!(
-            "exact-test receipt does not contain one matching success line for `{test_name}`"
+            "exact-test receipt does not contain one matching success line for `{runtime_test_name}`"
         ));
     }
     Ok(())
@@ -2896,6 +3054,7 @@ fn load_regression_baseline(
             root.display()
         ));
     }
+    validate_baseline_workspace_evidence(root, &baseline)?;
     let baseline_ancestor_status = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -2917,7 +3076,6 @@ fn load_regression_baseline(
             baseline.baseline_commit
         ));
     }
-
     for entry in &baseline.ignored_tests {
         let Some(receipt) = &entry.evidence.receipt else {
             continue;
@@ -3684,7 +3842,8 @@ fn sample_release_evidence() -> (RegressionBaseline, ReleaseEvidenceManifest) {
         passed: 1,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
         ignored_tests: vec![release_run, live_guard],
     };
     (baseline, manifest)
@@ -4655,6 +4814,400 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; fini
     );
 }
 
+/// libtest addresses a library unit test by its file-derived module path. The
+/// baseline stores the in-file identity, so the canonical runtime name must be
+/// reconstructed from the source path before it is used as an exact filter or
+/// matched against a transcript success line.
+#[test]
+fn test_regression_guard_canonical_runtime_test_name_matches_libtest_module_paths() {
+    // The crate root declares no extra module.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/lib.rs", "tests::foo"),
+        Ok("tests::foo".to_owned())
+    );
+    // A single-file module contributes exactly its file stem. This is the
+    // shape that previously produced a command selecting zero tests.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/page_cache.rs", "tests::foo"),
+        Ok("page_cache::tests::foo".to_owned())
+    );
+    // `foo/mod.rs` is the module `foo`, not `foo::mod`.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/foo/mod.rs", "tests::foo"),
+        Ok("foo::tests::foo".to_owned())
+    );
+    // Nested modules accumulate every directory component.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/foo/bar.rs", "tests::foo"),
+        Ok("foo::bar::tests::foo".to_owned())
+    );
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/foo/bar/mod.rs", "tests::foo"),
+        Ok("foo::bar::tests::foo".to_owned())
+    );
+    // A nested `lib.rs` is an ordinary module named `lib`, not a crate root.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/foo/lib.rs", "tests::foo"),
+        Ok("foo::lib::tests::foo".to_owned())
+    );
+    // An integration test is its own crate root and keeps the entry name.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-e2e/tests/case.rs", "exact_case"),
+        Ok("exact_case".to_owned())
+    );
+
+    // Invalid or unaddressable sources must fail closed rather than produce a
+    // filter that silently selects nothing.
+    for (source_path, expected_fragment) in [
+        (
+            "crates/fsqlite-pager/src/mod.rs",
+            "no addressable module path",
+        ),
+        (
+            "crates/fsqlite-pager/src/foo.rs/bar.rs",
+            "malformed module directory",
+        ),
+        ("crates/fsqlite-pager/src/main.rs", "unambiguous library"),
+        (
+            "crates/fsqlite-pager/benches/bench.rs",
+            "unambiguous library",
+        ),
+        // Too few components to name a target directory at all, which is a
+        // distinct rejection from an unambiguous-target failure.
+        (
+            "crates/fsqlite-pager/README.md",
+            "outside a supported workspace crate target",
+        ),
+        ("src/page_cache.rs", "outside a supported workspace crate"),
+    ] {
+        let error = canonical_runtime_test_name(source_path, "tests::foo")
+            .expect_err(&format!("`{source_path}` must fail closed"));
+        assert!(
+            error.contains(expected_fragment),
+            "unexpected rejection reason for `{source_path}`: {error}"
+        );
+    }
+
+    assert!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/page_cache.rs", "   ")
+            .expect_err("an empty test name must fail closed")
+            .contains("must not be empty")
+    );
+}
+
+/// The exact-run command and the transcript check must agree on the same
+/// canonical runtime name, otherwise the canonical command runs zero tests
+/// while its receipt still appears well formed.
+#[test]
+fn test_regression_guard_library_exact_argv_and_transcript_use_runtime_module_path() {
+    let mut entry = sample_ignored_baseline(
+        "crates/fsqlite-pager/src/page_cache.rs",
+        "tests::test_sharded_cache_throughput_vs_single",
+    );
+    entry.kind = IgnoreKind::Performance;
+    entry.policy = IgnorePolicy::RunForRelease;
+
+    let argv = expected_current_run_argv(&entry).expect("library source has a canonical target");
+    let filter_index = argv
+        .iter()
+        .position(|argument| argument == "--lib")
+        .expect("library target selects --lib")
+        + 1;
+    assert_eq!(
+        argv[filter_index], "page_cache::tests::test_sharded_cache_throughput_vs_single",
+        "the exact filter must address the file-derived runtime module path"
+    );
+    assert!(
+        !argv.contains(&"tests::test_sharded_cache_throughput_vs_single".to_owned()),
+        "the bare in-file identity must never be used as an exact filter"
+    );
+
+    let passing = r"
+     Running unittests src/lib.rs (target/debug/deps/fsqlite_pager-a1)
+test page_cache::tests::test_sharded_cache_throughput_vs_single ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+    assert_eq!(validate_single_test_transcript(passing, &entry), Ok(()));
+
+    // A transcript carrying the bare in-file identity is exactly what the old
+    // command would have produced, and must no longer satisfy the receipt.
+    let unqualified = passing.replace(
+        "test page_cache::tests::test_sharded_cache_throughput_vs_single ... ok",
+        "test tests::test_sharded_cache_throughput_vs_single ... ok",
+    );
+    assert!(
+        validate_single_test_transcript(&unqualified, &entry)
+            .expect_err("an unqualified success line must fail")
+            .contains("page_cache::tests::test_sharded_cache_throughput_vs_single")
+    );
+}
+
+/// Structurally discovers `#[path = "..."]` module declarations in one parsed
+/// source. A textual scan cannot be trusted here: attribute spacing, multiline
+/// attributes, `cfg_attr` wrapping, and `#[path]` inside comments or string
+/// literals all defeat it, and an under-count silently narrows the audited
+/// list. Parsing with `syn` and inspecting `ItemMod` attributes gives an exact
+/// answer.
+///
+/// Forms whose target this reconstruction cannot resolve are rejected rather
+/// than skipped:
+/// * `#[cfg_attr(..., path = "...")]`, whose applicability is configuration
+///   dependent;
+/// * a `#[path]` on an inline module, or on a module nested inside one, where
+///   rustc resolves the target against the enclosing module directory rather
+///   than the file directory;
+/// * a non-string-literal `path` value.
+fn collect_module_path_attributes(source_path: &str, source: &str) -> Result<Vec<String>, String> {
+    struct Collector<'a> {
+        source_path: &'a str,
+        inline_depth: usize,
+        values: Vec<String>,
+        error: Option<String>,
+    }
+
+    impl Collector<'_> {
+        fn fail(&mut self, message: String) {
+            if self.error.is_none() {
+                self.error = Some(message);
+            }
+        }
+
+        fn inspect(&mut self, node: &syn::ItemMod) {
+            for attribute in &node.attrs {
+                match &attribute.meta {
+                    Meta::NameValue(pair) => {
+                        if canonical_meta_path(&pair.path).as_deref() != Ok("path") {
+                            continue;
+                        }
+                        if self.inline_depth > 0 || node.content.is_some() {
+                            self.fail(format!(
+                                "`{}` declares a `#[path]` module in an unsupported inline position; its target is not file-directory relative",
+                                self.source_path
+                            ));
+                            continue;
+                        }
+                        match &pair.value {
+                            Expr::Lit(literal) => match &literal.lit {
+                                Lit::Str(value) => self.values.push(value.value()),
+                                _ => self.fail(format!(
+                                    "`{}` declares a non-string `#[path]` value",
+                                    self.source_path
+                                )),
+                            },
+                            _ => self.fail(format!(
+                                "`{}` declares a non-literal `#[path]` value",
+                                self.source_path
+                            )),
+                        }
+                    }
+                    Meta::List(list) => {
+                        if canonical_meta_path(&list.path).as_deref() != Ok("cfg_attr") {
+                            continue;
+                        }
+                        // `cfg_attr` bodies are not always parseable as nested
+                        // `Meta`; fall back to a token check so a conditional
+                        // `path` can never be silently dropped.
+                        let mentions_path = match parse_meta_list(list) {
+                            Ok(nested) => nested.iter().any(|meta| {
+                                canonical_meta_path(meta.path()).as_deref() == Ok("path")
+                            }),
+                            Err(_) => list.tokens.to_string().contains("path"),
+                        };
+                        if mentions_path {
+                            self.fail(format!(
+                                "`{}` declares a configuration-dependent `#[cfg_attr(..., path = ...)]` module",
+                                self.source_path
+                            ));
+                        }
+                    }
+                    Meta::Path(_) => {}
+                }
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Collector<'_> {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            self.inspect(node);
+            if node.content.is_some() {
+                self.inline_depth += 1;
+                syn::visit::visit_item_mod(self, node);
+                self.inline_depth -= 1;
+            } else {
+                syn::visit::visit_item_mod(self, node);
+            }
+        }
+    }
+
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("unable to parse `{source_path}` for `#[path]` audit: {error}"))?;
+    let mut collector = Collector {
+        source_path,
+        inline_depth: 0,
+        values: Vec::new(),
+        error: None,
+    };
+    collector.visit_file(&file);
+    if let Some(error) = collector.error {
+        return Err(error);
+    }
+    Ok(collector.values)
+}
+
+/// The `#[path]` audit is only as exact as its discovery, so the structural
+/// collector is pinned against the textual shapes a line scan would miss or
+/// invent.
+#[test]
+fn test_regression_guard_module_path_attribute_discovery_is_structural() {
+    // Spacing variants and multiline attributes are found.
+    let spaced = r#"
+        #[path="a.rs"]
+        mod a;
+        #[ path = "b.rs" ]
+        mod b;
+        #[path
+            = "c.rs"]
+        mod c;
+    "#;
+    assert_eq!(
+        collect_module_path_attributes("crates/x/src/lib.rs", spaced),
+        Ok(vec![
+            "a.rs".to_owned(),
+            "b.rs".to_owned(),
+            "c.rs".to_owned()
+        ])
+    );
+
+    // Comments and string literals must not be mistaken for declarations.
+    let decoys = r##"
+        // #[path = "commented.rs"]
+        /* #[path = "blocked.rs"] */
+        const DOC: &str = r#"#[path = "quoted.rs"]"#;
+        mod ordinary;
+    "##;
+    assert_eq!(
+        collect_module_path_attributes("crates/x/src/lib.rs", decoys),
+        Ok(Vec::new())
+    );
+
+    // Configuration-dependent remapping is refused, not skipped.
+    let conditional = r#"
+        #[cfg_attr(test, path = "conditional.rs")]
+        mod conditional;
+    "#;
+    assert!(
+        collect_module_path_attributes("crates/x/src/lib.rs", conditional)
+            .expect_err("cfg_attr path remapping must fail closed")
+            .contains("configuration-dependent")
+    );
+
+    // A `#[path]` nested inside an inline module resolves against the
+    // enclosing module directory, which this reconstruction cannot model.
+    let nested = r#"
+        mod outer {
+            #[path = "inner.rs"]
+            mod inner;
+        }
+    "#;
+    assert!(
+        collect_module_path_attributes("crates/x/src/lib.rs", nested)
+            .expect_err("nested `#[path]` must fail closed")
+            .contains("unsupported inline position")
+    );
+
+    // Unparseable sources fail closed rather than reporting zero declarations.
+    assert!(
+        collect_module_path_attributes("crates/x/src/lib.rs", "mod broken {")
+            .expect_err("an unparseable source must fail closed")
+            .contains("unable to parse")
+    );
+}
+
+/// `PATH_REMAPPED_LIBRARY_SOURCES` is a hand-audited list, so it must be kept
+/// exactly in sync with the tree. This scans every tracked library source for
+/// `#[path]` module declarations, resolves each target relative to its
+/// declaring file, and requires the audited list to match precisely — a new
+/// remap cannot be added without also being refused by
+/// [`canonical_runtime_test_name`].
+///
+/// Scope note: `#[path]` declarations that live in integration-test sources
+/// pull a library file into a *second* target. That multiplicity is a distinct
+/// concern already carried as a registered inventory soundness limitation, and
+/// is deliberately out of scope here.
+#[test]
+fn phase5_path_remapped_library_sources_are_audited() {
+    let root = repo_root();
+    let tracked = tracked_rust_source_paths(&root).expect("enumerate tracked Rust sources");
+
+    let mut discovered = Vec::new();
+    for source_path in tracked {
+        let mut components = source_path.split('/');
+        if components.next() != Some("crates") {
+            continue;
+        }
+        let Some(_package) = components.next() else {
+            continue;
+        };
+        if components.next() != Some("src") {
+            continue;
+        }
+        // An unreadable tracked source must fail closed: skipping it would
+        // shrink the discovered set and let this audit claim exactness over a
+        // tree it did not actually read.
+        let contents = fs::read_to_string(root.join(&source_path))
+            .map_err(|error| {
+                format!("unable to read tracked library source `{source_path}`: {error}")
+            })
+            .expect("every tracked library source must be readable for the `#[path]` audit");
+        let parent = Path::new(&source_path)
+            .parent()
+            .expect("library source has a parent directory")
+            .to_path_buf();
+        let declared = collect_module_path_attributes(&source_path, &contents)
+            .expect("`#[path]` audit must resolve every tracked library source");
+        for value in declared {
+            let target = normalize_source_path(&parent.join(&value))
+                .expect("`#[path]` target resolves inside the repository");
+            // Only library-mounted targets are addressed by the file-derived
+            // runtime-name derivation.
+            if target.split('/').nth(2) == Some("src") {
+                discovered.push(target);
+            }
+        }
+    }
+    discovered.sort();
+    discovered.dedup();
+
+    let audited = PATH_REMAPPED_LIBRARY_SOURCES
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        discovered, audited,
+        "PATH_REMAPPED_LIBRARY_SOURCES must list exactly the `#[path]`-remapped library sources present in the tree"
+    );
+
+    // Every audited source must actually fail closed.
+    for source_path in PATH_REMAPPED_LIBRARY_SOURCES {
+        let error = canonical_runtime_test_name(source_path, "tests::foo").expect_err(
+            "a `#[path]`-remapped library source must not yield a file-derived runtime name",
+        );
+        assert!(
+            error.contains("`#[path]` declaration"),
+            "unexpected rejection reason for `{source_path}`: {error}"
+        );
+    }
+
+    // The limitation stays registered so the release gate cannot silently
+    // treat this derivation as machine-audited.
+    assert!(
+        SOURCE_INVENTORY_SOUNDNESS_LIMITATIONS
+            .iter()
+            .any(|limitation| limitation.contains("`#[path]`-remapped sources are refused")),
+        "the `#[path]` derivation limitation must remain registered"
+    );
+}
+
 #[test]
 fn test_regression_guard_release_perf_command_matches_conditional_ignore() {
     let mut entry = sample_ignored_baseline(
@@ -4941,7 +5494,7 @@ fn test_regression_guard_baseline_schema_rejects_unknown_fields() {
         "passed": 1,
         "failed": 0,
         "ignored": 0,
-        "baseline_commit": "deadbeef",
+        "baseline_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
         "ignored_tests": [],
         "unexpected": true
     }"#;
@@ -4996,6 +5549,16 @@ fn test_regression_guard_release_loader_verifies_git_provenance_and_rename_delta
     let baseline_path = root.join(REGRESSION_BASELINE_PATH);
     fs::create_dir_all(baseline_path.parent().expect("baseline has parent"))
         .expect("create baseline directory");
+    let evidence_directory = root.join(EVIDENCE_PATH_PREFIX);
+    fs::create_dir_all(&evidence_directory).expect("create baseline evidence directory");
+    let workspace_path = format!("{EVIDENCE_PATH_PREFIX}baseline-workspace.txt");
+    let workspace = concat!(
+        "     Running unittests src/lib.rs (target/debug/deps/example-a1)\n",
+        "test baseline_case ... ok\n",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    );
+    fs::write(root.join(&workspace_path), workspace).expect("write baseline workspace transcript");
+    let workspace_digest = blake3::hash(workspace.as_bytes()).to_hex().to_string();
     fs::write(
         &baseline_path,
         format!(
@@ -5006,6 +5569,16 @@ fn test_regression_guard_release_loader_verifies_git_provenance_and_rename_delta
                 "failed": 0,
                 "ignored": 0,
                 "baseline_commit": "{baseline_commit}",
+                "baseline_evidence": {{
+                    "source_commit": "{baseline_commit}",
+                    "workspace": {{
+                        "argv": ["cargo", "test", "--locked", "--workspace", "--", "--test-threads=1"],
+                        "exit_status": 0,
+                        "capture_status": 0,
+                        "artifact_path": "{workspace_path}",
+                        "artifact_blake3": "{workspace_digest}"
+                    }}
+                }},
                 "ignored_tests": []
             }}"#
         ),
@@ -5017,12 +5590,28 @@ fn test_regression_guard_release_loader_verifies_git_provenance_and_rename_delta
             .contains("tracked by Git")
     );
     assert!(
-        git(&["add", "--force", REGRESSION_BASELINE_PATH]).success(),
-        "force-add the intentionally ignored keeper baseline"
+        git(&["add", "--force", REGRESSION_BASELINE_PATH, &workspace_path,]).success(),
+        "force-add the intentionally ignored keeper baseline and its transcript"
     );
     assert!(git(&["commit", "-m", "add baseline"]).success());
     let baseline_head = resolve_current_head(root).expect("resolve baseline HEAD");
-    assert!(load_regression_baseline(&baseline_path, root, &baseline_head).is_ok());
+    let loaded = load_regression_baseline(&baseline_path, root, &baseline_head)
+        .expect("typed baseline workspace receipt must validate");
+    let mut missing_receipt = loaded.clone();
+    missing_receipt.baseline_evidence = None;
+    assert!(
+        validate_baseline_workspace_evidence(root, &missing_receipt)
+            .expect_err("unattested baseline counters must fail closed")
+            .contains("lacks a typed workspace receipt")
+    );
+    let mut count_mismatch = loaded.clone();
+    count_mismatch.passed = 2;
+    count_mismatch.total_tests = 2;
+    assert!(
+        validate_baseline_workspace_evidence(root, &count_mismatch)
+            .expect_err("a count-preserving-looking baseline must still match its transcript")
+            .contains("do not match declared baseline counts")
+    );
 
     let missing_commit = "f".repeat(40);
     fs::write(
@@ -5103,6 +5692,7 @@ fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
         failed: 0,
         ignored: 0,
         baseline_commit: tested_commit.clone(),
+        baseline_evidence: None,
         ignored_tests: vec![live_guard],
     };
 
@@ -5360,7 +5950,8 @@ fn test_regression_guard_ignore_taxonomy_requires_sorted_unique_locators() {
         passed: 1,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
         ignored_tests,
     };
 
@@ -5882,7 +6473,8 @@ fn test_regression_guard_release_evaluator_fails_each_independent_gate() {
         passed: 1,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
         ignored_tests,
     };
     let green_counts = RegressionCounts {
@@ -6130,7 +6722,8 @@ fn test_regression_guard_baseline_validation_fails_closed() {
         passed: 3,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
         ignored_tests: Vec::new(),
     };
     assert_eq!(valid.validate(), Ok(()));
@@ -6173,6 +6766,67 @@ fn test_regression_guard_baseline_validation_fails_closed() {
     );
 }
 
+/// An abbreviated `baseline_commit` can never equal the 40-digit
+/// `source_commit` that `validate_baseline_workspace_evidence` requires, so
+/// accepting one would make the typed workspace receipt permanently
+/// unsatisfiable instead of merely unproven. The anchor must therefore be a
+/// full object name before any receipt is authored against it.
+#[test]
+fn test_regression_guard_baseline_rejects_abbreviated_provenance_anchor() {
+    let full_anchor = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    assert_eq!(full_anchor.len(), 40, "fixture anchor must be a full OID");
+
+    let baseline = RegressionBaseline {
+        as_of_phase: "checkpoint_1".to_owned(),
+        total_tests: 1,
+        passed: 1,
+        failed: 0,
+        ignored: 0,
+        baseline_commit: full_anchor.to_owned(),
+        baseline_evidence: None,
+        ignored_tests: Vec::new(),
+    };
+    assert_eq!(
+        baseline.validate(),
+        Ok(()),
+        "a full 40-digit lowercase anchor must remain valid"
+    );
+
+    // Every abbreviation Git itself would accept must still fail closed here,
+    // including the previously permitted 7-digit floor and the 39-digit
+    // boundary immediately below a full object name.
+    for length in [7_usize, 8, 12, 39] {
+        let mut abbreviated = baseline.clone();
+        abbreviated.baseline_commit = full_anchor[..length].to_owned();
+        let error = abbreviated.validate().expect_err(&format!(
+            "a {length}-digit abbreviated provenance anchor must fail closed"
+        ));
+        assert!(
+            error.contains("full untrimmed 40-digit lowercase hexadecimal Git object name"),
+            "unexpected rejection reason for a {length}-digit anchor: {error}"
+        );
+    }
+
+    // Over-long and non-lowercase-hex anchors stay rejected for the same reason.
+    let mut over_long = baseline.clone();
+    over_long.baseline_commit = format!("{full_anchor}0");
+    assert!(
+        over_long
+            .validate()
+            .expect_err("a 41-digit anchor must fail closed")
+            .contains("hexadecimal Git object name")
+    );
+
+    let mut uppercase = baseline;
+    uppercase.baseline_commit = full_anchor.to_uppercase();
+    assert!(
+        uppercase
+            .validate()
+            .expect_err("an uppercase anchor must fail closed")
+            .contains("hexadecimal Git object name")
+    );
+}
+
 #[test]
 fn test_regression_guard_detects_failure() {
     let baseline = RegressionBaseline {
@@ -6181,7 +6835,8 @@ fn test_regression_guard_detects_failure() {
         passed: 5_319,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
         ignored_tests: Vec::new(),
     };
     let actual = RegressionCounts {
@@ -6211,7 +6866,8 @@ fn test_regression_guard_baseline_comparison() {
         passed: 5_319,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
         ignored_tests: Vec::new(),
     };
     let actual = RegressionCounts {
@@ -6244,7 +6900,8 @@ fn test_regression_guard_treats_aggregate_ignored_delta_as_telemetry() {
         passed: 5,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
         ignored_tests: Vec::new(),
     };
     let actual = RegressionCounts {

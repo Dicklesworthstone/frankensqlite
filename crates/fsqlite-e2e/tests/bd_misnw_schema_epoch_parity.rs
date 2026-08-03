@@ -1263,7 +1263,6 @@ fn s30_subquery_after_schema_change() {
 // ─── S31: Mixed DML+DDL across nested savepoints ─────────────────────
 
 #[test]
-#[ignore = "MVCC assertion: prepared write staging must clear conflict-only tracking first (begin_concurrent.rs:1308)"]
 fn s31_savepoint_nested_dml_ddl_mix() {
     asupersync::test_utils::run_test(|| async {
         let tn = "s31_sp_mix";
