@@ -561,12 +561,10 @@ impl IoUringRuntime {
             #[cfg(not(test))]
             let pending_start_barrier = 0;
 
+            let pending_count = u64::try_from(queue.pending.len()).unwrap_or(u64::MAX);
             if queue.active
                 || queue.pending.is_empty()
-                || (pending_start_barrier != 0
-                    && u64::try_from(queue.pending.len())
-                        .expect("pending request count must fit in u64")
-                        < pending_start_barrier)
+                || (pending_start_barrier != 0 && pending_count < pending_start_barrier)
             {
                 false
             } else {
@@ -1506,7 +1504,8 @@ mod tests {
     use std::future::Future;
     use std::io::Write;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
-    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
 
     static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -1552,7 +1551,7 @@ mod tests {
         }
 
         fn event_count(&self, event: &str) -> usize {
-            let needle = format!(r#"\"event\":\"{event}\""#);
+            let needle = format!(r#""event":"{event}""#);
             self.bytes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1872,9 +1871,6 @@ mod tests {
         const READ_SIZE: usize = 4096;
 
         let _guard = io_uring_test_guard();
-        let _driver_start_barrier = ScopedDriverStartAfterPending::set(
-            u64::try_from(READ_COUNT).expect("read count fits u64"),
-        );
         if run_async_vfs_trace_in_subprocess() {
             return;
         }
@@ -1903,6 +1899,9 @@ mod tests {
                 .await
                 .expect("seed write should succeed");
 
+            let _driver_start_barrier = ScopedDriverStartAfterPending::set(
+                u64::try_from(READ_COUNT).expect("read count fits u64"),
+            );
             let starts_before = file.runtime.driver_starts.load(Ordering::Relaxed);
             let submitted_before = file.runtime.submitted_requests.load(Ordering::Relaxed);
             let file = Arc::new(file);
