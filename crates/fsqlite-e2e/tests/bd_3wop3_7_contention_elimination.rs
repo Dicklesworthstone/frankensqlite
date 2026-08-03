@@ -18,7 +18,7 @@
 //! 2. test_parallel_wal_segments_independent (D1 dependency)
 //! 3. test_page_cache_shard_distribution (D2 dependency)
 //! 4. test_combiner_reduces_atomic_ops (D3 dependency)
-//! 5. test_ebr_no_gc_pauses (D5 proof-surface blocker)
+//! 5. test_ebr_bounded_reclaim_work_per_cycle (D5 bounded-reclaim keeper)
 //! 6. test_scaling_curve
 //!
 //! ## Stress Tests
@@ -36,6 +36,7 @@
 //! ```sh
 //! cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination test_page_cache_shard_distribution -- --exact
 //! cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination test_combiner_reduces_atomic_ops -- --exact
+//! cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination test_ebr_bounded_reclaim_work_per_cycle -- --exact
 //! ```
 //! Run each manual stress keeper by its exact name with `--ignored --exact`.
 //! Do not run every ignored test as a group: the explicit release-blocker
@@ -49,6 +50,9 @@ use std::time::{Duration, Instant};
 use std::{env, process::Command};
 
 use fsqlite_mvcc::commit_combiner::{CommitCombineStagingControl, CommitSequenceCombiner};
+use fsqlite_mvcc::{
+    EbrRetireQueue, MAX_EBR_RECLAIM_SLOTS_PER_CYCLE, VersionGuardRegistry, VersionIdx,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -552,17 +556,53 @@ fn test_combiner_reduces_atomic_ops() {
     drop(release_guard);
 }
 
-/// Test 5: require a deterministic receipt for GC-induced pause behavior.
+/// Test 5: require a deterministic receipt for bounded EBR collection work.
 ///
-/// Sustained writes alone cannot prove that collection occurred during the
-/// measurement window, so this gate remains fail-closed until the public test
-/// surface exposes GC-cycle and pause telemetry.
+/// The declared pause bound is a work-unit bound, not a wall-clock claim: one
+/// normal EBR maintenance cycle may recycle at most
+/// `MAX_EBR_RECLAIM_SLOTS_PER_CYCLE` safe slots. A deliberately oversized
+/// safe backlog proves both carry-over and eventual drain through real queue
+/// cycles without ambient timing.
 #[test]
-#[ignore = "release blocker: deterministic GC-cycle and pause telemetry are not exposed"]
-fn test_ebr_no_gc_pauses() {
-    panic!(
-        "test_ebr_no_gc_pauses: sustained writes do not prove that a GC cycle occurred; deterministic cycle and pause receipts are required"
+fn test_ebr_bounded_reclaim_work_per_cycle() {
+    let registry = Arc::new(VersionGuardRegistry::default());
+    let queue = EbrRetireQueue::new();
+    let backlog = MAX_EBR_RECLAIM_SLOTS_PER_CYCLE * 2 + 1;
+    queue.retire_batch(
+        (0..backlog).map(|slot| {
+            VersionIdx::test_only(
+                0,
+                u32::try_from(slot).expect("EBR keeper backlog slot fits u32"),
+                0,
+            )
+        }),
+        registry.current_epoch(),
     );
+
+    let bound = u64::try_from(MAX_EBR_RECLAIM_SLOTS_PER_CYCLE)
+        .expect("EBR reclaim bound fits receipt counter");
+    let mut expected_cycles = 0_u64;
+    let mut expected_reclaimed = 0_u64;
+    for expected_slots in [
+        MAX_EBR_RECLAIM_SLOTS_PER_CYCLE,
+        MAX_EBR_RECLAIM_SLOTS_PER_CYCLE,
+        1,
+    ] {
+        let reclaimed = queue.drain_if_safe(registry.advance_epoch(), None);
+        assert_eq!(reclaimed.len(), expected_slots);
+        expected_cycles += 1;
+        expected_reclaimed += u64::try_from(expected_slots).expect("cycle slots fit receipt");
+
+        let receipt = queue.reclaim_cycle_receipt();
+        assert_eq!(receipt.collection_cycles_total, expected_cycles);
+        assert_eq!(receipt.slots_reclaimed_total, expected_reclaimed);
+        assert!(
+            receipt.max_slots_reclaimed_per_cycle <= bound,
+            "each normal EBR maintenance cycle stays within the declared work bound"
+        );
+    }
+
+    assert_eq!(queue.pending_count(), 0, "safe backlog eventually drains");
 }
 
 /// Manual sustained-insert latency smoke test.

@@ -22,6 +22,10 @@ mvcc-flat-combining = []
 # Opt-in test support for deterministic, production-shaped commit-combiner
 # evidence. Normal MVCC builds retain the uninstrumented hot path.
 commit-combiner-test-support = []
+# Opt-in test support for deterministic bounded-EBR reclamation receipts.
+# Production builds retain the bounded reclamation contract without receipt
+# counters on the maintenance path.
+ebr-reclaim-test-support = []
 
 [dependencies]
 blake3 = { workspace = true }

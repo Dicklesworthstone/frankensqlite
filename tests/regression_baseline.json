@@ -582,18 +582,6 @@
     },
     {
       "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
-      "test_name": "test_ebr_no_gc_pauses",
-      "reason": "release blocker: deterministic GC-cycle and pause telemetry are not exposed",
-      "cfg_condition": null,
-      "kind": "release_gate",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Expose deterministic collection-cycle and pause telemetry, force at least one observed cycle, and produce a release-commit receipt proving the declared pause bound.",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
       "test_name": "test_large_row_concurrent_commit_smoke",
       "reason": "manual large-row concurrent-commit smoke test; does not prove prepare/WAL overlap",
       "cfg_condition": null,

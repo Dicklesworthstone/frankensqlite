@@ -472,6 +472,9 @@ pub use differential_privacy::{
     DpEngine, DpError, DpMetrics, DpQueryResult, NoiseMechanism, PrivacyBudget, dp_metrics,
     reset_dp_metrics, sensitivity,
 };
+#[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+pub use ebr::EbrReclaimCycleReceipt;
+pub use ebr::MAX_EBR_RECLAIM_SLOTS_PER_CYCLE;
 pub use ebr::{
     DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE, EbrMetrics, EbrMetricsSnapshot, EbrRetireQueue,
     GLOBAL_EBR_METRICS, ReaderPinSnapshot, StaleReaderConfig, VersionGuard, VersionGuardRegistry,

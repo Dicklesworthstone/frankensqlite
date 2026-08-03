@@ -49,6 +49,18 @@ impl VersionIdx {
         }
     }
 
+    /// Constructs an opaque index for EBR queue receipt tests.
+    ///
+    /// This is available only with `ebr-reclaim-test-support`; production
+    /// indices must continue to be allocated by [`VersionArena`].
+    #[cfg(feature = "ebr-reclaim-test-support")]
+    #[doc(hidden)]
+    #[inline]
+    #[must_use]
+    pub const fn test_only(chunk: u32, offset: u32, generation: u32) -> Self {
+        Self::new(chunk, offset, generation)
+    }
+
     /// Chunk index within the arena.
     #[inline]
     #[must_use]
