@@ -17,9 +17,10 @@ Local-tree facts checked for this revision:
 
 - The workspace has 27 members, all locally declared at `0.2.0`; two members
   are marked `publish = false`.
-- `v0.1.19` is the preceding release tag. A commit count relative to that tag
-  is intentionally omitted because it changes as release preparation lands and
-  is not a release-readiness metric.
+- `v0.1.19` is the semantic and crates.io preceding release tag, but it is not
+  an ancestor of current `main`; `v0.1.18` is the latest released ancestor. A
+  commit count relative to `v0.1.19` is intentionally omitted because it
+  changes as release preparation lands and is not a release-readiness metric.
 - `CHANGELOG.md` contains an unreleased `0.2.0` section describing the next
   lockstep release.
 - The checked-in release workflow contains an explicit 25-crate publish order,

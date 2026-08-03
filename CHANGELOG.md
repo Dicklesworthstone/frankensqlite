@@ -19,7 +19,9 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ## [0.2.0] -- Unreleased (async storage stack, adaptive skip-scan execution, parallel-WAL durability certificates)
 
-Next full-workspace lockstep release (`0.1.19 -> 0.2.0`).
+Next full-workspace lockstep release (`0.1.19 -> 0.2.0`). `v0.1.19` is the
+semantic and crates.io predecessor, but it is not an ancestor of current
+`main`; `v0.1.18` is the latest released ancestor.
 
 > **BREAKING.** This release makes the storage stack `async` end to end, which
 > changes public signatures. Under Cargo's 0.x rules the minor version is the
