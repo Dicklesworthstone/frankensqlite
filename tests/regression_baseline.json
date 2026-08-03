@@ -869,18 +869,6 @@
       }
     },
     {
-      "source_path": "crates/fsqlite-e2e/tests/identifier_quoting_oracle_e2e.rs",
-      "test_name": "quoting_double_quoted_string_fallback",
-      "reason": "bd-hrz7y: double-quoted-string fallback (DQS) not supported; frank errors instead",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Resolve the declared compatibility policy, then remove the ignore only after the unchanged exact oracle passes three consecutive release-commit runs with content-hashed receipts.",
-        "receipt": null
-      }
-    },
-    {
       "source_path": "crates/fsqlite-e2e/tests/index_range_eqp_diagnostic.rs",
       "test_name": "diagnostic_composite_desc_order_by",
       "reason": "diagnostic/A-B bench; run explicitly under --profile release-perf",
