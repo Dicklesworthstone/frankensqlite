@@ -570,18 +570,6 @@
     },
     {
       "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
-      "test_name": "test_combiner_reduces_atomic_ops",
-      "reason": "release blocker: deterministic staged-pending control and per-instance commit-combiner metrics are not exposed",
-      "cfg_condition": null,
-      "kind": "release_gate",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Expose deterministic staged-pending control and per-instance metrics, then produce a keeper receipt showing multiple pending requests were combined with fewer atomic operations than requests.",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
       "test_name": "test_contention_under_version_churn",
       "reason": "manual timing-sensitive version-churn stress test",
       "cfg_condition": null,
