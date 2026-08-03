@@ -44,7 +44,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -649,39 +649,6 @@ fn maybe_write_persistent_phase_capture(sample: &PersistentPhaseCaptureSample) {
     }
 }
 
-fn pending_persistent_phase_capture_samples()
--> &'static Mutex<BTreeMap<(String, &'static str), PersistentPhaseCaptureSample>> {
-    static PENDING: OnceLock<
-        Mutex<BTreeMap<(String, &'static str), PersistentPhaseCaptureSample>>,
-    > = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-/// Retain at most one sample per engine while Criterion is timing.  This performs
-/// no filesystem, hashing, serialization, or report-refresh work.
-fn queue_persistent_phase_capture(sample: PersistentPhaseCaptureSample) {
-    if persistent_phase_capture_dir().is_none() {
-        return;
-    }
-    let key = (sample.benchmark_group.clone(), sample.engine);
-    pending_persistent_phase_capture_samples()
-        .lock()
-        .expect("persistent phase capture queue mutex poisoned")
-        .insert(key, sample);
-}
-
-/// Flush citation artifacts only after Criterion has finished timing the group.
-fn flush_persistent_phase_capture() {
-    let samples = std::mem::take(
-        &mut *pending_persistent_phase_capture_samples()
-            .lock()
-            .expect("persistent phase capture queue mutex poisoned"),
-    );
-    for sample in samples.values() {
-        maybe_write_persistent_phase_capture(sample);
-    }
-}
-
 // ─── C SQLite concurrent writers (file-backed WAL) ──────────────────────
 
 // BENCH-META: engine=csqlite, lifecycle=prepared, storage=file, concurrency=concurrent
@@ -693,8 +660,15 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
     group.throughput(Throughput::Elements(total_rows));
 
     group.bench_function("csqlite_concurrent_persistent", |b| {
-        b.iter_batched(
-            || {
+        // `iter_custom` is required here: Criterion must observe only the
+        // concurrent-writer workload. Fixture creation, metric aggregation,
+        // logging, and citation-artifact capture all perform filesystem,
+        // locking, hashing, and allocation work that would otherwise be folded
+        // into the reported per-iteration time.
+        b.iter_custom(|iters| {
+            let mut accumulated = Duration::ZERO;
+            for _ in 0..iters {
+                // ── setup: deliberately outside the timed region ──────────
                 let tmp = tempfile::NamedTempFile::new().unwrap();
                 let path = tmp.path().to_str().unwrap().to_owned();
                 {
@@ -715,10 +689,6 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 }
                 let retry_count = Arc::new(AtomicU64::new(0));
                 let operations_with_retries = Arc::new(AtomicU64::new(0));
-                (tmp, path, retry_count, operations_with_retries)
-            },
-            |(_tmp, path, retry_count, operations_with_retries)| {
-                let run_started = Instant::now();
                 let barrier = Arc::new(Barrier::new(n_threads));
                 let operation_timings: Arc<Vec<std::sync::Mutex<Vec<PersistentOperationTiming>>>> =
                     Arc::new(
@@ -734,6 +704,8 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         .collect(),
                 );
 
+                // ── timed region begins: concurrent workload only ─────────
+                let run_started = Instant::now();
                 let handles: Vec<_> = (0..n_threads)
                     .map(|tid| {
                         let p = path.clone();
@@ -858,8 +830,12 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     h.join().unwrap();
                 }
                 let run_wall = run_started.elapsed();
+                // ── timed region ends: only run_wall is reported ──────────
+                accumulated += run_wall;
 
-                // Report metrics
+                // Everything below is untimed: aggregation locks mutexes and
+                // allocates, logging writes to stderr, and citation capture
+                // hashes and writes files.
                 let total_retries = retry_count.load(Ordering::Relaxed);
                 let operations_with_retries = operations_with_retries.load(Ordering::Relaxed);
                 let flattened_operation_timings: Vec<PersistentOperationTiming> = operation_timings
@@ -888,7 +864,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     "[C SQLite {n_threads}t wall audit] {}",
                     format_operation_wall_time_audit(&metrics.operation_wall_time_audit)
                 );
-                queue_persistent_phase_capture(PersistentPhaseCaptureSample {
+                maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
                     schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/csqlite_concurrent_persistent"),
@@ -904,15 +880,20 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     flusher_lock_wait_fraction_basis_points: None,
                     lock_topology_limited: None,
                 });
-            },
-            criterion::BatchSize::LargeInput,
-        );
+                drop(tmp);
+            }
+            accumulated
+        });
     });
 
     // FrankenSQLite with real concurrent writers
     group.bench_function("frankensqlite_concurrent_persistent", |b| {
-        b.iter_batched(
-            || {
+        // See the C SQLite arm above: `iter_custom` keeps fixture creation,
+        // aggregation, logging, and citation capture out of the reported time.
+        b.iter_custom(|iters| {
+            let mut accumulated = Duration::ZERO;
+            for _ in 0..iters {
+                // ── setup: deliberately outside the timed region ──────────
                 let tmp = tempfile::NamedTempFile::new().unwrap();
                 let path = tmp.path().to_str().unwrap().to_owned();
                 {
@@ -927,10 +908,6 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 }
                 let conflict_count = Arc::new(AtomicU64::new(0));
                 let operations_with_conflicts = Arc::new(AtomicU64::new(0));
-                (tmp, path, conflict_count, operations_with_conflicts)
-            },
-            |(_tmp, path, conflict_count, operations_with_conflicts)| {
-                let run_started = Instant::now();
                 let barrier = Arc::new(Barrier::new(n_threads));
                 let operation_timings: Arc<Vec<std::sync::Mutex<Vec<PersistentOperationTiming>>>> =
                     Arc::new(
@@ -946,6 +923,14 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         .collect(),
                 );
 
+                // Discard consolidation metrics accumulated while creating the
+                // fixture. Setup opens a connection and runs CREATE TABLE per
+                // thread, which drives WAL consolidation; leaving those counts
+                // in place would attribute setup DDL to the measured workload.
+                fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.reset();
+
+                // ── timed region begins: concurrent workload only ─────────
+                let run_started = Instant::now();
                 let handles: Vec<_> = (0..n_threads)
                     .map(|tid| {
                         let p = path.clone();
@@ -1176,8 +1161,12 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     h.join().unwrap();
                 }
                 let run_wall = run_started.elapsed();
+                // ── timed region ends: only run_wall is reported ──────────
+                accumulated += run_wall;
 
-                // Report metrics
+                // Everything below is untimed: aggregation locks mutexes and
+                // allocates, logging writes to stderr, and citation capture
+                // hashes and writes files.
                 let total_conflicts = conflict_count.load(Ordering::Relaxed);
                 let operations_with_conflicts = operations_with_conflicts.load(Ordering::Relaxed);
                 let flattened_operation_timings: Vec<PersistentOperationTiming> = operation_timings
@@ -1236,7 +1225,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         &benchmark_metrics.operation_wall_time_audit
                     )
                 );
-                queue_persistent_phase_capture(PersistentPhaseCaptureSample {
+                maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
                     schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/frankensqlite_concurrent_persistent"),
@@ -1256,13 +1245,13 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 });
                 // Reset metrics for next iteration
                 fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.reset();
-            },
-            criterion::BatchSize::LargeInput,
-        );
+                drop(tmp);
+            }
+            accumulated
+        });
     });
 
     group.finish();
-    flush_persistent_phase_capture();
 }
 
 fn bench_persistent_1t(c: &mut Criterion) {
@@ -1319,24 +1308,87 @@ mod tests {
     }
 
     #[test]
-    fn citation_capture_and_criterion_configuration_stay_outside_timed_group_work() {
+    fn citation_configuration_has_no_group_level_overrides() {
+        // Scoped to the implementation: a whole-file search would match the
+        // literals in this assertion and in the shell validator's counterpart.
         let source = include_str!("concurrent_write_persistent_bench.rs");
-        assert!(!source.contains("group.sample_size("));
-        assert!(!source.contains("group.measurement_time("));
+        let impl_slice = implementation_slice(source);
+        assert!(!impl_slice.contains("group.sample_size("));
+        assert!(!impl_slice.contains("group.measurement_time("));
+    }
 
-        let group_finish = source
-            .rfind("group.finish();")
-            .expect("benchmark must finish its Criterion group");
-        let capture_flush = source[group_finish..]
-            .find("flush_persistent_phase_capture();")
-            .expect("citation capture must flush after Criterion group completion");
-        assert!(capture_flush > 0);
+    /// The benchmark implementation, excluding this test module.
+    ///
+    /// Assertions below must not inspect their own prose: a bare search of the
+    /// whole file would match the tokens named in these comments and messages.
+    fn implementation_slice(source: &str) -> &str {
+        let start = source
+            .find("fn bench_concurrent_csqlite_persistent(")
+            .expect("benchmark implementation function must exist");
+        let end = source
+            .find("fn bench_persistent_1t(")
+            .expect("per-thread wrapper must exist");
+        assert!(start < end, "implementation must precede the wrappers");
+        &source[start..end]
+    }
+
+    /// Criterion must observe only the concurrent-writer workload.
+    ///
+    /// The batched form times the whole routine, which folds fixture teardown,
+    /// metric aggregation, stderr logging, and citation-artifact hashing and
+    /// writing into the reported per-iteration duration. Both engine arms must
+    /// instead drive Criterion through a custom timing loop that accumulates
+    /// nothing but the workload wall time.
+    #[test]
+    fn timed_region_accumulates_only_workload_wall_time() {
+        let source = include_str!("concurrent_write_persistent_bench.rs");
+        let impl_slice = implementation_slice(source);
+        assert!(
+            !impl_slice.contains(".iter_batched("),
+            "batched timing includes post-workload capture work"
+        );
         assert_eq!(
-            source
-                .matches("maybe_write_persistent_phase_capture(")
+            impl_slice.matches("b.iter_custom(").count(),
+            2,
+            "both engine arms must drive Criterion through a custom timing loop"
+        );
+        assert_eq!(
+            impl_slice.matches("accumulated += run_wall;").count(),
+            2,
+            "each arm must accumulate exactly the workload wall time"
+        );
+        assert_eq!(
+            impl_slice
+                .matches("let mut accumulated = Duration::ZERO;")
                 .count(),
             2,
-            "the only artifact write must be the function definition and post-group flush"
+            "each arm returns only its accumulator to Criterion"
+        );
+    }
+
+    /// Consolidation metrics must describe the workload, not the fixture.
+    ///
+    /// Setup opens a connection and runs `CREATE TABLE` per thread, which
+    /// drives WAL consolidation. The FrankenSQLite arm must therefore reset the
+    /// global snapshot after the fixture is built and before the clock starts.
+    #[test]
+    fn consolidation_metrics_reset_before_timed_region() {
+        let source = include_str!("concurrent_write_persistent_bench.rs");
+        let impl_slice = implementation_slice(source);
+        let arm_start = impl_slice
+            .find("\"frankensqlite_concurrent_persistent\"")
+            .expect("FrankenSQLite arm must exist");
+        let arm = &impl_slice[arm_start..];
+        let reset = arm
+            .find("GLOBAL_CONSOLIDATION_METRICS.reset();")
+            .expect("arm must reset consolidation metrics");
+        let run_started = arm
+            .find("let run_started = Instant::now();")
+            .expect("arm must start a timing clock");
+        assert!(
+            reset < run_started,
+            "consolidation metrics must be reset before the timed region so \
+             fixture DDL is not attributed to the measured workload"
         );
     }
 

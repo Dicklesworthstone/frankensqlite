@@ -127,6 +127,108 @@ require_requested_actual_match() {
         || die "requested RCH_WORKER ${requested_worker} differs from daemon-selected worker ${actual_worker}"
 }
 
+# Isolate the benchmark's timing implementation: everything from the shared
+# engine-arm builder up to the first per-thread wrapper. The inline `#[test]`
+# module quotes these same tokens in its prose and assertions, and the bench
+# declares `harness = false`, so those tests never execute. Whole-file greps
+# would therefore both false-positive on the test literals and provide no real
+# gate; this region is the only trustworthy source of truth.
+benchmark_timing_region() {
+    awk '
+        /^fn bench_concurrent_csqlite_persistent\(/ { inside = 1 }
+        /^fn bench_persistent_1t\(/ { inside = 0 }
+        inside { print }
+    ' "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs"
+}
+
+# Count fixed-string occurrences.
+#
+# `grep -Fo | wc -l` cannot be used here: grep exits 1 when the needle is
+# absent, `pipefail` promotes that to a failed command substitution, and `set
+# -e` then aborts the script *before* the zero count can be compared. Zero is a
+# legitimate and expected result for the prohibited tokens, so counting is done
+# with awk, which exits 0 whether or not it matched.
+count_fixed_occurrences() {
+    local needle="$1" haystack="$2"
+    awk -v needle="$needle" '
+        {
+            start = 1
+            while ((pos = index(substr($0, start), needle)) > 0) {
+                total++
+                start += pos + length(needle) - 1
+            }
+        }
+        END { print total + 0 }
+    ' <<<"$haystack"
+}
+
+# The FrankenSQLite engine arm, from its Criterion label to the end of the
+# implementation region.
+frankensqlite_arm_region() {
+    benchmark_timing_region | awk '
+        /"frankensqlite_concurrent_persistent"/ { inside = 1 }
+        inside { print }
+    '
+}
+
+# Consolidation metrics must describe the workload, not the fixture. Setup opens
+# a connection and runs CREATE TABLE per thread, which drives WAL consolidation;
+# without a reset those counts are attributed to the measured workload. The
+# inline Rust test asserting this cannot enforce it, because the bench declares
+# `harness = false` and never runs its `#[test]` functions.
+validate_frankensqlite_reset_before_timing() {
+    local arm reset_line run_started_line
+    arm="$(frankensqlite_arm_region)"
+    [[ -n "$arm" ]] || die "could not isolate the FrankenSQLite engine arm"
+    reset_line="$(awk '/GLOBAL_CONSOLIDATION_METRICS\.reset\(\);/ { print NR; exit }' <<<"$arm")"
+    run_started_line="$(awk '/let run_started = Instant::now\(\);/ { print NR; exit }' <<<"$arm")"
+    [[ -n "$reset_line" ]] \
+        || die "FrankenSQLite arm never resets consolidation metrics"
+    [[ -n "$run_started_line" ]] \
+        || die "FrankenSQLite arm has no timing clock"
+    (( reset_line < run_started_line )) \
+        || die "consolidation metrics are reset after the timed region begins; fixture DDL would be attributed to the workload"
+}
+
+# Criterion must observe only the concurrent-writer workload. Fixture creation,
+# metric aggregation, logging, and citation capture all perform filesystem,
+# locking, hashing, and allocation work; batched timing would fold every one of
+# them into the reported per-iteration estimate.
+validate_benchmark_timing_contract() {
+    local region
+    region="$(benchmark_timing_region)"
+    [[ -n "$region" ]] \
+        || die "could not isolate the benchmark timing region; refuse to certify timing"
+
+    local iter_custom_arms accumulations batched_calls sample_overrides measurement_overrides
+    local capture_sites
+    iter_custom_arms="$(count_fixed_occurrences 'b.iter_custom(' "$region")"
+    accumulations="$(count_fixed_occurrences 'accumulated += run_wall;' "$region")"
+    batched_calls="$(count_fixed_occurrences '.iter_batched(' "$region")"
+    sample_overrides="$(count_fixed_occurrences 'group.sample_size(' "$region")"
+    measurement_overrides="$(count_fixed_occurrences 'group.measurement_time(' "$region")"
+    capture_sites="$(count_fixed_occurrences 'maybe_write_persistent_phase_capture(' "$region")"
+
+    [[ "$iter_custom_arms" == "2" ]] \
+        || die "expected exactly two custom-timed engine arms, found ${iter_custom_arms}"
+    [[ "$accumulations" == "2" ]] \
+        || die "expected exactly two workload wall-time accumulations, found ${accumulations}"
+    [[ "$batched_calls" == "0" ]] \
+        || die "benchmark uses batched timing; post-workload capture would be inside the estimate"
+    [[ "$sample_overrides" == "0" ]] \
+        || die "benchmark overrides Criterion sample-size; receipt inputs would not be authoritative"
+    [[ "$measurement_overrides" == "0" ]] \
+        || die "benchmark overrides Criterion measurement-time; receipt inputs would not be authoritative"
+    # Timing correctness alone is not enough: an edit could keep every timing
+    # assertion green while silently dropping phase-sample retention, leaving a
+    # pack that measures correctly and cites nothing. Require one capture site
+    # per engine arm.
+    [[ "$capture_sites" == "2" ]] \
+        || die "expected exactly two phase-capture sites (one per engine arm), found ${capture_sites}"
+
+    validate_frankensqlite_reset_before_timing
+}
+
 validate_citation_contract() {
     [[ "$RENDER_ONLY" == "0" ]] || die "RENDER_ONLY is not valid for a citation-grade capture"
     [[ "$SKIP_RUN" == "0" ]] || die "SKIP_RUN is not valid for a citation-grade capture"
@@ -161,19 +263,16 @@ validate_citation_contract() {
     grep -Fq 'FSQLITE_BENCH_BUILD_NONCE' \
         "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs" \
         || die "benchmark provenance does not consume FSQLITE_BENCH_BUILD_NONCE; refuse to run an uncitable pack"
-    ! rg -Fq 'group.sample_size(' \
-        "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs" \
-        || die "benchmark overrides Criterion sample-size; receipt inputs would not be authoritative"
-    ! rg -Fq 'group.measurement_time(' \
-        "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs" \
-        || die "benchmark overrides Criterion measurement-time; receipt inputs would not be authoritative"
-    grep -Fq 'flush_persistent_phase_capture();' \
-        "$PROJECT_ROOT/crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs" \
-        || die "benchmark lacks post-timing capture flush; refuse timing-contaminated estimates"
+    validate_benchmark_timing_contract
 }
 
 run_synthetic_contract_checks() {
     local RCH_WORKER="healthy-worker"
+    # The timing contract is source-derived, so it is executable here as well as
+    # in a real preflight. This is the only executable gate on the benchmark's
+    # timed region: the bench declares `harness = false`, so its inline
+    # `#[test]` functions compile but never run.
+    validate_benchmark_timing_contract
     require_lower_hex "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 64 synthetic_nonce
     require_lower_hex "0123456789abcdef0123456789abcdef01234567" 40 synthetic_commit
     require_positive_integer 21 synthetic_sample_count
