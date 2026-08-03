@@ -204,6 +204,76 @@ fn index_partial() {
     });
 }
 
+/// GH#196 keeper (partial index): `INSERT OR REPLACE` must delete every index
+/// entry derived from the victim row, including index forms whose keys cannot
+/// be rebuilt from the victim payload by direct-column metadata.
+///
+/// Partial and expression indexes take the fallback path in
+/// `fsqlite_vdbe::codegen::register_table_index_meta`, which signals an empty
+/// `column_indices` list so the engine locates the victim entry by its
+/// trailing rowid instead.
+///
+/// `PRAGMA integrity_check` is the load-bearing assertion here. A forced
+/// `INDEXED BY` lookup is NOT sufficient on its own: a stale index entry still
+/// carries the victim's rowid, which is re-seeked into the table, finds no row
+/// once the victim is gone, and is silently filtered — so the forced lookup can
+/// report zero rows while the stale entry is still on disk. Only the
+/// cross-reference level of `integrity_check` compares index entries against
+/// table rows and detects the orphan. The forced lookups are kept as secondary
+/// checks, and the survivor probe proves the index is still usable afterwards
+/// rather than merely empty.
+#[test]
+fn index_replace_victim_cleanup_partial_index() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE tp (id INTEGER PRIMARY KEY, u TEXT UNIQUE, a TEXT, flag INTEGER)",
+                "CREATE INDEX pidx ON tp(a) WHERE flag = 1",
+                "INSERT INTO tp VALUES (1,'k','victim',1)",
+                // Conflict is on the secondary UNIQUE; the victim is the indexed row.
+                "INSERT OR REPLACE INTO tp VALUES (2,'k','newrow',1)",
+            ],
+            &[
+                // Primary assertion: orphaned index entries are cross-referenced.
+                "PRAGMA integrity_check",
+                // Table-row replacement, kept separate from index cleanup so a
+                // failure distinguishes the two.
+                "SELECT id, u, a, flag FROM tp ORDER BY id",
+                // Secondary: forced lookup for the victim's old partial-index key.
+                "SELECT count(*) FROM tp INDEXED BY pidx WHERE flag = 1 AND a = 'victim'",
+                // Survivor must remain reachable *through pidx*, not just present.
+                "SELECT id FROM tp INDEXED BY pidx WHERE flag = 1 AND a = 'newrow'",
+            ],
+            "index_replace_victim_cleanup_partial_index",
+        )
+        .await;
+    });
+}
+
+/// GH#196 keeper (expression index): same schedule and same reasoning as
+/// [`index_replace_victim_cleanup_partial_index`], over `lower(a)`.
+#[test]
+fn index_replace_victim_cleanup_expression_index() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE te (id INTEGER PRIMARY KEY, u TEXT UNIQUE, a TEXT)",
+                "CREATE INDEX eidx ON te(lower(a))",
+                "INSERT INTO te VALUES (1,'k2','VICTIM')",
+                "INSERT OR REPLACE INTO te VALUES (2,'k2','NEWROW')",
+            ],
+            &[
+                "PRAGMA integrity_check",
+                "SELECT id, u, a FROM te ORDER BY id",
+                "SELECT count(*) FROM te INDEXED BY eidx WHERE lower(a) = 'victim'",
+                "SELECT id FROM te INDEXED BY eidx WHERE lower(a) = 'newrow'",
+            ],
+            "index_replace_victim_cleanup_expression_index",
+        )
+        .await;
+    });
+}
+
 #[test]
 fn index_on_expression() {
     // Expression index: CREATE INDEX ... ON t(expr); queries on the expression
