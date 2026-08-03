@@ -65,8 +65,6 @@ static FORCE_ASUPERSYNC_READ_ABORT: AtomicBool = AtomicBool::new(false);
 static FORCE_ASUPERSYNC_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_WRITE_ABORT: AtomicBool = AtomicBool::new(false);
-#[cfg(all(test, feature = "linux-asupersync-uring"))]
-static TEST_DRIVER_START_AFTER_PENDING: AtomicU64 = AtomicU64::new(0);
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -556,16 +554,7 @@ impl IoUringRuntime {
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            #[cfg(test)]
-            let pending_start_barrier = TEST_DRIVER_START_AFTER_PENDING.load(Ordering::Acquire);
-            #[cfg(not(test))]
-            let pending_start_barrier = 0;
-
-            let pending_count = u64::try_from(queue.pending.len()).unwrap_or(u64::MAX);
-            if queue.active
-                || queue.pending.is_empty()
-                || (pending_start_barrier != 0 && pending_count < pending_start_barrier)
-            {
+            if queue.active || queue.pending.is_empty() {
                 false
             } else {
                 queue.active = true;
@@ -1504,8 +1493,7 @@ mod tests {
     use std::future::Future;
     use std::io::Write;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::prelude::*;
 
     static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -1639,30 +1627,6 @@ mod tests {
     impl Drop for ScopedAtomicFlag<'_> {
         fn drop(&mut self) {
             self.flag.store(false, Ordering::Release);
-        }
-    }
-
-    #[cfg(feature = "linux-asupersync-uring")]
-    struct ScopedDriverStartAfterPending {
-        previous: u64,
-    }
-
-    #[cfg(feature = "linux-asupersync-uring")]
-    impl ScopedDriverStartAfterPending {
-        fn set(pending: u64) -> Self {
-            let previous = TEST_DRIVER_START_AFTER_PENDING.swap(pending, Ordering::AcqRel);
-            assert_eq!(
-                previous, 0,
-                "the shared-ring test must not inherit a driver-start barrier"
-            );
-            Self { previous }
-        }
-    }
-
-    #[cfg(feature = "linux-asupersync-uring")]
-    impl Drop for ScopedDriverStartAfterPending {
-        fn drop(&mut self) {
-            TEST_DRIVER_START_AFTER_PENDING.store(self.previous, Ordering::Release);
         }
     }
 
@@ -1888,41 +1852,47 @@ mod tests {
 
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("shared_ring_100_reads.db");
-            let (file, _) = vfs
-                .open(&cx, Some(&path), open_flags_create_unlocked())
-                .expect("open should succeed");
             let mut seeded = vec![0_u8; READ_COUNT * READ_SIZE];
             for (page_index, page) in seeded.chunks_exact_mut(READ_SIZE).enumerate() {
                 page.fill(u8::try_from(page_index).expect("100 pages fit in u8"));
             }
-            file.write(&cx, &seeded, 0)
-                .await
-                .expect("seed write should succeed");
+            std::fs::write(&path, seeded).expect("synchronous seed write should succeed");
+            let (file, _) = vfs
+                .open(&cx, Some(&path), open_flags_create_unlocked())
+                .expect("open should succeed");
 
-            let _driver_start_barrier = ScopedDriverStartAfterPending::set(
-                u64::try_from(READ_COUNT).expect("read count fits u64"),
-            );
             let starts_before = file.runtime.driver_starts.load(Ordering::Relaxed);
             let submitted_before = file.runtime.submitted_requests.load(Ordering::Relaxed);
-            let file = Arc::new(file);
-            let runtime_handle = test_runtime().handle();
-            let mut handles = Vec::with_capacity(READ_COUNT);
+            let runtime = Arc::clone(&file.runtime);
+            let backing_file = file
+                .inner
+                .canonical_file()
+                .expect("opened file must retain its canonical handle");
+            let mut requests = Vec::with_capacity(READ_COUNT);
             for page_index in 0..READ_COUNT {
-                let task_file = Arc::clone(&file);
-                let task_cx = cx.create_child();
                 let offset = u64::try_from(page_index * READ_SIZE).expect("offset fits u64");
-                handles.push(runtime_handle.spawn(async move {
-                    let task_native_cx =
-                        NativeCx::current().expect("runtime task should install Cx");
-                    task_cx.set_native_cx(task_native_cx);
-                    let mut data = vec![0_u8; READ_SIZE];
-                    let bytes_read = task_file.read(&task_cx, &mut data, offset).await?;
-                    Ok::<_, FrankenError>((page_index, bytes_read, data))
-                }));
+                let (request_id, receiver) = runtime
+                    .enqueue_read(
+                        &cx,
+                        &native_cx,
+                        Arc::clone(&backing_file),
+                        READ_SIZE,
+                        offset,
+                    )
+                    .expect("read request should enqueue");
+                requests.push((page_index, request_id, receiver));
             }
-
-            for handle in handles {
-                let (page_index, bytes_read, data) = handle.await.expect("read should succeed");
+            runtime
+                .ensure_driver(&native_cx)
+                .expect("one driver should start after all reads are queued");
+            for (page_index, request_id, mut receiver) in requests {
+                let completion = receiver
+                    .recv(&native_cx)
+                    .await
+                    .expect("queued read should complete");
+                let DriverCompletion::Read { data, bytes_read } = completion else {
+                    panic!("request {request_id} must complete as a read");
+                };
                 assert_eq!(bytes_read, READ_SIZE);
                 assert!(
                     data.iter().all(|byte| *byte
