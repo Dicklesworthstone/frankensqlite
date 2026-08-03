@@ -141,10 +141,9 @@ fn sustained_insert_retry_delay_is_bounded_and_worker_staggered() {
                 sustained_insert_retry_delay(
                     attempt,
                     u64::try_from(worker_id).expect("worker id fits u64"),
+                ) <= Duration::from_micros(
+                    SUSTAINED_INSERT_RETRY_CAP_US + SUSTAINED_INSERT_RETRY_JITTER_US - 1,
                 )
-                    <= Duration::from_micros(
-                        SUSTAINED_INSERT_RETRY_CAP_US + SUSTAINED_INSERT_RETRY_JITTER_US - 1,
-                    )
             );
         }
     }
@@ -555,8 +554,8 @@ fn test_sustained_insert_p99_latency() {
                             successful_ids: Vec::with_capacity(10_000),
                             retry_attempts: 0,
                         };
-                        let worker_stride = i64::try_from(SUSTAINED_INSERT_WORKERS)
-                            .expect("worker count fits i64");
+                        let worker_stride =
+                            i64::try_from(SUSTAINED_INSERT_WORKERS).expect("worker count fits i64");
                         let mut i = i64::try_from(tid).expect("worker id fits i64");
 
                         while !s.load(Ordering::Acquire) {
@@ -727,9 +726,10 @@ fn test_sustained_insert_p99_latency() {
             .expect("read sustained-insert rows")
             .iter()
             .map(|row| match row.values() {
-                [fsqlite::SqliteValue::Integer(id), fsqlite::SqliteValue::Text(value)] => {
-                    (*id, value.to_string())
-                }
+                [
+                    fsqlite::SqliteValue::Integer(id),
+                    fsqlite::SqliteValue::Text(value),
+                ] => (*id, value.to_string()),
                 values => panic!("unexpected sustained-insert row shape: {values:?}"),
             })
             .collect::<Vec<_>>();

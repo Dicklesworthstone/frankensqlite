@@ -38,7 +38,7 @@
 //! ```text
 //! mt-mvcc-bench [--rows-per-thread=1000] [--threads=1,2,4,8,16,32,64,128] [--iters=21]
 //! [--json-output=PATH] [--summary-md=PATH]
-//! [--separate-tables]
+//! [--separate-tables] [--one-row-per-transaction]
 //! ```
 //!
 //! ## Caveats
@@ -49,14 +49,18 @@
 //!   The benchmark fails closed unless both the default-on API guard and the
 //!   effective PRAGMA readback prove concurrent mode stayed enabled. It never
 //!   falls back to plain `BEGIN`.
-//! * We retry transient errors (`FrankenError::is_transient()`) by rolling back
-//!   and reopening the whole transaction, up to `MAX_RETRIES`; hard row-level
-//!   failures remain separate from offered, attempted, retried, and
+//! * In `--one-row-per-transaction` mode, both engines retry a complete
+//!   BEGIN/INSERT/COMMIT transaction after any retryable stage failure. The
+//!   default bulk mode retains its v7 engine-specific retry policy. Hard
+//!   row-level failures remain separate from offered, attempted, retried, and
 //!   database-proven committed work so a failed arm cannot inflate throughput.
 //! * Each paired round creates fresh tempfiles so no database state carries
 //!   across runs. Every F/C claim is preceded by a same-invocation interleaved
 //!   C/C A/A null. The verdict uses a bootstrap CI for the per-round median
 //!   ratio; CV and MAD are provenance only.
+//! * Release tooling may supply a canonical resolved dependency/feature graph
+//!   SHA-256 through `FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256`
+//!   at build time. Ordinary builds leave that receipt explicitly unavailable.
 
 // bd-mnlk2 / bd-zavyn: the hoisted timed windows await fsqlite-core's
 // deliberately large, deeply nested engine futures inside one runtime entry
@@ -91,6 +95,10 @@ const CONTRACT_BOOTSTRAP_REPS: usize = 10_000;
 const DEFAULT_HISTORY_JSON: &str = ".bench-history/mt-mvcc-bench.latest.json";
 const DEFAULT_SEPARATE_TABLES_HISTORY_JSON: &str =
     ".bench-history/mt-mvcc-bench.separate-tables.latest.json";
+const DEFAULT_ONE_ROW_HISTORY_JSON: &str =
+    ".bench-history/mt-mvcc-bench.one-row-per-transaction.latest.json";
+const DEFAULT_SEPARATE_TABLES_ONE_ROW_HISTORY_JSON: &str =
+    ".bench-history/mt-mvcc-bench.separate-tables.one-row-per-transaction.latest.json";
 const ROWID_BASE_STRIDE: i64 = 1_000_000;
 const MAX_RETRIES: usize = 512;
 const RETRY_SLEEP_MS: u64 = 1;
@@ -101,11 +109,18 @@ const MAX_RETRY_SLEEP_MS: u64 = 25;
 // with prior artifacts.
 const CSQLITE_RETRY_ALGORITHM: &str = "csqlite.per-operation.fixed-1ms.busy-or-locked.max-512.v1";
 const FSQLITE_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.whole-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-timeout.v1";
+const CSQLITE_ONE_ROW_RETRY_ALGORITHM: &str = "csqlite.whole-one-row-transaction.fixed-1ms.busy-or-locked.max-512-or-shared-worker-timeout.v1";
+const FSQLITE_ONE_ROW_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.whole-one-row-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-shared-worker-timeout.v1";
+const CSQLITE_ONE_ROW_RETRY_UNIT: &str = "whole one-row BEGIN/INSERT/COMMIT transaction attempt";
+const FSQLITE_ONE_ROW_RETRY_UNIT: &str =
+    "whole one-row BEGIN CONCURRENT/INSERT/COMMIT transaction attempt";
 const FSQLITE_RETRYABLE_ERRORS: &str = "Busy|BusyRecovery|BusySnapshot|DatabaseLocked|\
     WriteConflict|SerializationFailure|PageBufferCapacityExhausted";
-/// Base wall-clock retry budget for one whole-transaction attempt loop.
-/// Scaled up with offered work by [`fsqlite_retry_timeout`] — the fixed 5s
-/// was exceeded by queueing alone at 64 writers x 1000-row txns (bd-caa6u).
+/// Base wall-clock retry budget for one bulk transaction attempt loop, or one
+/// shared worker deadline covering all row transactions in one-row mode.
+/// Scaled up with
+/// offered work by [`fsqlite_retry_timeout`] — the fixed 5s was exceeded by
+/// queueing alone at 64 writers x 1000-row txns (bd-caa6u).
 const FSQLITE_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pessimistic whole-run contention floor used to scale the retry budget.
 /// The first full-matrix run showed 10k wps was still optimistic at peak
@@ -113,6 +128,12 @@ const FSQLITE_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 /// envelope while the 128-writer arm (17.8s) passed with zero failures.
 /// 5k wps gives 64 writers ~17.8s and 128 writers ~30.6s.
 const RETRY_BUDGET_FLOOR_WPS: u64 = 5_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionGranularity {
+    Bulk,
+    OneRow,
+}
 
 /// Wall-clock retry budget for one transaction attempt loop, scaled with the
 /// total offered work so a txn that legitimately waits behind a 64/128-writer
@@ -125,28 +146,70 @@ fn fsqlite_retry_timeout(threads: usize, rows_per_thread: usize) -> Duration {
 
 fn retry_timeout_millis(timeout: Duration) -> Result<u64, String> {
     u64::try_from(timeout.as_millis())
-        .map_err(|_| format!("FrankenSQLite retry timeout {timeout:?} exceeds reportable range"))
+        .map_err(|_| format!("retry timeout {timeout:?} exceeds reportable range"))
+}
+
+fn retry_policy_receipt_for_granularity(
+    retry_timeout: Duration,
+    retry_timeout_overridden: bool,
+    transaction_granularity: TransactionGranularity,
+) -> Result<RetryPolicyReceipt, String> {
+    let (
+        csqlite_retry_unit,
+        csqlite_retry_algorithm,
+        fsqlite_retry_unit,
+        fsqlite_retry_backoff_algorithm,
+    ) = match transaction_granularity {
+        TransactionGranularity::Bulk => (
+            "individual INSERT or COMMIT operation",
+            CSQLITE_RETRY_ALGORITHM,
+            "whole BEGIN CONCURRENT transaction attempt",
+            FSQLITE_RETRY_BACKOFF_ALGORITHM,
+        ),
+        TransactionGranularity::OneRow => (
+            CSQLITE_ONE_ROW_RETRY_UNIT,
+            CSQLITE_ONE_ROW_RETRY_ALGORITHM,
+            FSQLITE_ONE_ROW_RETRY_UNIT,
+            FSQLITE_ONE_ROW_RETRY_BACKOFF_ALGORITHM,
+        ),
+    };
+    let retry_timeout_ms = retry_timeout_millis(retry_timeout)?;
+    let one_row_mode = transaction_granularity == TransactionGranularity::OneRow;
+    Ok(RetryPolicyReceipt {
+        csqlite_busy_timeout_ms: 5_000,
+        csqlite_max_operation_retries: if transaction_granularity == TransactionGranularity::Bulk {
+            MAX_RETRIES
+        } else {
+            0
+        },
+        csqlite_max_transaction_retries: (transaction_granularity
+            == TransactionGranularity::OneRow)
+            .then_some(MAX_RETRIES),
+        csqlite_retry_sleep_ms: RETRY_SLEEP_MS,
+        csqlite_retry_unit: csqlite_retry_unit.to_owned(),
+        csqlite_retry_algorithm: csqlite_retry_algorithm.to_owned(),
+        shared_worker_retry_timeout_ms: one_row_mode.then_some(retry_timeout_ms),
+        shared_worker_retry_timeout_overridden: one_row_mode.then_some(retry_timeout_overridden),
+        fsqlite_transaction_timeout_ms: retry_timeout_ms,
+        fsqlite_max_transaction_retries: MAX_RETRIES,
+        fsqlite_retry_sleep_base_ms: RETRY_SLEEP_MS,
+        fsqlite_retry_sleep_cap_ms: MAX_RETRY_SLEEP_MS + 4,
+        fsqlite_retry_unit: fsqlite_retry_unit.to_owned(),
+        fsqlite_retry_backoff_algorithm: fsqlite_retry_backoff_algorithm.to_owned(),
+        fsqlite_retryable_errors: FSQLITE_RETRYABLE_ERRORS.to_owned(),
+        fsqlite_timeout_overridden: retry_timeout_overridden,
+    })
 }
 
 fn retry_policy_receipt(
     fsqlite_timeout: Duration,
     fsqlite_timeout_overridden: bool,
 ) -> Result<RetryPolicyReceipt, String> {
-    Ok(RetryPolicyReceipt {
-        csqlite_busy_timeout_ms: 5_000,
-        csqlite_max_operation_retries: MAX_RETRIES,
-        csqlite_retry_sleep_ms: RETRY_SLEEP_MS,
-        csqlite_retry_unit: "individual INSERT or COMMIT operation".to_owned(),
-        csqlite_retry_algorithm: CSQLITE_RETRY_ALGORITHM.to_owned(),
-        fsqlite_transaction_timeout_ms: retry_timeout_millis(fsqlite_timeout)?,
-        fsqlite_max_transaction_retries: MAX_RETRIES,
-        fsqlite_retry_sleep_base_ms: RETRY_SLEEP_MS,
-        fsqlite_retry_sleep_cap_ms: MAX_RETRY_SLEEP_MS + 4,
-        fsqlite_retry_unit: "whole BEGIN CONCURRENT transaction attempt".to_owned(),
-        fsqlite_retry_backoff_algorithm: FSQLITE_RETRY_BACKOFF_ALGORITHM.to_owned(),
-        fsqlite_retryable_errors: FSQLITE_RETRYABLE_ERRORS.to_owned(),
+    retry_policy_receipt_for_granularity(
+        fsqlite_timeout,
         fsqlite_timeout_overridden,
-    })
+        TransactionGranularity::Bulk,
+    )
 }
 
 fn fsqlite_error_is_retryable(error: &fsqlite::FrankenError) -> bool {
@@ -174,6 +237,7 @@ const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
 const PASS_OVER_PASS_MAX_RATIO_DROP_PCT: f64 = 5.0;
 const REPORT_SCHEMA_V7: &str = "fsqlite-e2e.mt_mvcc_bench_report.v7";
+const REPORT_SCHEMA_V8: &str = "fsqlite-e2e.mt_mvcc_bench_report.v8";
 const SETTINGS_INTERPRETATION: &str = "Both engines proved the listed effective PRAGMA values; \
     equal names and readbacks do not establish cross-engine semantic equivalence.";
 const ACCOUNTING_INTERPRETATION: &str = "offered and committed writes share one row unit; \
@@ -185,14 +249,49 @@ const TIMING_INTERPRETATION: &str = "workload_elapsed_ns begins only after every
 const NON_CITABLE_REASON: &str = "v7 binds the running executable, build/runtime source identity, \
     Cargo.lock, invocation, toolchain, and measurement host to this same-invocation comparison, \
     but bd-uh1fv still requires external watchdog, sanitized environment, matched retry/deadline \
-    semantics, a build-attested resolved dependency/feature-graph digest, counterbalanced topology \
-    receipts, immutable manifest, retained baseline history, and independent verification.";
+    semantics, external validation (and, when absent, capture) of a build-attested resolved \
+    dependency/feature-graph digest, counterbalanced topology receipts, immutable manifest, \
+    retained baseline history, and independent verification.";
+const NON_CITABLE_REASON_V8: &str = "v8 adds explicit one-row transaction/retry-unit truth and an \
+    optional build-attested resolved dependency/feature-graph digest, but remains non-citable: \
+    bd-uh1fv still requires an external watchdog, sanitized environment, matched retry/deadline \
+    semantics, counterbalanced topology receipts, immutable manifest, retained baseline history, \
+    and independent verification; a default build also leaves the graph digest unavailable.";
 const RELEASE_REGRESSION_SCOPE: &str = "Narrow same-process, same-host F/C writer-throughput \
     comparison for only the requested mt-mvcc-bench workload/configurations; this report does not \
     cover the shipped release profile, other workloads or platforms, long-term baseline retention, \
     independent reproduction, or overall release eligibility.";
 const EMBEDDED_BUILD_CARGO_LOCK: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+const DEPENDENCY_GRAPH_ATTESTATION_AVAILABLE: &str = "available: the lowercase SHA-256 was \
+    supplied at build time through the rerun-sensitive \
+    FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256 attestation input";
+const DEPENDENCY_GRAPH_ATTESTATION_UNAVAILABLE: &str = "unavailable: \
+    FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256 was not supplied at build time; \
+    ordinary non-release builds do not invent a dependency/feature graph digest";
+
+impl TransactionGranularity {
+    const fn report_schema(self) -> &'static str {
+        match self {
+            Self::Bulk => REPORT_SCHEMA_V7,
+            Self::OneRow => REPORT_SCHEMA_V8,
+        }
+    }
+
+    const fn non_citable_reason(self) -> &'static str {
+        match self {
+            Self::Bulk => NON_CITABLE_REASON,
+            Self::OneRow => NON_CITABLE_REASON_V8,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Bulk => "one_bulk_transaction_per_worker",
+            Self::OneRow => "one_row_per_transaction",
+        }
+    }
+}
 
 macro_rules! human_output {
     ($json_stdout:expr, $($arg:tt)*) => {
@@ -214,6 +313,37 @@ fn bytes_to_lower_hex(bytes: &[u8]) -> String {
 
 fn sha256_bytes(bytes: &[u8]) -> String {
     bytes_to_lower_hex(&Sha256::digest(bytes))
+}
+
+fn parse_optional_lower_sha256(value: &str) -> Result<Option<String>, String> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() != 64 {
+        return Err(format!(
+            "expected 64 lowercase hexadecimal characters, got {}",
+            value.len()
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("digest contains a non-lowercase-hexadecimal character".to_owned());
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn resolved_dependency_feature_graph_attestation(
+    value: &str,
+) -> Result<(Option<String>, &'static str), String> {
+    let digest = parse_optional_lower_sha256(value)?;
+    let limitation = if digest.is_some() {
+        DEPENDENCY_GRAPH_ATTESTATION_AVAILABLE
+    } else {
+        DEPENDENCY_GRAPH_ATTESTATION_UNAVAILABLE
+    };
+    Ok((digest, limitation))
 }
 
 fn file_identity(path: &Path) -> String {
@@ -812,6 +942,11 @@ fn collect_rustflags() -> RustflagsReceipt {
 }
 
 fn collect_build_configuration() -> BuildConfigurationReceipt {
+    let (resolved_dependency_feature_graph_sha256, resolved_dependency_feature_graph_limitation) =
+        resolved_dependency_feature_graph_attestation(env!(
+            "FSQLITE_BENCH_BUILD_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256"
+        ))
+        .expect("fsqlite-e2e/build.rs must reject an invalid dependency/feature graph digest");
     BuildConfigurationReceipt {
         cargo_profile: env!("FSQLITE_BENCH_BUILD_PROFILE").to_owned(),
         selected_profile: env!("FSQLITE_BENCH_BUILD_SELECTED_PROFILE").to_owned(),
@@ -830,10 +965,8 @@ fn collect_build_configuration() -> BuildConfigurationReceipt {
         native_build_overrides_hex: env!("FSQLITE_BENCH_BUILD_NATIVE_OVERRIDES_HEX").to_owned(),
         rustc_version_verbose: env!("FSQLITE_BENCH_BUILD_RUSTC_VERSION").to_owned(),
         cargo_version: env!("FSQLITE_BENCH_BUILD_CARGO_VERSION").to_owned(),
-        resolved_dependency_feature_graph_sha256: None,
-        resolved_dependency_feature_graph_limitation: "the existing fsqlite-e2e build attestation \
-            exposes this crate's enabled features but not Cargo's resolved dependency/feature \
-            graph; v7 therefore leaves the digest explicitly unavailable",
+        resolved_dependency_feature_graph_sha256,
+        resolved_dependency_feature_graph_limitation,
     }
 }
 
@@ -1174,6 +1307,20 @@ fn cargo_lock_identity_is_valid(cargo_lock: &CargoLockIdentityReceipt) -> bool {
 }
 
 fn build_configuration_is_valid(configuration: &BuildConfigurationReceipt) -> bool {
+    let dependency_graph_attestation_valid = configuration
+        .resolved_dependency_feature_graph_sha256
+        .as_deref()
+        .map_or_else(
+            || {
+                configuration.resolved_dependency_feature_graph_limitation
+                    == DEPENDENCY_GRAPH_ATTESTATION_UNAVAILABLE
+            },
+            |digest| {
+                parse_optional_lower_sha256(digest).is_ok_and(|value| value.is_some())
+                    && configuration.resolved_dependency_feature_graph_limitation
+                        == DEPENDENCY_GRAPH_ATTESTATION_AVAILABLE
+            },
+        );
     [
         configuration.cargo_profile.as_str(),
         configuration.selected_profile.as_str(),
@@ -1189,6 +1336,7 @@ fn build_configuration_is_valid(configuration: &BuildConfigurationReceipt) -> bo
     .all(is_known_receipt_value)
         && configuration.rustflags.decode_error.is_none()
         && configuration.rustflags.decoded_arguments.is_some()
+        && dependency_graph_attestation_valid
 }
 
 fn invocation_is_valid(invocation: &InvocationReceipt) -> bool {
@@ -1272,9 +1420,10 @@ fn provenance_evidence_is_valid(
     subject: &SubjectIdentityReceipt,
     environment: &ComparisonEnvironmentReceipt,
 ) -> bool {
-    // This predicate only proves that v7's in-process receipts were complete
-    // and stable for this run. It does not fill the external-verification gaps
-    // listed in NON_CITABLE_REASON, so a true result must remain non-citable.
+    // This predicate only proves that the v7/v8 in-process diagnostic receipts
+    // were complete and stable for this run. It does not fill the
+    // schema-specific external-verification gaps, so a true result must remain
+    // non-citable.
     executable_identity_is_valid(&subject.executable)
         && source_identity_is_valid(subject)
         && cargo_lock_identity_is_valid(&subject.cargo_lock)
@@ -1335,7 +1484,9 @@ struct Options {
     history_json: PathBuf,
     apples_to_apples: bool,
     separate_tables: bool,
-    /// Fixed per-transaction retry budget override in seconds; when unset,
+    transaction_granularity: TransactionGranularity,
+    /// Fixed retry deadline override in seconds; one-row mode shares this
+    /// deadline across every transaction attempted by a worker. When unset,
     /// the budget scales with threads x rows (bd-caa6u).
     retry_timeout_secs: Option<u64>,
 }
@@ -1352,6 +1503,7 @@ impl Default for Options {
             history_json: PathBuf::from(DEFAULT_HISTORY_JSON),
             apples_to_apples: false,
             separate_tables: false,
+            transaction_granularity: TransactionGranularity::Bulk,
             retry_timeout_secs: None,
         }
     }
@@ -1362,7 +1514,7 @@ fn print_usage_and_exit(code: i32) -> ! {
         "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
          [--json-output=PATH] [--json-stdout] [--summary-md=PATH] [--history-json=PATH] \\\n\
          [--apples-to-apples] \\\n\
-         [--separate-tables] [--retry-timeout-secs=N]\n\
+         [--separate-tables] [--one-row-per-transaction] [--retry-timeout-secs=N]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
          --threads=1,2,4,8,16,32,64,128 --iters={DEFAULT_ITERS}\n\
@@ -1370,6 +1522,8 @@ fn print_usage_and_exit(code: i32) -> ! {
          uses the prepared-statement/file-backed/shared-db path on both engines.\n\
          note: writer counts above MAX_CONCURRENT_WRITERS are reported and skipped;\n\
          counts above host available_parallelism are measured only as non-comparable diagnostics.\n\
+         note: --one-row-per-transaction retries each complete one-row transaction and emits the\n\
+         non-citable v8 report; the default bulk transaction retains the v7 analyzer contract.\n\
          note: --rows-per-thread=0 reduces the run to shared-file worker open + synchronized start,\n\
          which is the minimal repro for the 13+ thread startup-open failure."
     );
@@ -1404,6 +1558,7 @@ where
     S: Into<String>,
 {
     let mut opts = Options::default();
+    let mut history_json_explicit = false;
     let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
         if arg == "--apples-to-apples" {
@@ -1412,6 +1567,10 @@ where
         }
         if arg == "--separate-tables" {
             opts.separate_tables = true;
+            continue;
+        }
+        if arg == "--one-row-per-transaction" {
+            opts.transaction_granularity = TransactionGranularity::OneRow;
             continue;
         }
         if arg == "--json-stdout" {
@@ -1467,6 +1626,7 @@ where
             }
             "--history-json" => {
                 opts.history_json = PathBuf::from(val);
+                history_json_explicit = true;
             }
             other => {
                 return Err(ParseArgsError::Message(format!(
@@ -1475,8 +1635,16 @@ where
             }
         }
     }
-    if opts.separate_tables && opts.history_json == Path::new(DEFAULT_HISTORY_JSON) {
-        opts.history_json = PathBuf::from(DEFAULT_SEPARATE_TABLES_HISTORY_JSON);
+    if !history_json_explicit {
+        opts.history_json =
+            PathBuf::from(match (opts.separate_tables, opts.transaction_granularity) {
+                (false, TransactionGranularity::Bulk) => DEFAULT_HISTORY_JSON,
+                (true, TransactionGranularity::Bulk) => DEFAULT_SEPARATE_TABLES_HISTORY_JSON,
+                (false, TransactionGranularity::OneRow) => DEFAULT_ONE_ROW_HISTORY_JSON,
+                (true, TransactionGranularity::OneRow) => {
+                    DEFAULT_SEPARATE_TABLES_ONE_ROW_HISTORY_JSON
+                }
+            });
     }
     Ok(opts)
 }
@@ -1719,10 +1887,16 @@ struct MedianCiContractReport {
 struct RetryPolicyReceipt {
     csqlite_busy_timeout_ms: u64,
     csqlite_max_operation_retries: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    csqlite_max_transaction_retries: Option<usize>,
     csqlite_retry_sleep_ms: u64,
     csqlite_retry_unit: String,
     #[serde(default)]
     csqlite_retry_algorithm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_worker_retry_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_worker_retry_timeout_overridden: Option<bool>,
     fsqlite_transaction_timeout_ms: u64,
     fsqlite_max_transaction_retries: usize,
     fsqlite_retry_sleep_base_ms: u64,
@@ -1733,6 +1907,78 @@ struct RetryPolicyReceipt {
     #[serde(default)]
     fsqlite_retryable_errors: String,
     fsqlite_timeout_overridden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TransactionContractReceipt {
+    granularity: &'static str,
+    rows_per_transaction: usize,
+    prepared_statement_scope: &'static str,
+    duplicate_after_ambiguous_commit_policy: &'static str,
+    csqlite_retry_unit: String,
+    fsqlite_retry_unit: String,
+}
+
+fn transaction_contract_receipt(
+    transaction_granularity: TransactionGranularity,
+    retry_policy: &RetryPolicyReceipt,
+) -> Option<TransactionContractReceipt> {
+    (transaction_granularity == TransactionGranularity::OneRow).then(|| {
+        TransactionContractReceipt {
+            granularity: transaction_granularity.label(),
+            rows_per_transaction: 1,
+            prepared_statement_scope: "exactly once per worker, reused across row transactions",
+            duplicate_after_ambiguous_commit_policy: "fail_closed; a duplicate is never accepted as proof of exact id+payload",
+            csqlite_retry_unit: retry_policy.csqlite_retry_unit.clone(),
+            fsqlite_retry_unit: retry_policy.fsqlite_retry_unit.clone(),
+        }
+    })
+}
+
+fn transaction_contract_is_valid(
+    schema_version: &str,
+    transaction_granularity: TransactionGranularity,
+    rows_per_thread: usize,
+    contract: Option<&TransactionContractReceipt>,
+    configuration_receipts: &[ConfigurationReceipt],
+) -> bool {
+    match transaction_granularity {
+        TransactionGranularity::Bulk => schema_version == REPORT_SCHEMA_V7 && contract.is_none(),
+        TransactionGranularity::OneRow => {
+            let Some(contract) = contract else {
+                return false;
+            };
+            if schema_version != REPORT_SCHEMA_V8
+                || rows_per_thread == 0
+                || contract.granularity != TransactionGranularity::OneRow.label()
+                || contract.rows_per_transaction != 1
+                || contract.prepared_statement_scope
+                    != "exactly once per worker, reused across row transactions"
+                || contract.duplicate_after_ambiguous_commit_policy
+                    != "fail_closed; a duplicate is never accepted as proof of exact id+payload"
+            {
+                return false;
+            }
+            !configuration_receipts.is_empty()
+                && configuration_receipts.iter().all(|configuration| {
+                    configuration.retry_policy.as_ref().is_some_and(|policy| {
+                        policy.csqlite_max_operation_retries == 0
+                            && policy.csqlite_max_transaction_retries == Some(MAX_RETRIES)
+                            && policy.shared_worker_retry_timeout_ms
+                                == Some(policy.fsqlite_transaction_timeout_ms)
+                            && policy.shared_worker_retry_timeout_overridden
+                                == Some(policy.fsqlite_timeout_overridden)
+                            && policy.csqlite_retry_unit == CSQLITE_ONE_ROW_RETRY_UNIT
+                            && policy.fsqlite_retry_unit == FSQLITE_ONE_ROW_RETRY_UNIT
+                            && policy.csqlite_retry_unit == contract.csqlite_retry_unit
+                            && policy.fsqlite_retry_unit == contract.fsqlite_retry_unit
+                            && policy.csqlite_retry_algorithm == CSQLITE_ONE_ROW_RETRY_ALGORITHM
+                            && policy.fsqlite_retry_backoff_algorithm
+                                == FSQLITE_ONE_ROW_RETRY_BACKOFF_ALGORITHM
+                    })
+                })
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1755,8 +2001,46 @@ struct ConfigurationReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RoundOrderReceipt {
+    round_index: usize,
+    execution_order: [String; 4],
+}
+
+fn round_order_receipt(round_index: usize) -> RoundOrderReceipt {
+    let order = if round_index % 2 == 0 {
+        [
+            "csqlite_null_a",
+            "csqlite_null_b",
+            "csqlite_baseline",
+            "fsqlite_candidate",
+        ]
+    } else {
+        [
+            "fsqlite_candidate",
+            "csqlite_baseline",
+            "csqlite_null_b",
+            "csqlite_null_a",
+        ]
+    };
+    RoundOrderReceipt {
+        round_index,
+        execution_order: order.map(str::to_owned),
+    }
+}
+
+fn round_order_receipts_are_valid(receipts: &[RoundOrderReceipt], rounds: usize) -> bool {
+    receipts.len() == rounds
+        && receipts
+            .iter()
+            .enumerate()
+            .all(|(round_index, receipt)| receipt == &round_order_receipt(round_index))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ThreadTruthReport {
     configuration: ConfigurationReceipt,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    round_order_receipts: Vec<RoundOrderReceipt>,
     null_c_a_samples: Vec<SampleEvidence>,
     null_c_b_samples: Vec<SampleEvidence>,
     sqlite_samples: Vec<SampleEvidence>,
@@ -1801,6 +2085,8 @@ struct MtMvccBenchReport {
     accounting_interpretation: &'static str,
     timing_interpretation: &'static str,
     workload_shape: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_contract: Option<TransactionContractReceipt>,
     rows_per_thread: usize,
     iterations: usize,
     configuration_receipts: Vec<ConfigurationReceipt>,
@@ -1861,6 +2147,14 @@ impl FsqliteRetryBudget {
         }
     }
 
+    const fn with_started(started: Instant, timeout: Duration) -> Self {
+        Self {
+            attempts: 0,
+            started,
+            timeout,
+        }
+    }
+
     const fn attempts(&self) -> usize {
         self.attempts
     }
@@ -1876,6 +2170,33 @@ impl FsqliteRetryBudget {
             .min(MAX_RETRY_SLEEP_MS);
         let jitter_ms = ((tid as u64).wrapping_mul(7) + (self.attempts as u64).wrapping_mul(3)) % 5;
         Some(Duration::from_millis(base_ms.saturating_add(jitter_ms)))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OneRowWorkerRetryDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl OneRowWorkerRetryDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    const fn with_started(started: Instant, timeout: Duration) -> Self {
+        Self { started, timeout }
+    }
+
+    const fn fsqlite_budget(self) -> FsqliteRetryBudget {
+        FsqliteRetryBudget::with_started(self.started, self.timeout)
+    }
+
+    fn allows_retry(self, retries: usize) -> bool {
+        retries < MAX_RETRIES && self.started.elapsed() < self.timeout
     }
 }
 
@@ -2209,6 +2530,7 @@ fn build_thread_report(
     null: &PairedRunStats,
     claim: &PairedRunStats,
     configuration: &ConfigurationReceipt,
+    round_order_receipts: &[RoundOrderReceipt],
 ) -> ThreadComparisonReport {
     let sqlite = &claim.arm_a;
     let fsqlite = &claim.arm_b;
@@ -2244,6 +2566,7 @@ fn build_thread_report(
         median_ci_contract: Some(median_ci_contract(null, claim, configuration)),
         truth: Some(ThreadTruthReport {
             configuration: configuration.clone(),
+            round_order_receipts: round_order_receipts.to_vec(),
             null_c_a_samples: null.arm_a.sample_evidence(),
             null_c_b_samples: null.arm_b.sample_evidence(),
             sqlite_samples: sqlite.sample_evidence(),
@@ -2299,6 +2622,28 @@ fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
         report.timing_interpretation
     );
     let _ = writeln!(out, "- Workload shape: `{}`", report.workload_shape);
+    if let Some(contract) = &report.transaction_contract {
+        let _ = writeln!(
+            out,
+            "- Transaction granularity: `{}` (`{}` row per transaction)",
+            contract.granularity, contract.rows_per_transaction
+        );
+        let _ = writeln!(
+            out,
+            "- C SQLite retry unit: `{}`",
+            contract.csqlite_retry_unit
+        );
+        let _ = writeln!(
+            out,
+            "- FrankenSQLite retry unit: `{}`",
+            contract.fsqlite_retry_unit
+        );
+        let _ = writeln!(
+            out,
+            "- Duplicate-after-ambiguous-commit policy: `{}`",
+            contract.duplicate_after_ambiguous_commit_policy
+        );
+    }
     let _ = writeln!(out, "- Rows per thread: `{}`", report.rows_per_thread);
     let _ = writeln!(out, "- Iterations: `{}`", report.iterations);
     let _ = writeln!(out, "- Schema: `{}`\n", report.schema_version);
@@ -2537,6 +2882,7 @@ fn uniform_effective_settings(
 fn valid_truth_settings(
     row: &ThreadComparisonReport,
     rows_per_thread: usize,
+    transaction_granularity: TransactionGranularity,
 ) -> Option<EffectiveSettingsFingerprint> {
     let truth = row.truth.as_ref()?;
     let configuration = &truth.configuration;
@@ -2545,6 +2891,8 @@ fn valid_truth_settings(
         || truth.null_c_b_samples.len() != rounds
         || truth.sqlite_samples.len() != rounds
         || truth.fsqlite_samples.len() != rounds
+        || (transaction_granularity == TransactionGranularity::OneRow
+            && !round_order_receipts_are_valid(&truth.round_order_receipts, rounds))
         || configuration.writers != row.threads
         || !configuration.measured
         || !configuration.comparison_eligible
@@ -2559,8 +2907,12 @@ fn valid_truth_settings(
         return None;
     }
     let retry_policy = configuration.retry_policy.clone()?;
-    let expected_retry_policy =
-        retry_policy_receipt(fsqlite_retry_timeout(row.threads, rows_per_thread), false).ok()?;
+    let expected_retry_policy = retry_policy_receipt_for_granularity(
+        fsqlite_retry_timeout(row.threads, rows_per_thread),
+        false,
+        transaction_granularity,
+    )
+    .ok()?;
     if retry_policy != expected_retry_policy {
         return None;
     }
@@ -2663,8 +3015,9 @@ fn valid_median_ci_contract(row: &ThreadComparisonReport) -> Option<&MedianCiCon
 fn comparable_history_row(
     row: &ThreadComparisonReport,
     rows_per_thread: usize,
+    transaction_granularity: TransactionGranularity,
 ) -> Option<ComparableHistoryRow> {
-    let settings = valid_truth_settings(row, rows_per_thread)?;
+    let settings = valid_truth_settings(row, rows_per_thread, transaction_granularity)?;
     let contract = valid_median_ci_contract(row)?;
     Some(ComparableHistoryRow {
         throughput_ratio: contract.claim_ratio_median,
@@ -2675,10 +3028,13 @@ fn comparable_history_row(
 fn comparable_rows_by_thread(
     rows: &[ThreadComparisonReport],
     rows_per_thread: usize,
+    transaction_granularity: TransactionGranularity,
 ) -> BTreeMap<usize, Vec<ComparableHistoryRow>> {
     let mut grouped = BTreeMap::<usize, Vec<ComparableHistoryRow>>::new();
     for row in rows {
-        if let Some(comparable) = comparable_history_row(row, rows_per_thread) {
+        if let Some(comparable) =
+            comparable_history_row(row, rows_per_thread, transaction_granularity)
+        {
             grouped.entry(row.threads).or_default().push(comparable);
         }
     }
@@ -2690,6 +3046,7 @@ fn history_evidence_is_invalid(
     retry_timeout_overridden: bool,
     rows_per_thread: usize,
     iterations: usize,
+    transaction_granularity: TransactionGranularity,
     rows: &[ThreadComparisonReport],
     configuration_receipts: &[ConfigurationReceipt],
 ) -> bool {
@@ -2738,7 +3095,7 @@ fn history_evidence_is_invalid(
     {
         return true;
     }
-    let comparable = comparable_rows_by_thread(rows, rows_per_thread);
+    let comparable = comparable_rows_by_thread(rows, rows_per_thread, transaction_granularity);
     comparable.len() != rows.len() || comparable.values().any(|candidates| candidates.len() != 1)
 }
 
@@ -2747,11 +3104,13 @@ fn historical_report_matches_contract(
     current_workload_shape: &str,
     current_rows_per_thread: usize,
     current_iterations: usize,
+    current_transaction_granularity: TransactionGranularity,
 ) -> bool {
     let Some(configuration_receipts) = previous.configuration_receipts.as_deref() else {
         return false;
     };
-    previous.schema_version.as_deref() == Some(REPORT_SCHEMA_V7)
+    current_transaction_granularity == TransactionGranularity::Bulk
+        && previous.schema_version.as_deref() == Some(REPORT_SCHEMA_V7)
         && previous.citable == Some(true)
         && previous.measurement_evidence_valid == Some(true)
         && previous
@@ -2778,6 +3137,7 @@ fn historical_report_matches_contract(
             false,
             current_rows_per_thread,
             current_iterations,
+            TransactionGranularity::Bulk,
             &previous.thread_results,
             configuration_receipts,
         )
@@ -2792,6 +3152,7 @@ struct PassOverPassGateInput<'a> {
     current_workload_shape: &'a str,
     current_rows_per_thread: usize,
     current_iterations: usize,
+    current_transaction_granularity: TransactionGranularity,
     current_wal_autocheckpoint_overridden: bool,
     current_retry_timeout_overridden: bool,
 }
@@ -2823,6 +3184,7 @@ fn build_pass_over_pass_gate(input: PassOverPassGateInput<'_>) -> PassOverPassGa
         current_workload_shape,
         current_rows_per_thread,
         current_iterations,
+        current_transaction_granularity,
         current_wal_autocheckpoint_overridden,
         current_retry_timeout_overridden,
     } = input;
@@ -2844,6 +3206,7 @@ fn build_pass_over_pass_gate(input: PassOverPassGateInput<'_>) -> PassOverPassGa
             current_workload_shape,
             current_rows_per_thread,
             current_iterations,
+            current_transaction_granularity,
         )
     });
     let current_evidence_valid = !history_evidence_is_invalid(
@@ -2851,16 +3214,24 @@ fn build_pass_over_pass_gate(input: PassOverPassGateInput<'_>) -> PassOverPassGa
         current_retry_timeout_overridden,
         current_rows_per_thread,
         current_iterations,
+        current_transaction_granularity,
         current_rows,
         current_configuration_receipts,
     );
     let mut comparable_pair_count = 0usize;
     let mut regressions = Vec::new();
     if let Some(previous) = previous {
-        let previous_by_threads =
-            comparable_rows_by_thread(&previous.thread_results, current_rows_per_thread);
+        let previous_by_threads = comparable_rows_by_thread(
+            &previous.thread_results,
+            current_rows_per_thread,
+            TransactionGranularity::Bulk,
+        );
         let current_by_threads = if current_evidence_valid {
-            comparable_rows_by_thread(current_rows, current_rows_per_thread)
+            comparable_rows_by_thread(
+                current_rows,
+                current_rows_per_thread,
+                current_transaction_granularity,
+            )
         } else {
             BTreeMap::new()
         };
@@ -3024,19 +3395,30 @@ fn configuration_receipt(
              and cannot update or compare against default-cadence history"
         ));
     }
-    if receipt
+    let retry_timeout_overridden = receipt
         .retry_policy
         .as_ref()
-        .is_some_and(|policy| policy.fsqlite_timeout_overridden)
-    {
+        .is_some_and(|policy| policy.fsqlite_timeout_overridden);
+    let retry_timeout_is_shared = receipt
+        .retry_policy
+        .as_ref()
+        .is_some_and(|policy| policy.shared_worker_retry_timeout_ms.is_some());
+    if retry_timeout_overridden {
         receipt.comparison_eligible = false;
         if receipt.status == "supported" {
             "diagnostic_override".clone_into(&mut receipt.status);
         }
-        receipt.reason.push_str(
-            "; explicit FrankenSQLite-only retry-timeout override is diagnostic-only and cannot \
-             update or compare against default-policy history",
-        );
+        if retry_timeout_is_shared {
+            receipt.reason.push_str(
+                "; explicit shared C SQLite/FrankenSQLite worker retry-timeout override is \
+                 diagnostic-only and cannot update or compare against default-policy history",
+            );
+        } else {
+            receipt.reason.push_str(
+                "; explicit FrankenSQLite-only retry-timeout override is diagnostic-only and \
+                 cannot update or compare against default-policy history",
+            );
+        }
     }
     receipt
 }
@@ -3616,6 +3998,285 @@ fn build_work_accounting(
 
 // ─── FrankenSQLite workload ──────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneRowRetryStage {
+    Begin,
+    Insert,
+    Commit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneRowFailureDisposition {
+    Retry,
+    FailClosed,
+}
+
+const fn one_row_failure_disposition(
+    stage: OneRowRetryStage,
+    retryable: bool,
+    rollback_succeeded: Option<bool>,
+) -> OneRowFailureDisposition {
+    let transaction_state_is_known = match stage {
+        OneRowRetryStage::Begin => rollback_succeeded.is_none(),
+        OneRowRetryStage::Insert | OneRowRetryStage::Commit => {
+            matches!(rollback_succeeded, Some(true))
+        }
+    };
+    if retryable && transaction_state_is_known {
+        OneRowFailureDisposition::Retry
+    } else {
+        OneRowFailureDisposition::FailClosed
+    }
+}
+
+impl Display for OneRowRetryStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Begin => "BEGIN",
+            Self::Insert => "INSERT",
+            Self::Commit => "COMMIT",
+        })
+    }
+}
+
+enum OneRowAttempt {
+    Committed,
+    Retry {
+        stage: OneRowRetryStage,
+        error: fsqlite::FrankenError,
+    },
+}
+
+fn run_fsqlite_one_row_transactions(
+    conn: &fsqlite::Connection,
+    stmt: &fsqlite::PreparedStatement<'_>,
+    tid: usize,
+    base: i64,
+    rows_per_thread: usize,
+    retry_timeout: Duration,
+) -> Result<(usize, usize), String> {
+    let mut attempted_writes = 0usize;
+    let mut retried_transactions = 0usize;
+    let worker_retry_deadline = OneRowWorkerRetryDeadline::new(retry_timeout);
+    for row_index in 0..rows_per_thread {
+        let row_index = i64::try_from(row_index)
+            .map_err(|_| format!("[fsqlite t{tid}] row index exceeds i64"))?;
+        let id = base
+            .checked_add(row_index)
+            .ok_or_else(|| format!("[fsqlite t{tid}] row id overflow"))?;
+        let params = [
+            fsqlite::SqliteValue::Integer(id),
+            fsqlite::SqliteValue::Text(format!("tid{tid}_i{row_index}").into()),
+        ];
+        let mut retry_budget = worker_retry_deadline.fsqlite_budget();
+
+        loop {
+            let outcome = fsqlite_e2e::block_on(async {
+                if let Err(error) = conn.execute("BEGIN CONCURRENT").await {
+                    if one_row_failure_disposition(
+                        OneRowRetryStage::Begin,
+                        fsqlite_error_is_retryable(&error),
+                        None,
+                    ) == OneRowFailureDisposition::Retry
+                    {
+                        return Ok(OneRowAttempt::Retry {
+                            stage: OneRowRetryStage::Begin,
+                            error,
+                        });
+                    }
+                    return Err(format!(
+                        "[fsqlite t{tid}] one-row BEGIN failed for id {id}: {error}"
+                    ));
+                }
+
+                attempted_writes = attempted_writes
+                    .checked_add(1)
+                    .ok_or_else(|| format!("[fsqlite t{tid}] write-attempt counter overflow"))?;
+                if let Err(error) = stmt.execute_with_params(&params).await {
+                    let rollback = conn.execute("ROLLBACK").await;
+                    if let Err(rollback_error) = rollback {
+                        return Err(format!(
+                            "[fsqlite t{tid}] one-row INSERT failed for id {id}: {error}; \
+                             mandatory rollback also failed: {rollback_error}"
+                        ));
+                    }
+                    if one_row_failure_disposition(
+                        OneRowRetryStage::Insert,
+                        fsqlite_error_is_retryable(&error),
+                        Some(true),
+                    ) == OneRowFailureDisposition::Retry
+                    {
+                        return Ok(OneRowAttempt::Retry {
+                            stage: OneRowRetryStage::Insert,
+                            error,
+                        });
+                    }
+                    return Err(format!(
+                        "[fsqlite t{tid}] one-row INSERT failed for id {id}: {error}; duplicate \
+                         and constraint errors are fail-closed and are never accepted as proof of \
+                         the intended id+payload"
+                    ));
+                }
+
+                match conn.execute("COMMIT").await {
+                    Ok(_) => Ok(OneRowAttempt::Committed),
+                    Err(error) => {
+                        let rollback = conn.execute("ROLLBACK").await;
+                        if let Err(rollback_error) = rollback {
+                            return Err(format!(
+                                "[fsqlite t{tid}] one-row COMMIT failed for id {id}: {error}; \
+                                 mandatory rollback also failed: {rollback_error}; ambiguous \
+                                 commit state is fail-closed"
+                            ));
+                        }
+                        if one_row_failure_disposition(
+                            OneRowRetryStage::Commit,
+                            fsqlite_error_is_retryable(&error),
+                            Some(true),
+                        ) == OneRowFailureDisposition::Retry
+                        {
+                            Ok(OneRowAttempt::Retry {
+                                stage: OneRowRetryStage::Commit,
+                                error,
+                            })
+                        } else {
+                            Err(format!(
+                                "[fsqlite t{tid}] one-row COMMIT failed for id {id}: {error}"
+                            ))
+                        }
+                    }
+                }
+            })?;
+
+            match outcome {
+                OneRowAttempt::Committed => break,
+                OneRowAttempt::Retry { stage, error } => {
+                    let Some(wait) = retry_budget.next_wait(tid) else {
+                        return Err(format!(
+                            "[fsqlite t{tid}] one-row transaction for id {id} exhausted retry \
+                             budget at {stage} after {} retries: {error}",
+                            retry_budget.attempts()
+                        ));
+                    };
+                    retried_transactions = retried_transactions
+                        .checked_add(1)
+                        .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
+                    thread::sleep(wait);
+                }
+            }
+        }
+    }
+    Ok((attempted_writes, retried_transactions))
+}
+
+fn run_rusqlite_one_row_transactions(
+    conn: &rusqlite::Connection,
+    stmt: &mut rusqlite::Statement<'_>,
+    tid: usize,
+    base: i64,
+    rows_per_thread: usize,
+    retry_timeout: Duration,
+) -> Result<(usize, usize), String> {
+    let mut attempted_writes = 0usize;
+    let mut retried_transactions = 0usize;
+    let worker_retry_deadline = OneRowWorkerRetryDeadline::new(retry_timeout);
+    for row_index in 0..rows_per_thread {
+        let row_index = i64::try_from(row_index)
+            .map_err(|_| format!("[sqlite t{tid}] row index exceeds i64"))?;
+        let id = base
+            .checked_add(row_index)
+            .ok_or_else(|| format!("[sqlite t{tid}] row id overflow"))?;
+        let payload = format!("tid{tid}_i{row_index}");
+        let mut retries = 0usize;
+
+        loop {
+            if let Err(error) = conn.execute_batch("BEGIN") {
+                if one_row_failure_disposition(
+                    OneRowRetryStage::Begin,
+                    csqlite_error_is_retryable(&error),
+                    None,
+                ) == OneRowFailureDisposition::Retry
+                    && worker_retry_deadline.allows_retry(retries)
+                {
+                    retries += 1;
+                    retried_transactions = retried_transactions
+                        .checked_add(1)
+                        .ok_or_else(|| format!("[sqlite t{tid}] retry counter overflow"))?;
+                    thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
+                    continue;
+                }
+                return Err(format!(
+                    "[sqlite t{tid}] one-row BEGIN failed for id {id} after {retries} retries: \
+                     {error}"
+                ));
+            }
+
+            attempted_writes = attempted_writes
+                .checked_add(1)
+                .ok_or_else(|| format!("[sqlite t{tid}] write-attempt counter overflow"))?;
+            if let Err(error) = stmt.execute(rusqlite::params![id, &payload]) {
+                conn.execute_batch("ROLLBACK").map_err(|rollback_error| {
+                    format!(
+                        "[sqlite t{tid}] one-row INSERT failed for id {id}: {error}; mandatory \
+                         rollback also failed: {rollback_error}"
+                    )
+                })?;
+                if one_row_failure_disposition(
+                    OneRowRetryStage::Insert,
+                    csqlite_error_is_retryable(&error),
+                    Some(true),
+                ) == OneRowFailureDisposition::Retry
+                    && worker_retry_deadline.allows_retry(retries)
+                {
+                    retries += 1;
+                    retried_transactions = retried_transactions
+                        .checked_add(1)
+                        .ok_or_else(|| format!("[sqlite t{tid}] retry counter overflow"))?;
+                    thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
+                    continue;
+                }
+                return Err(format!(
+                    "[sqlite t{tid}] one-row INSERT failed for id {id} after {retries} retries: \
+                     {error}; duplicate and constraint errors are fail-closed and are never \
+                     accepted as proof of the intended id+payload"
+                ));
+            }
+
+            match conn.execute_batch("COMMIT") {
+                Ok(()) => break,
+                Err(error) => {
+                    conn.execute_batch("ROLLBACK").map_err(|rollback_error| {
+                        format!(
+                            "[sqlite t{tid}] one-row COMMIT failed for id {id}: {error}; \
+                             mandatory rollback also failed: {rollback_error}; ambiguous commit \
+                             state is fail-closed"
+                        )
+                    })?;
+                    if one_row_failure_disposition(
+                        OneRowRetryStage::Commit,
+                        csqlite_error_is_retryable(&error),
+                        Some(true),
+                    ) == OneRowFailureDisposition::Retry
+                        && worker_retry_deadline.allows_retry(retries)
+                    {
+                        retries += 1;
+                        retried_transactions = retried_transactions
+                            .checked_add(1)
+                            .ok_or_else(|| format!("[sqlite t{tid}] retry counter overflow"))?;
+                        thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
+                        continue;
+                    }
+                    return Err(format!(
+                        "[sqlite t{tid}] one-row COMMIT failed for id {id} after {retries} \
+                         retries: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok((attempted_writes, retried_transactions))
+}
+
 fn open_fsqlite_worker(
     path: &str,
     wal_autocheckpoint_pages: i64,
@@ -3630,6 +4291,7 @@ fn run_fsqlite(
     threads: usize,
     rows_per_thread: usize,
     separate_tables: bool,
+    transaction_granularity: TransactionGranularity,
     retry_timeout: Duration,
     wal_autocheckpoint_pages: i64,
 ) -> Result<RunResult, String> {
@@ -3698,16 +4360,37 @@ fn run_fsqlite(
             } else {
                 tid as i64 * ROWID_BASE_STRIDE
             };
-            // Prepare the INSERT once per transaction attempt; bind params per
-            // iteration. This matches the rusqlite reference loop (L412-446
-            // below) so both sides parse+plan the insert a single time and
-            // the per-row cost is just bind + execute.
+            // The v7 bulk path below prepares once per transaction attempt.
+            // The v8 one-row path prepares once per worker and reuses that
+            // statement across all row transactions, matching its rusqlite
+            // reference arm. In both modes, bind+execute rather than SQL
+            // formatting is the per-row operation.
             //
             // Using `format!` per-iter on the fsqlite side was an
             // apples-to-oranges artifact that pinned `Lexer::tokenize_into`
             // at 2.53% self-time and drove 12%+ allocator churn on MT 8t
             // (2026-04-23 capture `fsqlite-t3b-validation-185110`).
             let insert_sql = worker_insert_sql(tid, separate_tables);
+
+            if transaction_granularity == TransactionGranularity::OneRow {
+                let stmt = fsqlite_e2e::block_on(conn.prepare(&insert_sql))
+                    .map_err(|error| format!("[fsqlite t{tid}] prepare failed: {error}"))?;
+                let (attempted_writes, retried_operations) = run_fsqlite_one_row_transactions(
+                    &conn,
+                    &stmt,
+                    tid,
+                    base,
+                    rows_per_thread,
+                    retry_timeout,
+                )?;
+                return Ok(WorkerWork {
+                    settings,
+                    attempted_writes,
+                    retried_operations,
+                    reported_failed_writes: 0,
+                    workload_finished: Instant::now(),
+                });
+            }
 
             // Single transaction spanning all rows; retry on transient
             // conflicts by rolling back and reopening the transaction.
@@ -3901,6 +4584,8 @@ fn run_rusqlite(
     threads: usize,
     rows_per_thread: usize,
     separate_tables: bool,
+    transaction_granularity: TransactionGranularity,
+    retry_timeout: Duration,
     wal_autocheckpoint_pages: i64,
 ) -> Result<RunResult, String> {
     let tmp = tempfile::NamedTempFile::new()
@@ -3987,6 +4672,27 @@ fn run_rusqlite(
             let mut attempted_writes = 0usize;
             let mut retried_operations = 0usize;
             let insert_sql = worker_insert_sql(tid, separate_tables);
+
+            if transaction_granularity == TransactionGranularity::OneRow {
+                let mut stmt = conn
+                    .prepare(&insert_sql)
+                    .map_err(|error| format!("[sqlite t{tid}] prepare failed: {error}"))?;
+                let (attempted_writes, retried_operations) = run_rusqlite_one_row_transactions(
+                    &conn,
+                    &mut stmt,
+                    tid,
+                    base,
+                    rows_per_thread,
+                    retry_timeout,
+                )?;
+                return Ok(WorkerWork {
+                    settings,
+                    attempted_writes,
+                    retried_operations,
+                    reported_failed_writes: 0,
+                    workload_finished: Instant::now(),
+                });
+            }
 
             conn.execute_batch("BEGIN")
                 .map_err(|error| format!("[sqlite t{tid}] BEGIN failed: {error}"))?;
@@ -4121,7 +4827,7 @@ fn collect_contract<N1, N2, A, B>(
     mut null_b: N2,
     mut baseline: A,
     mut candidate: B,
-) -> Result<(PairedRunStats, PairedRunStats), String>
+) -> Result<(PairedRunStats, PairedRunStats, Vec<RoundOrderReceipt>), String>
 where
     N1: FnMut() -> Result<RunResult, String>,
     N2: FnMut() -> Result<RunResult, String>,
@@ -4132,6 +4838,7 @@ where
     let mut null_b_samples = Vec::with_capacity(iters);
     let mut baseline_samples = Vec::with_capacity(iters);
     let mut candidate_samples = Vec::with_capacity(iters);
+    let mut round_order_receipts = Vec::with_capacity(iters);
 
     for round in 0..iters {
         let (null_a_sample, null_b_sample, baseline_sample, candidate_sample) = if round % 2 == 0 {
@@ -4152,11 +4859,13 @@ where
         null_b_samples.push(null_b_sample);
         baseline_samples.push(baseline_sample);
         candidate_samples.push(candidate_sample);
+        round_order_receipts.push(round_order_receipt(round));
     }
 
     Ok((
         paired_run_stats(null_a_samples, null_b_samples),
         paired_run_stats(baseline_samples, candidate_samples),
+        round_order_receipts,
     ))
 }
 
@@ -4189,7 +4898,7 @@ fn run(opts: Options) -> Result<(), String> {
         .map(|value| value.get());
 
     eprintln!(
-        "mt-mvcc-bench: rows_per_thread={} threads={:?} paired_rounds={} bootstrap_reps={} synchronous=NORMAL wal_autocheckpoint={} available_parallelism={available_parallelism:?} apples_to_apples={} separate_tables={}",
+        "mt-mvcc-bench: rows_per_thread={} threads={:?} paired_rounds={} bootstrap_reps={} synchronous=NORMAL wal_autocheckpoint={} available_parallelism={available_parallelism:?} apples_to_apples={} separate_tables={} transaction_granularity={}",
         opts.rows_per_thread,
         opts.threads,
         opts.iters,
@@ -4197,8 +4906,12 @@ fn run(opts: Options) -> Result<(), String> {
         wal_autocheckpoint_pages,
         opts.apples_to_apples,
         opts.separate_tables,
+        opts.transaction_granularity.label(),
     );
-    eprintln!("mt-mvcc-bench: NON-CITABLE: {NON_CITABLE_REASON}");
+    eprintln!(
+        "mt-mvcc-bench: NON-CITABLE: {}",
+        opts.transaction_granularity.non_citable_reason()
+    );
     eprintln!("mt-mvcc-bench: settings contract: {SETTINGS_INTERPRETATION}");
     eprintln!("mt-mvcc-bench: accounting contract: {ACCOUNTING_INTERPRETATION}");
     eprintln!("mt-mvcc-bench: timing contract: {TIMING_INTERPRETATION}");
@@ -4220,7 +4933,11 @@ fn run(opts: Options) -> Result<(), String> {
             || fsqlite_retry_timeout(n, opts.rows_per_thread),
             Duration::from_secs,
         );
-        let retry_policy = retry_policy_receipt(retry_timeout, opts.retry_timeout_secs.is_some())?;
+        let retry_policy = retry_policy_receipt_for_granularity(
+            retry_timeout,
+            opts.retry_timeout_secs.is_some(),
+            opts.transaction_granularity,
+        )?;
         let configuration = configuration_receipt(
             n,
             opts.rows_per_thread,
@@ -4248,13 +4965,15 @@ fn run(opts: Options) -> Result<(), String> {
         if !configuration.measured {
             continue;
         }
-        let (null, claim) = collect_contract(
+        let (null, claim, round_order_receipts) = collect_contract(
             opts.iters,
             || {
                 run_rusqlite(
                     n,
                     opts.rows_per_thread,
                     opts.separate_tables,
+                    opts.transaction_granularity,
+                    retry_timeout,
                     wal_autocheckpoint_pages,
                 )
             },
@@ -4263,6 +4982,8 @@ fn run(opts: Options) -> Result<(), String> {
                     n,
                     opts.rows_per_thread,
                     opts.separate_tables,
+                    opts.transaction_granularity,
+                    retry_timeout,
                     wal_autocheckpoint_pages,
                 )
             },
@@ -4271,6 +4992,8 @@ fn run(opts: Options) -> Result<(), String> {
                     n,
                     opts.rows_per_thread,
                     opts.separate_tables,
+                    opts.transaction_granularity,
+                    retry_timeout,
                     wal_autocheckpoint_pages,
                 )
             },
@@ -4285,6 +5008,7 @@ fn run(opts: Options) -> Result<(), String> {
                     n,
                     opts.rows_per_thread,
                     opts.separate_tables,
+                    opts.transaction_granularity,
                     retry_timeout,
                     wal_autocheckpoint_pages,
                 );
@@ -4305,7 +5029,19 @@ fn run(opts: Options) -> Result<(), String> {
                 result
             },
         )?;
-        let report = build_thread_report(n, &null, &claim, &configuration);
+        let report_round_order_receipts =
+            if opts.transaction_granularity == TransactionGranularity::OneRow {
+                round_order_receipts.as_slice()
+            } else {
+                &[]
+            };
+        let report = build_thread_report(
+            n,
+            &null,
+            &claim,
+            &configuration,
+            report_round_order_receipts,
+        );
         let contract = report
             .median_ci_contract
             .as_ref()
@@ -4419,6 +5155,7 @@ fn run(opts: Options) -> Result<(), String> {
         current_workload_shape: workload_shape,
         current_rows_per_thread: opts.rows_per_thread,
         current_iterations: opts.iters,
+        current_transaction_granularity: opts.transaction_granularity,
         current_wal_autocheckpoint_overridden: wal_autocheckpoint_overridden,
         current_retry_timeout_overridden: opts.retry_timeout_secs.is_some(),
     });
@@ -4433,18 +5170,34 @@ fn run(opts: Options) -> Result<(), String> {
         opts.retry_timeout_secs.is_some(),
         opts.rows_per_thread,
         opts.iters,
+        opts.transaction_granularity,
         &thread_results,
+        &configuration_receipts,
+    );
+    let report_schema = opts.transaction_granularity.report_schema();
+    let transaction_contract = configuration_receipts
+        .first()
+        .and_then(|configuration| configuration.retry_policy.as_ref())
+        .and_then(|retry_policy| {
+            transaction_contract_receipt(opts.transaction_granularity, retry_policy)
+        });
+    let transaction_contract_valid = transaction_contract_is_valid(
+        report_schema,
+        opts.transaction_granularity,
+        opts.rows_per_thread,
+        transaction_contract.as_ref(),
         &configuration_receipts,
     );
     let (subject_identity, comparison_environment) = provenance.finish();
     let measurement_evidence_valid = workload_evidence_valid
+        && transaction_contract_valid
         && provenance_evidence_is_valid(&subject_identity, &comparison_environment);
 
     let full_report = MtMvccBenchReport {
-        schema_version: REPORT_SCHEMA_V7,
+        schema_version: report_schema,
         citable: false,
         measurement_evidence_valid,
-        non_citable_reason: NON_CITABLE_REASON,
+        non_citable_reason: opts.transaction_granularity.non_citable_reason(),
         release_regression_scope: RELEASE_REGRESSION_SCOPE,
         subject_identity,
         comparison_environment,
@@ -4452,6 +5205,7 @@ fn run(opts: Options) -> Result<(), String> {
         accounting_interpretation: ACCOUNTING_INTERPRETATION,
         timing_interpretation: TIMING_INTERPRETATION,
         workload_shape,
+        transaction_contract,
         rows_per_thread: opts.rows_per_thread,
         iterations: opts.iters,
         configuration_receipts,
@@ -4593,7 +5347,8 @@ mod tests {
                 rustc_version_verbose: "rustc test".to_owned(),
                 cargo_version: "cargo test".to_owned(),
                 resolved_dependency_feature_graph_sha256: None,
-                resolved_dependency_feature_graph_limitation: "test limitation",
+                resolved_dependency_feature_graph_limitation:
+                    DEPENDENCY_GRAPH_ATTESTATION_UNAVAILABLE,
             },
             invocation: InvocationReceipt {
                 argv_lossy: vec!["mt-mvcc-bench".to_owned(), "--json-stdout".to_owned()],
@@ -4667,6 +5422,7 @@ mod tests {
             accounting_interpretation: ACCOUNTING_INTERPRETATION,
             timing_interpretation: TIMING_INTERPRETATION,
             workload_shape: "shared_table",
+            transaction_contract: None,
             rows_per_thread: 1,
             iterations: 1,
             configuration_receipts: Vec::new(),
@@ -4681,6 +5437,30 @@ mod tests {
                 regressions: Vec::new(),
             },
         }
+    }
+
+    fn minimal_v8_one_row_report() -> MtMvccBenchReport {
+        let retry_policy = retry_policy_receipt_for_granularity(
+            fsqlite_retry_timeout(1, 1),
+            false,
+            TransactionGranularity::OneRow,
+        )
+        .expect("one-row test retry policy must be representable");
+        let configuration = configuration_receipt(
+            1,
+            1,
+            Some(8),
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            false,
+            retry_policy.clone(),
+        );
+        let mut report = minimal_v7_report();
+        report.schema_version = REPORT_SCHEMA_V8;
+        report.non_citable_reason = NON_CITABLE_REASON_V8;
+        report.transaction_contract =
+            transaction_contract_receipt(TransactionGranularity::OneRow, &retry_policy);
+        report.configuration_receipts = vec![configuration];
+        report
     }
 
     #[test]
@@ -4860,7 +5640,146 @@ mod tests {
             value["comparison_environment"]["measurement_host"]["host"]["hostname"],
             "test-host"
         );
+        assert!(value.get("transaction_contract").is_none());
         assert!(value.get("release_eligible").is_none());
+    }
+
+    #[test]
+    fn optional_dependency_feature_graph_digest_is_strict_lower_sha256() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(parse_optional_lower_sha256(""), Ok(None));
+        assert_eq!(
+            parse_optional_lower_sha256(digest),
+            Ok(Some(digest.to_owned()))
+        );
+        assert!(parse_optional_lower_sha256(&digest[..63]).is_err());
+        assert!(parse_optional_lower_sha256(&digest.to_ascii_uppercase()).is_err());
+        assert!(parse_optional_lower_sha256(&format!("{}g", &digest[..63])).is_err());
+
+        let (unavailable, limitation) = resolved_dependency_feature_graph_attestation("")
+            .expect("an absent digest is an explicit non-release state");
+        assert_eq!(unavailable, None);
+        assert_eq!(limitation, DEPENDENCY_GRAPH_ATTESTATION_UNAVAILABLE);
+        let (available, limitation) = resolved_dependency_feature_graph_attestation(digest)
+            .expect("a canonical digest must be accepted");
+        assert_eq!(available.as_deref(), Some(digest));
+        assert_eq!(limitation, DEPENDENCY_GRAPH_ATTESTATION_AVAILABLE);
+
+        let mut invalid = test_comparison_environment().build_configuration;
+        invalid.resolved_dependency_feature_graph_sha256 = Some("A".repeat(64));
+        assert!(!build_configuration_is_valid(&invalid));
+
+        let mut mismatched = test_comparison_environment().build_configuration;
+        mismatched.resolved_dependency_feature_graph_sha256 = Some(digest.to_owned());
+        assert!(!build_configuration_is_valid(&mismatched));
+        mismatched.resolved_dependency_feature_graph_limitation =
+            DEPENDENCY_GRAPH_ATTESTATION_AVAILABLE;
+        assert!(build_configuration_is_valid(&mismatched));
+    }
+
+    #[test]
+    fn v8_one_row_report_binds_granularity_retry_units_and_non_citable_status() {
+        let report = minimal_v8_one_row_report();
+        assert!(transaction_contract_is_valid(
+            report.schema_version,
+            TransactionGranularity::OneRow,
+            report.rows_per_thread,
+            report.transaction_contract.as_ref(),
+            &report.configuration_receipts,
+        ));
+
+        let value = serde_json::to_value(&report).expect("v8 one-row report must serialize");
+        assert_eq!(value["schema_version"], REPORT_SCHEMA_V8);
+        assert_eq!(value["citable"], false);
+        assert_eq!(
+            value["transaction_contract"]["granularity"],
+            "one_row_per_transaction"
+        );
+        assert_eq!(value["transaction_contract"]["rows_per_transaction"], 1);
+        assert_eq!(
+            value["configuration_receipts"][0]["retry_policy"]["csqlite_max_operation_retries"],
+            0
+        );
+        assert_eq!(
+            value["configuration_receipts"][0]["retry_policy"]["csqlite_max_transaction_retries"],
+            MAX_RETRIES
+        );
+        assert_eq!(
+            value["configuration_receipts"][0]["retry_policy"]["shared_worker_retry_timeout_ms"],
+            retry_timeout_millis(fsqlite_retry_timeout(1, DEFAULT_ROWS_PER_THREAD))
+                .expect("test retry timeout must fit")
+        );
+        assert_eq!(
+            value["configuration_receipts"][0]["retry_policy"]["shared_worker_retry_timeout_overridden"],
+            false
+        );
+        assert!(value.get("release_eligible").is_none());
+    }
+
+    #[test]
+    fn one_row_report_contract_fails_closed_on_missing_or_mismatched_truth() {
+        let report = minimal_v8_one_row_report();
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V7,
+            TransactionGranularity::OneRow,
+            report.rows_per_thread,
+            report.transaction_contract.as_ref(),
+            &report.configuration_receipts,
+        ));
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V8,
+            TransactionGranularity::OneRow,
+            report.rows_per_thread,
+            None,
+            &report.configuration_receipts,
+        ));
+
+        let mut invalid_configurations = report.configuration_receipts.clone();
+        invalid_configurations[0]
+            .retry_policy
+            .as_mut()
+            .expect("test configuration retry policy")
+            .csqlite_retry_unit = "individual INSERT operation".to_owned();
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V8,
+            TransactionGranularity::OneRow,
+            report.rows_per_thread,
+            report.transaction_contract.as_ref(),
+            &invalid_configurations,
+        ));
+
+        let mut missing_shared_deadline = report.configuration_receipts.clone();
+        missing_shared_deadline[0]
+            .retry_policy
+            .as_mut()
+            .expect("test configuration retry policy")
+            .shared_worker_retry_timeout_ms = None;
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V8,
+            TransactionGranularity::OneRow,
+            report.rows_per_thread,
+            report.transaction_contract.as_ref(),
+            &missing_shared_deadline,
+        ));
+
+        let mut coordinated_drift = minimal_v8_one_row_report();
+        coordinated_drift
+            .transaction_contract
+            .as_mut()
+            .expect("test transaction contract")
+            .csqlite_retry_unit = "individual INSERT operation".to_owned();
+        coordinated_drift.configuration_receipts[0]
+            .retry_policy
+            .as_mut()
+            .expect("test configuration retry policy")
+            .csqlite_retry_unit = "individual INSERT operation".to_owned();
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V8,
+            TransactionGranularity::OneRow,
+            coordinated_drift.rows_per_thread,
+            coordinated_drift.transaction_contract.as_ref(),
+            &coordinated_drift.configuration_receipts,
+        ));
     }
 
     #[test]
@@ -4905,6 +5824,88 @@ mod tests {
             parse_args_from(["--json-stdout=true"]),
             Err(ParseArgsError::Message(message)) if message.contains("unknown argument")
         ));
+    }
+
+    #[test]
+    fn one_row_transaction_flag_is_explicit_and_uses_isolated_history() {
+        let defaults = parse_args_from(std::iter::empty::<&str>())
+            .expect("default benchmark arguments must parse");
+        assert_eq!(
+            defaults.transaction_granularity,
+            TransactionGranularity::Bulk
+        );
+        assert_eq!(defaults.history_json, Path::new(DEFAULT_HISTORY_JSON));
+
+        let one_row = parse_args_from(["--one-row-per-transaction"])
+            .expect("one-row transaction flag must parse");
+        assert_eq!(
+            one_row.transaction_granularity,
+            TransactionGranularity::OneRow
+        );
+        assert_eq!(
+            one_row.history_json,
+            Path::new(DEFAULT_ONE_ROW_HISTORY_JSON)
+        );
+
+        let separate = parse_args_from(["--separate-tables", "--one-row-per-transaction"])
+            .expect("separate-table one-row mode must parse");
+        assert!(separate.separate_tables);
+        assert_eq!(
+            separate.history_json,
+            Path::new(DEFAULT_SEPARATE_TABLES_ONE_ROW_HISTORY_JSON)
+        );
+
+        let explicit_history = parse_args_from([
+            "--one-row-per-transaction",
+            "--history-json=/tmp/explicit-history.json",
+        ])
+        .expect("one-row mode must preserve an explicit history path");
+        assert_eq!(
+            explicit_history.history_json,
+            Path::new("/tmp/explicit-history.json")
+        );
+
+        let explicit_default_history = parse_args_from([
+            "--one-row-per-transaction",
+            "--history-json=.bench-history/mt-mvcc-bench.latest.json",
+        ])
+        .expect("an explicit default-valued history path must remain explicit");
+        assert_eq!(
+            explicit_default_history.history_json,
+            Path::new(DEFAULT_HISTORY_JSON)
+        );
+    }
+
+    #[test]
+    fn one_row_retry_policy_reports_whole_transaction_truth() {
+        let policy = retry_policy_receipt_for_granularity(
+            Duration::from_secs(7),
+            false,
+            TransactionGranularity::OneRow,
+        )
+        .expect("one-row retry timeout must fit the report");
+        assert_eq!(policy.csqlite_max_operation_retries, 0);
+        assert_eq!(policy.csqlite_max_transaction_retries, Some(MAX_RETRIES));
+        assert_eq!(policy.shared_worker_retry_timeout_ms, Some(7_000));
+        assert_eq!(policy.shared_worker_retry_timeout_overridden, Some(false));
+        assert_eq!(policy.csqlite_retry_unit, CSQLITE_ONE_ROW_RETRY_UNIT);
+        assert_eq!(
+            policy.csqlite_retry_algorithm,
+            CSQLITE_ONE_ROW_RETRY_ALGORITHM
+        );
+        assert_eq!(policy.fsqlite_retry_unit, FSQLITE_ONE_ROW_RETRY_UNIT);
+        assert_eq!(
+            policy.fsqlite_retry_backoff_algorithm,
+            FSQLITE_ONE_ROW_RETRY_BACKOFF_ALGORITHM
+        );
+
+        let bulk = retry_policy_receipt(Duration::from_secs(7), false)
+            .expect("bulk retry timeout must fit the report");
+        assert_eq!(bulk.csqlite_max_operation_retries, MAX_RETRIES);
+        assert_eq!(bulk.csqlite_max_transaction_retries, None);
+        assert_eq!(bulk.shared_worker_retry_timeout_ms, None);
+        assert_eq!(bulk.shared_worker_retry_timeout_overridden, None);
+        assert_eq!(bulk.csqlite_retry_algorithm, CSQLITE_RETRY_ALGORITHM);
     }
 
     fn sample_result(elapsed_ms: u64, total_rows: usize, failed_rows: usize) -> RunResult {
@@ -5018,7 +6019,7 @@ mod tests {
             false,
             default_retry_policy(threads, DEFAULT_ROWS_PER_THREAD),
         );
-        build_thread_report(threads, &null, &claim, &configuration)
+        build_thread_report(threads, &null, &claim, &configuration, &[])
     }
 
     fn history_with_rows(
@@ -5080,6 +6081,7 @@ mod tests {
             current_workload_shape: "shared_table",
             current_rows_per_thread: DEFAULT_ROWS_PER_THREAD,
             current_iterations,
+            current_transaction_granularity: TransactionGranularity::Bulk,
             current_wal_autocheckpoint_overridden: false,
             current_retry_timeout_overridden: false,
         })
@@ -5101,6 +6103,7 @@ mod tests {
             current_workload_shape: "shared_table",
             current_rows_per_thread: 1_000,
             current_iterations: 1,
+            current_transaction_granularity: TransactionGranularity::Bulk,
             current_wal_autocheckpoint_overridden: false,
             current_retry_timeout_overridden: false,
         })
@@ -5117,7 +6120,7 @@ mod tests {
             vec![sample_result(200, 1000, 3)],
         );
 
-        let report = build_thread_report(4, &null, &claim, &supported_configuration(4));
+        let report = build_thread_report(4, &null, &claim, &supported_configuration(4), &[]);
 
         assert_eq!(report.threads, 4);
         assert!((report.fsqlite_wps_p50 - 4985.0).abs() < 0.01);
@@ -5142,6 +6145,7 @@ mod tests {
             accounting_interpretation: ACCOUNTING_INTERPRETATION,
             timing_interpretation: TIMING_INTERPRETATION,
             workload_shape: "shared_table",
+            transaction_contract: None,
             rows_per_thread: 250,
             iterations: 1,
             configuration_receipts: vec![supported_configuration(8)],
@@ -5503,6 +6507,7 @@ mod tests {
             current_workload_shape: "shared_table",
             current_rows_per_thread: 1000,
             current_iterations: 1,
+            current_transaction_granularity: TransactionGranularity::Bulk,
             current_wal_autocheckpoint_overridden: false,
             current_retry_timeout_overridden: false,
         });
@@ -5548,6 +6553,7 @@ mod tests {
             current_workload_shape: "shared_table",
             current_rows_per_thread: 1000,
             current_iterations: 1,
+            current_transaction_granularity: TransactionGranularity::Bulk,
             current_wal_autocheckpoint_overridden: false,
             current_retry_timeout_overridden: false,
         });
@@ -5589,6 +6595,7 @@ mod tests {
             current_workload_shape: "shared_table",
             current_rows_per_thread: DEFAULT_ROWS_PER_THREAD,
             current_iterations: 1,
+            current_transaction_granularity: TransactionGranularity::Bulk,
             current_wal_autocheckpoint_overridden: false,
             current_retry_timeout_overridden: false,
         });
@@ -5758,6 +6765,7 @@ mod tests {
             current_workload_shape: "shared_table",
             current_rows_per_thread: DEFAULT_ROWS_PER_THREAD,
             current_iterations: 1,
+            current_transaction_granularity: TransactionGranularity::Bulk,
             current_wal_autocheckpoint_overridden: false,
             current_retry_timeout_overridden: false,
         });
@@ -5978,6 +6986,7 @@ mod tests {
             false,
             DEFAULT_ROWS_PER_THREAD,
             1,
+            TransactionGranularity::Bulk,
             std::slice::from_ref(&row),
             std::slice::from_ref(&receipt),
         ));
@@ -5987,6 +6996,7 @@ mod tests {
             false,
             DEFAULT_ROWS_PER_THREAD,
             1,
+            TransactionGranularity::Bulk,
             std::slice::from_ref(&row),
             std::slice::from_ref(&receipt),
         ));
@@ -5995,6 +7005,7 @@ mod tests {
             true,
             DEFAULT_ROWS_PER_THREAD,
             1,
+            TransactionGranularity::Bulk,
             std::slice::from_ref(&row),
             std::slice::from_ref(&receipt),
         ));
@@ -6006,6 +7017,48 @@ mod tests {
             false,
             DEFAULT_ROWS_PER_THREAD,
             1,
+            TransactionGranularity::Bulk,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&receipt),
+        ));
+    }
+
+    #[test]
+    fn one_row_measurement_validation_requires_the_v8_retry_policy() {
+        let mut row = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let one_row_policy = retry_policy_receipt_for_granularity(
+            fsqlite_retry_timeout(8, DEFAULT_ROWS_PER_THREAD),
+            false,
+            TransactionGranularity::OneRow,
+        )
+        .expect("one-row validation policy must be representable");
+        row.truth
+            .as_mut()
+            .expect("test row truth")
+            .configuration
+            .retry_policy = Some(one_row_policy);
+        let receipt = row
+            .truth
+            .as_ref()
+            .expect("test row truth")
+            .configuration
+            .clone();
+
+        assert!(!history_evidence_is_invalid(
+            false,
+            false,
+            DEFAULT_ROWS_PER_THREAD,
+            1,
+            TransactionGranularity::OneRow,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&receipt),
+        ));
+        assert!(history_evidence_is_invalid(
+            false,
+            false,
+            DEFAULT_ROWS_PER_THREAD,
+            1,
+            TransactionGranularity::Bulk,
             std::slice::from_ref(&row),
             std::slice::from_ref(&receipt),
         ));
@@ -6060,6 +7113,120 @@ mod tests {
         assert_eq!(waits[0], Duration::from_millis(4));
         assert_eq!(waits[7], Duration::from_millis(6));
         assert_eq!(waits[39], Duration::from_millis(25));
+    }
+
+    #[test]
+    fn one_row_retry_budgets_share_one_expiring_worker_deadline() {
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test instant must support a two-second lookback");
+        let deadline = OneRowWorkerRetryDeadline::with_started(started, Duration::from_secs(1));
+        let mut first_row = deadline.fsqlite_budget();
+        let mut later_row = deadline.fsqlite_budget();
+
+        assert!(first_row.next_wait(0).is_none());
+        assert!(later_row.next_wait(0).is_none());
+        assert!(!deadline.allows_retry(0));
+        assert_eq!(first_row.attempts(), 0);
+        assert_eq!(later_row.attempts(), 0);
+    }
+
+    #[test]
+    fn collect_contract_receipts_bind_the_actual_counterbalanced_execution_order() {
+        let observed = std::cell::RefCell::new(Vec::new());
+        let (_, _, receipts) = collect_contract(
+            3,
+            || {
+                observed.borrow_mut().push("csqlite_null_a".to_owned());
+                Ok(sample_result(1, 1, 0))
+            },
+            || {
+                observed.borrow_mut().push("csqlite_null_b".to_owned());
+                Ok(sample_result(1, 1, 0))
+            },
+            || {
+                observed.borrow_mut().push("csqlite_baseline".to_owned());
+                Ok(sample_result(1, 1, 0))
+            },
+            || {
+                observed.borrow_mut().push("fsqlite_candidate".to_owned());
+                Ok(sample_result(1, 1, 0))
+            },
+        )
+        .expect("counterbalanced contract collection must complete");
+
+        assert!(round_order_receipts_are_valid(&receipts, 3));
+        let receipted = receipts
+            .iter()
+            .flat_map(|receipt| receipt.execution_order.iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(observed.into_inner(), receipted);
+    }
+
+    #[test]
+    fn one_row_failure_policy_retries_only_known_rolled_back_state() {
+        assert_eq!(
+            one_row_failure_disposition(OneRowRetryStage::Begin, true, None),
+            OneRowFailureDisposition::Retry
+        );
+        assert_eq!(
+            one_row_failure_disposition(OneRowRetryStage::Insert, true, Some(true)),
+            OneRowFailureDisposition::Retry
+        );
+        assert_eq!(
+            one_row_failure_disposition(OneRowRetryStage::Commit, true, Some(true)),
+            OneRowFailureDisposition::Retry
+        );
+        assert_eq!(
+            one_row_failure_disposition(OneRowRetryStage::Commit, true, Some(false)),
+            OneRowFailureDisposition::FailClosed
+        );
+        assert_eq!(
+            one_row_failure_disposition(OneRowRetryStage::Insert, false, Some(true)),
+            OneRowFailureDisposition::FailClosed
+        );
+        assert_eq!(
+            one_row_failure_disposition(OneRowRetryStage::Begin, true, Some(true)),
+            OneRowFailureDisposition::FailClosed
+        );
+    }
+
+    #[test]
+    fn one_row_workloads_commit_exact_separate_table_state() {
+        let threads = 2;
+        let rows_per_thread = 3;
+        let retry_timeout = fsqlite_retry_timeout(threads, rows_per_thread);
+        let sqlite = run_rusqlite(
+            threads,
+            rows_per_thread,
+            true,
+            TransactionGranularity::OneRow,
+            retry_timeout,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+        )
+        .expect("C SQLite one-row workload must complete");
+        let fsqlite = run_fsqlite(
+            threads,
+            rows_per_thread,
+            true,
+            TransactionGranularity::OneRow,
+            retry_timeout,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+        )
+        .expect("FrankenSQLite one-row workload must complete");
+
+        for (engine, result) in [("C SQLite", sqlite), ("FrankenSQLite", fsqlite)] {
+            assert!(
+                result.correctness_valid(),
+                "{engine} one-row state/oracle proof failed: {result:#?}"
+            );
+            assert_eq!(result.accounting.offered_writes, 6, "{engine}");
+            assert_eq!(result.accounting.succeeded_writes, 6, "{engine}");
+            assert_eq!(result.accounting.failed_writes, 0, "{engine}");
+            assert_eq!(result.committed_state.expected_rows, 6, "{engine}");
+            assert_eq!(result.committed_state.observed_rows, 6, "{engine}");
+            assert_eq!(result.committed_state.integrity_check, ["ok"], "{engine}");
+        }
     }
 
     #[test]

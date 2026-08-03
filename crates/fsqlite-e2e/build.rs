@@ -53,6 +53,23 @@ fn emit(name: &str, value: impl AsRef<str>) {
     println!("cargo:rustc-env={name}={}", single_line(value.as_ref()));
 }
 
+fn optional_lower_sha256_environment(name: &str) -> String {
+    let Some(value) = env::var_os(name) else {
+        return String::new();
+    };
+    let value = value.into_string().unwrap_or_else(|_| {
+        panic!("{name} must be valid UTF-8 when supplied");
+    });
+    assert!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{name} must be exactly 64 lowercase hexadecimal characters when supplied"
+    );
+    value
+}
+
 fn selected_profile_from_out_dir() -> String {
     env::var_os("OUT_DIR")
         .map(std::path::PathBuf::from)
@@ -260,6 +277,10 @@ fn main() {
         hex_bytes(native_build_override_environment().as_bytes()),
     );
     emit(
+        "FSQLITE_BENCH_BUILD_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256",
+        optional_lower_sha256_environment("FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256"),
+    );
+    emit(
         "FSQLITE_BENCH_BUILD_RUSTC_VERSION",
         command_stdout(&rustc, &["--version", "--verbose"]).unwrap_or_else(|| "unknown".to_owned()),
     );
@@ -318,6 +339,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=FSQLITE_BENCH_BUILD_NONCE");
     println!("cargo:rerun-if-env-changed=FSQLITE_BENCH_PROFILE_NAME");
+    println!("cargo:rerun-if-env-changed=FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256");
     for profile in ["RELEASE", "RELEASE_PERF"] {
         for key in [
             "OPT_LEVEL",
