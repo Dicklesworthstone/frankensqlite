@@ -204,21 +204,43 @@ fn quoting_double_quoted_column_reference() {
     });
 }
 
-/// SQLite's DQS (mis)feature: a double-quoted token matching no identifier is
-/// treated as a string literal. frank is stricter and errors. Tracked in
-/// bd-hrz7y (low priority — frank's behavior is arguably preferable).
+/// v0.2 deliberately rejects SQLite's legacy DQS fallback: a double-quoted
+/// token matching no identifier is not reinterpreted as a string literal.
+/// Ordinary double-quoted identifiers remain valid. See GH #148.
 #[test]
-#[ignore = "bd-hrz7y: double-quoted-string fallback (DQS) not supported; frank errors instead"]
 fn quoting_double_quoted_string_fallback() {
     asupersync::test_utils::run_test(|| async {
-        scenario(
-            &[
-                "CREATE TABLE t (a INTEGER, b TEXT)",
-                "INSERT INTO t VALUES (1,'x'),(2,'y')",
-            ],
-            &["SELECT \"no_such\" FROM t"],
-            "quoting_double_quoted_string_fallback",
-        )
-        .await;
+        let f = Connection::open(":memory:").await.expect("open frank");
+        let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        for statement in [
+            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "INSERT INTO t VALUES (1,'x'),(2,'y')",
+        ] {
+            f.execute(statement).await.expect("set up frank");
+            r.execute_batch(statement).expect("set up rusqlite");
+        }
+
+        let legacy_sql = "SELECT \"no_such\" FROM t ORDER BY a";
+        assert_eq!(
+            sqlite_rows(&r, legacy_sql).expect("legacy SQLite DQS fallback"),
+            vec![vec!["'no_such'".to_owned()], vec!["'no_such'".to_owned()]],
+            "stock SQLite must retain its legacy DQS fallback for this policy contrast"
+        );
+        let frank_error = frank_rows(&f, legacy_sql)
+            .await
+            .expect_err("FrankenSQLite must reject an unresolved quoted identifier");
+        assert!(
+            frank_error.contains("no_such"),
+            "rejection must identify the unresolved quoted token: {frank_error}"
+        );
+
+        let identifier_sql = "SELECT \"b\" FROM t ORDER BY a";
+        assert_eq!(
+            frank_rows(&f, identifier_sql)
+                .await
+                .expect("FrankenSQLite quoted identifier"),
+            sqlite_rows(&r, identifier_sql).expect("SQLite quoted identifier"),
+            "ordinary double-quoted identifiers remain supported"
+        );
     });
 }

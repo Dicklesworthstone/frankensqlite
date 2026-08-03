@@ -69,14 +69,19 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   3 (UTF-16be) fail closed as unsupported instead of being decoded, modified,
   checkpointed, or exported with lossy text. Convert them to UTF-8 with stock
   SQLite before opening them in FrankenSQLite. BLOB bytes are unaffected.
+- **Legacy SQLite double-quoted-string fallback is intentionally unsupported.**
+  FrankenSQLite always interprets double-quoted tokens as identifiers. An
+  unresolved `"token"` therefore returns an identifier-resolution error, whereas
+  legacy-enabled SQLite may treat it as the string literal `token`. Use
+  single-quoted SQL string literals. Ordinary double-quoted identifiers remain
+  supported ([#148](https://github.com/Dicklesworthstone/frankensqlite/issues/148)).
 
 ### Added
 
 - **MySQL-style skip scan.** Composite indexes are now usable when the leading
   column has no equality constraint, by iterating its distinct values. Covers
   `WHERE b = <const>` on a 2-column index, `IS NULL`, inclusive and exclusive
-  lower bounds, no-lower ranges (`b < k` / `b <= k`), general ranges, and
-  indexes wider than two columns. `SKIP_SCAN_WALK_PROBES` adaptively walks
+  bounds, and indexes wider than two columns. `SKIP_SCAN_WALK_PROBES` adaptively walks
   before seeking so the optimization degrades gracefully on low-cardinality
   leading columns.
 - Skip scans stream a satisfied `ORDER BY` without materializing a sorter, and
