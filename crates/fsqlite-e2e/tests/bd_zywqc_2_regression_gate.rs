@@ -1,9 +1,16 @@
 //! Contract tests for the bd-zywqc.2 performance regression guard.
 //!
-//! These tests invoke the real shell analyzer against complete, v7-shaped
-//! benchmark evidence. They deliberately avoid running the benchmark itself.
+//! These tests invoke the real shell analyzer against complete v9 evidence and
+//! exercise its measured path with a fake Cargo executable. They never run the
+//! benchmark itself.
 
 #![cfg(unix)]
+
+// Retain the former v7 fixture suite as historical executable documentation.
+// The active gate rejects v7, so these tests are intentionally not compiled.
+#[rustfmt::skip]
+#[cfg(any())]
+mod legacy_v7 {
 
 use std::fs;
 use std::io::Write;
@@ -193,8 +200,9 @@ fn measured_shell_output_with_fake_cargo(
     let fake_cargo = fake_bin.join("cargo");
     fs::write(
         &fake_cargo,
-        r#"#!/usr/bin/env bash
+r#"#!/usr/bin/env bash
 set -euo pipefail
+[[ "$PWD" == "$FSQLITE_FAKE_REPO_ROOT" ]]
 if [[ "${1:-}" == "-V" ]]; then
     printf '%s\n' 'cargo fixture'
     exit 0
@@ -2205,4 +2213,1315 @@ fn explicit_capture_refuses_a_broken_baseline_symlink() {
         !missing_target.exists(),
         "capture must not follow a broken baseline symlink and create its target"
     );
+}
+
+}
+
+mod v9 {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::{Value, json};
+    use sha2::{Digest as _, Sha256};
+    use tempfile::TempDir;
+
+    const ITERATIONS: usize = 21;
+    const ROWS_PER_THREAD: usize = 500;
+    const REPORT_SCHEMA: &str = "fsqlite-e2e.mt_mvcc_bench_report.v9";
+    const BASELINE_SCHEMA: &str = "fsqlite.perf_regression_gate.baseline.v6";
+    const GATE_SCHEMA: &str = "fsqlite.perf_regression_gate.result.v5";
+    const FIXTURE_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EXECUTABLE_SHA256: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const CARGO_LOCK_SHA256: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const NON_CITABLE_REASON: &str = "v9 extends the explicit one-row transaction/retry-unit contract with retryable statement-preparation truth under the shared worker deadline and an exact v2 FSQLite retry identity; it retains an optional build-attested resolved dependency/feature-graph digest, but remains non-citable: bd-uh1fv still requires an external watchdog, sanitized environment, matched retry/deadline semantics, counterbalanced topology receipts, immutable manifest, retained baseline history, and independent verification; a default build also leaves the graph digest unavailable.";
+    const RELEASE_SCOPE: &str = "Narrow same-process, same-host F/C writer-throughput comparison for only this report's attested selected Cargo profile and the requested mt-mvcc-bench workload/configurations; this report does not cover other workloads or platforms, long-term baseline retention, independent reproduction, or overall release eligibility.";
+    const SETTINGS_INTERPRETATION: &str = "Both engines proved the listed effective PRAGMA values; equal names and readbacks do not establish cross-engine semantic equivalence.";
+    const ACCOUNTING_INTERPRETATION: &str = "offered and committed writes share one row unit; attempted_writes counts physical INSERT calls; retried_operations records the existing engine-specific retry unit and is provenance only, not a cross-engine comparison metric.";
+    const TIMING_INTERPRETATION: &str = "workload_elapsed_ns begins only after every worker has opened and proved its effective settings, and ends at the last worker's transaction terminal point before connection teardown; worker_startup_elapsed_ns is reported separately.";
+    const GRAPH_LIMITATION: &str = "available: the lowercase SHA-256 was supplied at build time through the rerun-sensitive FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256 attestation input";
+    const CSQLITE_RETRY_UNIT: &str = "whole one-row BEGIN/INSERT/COMMIT transaction attempt";
+    const FSQLITE_RETRY_UNIT: &str =
+        "statement preparation or whole one-row BEGIN CONCURRENT/INSERT/COMMIT transaction attempt";
+    const CSQLITE_RETRY_ALGORITHM: &str = "csqlite.whole-one-row-transaction.fixed-1ms.busy-or-locked.max-512-or-shared-worker-timeout.v1";
+    const FSQLITE_RETRY_ALGORITHM: &str = "fsqlite.prepare-or-whole-one-row-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-shared-worker-timeout.v2";
+    const V8_FSQLITE_RETRY_UNIT: &str =
+        "whole one-row BEGIN CONCURRENT/INSERT/COMMIT transaction attempt";
+    const V8_FSQLITE_RETRY_ALGORITHM: &str = "fsqlite.whole-one-row-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-shared-worker-timeout.v1";
+    const RETRYABLE_ERRORS: &str = "Busy|BusyRecovery|BusySnapshot|DatabaseLocked|WriteConflict|SerializationFailure|PageBufferCapacityExhausted";
+    const SQLITE_ELAPSED_NS: u64 = 1_000_000_000;
+    static NEXT_RUN_ID: AtomicUsize = AtomicUsize::new(1);
+
+    fn unresolved_release_coverage() -> Value {
+        json!([
+            "32-writer cell",
+            "balanced, write-heavy, and read-heavy macro workloads",
+            "INSERT, SELECT-by-primary-key, and UPDATE micro workloads",
+            "calibration receipt",
+            "synthetic-regression sensitivity proof",
+            "flamegraph evidence",
+            "rolling 30-day retained baselines",
+            "historical baseline/current paired block deltas; this gate uses independent samples",
+            "non-host release platforms",
+            "external watchdog enforcement",
+            "sanitized benchmark environment",
+            "matched cross-engine retry/deadline semantics",
+            "counterbalanced topology receipts",
+            "immutable measurement manifest",
+            "independent verification",
+            "pinned-host enforcement",
+        ])
+    }
+
+    fn assert_diagnostic_only(value: &Value) {
+        assert_eq!(value["release_evidence"], false);
+        assert_eq!(value["release_eligible"], false);
+        assert_eq!(
+            value["unresolved_release_coverage"],
+            unresolved_release_coverage(),
+        );
+    }
+
+    #[derive(Clone)]
+    struct ReportPair {
+        release: Value,
+        release_perf: Value,
+    }
+
+    struct GateRun {
+        output: Output,
+        result_path: PathBuf,
+        run_dir: PathBuf,
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("fsqlite-e2e must live under crates/")
+            .canonicalize()
+            .expect("canonicalize repository root")
+    }
+
+    fn script_path() -> PathBuf {
+        repo_root().join("scripts/perf_regression_gate.sh")
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        lower_hex(&Sha256::digest(bytes))
+    }
+
+    fn lower_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        encoded
+    }
+
+    fn graph_value(target: &str) -> Value {
+        json!({
+            "schema_version": "fsqlite.dependency_feature_graph.v1",
+            "command": [
+                "cargo", "tree", "--locked", "--offline", "-p", "fsqlite-e2e",
+                "-e", "features,no-dev", "--no-default-features", "--target", target,
+            ],
+            "target": target,
+            "tree": "fsqlite-e2e v0.1.0 (${WORKSPACE_ROOT}/crates/fsqlite-e2e)\n",
+        })
+    }
+
+    fn canonical_graph_bytes(graph: &Value) -> Vec<u8> {
+        let object = graph.as_object().expect("graph object");
+        let sorted = object
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut bytes = serde_json::to_vec(&sorted).expect("serialize canonical graph");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn graph_bytes(target: &str) -> Vec<u8> {
+        canonical_graph_bytes(&graph_value(target))
+    }
+
+    fn write_graph(path: &Path, target: &str) -> String {
+        let bytes = graph_bytes(target);
+        fs::write(path, &bytes).expect("write graph fixture");
+        sha256(&bytes)
+    }
+
+    fn write_graph_value(path: &Path, graph: &Value) -> String {
+        let bytes = canonical_graph_bytes(graph);
+        fs::write(path, &bytes).expect("write graph fixture");
+        sha256(&bytes)
+    }
+
+    fn snapshot(digest: &str) -> Value {
+        json!({
+            "sha256": digest,
+            "bytes_read": 3,
+            "metadata_size_bytes": 3,
+            "unix_device": 7,
+            "unix_inode": 11,
+            "error": null,
+        })
+    }
+
+    fn subject_identity(commit: &str, nonce: &str) -> Value {
+        json!({
+            "executable": {
+                "current_exe_path": "/fixture/mt-mvcc-bench",
+                "canonical_path": "/fixture/mt-mvcc-bench",
+                "path_resolution_error": null,
+                "process_id": 42,
+                "before_measurement": snapshot(EXECUTABLE_SHA256),
+                "after_measurement": snapshot(EXECUTABLE_SHA256),
+                "unchanged_during_measurement": true,
+            },
+            "build_source": {
+                "workspace_root": "/fixture/frankensqlite",
+                "git_sha": commit,
+                "git_branch": "main",
+                "git_tree_state": "clean",
+                "build_nonce": nonce,
+                "build_input_tracking": "complete",
+            },
+            "runtime_source": {
+                "before_measurement": runtime_source(commit),
+                "after_measurement": runtime_source(commit),
+                "same_clean_git_identity_at_capture_points": true,
+                "stability_limitation": "fixture captures only before and after identity",
+            },
+            "cargo_lock": {
+                "embedded_build_sha256": CARGO_LOCK_SHA256,
+                "embedded_build_size_bytes": 3,
+                "runtime_path": "/fixture/frankensqlite/Cargo.lock",
+                "before_measurement": snapshot(CARGO_LOCK_SHA256),
+                "after_measurement": snapshot(CARGO_LOCK_SHA256),
+                "before_matches_embedded_build": true,
+                "after_matches_embedded_build": true,
+                "unchanged_at_capture_points": true,
+            },
+        })
+    }
+
+    fn runtime_source(commit: &str) -> Value {
+        json!({
+            "workspace_root": "/fixture/frankensqlite",
+            "canonical_workspace_root": "/fixture/frankensqlite",
+            "git_sha": commit,
+            "git_branch": "main",
+            "git_tree_state": "clean",
+            "matches_build_git_sha": true,
+            "discovery_errors": [],
+        })
+    }
+
+    fn invocation(arguments: &[String]) -> Value {
+        let raw = arguments
+            .iter()
+            .map(|argument| lower_hex(argument.as_bytes()))
+            .collect::<Vec<_>>();
+        let mut canonical = Vec::new();
+        for argument in arguments {
+            canonical.extend_from_slice(
+                &u64::try_from(argument.len())
+                    .expect("argument length fits u64")
+                    .to_le_bytes(),
+            );
+            canonical.extend_from_slice(argument.as_bytes());
+        }
+        json!({
+            "argv_lossy": arguments,
+            "argv_raw_hex": raw,
+            "raw_encoding": "unix_os_str_bytes",
+            "length_prefixed_argv_sha256": sha256(&canonical),
+        })
+    }
+
+    fn build_configuration(profile: &str, target: &str, graph_digest: &str) -> Value {
+        let (selected, label, opt_level) = match profile {
+            "release" => ("release", "release", "z"),
+            "release-perf" => ("release-perf", "release-perf", "3"),
+            _ => panic!("unexpected fixture profile"),
+        };
+        json!({
+            "cargo_profile": "release",
+            "selected_profile": selected,
+            "profile_label": label,
+            "opt_level": opt_level,
+            "debug": "false",
+            "target": target,
+            "build_host": "fixture-host-target",
+            "enabled_features": [],
+            "rustflags": {
+                "cargo_encoded_rustflags_present": false,
+                "encoded_hex": "",
+                "decoded_arguments": [],
+                "decode_error": null,
+            },
+            "profile_overrides_hex": "",
+            "native_build_overrides_hex": "",
+            "rustc_version_verbose": "rustc fixture",
+            "cargo_version": "cargo fixture",
+            "resolved_dependency_feature_graph_sha256": graph_digest,
+            "resolved_dependency_feature_graph_limitation": GRAPH_LIMITATION,
+        })
+    }
+
+    fn measurement_host() -> Value {
+        json!({
+            "host": {
+                "hostname": "fixture-host",
+                "cpu_model": "fixture-cpu",
+                "available_parallelism": 64,
+                "cpu_online": "0-63",
+                "cpu_present": "0-63",
+                "cpu_possible": "0-63",
+                "cpu_isolated": null,
+                "cpu_topology": {
+                    "logical_cpu_directories": 64,
+                    "physical_package_count": 1,
+                    "physical_core_count": 32,
+                },
+                "scaling_governors_by_cpu": {},
+                "kernel_release": "fixture-kernel",
+                "kernel_version": "fixture-version",
+                "numa_online_nodes": "0",
+                "numa_possible_nodes": "0",
+                "numa_node_directories": 1,
+                "unavailable_fields": ["cpu_isolated", "scaling_governors_by_cpu"],
+            },
+            "before_measurement": dynamic_host(1),
+            "after_measurement": dynamic_host(2),
+        })
+    }
+
+    fn dynamic_host(timestamp: usize) -> Value {
+        json!({
+            "unix_epoch_millis": timestamp,
+            "process_cpu_affinity_mask": "ffffffffffffffff",
+            "process_cpu_affinity_list": "0-63",
+            "proc_self_cgroup": "0::/fixture",
+            "cpuset_cpus_effective": "0-63",
+            "cpuset_mems_effective": "0",
+            "load_average": "0.00 0.00 0.00 1/1 1",
+            "pressure_cpu": "some avg10=0.00",
+            "pressure_memory": "some avg10=0.00",
+            "pressure_io": "some avg10=0.00",
+        })
+    }
+
+    fn retry_policy(threads: usize) -> Value {
+        let timeout_ms = (5 + threads * ROWS_PER_THREAD / 5_000) * 1_000;
+        json!({
+            "csqlite_busy_timeout_ms": 5000,
+            "csqlite_max_operation_retries": 0,
+            "csqlite_max_transaction_retries": 512,
+            "csqlite_retry_sleep_ms": 1,
+            "csqlite_retry_unit": CSQLITE_RETRY_UNIT,
+            "csqlite_retry_algorithm": CSQLITE_RETRY_ALGORITHM,
+            "shared_worker_retry_timeout_ms": timeout_ms,
+            "shared_worker_retry_timeout_overridden": false,
+            "fsqlite_transaction_timeout_ms": timeout_ms,
+            "fsqlite_max_transaction_retries": 512,
+            "fsqlite_retry_sleep_base_ms": 1,
+            "fsqlite_retry_sleep_cap_ms": 29,
+            "fsqlite_retry_unit": FSQLITE_RETRY_UNIT,
+            "fsqlite_retry_backoff_algorithm": FSQLITE_RETRY_ALGORITHM,
+            "fsqlite_retryable_errors": RETRYABLE_ERRORS,
+            "fsqlite_timeout_overridden": false,
+        })
+    }
+
+    fn configuration(threads: usize) -> Value {
+        json!({
+            "writers": threads,
+            "available_parallelism": 64,
+            "max_supported_writers": 128,
+            "wal_autocheckpoint_pages": 1000,
+            "wal_autocheckpoint_overridden": false,
+            "offered_writes_per_sample": threads * ROWS_PER_THREAD,
+            "retry_policy": retry_policy(threads),
+            "status": "supported",
+            "comparison_eligible": true,
+            "measured": true,
+            "reason": "complete deterministic v9 contract fixture",
+        })
+    }
+
+    fn settings(concurrent_mode: &str) -> Value {
+        json!({
+            "page_size_bytes": 4096,
+            "journal_mode": "wal",
+            "synchronous": "normal",
+            "cache_size": -64000,
+            "busy_timeout_ms": 5000,
+            "wal_autocheckpoint_pages": 1000,
+            "concurrent_mode": concurrent_mode,
+        })
+    }
+
+    fn sample(threads: usize, elapsed_ns: u64, concurrent_mode: &str) -> Value {
+        let offered = threads * ROWS_PER_THREAD;
+        json!({
+            "worker_startup_elapsed_ns": 1_000_000,
+            "workload_elapsed_ns": elapsed_ns,
+            "settings": settings(concurrent_mode),
+            "accounting": {
+                "offered_writes": offered,
+                "attempted_writes": offered,
+                "succeeded_writes": offered,
+                "retried_operations": 0,
+                "failed_writes": 0,
+                "worker_reported_failed_writes": 0,
+                "exact": true,
+                "diagnostics": [],
+            },
+            "committed_state": {
+                "expected_rows": offered,
+                "observed_rows": offered,
+                "expected_id_sum": 42,
+                "observed_id_sum": 42,
+                "expected_payload_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "observed_payload_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "integrity_check": ["ok"],
+                "valid": true,
+                "diagnostics": [],
+            },
+        })
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn thread_report(threads: usize, fsqlite_elapsed_ns: u64) -> Value {
+        let sqlite_samples = (0..ITERATIONS)
+            .map(|_| sample(threads, SQLITE_ELAPSED_NS, "sqlite_wal_single_writer"))
+            .collect::<Vec<_>>();
+        let fsqlite_samples = (0..ITERATIONS)
+            .map(|_| sample(threads, fsqlite_elapsed_ns, "fsqlite_mvcc_on"))
+            .collect::<Vec<_>>();
+        let offered = (threads * ROWS_PER_THREAD) as f64;
+        let sqlite_wps = offered / (SQLITE_ELAPSED_NS as f64 / 1_000_000_000.0);
+        let fsqlite_wps = offered / (fsqlite_elapsed_ns as f64 / 1_000_000_000.0);
+        let ratio = fsqlite_wps / sqlite_wps;
+        let verdict = if ratio > 1.01 {
+            "FSQLITE_FASTER"
+        } else if ratio < 0.99 {
+            "FSQLITE_SLOWER"
+        } else {
+            "INCONCLUSIVE"
+        };
+        let round_order_receipts = (0..ITERATIONS)
+            .map(|round_index| {
+                let execution_order = if round_index % 2 == 0 {
+                    json!([
+                        "csqlite_null_a",
+                        "csqlite_null_b",
+                        "csqlite_baseline",
+                        "fsqlite_candidate"
+                    ])
+                } else {
+                    json!([
+                        "fsqlite_candidate",
+                        "csqlite_baseline",
+                        "csqlite_null_b",
+                        "csqlite_null_a"
+                    ])
+                };
+                json!({"round_index": round_index, "execution_order": execution_order})
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "threads": threads,
+            "fsqlite_wps_p50": fsqlite_wps,
+            "fsqlite_wps_p95": fsqlite_wps,
+            "fsqlite_wps_p99": fsqlite_wps,
+            "sqlite_wps_p50": sqlite_wps,
+            "sqlite_wps_p95": sqlite_wps,
+            "sqlite_wps_p99": sqlite_wps,
+            "throughput_ratio": ratio,
+            "fsqlite_ms_p50": fsqlite_elapsed_ns as f64 / 1_000_000.0,
+            "fsqlite_ms_p95": fsqlite_elapsed_ns as f64 / 1_000_000.0,
+            "fsqlite_ms_p99": fsqlite_elapsed_ns as f64 / 1_000_000.0,
+            "sqlite_ms_p50": 1000.0,
+            "sqlite_ms_p95": 1000.0,
+            "sqlite_ms_p99": 1000.0,
+            "time_ratio": fsqlite_elapsed_ns as f64 / SQLITE_ELAPSED_NS as f64,
+            "fsqlite_failed_rows": 0,
+            "sqlite_failed_rows": 0,
+            "median_ci_contract": {
+                "null_ratio_median": 1.0,
+                "null_ratio_ci95_low": 1.0,
+                "null_ratio_ci95_high": 1.0,
+                "null_ratio_cv_pct": 0.0,
+                "null_ratio_mad": 0.0,
+                "claim_ratio_median": ratio,
+                "claim_ratio_ci95_low": ratio,
+                "claim_ratio_ci95_high": ratio,
+                "claim_ratio_cv_pct": 0.0,
+                "claim_ratio_mad": 0.0,
+                "null_radius": 0.0,
+                "min_decidable_gain": 1.01,
+                "max_decidable_regression": 0.99,
+                "claim_margin": null,
+                "cv_gate": "never",
+                "verdict": verdict,
+            },
+            "truth": {
+                "configuration": configuration(threads),
+                "round_order_receipts": round_order_receipts,
+                "null_c_a_samples": sqlite_samples.clone(),
+                "null_c_b_samples": sqlite_samples.clone(),
+                "sqlite_samples": sqlite_samples,
+                "fsqlite_samples": fsqlite_samples,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn report(
+        profile: &str,
+        commit: &str,
+        nonce: &str,
+        target: &str,
+        graph_digest: &str,
+        history_path: &str,
+        output_path: &str,
+        elapsed: [u64; 3],
+    ) -> Value {
+        let argv = vec![
+            "mt-mvcc-bench".to_owned(),
+            "--threads=1,8,16".to_owned(),
+            format!("--rows-per-thread={ROWS_PER_THREAD}"),
+            format!("--iters={ITERATIONS}"),
+            "--separate-tables".to_owned(),
+            "--one-row-per-transaction".to_owned(),
+            format!("--history-json={history_path}"),
+            format!("--json-output={output_path}"),
+        ];
+        json!({
+            "schema_version": REPORT_SCHEMA,
+            "citable": false,
+            "measurement_evidence_valid": true,
+            "non_citable_reason": NON_CITABLE_REASON,
+            "release_regression_scope": RELEASE_SCOPE,
+            "subject_identity": subject_identity(commit, nonce),
+            "comparison_environment": {
+                "build_configuration": build_configuration(profile, target, graph_digest),
+                "invocation": invocation(&argv),
+                "measurement_host": measurement_host(),
+            },
+            "settings_interpretation": SETTINGS_INTERPRETATION,
+            "accounting_interpretation": ACCOUNTING_INTERPRETATION,
+            "timing_interpretation": TIMING_INTERPRETATION,
+            "workload_shape": "separate_tables",
+            "transaction_contract": {
+                "granularity": "one_row_per_transaction",
+                "rows_per_transaction": 1,
+                "prepared_statement_scope": "one successfully prepared statement per worker, reused across row transactions; transient preparation failures retry under the shared worker deadline",
+                "duplicate_after_ambiguous_commit_policy": "fail_closed; a duplicate is never accepted as proof of exact id+payload",
+                "csqlite_retry_unit": CSQLITE_RETRY_UNIT,
+                "fsqlite_retry_unit": FSQLITE_RETRY_UNIT,
+            },
+            "rows_per_thread": ROWS_PER_THREAD,
+            "iterations": ITERATIONS,
+            "configuration_receipts": [configuration(1), configuration(8), configuration(16)],
+            "thread_results": [
+                thread_report(1, elapsed[0]),
+                thread_report(8, elapsed[1]),
+                thread_report(16, elapsed[2]),
+            ],
+            "pass_over_pass_gate": {
+                "schema_version": "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1",
+                "history_json_path": history_path,
+                "threshold_ratio_drop_pct": 5.0,
+                "status": "disabled_non_citable",
+                "previous_report_found": false,
+                "comparable_pair_count": 0,
+                "regressions": [],
+            },
+        })
+    }
+
+    fn fixture_pair(fixture: &TempDir, elapsed: [u64; 3]) -> (ReportPair, PathBuf) {
+        let graph_path = fixture.path().join("graph.json");
+        let digest = write_graph(&graph_path, "fixture-target");
+        let release = report(
+            "release",
+            FIXTURE_COMMIT,
+            "fixture-release-nonce",
+            "fixture-target",
+            &digest,
+            "fixture-release-history.json",
+            "fixture-release-output.json",
+            elapsed,
+        );
+        let release_perf = report(
+            "release-perf",
+            FIXTURE_COMMIT,
+            "fixture-release-perf-nonce",
+            "fixture-target",
+            &digest,
+            "fixture-release-perf-history.json",
+            "fixture-release-perf-output.json",
+            elapsed,
+        );
+        (
+            ReportPair {
+                release,
+                release_perf,
+            },
+            graph_path,
+        )
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create JSON parent");
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(value).expect("serialize JSON"),
+        )
+        .expect("write JSON");
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_slice(&fs::read(path).expect("read JSON")).expect("parse JSON")
+    }
+
+    fn gate_run(fixture: &TempDir, pair: &ReportPair, graph_path: &Path, capture: bool) -> GateRun {
+        let run_id = format!(
+            "v9-contract-{}",
+            NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let release_path = fixture.path().join("input.release.json");
+        let release_perf_path = fixture.path().join("input.release-perf.json");
+        write_json(&release_path, &pair.release);
+        write_json(&release_perf_path, &pair.release_perf);
+        let target = fixture.path().join("target");
+        let run_dir = target.join("regression_gate_runs").join(&run_id);
+        let mut command = Command::new("bash");
+        command
+            .env("FSQLITE_REGGATE_RUN_ID", &run_id)
+            .arg(script_path())
+            .arg("--analyze-only-release")
+            .arg(&release_path)
+            .arg("--analyze-only-release-perf")
+            .arg(&release_perf_path)
+            .arg("--graph-artifact")
+            .arg(graph_path)
+            .arg("--expected-commit")
+            .arg(FIXTURE_COMMIT)
+            .arg("--target-dir")
+            .arg(&target)
+            .arg("--baseline-dir")
+            .arg(fixture.path().join("baselines"))
+            .arg("--rows")
+            .arg(ROWS_PER_THREAD.to_string())
+            .arg("--max-drop-16t")
+            .arg("0.10")
+            .arg("--max-scaling-drop-8-over-1")
+            .arg("0.10")
+            .arg("--max-scaling-drop-16-over-8")
+            .arg("0.10");
+        if capture {
+            command.arg("--capture-baseline");
+        }
+        GateRun {
+            output: command.output().expect("run v9 gate"),
+            result_path: run_dir.join("result.json"),
+            run_dir,
+        }
+    }
+
+    fn output_detail(run: &GateRun) -> String {
+        format!(
+            "status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.output.status.code(),
+            String::from_utf8_lossy(&run.output.stdout),
+            String::from_utf8_lossy(&run.output.stderr),
+        )
+    }
+
+    fn capture(fixture: &TempDir, pair: &ReportPair, graph: &Path) {
+        let run = gate_run(fixture, pair, graph, true);
+        assert_eq!(run.output.status.code(), Some(0), "{}", output_detail(&run));
+        let result = read_json(&run.result_path);
+        assert_eq!(result["schema_version"], GATE_SCHEMA);
+        assert_eq!(result["verdict"], "baseline_captured");
+        assert_diagnostic_only(&result);
+        assert!(
+            result["diagnostic_margin_policy"]["16t_absolute"]["source"]
+                .as_str()
+                .expect("16t margin source")
+                .contains("acceptance-owner value remains unresolved"),
+        );
+        let baseline = read_json(&fixture.path().join("baselines/latest.json"));
+        assert_eq!(baseline["schema_version"], BASELINE_SCHEMA);
+        assert!(baseline["profiles"]["release"]["report"].is_object());
+        assert!(baseline["profiles"]["release-perf"]["report"].is_object());
+        assert_diagnostic_only(&baseline);
+        assert!(run.run_dir.join("current.release.json").is_file());
+        assert!(run.run_dir.join("current.release-perf.json").is_file());
+        assert!(run.run_dir.join("dependency-feature-graph.json").is_file());
+    }
+
+    fn assert_invalid(pair: &ReportPair, mutation_label: &str) -> String {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (_, graph) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        let run = gate_run(&fixture, pair, &graph, true);
+        assert_eq!(
+            run.output.status.code(),
+            Some(2),
+            "mutation={mutation_label}\n{}",
+            output_detail(&run),
+        );
+        let result = read_json(&run.result_path);
+        assert_eq!(result["verdict"], "invalid_evidence");
+        assert_diagnostic_only(&result);
+        result["error"]
+            .as_str()
+            .expect("invalid evidence error")
+            .to_owned()
+    }
+
+    #[test]
+    fn capture_binds_both_profiles_graph_and_unresolved_release_scope() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (pair, graph) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        capture(&fixture, &pair, &graph);
+    }
+
+    #[test]
+    fn unchanged_dual_profile_comparison_passes_as_diagnostic_only() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (pair, graph) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        capture(&fixture, &pair, &graph);
+        let run = gate_run(&fixture, &pair, &graph, false);
+        assert_eq!(run.output.status.code(), Some(0), "{}", output_detail(&run));
+        let result = read_json(&run.result_path);
+        assert_diagnostic_only(&result);
+        assert_eq!(result["guard_status"], "passed");
+        assert_eq!(result["verdict"], "diagnostic_only");
+        assert_eq!(
+            result["absolute_comparisons"]
+                .as_array()
+                .expect("absolute comparisons")
+                .len(),
+            6,
+        );
+        assert_eq!(
+            result["scaling_comparisons"]
+                .as_array()
+                .expect("scaling comparisons")
+                .len(),
+            4,
+        );
+        assert!(
+            result["absolute_comparisons"]
+                .as_array()
+                .expect("absolute comparisons")
+                .iter()
+                .all(|comparison| comparison["sampling_design"]
+                    == "independent_two_sample_bootstrap"),
+        );
+    }
+
+    #[test]
+    fn baseline_and_current_dependency_graphs_are_attested_independently() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (baseline, baseline_graph) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        capture(&fixture, &baseline, &baseline_graph);
+
+        let mut current_graph = graph_value("fixture-target");
+        current_graph["tree"] = json!(
+            "fsqlite-e2e v0.1.0 (${WORKSPACE_ROOT}/crates/fsqlite-e2e)\n+-- comparator-only-dependency v1.0.0\n"
+        );
+        let current_graph_path = fixture.path().join("current-graph.json");
+        let current_graph_digest = write_graph_value(&current_graph_path, &current_graph);
+        let mut current = baseline.clone();
+        for report in [&mut current.release, &mut current.release_perf] {
+            report["comparison_environment"]["build_configuration"]["resolved_dependency_feature_graph_sha256"] =
+                json!(current_graph_digest.clone());
+        }
+
+        let run = gate_run(&fixture, &current, &current_graph_path, false);
+        assert_eq!(run.output.status.code(), Some(0), "{}", output_detail(&run));
+        let result = read_json(&run.result_path);
+        assert_diagnostic_only(&result);
+        assert_ne!(
+            result["baseline_dependency_feature_graph_sha256"],
+            result["current_dependency_feature_graph_sha256"],
+        );
+        assert_eq!(result["guard_status"], "passed");
+    }
+
+    #[test]
+    fn baseline_envelope_paths_are_typed_and_bound_in_analyze_only_mode() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (pair, graph) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        capture(&fixture, &pair, &graph);
+
+        let baseline_dir = fixture.path().join("baselines");
+        let mut baseline = read_json(&baseline_dir.join("latest.json"));
+        baseline["profiles"]["release"]["report_history_json_path"] = json!(false);
+        let mut payload = serde_json::to_vec_pretty(&baseline).expect("serialize forged baseline");
+        payload.push(b'\n');
+        let digest = sha256(&payload);
+        fs::rename(&baseline_dir, fixture.path().join("original-baselines"))
+            .expect("retain original baseline directory");
+        fs::create_dir_all(baseline_dir.join("versions"))
+            .expect("create forged baseline versions directory");
+        let version = baseline_dir.join("versions").join(format!("{digest}.json"));
+        fs::write(&version, payload).expect("write forged content-addressed baseline");
+        fs::hard_link(&version, baseline_dir.join("latest.json"))
+            .expect("publish forged baseline hard link");
+
+        let run = gate_run(&fixture, &pair, &graph, false);
+        assert_eq!(run.output.status.code(), Some(2), "{}", output_detail(&run));
+        let result = read_json(&run.result_path);
+        assert_diagnostic_only(&result);
+        assert!(
+            result["error"]
+                .as_str()
+                .expect("invalid evidence error")
+                .contains("report_history_json_path must be a non-empty string"),
+        );
+    }
+
+    #[test]
+    fn active_gate_rejects_prior_schemas_and_requires_both_exact_profiles() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["schema_version"] = json!("fsqlite-e2e.mt_mvcc_bench_report.v7");
+        assert!(assert_invalid(&pair, "v7 schema").contains("prior schemas are not accepted"));
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["schema_version"] = json!("fsqlite-e2e.mt_mvcc_bench_report.v8");
+        assert!(assert_invalid(&pair, "v8 schema").contains("prior schemas are not accepted"));
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release_perf = pair.release.clone();
+        assert!(assert_invalid(&pair, "duplicated release profile").contains("release-perf"));
+    }
+
+    #[test]
+    fn graph_attestation_and_intended_commit_are_fail_closed() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["comparison_environment"]["build_configuration"]["resolved_dependency_feature_graph_sha256"] =
+            json!("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+        assert!(assert_invalid(&pair, "graph digest").contains("exact retained"));
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["subject_identity"]["build_source"]["git_sha"] =
+            json!("dddddddddddddddddddddddddddddddddddddddd");
+        for point in ["before_measurement", "after_measurement"] {
+            pair.release["subject_identity"]["runtime_source"][point]["git_sha"] =
+                json!("dddddddddddddddddddddddddddddddddddddddd");
+        }
+        assert!(assert_invalid(&pair, "intended commit").contains("intended commit"));
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["subject_identity"]["build_source"]["git_sha"] = json!("not-a-git-sha");
+        assert!(assert_invalid(&pair, "malformed Git SHA").contains("Git object ID"));
+    }
+
+    #[test]
+    fn integer_contract_fields_reject_boolean_and_floating_point_aliases() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["rows_per_thread"] = json!(false);
+        assert!(assert_invalid(&pair, "boolean rows").contains("must be an integer"));
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["configuration_receipts"][0]["max_supported_writers"] = json!(128.0);
+        pair.release["thread_results"][0]["truth"]["configuration"] =
+            pair.release["configuration_receipts"][0].clone();
+        assert!(
+            assert_invalid(&pair, "floating max writers")
+                .contains("max_supported_writers must be an integer"),
+        );
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["thread_results"][0]["truth"]["sqlite_samples"][0]["accounting"]["failed_writes"] =
+            json!(false);
+        assert!(assert_invalid(&pair, "boolean failed writes").contains("must be an integer"));
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        for field in ["expected_id_sum", "observed_id_sum"] {
+            pair.release["thread_results"][0]["truth"]["sqlite_samples"][0]["committed_state"]
+                [field] = json!(true);
+        }
+        assert!(assert_invalid(&pair, "boolean id sums").contains("must be an integer"));
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["thread_results"][0]["truth"]["round_order_receipts"][0]["round_index"] =
+            json!(0.0);
+        assert!(assert_invalid(&pair, "floating round index").contains("must be the integer 0"),);
+    }
+
+    #[test]
+    fn host_receipts_require_complete_typed_topology_and_dynamic_fields() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["comparison_environment"]["measurement_host"]["host"]["cpu_topology"]
+            .as_object_mut()
+            .expect("topology object")
+            .remove("logical_cpu_directories");
+        assert!(
+            assert_invalid(&pair, "missing topology")
+                .contains("logical_cpu_directories must be present"),
+        );
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["comparison_environment"]["measurement_host"]["host"]["scaling_governors_by_cpu"] =
+            json!({"cpu0": false});
+        pair.release["comparison_environment"]["measurement_host"]["host"]["unavailable_fields"] =
+            json!(["cpu_isolated"]);
+        assert!(assert_invalid(&pair, "malformed governor").contains("non-empty string"));
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["comparison_environment"]["measurement_host"]["host"]["unavailable_fields"] =
+            json!(["cpu_isolated"]);
+        assert!(
+            assert_invalid(&pair, "contradictory unavailable fields")
+                .contains("unavailable_fields"),
+        );
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["comparison_environment"]["measurement_host"]["before_measurement"]
+            .as_object_mut()
+            .expect("dynamic host object")
+            .remove("load_average");
+        assert!(
+            assert_invalid(&pair, "missing load receipt").contains("load_average must be present"),
+        );
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["comparison_environment"]["measurement_host"]["after_measurement"]["pressure_cpu"] =
+            json!("");
+        assert!(assert_invalid(&pair, "empty pressure receipt").contains("non-empty string"));
+    }
+
+    #[test]
+    fn transaction_shared_deadline_and_round_order_receipts_are_exact() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["transaction_contract"]["rows_per_transaction"] = json!(2);
+        assert!(assert_invalid(&pair, "transaction granularity").contains("must be the integer 1"),);
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["configuration_receipts"][2]["retry_policy"]["shared_worker_retry_timeout_ms"] =
+            json!(5000);
+        pair.release["thread_results"][2]["truth"]["configuration"] =
+            pair.release["configuration_receipts"][2].clone();
+        assert!(
+            assert_invalid(&pair, "shared deadline").contains("shared_worker_retry_timeout_ms"),
+        );
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["thread_results"][0]["truth"]["round_order_receipts"][1]["execution_order"] =
+            json!([
+                "csqlite_null_a",
+                "csqlite_null_b",
+                "csqlite_baseline",
+                "fsqlite_candidate",
+            ]);
+        assert!(assert_invalid(&pair, "round order").contains("round_order_receipts"));
+    }
+
+    #[test]
+    fn v9_rejects_the_v8_transaction_only_retry_contract() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        pair.release["transaction_contract"]["fsqlite_retry_unit"] = json!(V8_FSQLITE_RETRY_UNIT);
+        for index in 0..3 {
+            pair.release["configuration_receipts"][index]["retry_policy"]["fsqlite_retry_unit"] =
+                json!(V8_FSQLITE_RETRY_UNIT);
+            pair.release["thread_results"][index]["truth"]["configuration"] =
+                pair.release["configuration_receipts"][index].clone();
+        }
+        assert!(
+            assert_invalid(&pair, "v8 transaction-only retry unit")
+                .contains("transaction_contract.fsqlite_retry_unit"),
+        );
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (mut pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        for index in 0..3 {
+            pair.release["configuration_receipts"][index]["retry_policy"]["fsqlite_retry_backoff_algorithm"] =
+                json!(V8_FSQLITE_RETRY_ALGORITHM);
+            pair.release["thread_results"][index]["truth"]["configuration"] =
+                pair.release["configuration_receipts"][index].clone();
+        }
+        assert!(
+            assert_invalid(&pair, "v8 transaction-only retry algorithm")
+                .contains("retry_policy.fsqlite_retry_backoff_algorithm"),
+        );
+    }
+
+    #[test]
+    fn any_profile_cell_regression_fails_the_combined_verdict() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (baseline, graph) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        capture(&fixture, &baseline, &graph);
+        let (mut current, _) = fixture_pair(
+            &fixture,
+            [SQLITE_ELAPSED_NS, 1_250_000_000, SQLITE_ELAPSED_NS],
+        );
+        current.release = baseline.release;
+        let run = gate_run(&fixture, &current, &graph, false);
+        assert_eq!(run.output.status.code(), Some(1), "{}", output_detail(&run));
+        let result = read_json(&run.result_path);
+        assert_diagnostic_only(&result);
+        assert_eq!(result["guard_status"], "failed");
+        assert!(
+            result["absolute_comparisons"]
+                .as_array()
+                .expect("absolute comparisons")
+                .iter()
+                .any(|comparison| comparison["profile"] == "release-perf"
+                    && comparison["threads"] == 8
+                    && comparison["status"] == "regression"),
+        );
+    }
+
+    #[test]
+    fn scaling_retention_is_independent_and_combined_with_absolute_cells() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let (baseline, graph) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        capture(&fixture, &baseline, &graph);
+        let (current, _) = fixture_pair(
+            &fixture,
+            [SQLITE_ELAPSED_NS, 500_000_000, SQLITE_ELAPSED_NS],
+        );
+        let run = gate_run(&fixture, &current, &graph, false);
+        assert_eq!(run.output.status.code(), Some(1), "{}", output_detail(&run));
+        let result = read_json(&run.result_path);
+        assert_diagnostic_only(&result);
+        assert!(
+            result["scaling_comparisons"]
+                .as_array()
+                .expect("scaling comparisons")
+                .iter()
+                .any(|comparison| comparison["scaling"] == "16/8"
+                    && comparison["sampling_design"] == "independent_four_sample_bootstrap"
+                    && comparison["status"] == "regression"),
+        );
+    }
+
+    #[test]
+    fn unset_new_policy_margins_are_rejected_before_analysis() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let output = Command::new("bash")
+            .env("FSQLITE_REGGATE_RUN_ID", "missing-policy-margins")
+            .arg(script_path())
+            .arg("--target-dir")
+            .arg(fixture.path().join("target"))
+            .arg("--baseline-dir")
+            .arg(fixture.path().join("baselines"))
+            .output()
+            .expect("run gate without policy margins");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("--max-drop-16t must be an explicit finite fraction"),
+        );
+    }
+
+    #[test]
+    fn analyze_only_normalizes_relative_paths_before_entering_repo_root() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let foreign = fixture.path().join("foreign-working-directory");
+        let inputs = foreign.join("inputs");
+        fs::create_dir_all(&inputs).expect("create relative-path fixture inputs");
+        let (pair, _) = fixture_pair(&fixture, [SQLITE_ELAPSED_NS; 3]);
+        write_json(&inputs.join("release.json"), &pair.release);
+        write_json(&inputs.join("release-perf.json"), &pair.release_perf);
+        let run_id = "v9-relative-analyze-only-paths";
+        let output = Command::new("bash")
+            .current_dir(&foreign)
+            .env("FSQLITE_REGGATE_RUN_ID", run_id)
+            .arg(script_path())
+            .arg("--capture-baseline")
+            .arg("--analyze-only-release")
+            .arg("inputs/release.json")
+            .arg("--analyze-only-release-perf")
+            .arg("inputs/release-perf.json")
+            .arg("--graph-artifact")
+            .arg("../graph.json")
+            .arg("--expected-commit")
+            .arg(FIXTURE_COMMIT)
+            .arg("--target-dir")
+            .arg("relative-target")
+            .arg("--baseline-dir")
+            .arg("relative-baselines")
+            .arg("--rows")
+            .arg(ROWS_PER_THREAD.to_string())
+            .arg("--max-drop-16t")
+            .arg("0.10")
+            .arg("--max-scaling-drop-8-over-1")
+            .arg("0.10")
+            .arg("--max-scaling-drop-16-over-8")
+            .arg("0.10")
+            .output()
+            .expect("run analyze-only gate from foreign working directory");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let result = read_json(
+            &foreign
+                .join("relative-target/regression_gate_runs")
+                .join(run_id)
+                .join("result.json"),
+        );
+        assert_diagnostic_only(&result);
+        assert!(foreign.join("relative-baselines/latest.json").is_file());
+    }
+
+    fn rustc_host() -> String {
+        let output = Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .expect("query rustc host");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 rustc output")
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .expect("rustc host line")
+            .to_owned()
+    }
+
+    // The embedded fake-Cargo script intentionally contains Bash `${...}`
+    // parameter expansions, which are not Rust formatting placeholders.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn measured_fake_cargo_run(
+        fixture: &TempDir,
+        run_id: &str,
+        create_history_profile: Option<&str>,
+    ) -> Output {
+        let target_dir = fixture.path().join("target");
+        let run_dir = target_dir.join("regression_gate_runs").join(run_id);
+        let target = rustc_host();
+        let expected_graph_bytes = graph_bytes(&target);
+        let graph_digest = sha256(&expected_graph_bytes);
+        let commit = FIXTURE_COMMIT;
+        let release_history = run_dir.join("disposable_history.release.json");
+        let release_output = run_dir.join("current.release.json");
+        let release_perf_history = run_dir.join("disposable_history.release-perf.json");
+        let release_perf_output = run_dir.join("current.release-perf.json");
+        let release_report = report(
+            "release",
+            commit,
+            &format!("{run_id}.release"),
+            &target,
+            &graph_digest,
+            &release_history.to_string_lossy(),
+            &release_output.to_string_lossy(),
+            [SQLITE_ELAPSED_NS; 3],
+        );
+        let release_perf_report = report(
+            "release-perf",
+            commit,
+            &format!("{run_id}.release-perf"),
+            &target,
+            &graph_digest,
+            &release_perf_history.to_string_lossy(),
+            &release_perf_output.to_string_lossy(),
+            [SQLITE_ELAPSED_NS; 3],
+        );
+        let release_fixture = fixture.path().join("fake-release.json");
+        let release_perf_fixture = fixture.path().join("fake-release-perf.json");
+        write_json(&release_fixture, &release_report);
+        write_json(&release_perf_fixture, &release_perf_report);
+
+        let fake_bin = fixture.path().join("fake-bin");
+        fs::create_dir_all(&fake_bin).expect("create fake bin");
+        let fake_cargo = fake_bin.join("cargo");
+        fs::write(
+            &fake_cargo,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$FSQLITE_FAKE_REPO_ROOT" ]]
+if [[ "${1:-}" == "-V" ]]; then
+    printf '%s\n' 'cargo fixture'
+    exit 0
+fi
+if [[ "${1:-}" == "tree" ]]; then
+    [[ "$*" == *"--locked --offline -p fsqlite-e2e -e features,no-dev --no-default-features --target $FSQLITE_FAKE_TARGET"* ]]
+    printf 'fsqlite-e2e v0.1.0 (%s/crates/fsqlite-e2e)\n' "$FSQLITE_FAKE_REPO_ROOT"
+    exit 0
+fi
+profile="${FSQLITE_BENCH_PROFILE_NAME:-}"
+[[ "$profile" == "release" || "$profile" == "release-perf" ]]
+[[ "${FSQLITE_BENCH_BUILD_NONCE:-}" == "$FSQLITE_FAKE_RUN_ID.$profile" ]]
+[[ "${FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256:-}" == "$FSQLITE_FAKE_GRAPH_SHA256" ]]
+[[ "${CARGO_TARGET_DIR:-}" == "$FSQLITE_FAKE_TARGET_DIR/regression_gate_builds/$FSQLITE_FAKE_RUN_ID/$profile" ]]
+expected=(run --locked --offline -p fsqlite-e2e --no-default-features --target "$FSQLITE_FAKE_TARGET" --bin mt-mvcc-bench --profile "$profile" -- --threads=1,8,16 --rows-per-thread=500 --iters=21 --separate-tables --one-row-per-transaction)
+actual=("$@")
+[[ "${#actual[@]}" -eq $((${#expected[@]} + 2)) ]]
+for index in "${!expected[@]}"; do
+    [[ "${actual[$index]}" == "${expected[$index]}" ]]
+done
+json_output=''
+history_path=''
+for argument in "$@"; do
+    case "$argument" in
+        --json-output=*) json_output="${argument#--json-output=}" ;;
+        --history-json=*) history_path="${argument#--history-json=}" ;;
+    esac
+done
+[[ "$json_output" == "$FSQLITE_FAKE_RUN_DIR/current.$profile.json" ]]
+[[ "$history_path" == "$FSQLITE_FAKE_RUN_DIR/disposable_history.$profile.json" ]]
+if [[ "$profile" == "release" ]]; then
+    cp "$FSQLITE_FAKE_RELEASE_REPORT" "$json_output"
+else
+    cp "$FSQLITE_FAKE_RELEASE_PERF_REPORT" "$json_output"
+fi
+printf '%s|%s|%s\n' "$profile" "$CARGO_TARGET_DIR" "$FSQLITE_BENCH_BUILD_NONCE" >> "$FSQLITE_FAKE_CALL_LOG"
+if [[ "$FSQLITE_FAKE_CREATE_HISTORY_PROFILE" == "$profile" ]]; then
+    printf '%s\n' '{"forged":true}' > "$history_path"
+fi
+"#,
+        )
+        .expect("write fake Cargo");
+        let fake_git = fake_bin.join("git");
+        fs::write(
+            &fake_git,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+[[ "$#" -eq 4 ]]
+[[ "$1" == "-C" ]]
+[[ "$2" == "$FSQLITE_FAKE_REPO_ROOT" ]]
+[[ "$3" == "rev-parse" ]]
+[[ "$4" == "HEAD" ]]
+printf '%s\n' "$FSQLITE_FAKE_COMMIT"
+"#,
+        )
+        .expect("write fake Git");
+        for (path, label) in [(&fake_cargo, "Cargo"), (&fake_git, "Git")] {
+            let mut permissions = fs::metadata(path)
+                .unwrap_or_else(|error| panic!("fake {label} metadata: {error}"))
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)
+                .unwrap_or_else(|error| panic!("make fake {label} executable: {error}"));
+        }
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![fake_bin];
+        path_entries.extend(std::env::split_paths(&inherited_path));
+        let path = std::env::join_paths(path_entries).expect("join fake PATH");
+        Command::new("bash")
+            .env("PATH", path)
+            .env("FSQLITE_REGGATE_RUN_ID", run_id)
+            .env("FSQLITE_FAKE_TARGET", &target)
+            .env("FSQLITE_FAKE_REPO_ROOT", repo_root())
+            .env("FSQLITE_FAKE_COMMIT", commit)
+            .env("FSQLITE_FAKE_RUN_ID", run_id)
+            .env("FSQLITE_FAKE_RUN_DIR", &run_dir)
+            .env("FSQLITE_FAKE_TARGET_DIR", &target_dir)
+            .env("FSQLITE_FAKE_GRAPH_SHA256", &graph_digest)
+            .env("FSQLITE_FAKE_RELEASE_REPORT", &release_fixture)
+            .env("FSQLITE_FAKE_RELEASE_PERF_REPORT", &release_perf_fixture)
+            .env(
+                "FSQLITE_FAKE_CALL_LOG",
+                fixture.path().join("fake-cargo.calls"),
+            )
+            .env(
+                "FSQLITE_FAKE_CREATE_HISTORY_PROFILE",
+                create_history_profile.unwrap_or_default(),
+            )
+            .arg(script_path())
+            .arg("--capture-baseline")
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .arg("--baseline-dir")
+            .arg(fixture.path().join("baselines"))
+            .arg("--rows")
+            .arg(ROWS_PER_THREAD.to_string())
+            .arg("--max-drop-16t")
+            .arg("0.10")
+            .arg("--max-scaling-drop-8-over-1")
+            .arg("0.10")
+            .arg("--max-scaling-drop-16-over-8")
+            .arg("0.10")
+            .output()
+            .expect("run measured gate with fake Cargo")
+    }
+
+    #[test]
+    fn measured_shell_runs_both_profiles_with_isolated_receipts() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let run_id = "measured-v9-dual-profile";
+        let output = measured_fake_cargo_run(&fixture, run_id, None);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let calls = fs::read_to_string(fixture.path().join("fake-cargo.calls"))
+            .expect("read fake Cargo calls");
+        assert_eq!(calls.lines().count(), 2);
+        assert!(calls.contains("release|"));
+        assert!(calls.contains("release-perf|"));
+        let run_dir = fixture
+            .path()
+            .join("target/regression_gate_runs")
+            .join(run_id);
+        for artifact in [
+            "current.release.json",
+            "current.release-perf.json",
+            "dependency-feature-graph.json",
+            "bench.release.log",
+            "bench.release-perf.log",
+        ] {
+            assert!(run_dir.join(artifact).is_file(), "missing {artifact}");
+        }
+        assert_diagnostic_only(&read_json(&run_dir.join("result.json")));
+    }
+
+    #[test]
+    fn measured_shell_rejects_history_created_by_the_second_profile() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let output =
+            measured_fake_cargo_run(&fixture, "measured-v9-forged-history", Some("release-perf"));
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("non-citable v9 benchmark unexpectedly created history"),
+        );
+        assert!(!fixture.path().join("baselines/latest.json").exists());
+    }
 }

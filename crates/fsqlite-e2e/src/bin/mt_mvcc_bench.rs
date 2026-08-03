@@ -51,8 +51,10 @@
 //!   falls back to plain `BEGIN`.
 //! * In `--one-row-per-transaction` mode, both engines retry a complete
 //!   BEGIN/INSERT/COMMIT transaction after any retryable stage failure. The
-//!   default bulk mode retains its v7 engine-specific retry policy. Hard
-//!   row-level failures remain separate from offered, attempted, retried, and
+//!   FrankenSQLite arm also retries transient statement-preparation failures
+//!   before the first transaction under the same shared worker deadline. The
+//!   default bulk mode retains its v7 engine-specific retry policy. Hard row-
+//!   level failures remain separate from offered, attempted, retried, and
 //!   database-proven committed work so a failed arm cannot inflate throughput.
 //! * Each paired round creates fresh tempfiles so no database state carries
 //!   across runs. Every F/C claim is preceded by a same-invocation interleaved
@@ -110,14 +112,15 @@ const MAX_RETRY_SLEEP_MS: u64 = 25;
 const CSQLITE_RETRY_ALGORITHM: &str = "csqlite.per-operation.fixed-1ms.busy-or-locked.max-512.v1";
 const FSQLITE_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.whole-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-timeout.v1";
 const CSQLITE_ONE_ROW_RETRY_ALGORITHM: &str = "csqlite.whole-one-row-transaction.fixed-1ms.busy-or-locked.max-512-or-shared-worker-timeout.v1";
-const FSQLITE_ONE_ROW_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.whole-one-row-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-shared-worker-timeout.v1";
+const FSQLITE_ONE_ROW_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.prepare-or-whole-one-row-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-shared-worker-timeout.v2";
 const CSQLITE_ONE_ROW_RETRY_UNIT: &str = "whole one-row BEGIN/INSERT/COMMIT transaction attempt";
 const FSQLITE_ONE_ROW_RETRY_UNIT: &str =
-    "whole one-row BEGIN CONCURRENT/INSERT/COMMIT transaction attempt";
+    "statement preparation or whole one-row BEGIN CONCURRENT/INSERT/COMMIT transaction attempt";
 const FSQLITE_RETRYABLE_ERRORS: &str = "Busy|BusyRecovery|BusySnapshot|DatabaseLocked|\
     WriteConflict|SerializationFailure|PageBufferCapacityExhausted";
 /// Base wall-clock retry budget for one bulk transaction attempt loop, or one
-/// shared worker deadline covering all row transactions in one-row mode.
+/// shared worker deadline covering statement preparation and all row
+/// transactions in one-row mode.
 /// Scaled up with
 /// offered work by [`fsqlite_retry_timeout`] — the fixed 5s was exceeded by
 /// queueing alone at 64 writers x 1000-row txns (bd-caa6u).
@@ -201,6 +204,7 @@ fn retry_policy_receipt_for_granularity(
     })
 }
 
+#[cfg(test)]
 fn retry_policy_receipt(
     fsqlite_timeout: Duration,
     fsqlite_timeout_overridden: bool,
@@ -237,7 +241,9 @@ const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
 const PASS_OVER_PASS_MAX_RATIO_DROP_PCT: f64 = 5.0;
 const REPORT_SCHEMA_V7: &str = "fsqlite-e2e.mt_mvcc_bench_report.v7";
+#[cfg(test)]
 const REPORT_SCHEMA_V8: &str = "fsqlite-e2e.mt_mvcc_bench_report.v8";
+const REPORT_SCHEMA_V9: &str = "fsqlite-e2e.mt_mvcc_bench_report.v9";
 const SETTINGS_INTERPRETATION: &str = "Both engines proved the listed effective PRAGMA values; \
     equal names and readbacks do not establish cross-engine semantic equivalence.";
 const ACCOUNTING_INTERPRETATION: &str = "offered and committed writes share one row unit; \
@@ -252,15 +258,21 @@ const NON_CITABLE_REASON: &str = "v7 binds the running executable, build/runtime
     semantics, external validation (and, when absent, capture) of a build-attested resolved \
     dependency/feature-graph digest, counterbalanced topology receipts, immutable manifest, \
     retained baseline history, and independent verification.";
-const NON_CITABLE_REASON_V8: &str = "v8 adds explicit one-row transaction/retry-unit truth and an \
-    optional build-attested resolved dependency/feature-graph digest, but remains non-citable: \
-    bd-uh1fv still requires an external watchdog, sanitized environment, matched retry/deadline \
-    semantics, counterbalanced topology receipts, immutable manifest, retained baseline history, \
-    and independent verification; a default build also leaves the graph digest unavailable.";
+const NON_CITABLE_REASON_V9: &str = "v9 extends the explicit one-row transaction/retry-unit \
+    contract with retryable statement-preparation truth under the shared worker deadline and an \
+    exact v2 FSQLite retry identity; it retains an optional build-attested resolved \
+    dependency/feature-graph digest, but remains non-citable: bd-uh1fv still requires an external \
+    watchdog, sanitized environment, matched retry/deadline semantics, counterbalanced topology \
+    receipts, immutable manifest, retained baseline history, and independent verification; a \
+    default build also leaves the graph digest unavailable.";
 const RELEASE_REGRESSION_SCOPE: &str = "Narrow same-process, same-host F/C writer-throughput \
     comparison for only the requested mt-mvcc-bench workload/configurations; this report does not \
     cover the shipped release profile, other workloads or platforms, long-term baseline retention, \
     independent reproduction, or overall release eligibility.";
+const RELEASE_REGRESSION_SCOPE_V9: &str = "Narrow same-process, same-host F/C writer-throughput \
+    comparison for only this report's attested selected Cargo profile and the requested \
+    mt-mvcc-bench workload/configurations; this report does not cover other workloads or platforms, \
+    long-term baseline retention, independent reproduction, or overall release eligibility.";
 const EMBEDDED_BUILD_CARGO_LOCK: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
 const DEPENDENCY_GRAPH_ATTESTATION_AVAILABLE: &str = "available: the lowercase SHA-256 was \
@@ -274,14 +286,21 @@ impl TransactionGranularity {
     const fn report_schema(self) -> &'static str {
         match self {
             Self::Bulk => REPORT_SCHEMA_V7,
-            Self::OneRow => REPORT_SCHEMA_V8,
+            Self::OneRow => REPORT_SCHEMA_V9,
         }
     }
 
     const fn non_citable_reason(self) -> &'static str {
         match self {
             Self::Bulk => NON_CITABLE_REASON,
-            Self::OneRow => NON_CITABLE_REASON_V8,
+            Self::OneRow => NON_CITABLE_REASON_V9,
+        }
+    }
+
+    const fn release_regression_scope(self) -> &'static str {
+        match self {
+            Self::Bulk => RELEASE_REGRESSION_SCOPE,
+            Self::OneRow => RELEASE_REGRESSION_SCOPE_V9,
         }
     }
 
@@ -638,10 +657,7 @@ fn begin_executable_identity() -> ExecutableIdentityStart {
                     )),
                 ),
             };
-            let path_used = canonical_path
-                .as_ref()
-                .unwrap_or(&current_exe_path)
-                .to_path_buf();
+            let path_used = canonical_path.as_ref().unwrap_or(&current_exe_path).clone();
             let before_measurement = snapshot_file(&path_used);
             ExecutableIdentityStart {
                 current_exe_path: Some(current_exe_path),
@@ -1420,7 +1436,7 @@ fn provenance_evidence_is_valid(
     subject: &SubjectIdentityReceipt,
     environment: &ComparisonEnvironmentReceipt,
 ) -> bool {
-    // This predicate only proves that the v7/v8 in-process diagnostic receipts
+    // This predicate only proves that the v7/v9 in-process diagnostic receipts
     // were complete and stable for this run. It does not fill the
     // schema-specific external-verification gaps, so a true result must remain
     // non-citable.
@@ -1523,7 +1539,7 @@ fn print_usage_and_exit(code: i32) -> ! {
          note: writer counts above MAX_CONCURRENT_WRITERS are reported and skipped;\n\
          counts above host available_parallelism are measured only as non-comparable diagnostics.\n\
          note: --one-row-per-transaction retries each complete one-row transaction and emits the\n\
-         non-citable v8 report; the default bulk transaction retains the v7 analyzer contract.\n\
+         non-citable v9 report; the default bulk transaction retains the v7 analyzer contract.\n\
          note: --rows-per-thread=0 reduces the run to shared-file worker open + synchronized start,\n\
          which is the minimal repro for the 13+ thread startup-open failure."
     );
@@ -1927,7 +1943,7 @@ fn transaction_contract_receipt(
         TransactionContractReceipt {
             granularity: transaction_granularity.label(),
             rows_per_transaction: 1,
-            prepared_statement_scope: "exactly once per worker, reused across row transactions",
+            prepared_statement_scope: "one successfully prepared statement per worker, reused across row transactions; transient preparation failures retry under the shared worker deadline",
             duplicate_after_ambiguous_commit_policy: "fail_closed; a duplicate is never accepted as proof of exact id+payload",
             csqlite_retry_unit: retry_policy.csqlite_retry_unit.clone(),
             fsqlite_retry_unit: retry_policy.fsqlite_retry_unit.clone(),
@@ -1948,12 +1964,12 @@ fn transaction_contract_is_valid(
             let Some(contract) = contract else {
                 return false;
             };
-            if schema_version != REPORT_SCHEMA_V8
+            if schema_version != REPORT_SCHEMA_V9
                 || rows_per_thread == 0
                 || contract.granularity != TransactionGranularity::OneRow.label()
                 || contract.rows_per_transaction != 1
                 || contract.prepared_statement_scope
-                    != "exactly once per worker, reused across row transactions"
+                    != "one successfully prepared statement per worker, reused across row transactions; transient preparation failures retry under the shared worker deadline"
                 || contract.duplicate_after_ambiguous_commit_policy
                     != "fail_closed; a duplicate is never accepted as proof of exact id+payload"
             {
@@ -2187,6 +2203,7 @@ impl OneRowWorkerRetryDeadline {
         }
     }
 
+    #[cfg(test)]
     const fn with_started(started: Instant, timeout: Duration) -> Self {
         Self { started, timeout }
     }
@@ -4000,6 +4017,7 @@ fn build_work_accounting(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OneRowRetryStage {
+    Prepare,
     Begin,
     Insert,
     Commit,
@@ -4017,7 +4035,7 @@ const fn one_row_failure_disposition(
     rollback_succeeded: Option<bool>,
 ) -> OneRowFailureDisposition {
     let transaction_state_is_known = match stage {
-        OneRowRetryStage::Begin => rollback_succeeded.is_none(),
+        OneRowRetryStage::Prepare | OneRowRetryStage::Begin => rollback_succeeded.is_none(),
         OneRowRetryStage::Insert | OneRowRetryStage::Commit => {
             matches!(rollback_succeeded, Some(true))
         }
@@ -4032,6 +4050,7 @@ const fn one_row_failure_disposition(
 impl Display for OneRowRetryStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::Prepare => "PREPARE",
             Self::Begin => "BEGIN",
             Self::Insert => "INSERT",
             Self::Commit => "COMMIT",
@@ -4047,17 +4066,56 @@ enum OneRowAttempt {
     },
 }
 
+fn prepare_fsqlite_one_row_with_retry<'context, Context, Prepared, Prepare>(
+    context: &'context Context,
+    tid: usize,
+    worker_retry_deadline: OneRowWorkerRetryDeadline,
+    mut prepare: Prepare,
+) -> Result<(Prepared, usize), String>
+where
+    Context: ?Sized,
+    Prepare: FnMut(&'context Context) -> Result<Prepared, fsqlite::FrankenError>,
+{
+    let mut retry_budget = worker_retry_deadline.fsqlite_budget();
+    loop {
+        match prepare(context) {
+            Ok(prepared) => return Ok((prepared, retry_budget.attempts())),
+            Err(error)
+                if one_row_failure_disposition(
+                    OneRowRetryStage::Prepare,
+                    fsqlite_error_is_retryable(&error),
+                    None,
+                ) == OneRowFailureDisposition::Retry =>
+            {
+                let Some(wait) = retry_budget.next_wait(tid) else {
+                    return Err(format!(
+                        "[fsqlite t{tid}] one-row PREPARE exhausted shared worker retry budget \
+                         after {} retries: {error}",
+                        retry_budget.attempts()
+                    ));
+                };
+                thread::sleep(wait);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "[fsqlite t{tid}] one-row PREPARE failed after {} retries: {error}",
+                    retry_budget.attempts()
+                ));
+            }
+        }
+    }
+}
+
 fn run_fsqlite_one_row_transactions(
     conn: &fsqlite::Connection,
     stmt: &fsqlite::PreparedStatement<'_>,
     tid: usize,
     base: i64,
     rows_per_thread: usize,
-    retry_timeout: Duration,
+    worker_retry_deadline: OneRowWorkerRetryDeadline,
 ) -> Result<(usize, usize), String> {
     let mut attempted_writes = 0usize;
     let mut retried_transactions = 0usize;
-    let worker_retry_deadline = OneRowWorkerRetryDeadline::new(retry_timeout);
     for row_index in 0..rows_per_thread {
         let row_index = i64::try_from(row_index)
             .map_err(|_| format!("[fsqlite t{tid}] row index exceeds i64"))?;
@@ -4361,10 +4419,11 @@ fn run_fsqlite(
                 tid as i64 * ROWID_BASE_STRIDE
             };
             // The v7 bulk path below prepares once per transaction attempt.
-            // The v8 one-row path prepares once per worker and reuses that
-            // statement across all row transactions, matching its rusqlite
-            // reference arm. In both modes, bind+execute rather than SQL
-            // formatting is the per-row operation.
+            // The v9 one-row path retains one successfully prepared statement
+            // per worker across all row transactions, matching its rusqlite
+            // reference arm. Transient preparation failures may retry under
+            // the shared worker deadline. In both modes, bind+execute rather
+            // than SQL formatting is the per-row operation.
             //
             // Using `format!` per-iter on the fsqlite side was an
             // apples-to-oranges artifact that pinned `Lexer::tokenize_into`
@@ -4373,16 +4432,24 @@ fn run_fsqlite(
             let insert_sql = worker_insert_sql(tid, separate_tables);
 
             if transaction_granularity == TransactionGranularity::OneRow {
-                let stmt = fsqlite_e2e::block_on(conn.prepare(&insert_sql))
-                    .map_err(|error| format!("[fsqlite t{tid}] prepare failed: {error}"))?;
-                let (attempted_writes, retried_operations) = run_fsqlite_one_row_transactions(
+                let worker_retry_deadline = OneRowWorkerRetryDeadline::new(retry_timeout);
+                let (stmt, prepare_retries) = prepare_fsqlite_one_row_with_retry(
+                    &conn,
+                    tid,
+                    worker_retry_deadline,
+                    |worker_conn| fsqlite_e2e::block_on(worker_conn.prepare(&insert_sql)),
+                )?;
+                let (attempted_writes, transaction_retries) = run_fsqlite_one_row_transactions(
                     &conn,
                     &stmt,
                     tid,
                     base,
                     rows_per_thread,
-                    retry_timeout,
+                    worker_retry_deadline,
                 )?;
+                let retried_operations = prepare_retries
+                    .checked_add(transaction_retries)
+                    .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
                 return Ok(WorkerWork {
                     settings,
                     attempted_writes,
@@ -5198,7 +5265,7 @@ fn run(opts: Options) -> Result<(), String> {
         citable: false,
         measurement_evidence_valid,
         non_citable_reason: opts.transaction_granularity.non_citable_reason(),
-        release_regression_scope: RELEASE_REGRESSION_SCOPE,
+        release_regression_scope: opts.transaction_granularity.release_regression_scope(),
         subject_identity,
         comparison_environment,
         settings_interpretation: SETTINGS_INTERPRETATION,
@@ -5439,7 +5506,7 @@ mod tests {
         }
     }
 
-    fn minimal_v8_one_row_report() -> MtMvccBenchReport {
+    fn minimal_v9_one_row_report() -> MtMvccBenchReport {
         let retry_policy = retry_policy_receipt_for_granularity(
             fsqlite_retry_timeout(1, 1),
             false,
@@ -5455,8 +5522,9 @@ mod tests {
             retry_policy.clone(),
         );
         let mut report = minimal_v7_report();
-        report.schema_version = REPORT_SCHEMA_V8;
-        report.non_citable_reason = NON_CITABLE_REASON_V8;
+        report.schema_version = REPORT_SCHEMA_V9;
+        report.non_citable_reason = NON_CITABLE_REASON_V9;
+        report.release_regression_scope = RELEASE_REGRESSION_SCOPE_V9;
         report.transaction_contract =
             transaction_contract_receipt(TransactionGranularity::OneRow, &retry_policy);
         report.configuration_receipts = vec![configuration];
@@ -5678,8 +5746,8 @@ mod tests {
     }
 
     #[test]
-    fn v8_one_row_report_binds_granularity_retry_units_and_non_citable_status() {
-        let report = minimal_v8_one_row_report();
+    fn v9_one_row_report_binds_granularity_retry_units_and_non_citable_status() {
+        let report = minimal_v9_one_row_report();
         assert!(transaction_contract_is_valid(
             report.schema_version,
             TransactionGranularity::OneRow,
@@ -5688,9 +5756,13 @@ mod tests {
             &report.configuration_receipts,
         ));
 
-        let value = serde_json::to_value(&report).expect("v8 one-row report must serialize");
-        assert_eq!(value["schema_version"], REPORT_SCHEMA_V8);
+        let value = serde_json::to_value(&report).expect("v9 one-row report must serialize");
+        assert_eq!(value["schema_version"], REPORT_SCHEMA_V9);
         assert_eq!(value["citable"], false);
+        assert_eq!(
+            value["release_regression_scope"],
+            RELEASE_REGRESSION_SCOPE_V9,
+        );
         assert_eq!(
             value["transaction_contract"]["granularity"],
             "one_row_per_transaction"
@@ -5718,7 +5790,7 @@ mod tests {
 
     #[test]
     fn one_row_report_contract_fails_closed_on_missing_or_mismatched_truth() {
-        let report = minimal_v8_one_row_report();
+        let report = minimal_v9_one_row_report();
         assert!(!transaction_contract_is_valid(
             REPORT_SCHEMA_V7,
             TransactionGranularity::OneRow,
@@ -5728,6 +5800,13 @@ mod tests {
         ));
         assert!(!transaction_contract_is_valid(
             REPORT_SCHEMA_V8,
+            TransactionGranularity::OneRow,
+            report.rows_per_thread,
+            report.transaction_contract.as_ref(),
+            &report.configuration_receipts,
+        ));
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V9,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
             None,
@@ -5741,7 +5820,7 @@ mod tests {
             .expect("test configuration retry policy")
             .csqlite_retry_unit = "individual INSERT operation".to_owned();
         assert!(!transaction_contract_is_valid(
-            REPORT_SCHEMA_V8,
+            REPORT_SCHEMA_V9,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
             report.transaction_contract.as_ref(),
@@ -5755,14 +5834,14 @@ mod tests {
             .expect("test configuration retry policy")
             .shared_worker_retry_timeout_ms = None;
         assert!(!transaction_contract_is_valid(
-            REPORT_SCHEMA_V8,
+            REPORT_SCHEMA_V9,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
             report.transaction_contract.as_ref(),
             &missing_shared_deadline,
         ));
 
-        let mut coordinated_drift = minimal_v8_one_row_report();
+        let mut coordinated_drift = minimal_v9_one_row_report();
         coordinated_drift
             .transaction_contract
             .as_mut()
@@ -5774,7 +5853,7 @@ mod tests {
             .expect("test configuration retry policy")
             .csqlite_retry_unit = "individual INSERT operation".to_owned();
         assert!(!transaction_contract_is_valid(
-            REPORT_SCHEMA_V8,
+            REPORT_SCHEMA_V9,
             TransactionGranularity::OneRow,
             coordinated_drift.rows_per_thread,
             coordinated_drift.transaction_contract.as_ref(),
@@ -5877,7 +5956,7 @@ mod tests {
     }
 
     #[test]
-    fn one_row_retry_policy_reports_whole_transaction_truth() {
+    fn one_row_retry_policy_reports_engine_specific_retry_truth() {
         let policy = retry_policy_receipt_for_granularity(
             Duration::from_secs(7),
             false,
@@ -7024,7 +7103,7 @@ mod tests {
     }
 
     #[test]
-    fn one_row_measurement_validation_requires_the_v8_retry_policy() {
+    fn one_row_measurement_validation_requires_the_v9_retry_policy() {
         let mut row = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
         let one_row_policy = retry_policy_receipt_for_granularity(
             fsqlite_retry_timeout(8, DEFAULT_ROWS_PER_THREAD),
@@ -7032,11 +7111,9 @@ mod tests {
             TransactionGranularity::OneRow,
         )
         .expect("one-row validation policy must be representable");
-        row.truth
-            .as_mut()
-            .expect("test row truth")
-            .configuration
-            .retry_policy = Some(one_row_policy);
+        let truth = row.truth.as_mut().expect("test row truth");
+        truth.configuration.retry_policy = Some(one_row_policy);
+        truth.round_order_receipts = vec![round_order_receipt(0)];
         let receipt = row
             .truth
             .as_ref()
@@ -7164,7 +7241,11 @@ mod tests {
     }
 
     #[test]
-    fn one_row_failure_policy_retries_only_known_rolled_back_state() {
+    fn one_row_failure_policy_retries_only_known_transaction_state() {
+        assert_eq!(
+            one_row_failure_disposition(OneRowRetryStage::Prepare, true, None),
+            OneRowFailureDisposition::Retry
+        );
         assert_eq!(
             one_row_failure_disposition(OneRowRetryStage::Begin, true, None),
             OneRowFailureDisposition::Retry
@@ -7189,6 +7270,43 @@ mod tests {
             one_row_failure_disposition(OneRowRetryStage::Begin, true, Some(true)),
             OneRowFailureDisposition::FailClosed
         );
+    }
+
+    #[test]
+    fn one_row_prepare_retries_transient_error_and_counts_it() {
+        let mut prepare_calls = 0usize;
+        let deadline = OneRowWorkerRetryDeadline::new(Duration::from_secs(1));
+        let (prepared, retries) = prepare_fsqlite_one_row_with_retry(&(), 0, deadline, |_| {
+            prepare_calls += 1;
+            if prepare_calls == 1 {
+                Err(fsqlite::FrankenError::BusyRecovery)
+            } else {
+                Ok("prepared")
+            }
+        })
+        .expect("transient PREPARE failure must recover inside the shared deadline");
+
+        assert_eq!(prepared, "prepared");
+        assert_eq!(prepare_calls, 2);
+        assert_eq!(retries, 1);
+    }
+
+    #[test]
+    fn one_row_prepare_retry_rejects_an_expired_shared_deadline() {
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test instant supports a two-second lookback");
+        let deadline = OneRowWorkerRetryDeadline::with_started(started, Duration::from_secs(1));
+        let mut prepare_calls = 0usize;
+        let error = prepare_fsqlite_one_row_with_retry(&(), 0, deadline, |_| {
+            prepare_calls += 1;
+            Err::<(), _>(fsqlite::FrankenError::BusyRecovery)
+        })
+        .expect_err("expired shared deadline must reject a retryable PREPARE failure");
+
+        assert_eq!(prepare_calls, 1);
+        assert!(error.contains("one-row PREPARE exhausted shared worker retry budget"));
+        assert!(error.contains("after 0 retries"));
     }
 
     #[test]

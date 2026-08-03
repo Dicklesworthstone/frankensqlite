@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# bd-zywqc.2: provisional concurrent-write performance regression guard.
+# bd-zywqc.2: fail-closed v9 concurrent-write performance diagnostic.
 #
-# This guard compares absolute FrankenSQLite throughput emitted by
-# mt-mvcc-bench: arithmetic mean at one writer (5% maximum drop) and median at
-# eight writers (zero tolerated drop), matching the tracked contract. Paired
-# FrankenSQLite/C-SQLite ratios remain diagnostics, not the gated metric. The
-# guard is intentionally fail-closed: benchmark failures, missing baselines,
+# This guard compares absolute FrankenSQLite throughput emitted by the v9
+# one-row, separate-table mt-mvcc-bench contract under both shipped `release`
+# and throughput-oriented `release-perf`. It also requires 8/1 and 16/8 scaling
+# retention. Historical baseline/current samples are independent two-sample
+# evidence; only the C/C and C/F arms inside each report are paired. The guard
+# is intentionally fail-closed: benchmark failures, missing baselines,
 # malformed evidence, incompatible provenance, anything other than the exact
-# configured 21 samples,
-# regressions, and statistically inconclusive comparisons all return non-zero.
+# configured 21 counterbalanced rounds, regressions, and statistically
+# inconclusive comparisons all return non-zero.
 # The tracked zero-drop 8-writer threshold is therefore an unresolved release
 # policy blocker for ordinary noisy measurements: a non-degenerate two-sided
 # confidence interval can overlap zero even when baseline and candidate are
@@ -18,48 +19,77 @@ set -euo pipefail
 # owner specifies an equivalence margin or other statistically decidable rule;
 # do not silently weaken the threshold here.
 #
-# The underlying v7 benchmark report is explicitly non-citable. A green result
+# The underlying v9 benchmark report is explicitly non-citable. A green result
 # here is useful as a same-environment development guard, but it is not by
 # itself sufficient release evidence.
+# The 16-writer and scaling margins are required caller inputs because no
+# acceptance-owner values exist yet. Supplying them makes the diagnostic rule
+# explicit; it does not authorize those values or promote the result to release
+# evidence.
 #
 # Usage:
 #   ./scripts/perf_regression_gate.sh [--capture-baseline] [--target-dir DIR]
-#                                     [--baseline-dir DIR] [--rows N]
-#                                     [--analyze-only CURRENT.json]
+#       [--baseline-dir DIR] [--rows N]
+#       --max-drop-16t FRACTION
+#       --max-scaling-drop-8-over-1 FRACTION
+#       --max-scaling-drop-16-over-8 FRACTION
+#
+# Analyze-only additionally requires both profile reports and the exact graph:
+#       --analyze-only-release CURRENT.release.json
+#       --analyze-only-release-perf CURRENT.release-perf.json
+#       --graph-artifact dependency-feature-graph.json
+#       [--expected-commit SHA]
 #
 # Modes:
 #   Default:             run the benchmark and compare with an existing baseline
 #   --capture-baseline:  validate and create a new baseline; never overwrite
-#   --analyze-only:      skip Cargo and analyze an existing report (test/debug)
+#   --analyze-only-*:    skip Cargo and analyze an existing report pair (test/debug)
 #
 # Artifacts:
-#   $TARGET_DIR/regression_gate_runs/$RUN_ID/current.json  raw v7 report
-#   $TARGET_DIR/regression_gate_runs/$RUN_ID/result.json   guard verdict
-#   $BASELINE_DIR/latest.json                              baseline envelope
+#   $TARGET_DIR/regression_gate_runs/$RUN_ID/current.release.json
+#   $TARGET_DIR/regression_gate_runs/$RUN_ID/current.release-perf.json
+#   $TARGET_DIR/regression_gate_runs/$RUN_ID/dependency-feature-graph.json
+#   $TARGET_DIR/regression_gate_runs/$RUN_ID/bench.{release,release-perf}.log
+#   $TARGET_DIR/regression_gate_runs/$RUN_ID/result.json
+#   $TARGET_DIR/regression_gate_builds/$RUN_ID/{release,release-perf}/
+#   $BASELINE_DIR/latest.json
 
 readonly BEAD_ID="bd-zywqc.2"
-readonly GATE_SCHEMA="fsqlite.perf_regression_gate.result.v3"
-readonly BASELINE_SCHEMA="fsqlite.perf_regression_gate.baseline.v4"
-readonly REPORT_SCHEMA="fsqlite-e2e.mt_mvcc_bench_report.v7"
+readonly GATE_SCHEMA="fsqlite.perf_regression_gate.result.v5"
+readonly BASELINE_SCHEMA="fsqlite.perf_regression_gate.baseline.v6"
+readonly REPORT_SCHEMA="fsqlite-e2e.mt_mvcc_bench_report.v9"
 readonly ITERATIONS=21
 readonly MAX_FSQLITE_WPS_DROP_1T=0.05
 readonly MAX_FSQLITE_WPS_DROP_8T=0.0
+readonly REQUIRED_THREADS="1,8,16"
+readonly PROFILES="release release-perf"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/fsqlite-reggate-target}"
 BASELINE_DIR="$REPO_ROOT/tests/perf/baselines"
 CAPTURE_BASELINE=false
 ROWS_PER_THREAD=500
-ANALYZE_ONLY=""
-ANALYZE_ONLY_REQUESTED=false
+ANALYZE_ONLY_RELEASE=""
+ANALYZE_ONLY_RELEASE_PERF=""
+GRAPH_ARTIFACT_INPUT=""
+EXPECTED_COMMIT_OVERRIDE=""
+MAX_FSQLITE_WPS_DROP_16T=""
+MAX_SCALING_DROP_8_OVER_1=""
+MAX_SCALING_DROP_16_OVER_8=""
 
 usage() {
     printf '%s\n' \
         "Usage: $0 [--capture-baseline] [--target-dir DIR]" \
         "          [--baseline-dir DIR] [--rows N]" \
-        "          [--analyze-only CURRENT.json]" >&2
+        "          --max-drop-16t FRACTION" \
+        "          --max-scaling-drop-8-over-1 FRACTION" \
+        "          --max-scaling-drop-16-over-8 FRACTION" \
+        "          [--analyze-only-release CURRENT.release.json" \
+        "           --analyze-only-release-perf CURRENT.release-perf.json" \
+        "           --graph-artifact dependency-feature-graph.json" \
+        "           --expected-commit SHA]" >&2
 }
 
 require_option_value() {
@@ -93,10 +123,39 @@ while [[ $# -gt 0 ]]; do
             ROWS_PER_THREAD="$2"
             shift 2
             ;;
-        --analyze-only)
+        --analyze-only-release)
             require_option_value "$1" "$#"
-            ANALYZE_ONLY="$2"
-            ANALYZE_ONLY_REQUESTED=true
+            ANALYZE_ONLY_RELEASE="$2"
+            shift 2
+            ;;
+        --analyze-only-release-perf)
+            require_option_value "$1" "$#"
+            ANALYZE_ONLY_RELEASE_PERF="$2"
+            shift 2
+            ;;
+        --graph-artifact)
+            require_option_value "$1" "$#"
+            GRAPH_ARTIFACT_INPUT="$2"
+            shift 2
+            ;;
+        --expected-commit)
+            require_option_value "$1" "$#"
+            EXPECTED_COMMIT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --max-drop-16t)
+            require_option_value "$1" "$#"
+            MAX_FSQLITE_WPS_DROP_16T="$2"
+            shift 2
+            ;;
+        --max-scaling-drop-8-over-1)
+            require_option_value "$1" "$#"
+            MAX_SCALING_DROP_8_OVER_1="$2"
+            shift 2
+            ;;
+        --max-scaling-drop-16-over-8)
+            require_option_value "$1" "$#"
+            MAX_SCALING_DROP_16_OVER_8="$2"
             shift 2
             ;;
         --help|-h)
@@ -115,8 +174,18 @@ if [[ -z "$TARGET_DIR" || -z "$BASELINE_DIR" ]]; then
     echo "[$BEAD_ID] FATAL: target and baseline directories must be non-empty" >&2
     exit 2
 fi
-if [[ "$ANALYZE_ONLY_REQUESTED" = true && -z "$ANALYZE_ONLY" ]]; then
-    echo "[$BEAD_ID] FATAL: --analyze-only requires a non-empty path" >&2
+analyze_only_count=0
+[[ -n "$ANALYZE_ONLY_RELEASE" ]] && analyze_only_count=$((analyze_only_count + 1))
+[[ -n "$ANALYZE_ONLY_RELEASE_PERF" ]] && analyze_only_count=$((analyze_only_count + 1))
+[[ -n "$GRAPH_ARTIFACT_INPUT" ]] && analyze_only_count=$((analyze_only_count + 1))
+if [[ "$analyze_only_count" -ne 0 && "$analyze_only_count" -ne 3 ]]; then
+    echo "[$BEAD_ID] FATAL: analyze-only mode requires both profile reports and --graph-artifact" >&2
+    exit 2
+fi
+ANALYZE_ONLY_REQUESTED=false
+[[ "$analyze_only_count" -eq 3 ]] && ANALYZE_ONLY_REQUESTED=true
+if [[ -n "$EXPECTED_COMMIT_OVERRIDE" && "$ANALYZE_ONLY_REQUESTED" != true ]]; then
+    echo "[$BEAD_ID] FATAL: --expected-commit is only valid in analyze-only mode" >&2
     exit 2
 fi
 
@@ -129,14 +198,36 @@ fi
 if [[ "$BASELINE_DIR" != /* ]]; then
     BASELINE_DIR="$PWD/$BASELINE_DIR"
 fi
-if [[ "$ANALYZE_ONLY_REQUESTED" = true && "$ANALYZE_ONLY" != /* ]]; then
-    ANALYZE_ONLY="$PWD/$ANALYZE_ONLY"
+if [[ "$ANALYZE_ONLY_REQUESTED" = true ]]; then
+    [[ "$ANALYZE_ONLY_RELEASE" = /* ]] || ANALYZE_ONLY_RELEASE="$PWD/$ANALYZE_ONLY_RELEASE"
+    [[ "$ANALYZE_ONLY_RELEASE_PERF" = /* ]] || ANALYZE_ONLY_RELEASE_PERF="$PWD/$ANALYZE_ONLY_RELEASE_PERF"
+    [[ "$GRAPH_ARTIFACT_INPUT" = /* ]] || GRAPH_ARTIFACT_INPUT="$PWD/$GRAPH_ARTIFACT_INPUT"
 fi
 
 if [[ ! "$ROWS_PER_THREAD" =~ ^[1-9][0-9]*$ ]]; then
     echo "[$BEAD_ID] FATAL: --rows must be a positive integer" >&2
     exit 2
 fi
+validate_fraction() {
+    local name="$1"
+    local value="$2"
+    if [[ -z "$value" ]] || ! python3 - "$value" <<'PYEOF'
+import math
+import sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and 0.0 <= value < 1.0 else 1)
+PYEOF
+    then
+        echo "[$BEAD_ID] FATAL: $name must be an explicit finite fraction in [0,1)" >&2
+        exit 2
+    fi
+}
+validate_fraction --max-drop-16t "$MAX_FSQLITE_WPS_DROP_16T"
+validate_fraction --max-scaling-drop-8-over-1 "$MAX_SCALING_DROP_8_OVER_1"
+validate_fraction --max-scaling-drop-16-over-8 "$MAX_SCALING_DROP_16_OVER_8"
 
 if ! mkdir -p "$TARGET_DIR"; then
     echo "[$BEAD_ID] FATAL: cannot create target directory: $TARGET_DIR" >&2
@@ -155,20 +246,36 @@ if ! mkdir -p "$RUNS_DIR" || ! mkdir "$RUN_DIR"; then
     exit 2
 fi
 
-CURRENT_JSON="$RUN_DIR/current.json"
+CURRENT_RELEASE_JSON="$RUN_DIR/current.release.json"
+CURRENT_RELEASE_PERF_JSON="$RUN_DIR/current.release-perf.json"
 RESULT_JSON="$RUN_DIR/result.json"
 BASELINE_JSON="$BASELINE_DIR/latest.json"
-BENCH_LOG="$RUN_DIR/bench.log"
+GRAPH_JSON="$RUN_DIR/dependency-feature-graph.json"
 COMMIT_HASH="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$EXPECTED_COMMIT_OVERRIDE" ]]; then
+    COMMIT_HASH="$EXPECTED_COMMIT_OVERRIDE"
+fi
+if [[ -z "$COMMIT_HASH" || "$COMMIT_HASH" == "unknown" ]]; then
+    echo "[$BEAD_ID] FATAL: intended source commit is unknown" >&2
+    exit 2
+fi
 MEASUREMENT_MODE="measured"
-EXPECTED_HISTORY_JSON=""
 
-echo "[$BEAD_ID] Provisional performance regression guard"
+echo "[$BEAD_ID] Diagnostic-only v9 performance regression guard"
 echo "[$BEAD_ID] Commit: $COMMIT_HASH"
 echo "[$BEAD_ID] Rows/thread: $ROWS_PER_THREAD"
 echo "[$BEAD_ID] Iterations: $ITERATIONS"
+echo "[$BEAD_ID] Profiles: $PROFILES"
+echo "[$BEAD_ID] Threads: $REQUIRED_THREADS"
+echo "[$BEAD_ID] Absolute maximum drops: 1t=$MAX_FSQLITE_WPS_DROP_1T 8t=$MAX_FSQLITE_WPS_DROP_8T 16t=$MAX_FSQLITE_WPS_DROP_16T"
+echo "[$BEAD_ID] Scaling maximum drops (caller-supplied, policy-unresolved): 8/1=$MAX_SCALING_DROP_8_OVER_1 16/8=$MAX_SCALING_DROP_16_OVER_8"
 echo "[$BEAD_ID] Target: $TARGET_DIR"
 echo "[$BEAD_ID] Run directory: $RUN_DIR"
+
+if ! cd "$REPO_ROOT"; then
+    echo "[$BEAD_ID] FATAL: cannot enter repository root: $REPO_ROOT" >&2
+    exit 2
+fi
 
 if [[ "$CAPTURE_BASELINE" = false && ! -f "$BASELINE_JSON" ]]; then
     echo "[$BEAD_ID] FATAL: no baseline at $BASELINE_JSON" >&2
@@ -182,56 +289,94 @@ if [[ "$CAPTURE_BASELINE" = true && ( -e "$BASELINE_JSON" || -L "$BASELINE_JSON"
 fi
 
 if [[ "$ANALYZE_ONLY_REQUESTED" = true ]]; then
-    if [[ ! -f "$ANALYZE_ONLY" ]]; then
-        echo "[$BEAD_ID] FATAL: --analyze-only report does not exist: $ANALYZE_ONLY" >&2
-        exit 2
-    fi
-    if ! cp "$ANALYZE_ONLY" "$CURRENT_JSON"; then
-        echo "[$BEAD_ID] FATAL: cannot snapshot --analyze-only report into $CURRENT_JSON" >&2
-        exit 2
-    fi
+    for source in "$ANALYZE_ONLY_RELEASE" "$ANALYZE_ONLY_RELEASE_PERF" "$GRAPH_ARTIFACT_INPUT"; do
+        [[ -f "$source" ]] || { echo "[$BEAD_ID] FATAL: analyze-only input does not exist: $source" >&2; exit 2; }
+    done
+    cp "$ANALYZE_ONLY_RELEASE" "$CURRENT_RELEASE_JSON"
+    cp "$ANALYZE_ONLY_RELEASE_PERF" "$CURRENT_RELEASE_PERF_JSON"
+    cp "$GRAPH_ARTIFACT_INPUT" "$GRAPH_JSON"
     MEASUREMENT_MODE="analyze_only"
-    echo "[$BEAD_ID] Analyze-only source: $ANALYZE_ONLY"
-    echo "[$BEAD_ID] Analyze-only snapshot: $CURRENT_JSON"
+    echo "[$BEAD_ID] Analyze-only release source: $ANALYZE_ONLY_RELEASE"
+    echo "[$BEAD_ID] Analyze-only release-perf source: $ANALYZE_ONLY_RELEASE_PERF"
 else
-    # V7 cannot authenticate historical input and therefore must never create or
-    # update its history path. Give it a fresh per-invocation path so both the
-    # emitted receipt and the path's continued absence can be verified.
-    HISTORY_JSON="$RUN_DIR/disposable_history.json"
-    EXPECTED_HISTORY_JSON="$HISTORY_JSON"
-    echo "[$BEAD_ID] Running paired mt-mvcc-bench (threads 1,8) ..."
+    GRAPH_RAW="$RUN_DIR/dependency-feature-graph.raw.txt"
+    GRAPH_LOG="$RUN_DIR/dependency-feature-graph.log"
+    BUILD_TARGET="$(rustc -vV 2>/dev/null | awk '/^host:/ { print $2 }')"
+    [[ -n "$BUILD_TARGET" ]] || { echo "[$BEAD_ID] FATAL: cannot determine rustc host target" >&2; exit 2; }
     set +e
-    env CARGO_TARGET_DIR="$TARGET_DIR" \
-        FSQLITE_BENCH_PROFILE_NAME=release-perf \
-        FSQLITE_BENCH_BUILD_NONCE="$RUN_ID" \
-        cargo run -p fsqlite-e2e \
-        --bin mt-mvcc-bench --profile release-perf -- \
-        --threads=1,8 \
-        --rows-per-thread="$ROWS_PER_THREAD" \
-        --iters="$ITERATIONS" \
-        --history-json="$HISTORY_JSON" \
-        --json-output="$CURRENT_JSON" 2>&1 | tee "$BENCH_LOG"
-    pipeline_status=("${PIPESTATUS[@]}")
+    cargo tree --locked --offline -p fsqlite-e2e -e features,no-dev \
+        --no-default-features --target "$BUILD_TARGET" >"$GRAPH_RAW" 2>"$GRAPH_LOG"
+    graph_status=$?
     set -e
-    benchmark_status="${pipeline_status[0]}"
-    tee_status="${pipeline_status[1]}"
-    if [[ "$benchmark_status" -ne 0 || "$tee_status" -ne 0 ]]; then
-        echo "[$BEAD_ID] FATAL: benchmark pipeline failed (benchmark=$benchmark_status, tee=$tee_status)" >&2
-        exit 2
-    fi
-    if [[ -e "$HISTORY_JSON" || -L "$HISTORY_JSON" ]]; then
-        echo "[$BEAD_ID] FATAL: non-citable v7 benchmark unexpectedly created its history path: $HISTORY_JSON" >&2
-        exit 2
-    fi
+    [[ "$graph_status" -eq 0 && -s "$GRAPH_RAW" ]] || { echo "[$BEAD_ID] FATAL: dependency-feature graph capture failed" >&2; exit 2; }
+    python3 - "$REPO_ROOT" "$BUILD_TARGET" "$GRAPH_RAW" "$GRAPH_JSON" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+repo_root, target, raw_path, output_path = sys.argv[1:]
+tree = Path(raw_path).read_text(encoding="utf-8").replace("\r\n", "\n")
+tree = tree.replace(repo_root, "${WORKSPACE_ROOT}")
+tree = "\n".join(line.rstrip() for line in tree.splitlines()) + "\n"
+value = {
+    "schema_version": "fsqlite.dependency_feature_graph.v1",
+    "command": ["cargo", "tree", "--locked", "--offline", "-p", "fsqlite-e2e", "-e", "features,no-dev", "--no-default-features", "--target", target],
+    "target": target,
+    "tree": tree,
+}
+Path(output_path).write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+PYEOF
+    GRAPH_SHA256="$(python3 - "$GRAPH_JSON" <<'PYEOF'
+import hashlib
+import sys
+from pathlib import Path
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PYEOF
+    )"
+    for profile in $PROFILES; do
+        history_json="$RUN_DIR/disposable_history.$profile.json"
+        bench_log="$RUN_DIR/bench.$profile.log"
+        profile_target="$TARGET_DIR/regression_gate_builds/$RUN_ID/$profile"
+        current_json="$RUN_DIR/current.$profile.json"
+        nonce="$RUN_ID.$profile"
+        echo "[$BEAD_ID] Running v9 mt-mvcc-bench profile=$profile threads=$REQUIRED_THREADS ..."
+        set +e
+        env CARGO_TARGET_DIR="$profile_target" \
+            FSQLITE_BENCH_PROFILE_NAME="$profile" \
+            FSQLITE_BENCH_BUILD_NONCE="$nonce" \
+            FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256="$GRAPH_SHA256" \
+            cargo run --locked --offline -p fsqlite-e2e --no-default-features \
+            --target "$BUILD_TARGET" \
+            --bin mt-mvcc-bench --profile "$profile" -- \
+            --threads="$REQUIRED_THREADS" \
+            --rows-per-thread="$ROWS_PER_THREAD" \
+            --iters="$ITERATIONS" \
+            --separate-tables \
+            --one-row-per-transaction \
+            --history-json="$history_json" \
+            --json-output="$current_json" 2>&1 | tee "$bench_log"
+        pipeline_status=("${PIPESTATUS[@]}")
+        set -e
+        benchmark_status="${pipeline_status[0]}"
+        tee_status="${pipeline_status[1]}"
+        if [[ "$benchmark_status" -ne 0 || "$tee_status" -ne 0 ]]; then
+            echo "[$BEAD_ID] FATAL: $profile benchmark pipeline failed (benchmark=$benchmark_status, tee=$tee_status)" >&2
+            exit 2
+        fi
+        if [[ -e "$history_json" || -L "$history_json" ]]; then
+            echo "[$BEAD_ID] FATAL: non-citable v9 benchmark unexpectedly created history: $history_json" >&2
+            exit 2
+        fi
+    done
 fi
 
-if [[ ! -s "$CURRENT_JSON" ]]; then
-    echo "[$BEAD_ID] FATAL: no non-empty JSON report at $CURRENT_JSON" >&2
-    exit 2
-fi
+for artifact in "$CURRENT_RELEASE_JSON" "$CURRENT_RELEASE_PERF_JSON" "$GRAPH_JSON"; do
+    [[ -s "$artifact" ]] || { echo "[$BEAD_ID] FATAL: missing or empty artifact: $artifact" >&2; exit 2; }
+done
 
 python3 - \
-    "$CURRENT_JSON" \
+    "$CURRENT_RELEASE_JSON" \
+    "$CURRENT_RELEASE_PERF_JSON" \
+    "$GRAPH_JSON" \
     "$BASELINE_JSON" \
     "$RESULT_JSON" \
     "$COMMIT_HASH" \
@@ -243,9 +388,11 @@ python3 - \
     "$ITERATIONS" \
     "$MAX_FSQLITE_WPS_DROP_1T" \
     "$MAX_FSQLITE_WPS_DROP_8T" \
+    "$MAX_FSQLITE_WPS_DROP_16T" \
+    "$MAX_SCALING_DROP_8_OVER_1" \
+    "$MAX_SCALING_DROP_16_OVER_8" \
     "$MEASUREMENT_MODE" \
-    "$RUN_ID" \
-    "$EXPECTED_HISTORY_JSON" <<'PYEOF'
+    "$RUN_ID" <<'PYEOF'
 import hashlib
 import json
 import math
@@ -255,6 +402,1707 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
+
+# Active v9 analyzer. The implementation-local `v8_` names identify its direct
+# analyzer lineage and are not serialized contract labels. The older v7
+# implementation remains below solely so historical diffs stay reviewable;
+# this entry point always exits before that code and therefore rejects prior
+# report schemas at the boundary.
+(
+    current_release_path_v8,
+    current_release_perf_path_v8,
+    graph_path_v8,
+    baseline_path_v8,
+    result_path_v8,
+    intended_commit_v8,
+    expected_rows_raw_v8,
+    capture_raw_v8,
+    baseline_schema_v8,
+    gate_schema_v8,
+    report_schema_v8,
+    expected_iterations_raw_v8,
+    max_drop_1t_raw_v8,
+    max_drop_8t_raw_v8,
+    max_drop_16t_raw_v8,
+    max_scaling_drop_8_over_1_raw_v8,
+    max_scaling_drop_16_over_8_raw_v8,
+    measurement_mode_v8,
+    run_id_v8,
+) = sys.argv[1:]
+
+EXPECTED_NON_CITABLE_REASON_V9 = (
+    "v9 extends the explicit one-row transaction/retry-unit contract with retryable "
+    "statement-preparation truth under the shared worker deadline and an exact v2 FSQLite "
+    "retry identity; it retains an optional build-attested resolved dependency/feature-graph "
+    "digest, but remains non-citable: bd-uh1fv still requires an external watchdog, sanitized "
+    "environment, matched retry/deadline semantics, counterbalanced topology receipts, "
+    "immutable manifest, retained baseline history, and independent verification; a default "
+    "build also leaves the graph digest unavailable."
+)
+EXPECTED_RELEASE_SCOPE_V9 = (
+    "Narrow same-process, same-host F/C writer-throughput comparison for only this "
+    "report's attested selected Cargo profile and the requested mt-mvcc-bench "
+    "workload/configurations; this report does not cover other workloads or platforms, "
+    "long-term baseline retention, independent reproduction, or overall release eligibility."
+)
+EXPECTED_SETTINGS_INTERPRETATION_V9 = (
+    "Both engines proved the listed effective PRAGMA values; equal names and readbacks "
+    "do not establish cross-engine semantic equivalence."
+)
+EXPECTED_ACCOUNTING_INTERPRETATION_V9 = (
+    "offered and committed writes share one row unit; attempted_writes counts physical "
+    "INSERT calls; retried_operations records the existing engine-specific retry unit and "
+    "is provenance only, not a cross-engine comparison metric."
+)
+EXPECTED_TIMING_INTERPRETATION_V9 = (
+    "workload_elapsed_ns begins only after every worker has opened and proved its effective "
+    "settings, and ends at the last worker's transaction terminal point before connection "
+    "teardown; worker_startup_elapsed_ns is reported separately."
+)
+GRAPH_ATTESTATION_AVAILABLE_V8 = (
+    "available: the lowercase SHA-256 was supplied at build time through the rerun-sensitive "
+    "FSQLITE_BENCH_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256 attestation input"
+)
+CSQLITE_RETRY_UNIT_V9 = "whole one-row BEGIN/INSERT/COMMIT transaction attempt"
+FSQLITE_RETRY_UNIT_V9 = (
+    "statement preparation or whole one-row BEGIN CONCURRENT/INSERT/COMMIT transaction attempt"
+)
+CSQLITE_RETRY_ALGORITHM_V9 = (
+    "csqlite.whole-one-row-transaction.fixed-1ms.busy-or-locked.max-512-or-"
+    "shared-worker-timeout.v1"
+)
+FSQLITE_RETRY_ALGORITHM_V9 = (
+    "fsqlite.prepare-or-whole-one-row-transaction.step-exp-every-8-cap-25ms-plus-"
+    "thread-attempt-jitter-0-to-4ms.max-512-or-shared-worker-timeout.v2"
+)
+FSQLITE_RETRYABLE_ERRORS_V9 = (
+    "Busy|BusyRecovery|BusySnapshot|DatabaseLocked|WriteConflict|"
+    "SerializationFailure|PageBufferCapacityExhausted"
+)
+REQUIRED_PROFILES_V8 = ("release", "release-perf")
+REQUIRED_THREADS_V8 = (1, 8, 16)
+BOOTSTRAP_REPETITIONS_V8 = 20_000
+UNRESOLVED_RELEASE_COVERAGE_V8 = [
+    "32-writer cell",
+    "balanced, write-heavy, and read-heavy macro workloads",
+    "INSERT, SELECT-by-primary-key, and UPDATE micro workloads",
+    "calibration receipt",
+    "synthetic-regression sensitivity proof",
+    "flamegraph evidence",
+    "rolling 30-day retained baselines",
+    "historical baseline/current paired block deltas; this gate uses independent samples",
+    "non-host release platforms",
+    "external watchdog enforcement",
+    "sanitized benchmark environment",
+    "matched cross-engine retry/deadline semantics",
+    "counterbalanced topology receipts",
+    "immutable measurement manifest",
+    "independent verification",
+    "pinned-host enforcement",
+]
+
+
+class V8EvidenceError(Exception):
+    pass
+
+
+def v8_fail(message):
+    raise V8EvidenceError(message)
+
+
+def v8_require_object(value, label, fields=()):
+    if not isinstance(value, dict):
+        v8_fail(f"{label} must be an object")
+    for field in fields:
+        if field not in value:
+            v8_fail(f"{label}.{field} must be present")
+    return value
+
+
+def v8_require_list(value, label):
+    if not isinstance(value, list):
+        v8_fail(f"{label} must be an array")
+    return value
+
+
+def v8_require_string(value, label):
+    if not isinstance(value, str) or not value.strip():
+        v8_fail(f"{label} must be a non-empty string")
+    if value == "unknown" or value.startswith("unknown:"):
+        v8_fail(f"{label} must be known")
+    return value
+
+
+def v8_require_int(value, label, *, positive=False):
+    if isinstance(value, bool) or not isinstance(value, int):
+        v8_fail(f"{label} must be an integer")
+    if positive and value <= 0:
+        v8_fail(f"{label} must be positive")
+    return value
+
+
+def v8_require_number(value, label, *, positive=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        v8_fail(f"{label} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or (positive and result <= 0.0):
+        v8_fail(f"{label} must be {'positive and ' if positive else ''}finite")
+    return result
+
+
+def v8_require_exact(value, expected, label):
+    if expected is None:
+        if value is not None:
+            v8_fail(f"{label} must be null")
+    elif isinstance(expected, bool):
+        if value is not expected:
+            v8_fail(f"{label} must be the boolean {str(expected).lower()}")
+    elif isinstance(expected, int):
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            v8_fail(f"{label} must be the integer {expected}")
+    elif isinstance(expected, float):
+        if not isinstance(value, float) or not math.isfinite(value) or value != expected:
+            v8_fail(f"{label} must be the floating-point value {expected}")
+    elif isinstance(expected, str):
+        if not isinstance(value, str) or value != expected:
+            v8_fail(f"{label} does not match the exact string contract")
+    elif isinstance(expected, list):
+        observed = v8_require_list(value, label)
+        if len(observed) != len(expected):
+            v8_fail(f"{label} does not match the exact array length")
+        for index, (observed_item, expected_item) in enumerate(zip(observed, expected)):
+            v8_require_exact(observed_item, expected_item, f"{label}[{index}]")
+    elif isinstance(expected, dict):
+        observed = v8_require_object(value, label)
+        if set(observed) != set(expected):
+            v8_fail(f"{label} does not contain the exact object fields")
+        for field, expected_item in expected.items():
+            v8_require_exact(observed[field], expected_item, f"{label}.{field}")
+    else:
+        v8_fail(f"{label} has an unsupported analyzer contract type")
+    return value
+
+
+def v8_require_sha256(value, label):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        v8_fail(f"{label} must be exactly 32 bytes of lowercase hexadecimal")
+    return value
+
+
+def v8_require_git_sha(value, label):
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        v8_fail(f"{label} must be a 40-character lowercase hexadecimal Git object ID")
+    return value
+
+
+def v8_require_fraction(value, label):
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0 or result >= 1.0:
+        v8_fail(f"{label} must be a finite fraction in [0,1)")
+    return result
+
+
+def v8_read_json(path, label):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        v8_fail(f"cannot read {label} JSON {path}: {error}")
+    return v8_require_object(value, label)
+
+
+def v8_canonical_compact_bytes(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+
+
+def v8_canonical_pretty_bytes(value):
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def v8_validate_graph(graph, label):
+    graph = v8_require_object(
+        graph, label, ("schema_version", "command", "target", "tree")
+    )
+    if graph["schema_version"] != "fsqlite.dependency_feature_graph.v1":
+        v8_fail(f"{label} schema is not v1")
+    target = v8_require_string(graph["target"], f"{label}.target")
+    expected_command = [
+        "cargo",
+        "tree",
+        "--locked",
+        "--offline",
+        "-p",
+        "fsqlite-e2e",
+        "-e",
+        "features,no-dev",
+        "--no-default-features",
+        "--target",
+        target,
+    ]
+    if graph["command"] != expected_command:
+        v8_fail(f"{label} command is not the exact locked no-dev feature graph")
+    tree = v8_require_string(graph["tree"], f"{label}.tree")
+    if not tree.endswith("\n") or "${WORKSPACE_ROOT}" not in tree:
+        v8_fail(f"{label} tree is not newline-terminated and workspace-normalized")
+    return graph
+
+
+def v8_read_graph(path):
+    try:
+        raw = Path(path).read_bytes()
+        graph = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        v8_fail(f"cannot read dependency/feature graph {path}: {error}")
+    graph = v8_validate_graph(graph, "dependency/feature graph")
+    if raw != v8_canonical_compact_bytes(graph):
+        v8_fail("dependency/feature graph bytes are not canonical sorted compact JSON")
+    return graph, hashlib.sha256(raw).hexdigest()
+
+
+def v8_command_output(*argv):
+    try:
+        return subprocess.run(
+            argv,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        v8_fail(f"cannot fingerprint command {' '.join(argv)}: {error}")
+
+
+def v8_optional_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unavailable"
+
+
+def v8_cpu_model():
+    try:
+        for line in Path("/proc/cpuinfo").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            if line.lower().startswith(("model name", "hardware")) and ":" in line:
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "unknown"
+
+
+def v8_provenance(expected_rows, graph_target):
+    affinity_getter = getattr(os, "sched_getaffinity", None)
+    try:
+        affinity_count = (
+            len(affinity_getter(0)) if affinity_getter is not None else "unavailable"
+        )
+    except OSError as error:
+        v8_fail(f"cannot read CPU-affinity fingerprint: {error}")
+    return {
+        "schema_version": "fsqlite.perf_regression_gate.provenance.v2",
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "cpu_model": v8_cpu_model(),
+        "logical_cpu_count": os.cpu_count(),
+        "affinity_cpu_count": affinity_count,
+        "cgroup_cpu_max": v8_optional_text("/sys/fs/cgroup/cpu.max"),
+        "cgroup_cpuset_effective": v8_optional_text(
+            "/sys/fs/cgroup/cpuset.cpus.effective"
+        ),
+        "cpu_governor": v8_optional_text(
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        ),
+        "rustc_verbose": v8_command_output("rustc", "-Vv"),
+        "cargo_version": v8_command_output("cargo", "-V"),
+        "rustflags": os.environ.get("RUSTFLAGS", ""),
+        "cargo_encoded_rustflags": os.environ.get("CARGO_ENCODED_RUSTFLAGS", ""),
+        "rch_worker": os.environ.get("RCH_WORKER", ""),
+        "profiles": list(REQUIRED_PROFILES_V8),
+        "benchmark": "mt-mvcc-bench",
+        "threads": list(REQUIRED_THREADS_V8),
+        "rows_per_thread": expected_rows,
+        "graph_target": graph_target,
+        "measurement_mode": measurement_mode_v8,
+    }
+
+
+def v8_validate_snapshot(value, label):
+    value = v8_require_object(
+        value,
+        label,
+        ("sha256", "bytes_read", "metadata_size_bytes", "unix_device", "unix_inode", "error"),
+    )
+    if value["error"] is not None:
+        v8_fail(f"{label}.error must be null")
+    identity = {
+        "sha256": v8_require_sha256(value["sha256"], f"{label}.sha256"),
+        "bytes_read": v8_require_int(value["bytes_read"], f"{label}.bytes_read", positive=True),
+        "metadata_size_bytes": v8_require_int(
+            value["metadata_size_bytes"], f"{label}.metadata_size_bytes", positive=True
+        ),
+        "unix_device": v8_require_int(value["unix_device"], f"{label}.unix_device"),
+        "unix_inode": v8_require_int(value["unix_inode"], f"{label}.unix_inode", positive=True),
+    }
+    if identity["bytes_read"] != identity["metadata_size_bytes"]:
+        v8_fail(f"{label} byte count disagrees with metadata")
+    return identity
+
+
+def v8_validate_subject_identity(report, label, expected_commit, expected_nonce):
+    subject = v8_require_object(
+        report.get("subject_identity"),
+        f"{label}.subject_identity",
+        ("executable", "build_source", "runtime_source", "cargo_lock"),
+    )
+    executable = v8_require_object(
+        subject["executable"],
+        f"{label}.subject_identity.executable",
+        (
+            "current_exe_path",
+            "canonical_path",
+            "path_resolution_error",
+            "process_id",
+            "before_measurement",
+            "after_measurement",
+            "unchanged_during_measurement",
+        ),
+    )
+    v8_require_string(executable["current_exe_path"], f"{label}.executable.current_exe_path")
+    v8_require_string(executable["canonical_path"], f"{label}.executable.canonical_path")
+    if executable["path_resolution_error"] is not None:
+        v8_fail(f"{label}.executable.path_resolution_error must be null")
+    v8_require_int(executable["process_id"], f"{label}.executable.process_id", positive=True)
+    before_exe = v8_validate_snapshot(executable["before_measurement"], f"{label}.executable.before")
+    after_exe = v8_validate_snapshot(executable["after_measurement"], f"{label}.executable.after")
+    if before_exe != after_exe or executable["unchanged_during_measurement"] is not True:
+        v8_fail(f"{label}.executable changed during measurement")
+
+    build = v8_require_object(
+        subject["build_source"],
+        f"{label}.subject_identity.build_source",
+        ("workspace_root", "git_sha", "git_branch", "git_tree_state", "build_nonce", "build_input_tracking"),
+    )
+    workspace_root = v8_require_string(build["workspace_root"], f"{label}.build.workspace_root")
+    build_sha = v8_require_git_sha(build["git_sha"], f"{label}.build.git_sha")
+    v8_require_string(build["git_branch"], f"{label}.build.git_branch")
+    if build["git_tree_state"] != "clean" or build["build_input_tracking"] != "complete":
+        v8_fail(f"{label}.build must be clean with complete input tracking")
+    nonce = v8_require_string(build["build_nonce"], f"{label}.build.build_nonce")
+    if expected_commit is not None and build_sha != expected_commit:
+        v8_fail(f"{label}.build.git_sha does not match analyzer intended commit")
+    if expected_nonce is not None and nonce != expected_nonce:
+        v8_fail(f"{label}.build.build_nonce does not match its measured profile run")
+
+    runtime = v8_require_object(
+        subject["runtime_source"],
+        f"{label}.subject_identity.runtime_source",
+        ("before_measurement", "after_measurement", "same_clean_git_identity_at_capture_points", "stability_limitation"),
+    )
+    runtime_identities = []
+    for point in ("before_measurement", "after_measurement"):
+        receipt = v8_require_object(
+            runtime[point],
+            f"{label}.runtime.{point}",
+            (
+                "workspace_root",
+                "canonical_workspace_root",
+                "git_sha",
+                "git_branch",
+                "git_tree_state",
+                "matches_build_git_sha",
+                "discovery_errors",
+            ),
+        )
+        identity = (
+            v8_require_string(receipt["workspace_root"], f"{label}.runtime.{point}.workspace_root"),
+            v8_require_string(receipt["canonical_workspace_root"], f"{label}.runtime.{point}.canonical_workspace_root"),
+            v8_require_git_sha(receipt["git_sha"], f"{label}.runtime.{point}.git_sha"),
+            v8_require_string(receipt["git_branch"], f"{label}.runtime.{point}.git_branch"),
+        )
+        if identity[0] != workspace_root or identity[1] != workspace_root or identity[2] != build_sha:
+            v8_fail(f"{label}.runtime.{point} does not match the embedded build")
+        if (
+            receipt["git_tree_state"] != "clean"
+            or receipt["matches_build_git_sha"] is not True
+            or receipt["discovery_errors"] != []
+        ):
+            v8_fail(f"{label}.runtime.{point} is not clean and build-bound")
+        runtime_identities.append(identity)
+    if runtime_identities[0] != runtime_identities[1]:
+        v8_fail(f"{label}.runtime source identity changed during measurement")
+    if runtime["same_clean_git_identity_at_capture_points"] is not True:
+        v8_fail(f"{label}.runtime stability receipt is not true")
+    v8_require_string(runtime["stability_limitation"], f"{label}.runtime.stability_limitation")
+
+    cargo_lock = v8_require_object(
+        subject["cargo_lock"],
+        f"{label}.subject_identity.cargo_lock",
+        (
+            "embedded_build_sha256",
+            "embedded_build_size_bytes",
+            "runtime_path",
+            "before_measurement",
+            "after_measurement",
+            "before_matches_embedded_build",
+            "after_matches_embedded_build",
+            "unchanged_at_capture_points",
+        ),
+    )
+    lock_sha = v8_require_sha256(cargo_lock["embedded_build_sha256"], f"{label}.cargo_lock.sha256")
+    lock_size = v8_require_int(cargo_lock["embedded_build_size_bytes"], f"{label}.cargo_lock.size", positive=True)
+    v8_require_string(cargo_lock["runtime_path"], f"{label}.cargo_lock.runtime_path")
+    before_lock = v8_validate_snapshot(cargo_lock["before_measurement"], f"{label}.cargo_lock.before")
+    after_lock = v8_validate_snapshot(cargo_lock["after_measurement"], f"{label}.cargo_lock.after")
+    if before_lock != after_lock or before_lock["sha256"] != lock_sha or before_lock["bytes_read"] != lock_size:
+        v8_fail(f"{label}.cargo_lock does not match its embedded build")
+    for field in ("before_matches_embedded_build", "after_matches_embedded_build", "unchanged_at_capture_points"):
+        if cargo_lock[field] is not True:
+            v8_fail(f"{label}.cargo_lock.{field} must be true")
+    return build_sha
+
+
+def v8_decode_hex(value, label):
+    if not isinstance(value, str) or len(value) % 2 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        v8_fail(f"{label} must be lowercase hexadecimal")
+    return bytes.fromhex(value)
+
+
+def v8_validate_build_configuration(value, label, profile, graph, graph_sha256):
+    value = v8_require_object(
+        value,
+        label,
+        (
+            "cargo_profile",
+            "selected_profile",
+            "profile_label",
+            "opt_level",
+            "debug",
+            "target",
+            "build_host",
+            "enabled_features",
+            "rustflags",
+            "profile_overrides_hex",
+            "native_build_overrides_hex",
+            "rustc_version_verbose",
+            "cargo_version",
+            "resolved_dependency_feature_graph_sha256",
+            "resolved_dependency_feature_graph_limitation",
+        ),
+    )
+    expected = {
+        "release": ("release", "release", "release", "z"),
+        "release-perf": ("release", "release-perf", "release-perf", "3"),
+    }[profile]
+    observed = tuple(value[field] for field in ("cargo_profile", "selected_profile", "profile_label", "opt_level"))
+    if observed != expected or value["debug"] != "false":
+        v8_fail(f"{label} does not identify the exact {profile} profile")
+    if value["target"] != graph["target"]:
+        v8_fail(f"{label}.target does not match the retained dependency/feature graph")
+    v8_require_string(value["build_host"], f"{label}.build_host")
+    if value["enabled_features"] != []:
+        v8_fail(f"{label}.enabled_features must be empty for --no-default-features")
+    rustflags = v8_require_object(
+        value["rustflags"],
+        f"{label}.rustflags",
+        ("cargo_encoded_rustflags_present", "encoded_hex", "decoded_arguments", "decode_error"),
+    )
+    if not isinstance(rustflags["cargo_encoded_rustflags_present"], bool) or rustflags["decode_error"] is not None:
+        v8_fail(f"{label}.rustflags is not a complete decodable receipt")
+    encoded = v8_decode_hex(rustflags["encoded_hex"], f"{label}.rustflags.encoded_hex")
+    try:
+        decoded = encoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        v8_fail(f"{label}.rustflags is not UTF-8: {error}")
+    expected_decoded = [part for part in decoded.split("\x1f") if part]
+    if rustflags["decoded_arguments"] != expected_decoded:
+        v8_fail(f"{label}.rustflags decoded arguments disagree with encoded bytes")
+    if not rustflags["cargo_encoded_rustflags_present"] and encoded:
+        v8_fail(f"{label}.rustflags claims absent bytes but contains data")
+    v8_decode_hex(value["profile_overrides_hex"], f"{label}.profile_overrides_hex")
+    v8_decode_hex(value["native_build_overrides_hex"], f"{label}.native_build_overrides_hex")
+    v8_require_string(value["rustc_version_verbose"], f"{label}.rustc_version_verbose")
+    v8_require_string(value["cargo_version"], f"{label}.cargo_version")
+    if value["resolved_dependency_feature_graph_sha256"] != graph_sha256:
+        v8_fail(f"{label} does not attest the exact retained dependency/feature graph bytes")
+    if value["resolved_dependency_feature_graph_limitation"] != GRAPH_ATTESTATION_AVAILABLE_V8:
+        v8_fail(f"{label} does not identify an available build-time graph attestation")
+    return value
+
+
+def v8_validate_invocation(value, label, expected_rows, expected_iterations, expected_history, expected_output):
+    value = v8_require_object(
+        value,
+        label,
+        ("argv_lossy", "argv_raw_hex", "raw_encoding", "length_prefixed_argv_sha256"),
+    )
+    lossy = v8_require_list(value["argv_lossy"], f"{label}.argv_lossy")
+    raw_hex = v8_require_list(value["argv_raw_hex"], f"{label}.argv_raw_hex")
+    if len(lossy) != len(raw_hex) or len(lossy) != 8 or value["raw_encoding"] != "unix_os_str_bytes":
+        v8_fail(f"{label} must contain the exact eight-argument Unix invocation receipt")
+    canonical = bytearray()
+    decoded = []
+    for index, encoded in enumerate(raw_hex):
+        raw = v8_decode_hex(encoded, f"{label}.argv_raw_hex[{index}]")
+        canonical.extend(len(raw).to_bytes(8, byteorder="little"))
+        canonical.extend(raw)
+        try:
+            decoded.append(raw.decode("utf-8"))
+        except UnicodeDecodeError as error:
+            v8_fail(f"{label}.argv_raw_hex[{index}] is not UTF-8: {error}")
+    if decoded != lossy:
+        v8_fail(f"{label}.argv_lossy disagrees with its raw argument bytes")
+    if hashlib.sha256(canonical).hexdigest() != value["length_prefixed_argv_sha256"]:
+        v8_fail(f"{label} digest disagrees with raw arguments")
+    required_prefix = [
+        f"--threads={','.join(map(str, REQUIRED_THREADS_V8))}",
+        f"--rows-per-thread={expected_rows}",
+        f"--iters={expected_iterations}",
+        "--separate-tables",
+        "--one-row-per-transaction",
+    ]
+    if lossy[1:6] != required_prefix:
+        v8_fail(f"{label} is not the exact 1,8,16 separate-table one-row invocation")
+    if not lossy[6].startswith("--history-json=") or not lossy[7].startswith("--json-output="):
+        v8_fail(f"{label} must bind history and JSON output paths")
+    history = lossy[6].split("=", 1)[1]
+    output = lossy[7].split("=", 1)[1]
+    if not history or not output:
+        v8_fail(f"{label} contains an empty artifact path")
+    if expected_history is not None and history != expected_history:
+        v8_fail(f"{label} history path does not match its measured profile run")
+    if expected_output is not None and output != expected_output:
+        v8_fail(f"{label} output path does not match its measured profile run")
+    return history, output
+
+
+def v8_validate_host(value, label):
+    value = v8_require_object(value, label, ("host", "before_measurement", "after_measurement"))
+    host = v8_require_object(
+        value["host"],
+        f"{label}.host",
+        (
+            "hostname",
+            "cpu_model",
+            "available_parallelism",
+            "cpu_online",
+            "cpu_present",
+            "cpu_possible",
+            "cpu_isolated",
+            "cpu_topology",
+            "scaling_governors_by_cpu",
+            "kernel_release",
+            "kernel_version",
+            "numa_online_nodes",
+            "numa_possible_nodes",
+            "numa_node_directories",
+            "unavailable_fields",
+        ),
+    )
+    for field in ("hostname", "cpu_model", "cpu_online", "cpu_present", "cpu_possible", "kernel_release", "kernel_version"):
+        v8_require_string(host[field], f"{label}.host.{field}")
+    available = v8_require_int(host["available_parallelism"], f"{label}.host.available_parallelism", positive=True)
+    if available < max(REQUIRED_THREADS_V8):
+        v8_fail(f"{label}.host lacks capacity for the required 16-writer cell")
+    topology = v8_require_object(
+        host["cpu_topology"],
+        f"{label}.host.cpu_topology",
+        ("logical_cpu_directories", "physical_package_count", "physical_core_count"),
+    )
+    v8_require_int(
+        topology["logical_cpu_directories"],
+        f"{label}.host.cpu_topology.logical_cpu_directories",
+        positive=True,
+    )
+    for field in ("physical_package_count", "physical_core_count"):
+        if topology[field] is not None:
+            v8_require_int(topology[field], f"{label}.host.cpu_topology.{field}", positive=True)
+    governors = v8_require_object(
+        host["scaling_governors_by_cpu"], f"{label}.host.scaling_governors_by_cpu"
+    )
+    for cpu, governor in governors.items():
+        v8_require_string(cpu, f"{label}.host.scaling_governors_by_cpu key")
+        v8_require_string(governor, f"{label}.host.scaling_governors_by_cpu.{cpu}")
+    if host["cpu_isolated"] is not None:
+        v8_require_string(host["cpu_isolated"], f"{label}.host.cpu_isolated")
+    for field in ("numa_online_nodes", "numa_possible_nodes"):
+        if host[field] is not None:
+            v8_require_string(host[field], f"{label}.host.{field}")
+    if host["numa_node_directories"] is not None:
+        numa_directories = v8_require_int(
+            host["numa_node_directories"], f"{label}.host.numa_node_directories"
+        )
+        if numa_directories < 0:
+            v8_fail(f"{label}.host.numa_node_directories must be non-negative")
+    unavailable = v8_require_list(host["unavailable_fields"], f"{label}.host.unavailable_fields")
+    for index, field in enumerate(unavailable):
+        v8_require_string(field, f"{label}.host.unavailable_fields[{index}]")
+    if len(unavailable) != len(set(unavailable)):
+        v8_fail(f"{label}.host.unavailable_fields must be unique")
+    expected_unavailable = [
+        field
+        for field in (
+            "hostname",
+            "cpu_model",
+            "available_parallelism",
+            "cpu_online",
+            "cpu_present",
+            "cpu_possible",
+            "kernel_release",
+            "kernel_version",
+            "numa_online_nodes",
+            "numa_possible_nodes",
+            "numa_node_directories",
+        )
+        if host[field] is None
+    ]
+    if host["cpu_isolated"] is None:
+        expected_unavailable.append("cpu_isolated")
+    if not governors:
+        expected_unavailable.append("scaling_governors_by_cpu")
+    v8_require_exact(
+        unavailable, expected_unavailable, f"{label}.host.unavailable_fields"
+    )
+    placement_fields = (
+        "process_cpu_affinity_mask",
+        "process_cpu_affinity_list",
+        "proc_self_cgroup",
+        "cpuset_cpus_effective",
+        "cpuset_mems_effective",
+    )
+    placements = []
+    timestamps = []
+    for point in ("before_measurement", "after_measurement"):
+        dynamic = v8_require_object(
+            value[point],
+            f"{label}.{point}",
+            (
+                "unix_epoch_millis",
+                *placement_fields,
+                "load_average",
+                "pressure_cpu",
+                "pressure_memory",
+                "pressure_io",
+            ),
+        )
+        timestamps.append(v8_require_int(dynamic["unix_epoch_millis"], f"{label}.{point}.unix_epoch_millis", positive=True))
+        placements.append({field: v8_require_string(dynamic[field], f"{label}.{point}.{field}") for field in placement_fields})
+        for field in ("load_average", "pressure_cpu", "pressure_memory", "pressure_io"):
+            if dynamic[field] is not None:
+                v8_require_string(dynamic[field], f"{label}.{point}.{field}")
+    if timestamps[1] < timestamps[0] or placements[0] != placements[1]:
+        v8_fail(f"{label} timestamps or CPU/cgroup placement changed during measurement")
+    return host, placements[0], available
+
+
+def v8_expected_retry_policy(writers, expected_rows):
+    timeout_ms = (5 + writers * expected_rows // 5_000) * 1_000
+    return {
+        "csqlite_busy_timeout_ms": 5_000,
+        "csqlite_max_operation_retries": 0,
+        "csqlite_max_transaction_retries": 512,
+        "csqlite_retry_sleep_ms": 1,
+        "csqlite_retry_unit": CSQLITE_RETRY_UNIT_V9,
+        "csqlite_retry_algorithm": CSQLITE_RETRY_ALGORITHM_V9,
+        "shared_worker_retry_timeout_ms": timeout_ms,
+        "shared_worker_retry_timeout_overridden": False,
+        "fsqlite_transaction_timeout_ms": timeout_ms,
+        "fsqlite_max_transaction_retries": 512,
+        "fsqlite_retry_sleep_base_ms": 1,
+        "fsqlite_retry_sleep_cap_ms": 29,
+        "fsqlite_retry_unit": FSQLITE_RETRY_UNIT_V9,
+        "fsqlite_retry_backoff_algorithm": FSQLITE_RETRY_ALGORITHM_V9,
+        "fsqlite_retryable_errors": FSQLITE_RETRYABLE_ERRORS_V9,
+        "fsqlite_timeout_overridden": False,
+    }
+
+
+def v8_expected_settings(concurrent_mode):
+    return {
+        "page_size_bytes": 4_096,
+        "journal_mode": "wal",
+        "synchronous": "normal",
+        "cache_size": -64_000,
+        "busy_timeout_ms": 5_000,
+        "wal_autocheckpoint_pages": 1_000,
+        "concurrent_mode": concurrent_mode,
+    }
+
+
+def v8_duration_seconds(elapsed_ns):
+    seconds, nanoseconds = divmod(elapsed_ns, 1_000_000_000)
+    return float(seconds) + float(nanoseconds) / 1_000_000_000.0
+
+
+def v8_validate_sample(sample, label, offered_writes, expected_settings):
+    sample = v8_require_object(sample, label, ("worker_startup_elapsed_ns", "workload_elapsed_ns", "settings", "accounting", "committed_state"))
+    v8_require_int(sample["worker_startup_elapsed_ns"], f"{label}.worker_startup_elapsed_ns", positive=True)
+    elapsed_ns = v8_require_int(sample["workload_elapsed_ns"], f"{label}.workload_elapsed_ns", positive=True)
+    v8_require_exact(
+        sample["settings"], expected_settings, f"{label}.settings"
+    )
+    accounting = v8_require_object(sample["accounting"], f"{label}.accounting")
+    if v8_require_int(accounting.get("offered_writes"), f"{label}.offered_writes", positive=True) != offered_writes:
+        v8_fail(f"{label}.offered_writes disagrees with the configuration")
+    attempted = v8_require_int(accounting.get("attempted_writes"), f"{label}.attempted_writes", positive=True)
+    succeeded = v8_require_int(accounting.get("succeeded_writes"), f"{label}.succeeded_writes", positive=True)
+    retried = v8_require_int(accounting.get("retried_operations"), f"{label}.retried_operations")
+    if attempted < succeeded or succeeded != offered_writes or retried < 0:
+        v8_fail(f"{label}.accounting does not prove all offered writes")
+    failed = v8_require_int(accounting.get("failed_writes"), f"{label}.failed_writes")
+    worker_failed = v8_require_int(
+        accounting.get("worker_reported_failed_writes"),
+        f"{label}.worker_reported_failed_writes",
+    )
+    v8_require_exact(accounting.get("diagnostics"), [], f"{label}.accounting.diagnostics")
+    if failed != 0 or worker_failed != 0 or accounting.get("exact") is not True:
+        v8_fail(f"{label}.accounting is not exact and failure-free")
+    committed = v8_require_object(sample["committed_state"], f"{label}.committed_state")
+    v8_require_exact(committed.get("diagnostics"), [], f"{label}.committed_state.diagnostics")
+    v8_require_exact(committed.get("integrity_check"), ["ok"], f"{label}.committed_state.integrity_check")
+    if committed.get("valid") is not True:
+        v8_fail(f"{label}.committed_state is not valid and diagnostic-free")
+    expected_committed_rows = v8_require_int(
+        committed.get("expected_rows"), f"{label}.committed_state.expected_rows"
+    )
+    observed_committed_rows = v8_require_int(
+        committed.get("observed_rows"), f"{label}.committed_state.observed_rows"
+    )
+    if expected_committed_rows != succeeded or observed_committed_rows != succeeded:
+        v8_fail(f"{label}.committed_state row oracle disagrees")
+    expected_id_sum = v8_require_int(
+        committed.get("expected_id_sum"), f"{label}.committed_state.expected_id_sum"
+    )
+    observed_id_sum = v8_require_int(
+        committed.get("observed_id_sum"), f"{label}.committed_state.observed_id_sum"
+    )
+    if expected_id_sum != observed_id_sum:
+        v8_fail(f"{label}.committed_state id-sum oracle disagrees")
+    expected_payload = v8_require_sha256(committed.get("expected_payload_sha256"), f"{label}.expected_payload_sha256")
+    if committed.get("observed_payload_sha256") != expected_payload:
+        v8_fail(f"{label}.committed_state payload oracle disagrees")
+    elapsed_seconds = v8_duration_seconds(elapsed_ns)
+    return {
+        "wps": succeeded / elapsed_seconds,
+        "elapsed_ms": elapsed_seconds * 1_000.0,
+    }
+
+
+def v8_percentile(values, quantile):
+    ordered = sorted(values)
+    rank = quantile * (len(ordered) - 1)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[lower]
+    fraction = rank - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def v8_close(observed, expected):
+    return math.isclose(observed, expected, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def v8_lcg_next(state):
+    return (state * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407) & ((1 << 64) - 1)
+
+
+def v8_ratio_stats(ratios):
+    median = statistics.median(ratios)
+    mean = sum(ratios) / len(ratios)
+    variance = sum((ratio - mean) ** 2 for ratio in ratios) / (len(ratios) - 1)
+    cv_pct = 0.0 if mean == 0.0 else math.sqrt(variance) / abs(mean) * 100.0
+    mad = statistics.median(abs(ratio - median) for ratio in ratios)
+    state = 0x7A25_2026_C011_CAFE
+    medians = []
+    for _ in range(10_000):
+        resample = []
+        for _ in ratios:
+            state = v8_lcg_next(state)
+            resample.append(ratios[state % len(ratios)])
+        medians.append(statistics.median(resample))
+    medians.sort()
+    return median, medians[250], medians[9_750], cv_pct, mad
+
+
+def v8_expected_median_contract(null_ratios, claim_ratios):
+    null = v8_ratio_stats(null_ratios)
+    claim = v8_ratio_stats(claim_ratios)
+    null_radius = max(abs(null[1] - 1.0), abs(null[2] - 1.0))
+    decisive_effect = max(2.0 * null_radius, 0.01)
+    minimum_gain = 1.0 + decisive_effect
+    maximum_regression = 1.0 - decisive_effect
+    claim_margin = None if null_radius == 0.0 else abs(claim[0] - 1.0) / null_radius
+    verdict = "INCONCLUSIVE"
+    if claim[1] > minimum_gain:
+        verdict = "FSQLITE_FASTER"
+    elif claim[2] < maximum_regression:
+        verdict = "FSQLITE_SLOWER"
+    return {
+        "null_ratio_median": null[0],
+        "null_ratio_ci95_low": null[1],
+        "null_ratio_ci95_high": null[2],
+        "null_ratio_cv_pct": null[3],
+        "null_ratio_mad": null[4],
+        "claim_ratio_median": claim[0],
+        "claim_ratio_ci95_low": claim[1],
+        "claim_ratio_ci95_high": claim[2],
+        "claim_ratio_cv_pct": claim[3],
+        "claim_ratio_mad": claim[4],
+        "null_radius": null_radius,
+        "min_decidable_gain": minimum_gain,
+        "max_decidable_regression": maximum_regression,
+        "claim_margin": claim_margin,
+        "cv_gate": "never",
+        "verdict": verdict,
+    }
+
+
+def v8_validate_median_contract(observed, expected, label):
+    observed = v8_require_object(observed, label)
+    if set(observed) != set(expected):
+        v8_fail(f"{label} fields do not match the v9 median-CI contract")
+    for field, expected_value in expected.items():
+        observed_value = observed[field]
+        if isinstance(expected_value, float):
+            if not v8_close(v8_require_number(observed_value, f"{label}.{field}"), expected_value):
+                v8_fail(f"{label}.{field} disagrees with paired within-report samples")
+        elif observed_value != expected_value:
+            v8_fail(f"{label}.{field} disagrees with the v9 median-CI contract")
+
+
+def v8_validate_report(
+    report,
+    label,
+    profile,
+    graph,
+    graph_sha256,
+    expected_rows,
+    expected_iterations,
+    *,
+    expected_commit=None,
+    expected_nonce=None,
+    expected_history=None,
+    expected_output=None,
+):
+    if report.get("schema_version") != report_schema_v8:
+        v8_fail(f"{label}.schema_version must be {report_schema_v8}; prior schemas are not accepted")
+    if report.get("citable") is not False or report.get("measurement_evidence_valid") is not True:
+        v8_fail(f"{label} must be valid but explicitly non-citable v9 evidence")
+    if report.get("non_citable_reason") != EXPECTED_NON_CITABLE_REASON_V9:
+        v8_fail(f"{label}.non_citable_reason does not match the v9 contract")
+    if report.get("release_regression_scope") != EXPECTED_RELEASE_SCOPE_V9:
+        v8_fail(f"{label}.release_regression_scope does not match the v9 contract")
+    if "release_evidence" in report or "release_eligible" in report:
+        v8_fail(f"{label} must not smuggle a release claim")
+    source_sha = v8_validate_subject_identity(report, label, expected_commit, expected_nonce)
+    environment = v8_require_object(
+        report.get("comparison_environment"),
+        f"{label}.comparison_environment",
+        ("build_configuration", "invocation", "measurement_host"),
+    )
+    build_configuration = v8_validate_build_configuration(
+        environment["build_configuration"],
+        f"{label}.build_configuration",
+        profile,
+        graph,
+        graph_sha256,
+    )
+    history_path, output_path = v8_validate_invocation(
+        environment["invocation"],
+        f"{label}.invocation",
+        expected_rows,
+        expected_iterations,
+        expected_history,
+        expected_output,
+    )
+    host, placement, available_parallelism = v8_validate_host(
+        environment["measurement_host"], f"{label}.measurement_host"
+    )
+    if report.get("workload_shape") != "separate_tables":
+        v8_fail(f"{label}.workload_shape must be separate_tables")
+    if (
+        v8_require_int(report.get("rows_per_thread"), f"{label}.rows_per_thread", positive=True)
+        != expected_rows
+        or v8_require_int(report.get("iterations"), f"{label}.iterations", positive=True)
+        != expected_iterations
+    ):
+        v8_fail(f"{label} does not use the exact rows/iterations contract")
+    transaction = {
+        "granularity": "one_row_per_transaction",
+        "rows_per_transaction": 1,
+        "prepared_statement_scope": "one successfully prepared statement per worker, reused across row transactions; transient preparation failures retry under the shared worker deadline",
+        "duplicate_after_ambiguous_commit_policy": "fail_closed; a duplicate is never accepted as proof of exact id+payload",
+        "csqlite_retry_unit": CSQLITE_RETRY_UNIT_V9,
+        "fsqlite_retry_unit": FSQLITE_RETRY_UNIT_V9,
+    }
+    v8_require_exact(
+        report.get("transaction_contract"), transaction, f"{label}.transaction_contract"
+    )
+    interpretations = {
+        "settings_interpretation": EXPECTED_SETTINGS_INTERPRETATION_V9,
+        "accounting_interpretation": EXPECTED_ACCOUNTING_INTERPRETATION_V9,
+        "timing_interpretation": EXPECTED_TIMING_INTERPRETATION_V9,
+    }
+    for field, expected in interpretations.items():
+        if report.get(field) != expected:
+            v8_fail(f"{label}.{field} does not match the v9 contract")
+    pass_gate = v8_require_object(report.get("pass_over_pass_gate"), f"{label}.pass_over_pass_gate")
+    if (
+        pass_gate.get("schema_version") != "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1"
+        or pass_gate.get("history_json_path") != history_path
+        or not v8_close(v8_require_number(pass_gate.get("threshold_ratio_drop_pct"), f"{label}.pass_over_pass_gate.threshold"), 5.0)
+        or pass_gate.get("status") != "disabled_non_citable"
+        or not isinstance(pass_gate.get("previous_report_found"), bool)
+        or v8_require_int(
+            pass_gate.get("comparable_pair_count"),
+            f"{label}.pass_over_pass_gate.comparable_pair_count",
+        )
+        != 0
+    ):
+        v8_fail(f"{label}.pass_over_pass_gate is not the disabled non-citable receipt")
+    v8_require_exact(
+        pass_gate.get("regressions"), [], f"{label}.pass_over_pass_gate.regressions"
+    )
+    if measurement_mode_v8 == "measured" and expected_history is not None:
+        if pass_gate["previous_report_found"] or os.path.lexists(history_path):
+            v8_fail(f"{label}.pass_over_pass_gate history path must remain absent")
+
+    receipts = v8_require_list(report.get("configuration_receipts"), f"{label}.configuration_receipts")
+    rows = v8_require_list(report.get("thread_results"), f"{label}.thread_results")
+    if len(receipts) != 3 or len(rows) != 3:
+        v8_fail(f"{label} must contain exactly the 1, 8, and 16 writer cells")
+    receipts_by_thread = {}
+    for index, receipt in enumerate(receipts):
+        receipt_label = f"{label}.configuration_receipts[{index}]"
+        receipt = v8_require_object(receipt, receipt_label)
+        writers = v8_require_int(receipt.get("writers"), f"{receipt_label}.writers", positive=True)
+        if writers in receipts_by_thread:
+            v8_fail(f"{label} contains duplicate {writers}-writer receipts")
+        if (
+            receipt.get("status") != "supported"
+            or receipt.get("comparison_eligible") is not True
+            or receipt.get("measured") is not True
+            or v8_require_int(
+                receipt.get("available_parallelism"),
+                f"{receipt_label}.available_parallelism",
+                positive=True,
+            )
+            != available_parallelism
+            or v8_require_int(
+                receipt.get("max_supported_writers"),
+                f"{receipt_label}.max_supported_writers",
+                positive=True,
+            )
+            != 128
+            or v8_require_int(
+                receipt.get("wal_autocheckpoint_pages"),
+                f"{receipt_label}.wal_autocheckpoint_pages",
+                positive=True,
+            )
+            != 1_000
+            or receipt.get("wal_autocheckpoint_overridden") is not False
+            or v8_require_int(
+                receipt.get("offered_writes_per_sample"),
+                f"{receipt_label}.offered_writes_per_sample",
+                positive=True,
+            )
+            != writers * expected_rows
+        ):
+            v8_fail(f"{receipt_label} does not match the exact shared-deadline v9 contract")
+        v8_require_exact(
+            receipt.get("retry_policy"),
+            v8_expected_retry_policy(writers, expected_rows),
+            f"{receipt_label}.retry_policy",
+        )
+        v8_require_string(receipt.get("reason"), f"{receipt_label}.reason")
+        receipts_by_thread[writers] = receipt
+    if tuple(sorted(receipts_by_thread)) != REQUIRED_THREADS_V8:
+        v8_fail(f"{label} configurations must be exactly {REQUIRED_THREADS_V8}")
+
+    rows_by_thread = {}
+    even_order = ["csqlite_null_a", "csqlite_null_b", "csqlite_baseline", "fsqlite_candidate"]
+    odd_order = ["fsqlite_candidate", "csqlite_baseline", "csqlite_null_b", "csqlite_null_a"]
+    for index, row in enumerate(rows):
+        row_label = f"{label}.thread_results[{index}]"
+        row = v8_require_object(row, row_label)
+        threads = v8_require_int(row.get("threads"), f"{row_label}.threads", positive=True)
+        if threads not in receipts_by_thread or threads in rows_by_thread:
+            v8_fail(f"{row_label} has no unique matching configuration receipt")
+        truth = v8_require_object(row.get("truth"), f"{row_label}.truth")
+        v8_require_exact(
+            truth.get("configuration"),
+            receipts_by_thread[threads],
+            f"{row_label}.truth.configuration",
+        )
+        round_receipts = v8_require_list(truth.get("round_order_receipts"), f"{row_label}.truth.round_order_receipts")
+        expected_round_receipts = [
+            {"round_index": round_index, "execution_order": even_order if round_index % 2 == 0 else odd_order}
+            for round_index in range(expected_iterations)
+        ]
+        v8_require_exact(
+            round_receipts,
+            expected_round_receipts,
+            f"{row_label}.truth.round_order_receipts",
+        )
+        offered = threads * expected_rows
+        arm_settings = {
+            "null_c_a_samples": v8_expected_settings("sqlite_wal_single_writer"),
+            "null_c_b_samples": v8_expected_settings("sqlite_wal_single_writer"),
+            "sqlite_samples": v8_expected_settings("sqlite_wal_single_writer"),
+            "fsqlite_samples": v8_expected_settings("fsqlite_mvcc_on"),
+        }
+        arms = {}
+        for arm, settings in arm_settings.items():
+            samples = v8_require_list(truth.get(arm), f"{row_label}.truth.{arm}")
+            if len(samples) != expected_iterations:
+                v8_fail(f"{row_label}.truth.{arm} must contain exactly {expected_iterations} samples")
+            arms[arm] = [
+                v8_validate_sample(sample, f"{row_label}.truth.{arm}[{sample_index}]", offered, settings)
+                for sample_index, sample in enumerate(samples)
+            ]
+        null_ratios = [
+            right["wps"] / left["wps"]
+            for left, right in zip(arms["null_c_a_samples"], arms["null_c_b_samples"])
+        ]
+        claim_ratios = [
+            candidate["wps"] / baseline["wps"]
+            for baseline, candidate in zip(arms["sqlite_samples"], arms["fsqlite_samples"])
+        ]
+        v8_validate_median_contract(
+            row.get("median_ci_contract"),
+            v8_expected_median_contract(null_ratios, claim_ratios),
+            f"{row_label}.median_ci_contract",
+        )
+        fsqlite_wps = [sample["wps"] for sample in arms["fsqlite_samples"]]
+        sqlite_wps = [sample["wps"] for sample in arms["sqlite_samples"]]
+        fsqlite_ms = [sample["elapsed_ms"] for sample in arms["fsqlite_samples"]]
+        sqlite_ms = [sample["elapsed_ms"] for sample in arms["sqlite_samples"]]
+        for prefix, wps_values, ms_values in (("fsqlite", fsqlite_wps, fsqlite_ms), ("sqlite", sqlite_wps, sqlite_ms)):
+            for suffix, quantile in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+                for metric, values in (("wps", wps_values), ("ms", ms_values)):
+                    field = f"{prefix}_{metric}_{suffix}"
+                    if not v8_close(v8_require_number(row.get(field), f"{row_label}.{field}", positive=True), v8_percentile(values, quantile)):
+                        v8_fail(f"{row_label}.{field} disagrees with raw samples")
+        ratio_median = statistics.median(claim_ratios)
+        if not v8_close(v8_require_number(row.get("throughput_ratio"), f"{row_label}.throughput_ratio", positive=True), ratio_median):
+            v8_fail(f"{row_label}.throughput_ratio disagrees with paired within-report samples")
+        expected_time_ratio = v8_percentile(fsqlite_ms, 0.50) / v8_percentile(sqlite_ms, 0.50)
+        if not v8_close(v8_require_number(row.get("time_ratio"), f"{row_label}.time_ratio", positive=True), expected_time_ratio):
+            v8_fail(f"{row_label}.time_ratio disagrees with raw samples")
+        if (
+            v8_require_int(row.get("fsqlite_failed_rows"), f"{row_label}.fsqlite_failed_rows")
+            != 0
+            or v8_require_int(row.get("sqlite_failed_rows"), f"{row_label}.sqlite_failed_rows")
+            != 0
+        ):
+            v8_fail(f"{row_label} reports failed rows")
+        rows_by_thread[threads] = {"fsqlite_wps": fsqlite_wps, "ratio_median": ratio_median}
+    if tuple(sorted(rows_by_thread)) != REQUIRED_THREADS_V8:
+        v8_fail(f"{label} thread results must be exactly {REQUIRED_THREADS_V8}")
+    semantic_contract = {
+        "transaction_contract": transaction,
+        "configuration_receipts": {
+            str(thread): {
+                key: receipts_by_thread[thread][key]
+                for key in (
+                    "available_parallelism",
+                    "max_supported_writers",
+                    "wal_autocheckpoint_pages",
+                    "wal_autocheckpoint_overridden",
+                    "offered_writes_per_sample",
+                    "retry_policy",
+                )
+            }
+            for thread in REQUIRED_THREADS_V8
+        },
+        **interpretations,
+    }
+    cross_profile_build = {
+        key: build_configuration[key]
+        for key in (
+            "cargo_profile",
+            "target",
+            "build_host",
+            "enabled_features",
+            "rustflags",
+            "profile_overrides_hex",
+            "native_build_overrides_hex",
+            "rustc_version_verbose",
+            "cargo_version",
+            "resolved_dependency_feature_graph_sha256",
+            "resolved_dependency_feature_graph_limitation",
+        )
+    }
+    cross_revision_build = {
+        key: build_configuration[key]
+        for key in (
+            "cargo_profile",
+            "selected_profile",
+            "profile_label",
+            "opt_level",
+            "debug",
+            "target",
+            "build_host",
+            "enabled_features",
+            "rustflags",
+            "profile_overrides_hex",
+            "native_build_overrides_hex",
+            "rustc_version_verbose",
+            "cargo_version",
+        )
+    }
+    # Cargo reports the release profile family for both release and release-perf.
+    return {
+        "source_sha": source_sha,
+        "history_path": history_path,
+        "output_path": output_path,
+        "rows": rows_by_thread,
+        "contract": semantic_contract,
+        "measurement_comparability": {
+            # Historical engine revisions may legitimately resolve a different
+            # dependency graph. Each graph is attested independently; all other
+            # build/profile/host inputs must still match exactly.
+            "build_configuration": cross_revision_build,
+            "static_host": host,
+            "stable_process_placement": placement,
+        },
+        "cross_profile_comparability": {
+            "build": cross_profile_build,
+            "static_host": host,
+            "stable_process_placement": placement,
+        },
+    }
+
+
+def v8_arithmetic_mean(values):
+    return sum(values) / len(values)
+
+
+def v8_bootstrap_relative_delta(baseline_values, current_values, seed, statistic):
+    state = seed
+    deltas = []
+    for _ in range(BOOTSTRAP_REPETITIONS_V8):
+        baseline_sample = []
+        current_sample = []
+        for _ in baseline_values:
+            state = v8_lcg_next(state)
+            baseline_sample.append(baseline_values[state % len(baseline_values)])
+        for _ in current_values:
+            state = v8_lcg_next(state)
+            current_sample.append(current_values[state % len(current_values)])
+        baseline_statistic = statistic(baseline_sample)
+        current_statistic = statistic(current_sample)
+        if baseline_statistic <= 0.0:
+            v8_fail("independent bootstrap encountered non-positive baseline throughput")
+        deltas.append(current_statistic / baseline_statistic - 1.0)
+    deltas.sort()
+    return deltas[BOOTSTRAP_REPETITIONS_V8 * 25 // 1_000], deltas[min(BOOTSTRAP_REPETITIONS_V8 * 975 // 1_000, BOOTSTRAP_REPETITIONS_V8 - 1)]
+
+
+def v8_bootstrap_scaling_delta(baseline_numerator, baseline_denominator, current_numerator, current_denominator, seed):
+    state = seed
+    deltas = []
+    arrays = (baseline_numerator, baseline_denominator, current_numerator, current_denominator)
+    for _ in range(BOOTSTRAP_REPETITIONS_V8):
+        resamples = []
+        for values in arrays:
+            sample = []
+            for _ in values:
+                state = v8_lcg_next(state)
+                sample.append(values[state % len(values)])
+            resamples.append(sample)
+        baseline_scaling = statistics.median(resamples[0]) / statistics.median(resamples[1])
+        current_scaling = statistics.median(resamples[2]) / statistics.median(resamples[3])
+        if baseline_scaling <= 0.0:
+            v8_fail("independent scaling bootstrap encountered non-positive baseline scaling")
+        deltas.append(current_scaling / baseline_scaling - 1.0)
+    deltas.sort()
+    return deltas[BOOTSTRAP_REPETITIONS_V8 * 25 // 1_000], deltas[min(BOOTSTRAP_REPETITIONS_V8 * 975 // 1_000, BOOTSTRAP_REPETITIONS_V8 - 1)]
+
+
+def v8_classify(ci_low, ci_high, maximum_drop):
+    allowed_delta = -maximum_drop
+    if ci_high < allowed_delta and not v8_close(ci_high, allowed_delta):
+        return "regression"
+    if ci_low > allowed_delta or v8_close(ci_low, allowed_delta):
+        return "passed"
+    return "inconclusive"
+
+
+def v8_fsync_directory(path):
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(descriptor)
+    except OSError as error:
+        v8_fail(f"cannot fsync artifact directory {path}: {error}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def v8_ensure_directory(path):
+    directory = Path(path)
+    missing = []
+    cursor = directory
+    while not cursor.exists():
+        missing.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            v8_fail(f"cannot find existing parent for artifact directory {directory}")
+        cursor = parent
+    if not cursor.is_dir():
+        v8_fail(f"artifact directory ancestor is not a directory: {cursor}")
+    for item in reversed(missing):
+        try:
+            item.mkdir()
+        except FileExistsError:
+            if not item.is_dir():
+                v8_fail(f"artifact directory path is not a directory: {item}")
+        except OSError as error:
+            v8_fail(f"cannot create artifact directory {item}: {error}")
+        v8_fsync_directory(item.parent)
+
+
+def v8_write_json(path, value, *, exclusive=True):
+    destination = Path(path)
+    try:
+        v8_ensure_directory(destination.parent)
+        with destination.open("xb" if exclusive else "wb") as handle:
+            handle.write(v8_canonical_pretty_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        v8_fsync_directory(destination.parent)
+    except OSError as error:
+        v8_fail(f"cannot {'create' if exclusive else 'write'} JSON artifact {path}: {error}")
+
+
+def v8_publish_baseline(path, value, publication_run_id):
+    destination = Path(path)
+    payload = v8_canonical_pretty_bytes(value)
+    digest = hashlib.sha256(payload).hexdigest()
+    versions = destination.parent / "versions"
+    version = versions / f"{digest}.json"
+    result_scope = hashlib.sha256(str(Path(result_path_v8).resolve()).encode("utf-8")).hexdigest()[:16]
+    candidate_dir = versions / "candidates" / f"{publication_run_id}.{result_scope}"
+    candidate = candidate_dir / "baseline.json"
+    try:
+        v8_ensure_directory(versions / "candidates")
+        candidate_dir.mkdir()
+        v8_fsync_directory(candidate_dir.parent)
+        with candidate.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        v8_fsync_directory(candidate_dir)
+        if os.path.lexists(version):
+            if version.is_symlink() or not version.is_file() or version.read_bytes() != payload:
+                v8_fail(f"baseline version digest collision or corruption: {version}")
+        else:
+            try:
+                os.link(candidate, version, follow_symlinks=False)
+            except FileExistsError:
+                if version.is_symlink() or not version.is_file() or version.read_bytes() != payload:
+                    v8_fail(f"baseline version digest collision or corruption: {version}")
+        v8_fsync_directory(versions)
+        os.link(version, destination, follow_symlinks=False)
+        v8_fsync_directory(destination.parent)
+    except V8EvidenceError:
+        raise
+    except OSError as error:
+        v8_fail(f"cannot atomically publish baseline {path}: {error}")
+    return str(version), str(candidate), digest
+
+
+def v8_validate_profile_pair(validated, label):
+    first = validated["release"]
+    second = validated["release-perf"]
+    if first["source_sha"] != second["source_sha"]:
+        v8_fail(f"{label} profiles were not built from the same source commit")
+    if first["contract"] != second["contract"]:
+        v8_fail(f"{label} profiles use different benchmark contracts")
+    if first["cross_profile_comparability"] != second["cross_profile_comparability"]:
+        v8_fail(f"{label} profiles do not share one comparable host/build environment")
+
+
+def v8_report_digest(report):
+    return hashlib.sha256(v8_canonical_compact_bytes(report)).hexdigest()
+
+
+def v8_run():
+    expected_rows = int(expected_rows_raw_v8)
+    expected_iterations = int(expected_iterations_raw_v8)
+    capture = capture_raw_v8 == "true"
+    maximum_drops = {
+        1: v8_require_fraction(max_drop_1t_raw_v8, "1t maximum drop"),
+        8: v8_require_fraction(max_drop_8t_raw_v8, "8t maximum drop"),
+        16: v8_require_fraction(max_drop_16t_raw_v8, "16t maximum drop"),
+    }
+    scaling_drops = {
+        (8, 1): v8_require_fraction(max_scaling_drop_8_over_1_raw_v8, "8/1 scaling maximum drop"),
+        (16, 8): v8_require_fraction(max_scaling_drop_16_over_8_raw_v8, "16/8 scaling maximum drop"),
+    }
+    margin_policy = {
+        "1t_absolute": {
+            "maximum_drop_fraction": maximum_drops[1],
+            "source": "tracked bd-zywqc.2 contract",
+        },
+        "8t_absolute": {
+            "maximum_drop_fraction": maximum_drops[8],
+            "source": "tracked bd-zywqc.2 contract",
+        },
+        "16t_absolute": {
+            "maximum_drop_fraction": maximum_drops[16],
+            "source": "explicit caller input; acceptance-owner value remains unresolved",
+        },
+        "8_over_1_scaling": {
+            "maximum_drop_fraction": scaling_drops[(8, 1)],
+            "source": "explicit caller input; acceptance-owner value remains unresolved",
+        },
+        "16_over_8_scaling": {
+            "maximum_drop_fraction": scaling_drops[(16, 8)],
+            "source": "explicit caller input; acceptance-owner value remains unresolved",
+        },
+    }
+    graph, graph_sha256 = v8_read_graph(graph_path_v8)
+    provenance = v8_provenance(expected_rows, graph["target"])
+    paths = {
+        "release": current_release_path_v8,
+        "release-perf": current_release_perf_path_v8,
+    }
+    reports = {profile: v8_read_json(path, f"current {profile} report") for profile, path in paths.items()}
+    current_digests = {profile: v8_report_digest(report) for profile, report in reports.items()}
+    current_validated = {}
+    for profile in REQUIRED_PROFILES_V8:
+        required_nonce = f"{run_id_v8}.{profile}" if measurement_mode_v8 == "measured" else None
+        required_history = (
+            str(Path(paths[profile]).parent / f"disposable_history.{profile}.json")
+            if measurement_mode_v8 == "measured"
+            else None
+        )
+        current_validated[profile] = v8_validate_report(
+            reports[profile],
+            f"current {profile} report",
+            profile,
+            graph,
+            graph_sha256,
+            expected_rows,
+            expected_iterations,
+            expected_commit=intended_commit_v8,
+            expected_nonce=required_nonce,
+            expected_history=required_history,
+            expected_output=paths[profile] if measurement_mode_v8 == "measured" else None,
+        )
+    v8_validate_profile_pair(current_validated, "current")
+
+    if capture:
+        baseline = {
+            "schema_version": baseline_schema_v8,
+            "bead_id": "bd-zywqc.2",
+            "analyzer_commit": intended_commit_v8,
+            "capture_run_id": run_id_v8,
+            "measurement_mode": measurement_mode_v8,
+            "comparison_design": "independent_two_sample_bootstrap; no historical pairing",
+            "unresolved_release_coverage": UNRESOLVED_RELEASE_COVERAGE_V8,
+            "diagnostic_margin_policy": margin_policy,
+            "provenance": provenance,
+            "dependency_feature_graph_sha256": graph_sha256,
+            "dependency_feature_graph": graph,
+            "profiles": {
+                profile: {
+                    "report_sha256": current_digests[profile],
+                    "report_history_json_path": current_validated[profile]["history_path"],
+                    "report_output_path": current_validated[profile]["output_path"],
+                    "report": reports[profile],
+                }
+                for profile in REQUIRED_PROFILES_V8
+            },
+            "release_evidence": False,
+            "release_eligible": False,
+        }
+        version, candidate, envelope_digest = v8_publish_baseline(
+            baseline_path_v8, baseline, run_id_v8
+        )
+        result = {
+            "schema_version": gate_schema_v8,
+            "bead_id": "bd-zywqc.2",
+            "mode": "capture_baseline",
+            "measurement_mode": measurement_mode_v8,
+            "comparison_design": "independent_two_sample_bootstrap; no historical pairing",
+            "unresolved_release_coverage": UNRESOLVED_RELEASE_COVERAGE_V8,
+            "diagnostic_margin_policy": margin_policy,
+            "analyzer_commit": intended_commit_v8,
+            "current_report_sha256": current_digests,
+            "dependency_feature_graph_sha256": graph_sha256,
+            "baseline_path": baseline_path_v8,
+            "baseline_version_path": version,
+            "baseline_candidate_path": candidate,
+            "baseline_envelope_sha256": envelope_digest,
+            "iterations": expected_iterations,
+            "verdict": "baseline_captured",
+            "release_evidence": False,
+            "release_eligible": False,
+        }
+        v8_write_json(result_path_v8, result)
+        print(f"[bd-zywqc.2] CAPTURED validated dual-profile v9 baseline: {baseline_path_v8}")
+        return 0
+
+    destination = Path(baseline_path_v8)
+    if destination.is_symlink() or not destination.is_file():
+        v8_fail("baseline latest path must be a regular file, not a symbolic link")
+    baseline = v8_read_json(baseline_path_v8, "baseline envelope")
+    if baseline.get("schema_version") != baseline_schema_v8:
+        v8_fail(f"baseline must use {baseline_schema_v8}; recapture explicitly")
+    baseline_payload = v8_canonical_pretty_bytes(baseline)
+    envelope_digest = hashlib.sha256(baseline_payload).hexdigest()
+    version = destination.parent / "versions" / f"{envelope_digest}.json"
+    if version.is_symlink() or not version.is_file():
+        v8_fail(f"baseline envelope has no matching regular content-addressed version: {version}")
+    try:
+        if not os.path.samefile(destination, version):
+            v8_fail("baseline latest path is not the matching content-addressed version")
+        if version.read_bytes() != baseline_payload:
+            v8_fail("baseline envelope bytes are not canonical content-addressed JSON")
+    except OSError as error:
+        v8_fail(f"cannot verify content-addressed baseline identity: {error}")
+    if (
+        baseline.get("bead_id") != "bd-zywqc.2"
+        or baseline.get("measurement_mode") != measurement_mode_v8
+        or baseline.get("comparison_design") != "independent_two_sample_bootstrap; no historical pairing"
+        or baseline.get("unresolved_release_coverage") != UNRESOLVED_RELEASE_COVERAGE_V8
+        or baseline.get("release_evidence") is not False
+        or baseline.get("release_eligible") is not False
+    ):
+        v8_fail("baseline envelope is not the required diagnostic-only independent-sample envelope")
+    capture_run_id = v8_require_string(baseline.get("capture_run_id"), "baseline.capture_run_id")
+    baseline_analyzer_commit = v8_require_git_sha(
+        baseline.get("analyzer_commit"), "baseline.analyzer_commit"
+    )
+    v8_require_exact(
+        baseline.get("provenance"), provenance, "baseline.provenance"
+    )
+    baseline_graph = v8_validate_graph(
+        baseline.get("dependency_feature_graph"),
+        "baseline dependency/feature graph",
+    )
+    baseline_graph_sha256 = v8_require_sha256(
+        baseline.get("dependency_feature_graph_sha256"),
+        "baseline.dependency_feature_graph_sha256",
+    )
+    if (
+        hashlib.sha256(v8_canonical_compact_bytes(baseline_graph)).hexdigest()
+        != baseline_graph_sha256
+    ):
+        v8_fail("baseline dependency/feature graph digest does not match its retained graph")
+    baseline_profiles = v8_require_object(baseline.get("profiles"), "baseline.profiles")
+    if set(baseline_profiles) != set(REQUIRED_PROFILES_V8):
+        v8_fail("baseline envelope must contain exactly release and release-perf reports")
+    baseline_validated = {}
+    baseline_digests = {}
+    for profile in REQUIRED_PROFILES_V8:
+        envelope_profile = v8_require_object(
+            baseline_profiles[profile],
+            f"baseline.profiles.{profile}",
+            ("report_sha256", "report_history_json_path", "report_output_path", "report"),
+        )
+        report = v8_require_object(envelope_profile["report"], f"baseline {profile} report")
+        digest = v8_report_digest(report)
+        if envelope_profile["report_sha256"] != digest:
+            v8_fail(f"baseline {profile} report digest does not match its envelope")
+        expected_nonce = f"{capture_run_id}.{profile}" if measurement_mode_v8 == "measured" else None
+        expected_history = v8_require_string(
+            envelope_profile["report_history_json_path"],
+            f"baseline.profiles.{profile}.report_history_json_path",
+        )
+        expected_output = v8_require_string(
+            envelope_profile["report_output_path"],
+            f"baseline.profiles.{profile}.report_output_path",
+        )
+        baseline_validated[profile] = v8_validate_report(
+            report,
+            f"baseline {profile} report",
+            profile,
+            baseline_graph,
+            baseline_graph_sha256,
+            expected_rows,
+            expected_iterations,
+            expected_commit=baseline_analyzer_commit,
+            expected_nonce=expected_nonce,
+            expected_history=expected_history,
+            expected_output=expected_output,
+        )
+        baseline_digests[profile] = digest
+    v8_validate_profile_pair(baseline_validated, "baseline")
+
+    for profile in REQUIRED_PROFILES_V8:
+        if baseline_validated[profile]["contract"] != current_validated[profile]["contract"]:
+            v8_fail(f"baseline and current {profile} reports use incompatible v9 contracts")
+        if baseline_validated[profile]["measurement_comparability"] != current_validated[profile]["measurement_comparability"]:
+            v8_fail(f"baseline and current {profile} reports use incompatible measurement environments")
+
+    comparisons = []
+    scaling_comparisons = []
+    guard_status = "passed"
+    for profile_index, profile in enumerate(REQUIRED_PROFILES_V8):
+        for threads in REQUIRED_THREADS_V8:
+            baseline_row = baseline_validated[profile]["rows"][threads]
+            current_row = current_validated[profile]["rows"][threads]
+            statistic = v8_arithmetic_mean if threads == 1 else statistics.median
+            metric = "fsqlite_wps_arithmetic_mean" if threads == 1 else "fsqlite_wps_median"
+            baseline_statistic = statistic(baseline_row["fsqlite_wps"])
+            current_statistic = statistic(current_row["fsqlite_wps"])
+            ci_low, ci_high = v8_bootstrap_relative_delta(
+                baseline_row["fsqlite_wps"],
+                current_row["fsqlite_wps"],
+                0xF5_71_17_E0_2026 ^ (profile_index << 12) ^ threads,
+                statistic,
+            )
+            status = v8_classify(ci_low, ci_high, maximum_drops[threads])
+            if status != "passed":
+                guard_status = "failed"
+            comparisons.append(
+                {
+                    "profile": profile,
+                    "threads": threads,
+                    "metric": metric,
+                    "sampling_design": "independent_two_sample_bootstrap",
+                    "baseline_fsqlite_wps": baseline_statistic,
+                    "current_fsqlite_wps": current_statistic,
+                    "relative_delta_pct": (current_statistic / baseline_statistic - 1.0) * 100.0,
+                    "bootstrap_ci95_delta_pct": [ci_low * 100.0, ci_high * 100.0],
+                    "max_allowed_drop_pct": maximum_drops[threads] * 100.0,
+                    "baseline_fsqlite_to_csqlite_ratio_median_within_report_paired_diagnostic": baseline_row["ratio_median"],
+                    "current_fsqlite_to_csqlite_ratio_median_within_report_paired_diagnostic": current_row["ratio_median"],
+                    "status": status,
+                }
+            )
+        for numerator, denominator in ((8, 1), (16, 8)):
+            baseline_numerator = baseline_validated[profile]["rows"][numerator]["fsqlite_wps"]
+            baseline_denominator = baseline_validated[profile]["rows"][denominator]["fsqlite_wps"]
+            current_numerator = current_validated[profile]["rows"][numerator]["fsqlite_wps"]
+            current_denominator = current_validated[profile]["rows"][denominator]["fsqlite_wps"]
+            baseline_scaling = statistics.median(baseline_numerator) / statistics.median(baseline_denominator)
+            current_scaling = statistics.median(current_numerator) / statistics.median(current_denominator)
+            ci_low, ci_high = v8_bootstrap_scaling_delta(
+                baseline_numerator,
+                baseline_denominator,
+                current_numerator,
+                current_denominator,
+                0x5CA1_1A6_2026 ^ (profile_index << 12) ^ (numerator << 4) ^ denominator,
+            )
+            maximum_drop = scaling_drops[(numerator, denominator)]
+            status = v8_classify(ci_low, ci_high, maximum_drop)
+            if status != "passed":
+                guard_status = "failed"
+            scaling_comparisons.append(
+                {
+                    "profile": profile,
+                    "scaling": f"{numerator}/{denominator}",
+                    "metric": "ratio_of_independently_resampled_fsqlite_wps_medians",
+                    "sampling_design": "independent_four_sample_bootstrap",
+                    "baseline_scaling_ratio": baseline_scaling,
+                    "current_scaling_ratio": current_scaling,
+                    "relative_delta_pct": (current_scaling / baseline_scaling - 1.0) * 100.0,
+                    "bootstrap_ci95_delta_pct": [ci_low * 100.0, ci_high * 100.0],
+                    "max_allowed_drop_pct": maximum_drop * 100.0,
+                    "status": status,
+                }
+            )
+    result = {
+        "schema_version": gate_schema_v8,
+        "bead_id": "bd-zywqc.2",
+        "mode": "regression_guard",
+        "measurement_mode": measurement_mode_v8,
+        "comparison_design": "independent historical samples; within-report engine arms only are paired",
+        "unresolved_release_coverage": UNRESOLVED_RELEASE_COVERAGE_V8,
+        "diagnostic_margin_policy": margin_policy,
+        "analyzer_commit": intended_commit_v8,
+        "baseline_analyzer_commit": baseline_analyzer_commit,
+        "current_report_sha256": current_digests,
+        "baseline_report_sha256": baseline_digests,
+        "current_dependency_feature_graph_sha256": graph_sha256,
+        "baseline_dependency_feature_graph_sha256": baseline_graph_sha256,
+        "baseline_envelope_sha256": envelope_digest,
+        "baseline_path": baseline_path_v8,
+        "baseline_version_path": str(version),
+        "iterations": expected_iterations,
+        "bootstrap_repetitions": BOOTSTRAP_REPETITIONS_V8,
+        "guard_status": guard_status,
+        "verdict": "diagnostic_only" if guard_status == "passed" else "failed",
+        "release_evidence": False,
+        "release_eligible": False,
+        "absolute_comparisons": comparisons,
+        "scaling_comparisons": scaling_comparisons,
+    }
+    v8_write_json(result_path_v8, result)
+    for comparison in comparisons:
+        print(
+            "  [{status}] {profile} {threads}t {metric}: {baseline:.2f} -> {current:.2f} wps; "
+            "independent CI {low:+.2f}%..{high:+.2f}%".format(
+                status=comparison["status"].upper(),
+                profile=comparison["profile"],
+                threads=comparison["threads"],
+                metric=comparison["metric"],
+                baseline=comparison["baseline_fsqlite_wps"],
+                current=comparison["current_fsqlite_wps"],
+                low=comparison["bootstrap_ci95_delta_pct"][0],
+                high=comparison["bootstrap_ci95_delta_pct"][1],
+            )
+        )
+    for comparison in scaling_comparisons:
+        print(
+            "  [{status}] {profile} scaling {scaling}: {baseline:.3f} -> {current:.3f}; "
+            "independent CI {low:+.2f}%..{high:+.2f}%".format(
+                status=comparison["status"].upper(),
+                profile=comparison["profile"],
+                scaling=comparison["scaling"],
+                baseline=comparison["baseline_scaling_ratio"],
+                current=comparison["current_scaling_ratio"],
+                low=comparison["bootstrap_ci95_delta_pct"][0],
+                high=comparison["bootstrap_ci95_delta_pct"][1],
+            )
+        )
+    if guard_status != "passed":
+        print("[bd-zywqc.2] FAILED: at least one profile/cell/scaling comparison regressed or was inconclusive", file=sys.stderr)
+        return 1
+    print("[bd-zywqc.2] PASSED diagnostic-only dual-profile v9 regression guard")
+    return 0
+
+
+try:
+    sys.exit(v8_run())
+except V8EvidenceError as error:
+    invalid = {
+        "schema_version": gate_schema_v8,
+        "bead_id": "bd-zywqc.2",
+        "mode": "capture_baseline" if capture_raw_v8 == "true" else "regression_guard",
+        "measurement_mode": measurement_mode_v8,
+        "analyzer_commit": intended_commit_v8,
+        "unresolved_release_coverage": UNRESOLVED_RELEASE_COVERAGE_V8,
+        "verdict": "invalid_evidence",
+        "release_evidence": False,
+        "release_eligible": False,
+        "error": str(error),
+    }
+    try:
+        v8_write_json(result_path_v8, invalid)
+    except V8EvidenceError as result_error:
+        print(f"[bd-zywqc.2] additionally could not write invalid result: {result_error}", file=sys.stderr)
+    print(f"[bd-zywqc.2] INVALID EVIDENCE: {error}", file=sys.stderr)
+    sys.exit(2)
 
 (
     current_path,
