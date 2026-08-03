@@ -472,8 +472,14 @@ impl CommitSequenceCombiner {
         CommitCombineTestReceipt {
             next_seq: self.next_seq(),
             metrics: self.metrics(),
-            registered_allocations: self.test_metrics.registered_allocations.load(Ordering::Acquire),
-            one_shot_allocations: self.test_metrics.one_shot_allocations.load(Ordering::Acquire),
+            registered_allocations: self
+                .test_metrics
+                .registered_allocations
+                .load(Ordering::Acquire),
+            one_shot_allocations: self
+                .test_metrics
+                .one_shot_allocations
+                .load(Ordering::Acquire),
         }
     }
 

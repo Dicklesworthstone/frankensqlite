@@ -32,9 +32,10 @@
 //! - D3: Flat Combining for commit sequencer
 //! - D5: Epoch-Based Reclamation for MVCC GC
 //!
-//! Run the active deterministic keeper with:
+//! Run either active deterministic keeper with:
 //! ```sh
 //! cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination test_page_cache_shard_distribution -- --exact
+//! cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination test_combiner_reduces_atomic_ops -- --exact
 //! ```
 //! Run each manual stress keeper by its exact name with `--ignored --exact`.
 //! Do not run every ignored test as a group: the explicit release-blocker
@@ -46,6 +47,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, process::Command};
+
+use fsqlite_mvcc::commit_combiner::{CommitCombineStagingControl, CommitSequenceCombiner};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -480,16 +483,73 @@ fn test_page_cache_shard_distribution() {
 /// Counts fetch_add calls during concurrent commits and asserts the count is
 /// reduced by the combining factor (batching amortizes atomic ops).
 ///
-/// D3 is implemented, but the current public API cannot deterministically
-/// stage multiple pending requests before one caller combines them.  A barrier
-/// before `alloc_commit_seq` is insufficient on a single-core scheduler, and
-/// the available metrics are process-global rather than per combiner.
+/// Uses feature-gated test support to hold real registered callers after they
+/// publish `PENDING` and before the existing combine path runs. This makes the
+/// batch deterministic without mutating private combiner slots.
 #[test]
-#[ignore = "release blocker: deterministic staged-pending control and per-instance commit-combiner metrics are not exposed"]
 fn test_combiner_reduces_atomic_ops() {
-    panic!(
-        "test_combiner_reduces_atomic_ops: production combining exists, but a deterministic reduction keeper requires staged pending-request control plus per-instance metrics"
+    const CALLERS: usize = 8;
+    const INITIAL_SEQUENCE: u64 = 10_000;
+    let callers_u64 = u64::try_from(CALLERS).expect("keeper caller count fits u64");
+
+    let staging_control = Arc::new(CommitCombineStagingControl::new(CALLERS));
+    let release_guard = staging_control.release_guard();
+    let combiner = Arc::new(CommitSequenceCombiner::new_with_staging_control(
+        INITIAL_SEQUENCE,
+        Arc::clone(&staging_control),
+    ));
+    let start = Arc::new(Barrier::new(CALLERS + 1));
+    let mut callers = Vec::with_capacity(CALLERS);
+
+    for _ in 0..CALLERS {
+        let combiner = Arc::clone(&combiner);
+        let start = Arc::clone(&start);
+        callers.push(thread::spawn(move || {
+            let handle = combiner
+                .register()
+                .expect("each keeper caller receives a real registered slot");
+            start.wait();
+            handle.alloc_commit_seq().get()
+        }));
+    }
+
+    start.wait();
+    assert!(
+        staging_control.wait_until_all_staged(Duration::from_secs(5)),
+        "all registered callers must publish before the combiner is released"
     );
+    let staging_receipt = staging_control.release_when_all_staged();
+    assert_eq!(staging_receipt.expected_callers, CALLERS);
+    assert_eq!(staging_receipt.staged_callers, CALLERS);
+
+    let mut sequences = callers
+        .into_iter()
+        .map(|caller| caller.join().expect("registered caller must join"))
+        .collect::<Vec<_>>();
+    sequences.sort_unstable();
+    let expected_sequences = (INITIAL_SEQUENCE..INITIAL_SEQUENCE + callers_u64).collect::<Vec<_>>();
+    assert_eq!(
+        sequences, expected_sequences,
+        "allocated sequences must be unique and contiguous"
+    );
+
+    let receipt = combiner.test_support_receipt();
+    assert_eq!(receipt.next_seq, INITIAL_SEQUENCE + callers_u64);
+    assert_eq!(
+        receipt.metrics.batches_total, 1,
+        "one real combined batch is required"
+    );
+    assert_eq!(receipt.metrics.ops_total, callers_u64);
+    assert_eq!(receipt.metrics.batch_size_sum, callers_u64);
+    assert_eq!(receipt.metrics.batch_size_max, callers_u64);
+    assert_eq!(receipt.registered_allocations, callers_u64);
+    assert_eq!(
+        receipt.one_shot_allocations, 0,
+        "keeper callers must not fall back to alloc_one_shot"
+    );
+    assert!(receipt.metrics.batches_total < receipt.metrics.ops_total);
+
+    drop(release_guard);
 }
 
 /// Test 5: require a deterministic receipt for GC-induced pause behavior.
