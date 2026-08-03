@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-pager"
-version = "0.1.19"
+version = "0.2.0"
 description = "Page cache and journal management"
 edition.workspace = true
 license-file.workspace = true
@@ -29,11 +29,11 @@ evalue-eviction = []
 foldhash = "0.2.0"
 smallvec = { version = "1.15.2", features = ["const_generics", "union", "const_new"] }
 bumpalo = { version = "3", features = ["collections"] }
-fsqlite-types = { path = "../fsqlite-types", version = "0.1.19", default-features = false }
-fsqlite-error = { path = "../fsqlite-error", version = "0.1.19" }
+fsqlite-types = { path = "../fsqlite-types", version = "0.2.0", default-features = false }
+fsqlite-error = { path = "../fsqlite-error", version = "0.2.0" }
 fsqlite-observability = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.19", default-features = false }
-fsqlite-wal = { path = "../fsqlite-wal", version = "0.1.19", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.2.0", default-features = false }
+fsqlite-wal = { path = "../fsqlite-wal", version = "0.2.0", default-features = false }
 xxhash-rust = { workspace = true }
 chacha20poly1305 = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
@@ -57,10 +57,10 @@ asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 # Dev-only, and fsqlite-mvcc depends on fsqlite-pager — so pager must publish
-# FIRST. A `^0.1.19` pin cannot resolve at publish time (mvcc 0.1.19 is not on
-# crates.io yet). Keep this a permissive range so the dev-edge stays satisfiable.
-fsqlite-mvcc = { path = "../fsqlite-mvcc", version = ">=0.1.2, <0.2.0", default-features = false }
-fsqlite-wal = { path = "../fsqlite-wal", version = "0.1.19", default-features = false }
+# FIRST. A `^0.2.0` pin would create a publish-order cycle; retain this bridge
+# range so the dev edge remains satisfiable before and after MVCC publishes.
+fsqlite-mvcc = { path = "../fsqlite-mvcc", version = ">=0.1.2, <0.3.0", default-features = false }
+fsqlite-wal = { path = "../fsqlite-wal", version = "0.2.0", default-features = false }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
 
