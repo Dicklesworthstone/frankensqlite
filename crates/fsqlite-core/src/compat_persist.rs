@@ -1227,12 +1227,63 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
 
             // Populate the index B-tree from table rows.
             {
-                let mut idx_cursor = fsqlite_btree::BtCursor::new(
+                // GH #304: carry the declared key semantics into the physical
+                // builder. `key_sort_directions` / `key_collations` were
+                // previously consumed only when regenerating CREATE INDEX text,
+                // so a DESC or non-BINARY term produced a b-tree whose physical
+                // order contradicted its own sqlite_master declaration. Stock
+                // SQLite then reads the index with the declared semantics and
+                // reports the image as malformed.
+                //
+                // Scope of the trailing entry, stated exactly: the key loop
+                // below emits a *synthetic* integer rowid as the suffix
+                // (`key_values.push(SqliteValue::Integer(rowid))`). That layout
+                // is correct only for rowid tables. A WITHOUT ROWID index takes
+                // its primary-key columns as the suffix instead, and this
+                // builder does not produce that shape at all — so the single
+                // trailing ASC/BINARY entry pushed here describes the synthetic
+                // rowid this code actually writes, and must NOT be read as
+                // implementing SQLite's general index-suffix rule. WITHOUT
+                // ROWID suffix semantics remain unfixed (GH #304 acceptance).
+                //
+                // Collations resolve against the cursor's default registry
+                // (BINARY/NOCASE/RTRIM only). A collation registered on the
+                // source connection is not reachable from this function, so a
+                // custom-collation term silently falls back to BINARY and its
+                // index remains mis-ordered relative to its own DDL. Also
+                // unfixed, and also part of GH #304 acceptance.
+                //
+                // Derive arity from the SAME discriminator the key loop below
+                // uses, not from `key_term_count()`: that helper prefers
+                // `key_expressions` whenever it is non-empty, while the loop
+                // only takes the expression branch when `columns` is empty.
+                // If both were ever populated the two would disagree and the
+                // metadata vectors would silently mis-align with the key.
+                let key_terms = if is_expression_index {
+                    index.key_expressions.len()
+                } else {
+                    index.columns.len()
+                };
+                let mut index_desc_flags: Vec<bool> = (0..key_terms)
+                    .map(|term| {
+                        index.key_sort_directions.get(term).copied() == Some(SortDirection::Desc)
+                    })
+                    .collect();
+                index_desc_flags.push(false);
+                let mut index_collations: Vec<Option<String>> = (0..key_terms)
+                    .map(|term| index.key_collations.get(term).cloned().flatten())
+                    .collect();
+                index_collations.push(None);
+
+                let mut idx_cursor = fsqlite_btree::BtCursor::new_with_index_desc(
                     TransactionPageIo::new(&mut txn),
                     idx_root,
                     usable_size,
                     true,
+                    index_desc_flags,
                 );
+                let collation_registry = idx_cursor.collation_registry();
+                idx_cursor.set_index_collation_context(index_collations, collation_registry);
                 configure_btree_cursor_page_size(&mut idx_cursor, usable_size, full_page_size);
                 if let Some(mem_table) = db.get_table(table.root_page) {
                     for (rowid, values) in mem_table.iter_rows() {
@@ -7282,20 +7333,194 @@ PRAGMA integrity_check;
                 "SELECT id FROM live INDEXED BY idx_live_grp_desc \
                  WHERE grp = ?1 ORDER BY id DESC",
             );
-            let scanned = collect(
-                "SELECT id FROM live NOT INDEXED WHERE grp = ?1 ORDER BY id DESC",
-            );
+            let scanned =
+                collect("SELECT id FROM live NOT INDEXED WHERE grp = ?1 ORDER BY id DESC");
 
             assert!(
                 !scanned.is_empty(),
                 "probe group must actually contain rows"
             );
             assert_eq!(
-                forced, scanned,
+                forced,
+                scanned,
                 "forced DESC-index lookup must return the same rows as the table scan \
                  (missing {} of {} rows)",
                 scanned.len().saturating_sub(forced.len()),
                 scanned.len()
+            );
+        });
+    }
+
+    /// GH #304 (collation + partial-index arm): a `DESC` term carrying a
+    /// non-BINARY built-in collation must also be built in declared order.
+    ///
+    /// `NOCASE` is the discriminating case: under BINARY every uppercase
+    /// prefix sorts before every lowercase one, while under NOCASE they
+    /// interleave alphabetically. An index declared `COLLATE NOCASE DESC` but
+    /// physically built BINARY/ASC is therefore doubly out of order, and stock
+    /// SQLite rejects it. The partial predicate exercises the same builder
+    /// loop with row filtering active.
+    #[test]
+    fn test_persist_to_sqlite_builds_collated_desc_partial_index_in_declared_order() {
+        asupersync::test_utils::run_test(|| async {
+            const ROW_COUNT: i64 = 400;
+
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("collated-desc-partial-index.db");
+            let cx = Cx::new();
+
+            // Case-varying prefixes: BINARY and NOCASE disagree on their order.
+            let prefixes = ["a", "B", "c", "D"];
+
+            let mut db = MemDatabase::new();
+            db.create_table_at(2, 3);
+            let table_data = db.get_table_mut(2).unwrap();
+            for id in 1..=ROW_COUNT {
+                let prefix = prefixes[usize::try_from(id - 1).unwrap() % prefixes.len()];
+                table_data.insert_row(
+                    id,
+                    vec![
+                        SqliteValue::Integer(id),
+                        SqliteValue::Text(format!("{prefix}{id:04}").into()),
+                        // Only two thirds of the rows satisfy the predicate.
+                        SqliteValue::Integer(i64::from(id % 3 != 0)),
+                    ],
+                );
+            }
+
+            let schema = vec![TableSchema {
+                name: "docs".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "id".to_owned(),
+                        affinity: 'D',
+                        is_ipk: true,
+                        type_name: Some("INTEGER".to_owned()),
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                    ColumnInfo {
+                        name: "name".to_owned(),
+                        affinity: 'B',
+                        is_ipk: false,
+                        type_name: Some("TEXT".to_owned()),
+                        notnull: true,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                    ColumnInfo {
+                        name: "active".to_owned(),
+                        affinity: 'D',
+                        is_ipk: false,
+                        type_name: Some("INTEGER".to_owned()),
+                        notnull: true,
+                        unique: false,
+                        default_value: Some("1".to_owned()),
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                ],
+                indexes: vec![IndexSchema {
+                    name: "idx_docs_name_ci_desc".to_owned(),
+                    root_page: 3,
+                    columns: vec!["name".to_owned()],
+                    key_expressions: Vec::new(),
+                    key_sort_directions: vec![SortDirection::Desc],
+                    where_clause: Some("active = 1".to_owned()),
+                    is_unique: false,
+                    key_collations: vec![Some("NOCASE".to_owned())],
+                    conflict_action: None,
+                }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![vec!["id".to_owned()]],
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            }];
+            let header = DatabaseHeader {
+                page_size: DEFAULT_PAGE_SIZE,
+                schema_cookie: 1,
+                change_counter: 1,
+                version_valid_for: 1,
+                ..DatabaseHeader::default()
+            };
+            let mut original_ddl = HashMap::new();
+            original_ddl.insert(
+                "docs".to_owned(),
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)"
+                    .to_owned(),
+            );
+            original_ddl.insert(
+                "idx_docs_name_ci_desc".to_owned(),
+                "CREATE INDEX idx_docs_name_ci_desc ON docs(name COLLATE NOCASE DESC) WHERE active = 1"
+                    .to_owned(),
+            );
+
+            persist_to_sqlite_with_header_and_master_entries(
+                &cx,
+                &db_path,
+                &schema,
+                &db,
+                &header,
+                &[],
+                &original_ddl,
+            )
+            .await
+            .unwrap();
+
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                integrity, "ok",
+                "stock SQLite must accept a persisted COLLATE NOCASE DESC partial index"
+            );
+
+            let collect = |sql: &str| -> Vec<String> {
+                let mut stmt = conn.prepare(sql).unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+
+            let forced = collect(
+                "SELECT name FROM docs INDEXED BY idx_docs_name_ci_desc \
+                 WHERE active = 1 ORDER BY name COLLATE NOCASE DESC",
+            );
+            let scanned = collect(
+                "SELECT name FROM docs NOT INDEXED \
+                 WHERE active = 1 ORDER BY name COLLATE NOCASE DESC",
+            );
+
+            assert!(
+                !scanned.is_empty(),
+                "partial predicate must retain some rows"
+            );
+            assert!(
+                scanned.len() < usize::try_from(ROW_COUNT).unwrap(),
+                "partial predicate must actually exclude some rows"
+            );
+            assert_eq!(
+                forced, scanned,
+                "forced collated-DESC partial-index scan must match the table scan"
             );
         });
     }
