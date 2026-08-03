@@ -1376,13 +1376,38 @@ impl GroupCommitQueue {
     }
 
     fn has_identity_wide_process_root(&self) -> bool {
-        self.has_process_root_finalization_attempt()
-            && process_root_finalization_scope_is_relevant(self.queue_id, None)
+        self.has_process_root_scope_with_hook(None, || {})
     }
 
     fn has_relevant_process_root(&self, handle_key: SharedDbFileKey) -> bool {
-        self.has_process_root_finalization_attempt()
-            && process_root_finalization_scope_is_relevant(self.queue_id, Some(handle_key))
+        self.has_process_root_scope_with_hook(Some(handle_key), || {})
+    }
+
+    fn has_process_root_scope_with_hook(
+        &self,
+        handle_key: Option<SharedDbFileKey>,
+        after_fast_observation: impl FnOnce(),
+    ) -> bool {
+        if !self.has_process_root_finalization_attempt() {
+            return false;
+        }
+        after_fast_observation();
+        let registry = process_root_finalization_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Terminal release decrements the atomic and removes the registry
+        // entry while holding this mutex. Revalidate after acquiring it so a
+        // stale optimistic observation cannot become a false invariant error
+        // or a spurious BusyRecovery result. Registration uses the same mutex,
+        // so a still-nonzero count must have an authoritative registry entry.
+        if !self.has_process_root_finalization_attempt() {
+            return false;
+        }
+        process_root_finalization_scope_is_relevant_in_registry(
+            &registry,
+            self.queue_id,
+            handle_key,
+        )
     }
 
     fn new(config: GroupCommitConfig) -> Self {
@@ -4741,16 +4766,6 @@ impl Drop for ProcessRootFinalizationAttempt {
             );
         }
     }
-}
-
-fn process_root_finalization_scope_is_relevant(
-    queue_id: u64,
-    handle_key: Option<SharedDbFileKey>,
-) -> bool {
-    let registry = process_root_finalization_registry()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    process_root_finalization_scope_is_relevant_in_registry(&registry, queue_id, handle_key)
 }
 
 fn process_root_finalization_scope_is_relevant_in_registry(
@@ -10125,8 +10140,10 @@ where
             // PagerInner ownership is the admission linearization point. A
             // root that won before this point publishes the queue atomic
             // before its registry record; the Acquire load observes it and
-            // the registry mutex then closes that publication interval. A
-            // root published after the load is ordered after this admission.
+            // the registry mutex then closes that publication interval. The
+            // scoped predicate revalidates the atomic under that mutex so a
+            // terminal release between the two observations is also ordered.
+            // A root published after the load is ordered after this admission.
             //
             // Never hold the process-global registry while waiting for a
             // pager-local mutex. Cancellation cleanup can publish a root while
@@ -10144,18 +10161,9 @@ where
             }
             if self
                 .group_commit_queue
-                .has_process_root_finalization_attempt()
+                .has_relevant_process_root(begin_handle_key)
             {
-                let registry = process_root_finalization_registry()
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if process_root_finalization_scope_is_relevant_in_registry(
-                    &registry,
-                    self.group_commit_queue.queue_id,
-                    Some(begin_handle_key),
-                ) {
-                    return Err(FrankenError::BusyRecovery);
-                }
+                return Err(FrankenError::BusyRecovery);
             }
 
             if inner.checkpoint_active {
@@ -33801,6 +33809,82 @@ mod tests {
     }
 
     #[test]
+    fn test_process_root_scope_check_revalidates_after_terminal_release() {
+        fn exercise(
+            scope: ProcessRootFinalizationScope,
+            queried_handle: Option<SharedDbFileKey>,
+        ) {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let attempt = ProcessRootFinalizationAttempt::register_scope(&queue, scope);
+            let queue_id = queue.queue_id;
+            let checker_queue = Arc::clone(&queue);
+            let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+            let checker = std::thread::spawn(move || {
+                checker_queue.has_process_root_scope_with_hook(queried_handle, || {
+                    observed_tx
+                        .send(())
+                        .expect("scope checker reports its optimistic observation");
+                    resume_rx
+                        .recv()
+                        .expect("scope checker receives permission to revalidate");
+                })
+            });
+
+            observed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("scope checker observes the published root");
+            let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+            let releaser = std::thread::spawn(move || {
+                attempt.release_after_terminal();
+                released_tx
+                    .send(())
+                    .expect("terminal releaser reports completion");
+            });
+            if let Err(error) = released_rx.recv_timeout(Duration::from_secs(5)) {
+                let _ = resume_tx.send(());
+                let _ = checker.join();
+                let _ = releaser.join();
+                panic!(
+                    "terminal release blocked behind a scope checker before its registry revalidation: {error}"
+                );
+            }
+
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "terminal release must clear the optimistic queue-local root"
+            );
+            assert!(
+                !process_root_finalization_registry()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .by_queue
+                    .contains_key(&queue_id),
+                "terminal release must remove the authoritative registry entry"
+            );
+
+            resume_tx
+                .send(())
+                .expect("resume scope checker after terminal release");
+            assert!(
+                !checker.join().expect("join scope checker"),
+                "a stale optimistic observation must revalidate to no live root"
+            );
+            releaser.join().expect("join terminal releaser");
+        }
+
+        exercise(ProcessRootFinalizationScope::IdentityWide, None);
+        let handle_key = SharedDbFileKey(17);
+        exercise(
+            ProcessRootFinalizationScope::ExactHandle(handle_key),
+            Some(handle_key),
+        );
+    }
+
+    #[test]
     fn test_exact_handle_process_root_does_not_convoy_unrelated_handle_settlement() {
         asupersync::test_utils::run_test(|| async {
             let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
@@ -45406,7 +45490,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires real benchmark harness with rusqlite reference; run via e2e bench suite"]
+    #[ignore = "release blocker: current-source 16-thread cross-engine evidence must come from the e2e benchmark gate"]
     fn test_16t_throughput_exceeds_sqlite() {
         // Acceptance test bd-3wop3.8 #4: Verify that 16-thread DML
         // throughput on FrankenSQLite exceeds C SQLite (via rusqlite).
@@ -45417,14 +45501,13 @@ mod tests {
         // 3. Multiple iterations for statistical significance
         // 4. The release-perf profile for meaningful numbers
         //
-        // Run via: cargo test -p fsqlite-pager --profile release-perf -- \
-        //          test_16t_throughput_exceeds_sqlite --ignored --nocapture
+        // The exact ignored invocation is deliberately fail-closed. It must
+        // not turn the absence of the external evidence into a passing test.
         //
         // The e2e benchmark harness (fsqlite-e2e) provides the canonical
         // evidence for this acceptance criterion.
-        eprintln!(
-            "INFO bead_id=bd-3wop3.8 case=16t_throughput_gate \
-             status=skipped reason=requires_benchmark_harness"
+        panic!(
+            "bd-3wop3.8: pager-local code cannot prove the 16-thread cross-engine throughput gate; require current-source and running-binary-bound e2e evidence with correctness oracles, a declared statistical threshold, and independent artifact verification"
         );
     }
 
