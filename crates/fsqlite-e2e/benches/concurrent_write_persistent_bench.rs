@@ -170,7 +170,8 @@ fn insert_sql(table_id: usize) -> String {
 fn criterion_config() -> Criterion {
     let criterion = Criterion::default().configure_from_args();
     persistent_phase_capture_dir().map_or(criterion, |capture_dir| {
-        criterion.output_directory(capture_dir.join("criterion_measurements"))
+        // criterion 0.8 takes `&Path` here, not an owned `PathBuf`.
+        criterion.output_directory(&capture_dir.join("criterion_measurements"))
     })
 }
 
@@ -387,7 +388,17 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buffer[..bytes_read]);
     }
-    let digest = format!("{:x}", hasher.finalize());
+    // sha2 0.11 returns `hybrid_array::Array`, which does not implement
+    // `LowerHex`; encode explicitly rather than relying on the 0.10 formatter.
+    let digest = {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(64);
+        for byte in hasher.finalize() {
+            let _ = write!(&mut encoded, "{byte:02x}");
+        }
+        encoded
+    };
     require_lowercase_hex_64(&digest, "running binary SHA-256")?;
     Ok(digest)
 }
