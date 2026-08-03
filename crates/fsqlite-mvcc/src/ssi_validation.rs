@@ -1428,7 +1428,6 @@ fn record_evidence_decision(
             SsiEvidenceRecordingMode::AbortOnly
         )
     {
-        FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.fetch_add(1, Ordering::Relaxed);
         // DRO remains fed from every successful SSI decision even when the
         // optional decision-evidence ledger records aborts only.
         #[allow(clippy::cast_possible_truncation)]
@@ -3210,10 +3209,10 @@ mod tests {
             "default successful commits must not enqueue a global evidence-ledger draft"
         );
         let after_commit = ssi_evidence_metrics_snapshot();
-        assert!(
-            after_commit.fsqlite_evidence_records_total_commit
-                > before.fsqlite_evidence_records_total_commit,
-            "AbortOnly must retain successful-commit metrics"
+        assert_eq!(
+            after_commit.fsqlite_evidence_records_total_commit,
+            before.fsqlite_evidence_records_total_commit,
+            "AbortOnly must not claim a successful evidence record without enqueuing one"
         );
 
         let abort_txn = TxnToken::new(TxnId::new(90_203).unwrap(), TxnEpoch::new(0));
