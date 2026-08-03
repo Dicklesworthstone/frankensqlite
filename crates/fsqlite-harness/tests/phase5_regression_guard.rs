@@ -3659,8 +3659,9 @@ fn ignored_test_release_blockers(
                         "{locator}: covered_by_parent lacks validated execution evidence for every declared parent"
                     ))
                 }
-                IgnorePolicy::CoveredByParent => None,
-                IgnorePolicy::RunForRelease | IgnorePolicy::Exempt => None,
+                IgnorePolicy::CoveredByParent
+                | IgnorePolicy::RunForRelease
+                | IgnorePolicy::Exempt => None,
             }
         })
         .collect()
