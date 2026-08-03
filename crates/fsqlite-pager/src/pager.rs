@@ -993,12 +993,13 @@ impl KeyedWaitSlot {
         #[cfg(test)]
         let _active_waiter = ActiveAsyncKeyedWaiter::new(&self.active_async_waiters);
         #[cfg(test)]
-        if let Some(rendezvous) = self
+        let rendezvous = self
             .async_wait_rendezvous
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        #[cfg(test)]
+        if let Some(rendezvous) = rendezvous {
             assert!(
                 rendezvous.wait_at_boundary(),
                 "keyed-wait test rendezvous must be released within its watchdog"
@@ -25037,6 +25038,8 @@ mod tests {
         }
     }
 
+    // These independent switches intentionally compose fault-injection scenarios.
+    #[allow(clippy::struct_excessive_bools)]
     #[derive(Debug, Clone, Copy, Default)]
     struct JournalDurabilityFaultPlan {
         ignore_zero_magic_write: bool,
