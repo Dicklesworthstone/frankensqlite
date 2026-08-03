@@ -1,6 +1,6 @@
 # Selective Turso Testing Adaptation Plan
 
-Status: proposed (rev 2 — independently re-verified and revised 2026-08-03)
+Status: proposed (rev 3 — dependency boundaries hardened 2026-08-03)
 
 Research date: 2026-08-03
 
@@ -114,6 +114,10 @@ A second-agent review re-verified the load-bearing claims in this plan:
   extends an existing gate rather than inventing one.
 - The §3.1 infrastructure inventory was checked against the tree; corrections
   from that check are folded into §3.1, §3.2, §5.2, §5.4, §5.5, and §5.7.
+- The only existing concurrency beads this plan consumes are `bd-2lt76` and
+  `bd-28z4i.5`. A review recap also named `bd-3d5y3` and `bd-p4dcv`, but neither
+  is referenced by this plan or its child beads; those names are not plan
+  inputs.
 
 ## 3. FrankenSQLite Baseline
 
@@ -139,13 +143,25 @@ most of the mechanics that a naive port would duplicate.
 The current test-realism inventory reports a very large suite spanning unit,
 memory-backed, file-backed, end-to-end, and property tests. Its numeric totals
 must be refreshed before this campaign uses them as a baseline, and the
-recount must separate engine-behavior tests from tracker-metadata tests: as of
-this review, 68 of 236 `fsqlite-harness` integration test files assert on
-`.beads/issues.jsonl` content rather than engine behavior, while the real
-differential mass sits in `crates/fsqlite-e2e/tests/` (214 of 269 files use
-rusqlite) and `crates/fsqlite/tests/`. The key point is already verified from
-the tree: hundreds of integration targets and mature harness modules exist, so
-one-file-per-import expansion would make CI worse.
+recount must separate engine-behavior tests from tracker-metadata tests. As of
+this review, 68 of 236 `fsqlite-harness` integration test files exercise
+`issues.jsonl`-shaped tracker metadata rather than engine behavior; 64 of those
+reference the literal `.beads/issues.jsonl` path, while four use temporary
+tracker fixtures. The real differential mass sits in
+`crates/fsqlite-e2e/tests/` (214 of 269 files use rusqlite) and
+`crates/fsqlite/tests/`. The counts are reproducible with:
+
+```bash
+find crates/fsqlite-harness/tests -maxdepth 1 -type f -name '*.rs' | wc -l
+rg -l 'issues\.jsonl' crates/fsqlite-harness/tests --glob '*.rs' | wc -l
+rg -l '\.beads/issues\.jsonl' crates/fsqlite-harness/tests --glob '*.rs' | wc -l
+find crates/fsqlite-e2e/tests -maxdepth 1 -type f -name '*.rs' | wc -l
+rg -l 'rusqlite' crates/fsqlite-e2e/tests --glob '*.rs' | wc -l
+```
+
+The key point is already verified from the tree: hundreds of integration
+targets and mature harness modules exist, so one-file-per-import expansion
+would make CI worse.
 
 ### 3.2 Architecture-sensitive test requirements
 
@@ -254,11 +270,16 @@ The generator contract should include:
   of these files (and of `sqlite_version_contract.toml` and
   `corpus_manifest.toml`) exist at the repository root, and some code paths
   still resolve the root copies (`fixture_root_contract.rs:627`,
-  `feature_coverage_dashboard.rs:776`) while the declared canonical constants
-  point at `docs/contracts/`. The two `corpus_manifest.toml` copies already
-  disagree on `content_hash`. Phase 0 must document the canonical set and
-  resolve or quarantine the duplicates before capability mapping is built on
-  top of them.
+  `feature_coverage_dashboard.rs:776`). Authority is currently distributed:
+  `canonical_parity_contract.rs` declares the `docs/contracts/` paths for the
+  SQLite-version, supported-surface, and feature-universe contracts;
+  `fixture_root_contract.rs::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH` declares the
+  corpus manifest; and `parity_taxonomy_test.rs` plus
+  `scripts/verify_parity_taxonomy.sh` enforce the taxonomy path. The two
+  `corpus_manifest.toml` copies already disagree on `content_hash`. Phase 0
+  must consolidate this authority, remove every live root-path read, and add a
+  drift guard before capability mapping is allowed to start. A decision record
+  or follow-up link alone does not satisfy that gate.
 - Required execution lane and forbidden fallbacks.
 - Strict result/error/transaction comparison policy.
 
@@ -283,7 +304,7 @@ absorb or supersede it rather than leave two partial generators in the tree.
 Its comparator's known weakness — treating any both-engines-error pair as
 agreement — is precisely what §3.3 invariant 6 forbids here.
 
-### 5.2 Structured reduction
+### 5.2 Structured SQL reduction
 
 The existing minimizer removes workload statements. Extend it with reducers
 that understand generated structure:
@@ -292,17 +313,19 @@ that understand generated structure:
 2. Remove clauses, joins, projections, predicates, order terms, and indexes.
 3. Replace expressions with children or typed literals.
 4. Reduce table/column cardinality and value sizes.
-5. Reduce schedule events, yield points, crash points, and worker count.
-6. Revalidate the exact mismatch signature after every reduction.
+5. Revalidate the exact SQL result/error mismatch signature after every
+   reduction.
 
 The existing failure bundle remains canonical (`failure_bundle` in both
 `fsqlite-harness` and `fsqlite-e2e`, plus `fsqlite-e2e::mismatch_artifacts`).
 Add original and minimized AST traces, generator profile hash, lane evidence,
-schedule, environment, and upstream provenance. The `replay_triage` workflow
-(artifact manifest → first divergence → replay → minimize → operator report)
-is the operator-facing integration point for new reducers. A minimized case
-must replay through the public verifier, not only an in-memory reducer
-callback.
+environment, and upstream provenance. The `replay_triage` workflow (artifact
+manifest → first divergence → replay → minimize → operator report) is the
+operator-facing integration point for new reducers. A minimized case must
+replay through the public verifier, not only an in-memory reducer callback.
+History, schedule, worker, yield, and crash reduction belong to §5.4 because
+they require the typed history schema and deterministic runtime adapter; they
+must not make this SQL reducer wait for the concurrency stack.
 
 ### 5.3 Stateful deterministic simulation
 
@@ -364,12 +387,24 @@ oracles; those beads own LabRuntime determinism and DPOR machinery. No new
 runtime or scheduler should be created here. Two DPOR engines already exist —
 asupersync's `DporExplorer` (used by `mvcc_alien_verification.rs`) and the
 harness-native trace-monoid DPOR in `fsqlite-harness::tla` — so this campaign
-must consume one of them, never add a third. A further constraint the history
-work must respect: LabRuntime does not currently schedule the production
-`fsqlite::Connection` engine at all — today it drives small hand-written MVCC
-models — so deterministic SQL-level schedule replay is contingent on
-`bd-2lt76` scope landing, and history capture must remain valid (as recorded
-observation, minus replay determinism) when the engine runs on OS threads.
+must consume one of them, never add a third.
+
+LabRuntime does not currently schedule the production `fsqlite::Connection`
+engine; today it drives small hand-written MVCC models. A narrow child of
+`bd-2lt76`, `bd-2lt76.1`, therefore owns the missing test-only bridge that
+drives the real pager-backed `Connection` path with an externally supplied
+`Cx`, deterministic yield choices, and lane evidence. Turso bead `.8` blocks
+on that bridge. Observation-only OS-thread histories remain useful inputs to
+the `.7` oracle, but they cannot close `.8` or support deterministic-replay
+claims.
+
+Once the history schema, oracle, and production-engine scheduling bridge are
+available, a separate history reducer removes transactions, operations,
+workers, schedule events, yield choices, and generic crash points while
+preserving the exact serializability/crash witness. It replays every candidate
+through the public history verifier and canonical failure bundle. Phase 4 may
+extend the generic crash-point reducer with process-specific kill/restart
+events, but it must not invent another reducer or artifact format.
 
 ### 5.5 Multiprocess and fault campaigns
 
@@ -506,12 +541,17 @@ Deliverables:
   rejection, `fsqlite.fallback_decision` events,
   `fallback_boundary_inventory.toml`) and demonstrate the finer lanes the
   dispatcher must additionally expose.
-- Document the canonical contract path set (`docs/contracts/`) and resolve or
-  quarantine the divergent root-level duplicates of
+- Inventory the distributed contract-path authorities and hand the exact
+  root-path consumer list to a dedicated canonicalization task.
+- Consolidate the canonical contract path set under `docs/contracts/`, remove
+  every live root-path read, and resolve or quarantine the divergent root-level
+  duplicates of
   `supported_surface_matrix.toml`, `feature_universe_ledger.toml`,
   `parity_taxonomy.toml`, `sqlite_version_contract.toml`, and
-  `corpus_manifest.toml` (§5.1). File deletion requires explicit human
-  approval per AGENTS.md; quarantine-by-decision-record is acceptable.
+  `corpus_manifest.toml` (§5.1). Add an executable drift guard. File deletion
+  requires explicit human approval per AGENTS.md; without that approval, the
+  canonicalization bead remains open until the root copies are made inert and
+  mechanically prevented from drifting.
 - Record explicit non-goals and owners.
 
 Exit gate:
@@ -520,8 +560,10 @@ Exit gate:
   baseline.
 - No source copying has occurred.
 - Concurrency work is coordinated with `bd-2lt76` and `bd-28z4i.5`.
-- The canonical contract paths are documented and the duplication has a
-  recorded resolution or quarantine decision.
+- Canonical contract authority is executable rather than documentary: all
+  consumers resolve `docs/contracts/`, no live fallback reads a root duplicate,
+  and a drift test fails closed. A decision record or linked follow-up alone is
+  insufficient.
 
 ### Phase 1: Typed differential generator pilot
 
@@ -550,12 +592,12 @@ Exit gate:
 - At least one demonstrated coverage gap or unique defect/reproducer, or a
   documented stop decision if the generator adds no value.
 
-### Phase 2: Structured reduction and corpus promotion
+### Phase 2: Structured SQL reduction and corpus promotion
 
 Deliverables:
 
-- AST-aware and schedule-aware reducers behind the current minimizer contract.
-- Exact-signature preservation.
+- AST/schema/value-aware reducers behind the current minimizer contract.
+- Exact SQL result/error signature preservation.
 - Bundle schema extensions and stable replay commands.
 - Promotion policy from random failure to reviewed regression corpus.
 - Regression tests with deliberately reducible synthetic failures.
@@ -568,7 +610,7 @@ Exit gate:
 - Existing bundles remain readable or receive a direct schema migration with
   no compatibility shim.
 
-### Phase 3: SQL-level concurrency oracle
+### Phase 3: SQL-level concurrency oracle and deterministic replay
 
 Deliverables:
 
@@ -576,8 +618,11 @@ Deliverables:
 - Independent model for register, list-append, bank, allocation, and write-skew
   workloads.
 - Serializability/SSI checker and first-committer-wins assertions.
-- LabRuntime schedule adapter owned jointly with existing determinism/DPOR
-  work.
+- Production-`Connection` LabRuntime bridge owned by `bd-2lt76.1`, preserving
+  explicit `Cx`, real pager/MVCC/WAL lane evidence, and default concurrent mode.
+- LabRuntime schedule adapter that consumes that bridge and the existing DPOR
+  engines.
+- History/schedule/worker/crash reducer with exact witness preservation.
 - Golden valid and invalid history fixtures.
 
 Exit gate:
@@ -586,8 +631,10 @@ Exit gate:
   known serializable fixtures.
 - Aborted, cancelled, timed-out, and indeterminate transactions have explicit
   semantics.
-- Failures emit deterministic seed, schedule, history, lane evidence, and
-  replay command.
+- The production `Connection`, not only a hand-written model, is scheduled by
+  LabRuntime; observation-only OS-thread histories do not satisfy this gate.
+- Failures emit deterministic seed, schedule, original and minimized history,
+  serialization witness, lane evidence, and replay command.
 - Concurrent mode is asserted true at setup and after reopen.
 
 ### Phase 4: Real-file and multiprocess campaigns
@@ -700,7 +747,9 @@ The new harness code itself needs tests.
 - AST printer/parser round trip on the supported subset;
 - budget enforcement and depth limits;
 - comparison rules for NULL, integers/reals, blobs, text, order, and errors;
-- every reducer preserves syntax and required dependencies;
+- every SQL reducer preserves syntax and setup dependencies;
+- every history reducer preserves the serializability/crash witness and public
+  replay contract;
 - history serialization and stable ordering;
 - serializability oracle golden accept/reject cases;
 - provenance validation and contract-drift failure.
@@ -734,6 +783,8 @@ The new harness code itself needs tests.
 | Imported unsupported tests create skip debt | Contract-driven capability map and skip-count drift gate. |
 | Flaky randomized tests | Fixed seed derivation, deterministic schedules, bounded time, replay artifact. |
 | Minimizer changes failure identity | Exact signature revalidation after every reduction. |
+| Divergent root contract copies silently redefine scope | Hard-gated authority consolidation, no live root-path reads, and an executable drift guard before profile mapping. |
+| Observation-only histories are mislabeled deterministic | Production `Connection`/LabRuntime bridge is a blocking prerequisite; observation-only evidence cannot close the deterministic integration bead. |
 | External tools become release blockers | Start nightly/advisory; promote only after stability and ownership evidence. |
 | License/provenance is lost | Required intake metadata and review before substantial copying. |
 | CI target explosion | Corpus-driven runners and target accounting rather than one target per case. |
@@ -776,12 +827,13 @@ Reject or defer when:
 
 ## 14. Recommended Order
 
-1. Baseline, provenance, overlap map, and execution-lane evidence.
+1. Baseline, provenance, overlap map, execution-lane evidence, and hard-gated
+   contract-authority consolidation.
 2. Narrow typed differential generator.
-3. Structured reducer integration.
-4. SQL-level serializability histories coordinated with existing LabRuntime and
-   DPOR work.
-5. Real-file/multiprocess schedules.
+3. Structured SQL reducer integration.
+4. SQL-level serializability histories plus the production-`Connection`
+   LabRuntime bridge.
+5. History/schedule reduction, then real-file/multiprocess schedules.
 6. SQLancer trial.
 7. Coverage-ledger and CI promotion decision (recommended after the SQLancer
    trial but not blocked by it — the tracker edge is non-blocking).
@@ -799,6 +851,8 @@ The program is complete when:
 - generated cases are scope-aware, deterministic, minimized, and replayable;
 - SQL-level concurrent histories are checked against serializability/SSI;
 - pager/MVCC/recovery claims include execution-lane evidence;
+- every scope-defining contract consumer resolves the canonical
+  `docs/contracts/` authority and the duplicate/drift guard passes;
 - external campaigns, if retained, have pinned provenance and bounded CI lanes;
 - the canonical ledgers expose generated and imported coverage without skip
   inflation;
@@ -814,13 +868,16 @@ Epic: `bd-turso-test-adaptation-zu081`
 | Phase | Bead | Deliverable |
 |---|---|---|
 | 0 | `bd-turso-test-adaptation-zu081.1` | Baseline, overlap map, and provenance policy |
+| 0 | `bd-turso-test-adaptation-zu081.18` | Canonical contract-authority consolidation and drift guard |
 | 0 | `bd-turso-test-adaptation-zu081.2` | Fail-closed execution-lane evidence |
 | 1 | `bd-turso-test-adaptation-zu081.3` | Independent typed SQL generator core |
 | 1 | `bd-turso-test-adaptation-zu081.4` | Contract-derived profiles and coverage |
 | 1 | `bd-turso-test-adaptation-zu081.5` | Differential, corpus, and replay adapters |
-| 2 | `bd-turso-test-adaptation-zu081.6` | AST and schedule-aware reduction |
+| 2 | `bd-turso-test-adaptation-zu081.6` | SQL AST/schema/value reduction |
 | 3 | `bd-turso-test-adaptation-zu081.7` | SSI/serializability history oracle |
+| 3 prerequisite | `bd-2lt76.1` | Production `Connection`/LabRuntime scheduling bridge |
 | 3 | `bd-turso-test-adaptation-zu081.8` | LabRuntime/DPOR history integration |
+| 3 | `bd-turso-test-adaptation-zu081.19` | History/schedule/worker/crash reduction |
 | 4 | `bd-turso-test-adaptation-zu081.9` | Real-file multiprocess crash/recovery |
 | 5 | `bd-turso-test-adaptation-zu081.10` | SQLancer provider spike |
 | 5 | `bd-turso-test-adaptation-zu081.11` | Bounded SQLancer nightly trial |
@@ -831,8 +888,10 @@ Epic: `bd-turso-test-adaptation-zu081`
 | 6 | `bd-turso-test-adaptation-zu081.16` | CLI/system/fixed-database gap audit |
 | cross-phase | `bd-turso-test-adaptation-zu081.17` | CI, coverage, and phase-promotion gates |
 
-The epic is P0 (it contains the current top triage pick) and every child
-carries both a `## Acceptance` section in its description and the structured
+The epic is P0 because it contains the current top triage pick. Cross-epic
+`bd-2lt76.1` is a child of `bd-2lt76`, not of this epic. The Turso epic
+therefore has 19 children, and every child carries both a
+`## Acceptance` section in its description and the structured
 `acceptance_criteria` field, so tooling that reads the structured field sees
 the same criteria as human readers.
 
@@ -840,29 +899,32 @@ The complete blocking-edge set (`task <- blockers`), kept exactly in sync
 with the tracker:
 
 ```text
-.2  <- .1            .3  <- .1            .4  <- .1, .3
-.5  <- .2, .3, .4    .6  <- .5            .7  <- .1, .2
-.8  <- .2, .7        .9  <- .6, .8        .10 <- .1, .2
-.11 <- .6, .10       .12 <- .11           .13 <- .1, .2
-.14 <- .7, .9        .15 <- .1, .9        .16 <- .1
-.17 <- .5, .6, .8
+.2  <- .1            .3  <- .1            .18 <- .1
+.4  <- .3, .18       .5  <- .2, .3, .4    .6  <- .5
+.7  <- .1, .2        bd-2lt76.1 <- bd-2jpu6.5
+.8  <- .2, .7, bd-2lt76.1                 .19 <- .7, .8
+.9  <- .19           .10 <- .1, .2        .11 <- .6, .10
+.12 <- .11           .13 <- .1, .2        .14 <- .7, .9
+.15 <- .1, .9        .16 <- .1            .17 <- .5, .6, .8, .19
 ```
 
-Reading order of the spine: `.1` baseline unblocks everything; the generator
-chain is `.3 -> .4 -> .5 -> .6`; the concurrency chain is `.7 -> .8 -> .9`;
-the external-oracle chain is `.10 -> .11 -> .12`.
+Reading order of the spine: `.1 -> .18 -> .4` is the contract gate; the SQL
+generator/reducer chain is `.3 -> .4 -> .5 -> .6`; the concurrency chain joins
+`.7` with cross-epic bridge `bd-2lt76.1` at `.8`, then continues through
+`.19 -> .9`; the external-oracle chain is `.10 -> .11 -> .12`.
 
 `.17` (CI, coverage, and promotion gates) deliberately does **not** block on
 the external or optional lanes: its edges to `.10`, `.11`, `.12`, `.13`,
 `.14`, `.15`, and `.16` are non-blocking `related` links, so a deferred or
 rejected external tool can never stall CI promotion of the native lanes. Only
-adopted lanes gate CI; epic-level closure (all 17 children) is what enforces
+adopted lanes gate CI; epic-level closure (all 19 children) is what enforces
 that every Turso testing area ends with an adopt/defer/reject record.
 
-The LabRuntime integration (`.8`) has non-blocking `related` edges to
-`bd-2lt76` and `bd-28z4i.5`. It must consume their determinism/DPOR
-interfaces but does not duplicate or wait for unrelated scope in those large
-existing beads. Optional beads `.13` through `.16` hang off Phase 0
-governance (`.13 <- .1, .2`; `.16 <- .1`) or the concurrency campaigns whose
-results they assess (`.14 <- .7, .9`; `.15 <- .1, .9`); none of them blocks
-the core delivery spine.
+The LabRuntime integration (`.8`) hard-blocks on narrow bridge `bd-2lt76.1`
+and retains a non-blocking `related` edge to `bd-28z4i.5`. This makes production
+determinism real without duplicating or waiting for unrelated DPOR scope.
+Observation-only histories are `.7` inputs, not `.8` completion evidence.
+Optional beads `.13` through `.16` hang off Phase 0 governance
+(`.13 <- .1, .2`; `.16 <- .1`) or the concurrency campaigns whose results they
+assess (`.14 <- .7, .9`; `.15 <- .1, .9`); none of them blocks the core
+delivery spine.
