@@ -7492,6 +7492,9 @@ mod tests {
     const SHARDED_CACHE_PERF_REPLAY: &str = "cargo test --profile release-perf -p \
         fsqlite-pager page_cache::tests::test_sharded_cache_throughput_vs_single -- \
         --exact --nocapture --test-threads=1";
+    const FAST_PATH_LATENCY_REPLAY: &str = "cargo test --locked --profile release-perf \
+        --package fsqlite-pager --lib page_cache::tests::test_fast_path_vs_sharded_latency_comparison \
+        -- --exact --ignored --nocapture --test-threads=1";
 
     fn measure_single_cache_insert_read(iterations: u32) -> Duration {
         let mut cache = PageCache::new(PageSize::DEFAULT);
@@ -7516,6 +7519,70 @@ mod tests {
             let value = u8::try_from(i & 0xff).unwrap();
             cache.insert_fresh(page_no, |data| data[0] = value).unwrap();
             checksum ^= black_box(cache.with_page(page_no, |data| data[0]).unwrap());
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn latency_lookup_page(lookup: u32, working_set_pages: u32) -> PageNumber {
+        let page_index = lookup.wrapping_mul(17) % working_set_pages;
+        PageNumber::new(page_index + 1).expect("latency lookup page number is nonzero")
+    }
+
+    fn populate_latency_lookup_cache(cache: &ShardedPageCache, working_set_pages: u32) {
+        for page_index in 1..=working_set_pages {
+            let page_no =
+                PageNumber::new(page_index).expect("latency setup page number is nonzero");
+            let expected = u8::try_from(page_index & 0xff).expect("page marker fits in a byte");
+            cache
+                .insert_fresh(page_no, |data| data[0] = expected)
+                .expect("latency setup page insertion succeeds");
+            assert_eq!(
+                cache
+                    .with_page(page_no, |data| data[0])
+                    .expect("latency setup page remains resident"),
+                expected,
+                "bead_id={BEAD_FZR07} case=latency_setup_lookup_correct page={page_index}"
+            );
+        }
+        assert_eq!(
+            cache.len(),
+            usize::try_from(working_set_pages).expect("working set length fits usize"),
+            "bead_id={BEAD_FZR07} case=latency_setup_residency"
+        );
+    }
+
+    fn hot_latency_lookup(cache: &ShardedPageCache, lookup: u32, working_set_pages: u32) -> u8 {
+        let page_no = latency_lookup_page(lookup, working_set_pages);
+        cache
+            .with_page(page_no, |data| black_box(data[0]))
+            .expect("warmed latency lookup remains resident")
+    }
+
+    fn measure_warmed_latency_lookup(
+        use_fast_path: bool,
+        working_set_pages: u32,
+        warmup_lookups: u32,
+        timed_lookups: u32,
+    ) -> Duration {
+        let cache = if use_fast_path {
+            ShardedPageCache::new_single_connection(PageSize::DEFAULT)
+        } else {
+            ShardedPageCache::new(PageSize::DEFAULT)
+        };
+        populate_latency_lookup_cache(&cache, working_set_pages);
+
+        let mut warmup_checksum = 0_u8;
+        for lookup in 0..warmup_lookups {
+            warmup_checksum =
+                warmup_checksum.wrapping_add(hot_latency_lookup(&cache, lookup, working_set_pages));
+        }
+        black_box(warmup_checksum);
+
+        let mut checksum = 0_u8;
+        let started = Instant::now();
+        for lookup in 0..timed_lookups {
+            checksum = checksum.wrapping_add(hot_latency_lookup(&cache, lookup, working_set_pages));
         }
         black_box(checksum);
         started.elapsed()
@@ -10413,43 +10480,79 @@ mod tests {
     #[test]
     #[ignore = "benchmark evidence only"]
     fn test_fast_path_vs_sharded_latency_comparison() {
-        // Compare latency of fast path vs sharded path for single-thread workload.
-        use std::time::Instant;
+        // This is a hot lookup gate. Setup, allocation growth, and initial cache
+        // warming are deliberately outside the timed region so the comparison
+        // represents the single-connection lookup fast path rather than growth.
+        // Pair and alternate the order to cancel directional scheduler drift.
+        const WORKING_SET_PAGES: u32 = 256;
+        const WARMUP_LOOKUPS: u32 = 50_000;
+        const TIMED_LOOKUPS: u32 = 100_000;
+        const SAMPLE_COUNT: usize = 11;
 
-        const ITERATIONS: u32 = 100_000;
+        let _ =
+            measure_warmed_latency_lookup(true, WORKING_SET_PAGES, WARMUP_LOOKUPS, TIMED_LOOKUPS);
+        let _ =
+            measure_warmed_latency_lookup(false, WORKING_SET_PAGES, WARMUP_LOOKUPS, TIMED_LOOKUPS);
 
-        // Fast path (single connection mode)
-        let fast_cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
-        let start = Instant::now();
-        for i in 1..=ITERATIONS {
-            let pn = PageNumber::new(i).unwrap();
-            fast_cache.insert_fresh(pn, |_| {}).unwrap();
-            fast_cache.with_page(pn, |_| {});
+        let mut evidence = Vec::with_capacity(SAMPLE_COUNT);
+        let mut speedups = Vec::with_capacity(SAMPLE_COUNT);
+        for sample in 0..SAMPLE_COUNT {
+            let (fast_elapsed, sharded_elapsed, order) = if sample % 2 == 0 {
+                (
+                    measure_warmed_latency_lookup(
+                        true,
+                        WORKING_SET_PAGES,
+                        WARMUP_LOOKUPS,
+                        TIMED_LOOKUPS,
+                    ),
+                    measure_warmed_latency_lookup(
+                        false,
+                        WORKING_SET_PAGES,
+                        WARMUP_LOOKUPS,
+                        TIMED_LOOKUPS,
+                    ),
+                    "fast_first",
+                )
+            } else {
+                let sharded_elapsed = measure_warmed_latency_lookup(
+                    false,
+                    WORKING_SET_PAGES,
+                    WARMUP_LOOKUPS,
+                    TIMED_LOOKUPS,
+                );
+                let fast_elapsed = measure_warmed_latency_lookup(
+                    true,
+                    WORKING_SET_PAGES,
+                    WARMUP_LOOKUPS,
+                    TIMED_LOOKUPS,
+                );
+                (fast_elapsed, sharded_elapsed, "sharded_first")
+            };
+            let speedup =
+                sharded_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+            evidence.push((sample, order, fast_elapsed, sharded_elapsed, speedup));
+            speedups.push(speedup);
         }
-        let fast_elapsed = start.elapsed();
+        let median_speedup = median_ratio(&mut speedups);
 
-        // Sharded path (normal mode)
-        let sharded_cache = ShardedPageCache::new(PageSize::DEFAULT);
-        let start = Instant::now();
-        for i in 1..=ITERATIONS {
-            let pn = PageNumber::new(i).unwrap();
-            sharded_cache.insert_fresh(pn, |_| {}).unwrap();
-            sharded_cache.with_page(pn, |_| {});
+        for (sample, order, fast_elapsed, sharded_elapsed, speedup) in &evidence {
+            eprintln!(
+                "bead_id={BEAD_FZR07} sample={sample} order={order} \
+                 fast_path={fast_elapsed:?} sharded={sharded_elapsed:?} speedup={speedup:.2}x"
+            );
         }
-        let sharded_elapsed = start.elapsed();
-
-        let speedup = sharded_elapsed.as_nanos() as f64 / fast_elapsed.as_nanos() as f64;
-
-        // Fast path should be faster (at least 1.2x for single-thread)
         eprintln!(
-            "bead_id={BEAD_FZR07} fast_path={:?} sharded={:?} speedup={:.2}x",
-            fast_elapsed, sharded_elapsed, speedup
+            "bead_id={BEAD_FZR07} median_speedup={median_speedup:.2}x samples={SAMPLE_COUNT} \
+             working_set_pages={WORKING_SET_PAGES} warmup_lookups={WARMUP_LOOKUPS} \
+             timed_lookups={TIMED_LOOKUPS} replay={FAST_PATH_LATENCY_REPLAY}"
         );
 
+        // Fast path should be faster (at least 1.2x for single-thread).
         assert!(
-            speedup >= 1.2,
+            median_speedup >= 1.2,
             "bead_id={BEAD_FZR07} case=latency_comparison \
-             fast path should be at least 1.2x faster, got {speedup:.2}x"
+             fast path median should be at least 1.2x faster, got {median_speedup:.2}x; \
+             evidence={evidence:?}; replay={FAST_PATH_LATENCY_REPLAY}"
         );
     }
 
