@@ -1,6 +1,6 @@
 # Selective Turso Testing Adaptation Plan
 
-Status: proposed
+Status: proposed (rev 2 — independently re-verified and revised 2026-08-03)
 
 Research date: 2026-08-03
 
@@ -93,6 +93,28 @@ more of the ladder; they must not turn a design aspiration into a current claim.
 
 This plan therefore borrows test methods, not architectural conclusions.
 
+### 2.3 Independent verification record (2026-08-03 review)
+
+A second-agent review re-verified the load-bearing claims in this plan:
+
+- The pinned Turso commit exists (committed 2026-08-03T11:43:52Z) and its
+  `testing/` subtree contains exactly 373 entries (GitHub tree API,
+  non-truncated listing).
+- `testing/sqltest/Cargo.toml` at that commit declares
+  `tokio = { workspace = true, features = ["full"] }`; the Tokio exclusion is
+  fact-based, not speculative.
+- Turso's `LICENSE.md` at that commit is MIT.
+- Whopper's documented Elle workflow checks
+  `--consistency-models snapshot-isolation`, confirming its acceptance model
+  is weaker than FrankenSQLite's SSI contract.
+- All four concurrent-mode defaults named in AGENTS.md are `true` on current
+  `main`, and no tokio-family crate appears in `Cargo.lock` or any workspace
+  `Cargo.toml`. `crates/fsqlite-harness/tests/no_tokio_enforcement.rs` already
+  enforces the dependency policy against `cargo metadata`, so the §11 control
+  extends an existing gate rather than inventing one.
+- The §3.1 infrastructure inventory was checked against the tree; corrections
+  from that check are folded into §3.1, §3.2, §5.2, §5.4, §5.5, and §5.7.
+
 ## 3. FrankenSQLite Baseline
 
 This is not a greenfield test effort. Existing infrastructure already covers
@@ -102,22 +124,28 @@ most of the mechanics that a naive port would duplicate.
 
 | Capability | Existing owner | Consequence for this plan |
 |---|---|---|
-| Differential execution against C SQLite | `fsqlite-harness::differential_v2` and E2E executors | New generators must emit the existing envelope. |
-| Seeded workload generation | `fsqlite-e2e::workload` | Reuse seed derivation and operation logs. |
-| Corpus normalization and coverage | `fsqlite-harness::corpus_ingest` | Imported or generated cases become corpus entries. |
-| Replay and failure bundles | `replay_harness`, `failure_bundle` | Extend bundle schemas; do not fork them. |
-| Mismatch minimization | `mismatch_minimizer` | Add structured reducers behind the existing interface. |
-| Metamorphic testing | `metamorphic` | Typed generation complements, rather than replaces, transformations. |
-| Adversarial campaigns | `adversarial_search` | External generators are additional campaign producers. |
-| Deterministic runtime and faults | `FsLab`, `LabRuntime`, `FaultVfs` | Use asupersync scheduling and VFS faults. |
-| Parity scope | `docs/canonical_parity_contract.md` and TOML contracts | Generation is scope-driven and fail-closed. |
-| CI target accounting | current verification workflows | New lanes must be discoverable, budgeted, and artifact-producing. |
+| Differential execution against C SQLite | `fsqlite-harness::differential_v2` (in-process rusqlite executors) plus `fsqlite-harness::oracle` (external `sqlite3` CLI) and `fsqlite-e2e::comparison` backends | New generators must emit the existing envelope; both reference paths stay available. |
+| Seeded workload generation | `fsqlite-e2e::workload` (`WorkloadGenerator`) and the six `oplog` presets | Reuse seed derivation and operation logs. |
+| Corpus normalization and coverage | `fsqlite-harness::corpus_ingest` plus `fixture_root_contract` (hash-locked roots) | Imported or generated cases become corpus entries. |
+| Replay and failure bundles | `replay_harness`, `replay_triage`, `failure_bundle` (present in both harness and e2e), `fsqlite-e2e::mismatch_artifacts` | Extend bundle schemas; do not fork them. |
+| Mismatch minimization | `mismatch_minimizer`; `fsqlite-e2e::comparison::reduce_*` repro reducers | Add structured reducers behind the existing interfaces. |
+| Metamorphic testing | `metamorphic` (a registry of exactly 8 rewrite transforms) | Typed generation complements, rather than replaces, transformations. Beyond these rewrites, the only generative SQL today is a self-described scaffold proptest over single-table SELECT (`crates/fsqlite-core/tests/differential_proptest.rs`). |
+| Adversarial campaigns | `adversarial_search` | This module attacks the verification gates themselves (mutation-based counterexample search), not SQL; external generators are additional campaign producers, not a replacement for it. |
+| Deterministic runtime and faults | `FsLab`/`LabRuntime`, `FaultVfs`, `fault_profiles` | Use asupersync scheduling and VFS faults. Caveat: LabRuntime/DPOR currently drive small hand-written MVCC models, not `fsqlite::Connection`; see §5.4. |
+| Coverage-guided fuzzing | `fuzz/` workspace: 5 libfuzzer targets (lexer, SQL parser, expression parser, record round-trip, xor-merge guard), no checked-in corpus | The SQLRight evaluation (§5.6) must beat this baseline; no engine-level (VDBE/btree/pager/WAL) fuzz target exists today. |
+| Parity scope | `docs/canonical_parity_contract.md` and the `docs/contracts/*.toml` contracts | Generation is scope-driven and fail-closed. See §5.1 for the canonical-path warning. |
+| CI target accounting | current verification workflows plus `fsqlite-harness::lane_selector` (CI lane selection) | New lanes must be discoverable, budgeted, and artifact-producing. |
 
 The current test-realism inventory reports a very large suite spanning unit,
 memory-backed, file-backed, end-to-end, and property tests. Its numeric totals
-must be refreshed before this campaign uses them as a baseline. The key point
-is already verified from the tree: hundreds of integration targets and mature
-harness modules exist, so one-file-per-import expansion would make CI worse.
+must be refreshed before this campaign uses them as a baseline, and the
+recount must separate engine-behavior tests from tracker-metadata tests: as of
+this review, 68 of 236 `fsqlite-harness` integration test files assert on
+`.beads/issues.jsonl` content rather than engine behavior, while the real
+differential mass sits in `crates/fsqlite-e2e/tests/` (214 of 269 files use
+rusqlite) and `crates/fsqlite/tests/`. The key point is already verified from
+the tree: hundreds of integration targets and mature harness modules exist, so
+one-file-per-import expansion would make CI worse.
 
 ### 3.2 Architecture-sensitive test requirements
 
@@ -125,6 +153,33 @@ Every new test must declare the execution lane it intends to exercise.
 `Connection` currently dispatches work among pager-backed/direct-VDBE and
 selected compatibility/fallback paths. A result can be correct while missing
 the storage, planner, VDBE, WAL, or MVCC code the test claims to validate.
+
+Substantial machinery for this already exists and must be the foundation, not
+duplicated:
+
+- `fsqlite-core::Connection` exposes `PRAGMA fsqlite.backend_kind`,
+  `PRAGMA fsqlite.backend_mode`, and `PRAGMA fsqlite.parity_cert_strict`, and
+  computes a `backend_identity()` string such as `unix:parity_cert_strict` or
+  `memory:fallback_allowed`.
+- Strict parity-cert mode (`set_strict_mem_fallback_rejection`) turns any
+  in-memory compatibility fallback into a hard error via
+  `log_mem_execution_fallback`; non-strict mode logs structured
+  `fsqlite.fallback_decision` tracing events carrying `statement_kind`,
+  `decision_reason`, `decision_outcome`, and `fallback_boundary`.
+- `fsqlite-e2e::fsqlite_executor::configure_connection` already fails closed
+  when a file-backed run resolves to the memory backend or is not strict, and
+  records a `StorageWiringReport` on every `EngineRunReport`.
+- `docs/contracts/fallback_boundary_inventory.toml` is the audited registry of
+  every fallback boundary, with runtime `decision_reason` strings
+  contract-tested against it.
+
+What is missing — and what bead `.2` delivers — is the finer-grained lane
+vocabulary below (planner/VDBE/MVCC/recovery participation, beyond today's
+memory-vs-pager and strict-mode distinction) and the propagation of observed
+lane evidence into failure bundles and coverage reports. Terminology note:
+"lane" in `fsqlite-harness::lane_selector` means CI lane selection, and
+`fsqlite-wal` has WAL "lanes"; this plan's term is always *execution-lane
+evidence* to avoid collision.
 
 Required lane evidence:
 
@@ -193,8 +248,17 @@ The generator contract should include:
 - Maximum AST depth, statement count, row count, value size, and execution
   budget.
 - A generation trace listing every selected construct and origin path.
-- Feature IDs from `supported_surface_matrix.toml`,
-  `feature_universe_ledger.toml`, and `parity_taxonomy.toml`.
+- Feature IDs from `docs/contracts/supported_surface_matrix.toml`,
+  `docs/contracts/feature_universe_ledger.toml`, and
+  `docs/contracts/parity_taxonomy.toml`. Warning: stale divergent duplicates
+  of these files (and of `sqlite_version_contract.toml` and
+  `corpus_manifest.toml`) exist at the repository root, and some code paths
+  still resolve the root copies (`fixture_root_contract.rs:627`,
+  `feature_coverage_dashboard.rs:776`) while the declared canonical constants
+  point at `docs/contracts/`. The two `corpus_manifest.toml` copies already
+  disagree on `content_hash`. Phase 0 must document the canonical set and
+  resolve or quarantine the duplicates before capability mapping is built on
+  top of them.
 - Required execution lane and forbidden fallbacks.
 - Strict result/error/transaction comparison policy.
 
@@ -212,6 +276,13 @@ expressions, joins, aggregates, subqueries/compound SELECT where declared, and
 transactions. DDL churn, partial extensions, window functions, maintenance
 PRAGMAs, and recovery sequences enter later profiles.
 
+The existing single-table SELECT proptest scaffold
+(`crates/fsqlite-core/tests/differential_proptest.rs`, frankensqlite#86) is
+prior art for exactly this idea at miniature scale; the typed generator should
+absorb or supersede it rather than leave two partial generators in the tree.
+Its comparator's known weakness — treating any both-engines-error pair as
+agreement — is precisely what §3.3 invariant 6 forbids here.
+
 ### 5.2 Structured reduction
 
 The existing minimizer removes workload statements. Extend it with reducers
@@ -224,10 +295,14 @@ that understand generated structure:
 5. Reduce schedule events, yield points, crash points, and worker count.
 6. Revalidate the exact mismatch signature after every reduction.
 
-The existing failure bundle remains canonical. Add original and minimized AST
-traces, generator profile hash, lane evidence, schedule, environment, and
-upstream provenance. A minimized case must replay through the public verifier,
-not only an in-memory reducer callback.
+The existing failure bundle remains canonical (`failure_bundle` in both
+`fsqlite-harness` and `fsqlite-e2e`, plus `fsqlite-e2e::mismatch_artifacts`).
+Add original and minimized AST traces, generator profile hash, lane evidence,
+schedule, environment, and upstream provenance. The `replay_triage` workflow
+(artifact manifest → first divergence → replay → minimize → operator report)
+is the operator-facing integration point for new reducers. A minimized case
+must replay through the public verifier, not only an in-memory reducer
+callback.
 
 ### 5.3 Stateful deterministic simulation
 
@@ -275,15 +350,41 @@ against golden histories. Otherwise, build or reuse a small internal
 serialization-graph checker and optionally export Elle EDN as a secondary
 diagnostic.
 
+Seed material for that checker already exists and is currently duplicated:
+`crates/fsqlite-e2e/tests/bd_2yqp6_6_1_ssi_serialization_anomaly_differential.rs`
+carries a hand-rolled `detect_cycle`/`dfs_cycle` conflict-graph checker,
+`bd_3plop_5_ssi_serialization_correctness.rs` asserts conflict-graph
+acyclicity independently, and `fsqlite-harness::tla` has a model-level
+`simulate_ssi_execution`. The history oracle should unify these into one
+shared library component instead of adding a fourth copy.
+
 Coordinate schedule exploration with existing beads `bd-2lt76` and
 `bd-28z4i.5`. This campaign owns SQL-level history semantics and workload
 oracles; those beads own LabRuntime determinism and DPOR machinery. No new
-runtime or scheduler should be created here.
+runtime or scheduler should be created here. Two DPOR engines already exist —
+asupersync's `DporExplorer` (used by `mvcc_alien_verification.rs`) and the
+harness-native trace-monoid DPOR in `fsqlite-harness::tla` — so this campaign
+must consume one of them, never add a third. A further constraint the history
+work must respect: LabRuntime does not currently schedule the production
+`fsqlite::Connection` engine at all — today it drives small hand-written MVCC
+models — so deterministic SQL-level schedule replay is contingent on
+`bd-2lt76` scope landing, and history capture must remain valid (as recorded
+observation, minus replay determinism) when the engine runs on OS threads.
 
 ### 5.5 Multiprocess and fault campaigns
 
 After in-process histories are stable, run the same operation schema across
-multiple processes using real files. Start with bounded cases:
+multiple processes using real files. The base harness already exists:
+`crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs` (the canonical
+multi-process source of truth per `docs/concurrency-contract.md`) spawns real
+child processes against one WAL database and already checks
+read-your-own-write, cross-process visibility, WAL shape, and C-SQLite
+cross-check invariants with versioned report schemas. This phase extends that
+harness with the typed history schema; it does not build a parallel one. Note
+also that the C-SQLite-side process executor (`fsqlite-e2e::executor`)
+documents its `deterministic`/`barrier` concurrency modes as currently
+degrading to `free`, so reference-side schedules are not deterministic today
+and history comparison must not assume they are. Start with bounded cases:
 
 - two processes with disjoint-page writes;
 - two processes with same-page conflicts;
@@ -301,8 +402,14 @@ merge CI.
 ### 5.6 External generator diversity
 
 SQLancer is the first external candidate because it provides an independent
-generator and well-known SQLite oracles without becoming a Rust runtime
-dependency. The provider must:
+generator and well-known SQLite oracles (TLP, NoREC, PQS) without becoming a
+Rust runtime dependency. It is a Java tool whose SQLite support runs
+in-process over JDBC, so "add a provider" concretely means implementing a
+SQLancer database-provider that reaches FrankenSQLite across a process or ABI
+boundary — candidate routes are driving the `fsqlite` CLI, a thin socket/pipe
+shim, or the optional `fsqlite-c-api` behind a SQLite-compatible JDBC driver
+configured to load a replacement native library. Selecting and de-risking that
+route is the point of the spike. The provider must:
 
 - invoke FrankenSQLite through a stable CLI or C API boundary;
 - pin the SQLancer revision and container/toolchain digest;
@@ -325,7 +432,13 @@ databases, exact/error/pattern/unordered results, capability requirements,
 backend selection, and plan snapshots. Its implementation depends on Tokio and
 duplicates substantial FrankenSQLite infrastructure.
 
-The pilot should therefore test the need before implementing a new parser:
+The pilot should therefore test the need before implementing a new parser.
+Note that SLT machinery already exists end to end — `fsqlite-harness::oracle`
+parses SLT (`parse_slt`, `skipif`/`onlyif`, `rowsort`/`valuesort`) and
+`corpus_ingest::ingest_slt_files` ingests it — but the checked-in SLT corpus
+is a single ~25-line smoke file (`conformance/slt/smoke/basic.slt`). Growing
+that corpus through the existing parser is the zero-new-syntax baseline any
+new DSL must beat.
 
 1. Select 20-50 representative existing FrankenSQLite cases that are currently
    verbose or duplicated.
@@ -382,12 +495,23 @@ Only candidates answering all required questions proceed.
 
 Deliverables:
 
-- Recompute current test inventory and CI runtime/resource baseline.
+- Recompute current test inventory and CI runtime/resource baseline,
+  separating engine-behavior tests from tracker-metadata compliance tests
+  (§3.1).
 - Produce a machine-readable overlap map from Turso areas to FrankenSQLite
   owners, contracts, and existing tests.
 - Define provenance schema and licensing decision record.
-- Define lane-evidence vocabulary and demonstrate how the current dispatcher
-  exposes it.
+- Define the lane-evidence vocabulary as an extension of the existing
+  parity-cert/fallback machinery (§3.2: `backend_identity`, strict-mode
+  rejection, `fsqlite.fallback_decision` events,
+  `fallback_boundary_inventory.toml`) and demonstrate the finer lanes the
+  dispatcher must additionally expose.
+- Document the canonical contract path set (`docs/contracts/`) and resolve or
+  quarantine the divergent root-level duplicates of
+  `supported_surface_matrix.toml`, `feature_universe_ledger.toml`,
+  `parity_taxonomy.toml`, `sqlite_version_contract.toml`, and
+  `corpus_manifest.toml` (§5.1). File deletion requires explicit human
+  approval per AGENTS.md; quarantine-by-decision-record is acceptable.
 - Record explicit non-goals and owners.
 
 Exit gate:
@@ -396,6 +520,8 @@ Exit gate:
   baseline.
 - No source copying has occurred.
 - Concurrency work is coordinated with `bd-2lt76` and `bd-28z4i.5`.
+- The canonical contract paths are documented and the duplication has a
+  recorded resolution or quarantine decision.
 
 ### Phase 1: Typed differential generator pilot
 
@@ -604,7 +730,7 @@ The new harness code itself needs tests.
 | Common-mode oracle bug | Test AST/model stays independent of production AST; retain C SQLite and external oracles. |
 | Fallback masks storage defects | Required-lane evidence fails closed. |
 | Turso semantics weaken FrankenSQLite guarantees | Canonical FrankenSQLite contracts win; serializability replaces SI acceptance. |
-| Tokio enters dev graph | Dependency policy test plus cargo-tree audit; implement with asupersync. |
+| Tokio enters dev graph | Existing `no_tokio_enforcement.rs` cargo-metadata gate plus cargo-tree audit; implement with asupersync. |
 | Imported unsupported tests create skip debt | Contract-driven capability map and skip-count drift gate. |
 | Flaky randomized tests | Fixed seed derivation, deterministic schedules, bounded time, replay artifact. |
 | Minimizer changes failure identity | Exact signature revalidation after every reduction. |
@@ -657,7 +783,8 @@ Reject or defer when:
    DPOR work.
 5. Real-file/multiprocess schedules.
 6. SQLancer trial.
-7. Coverage-ledger and CI promotion decision.
+7. Coverage-ledger and CI promotion decision (recommended after the SQLancer
+   trial but not blocked by it — the tracker edge is non-blocking).
 8. Optional SQLRight, declarative DSL, Antithesis, and syscall-fault decisions.
 
 This order maximizes independent correctness signal early while containing
@@ -704,17 +831,38 @@ Epic: `bd-turso-test-adaptation-zu081`
 | 6 | `bd-turso-test-adaptation-zu081.16` | CLI/system/fixed-database gap audit |
 | cross-phase | `bd-turso-test-adaptation-zu081.17` | CI, coverage, and phase-promotion gates |
 
-The blocking spine is:
+The epic is P0 (it contains the current top triage pick) and every child
+carries both a `## Acceptance` section in its description and the structured
+`acceptance_criteria` field, so tooling that reads the structured field sees
+the same criteria as human readers.
+
+The complete blocking-edge set (`task <- blockers`), kept exactly in sync
+with the tracker:
 
 ```text
-.1 baseline -> .2 lane evidence
-            -> .3 generator -> .4 profiles -> .5 adapters -> .6 reducers
-.1 + .2     -> .7 history oracle -> .8 LabRuntime integration -> .9 multiprocess
-.1 + .2     -> .10 SQLancer spike -> .11 trial -> .12 SQLRight decision
-.5 + .6 + .8 + .10 -> .17 CI and promotion gates
+.2  <- .1            .3  <- .1            .4  <- .1, .3
+.5  <- .2, .3, .4    .6  <- .5            .7  <- .1, .2
+.8  <- .2, .7        .9  <- .6, .8        .10 <- .1, .2
+.11 <- .6, .10       .12 <- .11           .13 <- .1, .2
+.14 <- .7, .9        .15 <- .1, .9        .16 <- .1
+.17 <- .5, .6, .8
 ```
 
-The LabRuntime integration has non-blocking `related` edges to `bd-2lt76` and
-`bd-28z4i.5`. It must consume their determinism/DPOR interfaces but does not
-duplicate or wait for unrelated scope in those large existing beads. Optional
-beads `.13` through `.16` do not block the core delivery spine.
+Reading order of the spine: `.1` baseline unblocks everything; the generator
+chain is `.3 -> .4 -> .5 -> .6`; the concurrency chain is `.7 -> .8 -> .9`;
+the external-oracle chain is `.10 -> .11 -> .12`.
+
+`.17` (CI, coverage, and promotion gates) deliberately does **not** block on
+the external or optional lanes: its edges to `.10`, `.11`, `.12`, `.13`,
+`.14`, `.15`, and `.16` are non-blocking `related` links, so a deferred or
+rejected external tool can never stall CI promotion of the native lanes. Only
+adopted lanes gate CI; epic-level closure (all 17 children) is what enforces
+that every Turso testing area ends with an adopt/defer/reject record.
+
+The LabRuntime integration (`.8`) has non-blocking `related` edges to
+`bd-2lt76` and `bd-28z4i.5`. It must consume their determinism/DPOR
+interfaces but does not duplicate or wait for unrelated scope in those large
+existing beads. Optional beads `.13` through `.16` hang off Phase 0
+governance (`.13 <- .1, .2`; `.16 <- .1`) or the concurrency campaigns whose
+results they assess (`.14 <- .7, .9`; `.15 <- .1, .9`); none of them blocks
+the core delivery spine.
