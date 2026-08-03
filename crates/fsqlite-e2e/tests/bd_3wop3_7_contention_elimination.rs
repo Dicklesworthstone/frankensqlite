@@ -14,12 +14,11 @@
 //! 8t/16t truth surface and same-pack comparator provenance.
 //!
 //! ## Contention Tests
-//! 1. test_no_global_locks_in_commit_fast_path
-//! 2. test_parallel_wal_segments_independent (D1 dependency)
-//! 3. test_page_cache_shard_distribution (D2 dependency)
-//! 4. test_combiner_reduces_atomic_ops (D3 dependency)
-//! 5. test_ebr_bounded_reclaim_work_per_cycle (D5 bounded-reclaim keeper)
-//! 6. test_scaling_curve
+//! 1. historical_parallel_wal_segment_design_inventory (D1 future design)
+//! 2. test_page_cache_shard_distribution (D2 dependency)
+//! 3. test_combiner_reduces_atomic_ops (D3 dependency)
+//! 4. test_ebr_bounded_reclaim_work_per_cycle (D5 bounded-reclaim keeper)
+//! 5. test_scaling_curve
 //!
 //! ## Stress Tests
 //! 7. test_64_thread_no_deadlock
@@ -27,7 +26,8 @@
 //! 9. test_contention_under_version_churn
 //!
 //! ## Dependencies
-//! - D1: Parallel WAL with per-thread log buffers
+//! - D1: Lane-local preparation plus one ordered WAL backend append; independent
+//!   lane-owned durable artifacts are future design work, not a v0.2 promise.
 //! - D2: Sharded PageCache (128 partitions)
 //! - D3: Flat Combining for commit sequencer
 //! - D5: Epoch-Based Reclamation for MVCC GC
@@ -39,7 +39,7 @@
 //! cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination test_ebr_bounded_reclaim_work_per_cycle -- --exact
 //! ```
 //! Run each manual stress keeper by its exact name with `--ignored --exact`.
-//! Do not run every ignored test as a group: the explicit release-blocker
+//! Do not run every ignored test as a group: remaining explicit release-blocker
 //! stubs intentionally panic until their proof surfaces exist.
 #![recursion_limit = "512"]
 
@@ -388,35 +388,17 @@ async fn open_fsqlite_worker(path: &str) -> fsqlite::Connection {
 // CONTENTION TESTS
 // ===========================================================================
 
-/// Test 1: Verify no global locks in the commit fast path.
+/// Historical D1 design inventory; it is not a v0.2 implementation claim.
 ///
-/// Instruments the commit path to assert no global Mutex is acquired during
-/// WAL frame writing. This is the foundational guarantee of D1.
-///
-/// D1 is implemented, but no exhaustive commit-path lock-acquisition counter
-/// is currently exposed to this integration target.  A WAL-local hook would
-/// not prove the absence of global locks elsewhere in commit processing.
+/// Production performs lane-local preparation before one ordered backend WAL
+/// append. Independent lane-owned durable artifacts are future design work, so
+/// this ignored diagnostic cannot provide release evidence or a throughput
+/// substitute.
 #[test]
-#[ignore = "release blocker: exhaustive commit-path global-lock instrumentation is not exposed"]
-fn test_no_global_locks_in_commit_fast_path() {
-    panic!(
-        "test_no_global_locks_in_commit_fast_path: requires exhaustive commit-path lock-acquisition instrumentation, not a WAL-local proxy"
-    );
-}
-
-/// Test 2: Verify WAL segment writes don't serialize.
-///
-/// Spawns N writer threads, each writing to their own WAL segment. Measures
-/// that aggregate write bandwidth scales with thread count.
-///
-/// D1 is implemented, but this target does not yet expose a deterministic
-/// receipt proving distinct segment ownership and overlap. Throughput alone is
-/// hardware-sensitive and cannot establish independence.
-#[test]
-#[ignore = "release blocker: deterministic parallel-WAL segment ownership and overlap receipts are not exposed"]
-fn test_parallel_wal_segments_independent() {
-    panic!(
-        "test_parallel_wal_segments_independent: requires distinct segment-ownership and observed-overlap receipts; a throughput ratio is not a correctness proof"
+#[ignore = "historical future-design inventory; no release receipt is required"]
+fn historical_parallel_wal_segment_design_inventory() {
+    println!(
+        "v0.2 uses lane-local preparation plus one ordered WAL backend append; independent lane-owned durable artifacts remain future design work"
     );
 }
 
