@@ -75,7 +75,18 @@ $OriginalSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
 [Net.ServicePointManager]::SecurityProtocol = $OriginalSecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $Owner = if ($env:FSQLITE_GITHUB_OWNER) { $env:FSQLITE_GITHUB_OWNER } else { 'Dicklesworthstone' }
 $Repo = if ($env:FSQLITE_GITHUB_REPO) { $env:FSQLITE_GITHUB_REPO } else { 'frankensqlite' }
-$MinisignPublicKey = 'RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB'
+# Signing epoch 1 (key id 36B847D11BA5A0D0,
+# SHA-256 4c6a3589921c0ab1c5ca0b96271039cf5a055aeddf002cde3e209e59e6793c92):
+# published v0.1.16 and v0.1.17 manifests only.
+$MinisignPublicKeyEpoch1 = 'RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB'
+# Signing epoch 2 (key id 1BBD79B28BF718D0,
+# SHA-256 2c41b1e61b65cffb7cfa4174d0940f99213dfaeb60eb4494a60f1e2a7a63cb59):
+# v0.2.0 and later manifests.
+$MinisignPublicKeyEpoch2 = 'RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70'
+$VersionPattern = '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+$VersionPatternNoPrefix = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+$VersionExplicit = -not [string]::IsNullOrWhiteSpace($Version)
+$SelectedMinisignPublicKey = $null
 $TempDirectory = $null
 $LockStream = $null
 $StagedBinary = $null
@@ -106,8 +117,8 @@ function Invoke-Download([string]$Uri, [string]$OutFile) {
 
 function Resolve-Version {
     if ($script:Version) {
-        if ($script:Version -match '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') { $script:Version = "v$($script:Version)" }
-        if ($script:Version -notmatch '^v\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
+        if ($script:Version -match $script:VersionPatternNoPrefix) { $script:Version = "v$($script:Version)" }
+        if ($script:Version -notmatch $script:VersionPattern) {
             Fail "Invalid version '$script:Version'; expected vX.Y.Z"
         }
         return
@@ -125,9 +136,29 @@ function Resolve-Version {
         $response = Invoke-WebRequest @redirectParameters
         $script:Version = [IO.Path]::GetFileName($response.BaseResponse.ResponseUri.AbsolutePath)
     }
-    if ($script:Version -notmatch '^v\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
+    if ($script:Version -notmatch $script:VersionPattern) {
         Fail "GitHub returned an invalid release tag: $script:Version"
     }
+}
+
+function Get-MinisignPublicKeyForVersion {
+    if ($script:Version -in @('v0.1.16', 'v0.1.17')) {
+        if (-not $script:VersionExplicit) {
+            Fail "Automatic version resolution returned legacy release $script:Version; pass -Version $script:Version explicitly"
+        }
+        return $MinisignPublicKeyEpoch1
+    }
+
+    $match = [regex]::Match($script:Version, $script:VersionPattern)
+    if ($match.Success) {
+        $major = $match.Groups[1].Value
+        $minor = $match.Groups[2].Value
+        if ($major -ne '0' -or ($minor -ne '0' -and $minor -ne '1')) {
+            return $MinisignPublicKeyEpoch2
+        }
+    }
+
+    Fail "Release $script:Version has no installer signing-key trust policy"
 }
 
 function Get-Sha256([string]$Path) {
@@ -241,6 +272,9 @@ try {
     }
 
     Resolve-Version
+    if (-not $FromSource -and -not $OfflineArchive -and -not $NoVerify) {
+        $SelectedMinisignPublicKey = Get-MinisignPublicKeyForVersion
+    }
     if (-not $Quiet) {
         Write-Host ''
         Write-Host 'FrankenSQLite installer' -ForegroundColor Green
@@ -281,7 +315,7 @@ try {
                 $minisign = Get-Command minisign -ErrorAction SilentlyContinue
                 if ($minisign) {
                     Invoke-Download "$base/SHA256SUMS.txt.minisig" $signature
-                    & $minisign.Source -Vm $manifest -x $signature -P $MinisignPublicKey | Out-Null
+                    & $minisign.Source -Vm $manifest -x $signature -P $selectedMinisignPublicKey | Out-Null
                     if ($LASTEXITCODE -ne 0) { Fail 'Release checksum signature verification failed' }
                     Write-Ok 'release manifest signature verified'
                 } else {
