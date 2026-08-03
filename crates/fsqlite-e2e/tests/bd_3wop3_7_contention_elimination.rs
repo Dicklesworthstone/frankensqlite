@@ -63,6 +63,28 @@ const HISTORICAL_PLACEHOLDER_8T_SPEEDUP: f64 = 1.5;
 /// Historical 16-thread placeholder gate from the pre-overlay contention file.
 const HISTORICAL_PLACEHOLDER_16T_SPEEDUP: f64 = 1.0;
 
+/// A same-table concurrent insert can legitimately observe an advertised
+/// concurrent-write contention result. Retry the idempotent `INSERT OR
+/// REPLACE` against a fresh snapshot, but keep a finite budget so a stuck
+/// writer remains a hard test failure.
+const SUSTAINED_INSERT_MAX_RETRIES: u32 = 128;
+const SUSTAINED_INSERT_RETRY_BASE_US: u64 = 25;
+const SUSTAINED_INSERT_RETRY_CAP_US: u64 = 2_000;
+const SUSTAINED_INSERT_RETRY_JITTER_US: u64 = 251;
+const SUSTAINED_INSERT_WORKERS: usize = 4;
+const SUSTAINED_INSERT_MIN_SUCCESSES_PER_WORKER: usize = 100;
+const SUSTAINED_INSERT_MAX_RETRIES_PER_SUCCESS: u64 = 4;
+const SUSTAINED_INSERT_P99_LIMIT_US: u64 = 10_000;
+const SUSTAINED_INSERT_MAX_LATENCY_LIMIT_US: u64 = 500_000;
+const SUSTAINED_INSERT_MIN_PROGRESS_RATIO_DENOMINATOR: usize = 4;
+
+#[derive(Clone, Debug, Default)]
+struct SustainedInsertWorkerMetrics {
+    latencies_us: Vec<u64>,
+    successful_ids: Vec<i64>,
+    retry_attempts: u64,
+}
+
 fn sqlite_i64(value: u64) -> i64 {
     i64::try_from(value).expect("test workload values fit SQLite INTEGER")
 }
@@ -75,6 +97,73 @@ fn is_expected_contention_error(error: &fsqlite::FrankenError) -> bool {
             | fsqlite::FrankenError::BusySnapshot { .. }
             | fsqlite::FrankenError::DatabaseLocked { .. }
     )
+}
+
+fn is_sustained_insert_retryable_contention(error: &fsqlite::FrankenError) -> bool {
+    matches!(
+        error,
+        fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::DatabaseLocked { .. }
+            | fsqlite::FrankenError::WriteConflict { .. }
+            | fsqlite::FrankenError::SerializationFailure { .. }
+    )
+}
+
+fn sustained_insert_retry_delay(attempt: u32, worker_id: u64) -> Duration {
+    let shift = attempt.min(7);
+    let base_us = (SUSTAINED_INSERT_RETRY_BASE_US << shift).min(SUSTAINED_INSERT_RETRY_CAP_US);
+    let jitter_us = worker_id
+        .wrapping_mul(37)
+        .wrapping_add(u64::from(attempt).wrapping_mul(17))
+        % SUSTAINED_INSERT_RETRY_JITTER_US;
+    Duration::from_micros(base_us.saturating_add(jitter_us))
+}
+
+#[test]
+fn sustained_insert_retry_delay_is_bounded_and_worker_staggered() {
+    assert_eq!(
+        sustained_insert_retry_delay(0, 0),
+        Duration::from_micros(SUSTAINED_INSERT_RETRY_BASE_US)
+    );
+    assert_ne!(
+        sustained_insert_retry_delay(3, 0),
+        sustained_insert_retry_delay(3, 1)
+    );
+    assert!(
+        sustained_insert_retry_delay(SUSTAINED_INSERT_MAX_RETRIES, 0)
+            >= Duration::from_micros(SUSTAINED_INSERT_RETRY_CAP_US)
+    );
+    for attempt in 0..=SUSTAINED_INSERT_MAX_RETRIES {
+        for worker_id in 0..SUSTAINED_INSERT_WORKERS {
+            assert!(
+                sustained_insert_retry_delay(
+                    attempt,
+                    u64::try_from(worker_id).expect("worker id fits u64"),
+                )
+                    <= Duration::from_micros(
+                        SUSTAINED_INSERT_RETRY_CAP_US + SUSTAINED_INSERT_RETRY_JITTER_US - 1,
+                    )
+            );
+        }
+    }
+
+    assert!(is_sustained_insert_retryable_contention(
+        &fsqlite::FrankenError::WriteConflict { page: 1, holder: 2 }
+    ));
+    assert!(!is_sustained_insert_retryable_contention(
+        &fsqlite::FrankenError::PageBufferCapacityExhausted {
+            operation: "sustained_insert_keeper",
+            page_size: 4_096,
+            max_buffers: 8,
+            total_buffers: 8,
+            available_buffers: 0,
+            cached_clean: 0,
+            cached_dirty: 8,
+            successful_evictions: 0,
+        }
+    ));
 }
 
 /// Run an ignored stress keeper in a child copy of this test binary so the
@@ -440,48 +529,89 @@ fn test_sustained_insert_p99_latency() {
         let path = Arc::new(path);
 
         let stop = Arc::new(AtomicBool::new(false));
-        let latencies = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let failures = Arc::new(AtomicU64::new(0));
+        let worker_metrics = Arc::new(std::sync::Mutex::new(vec![
+            SustainedInsertWorkerMetrics::default();
+            SUSTAINED_INSERT_WORKERS
+        ]));
+        let retry_exhaustions = Arc::new(AtomicU64::new(0));
+        let retry_exhaustion_errors = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let barrier = Arc::new(Barrier::new(5));
-        let handles: Vec<_> = (0..4)
+        let barrier = Arc::new(Barrier::new(SUSTAINED_INSERT_WORKERS + 1));
+        let handles: Vec<_> = (0..SUSTAINED_INSERT_WORKERS)
             .map(|tid| {
                 let p = Arc::clone(&path);
                 let s = Arc::clone(&stop);
-                let l = Arc::clone(&latencies);
-                let f = Arc::clone(&failures);
+                let m = Arc::clone(&worker_metrics);
+                let e = Arc::clone(&retry_exhaustions);
+                let ee = Arc::clone(&retry_exhaustion_errors);
                 let b = Arc::clone(&barrier);
 
                 thread::spawn(move || {
                     asupersync::test_utils::run_test(|| async {
                         let c = open_fsqlite_worker(p.as_str()).await;
                         b.wait();
-                        let mut local_latencies = Vec::with_capacity(10_000);
-                        let mut i = tid * 1_000_000;
+                        let mut local_metrics = SustainedInsertWorkerMetrics {
+                            latencies_us: Vec::with_capacity(10_000),
+                            successful_ids: Vec::with_capacity(10_000),
+                            retry_attempts: 0,
+                        };
+                        let worker_stride = i64::try_from(SUSTAINED_INSERT_WORKERS)
+                            .expect("worker count fits i64");
+                        let mut i = i64::try_from(tid).expect("worker id fits i64");
 
-                        while !s.load(Ordering::Relaxed) {
+                        while !s.load(Ordering::Acquire) {
                             let op_start = Instant::now();
-                            match c
-                                .execute_with_params(
-                                    "INSERT OR REPLACE INTO bench VALUES (?1, ?2)",
-                                    &[
-                                        fsqlite::SqliteValue::Integer(i),
-                                        fsqlite::SqliteValue::Text(format!("value_{i}").into()),
-                                    ],
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    local_latencies.push(op_start.elapsed().as_micros() as u64);
-                                }
-                                Err(_) => {
-                                    f.fetch_add(1, Ordering::Relaxed);
+                            let mut attempt = 0_u32;
+                            loop {
+                                match c
+                                    .execute_with_params(
+                                        "INSERT OR REPLACE INTO bench VALUES (?1, ?2)",
+                                        &[
+                                            fsqlite::SqliteValue::Integer(i),
+                                            fsqlite::SqliteValue::Text(format!("value_{i}").into()),
+                                        ],
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        local_metrics
+                                            .latencies_us
+                                            .push(op_start.elapsed().as_micros() as u64);
+                                        local_metrics.successful_ids.push(i);
+                                        break;
+                                    }
+                                    Err(error)
+                                        if is_sustained_insert_retryable_contention(&error)
+                                            && attempt < SUSTAINED_INSERT_MAX_RETRIES =>
+                                    {
+                                        local_metrics.retry_attempts = local_metrics
+                                            .retry_attempts
+                                            .checked_add(1)
+                                            .expect("sustained-insert retry count fits u64");
+                                        thread::sleep(sustained_insert_retry_delay(
+                                            attempt,
+                                            u64::try_from(tid).expect("worker id fits u64"),
+                                        ));
+                                        attempt += 1;
+                                    }
+                                    Err(error)
+                                        if is_sustained_insert_retryable_contention(&error) =>
+                                    {
+                                        e.fetch_add(1, Ordering::Relaxed);
+                                        ee.lock().unwrap().push(format!("{error:?}"));
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        panic!("unexpected sustained-insert failure: {error:?}");
+                                    }
                                 }
                             }
-                            i += 1;
+                            i = i
+                                .checked_add(worker_stride)
+                                .expect("sustained-insert row id fits i64");
                         }
 
-                        l.lock().unwrap().extend(local_latencies);
+                        m.lock().unwrap()[tid] = local_metrics;
                         c.close_without_checkpoint()
                             .await
                             .expect("close latency worker connection without checkpoint");
@@ -499,39 +629,131 @@ fn test_sustained_insert_p99_latency() {
             h.join().expect("join");
         }
 
-        let mut all_latencies = latencies.lock().unwrap().clone();
-        all_latencies.sort_unstable();
-
+        let exhausted = retry_exhaustions.load(Ordering::Relaxed);
         assert_eq!(
-            failures.load(Ordering::Relaxed),
+            exhausted,
             0,
-            "bd-3wop3.7: sustained-insert workload encountered failed writes"
+            "bd-3wop3.7: sustained-insert workload exhausted its bounded retry budget: {:?}",
+            retry_exhaustion_errors.lock().unwrap()
         );
+        let mut worker_metrics = worker_metrics.lock().unwrap().clone();
+        let mut worker_summaries = Vec::with_capacity(SUSTAINED_INSERT_WORKERS);
+        let mut successful_operations = 0_usize;
+        let mut retry_attempts = 0_u64;
+        let mut worst_worker_p99_us = 0_u64;
+        let mut maximum_latency_us = 0_u64;
+        let mut minimum_worker_operations = usize::MAX;
+        let mut maximum_worker_operations = 0_usize;
+        let mut expected_rows = Vec::new();
 
-        if all_latencies.is_empty() {
-            panic!("No operations completed");
+        for (worker_id, metrics) in worker_metrics.iter_mut().enumerate() {
+            assert_eq!(
+                metrics.successful_ids.len(),
+                metrics.latencies_us.len(),
+                "bd-3wop3.7: worker {worker_id} must retain one row id per successful timed write"
+            );
+            expected_rows.extend(
+                metrics
+                    .successful_ids
+                    .iter()
+                    .map(|&id| (id, format!("value_{id}"))),
+            );
+            let samples = &mut metrics.latencies_us;
+            samples.sort_unstable();
+            assert!(
+                samples.len() >= SUSTAINED_INSERT_MIN_SUCCESSES_PER_WORKER,
+                "bd-3wop3.7: worker {worker_id} completed only {} writes; minimum is {}",
+                samples.len(),
+                SUSTAINED_INSERT_MIN_SUCCESSES_PER_WORKER
+            );
+
+            let p99_idx = samples
+                .len()
+                .saturating_mul(99)
+                .div_ceil(100)
+                .saturating_sub(1);
+            let p99_us = samples.get(p99_idx).copied().unwrap_or(u64::MAX);
+            let worker_max_us = samples.last().copied().unwrap_or(u64::MAX);
+            assert!(
+                p99_us < SUSTAINED_INSERT_P99_LIMIT_US,
+                "bd-3wop3.7: worker {worker_id} sustained-insert p99 latency {:.2}ms exceeds {:.2}ms threshold",
+                p99_us as f64 / 1_000.0,
+                SUSTAINED_INSERT_P99_LIMIT_US as f64 / 1_000.0
+            );
+            assert!(
+                worker_max_us < SUSTAINED_INSERT_MAX_LATENCY_LIMIT_US,
+                "bd-3wop3.7: worker {worker_id} sustained-insert maximum latency {:.2}ms exceeds {:.2}ms threshold",
+                worker_max_us as f64 / 1_000.0,
+                SUSTAINED_INSERT_MAX_LATENCY_LIMIT_US as f64 / 1_000.0
+            );
+
+            let worker_retry_limit = u64::try_from(samples.len())
+                .expect("worker operation count fits u64")
+                .saturating_mul(SUSTAINED_INSERT_MAX_RETRIES_PER_SUCCESS);
+            assert!(
+                metrics.retry_attempts <= worker_retry_limit,
+                "bd-3wop3.7: worker {worker_id} used {} retry attempts, exceeding its {worker_retry_limit}-attempt limit for {} successful writes",
+                metrics.retry_attempts,
+                samples.len()
+            );
+
+            successful_operations = successful_operations.saturating_add(samples.len());
+            retry_attempts = retry_attempts.saturating_add(metrics.retry_attempts);
+            worst_worker_p99_us = worst_worker_p99_us.max(p99_us);
+            maximum_latency_us = maximum_latency_us.max(worker_max_us);
+            minimum_worker_operations = minimum_worker_operations.min(samples.len());
+            maximum_worker_operations = maximum_worker_operations.max(samples.len());
+            worker_summaries.push((
+                worker_id,
+                samples.len(),
+                metrics.retry_attempts,
+                p99_us,
+                worker_max_us,
+            ));
         }
 
-        let p99_idx = all_latencies
-            .len()
-            .saturating_mul(99)
-            .div_ceil(100)
-            .saturating_sub(1);
-        let p99_us = all_latencies.get(p99_idx).copied().unwrap_or(0);
-        let p99_ms = p99_us as f64 / 1000.0;
-
-        println!(
-            "[test_sustained_insert_p99_latency] {} ops, p99={:.2}ms, max={:.2}ms",
-            all_latencies.len(),
-            p99_ms,
-            all_latencies.last().copied().unwrap_or(0) as f64 / 1000.0
+        assert!(
+            minimum_worker_operations
+                .saturating_mul(SUSTAINED_INSERT_MIN_PROGRESS_RATIO_DENOMINATOR)
+                >= maximum_worker_operations,
+            "bd-3wop3.7: slowest worker completed {minimum_worker_operations} writes while fastest completed {maximum_worker_operations}; slowest must achieve at least 1/{SUSTAINED_INSERT_MIN_PROGRESS_RATIO_DENOMINATOR} of fastest"
         );
 
-        // Generous manual smoke threshold; this is not a release-performance
-        // claim and is intentionally excluded from the canonical matrix.
-        assert!(
-            p99_ms < 10.0,
-            "bd-3wop3.7: sustained-insert p99 latency {p99_ms:.2}ms exceeds 10ms threshold"
+        expected_rows.sort_unstable_by_key(|(id, _)| *id);
+        let verifier = open_fsqlite_worker(&path).await;
+        let actual_rows = verifier
+            .query("SELECT id, val FROM bench ORDER BY id")
+            .await
+            .expect("read sustained-insert rows")
+            .iter()
+            .map(|row| match row.values() {
+                [fsqlite::SqliteValue::Integer(id), fsqlite::SqliteValue::Text(value)] => {
+                    (*id, value.to_string())
+                }
+                values => panic!("unexpected sustained-insert row shape: {values:?}"),
+            })
+            .collect::<Vec<_>>();
+        verifier
+            .close()
+            .await
+            .expect("close sustained-insert verifier");
+        assert_eq!(
+            actual_rows.len(),
+            successful_operations,
+            "bd-3wop3.7: persisted row count must equal successful timed operations"
+        );
+        assert_eq!(
+            actual_rows, expected_rows,
+            "bd-3wop3.7: persisted rows must exactly match every successful timed write"
+        );
+
+        println!(
+            "[test_sustained_insert_p99_latency] {} ops, retries={}, retry_exhaustions={}, worst_worker_p99={:.2}ms, max={:.2}ms, workers={worker_summaries:?}",
+            successful_operations,
+            retry_attempts,
+            exhausted,
+            worst_worker_p99_us as f64 / 1_000.0,
+            maximum_latency_us as f64 / 1_000.0
         );
     });
 }
