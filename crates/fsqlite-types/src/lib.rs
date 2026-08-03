@@ -800,6 +800,19 @@ pub enum TextEncoding {
     Utf16be = 3,
 }
 
+impl TextEncoding {
+    /// Whether the v0.2 runtime can safely interpret and write this encoding.
+    ///
+    /// Header parsing remains format-complete for all three SQLite encoding
+    /// values so callers can distinguish valid-but-unsupported databases from
+    /// malformed headers. Runtime admission is deliberately narrower until the
+    /// value and collation layers preserve UTF-16 text bytes end to end.
+    #[must_use]
+    pub const fn is_runtime_supported(self) -> bool {
+        matches!(self, Self::Utf8)
+    }
+}
+
 /// Journal mode for the database connection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JournalMode {
@@ -2566,11 +2579,17 @@ mod tests {
     }
 
     #[test]
+    fn test_text_encoding_runtime_support() {
+        assert!(TextEncoding::Utf8.is_runtime_supported());
+        assert!(!TextEncoding::Utf16le.is_runtime_supported());
+        assert!(!TextEncoding::Utf16be.is_runtime_supported());
+    }
+
+    #[test]
     fn test_encoding_immutable_after_creation() {
-        // Encoding is set at creation and cannot be changed afterward.
-        // Changing the encoding field in an existing header and re-serializing
-        // produces a different byte at offset 56 -- the enforcement is at the
-        // application layer (PRAGMA encoding is rejected after first table).
+        // The generic header codec represents every valid SQLite encoding.
+        // Runtime admission is a separate policy enforced through
+        // TextEncoding::is_runtime_supported().
         let hdr1 = make_header_for_tests();
         assert_eq!(hdr1.text_encoding, TextEncoding::Utf8);
         let bytes1 = hdr1.to_bytes().expect("encode");

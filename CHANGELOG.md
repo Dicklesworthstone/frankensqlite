@@ -59,6 +59,15 @@ Next full-workspace lockstep release (`0.1.19 -> 0.2.0`).
   transaction.
   No rebuild is required solely for `unicode61`, `ascii`, or `trigram` indexes.
 
+### Known limitations
+
+- **Database text encoding is UTF-8-only in v0.2.0.** The database-header
+  codec recognizes all three valid SQLite encoding values, but the runtime
+  admits only encoding 1 (UTF-8). Databases declaring encoding 2 (UTF-16le) or
+  3 (UTF-16be) fail closed as unsupported instead of being decoded, modified,
+  checkpointed, or exported with lossy text. Convert them to UTF-8 with stock
+  SQLite before opening them in FrankenSQLite. BLOB bytes are unaffected.
+
 ### Added
 
 - **MySQL-style skip scan.** Composite indexes are now usable when the leading

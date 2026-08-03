@@ -474,11 +474,11 @@ notes = "Adaptive Replacement Cache with ghost entries"
 [[features]]
 id = "F-TXN.14"
 family = "TXN"
-title = "File format compatibility (100-byte header, B-tree pages)"
+title = "File format compatibility (UTF-8 database subset)"
 weight = 10
 status = "pass"
 observability = ["test_file_format", "e2e_compat_roundtrip"]
-notes = "SQLite 3.x format read/write in Compatibility mode"
+notes = "SQLite 3.x header and B-tree format read/write for encoding=1/UTF-8 databases; valid UTF-16 encodings are recognized and rejected in v0.2.0"
 
 [[features]]
 id = "F-TXN.15"
@@ -1039,11 +1039,11 @@ notes = "MVCC-specific configuration PRAGMAs"
 [[features]]
 id = "F-PGM.13"
 family = "PGM"
-title = "PRAGMA encoding (UTF-8, UTF-16le, UTF-16be)"
+title = "PRAGMA encoding (UTF-8 current; UTF-16 pending)"
 weight = 4
 status = "partial"
-observability = ["test_pragma_encoding"]
-notes = "Text encoding selection"
+observability = ["test_pragma_encoding", "test_text_encoding_runtime_support", "test_encoding_utf16le", "test_encoding_utf16be"]
+notes = "Encoding=1/UTF-8 is the supported v0.2.0 runtime surface; header values 2/3 are recognized as valid SQLite UTF-16 encodings and fail closed as unsupported"
 
 # ============================================================================
 # FAMILY: EXT — Extensions (weight pool: 80)

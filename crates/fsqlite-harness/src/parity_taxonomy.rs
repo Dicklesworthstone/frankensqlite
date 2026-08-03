@@ -1448,9 +1448,9 @@ fn build_pragma_features() -> Vec<Feature> {
     );
     b.add(
         "encoding",
-        "Read/set text encoding (UTF-8, UTF-16le, UTF-16be)",
+        "UTF-8 encoding is supported; UTF-16le/UTF-16be are recognized and rejected",
         1.5,
-        ParityStatus::Passing,
+        ParityStatus::Partial,
         &["pragma", "encoding"],
     );
     b.add(
@@ -2156,9 +2156,9 @@ fn build_type_system_features() -> Vec<Feature> {
     );
     b.add(
         "Text encoding",
-        "UTF-8, UTF-16le, UTF-16be with BOM handling",
+        "UTF-8 runtime support; UTF-16le/UTF-16be decoding and BOM handling pending",
         2.0,
-        ParityStatus::Passing,
+        ParityStatus::Partial,
         &["type", "encoding"],
     );
     b.add(

@@ -13667,8 +13667,11 @@ P2 targets.)
 
 ## 11. File Format Compatibility
 
-FrankenSQLite reads and writes standard SQLite database files. This section
-specifies every format detail needed for byte-level compatibility.
+The V1 target reads and writes standard SQLite database files. This section
+specifies every format detail needed for that byte-level compatibility. The
+v0.2.0 runtime implements the encoding=1/UTF-8 subset: it recognizes valid
+UTF-16le/UTF-16be headers and rejects them as unsupported rather than
+interpreting or rewriting their text.
 
 ### 11.1 Database Header (100 bytes at offset 0)
 
@@ -14075,15 +14078,21 @@ row into sqlite_master with the CREATE statement text.
 
 **Default:** UTF-8 (text encoding = 1 at header offset 56).
 
-**UTF-16 alternatives:** UTF-16le (2) and UTF-16be (3) are supported. The
-encoding is set at database creation and cannot be changed afterward. When
-UTF-16 is used, all text stored in the database is UTF-16 encoded, and text
-comparisons use UTF-16 collation.
+**v0.2.0 runtime boundary:** Only UTF-8 is currently supported for database
+TEXT. The header codec recognizes UTF-16le (2) and UTF-16be (3) as valid
+SQLite encodings, but runtime admission fails closed before schema/text
+interpretation or durable rewriting. BLOB byte sequences are unaffected.
 
-**How encoding affects comparison:** The BINARY collation uses `memcmp` on
-the raw bytes. For UTF-8, this produces correct Unicode code point ordering.
-For UTF-16, byte-order matters (LE vs BE). NOCASE collation always operates
-on Unicode code points regardless of encoding.
+**V1 UTF-16 target:** UTF-16le and UTF-16be support remains a future parity
+goal. The encoding is set at database creation and cannot be changed
+afterward. Once that target is implemented, all text stored in a UTF-16
+database will remain UTF-16 encoded and text comparisons will use the
+corresponding UTF-16 collation semantics.
+
+**How encoding affects comparison in the V1 target:** The BINARY collation
+uses `memcmp` on the raw bytes. For UTF-8, this produces correct Unicode code
+point ordering. For UTF-16, byte-order matters (LE vs BE). NOCASE collation
+operates on Unicode code points regardless of encoding.
 
 ### 11.13 Page Size Constraints
 
@@ -18103,12 +18112,15 @@ it is free of undefined behavior, data races, and use-after-free. The
 entire database engine -- including the B-tree, VDBE, MVCC system, and
 all extensions -- is memory-safe by construction.
 
-**5. Full Compatibility.** FrankenSQLite reads and writes standard SQLite
-database files. It targets **100% behavioral parity** against golden-file
-tests comparing output with C sqlite3 for the supported surface. Any
-intentional divergence MUST be explicitly documented and annotated in the
-harness with rationale. The SQL dialect, type affinity system, VDBE
-instruction set, file format, and WAL format all match SQLite 3.52.0. It aims
+**5. Full Compatibility (V1 Goal).** FrankenSQLite targets reading and writing
+standard SQLite database files. The v0.2.0 runtime supports encoding=1/UTF-8
+databases and deliberately rejects recognized UTF-16 encodings until the V1
+text-byte and collation work is complete. V1 targets **100% behavioral
+parity** against golden-file tests comparing output with C sqlite3 for the
+supported surface. Any intentional divergence MUST be explicitly documented
+and annotated in the harness with rationale. The SQL dialect, type affinity
+system, VDBE instruction set, file format, and WAL format target SQLite
+3.52.0. It aims
 to be a near-drop-in replacement for the sqlite3 CLI and library, targeting
 **100% parity** while deliberately omitting deprecated
 or security-sensitive features (loadable extensions, shared-cache mode, legacy

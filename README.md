@@ -27,7 +27,7 @@
 
 2. **RaptorQ Durability Research.** The workspace contains RaptorQ/ECS building blocks and partial native-mode integration. The live compatibility runtime does not yet justify a blanket self-healing or numeric durability claim; the native-mode sections below are design plus partial implementation and are gated on end-to-end recovery evidence.
 
-The current runnable engine is already real, but still hybrid. Compatibility mode over standard SQLite files is the live runtime path today; Native mode / ECS sections below describe the longer-term design plus partial implementation work. See "Current Implementation Status" before treating every section as present-day behavior.
+The current runnable engine is already real, but still hybrid. Compatibility mode over standard SQLite files is the live runtime path today, with one important v0.2.0 boundary: database text encoding must be encoding 1 (UTF-8). Valid SQLite UTF-16le/UTF-16be headers are recognized and rejected rather than decoded or rewritten unsafely. Native mode / ECS sections below describe the longer-term design plus partial implementation work. See "Current Implementation Status" before treating every section as present-day behavior.
 
 ### Install the CLI
 
@@ -63,7 +63,7 @@ closed rather than silently downgrading authenticity.
 | Concurrent readers | Many (WAL; 5 read-mark slots by default) | Many (Compat: same 5 read-mark slots; Native: bounded by txn-slot capacity, no WAL-index cap) |
 | Memory safety | Manual (C) | Core engine is safe Rust; `unsafe` is limited to `fsqlite-vfs` (mmap/shm) and the optional `fsqlite-c-api` shim (FFI) |
 | Data races | Possible (careful C) | Prevented inside the Rust engine by ownership and type-system checks |
-| File format | SQLite 3.x | Compatibility mode targets SQLite 3.x parity; Native/ECS work is separate |
+| File format | SQLite 3.x | SQLite 3.x layout for encoding=1/UTF-8 databases in v0.2.0; UTF-16 support remains a parity target |
 | Self-healing storage | No | Native/ECS design plus partial implementation; not a blanket compatibility-runtime guarantee |
 | Page-level encryption | No (commercial SEE extension) | XChaCha20-Poly1305 (DEK/KEK envelope, Argon2id KEK derivation) |
 | SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
@@ -93,7 +93,7 @@ Most of the workspace inherits `unsafe_code = "forbid"` from the root Cargo work
 
 ### 4. File Format Compatibility Is Non-Negotiable
 
-Compatibility with existing SQLite databases is a core goal of the current runtime. FrankenSQLite is built around standard `.db` plus rollback-journal/WAL files, and a major part of the harness exists to drive byte- and behavior-level parity against C SQLite. Full parity remains an active verification track rather than a claim that every edge is already finished.
+Compatibility with existing SQLite databases is a core goal of the current runtime. FrankenSQLite is built around standard `.db` plus rollback-journal/WAL files, and a major part of the harness exists to drive byte- and behavior-level parity against C SQLite. In v0.2.0, that runtime support is limited to databases whose header declares encoding 1 (UTF-8); encodings 2 and 3 are valid SQLite formats but are rejected as unsupported. Full parity, including UTF-16, remains an active verification track rather than a claim that every edge is already finished.
 
 ### 5. Serializable Snapshot Isolation (SSI) by Default
 
@@ -1214,6 +1214,10 @@ surface. Any intentional divergence MUST be explicitly documented and
 annotated in the harness with rationale. The conformance suite runs SQL Logic
 Tests (SLT format) covering:
 
+For v0.2.0, the supported file-format surface is encoding=1/UTF-8. UTF-16le
+and UTF-16be databases are recognized from their headers and fail closed; they
+are not included in the current parity claim.
+
 The canonical target/version contract is pinned in
 `docs/contracts/sqlite_version_contract.toml` and referenced by parity harness reports.
 The human-readable scope lock for that contract lives in
@@ -1256,7 +1260,7 @@ async-actor, namespace-lifecycle, and registry changes settle.
 
 ---
 
-## File Format (Binary Compatible with SQLite)
+## File Format (SQLite-Compatible Layout; UTF-8 Runtime in v0.2.0)
 
 ### Database Header (100 bytes at offset 0)
 
@@ -1287,6 +1291,11 @@ Offset  Size  Field
  92       4   Version-valid-for number
  96       4   SQLite version that wrote the file
 ```
+
+The table records SQLite's valid on-disk values. The v0.2.0 runtime supports
+only text encoding 1 (UTF-8). It recognizes header values 2 and 3 as valid
+UTF-16le/UTF-16be SQLite databases and rejects them as unsupported before
+interpreting or writing their text.
 
 ### B-tree Page Layout
 
@@ -1376,7 +1385,7 @@ The current user-facing runtime is the compatibility/pager-backed path over stan
 
 ### Compatibility Runtime (Current)
 
-The database file is a standard SQLite `.db` file. WAL frames use standard SQLite WAL format. An existing C SQLite database opens without conversion, and a FrankenSQLite database opens in C SQLite without conversion. Optional sidecars (`.wal-fec`, `.idx-fec`) store RaptorQ repair symbols alongside the standard files but the core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite.
+The database file uses the standard SQLite `.db` layout, and WAL frames use the standard SQLite WAL format. In v0.2.0, an existing C SQLite database opens without conversion only when its header declares encoding 1 (UTF-8). Valid encoding 2/3 (UTF-16le/UTF-16be) databases are recognized and rejected as unsupported. A UTF-8 FrankenSQLite database remains readable by C SQLite without conversion. Optional sidecars (`.wal-fec`, `.idx-fec`) store RaptorQ repair symbols alongside the standard files but the core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite within that supported surface.
 
 ### Native Mode (Design / Partial Implementation)
 
@@ -2550,7 +2559,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | Concurrent writers | No (1 writer) | Yes (page-level MVCC) | Partial (WAL extensions) | Yes (different architecture) | No (1 writer) |
 | Isolation level | Serializable (by serializing) | SSI (true serializable concurrency) | Snapshot | Snapshot | Snapshot |
 | Memory safety | Manual | Compile-time guaranteed | Manual (C) | Manual (C++) | Compile-time guaranteed |
-| File format | SQLite 3.x | SQLite 3.x (Compat) or ECS (Native) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
+| File format | SQLite 3.x | SQLite 3.x encoding=1/UTF-8 subset in v0.2.0 (Compat), or ECS (Native target) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
 | Page encryption | Commercial (SEE) | XChaCha20-Poly1305 built-in | No | No | No |
 | Self-healing storage | No | RaptorQ repair symbols | No | No | No |
 | Cross-process MVCC | No | Shared-memory coordination | No | Yes | No |
@@ -2559,7 +2568,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | WASM target | Via Emscripten | Planned (VFS abstraction) | Yes | Yes | Yes |
 | Async I/O | No | Yes (asupersync + Cx) | Yes | No | Yes (io_uring) |
 
-FrankenSQLite is the only option that combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
+FrankenSQLite's target combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. The v0.2.0 compatibility runtime covers SQLite encoding=1/UTF-8 databases; broader encoding parity and parts of the durability design remain active work. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
 
 ---
 
@@ -2651,6 +2660,12 @@ still serves as an authoritative reference.
 
 ## Limitations
 
+- **Database text encoding is UTF-8-only in v0.2.0.** FrankenSQLite supports
+  SQLite header encoding 1. It recognizes encodings 2 (UTF-16le) and 3
+  (UTF-16be) as valid SQLite formats but rejects them before schema/text
+  interpretation or durable rewriting. Convert such a database to UTF-8 with
+  stock SQLite before opening it in FrankenSQLite. This restriction concerns
+  SQLite TEXT encoding; arbitrary bytes stored as BLOB values are unaffected.
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
@@ -2691,7 +2706,7 @@ SQLite has accumulated 24 years of behavioral nuances that applications depend o
 ## FAQ
 
 **Q: Can I open an existing SQLite database with FrankenSQLite?**
-A: Yes. FrankenSQLite reads and writes the standard SQLite file format byte-for-byte. A database created by C SQLite opens in FrankenSQLite and vice versa.
+A: Yes, when the database header declares encoding 1 (UTF-8). FrankenSQLite v0.2.0 recognizes valid UTF-16le/UTF-16be SQLite databases but rejects them as unsupported; convert them to UTF-8 with stock SQLite first. UTF-8 databases use the standard SQLite file and WAL layouts, and a database written by FrankenSQLite opens in C SQLite.
 
 **Q: How does MVCC interact with WAL mode?**
 A: In the current compatibility runtime, WAL is the durability mechanism while MVCC conflict tracking lives above the pager in shared session state (`ConcurrentRegistry`, commit index, page locks, version store). The more ambitious WAL/native-mode extensions described elsewhere in this README are design/partial-implementation work rather than the entire hot path today.
@@ -2725,7 +2740,7 @@ A: Serializable Snapshot Isolation detects write skew -- a class of anomaly wher
 A: Three things. (1) Self-healing after torn writes: WAL frames carry repair symbols, so partial writes during a crash are recoverable without double-write journaling. (2) Bandwidth-optimal replication: fountain coding means a receiver can reconstruct data from any sufficient subset of encoding symbols, regardless of which symbols arrive. (3) Version chain compression: older page versions are stored as RaptorQ-encoded deltas rather than full copies.
 
 **Q: What is the difference between Compatibility and Native mode?**
-A: Today, the stable user-facing runtime is the compatibility/pager-backed path over standard SQLite files. Native mode refers to the ECS/content-addressed durability design and partial implementation work present in the repo. It is not yet a mature public `PRAGMA fsqlite.mode` toggle on `Connection`.
+A: Today, the stable user-facing runtime is the compatibility/pager-backed path over standard SQLite files whose header declares encoding=1/UTF-8. Native mode refers to the ECS/content-addressed durability design and partial implementation work present in the repo. It is not yet a mature public `PRAGMA fsqlite.mode` toggle on `Connection`.
 
 **Q: How does encryption work?**
 A: `PRAGMA key = 'passphrase'` derives a KEK via Argon2id and unwraps a per-database random DEK. Pages are encrypted with XChaCha20-Poly1305 using a fresh random 24-byte nonce per page write; the nonce and 16-byte tag are stored in each page's reserved bytes. `PRAGMA rekey = 'new_passphrase'` re-wraps the DEK in O(1). In Native mode, encryption happens before RaptorQ encoding (encrypt-then-code).
