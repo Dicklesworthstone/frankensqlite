@@ -1746,12 +1746,7 @@ mod tests {
         const READ_SIZE: usize = 4096;
 
         let _guard = io_uring_test_guard();
-        if std::env::var_os("FSQLITE_ASYNC_VFS_TRACE").is_some() {
-            let _ = tracing_subscriber::fmt()
-                .json()
-                .with_max_level(tracing::Level::TRACE)
-                .try_init();
-        }
+        init_async_vfs_test_tracing();
         test_runtime().block_on(async {
             let native_cx = NativeCx::current().expect("runtime block_on should install Cx");
             let cx = Cx::new();
@@ -1822,6 +1817,52 @@ mod tests {
                 "all one hundred reads must reach one submission queue batch"
             );
         });
+    }
+
+    /// Retains the legacy trace opt-in call site without mutating the test
+    /// process's global tracing dispatcher.
+    ///
+    /// A `tracing_subscriber::fmt().try_init()` here would make the first
+    /// test that sets `FSQLITE_ASYNC_VFS_TRACE` select the subscriber for every
+    /// later test in this binary. This workload does not assert trace events,
+    /// so it must not install a subscriber at all.
+    fn init_async_vfs_test_tracing() {
+        let _ = std::env::var_os("FSQLITE_ASYNC_VFS_TRACE");
+    }
+
+    #[test]
+    fn async_vfs_trace_opt_in_does_not_install_a_process_global_subscriber() {
+        const PROBE_ENV: &str = "FSQLITE_ASYNC_VFS_TRACE_GLOBAL_SUBSCRIBER_PROBE";
+        const TEST_FILTER: &str =
+            "async_vfs_trace_opt_in_does_not_install_a_process_global_subscriber";
+
+        if std::env::var_os(PROBE_ENV).is_some() {
+            assert!(
+                !tracing::dispatcher::has_been_set(),
+                "the fresh keeper process must start without a tracing subscriber"
+            );
+            init_async_vfs_test_tracing();
+            assert!(
+                !tracing::dispatcher::has_been_set(),
+                "the async-VFS trace opt-in must not leak a subscriber to a later test"
+            );
+            return;
+        }
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the libtest binary path must be available"),
+        )
+        .arg(TEST_FILTER)
+        .arg("--test-threads=1")
+        .env("FSQLITE_ASYNC_VFS_TRACE", "1")
+        .env(PROBE_ENV, "1")
+        .status()
+        .expect("the fresh keeper process must start");
+
+        assert!(
+            status.success(),
+            "the fresh keeper process must confirm the trace opt-in leaves no global subscriber"
+        );
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
