@@ -662,7 +662,7 @@
       "kind": "stress",
       "policy": "run_for_release",
       "evidence": {
-        "requirement": "Exact opt-in test exits 0 before its hard deadline with zero unexpected failures and the declared successful-operation p99 bound; immutable receipt records workload and release provenance.",
+        "requirement": "Exact opt-in test exits 0 before its hard deadline with every worker completing at least the declared minimum operation count and relative progress floor, zero unexpected failures or bounded-retry exhaustion, each worker's retry attempts within the declared per-success cap, the persisted ordered id/value rows exactly equal to all successful timed operations, and every worker's end-to-end p99 and maximum latency below their declared bounds including retry time; immutable receipt records workload, per-worker operation counts, retry counts and latency summaries, and release provenance.",
         "receipt": null
       }
     },
@@ -675,6 +675,18 @@
       "policy": "run_for_release",
       "evidence": {
         "requirement": "Exact release-perf run exits 0 and a content-addressed artifact records release commit, toolchain, host, RUSTFLAGS, workload parameters, repetitions, and measured throughput.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/bd_db300_3_8_10_commit_path_proof_pack.rs",
+      "test_name": "p4_non_regression_throughput",
+      "reason": "production performance gate; replay with --profile release-perf",
+      "cfg_condition": "debug_assertions",
+      "kind": "performance",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact release-perf run exits 0 after 11 order-alternated paired samples and reports a median FrankenSQLite-to-C-SQLite elapsed-time ratio below 5.0; retain a content-addressed receipt with release commit, toolchain, host, RUSTFLAGS, workload, and every sample.",
         "receipt": null
       }
     },
@@ -723,6 +735,18 @@
       "policy": "run_for_release",
       "evidence": {
         "requirement": "Exact release-perf run exits 0 and a content-addressed artifact records release commit, toolchain, host, RUSTFLAGS, workload parameters, repetitions, and measured throughput.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/bd_wsw3p_concurrent_write_showcase.rs",
+      "test_name": "t4_fsqlite_outperforms_csqlite_at_4_threads",
+      "reason": "production performance gate; replay with cargo test --profile release-perf -p fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --nocapture --test-threads=1",
+      "cfg_condition": "debug_assertions",
+      "kind": "performance",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact release-perf run exits 0 after 11 order-alternated paired four-writer samples and reports a median paired FrankenSQLite-to-C-SQLite throughput ratio above 1.0; retain every sample and full release commit, toolchain, host, and RUSTFLAGS provenance.",
         "receipt": null
       }
     },
@@ -1231,6 +1255,18 @@
       }
     },
     {
+      "source_path": "crates/fsqlite-mvcc/src/core_types.rs",
+      "test_name": "tests::test_txn_slot_alloc_release_latency_budget",
+      "reason": "production latency gate; replay with --profile release-perf",
+      "cfg_condition": "all(debug_assertions,test)",
+      "kind": "performance",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact release-perf run exits 0 with the median transaction-slot allocation-and-release latency below its declared nanosecond budget; retain all samples and full release commit, toolchain, host, and RUSTFLAGS provenance.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite-mvcc/src/invariants.rs",
       "test_name": "tests::bench_publish_cas_metrics_gate",
       "reason": "microbench — run manually",
@@ -1351,6 +1387,18 @@
       }
     },
     {
+      "source_path": "crates/fsqlite-pager/src/page_cache.rs",
+      "test_name": "tests::test_sharded_cache_throughput_vs_single",
+      "reason": "production performance gate; replay with --profile release-perf",
+      "cfg_condition": "all(debug_assertions,test)",
+      "kind": "performance",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact release-perf run exits 0 after 11 order-alternated paired samples and reports median sharded-cache overhead below the declared 3.0x ceiling; retain every sample and full release commit, toolchain, host, and RUSTFLAGS provenance.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite-pager/src/pager.rs",
       "test_name": "tests::bench_bd_db300_2_3_2_publication_counter_striping",
       "reason": "manual perf evidence for bd-db300.2.3.2",
@@ -1377,12 +1425,12 @@
     {
       "source_path": "crates/fsqlite-pager/src/pager.rs",
       "test_name": "tests::test_16t_throughput_exceeds_sqlite",
-      "reason": "requires real benchmark harness with rusqlite reference; run via e2e bench suite",
+      "reason": "release blocker: current-source 16-thread cross-engine evidence must come from the e2e benchmark gate",
       "cfg_condition": "test",
       "kind": "placeholder",
       "policy": "block_release",
       "evidence": {
-        "requirement": "Replace the logging-only stub with, or link it to, a reproducible 16-thread file-backed FrankenSQLite-versus-C-SQLite release-perf benchmark using multiple repetitions and a declared variance and acceptance gate; retain an immutable artifact.",
+        "requirement": "This exact sentinel must fail closed until a reproducible 16-thread file-backed FrankenSQLite-versus-C-SQLite e2e benchmark supplies current-source and running-binary identity, correctness oracles, counterbalanced repetitions, a declared confidence-bound acceptance gate, and an independently verified immutable artifact.",
         "receipt": null
       }
     },
@@ -1695,6 +1743,18 @@
       "policy": "exempt",
       "evidence": {
         "requirement": "Run this exact ignored benchmark under --profile release-perf --nocapture and retain output with commit, toolchain, host, and RUSTFLAGS before citing a numeric result.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite/tests/\u0074rigger_depth_worker_probe.rs",
+      "test_name": "diag_worker_\u0074rigger_depth_survival",
+      "reason": "diagnostic measurement, not a regression assertion",
+      "cfg_condition": "all(feature=\"async-api\",not(target_arch=\"wasm32\"))",
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run this exact ignored probe only for bounded diagnostic investigation; do not treat it as release evidence unless its observation is converted into a deterministic asserted keeper.",
         "receipt": null
       }
     },

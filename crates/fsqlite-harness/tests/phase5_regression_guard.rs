@@ -1697,6 +1697,15 @@ fn expected_current_run_argv(entry: &IgnoredTestBaseline) -> Result<Vec<String>,
         )
     })?;
     let target = expected_current_run_target(entry)?;
+    let needs_ignored_filter = match entry.cfg_condition.as_deref() {
+        None | Some("test") => true,
+        Some("debug_assertions" | "all(debug_assertions,test)") => false,
+        Some(condition) => {
+            return Err(format!(
+                "run_for_release ignore condition `{condition}` requires a typed compilation contract"
+            ));
+        }
+    };
     let mut argv = vec![
         "cargo".to_owned(),
         "test".to_owned(),
@@ -1717,9 +1726,12 @@ fn expected_current_run_argv(entry: &IgnoredTestBaseline) -> Result<Vec<String>,
         entry.test_name.clone(),
         "--".to_owned(),
         "--exact".to_owned(),
-        "--ignored".to_owned(),
-        "--test-threads=1".to_owned(),
     ]);
+    if needs_ignored_filter {
+        argv.push("--ignored".to_owned());
+    }
+    argv.push("--nocapture".to_owned());
+    argv.push("--test-threads=1".to_owned());
     Ok(argv)
 }
 
@@ -1922,15 +1934,6 @@ fn validate_release_evidence_manifest(
             return Err(format!(
                 "current-run receipt `{locator}` targets policy `{}` instead of run_for_release",
                 entry.policy.as_str()
-            ));
-        }
-        if entry
-            .cfg_condition
-            .as_deref()
-            .is_some_and(|condition| condition != "test")
-        {
-            return Err(format!(
-                "current-run receipt `{locator}` has a cfg-dependent ignore that requires a typed compilation contract"
             ));
         }
         let expected_requirement = blake3::hash(entry.evidence.requirement.as_bytes())
@@ -3886,6 +3889,76 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; fini
 }
 
 #[test]
+fn test_regression_guard_release_perf_command_matches_conditional_ignore() {
+    let mut entry = sample_ignored_baseline(
+        "crates/fsqlite-e2e/tests/manual_release.rs",
+        "manual_release_case",
+    );
+    entry.kind = IgnoreKind::Performance;
+    entry.policy = IgnorePolicy::RunForRelease;
+
+    let unconditional = expected_current_run_argv(&entry)
+        .expect("an unconditional ignore has a canonical release command");
+    assert_eq!(
+        unconditional,
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "--profile",
+            "release-perf",
+            "--package",
+            "fsqlite-e2e",
+            "--test",
+            "manual_release",
+            "manual_release_case",
+            "--",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+    );
+
+    entry.cfg_condition = Some("debug_assertions".to_owned());
+    let debug_only = expected_current_run_argv(&entry)
+        .expect("release-perf disables a debug-assertions-only ignore");
+    assert_eq!(
+        debug_only,
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "--profile",
+            "release-perf",
+            "--package",
+            "fsqlite-e2e",
+            "--test",
+            "manual_release",
+            "manual_release_case",
+            "--",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+    );
+
+    entry.cfg_condition = Some("all(debug_assertions,test)".to_owned());
+    assert_eq!(
+        expected_current_run_argv(&entry)
+            .expect("test-module debug-only ignores use the same release contract"),
+        debug_only
+    );
+
+    entry.cfg_condition = Some("unix".to_owned());
+    assert!(
+        expected_current_run_argv(&entry)
+            .expect_err("unmodeled conditional ignores must fail closed")
+            .contains("typed compilation contract")
+    );
+}
+
+#[test]
 fn test_regression_guard_release_manifest_requires_complete_typed_receipts() {
     let (baseline, manifest) = sample_release_evidence();
     let validated = validate_release_evidence_manifest(&manifest, &baseline)
@@ -3933,7 +4006,7 @@ fn test_regression_guard_release_manifest_requires_complete_typed_receipts() {
     assert!(
         validate_release_evidence_manifest(&manifest, &conditional_baseline)
             .expect_err("cfg-dependent evidence without a typed build contract must fail")
-            .contains("cfg-dependent ignore")
+            .contains("typed compilation contract")
     );
 
     let mut wrong_guard_kind = baseline.clone();
