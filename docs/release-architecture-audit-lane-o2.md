@@ -113,9 +113,10 @@ bare `SHA256SUMS` plus per-asset one-liners. The fallback releaser also signs
 only files matching the tool-name prefix, so a checksum manifest is never
 signed automatically under either name.
 
-Publish exactly one manifest. Shipping a bare `SHA256SUMS` alongside the signed
-`SHA256SUMS.txt` publishes a second, unsigned manifest that no installer reads
-and no signature covers; a release must carry the signed manifest only.
+Every published manifest must be signed. Publishing a bare `SHA256SUMS`
+alongside `SHA256SUMS.txt` is acceptable and matches prior practice, but only
+when each carries its own signature; an unsigned second manifest that no
+installer reads and no signature covers is the failure to avoid.
 
 Treat the manifest and its signature as an explicit release stage that must be
 produced and verified before upload, not as a by-product of building.
@@ -137,10 +138,24 @@ and are load-bearing:
   contain nothing beyond intended assets. Scratch files, superseded manifests,
   and editor backups matching those patterns are published silently.
 
-For the supported matrix the intended set is thirteen files: five archives, the
-build manifest, the signed checksum manifest and its signature, and one SBOM
-per archive. Any other count means the directory is wrong, not that the
-selection rule is.
+The staged file count and the published asset count are different numbers by
+design, and conflating them will make a correct directory look wrong. The
+releaser uploads a single local file under several asset names — the original,
+a versioned name, a compatibility name, and architecture aliases that spell
+`amd64` as `x86_64` and `arm64` as `aarch64` — and it also emits a per-asset
+`.sha256` one-liner for every name it publishes.
+
+For the supported matrix that means roughly two dozen staged files expanding to
+roughly forty published assets: five archives become ten published names, each
+with its own `.sha256`, alongside the per-archive signatures and provenance,
+both checksum manifests, the build manifest, the dependency inventory, and a
+signature for each of those. Verify the staged directory against the intended
+staging list and the published release against the expected asset list; a
+mismatch between the two counts is expected, not a defect.
+
+Per-archive signatures and provenance cover the primary names only. Alias names
+are byte-identical to their primaries and are already bound by the signed
+checksum manifests, so signing them again adds no coverage.
 
 Enabling the strict release contract replaces directory scanning with a closed,
 pre-enumerated asset plan and an exact-count gate that aborts the upload on any
@@ -150,6 +165,33 @@ itself; nothing is discovered from disk.
 SBOM generation is a standalone step, not part of build or release. Generated
 documents are named from a truncated archive basename and carry no license
 field, so a release that requires license provenance must record it separately.
+
+### Unresolved decisions for the next release
+
+The prior release line published per-archive provenance, per-archive
+signatures, and a single dependency inventory in SPDX form. Reproducing that
+surface is not automatic, and each of the following is an open decision rather
+than a settled contract:
+
+- **Provenance generation is not wired.** Attestation is a standalone command,
+  not a build or release stage, and no observed artifact directory has
+  contained one. Whether the next release reproduces per-archive provenance,
+  and by what step, is undecided.
+- **SPDX output is unverified.** The prior release published an SPDX
+  inventory, and the release notes for that line promise SPDX specifically.
+  Only the CycloneDX path has been exercised; the SPDX path and its naming
+  have not.
+- **Non-archive files are not signed automatically.** Automatic signing
+  matches files by tool-name prefix, so checksum manifests, the build
+  manifest, the dependency inventory, and provenance files fall outside it.
+  Every one of those was signed in the prior release, so each needs an
+  explicit signing step or it ships unsigned.
+- **Asset name prefix is inconsistent in the prior release.** Archives used
+  one prefix while the build manifest and dependency inventory used the longer
+  project name. Current tooling would emit the short prefix for all of them,
+  which silently breaks any consumer matching the older names. Choose the
+  prefix deliberately and state it, rather than inheriting whichever the
+  tooling happens to produce.
 
 ## Current release gate
 
