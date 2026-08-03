@@ -1697,16 +1697,9 @@ fn best_access_path_internal(
     let started = tracing::enabled!(tracing::Level::INFO).then(Instant::now);
     let locally_evaluable_terms;
     let access_terms = if unqualified_terms_are_table_local
-        && where_terms
-            .iter()
-            .any(|term| {
-                !table_local_access_path_probe_is_evaluable(
-                    term,
-                    &table.name,
-                    rowid_alias_hints,
-                )
-            })
-    {
+        && where_terms.iter().any(|term| {
+            !table_local_access_path_probe_is_evaluable(term, &table.name, rowid_alias_hints)
+        }) {
         // A table-local comparison such as `a = b` is a valid residual
         // predicate, but `b` cannot be evaluated until after reading the same
         // row. It must not become an index/rowid seek target. Keep it in
@@ -1716,11 +1709,7 @@ fn best_access_path_internal(
         locally_evaluable_terms = where_terms
             .iter()
             .filter(|term| {
-                table_local_access_path_probe_is_evaluable(
-                    term,
-                    &table.name,
-                    rowid_alias_hints,
-                )
+                table_local_access_path_probe_is_evaluable(term, &table.name, rowid_alias_hints)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -4554,8 +4543,7 @@ fn join_access_path(
     let explicit_hint = lookup_table_index_hint(&table.name, context.table_index_hints);
     let forced_index = match explicit_hint {
         Some(IndexHint::IndexedBy(index_name)) => indexes.iter().find(|index| {
-            identifier_eq(&index.table, &table.name)
-                && identifier_eq(&index.name, index_name)
+            identifier_eq(&index.table, &table.name) && identifier_eq(&index.name, index_name)
         }),
         Some(IndexHint::NotIndexed) | None => None,
     };
@@ -4579,14 +4567,15 @@ fn join_access_path(
         bound_terms = where_terms
             .iter()
             .filter_map(|term| {
-                bind_where_term_to_table(term, &table.name, context.available_outer_tables)
-                    .or_else(|| {
+                bind_where_term_to_table(term, &table.name, context.available_outer_tables).or_else(
+                    || {
                         forced_index
                             .filter(|index| {
                                 bare_term_is_forced_index_probe(term, &table.name, index)
                             })
                             .map(|_| term.clone())
-                    })
+                    },
+                )
             })
             .collect::<Vec<_>>();
         &bound_terms
@@ -4944,13 +4933,15 @@ fn table_local_access_path_probe_is_evaluable(
     }
 
     let has_no_columns = |expr: &Expr| expr_columns_satisfy(expr, &|_| false);
-    matches!(term.kind, WhereTermKind::Equality | WhereTermKind::RowidEquality)
-        && term.column.as_ref().is_some_and(|column| {
-            rowid_alias_hints
-                .iter()
-                .any(|hint| hint.matches_column(table_name, column))
-                && comparison_operand_for_where_column(term.expr, column).is_some_and(&has_no_columns)
-        })
+    matches!(
+        term.kind,
+        WhereTermKind::Equality | WhereTermKind::RowidEquality
+    ) && term.column.as_ref().is_some_and(|column| {
+        rowid_alias_hints
+            .iter()
+            .any(|hint| hint.matches_column(table_name, column))
+            && comparison_operand_for_where_column(term.expr, column).is_some_and(&has_no_columns)
+    })
 }
 
 fn expr_is_table_local_index_key(expr: &Expr, table_name: &str) -> bool {
@@ -10794,17 +10785,13 @@ mod tests {
         let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::qualified("b", "id"), Span::ZERO)),
             op: AstBinaryOp::Eq,
-            right: Box::new(Expr::Column(
-                ColumnRef::qualified("b", "other"),
-                Span::ZERO,
-            )),
+            right: Box::new(Expr::Column(ColumnRef::qualified("b", "other"), Span::ZERO)),
             span: Span::ZERO,
         }));
         let terms = [classify_where_term(expr)];
         let qualified = [RowidAliasHint::qualified("b", "id")];
 
-        let path =
-            best_access_path_with_rowid_alias_hints(&table, &[], &terms, None, &qualified);
+        let path = best_access_path_with_rowid_alias_hints(&table, &[], &terms, None, &qualified);
 
         assert!(matches!(path.kind, AccessPathKind::FullTableScan));
         assert!(path.index.is_none());
