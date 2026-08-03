@@ -13,8 +13,8 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use fsqlite_types::{CommitSeq, ObjectId, PageNumber, TxnToken, WitnessKey};
 use tracing::{debug, info, warn};
@@ -68,20 +68,22 @@ static FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_EVIDENCE_RECORDS_TOTAL_BUDGET_COMPACT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_SSI_EVIDENCE_MODE: AtomicU8 =
-    AtomicU8::new(SsiEvidenceRecordingMode::CompactCommit as u8);
+    AtomicU8::new(SsiEvidenceRecordingMode::AbortOnly as u8);
 static FSQLITE_SSI_EVIDENCE_MAX_PENDING_FULL_COMMIT_RECORDS: AtomicUsize = AtomicUsize::new(32);
 static FSQLITE_SSI_EVIDENCE_MAX_FULL_COMMIT_BYTES: AtomicU64 = AtomicU64::new(4 * 1024);
 
 /// Commit-time evidence detail level.
 ///
-/// `CompactCommit` keeps abort evidence rich while making the successful
-/// commit path cheap by default.
+/// `AbortOnly` keeps abort evidence rich without adding a process-global
+/// ledger mutex acquisition to every successful commit. Operators that need
+/// successful decision cards can explicitly select one of the commit modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SsiEvidenceRecordingMode {
     Full = 0,
     CompactCommit = 1,
     BudgetedCommit = 2,
+    AbortOnly = 3,
 }
 
 impl SsiEvidenceRecordingMode {
@@ -90,6 +92,7 @@ impl SsiEvidenceRecordingMode {
         match raw {
             1 => Self::CompactCommit,
             2 => Self::BudgetedCommit,
+            3 => Self::AbortOnly,
             _ => Self::Full,
         }
     }
@@ -119,6 +122,9 @@ std::thread_local! {
         SsiEvidenceRecordingMode,
         SsiEvidenceBudgetConfig,
     )>> = const { Cell::new(None) };
+    // This production-path witness is thread-local so parallel tests can prove
+    // their own commit did not enqueue a global ledger draft.
+    static SSI_EVIDENCE_TEST_LEDGER_ENQUEUE_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Snapshot of SSI evidence-record counters.
@@ -1383,6 +1389,10 @@ fn commit_evidence_detail_level(
     match ssi_evidence_recording_mode() {
         SsiEvidenceRecordingMode::Full => (false, "full"),
         SsiEvidenceRecordingMode::CompactCommit => (true, "compact_commit"),
+        // `record_evidence_decision` returns before this helper for default
+        // successful commits. Keep this branch explicit so a future caller
+        // cannot accidentally turn AbortOnly into full evidence collection.
+        SsiEvidenceRecordingMode::AbortOnly => (true, "abort_only"),
         SsiEvidenceRecordingMode::BudgetedCommit => {
             let budget = ssi_evidence_budget_config();
             let pending_records = ssi_evidence_ledger().pending_count();
@@ -1412,6 +1422,20 @@ fn record_evidence_decision(
     edges: &[DiscoveredEdge],
     rationale: &str,
 ) {
+    if matches!(decision_type, SsiDecisionType::CommitAllowed)
+        && matches!(
+            ssi_evidence_recording_mode(),
+            SsiEvidenceRecordingMode::AbortOnly
+        )
+    {
+        FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.fetch_add(1, Ordering::Relaxed);
+        // DRO remains fed from every successful SSI decision even when the
+        // optional decision-evidence ledger records aborts only.
+        #[allow(clippy::cast_possible_truncation)]
+        record_dro_commit(edges.len() as u64);
+        return;
+    }
+
     let (compact_commit_evidence, detail_level) =
         if matches!(decision_type, SsiDecisionType::CommitAllowed) {
             commit_evidence_detail_level(read_keys, write_keys, edges, rationale)
@@ -1514,6 +1538,10 @@ fn record_evidence_decision(
     if let Some(seq) = commit_seq {
         draft = draft.with_commit_seq(seq);
     }
+    #[cfg(test)]
+    SSI_EVIDENCE_TEST_LEDGER_ENQUEUE_COUNT.with(|count| {
+        count.set(count.get().saturating_add(1));
+    });
     ssi_evidence_ledger().record_async(draft);
 
     if matches!(decision_type, SsiDecisionType::CommitAllowed) {
@@ -1562,6 +1590,14 @@ mod tests {
         let result = f();
         drop(restore);
         result
+    }
+
+    fn reset_ssi_evidence_test_ledger_enqueue_count() {
+        SSI_EVIDENCE_TEST_LEDGER_ENQUEUE_COUNT.with(|count| count.set(0));
+    }
+
+    fn ssi_evidence_test_ledger_enqueue_count() -> u64 {
+        SSI_EVIDENCE_TEST_LEDGER_ENQUEUE_COUNT.with(Cell::get)
     }
 
     // -- Test ActiveTxnView implementation --
@@ -3111,54 +3147,143 @@ mod tests {
 
     #[test]
     fn test_evidence_store_queryable_by_txn_id() {
-        let txn = TxnToken::new(TxnId::new(90_101).unwrap(), TxnEpoch::new(0));
-        let result = ssi_validate_and_publish(
-            txn,
-            CommitSeq::new(1),
-            CommitSeq::new(5),
-            &[page_key(10)],
-            &[page_key(20)],
+        with_ssi_evidence_test_config(
+            SsiEvidenceRecordingMode::CompactCommit,
+            SsiEvidenceBudgetConfig::default(),
+            || {
+                let txn = TxnToken::new(TxnId::new(90_101).unwrap(), TxnEpoch::new(0));
+                let result = ssi_validate_and_publish(
+                    txn,
+                    CommitSeq::new(1),
+                    CommitSeq::new(5),
+                    &[page_key(10)],
+                    &[page_key(20)],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                );
+                result.expect("commit should succeed");
+
+                let rows = ssi_evidence_query(&SsiDecisionQuery {
+                    txn_id: Some(txn.id.get()),
+                    ..SsiDecisionQuery::default()
+                });
+                let last = rows
+                    .last()
+                    .expect("explicit CompactCommit must retain evidence");
+                assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+                assert!(last.conflict_pages.is_empty());
+                assert!(last.write_set.is_empty());
+                assert_eq!(last.read_set_summary.page_count, 0);
+            },
+        );
+    }
+
+    #[test]
+    fn test_default_abort_only_skips_success_ledger_enqueue_and_keeps_abort_evidence() {
+        reset_ssi_evidence_test_ledger_enqueue_count();
+        assert_eq!(
+            ssi_evidence_recording_mode(),
+            SsiEvidenceRecordingMode::AbortOnly
+        );
+
+        let before = ssi_evidence_metrics_snapshot();
+        let commit_txn = TxnToken::new(TxnId::new(90_202).unwrap(), TxnEpoch::new(0));
+        let commit = ssi_validate_and_publish(
+            commit_txn,
+            CommitSeq::new(3),
+            CommitSeq::new(4),
+            &[],
+            &[page_key(921)],
             &[],
             &[],
             &[],
             &[],
             false,
         );
-        result.expect("commit should succeed");
+        commit.expect("disjoint commit should still succeed under AbortOnly");
+        assert_eq!(
+            ssi_evidence_test_ledger_enqueue_count(),
+            0,
+            "default successful commits must not enqueue a global evidence-ledger draft"
+        );
+        let after_commit = ssi_evidence_metrics_snapshot();
+        assert!(
+            after_commit.fsqlite_evidence_records_total_commit
+                > before.fsqlite_evidence_records_total_commit,
+            "AbortOnly must retain successful-commit metrics"
+        );
 
-        // The global evidence ledger is a bounded ring buffer (capacity 1024).
-        // Under parallel test load, our entry may be evicted before we query it.
-        // Wait for quiescence, then check: if found, validate fields; if the
-        // buffer is full and our entry was evicted, that's expected.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let snapshot = ssi_evidence_snapshot();
-        let target_txn_id = txn.id.get();
+        let abort_txn = TxnToken::new(TxnId::new(90_203).unwrap(), TxnEpoch::new(0));
+        let abort = ssi_validate_and_publish(
+            abort_txn,
+            CommitSeq::new(4),
+            CommitSeq::new(5),
+            &[page_key(922)],
+            &[page_key(923)],
+            &[],
+            &[],
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(
+            abort.expect_err("marked transaction must abort").reason,
+            SsiAbortReason::MarkedForAbort
+        );
+        assert_eq!(
+            ssi_evidence_test_ledger_enqueue_count(),
+            1,
+            "AbortOnly must continue recording abort evidence"
+        );
         let rows = ssi_evidence_query(&SsiDecisionQuery {
-            txn_id: Some(target_txn_id),
+            txn_id: Some(abort_txn.id.get()),
             ..SsiDecisionQuery::default()
         });
-        if rows.is_empty() {
-            // Under parallel load, our entry may have been evicted from the
-            // bounded ring buffer. Verify the ledger is operational (non-empty)
-            // and all entries have valid structure.
-            assert!(
-                !snapshot.is_empty(),
-                "evidence ledger should not be completely empty"
-            );
-            for card in &snapshot {
-                assert!(card.decision_id > 0, "every card must have a decision_id");
-            }
-        } else {
-            let last = rows.last().unwrap();
-            assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
-            assert!(last.conflict_pages.is_empty());
-            assert!(last.write_set.is_empty());
-            assert_eq!(last.read_set_summary.page_count, 0);
-        }
+        let card = rows.last().expect("abort evidence must be retained");
+        assert_eq!(card.decision_type, SsiDecisionType::AbortCycle);
+        assert_eq!(card.write_set, vec![PageNumber::new(923).unwrap()]);
+        assert_eq!(card.read_set_summary.page_count, 1);
     }
 
     #[test]
-    fn test_commit_allowed_evidence_defaults_to_compact_mode() {
+    fn test_full_commit_mode_retains_full_success_evidence() {
+        with_ssi_evidence_test_config(
+            SsiEvidenceRecordingMode::Full,
+            SsiEvidenceBudgetConfig::default(),
+            || {
+                reset_ssi_evidence_test_ledger_enqueue_count();
+                let txn = TxnToken::new(TxnId::new(90_204).unwrap(), TxnEpoch::new(0));
+                ssi_validate_and_publish(
+                    txn,
+                    CommitSeq::new(5),
+                    CommitSeq::new(6),
+                    &[page_key(924)],
+                    &[page_key(925)],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                )
+                .expect("full-evidence commit should succeed");
+                assert_eq!(ssi_evidence_test_ledger_enqueue_count(), 1);
+                let rows = ssi_evidence_query(&SsiDecisionQuery {
+                    txn_id: Some(txn.id.get()),
+                    ..SsiDecisionQuery::default()
+                });
+                let card = rows.last().expect("Full mode must retain a success card");
+                assert_eq!(card.decision_type, SsiDecisionType::CommitAllowed);
+                assert_eq!(card.write_set, vec![PageNumber::new(925).unwrap()]);
+                assert_eq!(card.read_set_summary.page_count, 1);
+            },
+        );
+    }
+
+    #[test]
+    fn test_compact_commit_mode_retains_compact_success_evidence() {
         with_ssi_evidence_test_config(
             SsiEvidenceRecordingMode::CompactCommit,
             SsiEvidenceBudgetConfig {
@@ -3166,6 +3291,7 @@ mod tests {
                 max_commit_evidence_bytes: u64::MAX,
             },
             || {
+                reset_ssi_evidence_test_ledger_enqueue_count();
                 let txn = TxnToken::new(TxnId::new(90_202).unwrap(), TxnEpoch::new(0));
                 let result = ssi_validate_and_publish(
                     txn,
@@ -3180,6 +3306,7 @@ mod tests {
                     false,
                 );
                 result.expect("commit should succeed");
+                assert_eq!(ssi_evidence_test_ledger_enqueue_count(), 1);
 
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 let snapshot = ssi_evidence_snapshot();
@@ -3215,6 +3342,7 @@ mod tests {
                 max_commit_evidence_bytes: u64::MAX,
             },
             || {
+                reset_ssi_evidence_test_ledger_enqueue_count();
                 assert_eq!(
                     commit_evidence_detail_level(&[], &[], &[], ""),
                     (false, "budget_full")
@@ -3233,6 +3361,7 @@ mod tests {
                     false,
                 );
                 result.expect("commit should succeed");
+                assert_eq!(ssi_evidence_test_ledger_enqueue_count(), 1);
 
                 let rows = ssi_evidence_query(&SsiDecisionQuery {
                     txn_id: Some(txn.id.get()),
@@ -3263,6 +3392,7 @@ mod tests {
                 max_commit_evidence_bytes: 0,
             },
             || {
+                reset_ssi_evidence_test_ledger_enqueue_count();
                 let before = ssi_evidence_metrics_snapshot();
                 assert_eq!(
                     commit_evidence_detail_level(&[], &[page_key(941)], &[], "commit allowed"),
@@ -3282,6 +3412,7 @@ mod tests {
                     false,
                 );
                 result.expect("commit should succeed");
+                assert_eq!(ssi_evidence_test_ledger_enqueue_count(), 1);
 
                 let rows = ssi_evidence_query(&SsiDecisionQuery {
                     txn_id: Some(txn.id.get()),
