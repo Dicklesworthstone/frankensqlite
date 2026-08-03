@@ -1,6 +1,6 @@
 //! Contract tests for the bd-zywqc.2 performance regression guard.
 //!
-//! These tests invoke the real shell analyzer against complete, v6-shaped
+//! These tests invoke the real shell analyzer against complete, v7-shaped
 //! benchmark evidence. They deliberately avoid running the benchmark itself.
 
 #![cfg(unix)]
@@ -20,10 +20,17 @@ const ITERATIONS: usize = 21;
 const CONTRACT_BOOTSTRAP_REPETITIONS: usize = 10_000;
 const ROWS_PER_THREAD: usize = 500;
 const SQLITE_ELAPSED_NS: u64 = 1_000_000_000;
+const BASELINE_SCHEMA: &str = "fsqlite.perf_regression_gate.baseline.v4";
+const GATE_SCHEMA: &str = "fsqlite.perf_regression_gate.result.v3";
+const REPORT_SCHEMA: &str = "fsqlite-e2e.mt_mvcc_bench_report.v7";
+const EXECUTABLE_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const CARGO_LOCK_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const INVOCATION_SHA256: &str = "a344f09c2c54e4ded0af8977858be0ac3d06f3722cbfb4100450990d3e63bb17";
 const SETTINGS_INTERPRETATION: &str = "Both engines proved the listed effective PRAGMA values; equal names and readbacks do not establish cross-engine semantic equivalence.";
 const ACCOUNTING_INTERPRETATION: &str = "offered and committed writes share one row unit; attempted_writes counts physical INSERT calls; retried_operations records the existing engine-specific retry unit and is provenance only, not a cross-engine comparison metric.";
 const TIMING_INTERPRETATION: &str = "workload_elapsed_ns begins only after every worker has opened and proved its effective settings, and ends at the last worker's transaction terminal point before connection teardown; worker_startup_elapsed_ns is reported separately.";
-const NON_CITABLE_REASON: &str = "v6 adds fail-closed settings, committed-work, integrity, timing, retry-policy, and configuration receipts, but bd-uh1fv still requires external watchdog, sanitized environment, matched retry/deadline semantics, complete build/toolchain provenance, counterbalanced topology receipts, immutable manifest, and independent verification.";
+const NON_CITABLE_REASON: &str = "v7 binds the running executable, build/runtime source identity, Cargo.lock, invocation, toolchain, and measurement host to this same-invocation comparison, but bd-uh1fv still requires external watchdog, sanitized environment, matched retry/deadline semantics, a build-attested resolved dependency/feature-graph digest, counterbalanced topology receipts, immutable manifest, retained baseline history, and independent verification.";
+const RELEASE_REGRESSION_SCOPE: &str = "Narrow same-process, same-host F/C writer-throughput comparison for only the requested mt-mvcc-bench workload/configurations; this report does not cover the shipped release profile, other workloads or platforms, long-term baseline retention, independent reproduction, or overall release eligibility.";
 static NEXT_RUN_ID: AtomicUsize = AtomicUsize::new(1);
 
 struct GateRun {
@@ -82,9 +89,9 @@ fn measured_analyzer_output(
         .arg("contract-test-commit")
         .arg(ROWS_PER_THREAD.to_string())
         .arg(if capture_baseline { "true" } else { "false" })
-        .arg("fsqlite.perf_regression_gate.baseline.v3")
-        .arg("fsqlite.perf_regression_gate.result.v2")
-        .arg("fsqlite-e2e.mt_mvcc_bench_report.v6")
+        .arg(BASELINE_SCHEMA)
+        .arg(GATE_SCHEMA)
+        .arg(REPORT_SCHEMA)
         .arg(ITERATIONS.to_string())
         .arg("0.05")
         .arg("0.0")
@@ -160,6 +167,90 @@ fn gate_output_with_run_id(
         output: command.output().expect("run regression guard"),
         result_path,
     }
+}
+
+fn measured_shell_output_with_fake_cargo(
+    fixture: &TempDir,
+    run_id: &str,
+    create_history: bool,
+    capture_baseline: bool,
+) -> Output {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let target_dir = fixture.path().join("target");
+    let history_path = target_dir
+        .join("regression_gate_runs")
+        .join(run_id)
+        .join("disposable_history.json");
+    let mut report = fixture_report(833_333_333);
+    report["pass_over_pass_gate"]["history_json_path"] = json!(history_path.to_string_lossy());
+    report["subject_identity"]["build_source"]["build_nonce"] = json!(run_id);
+    let report_path = fixture.path().join("fake-cargo-report.json");
+    write_json(&report_path, &report);
+
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).expect("create fake Cargo directory");
+    let fake_cargo = fake_bin.join("cargo");
+    fs::write(
+        &fake_cargo,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-V" ]]; then
+    printf '%s\n' 'cargo fixture'
+    exit 0
+fi
+json_output=''
+history_path=''
+for argument in "$@"; do
+    case "$argument" in
+        --json-output=*) json_output="${argument#--json-output=}" ;;
+        --history-json=*) history_path="${argument#--history-json=}" ;;
+    esac
+done
+[[ -n "$json_output" ]]
+[[ -n "$history_path" ]]
+[[ "${FSQLITE_BENCH_BUILD_NONCE:-}" == "$FSQLITE_FAKE_EXPECTED_NONCE" ]]
+cp -- "$FSQLITE_FAKE_REPORT" "$json_output"
+if [[ "$FSQLITE_FAKE_CREATE_HISTORY" == "true" ]]; then
+    printf '%s\n' '{"forged":true}' > "$history_path"
+fi
+"#,
+    )
+    .expect("write fake Cargo executable");
+    let mut permissions = fs::metadata(&fake_cargo)
+        .expect("read fake Cargo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions).expect("make fake Cargo executable");
+
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_entries = vec![fake_bin];
+    path_entries.extend(std::env::split_paths(&inherited_path));
+    let test_path = std::env::join_paths(path_entries).expect("join fake Cargo PATH");
+
+    let mut command = Command::new("bash");
+    command
+        .env("FSQLITE_REGGATE_RUN_ID", run_id)
+        .env("FSQLITE_FAKE_EXPECTED_NONCE", run_id)
+        .env("FSQLITE_FAKE_REPORT", &report_path)
+        .env(
+            "FSQLITE_FAKE_CREATE_HISTORY",
+            if create_history { "true" } else { "false" },
+        )
+        .env("PATH", test_path)
+        .arg(script_path())
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .arg("--baseline-dir")
+        .arg(fixture.path().join("baselines"))
+        .arg("--rows")
+        .arg(ROWS_PER_THREAD.to_string());
+    if capture_baseline {
+        command.arg("--capture-baseline");
+    }
+    command
+        .output()
+        .expect("run measured regression guard with fake Cargo")
 }
 
 fn output_detail(output: &GateRun) -> String {
@@ -409,6 +500,151 @@ fn thread_report(threads: usize, sqlite_elapsed_ns: &[u64], fsqlite_elapsed_ns: 
     })
 }
 
+fn file_snapshot(hash: &str) -> Value {
+    json!({
+        "sha256": hash,
+        "bytes_read": 3,
+        "metadata_size_bytes": 3,
+        "unix_device": 7,
+        "unix_inode": 11,
+        "error": null,
+    })
+}
+
+fn subject_identity() -> Value {
+    json!({
+        "executable": {
+            "current_exe_path": "/fixture/mt-mvcc-bench",
+            "canonical_path": "/fixture/mt-mvcc-bench",
+            "path_resolution_error": null,
+            "process_id": 42,
+            "before_measurement": file_snapshot(EXECUTABLE_SHA256),
+            "after_measurement": file_snapshot(EXECUTABLE_SHA256),
+            "unchanged_during_measurement": true,
+        },
+        "build_source": {
+            "workspace_root": "/fixture/frankensqlite",
+            "git_sha": "fixture-sha",
+            "git_branch": "main",
+            "git_tree_state": "clean",
+            "build_nonce": "fixture-nonce",
+            "build_input_tracking": "complete",
+        },
+        "runtime_source": {
+            "before_measurement": {
+                "workspace_root": "/fixture/frankensqlite",
+                "canonical_workspace_root": "/fixture/frankensqlite",
+                "git_sha": "fixture-sha",
+                "git_branch": "main",
+                "git_tree_state": "clean",
+                "matches_build_git_sha": true,
+                "discovery_errors": [],
+            },
+            "after_measurement": {
+                "workspace_root": "/fixture/frankensqlite",
+                "canonical_workspace_root": "/fixture/frankensqlite",
+                "git_sha": "fixture-sha",
+                "git_branch": "main",
+                "git_tree_state": "clean",
+                "matches_build_git_sha": true,
+                "discovery_errors": [],
+            },
+            "same_clean_git_identity_at_capture_points": true,
+            "stability_limitation": "fixture limitation",
+        },
+        "cargo_lock": {
+            "embedded_build_sha256": CARGO_LOCK_SHA256,
+            "embedded_build_size_bytes": 3,
+            "runtime_path": "/fixture/frankensqlite/Cargo.lock",
+            "before_measurement": file_snapshot(CARGO_LOCK_SHA256),
+            "after_measurement": file_snapshot(CARGO_LOCK_SHA256),
+            "before_matches_embedded_build": true,
+            "after_matches_embedded_build": true,
+            "unchanged_at_capture_points": true,
+        },
+    })
+}
+
+fn comparison_environment() -> Value {
+    json!({
+        "build_configuration": {
+            "cargo_profile": "release",
+            "selected_profile": "release-perf",
+            "profile_label": "release-perf",
+            "opt_level": "3",
+            "debug": "false",
+            "target": "fixture-target",
+            "build_host": "fixture-host",
+            "enabled_features": [],
+            "rustflags": {
+                "cargo_encoded_rustflags_present": false,
+                "encoded_hex": "",
+                "decoded_arguments": [],
+                "decode_error": null,
+            },
+            "profile_overrides_hex": "",
+            "native_build_overrides_hex": "",
+            "rustc_version_verbose": "rustc fixture",
+            "cargo_version": "cargo fixture",
+            "resolved_dependency_feature_graph_sha256": null,
+            "resolved_dependency_feature_graph_limitation": "fixture limitation",
+        },
+        "invocation": {
+            "argv_lossy": ["mt-mvcc-bench"],
+            "argv_raw_hex": ["6d742d6d7663632d62656e6368"],
+            "raw_encoding": "unix_os_str_bytes",
+            "length_prefixed_argv_sha256": INVOCATION_SHA256,
+        },
+        "measurement_host": {
+            "host": {
+                "hostname": "fixture-host",
+                "cpu_model": "fixture-cpu",
+                "available_parallelism": 64,
+                "cpu_online": "0-63",
+                "cpu_present": "0-63",
+                "cpu_possible": "0-63",
+                "cpu_isolated": null,
+                "cpu_topology": {
+                    "logical_cpu_directories": 64,
+                    "physical_package_count": 1,
+                    "physical_core_count": 32,
+                },
+                "scaling_governors_by_cpu": {},
+                "kernel_release": "fixture-kernel",
+                "kernel_version": "fixture-version",
+                "numa_online_nodes": "0",
+                "numa_possible_nodes": "0",
+                "numa_node_directories": 1,
+                "unavailable_fields": ["cpu_isolated", "scaling_governors_by_cpu"],
+            },
+            "before_measurement": {
+                "unix_epoch_millis": 1,
+                "process_cpu_affinity_mask": "ffffffffffffffff",
+                "process_cpu_affinity_list": "0-63",
+                "proc_self_cgroup": "0::/fixture",
+                "cpuset_cpus_effective": "0-63",
+                "cpuset_mems_effective": "0",
+                "load_average": "0.00 0.00 0.00 1/1 1",
+                "pressure_cpu": "some avg10=0.00",
+                "pressure_memory": "some avg10=0.00",
+                "pressure_io": "some avg10=0.00",
+            },
+            "after_measurement": {
+                "unix_epoch_millis": 2,
+                "process_cpu_affinity_mask": "ffffffffffffffff",
+                "process_cpu_affinity_list": "0-63",
+                "proc_self_cgroup": "0::/fixture",
+                "cpuset_cpus_effective": "0-63",
+                "cpuset_mems_effective": "0",
+                "load_average": "0.00 0.00 0.00 1/1 1",
+                "pressure_cpu": "some avg10=0.00",
+                "pressure_memory": "some avg10=0.00",
+                "pressure_io": "some avg10=0.00",
+            },
+        },
+    })
+}
+
 fn report(one_thread_ns: Vec<u64>, eight_thread_ns: Vec<u64>) -> Value {
     report_with_engine_elapsed(
         vec![SQLITE_ELAPSED_NS; one_thread_ns.len()],
@@ -425,9 +661,13 @@ fn report_with_engine_elapsed(
     eight_thread_fsqlite_ns: Vec<u64>,
 ) -> Value {
     json!({
-        "schema_version": "fsqlite-e2e.mt_mvcc_bench_report.v6",
+        "schema_version": REPORT_SCHEMA,
         "citable": false,
+        "measurement_evidence_valid": true,
         "non_citable_reason": NON_CITABLE_REASON,
+        "release_regression_scope": RELEASE_REGRESSION_SCOPE,
+        "subject_identity": subject_identity(),
+        "comparison_environment": comparison_environment(),
         "settings_interpretation": SETTINGS_INTERPRETATION,
         "accounting_interpretation": ACCOUNTING_INTERPRETATION,
         "timing_interpretation": TIMING_INTERPRETATION,
@@ -443,7 +683,7 @@ fn report_with_engine_elapsed(
             "schema_version": "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1",
             "history_json_path": "disposable",
             "threshold_ratio_drop_pct": 5.0,
-            "status": "no_prior_report",
+            "status": "disabled_non_citable",
             "previous_report_found": false,
             "comparable_pair_count": 0,
             "regressions": [],
@@ -486,10 +726,7 @@ fn capture(fixture: &TempDir, current_path: &Path, report: &Value) {
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .expect("capture result has a UTF-8 run directory");
-    assert_eq!(
-        baseline["schema_version"],
-        "fsqlite.perf_regression_gate.baseline.v3"
-    );
+    assert_eq!(baseline["schema_version"], BASELINE_SCHEMA);
     assert_eq!(baseline["capture_run_id"], capture_run_id);
     assert_eq!(
         baseline["report_history_json_path"],
@@ -548,6 +785,116 @@ fn missing_baseline_fails_closed_without_implicit_capture() {
 }
 
 #[test]
+fn measured_v7_run_requires_history_path_to_remain_absent() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let run_id = "measured-v7-no-history";
+
+    let output = measured_shell_output_with_fake_cargo(&fixture, run_id, false, true);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.path().join("baselines/latest.json").is_file());
+    assert!(
+        !fixture
+            .path()
+            .join("target/regression_gate_runs")
+            .join(run_id)
+            .join("disposable_history.json")
+            .exists(),
+        "a successful non-citable v7 run must not create history"
+    );
+}
+
+#[test]
+fn measured_v7_run_rejects_any_history_write_before_analysis() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let run_id = "measured-v7-forged-history";
+
+    let output = measured_shell_output_with_fake_cargo(&fixture, run_id, true, true);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("non-citable v7 benchmark unexpectedly created its history path")
+    );
+    assert!(!fixture.path().join("baselines/latest.json").exists());
+}
+
+#[test]
+fn measured_baseline_and_candidate_bind_their_own_build_nonces() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+
+    let capture =
+        measured_shell_output_with_fake_cargo(&fixture, "measured-v7-baseline-nonce", false, true);
+    assert_eq!(
+        capture.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&capture.stdout),
+        String::from_utf8_lossy(&capture.stderr)
+    );
+
+    let comparison = measured_shell_output_with_fake_cargo(
+        &fixture,
+        "measured-v7-candidate-nonce",
+        false,
+        false,
+    );
+    assert_eq!(
+        comparison.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&comparison.stdout),
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+}
+
+#[test]
+fn measured_report_rejects_a_stale_build_nonce() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let run_id = "measured-v7-expected-nonce";
+    let history_path = fixture
+        .path()
+        .join("target/regression_gate_runs")
+        .join(run_id)
+        .join("disposable_history.json");
+    let mut report = fixture_report(833_333_333);
+    report["pass_over_pass_gate"]["history_json_path"] = json!(history_path.to_string_lossy());
+    report["subject_identity"]["build_source"]["build_nonce"] = json!("stale-build-nonce");
+    let report_path = fixture.path().join("stale-build-report.json");
+    write_json(&report_path, &report);
+    let result_path = fixture.path().join("results/stale-build-nonce.json");
+
+    let output = measured_analyzer_output(
+        &report_path,
+        &fixture.path().join("baselines/latest.json"),
+        &result_path,
+        true,
+        run_id,
+        &history_path,
+    );
+
+    assert_eq!(output.status.code(), Some(2), "{}", output_detail(&output));
+    assert!(
+        read_json(&result_path)["error"]
+            .as_str()
+            .expect("stale nonce error")
+            .contains("build_nonce does not match its measured run")
+    );
+}
+
+#[test]
 fn validated_capture_and_unchanged_comparison_pass_without_mutating_baseline() {
     let fixture = tempfile::tempdir().expect("tempdir");
     let current_path = fixture.path().join("current.json");
@@ -580,7 +927,96 @@ fn validated_capture_and_unchanged_comparison_pass_without_mutating_baseline() {
 }
 
 #[test]
-fn baseline_history_binding_is_independent_of_the_current_report_history() {
+fn v7_measurement_environment_drift_fails_closed() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let current_path = fixture.path().join("current.json");
+    let baseline_report = fixture_report(833_333_333);
+    capture(&fixture, &current_path, &baseline_report);
+
+    for drift in ["cpu_model", "hostname", "affinity", "target", "profile"] {
+        let mut current = baseline_report.clone();
+        match drift {
+            "cpu_model" => {
+                current["comparison_environment"]["measurement_host"]["host"]["cpu_model"] =
+                    json!("different-cpu");
+            }
+            "hostname" => {
+                current["comparison_environment"]["measurement_host"]["host"]["hostname"] =
+                    json!("different-host");
+            }
+            "affinity" => {
+                for capture_point in ["before_measurement", "after_measurement"] {
+                    current["comparison_environment"]["measurement_host"][capture_point]["process_cpu_affinity_list"] =
+                        json!("0-31");
+                }
+            }
+            "target" => {
+                current["comparison_environment"]["build_configuration"]["target"] =
+                    json!("different-target");
+            }
+            "profile" => {
+                current["comparison_environment"]["build_configuration"]["selected_profile"] =
+                    json!("release");
+            }
+            _ => unreachable!("complete drift fixture list"),
+        }
+        write_json(&current_path, &current);
+
+        let output = gate_output(&fixture, &current_path, false);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "drift={drift}\n{}",
+            output_detail(&output)
+        );
+        let error = read_json(&output.result_path)["error"]
+            .as_str()
+            .expect("environment drift error")
+            .to_owned();
+        assert!(
+            error.contains("incompatible v7 measurement environments")
+                || error.contains("was not built with the release-perf profile"),
+            "drift={drift}: {error}"
+        );
+    }
+}
+
+#[test]
+fn expected_per_run_v7_identity_and_dynamic_host_changes_remain_comparable() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let current_path = fixture.path().join("current.json");
+    let baseline_report = fixture_report(833_333_333);
+    capture(&fixture, &current_path, &baseline_report);
+    let mut current = baseline_report;
+    current["subject_identity"]["build_source"]["git_sha"] = json!("candidate-sha");
+    current["subject_identity"]["runtime_source"]["before_measurement"]["git_sha"] =
+        json!("candidate-sha");
+    current["subject_identity"]["runtime_source"]["after_measurement"]["git_sha"] =
+        json!("candidate-sha");
+    current["comparison_environment"]["invocation"]["argv_lossy"] =
+        json!(["mt-mvcc-bench", "--different-output-path"]);
+    current["comparison_environment"]["measurement_host"]["before_measurement"]["unix_epoch_millis"] =
+        json!(10);
+    current["comparison_environment"]["measurement_host"]["after_measurement"]["unix_epoch_millis"] =
+        json!(20);
+    current["comparison_environment"]["measurement_host"]["before_measurement"]["load_average"] =
+        json!("1.00 2.00 3.00 1/1 1");
+    current["comparison_environment"]["measurement_host"]["after_measurement"]["pressure_cpu"] =
+        json!("some avg10=1.00");
+    write_json(&current_path, &current);
+
+    let output = gate_output(&fixture, &current_path, false);
+
+    assert_eq!(output.status.code(), Some(0), "{}", output_detail(&output));
+    let result = read_json(&output.result_path);
+    assert_eq!(result["verdict"], "diagnostic_only");
+    assert_eq!(result["release_evidence"], false);
+    assert_eq!(result["release_eligible"], false);
+}
+
+#[test]
+fn baseline_history_path_receipt_is_independent_of_the_current_report_path() {
     let fixture = tempfile::tempdir().expect("tempdir");
     let current_path = fixture.path().join("current.json");
     let mut baseline_report = fixture_report(833_333_333);
@@ -604,7 +1040,7 @@ fn baseline_history_binding_is_independent_of_the_current_report_history() {
 }
 
 #[test]
-fn measured_mode_binds_current_and_baseline_to_their_own_run_histories() {
+fn measured_mode_binds_current_and_baseline_to_their_absent_history_paths() {
     let fixture = tempfile::tempdir().expect("tempdir");
     let baseline_path = fixture.path().join("baselines/latest.json");
     let baseline_report_path = fixture.path().join("baseline-report.json");
@@ -614,6 +1050,7 @@ fn measured_mode_binds_current_and_baseline_to_their_own_run_histories() {
     let mut baseline_report = fixture_report(833_333_333);
     baseline_report["pass_over_pass_gate"]["history_json_path"] =
         json!(baseline_history.to_string_lossy());
+    baseline_report["subject_identity"]["build_source"]["build_nonce"] = json!("measured-baseline");
     write_json(&baseline_report_path, &baseline_report);
     let capture_result = fixture.path().join("results/capture.json");
 
@@ -639,11 +1076,15 @@ fn measured_mode_binds_current_and_baseline_to_their_own_run_histories() {
     let mut current_report = baseline_report;
     current_report["pass_over_pass_gate"]["history_json_path"] =
         json!(current_history.to_string_lossy());
-    write_json(&current_report_path, &current_report);
+    current_report["subject_identity"]["build_source"]["build_nonce"] = json!("measured-current");
     let mismatched_history = fixture
         .path()
         .join("target/regression_gate_runs/measured-other/disposable_history.json");
     let mismatch_result = fixture.path().join("results/history-mismatch.json");
+    let mut mismatch_report = current_report.clone();
+    mismatch_report["subject_identity"]["build_source"]["build_nonce"] =
+        json!("measured-current-mismatch");
+    write_json(&current_report_path, &mismatch_report);
     let mismatch = measured_analyzer_output(
         &current_report_path,
         &baseline_path,
@@ -664,6 +1105,29 @@ fn measured_mode_binds_current_and_baseline_to_their_own_run_histories() {
             .expect("history mismatch error")
             .contains("does not match its bound history path")
     );
+
+    let mut forged_history_report = current_report.clone();
+    forged_history_report["pass_over_pass_gate"]["previous_report_found"] = json!(true);
+    forged_history_report["subject_identity"]["build_source"]["build_nonce"] =
+        json!("measured-current-forged-history");
+    write_json(&current_report_path, &forged_history_report);
+    let forged_result = fixture.path().join("results/forged-history.json");
+    let forged = measured_analyzer_output(
+        &current_report_path,
+        &baseline_path,
+        &forged_result,
+        false,
+        "measured-current-forged-history",
+        &current_history,
+    );
+    assert_eq!(forged.status.code(), Some(2), "{}", output_detail(&forged));
+    assert!(
+        read_json(&forged_result)["error"]
+            .as_str()
+            .expect("forged history error")
+            .contains("unexpectedly found per-run history")
+    );
+    write_json(&current_report_path, &current_report);
 
     let comparison_result = fixture.path().join("results/comparison.json");
 
@@ -1026,11 +1490,352 @@ fn malformed_receipt_types_and_contract_constants_are_invalid() {
 }
 
 #[test]
-fn citable_v6_claim_is_invalid_for_this_diagnostic_gate() {
+fn citable_v7_claim_is_invalid_for_this_diagnostic_gate() {
     let mut malformed = fixture_report(833_333_333);
     malformed["citable"] = json!(true);
 
     assert_invalid_capture(&malformed);
+}
+
+#[test]
+fn invalid_measurement_evidence_cannot_seed_a_diagnostic_baseline() {
+    let mut malformed = fixture_report(833_333_333);
+    malformed["measurement_evidence_valid"] = json!(false);
+
+    assert_invalid_capture(&malformed);
+}
+
+#[test]
+fn v7_provenance_receipts_and_release_perf_profile_are_required() {
+    for field in ["subject_identity", "comparison_environment"] {
+        let mut missing = fixture_report(833_333_333);
+        missing
+            .as_object_mut()
+            .expect("fixture report object")
+            .remove(field);
+        assert_invalid_capture(&missing);
+    }
+
+    let mut missing_executable = fixture_report(833_333_333);
+    missing_executable["subject_identity"]
+        .as_object_mut()
+        .expect("subject identity object")
+        .remove("executable");
+    assert_invalid_capture(&missing_executable);
+
+    let mut empty_executable = fixture_report(833_333_333);
+    empty_executable["subject_identity"]["executable"] = json!({});
+    assert_invalid_capture(&empty_executable);
+
+    let mut missing_host_capture = fixture_report(833_333_333);
+    missing_host_capture["comparison_environment"]["measurement_host"]
+        .as_object_mut()
+        .expect("measurement host object")
+        .remove("after_measurement");
+    assert_invalid_capture(&missing_host_capture);
+
+    let mut wrong_profile = fixture_report(833_333_333);
+    wrong_profile["comparison_environment"]["build_configuration"]["selected_profile"] =
+        json!("release");
+    assert_invalid_capture(&wrong_profile);
+
+    let mut unstable_placement = fixture_report(833_333_333);
+    unstable_placement["comparison_environment"]["measurement_host"]["after_measurement"]["process_cpu_affinity_list"] =
+        json!("0-31");
+    assert_invalid_capture(&unstable_placement);
+}
+
+#[test]
+fn v7_executable_receipt_must_be_complete_and_stable() {
+    let valid = fixture_report(833_333_333);
+    let mut reported_changed = valid.clone();
+    reported_changed["subject_identity"]["executable"]["unchanged_during_measurement"] =
+        json!(false);
+    assert_invalid_capture(&reported_changed);
+
+    let mut indeterminate_stability = valid.clone();
+    indeterminate_stability["subject_identity"]["executable"]["unchanged_during_measurement"] =
+        Value::Null;
+    assert_invalid_capture(&indeterminate_stability);
+
+    let mut snapshot_error = valid.clone();
+    snapshot_error["subject_identity"]["executable"]["before_measurement"]["error"] =
+        json!("fixture read failure");
+    assert_invalid_capture(&snapshot_error);
+
+    let mut malformed_digest = valid.clone();
+    malformed_digest["subject_identity"]["executable"]["before_measurement"]["sha256"] =
+        json!("not-a-sha256");
+    assert_invalid_capture(&malformed_digest);
+
+    let mut forged_stability = valid.clone();
+    forged_stability["subject_identity"]["executable"]["after_measurement"]["unix_inode"] =
+        json!(12);
+    assert_invalid_capture(&forged_stability);
+
+    let mut unresolved_path = valid;
+    unresolved_path["subject_identity"]["executable"]["canonical_path"] = Value::Null;
+    unresolved_path["subject_identity"]["executable"]["path_resolution_error"] =
+        json!("fixture canonicalization failure");
+    assert_invalid_capture(&unresolved_path);
+}
+
+#[test]
+fn v7_build_and_runtime_source_must_be_clean_bound_and_stable() {
+    let valid = fixture_report(833_333_333);
+    let mut dirty_build = valid.clone();
+    dirty_build["subject_identity"]["build_source"]["git_tree_state"] = json!("dirty");
+    assert_invalid_capture(&dirty_build);
+
+    let mut unknown_nonce = valid.clone();
+    unknown_nonce["subject_identity"]["build_source"]["build_nonce"] = json!("unknown");
+    assert_invalid_capture(&unknown_nonce);
+
+    let mut incomplete_input_tracking = valid.clone();
+    incomplete_input_tracking["subject_identity"]["build_source"]["build_input_tracking"] =
+        json!("unavailable");
+    assert_invalid_capture(&incomplete_input_tracking);
+
+    let mut dirty_runtime = valid.clone();
+    dirty_runtime["subject_identity"]["runtime_source"]["before_measurement"]["git_tree_state"] =
+        json!("dirty");
+    assert_invalid_capture(&dirty_runtime);
+
+    let mut mismatched_build = valid.clone();
+    mismatched_build["subject_identity"]["runtime_source"]["after_measurement"]["matches_build_git_sha"] =
+        json!(false);
+    assert_invalid_capture(&mismatched_build);
+
+    let mut forged_match_boolean = valid.clone();
+    forged_match_boolean["subject_identity"]["runtime_source"]["after_measurement"]["git_sha"] =
+        json!("different-fixture-sha");
+    assert_invalid_capture(&forged_match_boolean);
+
+    let mut discovery_error = valid.clone();
+    discovery_error["subject_identity"]["runtime_source"]["before_measurement"]["discovery_errors"] =
+        json!(["fixture git failure"]);
+    assert_invalid_capture(&discovery_error);
+
+    let mut changed_branch = valid.clone();
+    changed_branch["subject_identity"]["runtime_source"]["after_measurement"]["git_branch"] =
+        json!("release-candidate");
+    assert_invalid_capture(&changed_branch);
+
+    let mut indeterminate_stability = valid;
+    indeterminate_stability["subject_identity"]["runtime_source"]["same_clean_git_identity_at_capture_points"] =
+        Value::Null;
+    assert_invalid_capture(&indeterminate_stability);
+}
+
+#[test]
+fn v7_cargo_lock_receipt_must_match_the_build_and_remain_stable() {
+    let valid = fixture_report(833_333_333);
+    let mut mismatched_embedded_build = valid.clone();
+    mismatched_embedded_build["subject_identity"]["cargo_lock"]["before_matches_embedded_build"] =
+        json!(false);
+    assert_invalid_capture(&mismatched_embedded_build);
+
+    let mut indeterminate_match = valid.clone();
+    indeterminate_match["subject_identity"]["cargo_lock"]["after_matches_embedded_build"] =
+        Value::Null;
+    assert_invalid_capture(&indeterminate_match);
+
+    let mut reported_changed = valid.clone();
+    reported_changed["subject_identity"]["cargo_lock"]["unchanged_at_capture_points"] =
+        json!(false);
+    assert_invalid_capture(&reported_changed);
+
+    let mut snapshot_error = valid.clone();
+    snapshot_error["subject_identity"]["cargo_lock"]["after_measurement"]["error"] =
+        json!("fixture lockfile read failure");
+    assert_invalid_capture(&snapshot_error);
+
+    let mut forged_embedded_digest = valid.clone();
+    forged_embedded_digest["subject_identity"]["cargo_lock"]["embedded_build_sha256"] =
+        json!(EXECUTABLE_SHA256);
+    assert_invalid_capture(&forged_embedded_digest);
+
+    let mut forged_stability = valid;
+    forged_stability["subject_identity"]["cargo_lock"]["after_measurement"]["unix_inode"] =
+        json!(12);
+    assert_invalid_capture(&forged_stability);
+}
+
+#[test]
+fn v7_build_flags_and_invocation_must_be_decodable_and_self_consistent() {
+    let valid = fixture_report(833_333_333);
+    let mut rustflags_decode_error = valid.clone();
+    rustflags_decode_error["comparison_environment"]["build_configuration"]["rustflags"]["decode_error"] =
+        json!("fixture decode failure");
+    assert_invalid_capture(&rustflags_decode_error);
+
+    let mut inconsistent_decoded_rustflags = valid.clone();
+    inconsistent_decoded_rustflags["comparison_environment"]["build_configuration"]["rustflags"]
+        ["decoded_arguments"] = json!(["-Ctarget-cpu=native"]);
+    assert_invalid_capture(&inconsistent_decoded_rustflags);
+
+    let mut malformed_profile_overrides = valid.clone();
+    malformed_profile_overrides["comparison_environment"]["build_configuration"]["profile_overrides_hex"] =
+        json!("not-hex");
+    assert_invalid_capture(&malformed_profile_overrides);
+
+    let mut missing_raw_argument = valid.clone();
+    missing_raw_argument["comparison_environment"]["invocation"]["argv_raw_hex"] = json!([]);
+    assert_invalid_capture(&missing_raw_argument);
+
+    let mut malformed_raw_argument = valid.clone();
+    malformed_raw_argument["comparison_environment"]["invocation"]["argv_raw_hex"][0] =
+        json!("XYZ");
+    assert_invalid_capture(&malformed_raw_argument);
+
+    let mut forged_invocation_digest = valid;
+    forged_invocation_digest["comparison_environment"]["invocation"]["length_prefixed_argv_sha256"] =
+        json!(EXECUTABLE_SHA256);
+    assert_invalid_capture(&forged_invocation_digest);
+}
+
+#[test]
+fn v7_host_receipt_requires_essential_identity_and_stable_placement() {
+    let valid = fixture_report(833_333_333);
+    let mut missing_cpu_model = valid.clone();
+    missing_cpu_model["comparison_environment"]["measurement_host"]["host"]["cpu_model"] =
+        Value::Null;
+    assert_invalid_capture(&missing_cpu_model);
+
+    let mut missing_topology = valid.clone();
+    missing_topology["comparison_environment"]["measurement_host"]["host"]["cpu_topology"]["logical_cpu_directories"] =
+        Value::Null;
+    assert_invalid_capture(&missing_topology);
+
+    let mut missing_placement = valid.clone();
+    missing_placement["comparison_environment"]["measurement_host"]["before_measurement"]["cpuset_cpus_effective"] =
+        Value::Null;
+    assert_invalid_capture(&missing_placement);
+
+    let mut changed_placement = valid.clone();
+    changed_placement["comparison_environment"]["measurement_host"]["after_measurement"]["proc_self_cgroup"] =
+        json!("0::/different-fixture");
+    assert_invalid_capture(&changed_placement);
+
+    let mut reversed_timestamps = valid.clone();
+    reversed_timestamps["comparison_environment"]["measurement_host"]["after_measurement"]["unix_epoch_millis"] =
+        json!(0);
+    assert_invalid_capture(&reversed_timestamps);
+
+    let mut capacity_mismatch = valid.clone();
+    capacity_mismatch["comparison_environment"]["measurement_host"]["host"]["available_parallelism"] =
+        json!(32);
+    assert_invalid_capture(&capacity_mismatch);
+
+    let mut contradictory_unavailable_fields = valid;
+    contradictory_unavailable_fields["comparison_environment"]["measurement_host"]["host"]["unavailable_fields"] =
+        json!([]);
+    assert_invalid_capture(&contradictory_unavailable_fields);
+}
+
+#[test]
+fn optional_v7_host_and_dependency_fields_may_remain_unavailable() {
+    let mut report = fixture_report(833_333_333);
+    report["comparison_environment"]["measurement_host"]["host"]["numa_online_nodes"] = Value::Null;
+    report["comparison_environment"]["measurement_host"]["host"]["numa_possible_nodes"] =
+        Value::Null;
+    report["comparison_environment"]["measurement_host"]["host"]["numa_node_directories"] =
+        Value::Null;
+    report["comparison_environment"]["measurement_host"]["host"]["cpu_topology"]["physical_package_count"] =
+        Value::Null;
+    report["comparison_environment"]["measurement_host"]["host"]["cpu_topology"]["physical_core_count"] =
+        Value::Null;
+    report["comparison_environment"]["measurement_host"]["host"]["unavailable_fields"] = json!([
+        "numa_online_nodes",
+        "numa_possible_nodes",
+        "numa_node_directories",
+        "cpu_isolated",
+        "scaling_governors_by_cpu",
+    ]);
+    for capture in ["before_measurement", "after_measurement"] {
+        for field in [
+            "load_average",
+            "pressure_cpu",
+            "pressure_memory",
+            "pressure_io",
+        ] {
+            report["comparison_environment"]["measurement_host"][capture][field] = Value::Null;
+        }
+    }
+
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let current_path = fixture.path().join("current.json");
+    capture(&fixture, &current_path, &report);
+}
+
+#[test]
+fn v7_schema_and_scope_contract_deviations_are_invalid() {
+    let mut legacy_schema = fixture_report(833_333_333);
+    legacy_schema["schema_version"] = json!("fsqlite-e2e.mt_mvcc_bench_report.v6");
+    assert_invalid_capture(&legacy_schema);
+
+    let mut rewritten_reason = fixture_report(833_333_333);
+    rewritten_reason["non_citable_reason"] = json!("trust this report");
+    assert_invalid_capture(&rewritten_reason);
+
+    let mut broadened_scope = fixture_report(833_333_333);
+    broadened_scope["release_regression_scope"] = json!("all release workloads and platforms");
+    assert_invalid_capture(&broadened_scope);
+}
+
+#[test]
+fn v7_report_cannot_smuggle_a_release_claim() {
+    for field in ["release_eligible", "release_evidence"] {
+        let mut malformed = fixture_report(833_333_333);
+        malformed[field] = json!(true);
+        assert_invalid_capture(&malformed);
+    }
+}
+
+#[test]
+fn embedded_pass_over_pass_receipt_must_stay_disabled_and_empty() {
+    let mut forged_pass = fixture_report(833_333_333);
+    forged_pass["pass_over_pass_gate"]["status"] = json!("passed");
+    assert_invalid_capture(&forged_pass);
+
+    let mut forged_pair = fixture_report(833_333_333);
+    forged_pair["pass_over_pass_gate"]["comparable_pair_count"] = json!(1);
+    assert_invalid_capture(&forged_pair);
+
+    let mut forged_regression = fixture_report(833_333_333);
+    forged_regression["pass_over_pass_gate"]["regressions"] = json!([{
+        "threads": 8,
+        "previous_ratio": 1.0,
+        "current_ratio": 0.9,
+        "ratio_drop_pct": 10.0,
+    }]);
+    assert_invalid_capture(&forged_regression);
+}
+
+#[test]
+fn analyze_only_history_presence_is_diagnostic_not_comparability() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let current_path = fixture.path().join("current.json");
+    let mut report = fixture_report(833_333_333);
+    report["pass_over_pass_gate"]["previous_report_found"] = json!(true);
+    write_json(&current_path, &report);
+
+    let capture = gate_output(&fixture, &current_path, true);
+    assert_eq!(
+        capture.status.code(),
+        Some(0),
+        "{}",
+        output_detail(&capture)
+    );
+    let baseline = read_json(&fixture.path().join("baselines/latest.json"));
+    assert_eq!(
+        baseline["report"]["pass_over_pass_gate"]["status"],
+        "disabled_non_citable"
+    );
+    assert_eq!(
+        baseline["report"]["pass_over_pass_gate"]["comparable_pair_count"],
+        0
+    );
 }
 
 #[test]
@@ -1292,9 +2097,9 @@ print(json.dumps({
         .arg("contract-test-commit")
         .arg(ROWS_PER_THREAD.to_string())
         .arg("true")
-        .arg("fsqlite.perf_regression_gate.baseline.v3")
-        .arg("fsqlite.perf_regression_gate.result.v2")
-        .arg("fsqlite-e2e.mt_mvcc_bench_report.v6")
+        .arg(BASELINE_SCHEMA)
+        .arg(GATE_SCHEMA)
+        .arg(REPORT_SCHEMA)
         .arg(ITERATIONS.to_string())
         .arg("0.05")
         .arg("0.0")

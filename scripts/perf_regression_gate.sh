@@ -18,7 +18,7 @@ set -euo pipefail
 # owner specifies an equivalence margin or other statistically decidable rule;
 # do not silently weaken the threshold here.
 #
-# The underlying v6 benchmark report is explicitly non-citable. A green result
+# The underlying v7 benchmark report is explicitly non-citable. A green result
 # here is useful as a same-environment development guard, but it is not by
 # itself sufficient release evidence.
 #
@@ -33,14 +33,14 @@ set -euo pipefail
 #   --analyze-only:      skip Cargo and analyze an existing report (test/debug)
 #
 # Artifacts:
-#   $TARGET_DIR/regression_gate_runs/$RUN_ID/current.json  raw v6 report
+#   $TARGET_DIR/regression_gate_runs/$RUN_ID/current.json  raw v7 report
 #   $TARGET_DIR/regression_gate_runs/$RUN_ID/result.json   guard verdict
 #   $BASELINE_DIR/latest.json                              baseline envelope
 
 readonly BEAD_ID="bd-zywqc.2"
-readonly GATE_SCHEMA="fsqlite.perf_regression_gate.result.v2"
-readonly BASELINE_SCHEMA="fsqlite.perf_regression_gate.baseline.v3"
-readonly REPORT_SCHEMA="fsqlite-e2e.mt_mvcc_bench_report.v6"
+readonly GATE_SCHEMA="fsqlite.perf_regression_gate.result.v3"
+readonly BASELINE_SCHEMA="fsqlite.perf_regression_gate.baseline.v4"
+readonly REPORT_SCHEMA="fsqlite-e2e.mt_mvcc_bench_report.v7"
 readonly ITERATIONS=21
 readonly MAX_FSQLITE_WPS_DROP_1T=0.05
 readonly MAX_FSQLITE_WPS_DROP_8T=0.0
@@ -194,14 +194,17 @@ if [[ "$ANALYZE_ONLY_REQUESTED" = true ]]; then
     echo "[$BEAD_ID] Analyze-only source: $ANALYZE_ONLY"
     echo "[$BEAD_ID] Analyze-only snapshot: $CURRENT_JSON"
 else
-    # mt-mvcc-bench updates its history file for every structurally valid run,
-    # including regressions. Give it a disposable, per-invocation path so the
-    # immutable guard baseline can only change through --capture-baseline.
+    # V7 cannot authenticate historical input and therefore must never create or
+    # update its history path. Give it a fresh per-invocation path so both the
+    # emitted receipt and the path's continued absence can be verified.
     HISTORY_JSON="$RUN_DIR/disposable_history.json"
     EXPECTED_HISTORY_JSON="$HISTORY_JSON"
     echo "[$BEAD_ID] Running paired mt-mvcc-bench (threads 1,8) ..."
     set +e
-    env CARGO_TARGET_DIR="$TARGET_DIR" cargo run -p fsqlite-e2e \
+    env CARGO_TARGET_DIR="$TARGET_DIR" \
+        FSQLITE_BENCH_PROFILE_NAME=release-perf \
+        FSQLITE_BENCH_BUILD_NONCE="$RUN_ID" \
+        cargo run -p fsqlite-e2e \
         --bin mt-mvcc-bench --profile release-perf -- \
         --threads=1,8 \
         --rows-per-thread="$ROWS_PER_THREAD" \
@@ -214,6 +217,10 @@ else
     tee_status="${pipeline_status[1]}"
     if [[ "$benchmark_status" -ne 0 || "$tee_status" -ne 0 ]]; then
         echo "[$BEAD_ID] FATAL: benchmark pipeline failed (benchmark=$benchmark_status, tee=$tee_status)" >&2
+        exit 2
+    fi
+    if [[ -e "$HISTORY_JSON" || -L "$HISTORY_JSON" ]]; then
+        echo "[$BEAD_ID] FATAL: non-citable v7 benchmark unexpectedly created its history path: $HISTORY_JSON" >&2
         exit 2
     fi
 fi
@@ -291,10 +298,17 @@ expected_timing_interpretation = (
     "teardown; worker_startup_elapsed_ns is reported separately."
 )
 expected_non_citable_reason = (
-    "v6 adds fail-closed settings, committed-work, integrity, timing, retry-policy, and "
-    "configuration receipts, but bd-uh1fv still requires external watchdog, sanitized "
-    "environment, matched retry/deadline semantics, complete build/toolchain provenance, "
-    "counterbalanced topology receipts, immutable manifest, and independent verification."
+    "v7 binds the running executable, build/runtime source identity, Cargo.lock, invocation, "
+    "toolchain, and measurement host to this same-invocation comparison, but bd-uh1fv still "
+    "requires external watchdog, sanitized environment, matched retry/deadline semantics, a "
+    "build-attested resolved dependency/feature-graph digest, counterbalanced topology receipts, "
+    "immutable manifest, retained baseline history, and independent verification."
+)
+expected_release_regression_scope = (
+    "Narrow same-process, same-host F/C writer-throughput comparison for only the requested "
+    "mt-mvcc-bench workload/configurations; this report does not cover the shipped release "
+    "profile, other workloads or platforms, long-term baseline retention, independent "
+    "reproduction, or overall release eligibility."
 )
 
 
@@ -411,6 +425,100 @@ def require_nonempty_string(value, label):
     if not isinstance(value, str) or not value:
         fail(f"{label} must be a non-empty string")
     return value
+
+
+def require_known_receipt_value(value, label):
+    value = require_nonempty_string(value, label)
+    normalized = value.strip()
+    if not normalized or normalized == "unknown" or normalized.startswith("unknown:"):
+        fail(f"{label} must be known")
+    return value
+
+
+def require_object(value, label, required_fields=()):
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    for field in required_fields:
+        if field not in value:
+            fail(f"{label}.{field} must be present")
+    return value
+
+
+def require_list(value, label):
+    if not isinstance(value, list):
+        fail(f"{label} must be an array")
+    return value
+
+
+def require_lower_hex(value, label, *, exact_bytes=None):
+    value = require_nonempty_string(value, label)
+    if (
+        len(value) % 2 != 0
+        or any(character not in "0123456789abcdef" for character in value)
+        or (exact_bytes is not None and len(value) != exact_bytes * 2)
+    ):
+        expected = (
+            "lowercase hexadecimal"
+            if exact_bytes is None
+            else f"exactly {exact_bytes} bytes of lowercase hexadecimal"
+        )
+        fail(f"{label} must be {expected}")
+    return value
+
+
+def validate_complete_file_snapshot(value, label):
+    snapshot = require_object(
+        value,
+        label,
+        (
+            "sha256",
+            "bytes_read",
+            "metadata_size_bytes",
+            "unix_device",
+            "unix_inode",
+            "error",
+        ),
+    )
+    if snapshot["error"] is not None:
+        fail(f"{label}.error must be null for a complete snapshot")
+    sha256 = require_lower_hex(snapshot["sha256"], f"{label}.sha256", exact_bytes=32)
+    bytes_read = require_int(snapshot["bytes_read"], f"{label}.bytes_read", positive=True)
+    metadata_size = require_int(
+        snapshot["metadata_size_bytes"],
+        f"{label}.metadata_size_bytes",
+        positive=True,
+    )
+    if metadata_size != bytes_read:
+        fail(f"{label} byte count disagrees with file metadata")
+    unix_device = require_int(snapshot["unix_device"], f"{label}.unix_device")
+    unix_inode = require_int(snapshot["unix_inode"], f"{label}.unix_inode", positive=True)
+    if unix_device < 0:
+        fail(f"{label}.unix_device must be non-negative")
+    return {
+        "sha256": sha256,
+        "bytes_read": bytes_read,
+        "metadata_size_bytes": metadata_size,
+        "unix_device": unix_device,
+        "unix_inode": unix_inode,
+    }
+
+
+def validate_stable_file_snapshots(before, after, label):
+    before_identity = validate_complete_file_snapshot(before, f"{label}.before_measurement")
+    after_identity = validate_complete_file_snapshot(after, f"{label}.after_measurement")
+    if before_identity != after_identity:
+        fail(f"{label} changed during measurement")
+    return before_identity
+
+
+def validate_hex_blob(value, label):
+    if not isinstance(value, str):
+        fail(f"{label} must be a hexadecimal string")
+    if len(value) % 2 != 0 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        fail(f"{label} must be lowercase hexadecimal")
+    return bytes.fromhex(value)
 
 
 def arithmetic_mean(values):
@@ -621,7 +729,7 @@ def expected_median_ci_contract(null_ratios, claim_ratios):
 
 def validate_median_ci_contract(observed, expected, label):
     if set(observed) != set(expected):
-        fail(f"{label} fields do not match the v6 median-CI contract")
+        fail(f"{label} fields do not match the v7 median-CI contract")
     for field, expected_value in expected.items():
         observed_value = observed[field]
         if isinstance(expected_value, float):
@@ -629,16 +737,567 @@ def validate_median_ci_contract(observed, expected, label):
             if not close_enough(observed_number, expected_value):
                 fail(f"{label}.{field} disagrees with raw paired samples")
         elif observed_value != expected_value:
-            fail(f"{label}.{field} disagrees with the v6 median-CI contract")
+            fail(f"{label}.{field} disagrees with the v7 median-CI contract")
 
 
-def validate_report(report, label, required_history_path=None):
+def validate_report(
+    report,
+    label,
+    required_history_path=None,
+    required_build_nonce=None,
+):
     if report.get("schema_version") != report_schema:
         fail(f"{label}.schema_version must be {report_schema}")
     if report.get("citable") is not False:
-        fail(f"{label}.citable must be false for the diagnostic-only v6 schema")
+        fail(f"{label}.citable must be false for the diagnostic-only v7 schema")
+    if report.get("measurement_evidence_valid") is not True:
+        fail(f"{label}.measurement_evidence_valid must be true")
     if report.get("non_citable_reason") != expected_non_citable_reason:
-        fail(f"{label}.non_citable_reason does not match the v6 contract")
+        fail(f"{label}.non_citable_reason does not match the v7 contract")
+    if report.get("release_regression_scope") != expected_release_regression_scope:
+        fail(f"{label}.release_regression_scope does not match the v7 contract")
+    if "release_eligible" in report or "release_evidence" in report:
+        fail(f"{label} must not claim release eligibility or release evidence")
+
+    subject_identity = require_object(
+        report.get("subject_identity"),
+        f"{label}.subject_identity",
+        ("executable", "build_source", "runtime_source", "cargo_lock"),
+    )
+    executable = require_object(
+        subject_identity["executable"],
+        f"{label}.subject_identity.executable",
+        (
+            "current_exe_path",
+            "canonical_path",
+            "path_resolution_error",
+            "process_id",
+            "before_measurement",
+            "after_measurement",
+            "unchanged_during_measurement",
+        ),
+    )
+    require_known_receipt_value(
+        executable["current_exe_path"],
+        f"{label}.subject_identity.executable.current_exe_path",
+    )
+    require_known_receipt_value(
+        executable["canonical_path"],
+        f"{label}.subject_identity.executable.canonical_path",
+    )
+    if executable["path_resolution_error"] is not None:
+        fail(f"{label}.subject_identity.executable.path_resolution_error must be null")
+    require_int(
+        executable["process_id"],
+        f"{label}.subject_identity.executable.process_id",
+        positive=True,
+    )
+    validate_stable_file_snapshots(
+        executable["before_measurement"],
+        executable["after_measurement"],
+        f"{label}.subject_identity.executable",
+    )
+    if executable["unchanged_during_measurement"] is not True:
+        fail(
+            f"{label}.subject_identity.executable.unchanged_during_measurement "
+            "must be true"
+        )
+
+    build_source = require_object(
+        subject_identity["build_source"],
+        f"{label}.subject_identity.build_source",
+        (
+            "workspace_root",
+            "git_sha",
+            "git_branch",
+            "git_tree_state",
+            "build_nonce",
+            "build_input_tracking",
+        ),
+    )
+    for field in ("workspace_root", "git_sha", "git_branch"):
+        require_known_receipt_value(
+            build_source[field], f"{label}.subject_identity.build_source.{field}"
+        )
+    if build_source["git_tree_state"] != "clean":
+        fail(f"{label}.subject_identity.build_source.git_tree_state must be clean")
+    build_nonce = require_known_receipt_value(
+        build_source["build_nonce"],
+        f"{label}.subject_identity.build_source.build_nonce",
+    )
+    if required_build_nonce is not None and build_nonce != required_build_nonce:
+        fail(
+            f"{label}.subject_identity.build_source.build_nonce does not match its measured run"
+        )
+    if build_source["build_input_tracking"] != "complete":
+        fail(
+            f"{label}.subject_identity.build_source.build_input_tracking must be complete"
+        )
+
+    runtime_source = require_object(
+        subject_identity["runtime_source"],
+        f"{label}.subject_identity.runtime_source",
+        (
+            "before_measurement",
+            "after_measurement",
+            "same_clean_git_identity_at_capture_points",
+            "stability_limitation",
+        ),
+    )
+    runtime_canonical_roots = []
+    runtime_branches = []
+    for field in ("before_measurement", "after_measurement"):
+        runtime_label = f"{label}.subject_identity.runtime_source.{field}"
+        runtime_capture = require_object(
+            runtime_source[field],
+            runtime_label,
+            (
+                "workspace_root",
+                "canonical_workspace_root",
+                "git_sha",
+                "git_branch",
+                "git_tree_state",
+                "matches_build_git_sha",
+                "discovery_errors",
+            ),
+        )
+        if (
+            require_known_receipt_value(
+                runtime_capture["workspace_root"], f"{runtime_label}.workspace_root"
+            )
+            != build_source["workspace_root"]
+        ):
+            fail(f"{runtime_label}.workspace_root does not match the embedded build")
+        runtime_canonical_roots.append(
+            require_known_receipt_value(
+                runtime_capture["canonical_workspace_root"],
+                f"{runtime_label}.canonical_workspace_root",
+            )
+        )
+        if runtime_canonical_roots[-1] != build_source["workspace_root"]:
+            fail(
+                f"{runtime_label}.canonical_workspace_root does not match the embedded build"
+            )
+        runtime_git_sha = require_known_receipt_value(
+            runtime_capture["git_sha"], f"{runtime_label}.git_sha"
+        )
+        runtime_branches.append(
+            require_known_receipt_value(
+                runtime_capture["git_branch"], f"{runtime_label}.git_branch"
+            )
+        )
+        if runtime_git_sha != build_source["git_sha"]:
+            fail(f"{runtime_label}.git_sha does not match the embedded build")
+        if runtime_capture["git_tree_state"] != "clean":
+            fail(f"{runtime_label}.git_tree_state must be clean")
+        if runtime_capture["matches_build_git_sha"] is not True:
+            fail(f"{runtime_label}.matches_build_git_sha must be true")
+        discovery_errors = require_list(
+            runtime_capture["discovery_errors"],
+            f"{runtime_label}.discovery_errors",
+        )
+        if discovery_errors:
+            fail(f"{runtime_label}.discovery_errors must be empty")
+    if runtime_canonical_roots[0] != runtime_canonical_roots[1]:
+        fail(f"{label}.subject_identity.runtime_source workspace changed during measurement")
+    if runtime_branches[0] != runtime_branches[1]:
+        fail(f"{label}.subject_identity.runtime_source branch changed during measurement")
+    if runtime_source["same_clean_git_identity_at_capture_points"] is not True:
+        fail(
+            f"{label}.subject_identity.runtime_source."
+            "same_clean_git_identity_at_capture_points must be true"
+        )
+    require_known_receipt_value(
+        runtime_source["stability_limitation"],
+        f"{label}.subject_identity.runtime_source.stability_limitation",
+    )
+
+    cargo_lock = require_object(
+        subject_identity["cargo_lock"],
+        f"{label}.subject_identity.cargo_lock",
+        (
+            "embedded_build_sha256",
+            "embedded_build_size_bytes",
+            "runtime_path",
+            "before_measurement",
+            "after_measurement",
+            "before_matches_embedded_build",
+            "after_matches_embedded_build",
+            "unchanged_at_capture_points",
+        ),
+    )
+    embedded_lock_sha256 = require_lower_hex(
+        cargo_lock["embedded_build_sha256"],
+        f"{label}.subject_identity.cargo_lock.embedded_build_sha256",
+        exact_bytes=32,
+    )
+    embedded_lock_size = require_int(
+        cargo_lock["embedded_build_size_bytes"],
+        f"{label}.subject_identity.cargo_lock.embedded_build_size_bytes",
+        positive=True,
+    )
+    require_known_receipt_value(
+        cargo_lock["runtime_path"], f"{label}.subject_identity.cargo_lock.runtime_path"
+    )
+    lock_snapshot = validate_stable_file_snapshots(
+        cargo_lock["before_measurement"],
+        cargo_lock["after_measurement"],
+        f"{label}.subject_identity.cargo_lock",
+    )
+    if (
+        lock_snapshot["sha256"] != embedded_lock_sha256
+        or lock_snapshot["bytes_read"] != embedded_lock_size
+    ):
+        fail(f"{label}.subject_identity.cargo_lock does not match the embedded build")
+    for field in (
+        "before_matches_embedded_build",
+        "after_matches_embedded_build",
+        "unchanged_at_capture_points",
+    ):
+        if cargo_lock[field] is not True:
+            fail(f"{label}.subject_identity.cargo_lock.{field} must be true")
+    comparison_environment = require_object(
+        report.get("comparison_environment"),
+        f"{label}.comparison_environment",
+        ("build_configuration", "invocation", "measurement_host"),
+    )
+    build_configuration = require_object(
+        comparison_environment["build_configuration"],
+        f"{label}.comparison_environment.build_configuration",
+        (
+            "cargo_profile",
+            "selected_profile",
+            "profile_label",
+            "opt_level",
+            "debug",
+            "target",
+            "build_host",
+            "enabled_features",
+            "rustflags",
+            "profile_overrides_hex",
+            "native_build_overrides_hex",
+            "rustc_version_verbose",
+            "cargo_version",
+            "resolved_dependency_feature_graph_sha256",
+            "resolved_dependency_feature_graph_limitation",
+        ),
+    )
+    if (
+        build_configuration.get("selected_profile") != "release-perf"
+        or build_configuration.get("profile_label") != "release-perf"
+    ):
+        fail(f"{label} was not built with the release-perf profile")
+    for field in (
+        "cargo_profile",
+        "opt_level",
+        "debug",
+        "target",
+        "build_host",
+        "rustc_version_verbose",
+        "cargo_version",
+    ):
+        require_known_receipt_value(
+            build_configuration[field],
+            f"{label}.comparison_environment.build_configuration.{field}",
+        )
+    enabled_features = require_list(
+        build_configuration["enabled_features"],
+        f"{label}.comparison_environment.build_configuration.enabled_features",
+    )
+    if any(not isinstance(feature, str) or not feature for feature in enabled_features):
+        fail(
+            f"{label}.comparison_environment.build_configuration.enabled_features "
+            "must contain non-empty strings"
+        )
+    if enabled_features != sorted(set(enabled_features)):
+        fail(
+            f"{label}.comparison_environment.build_configuration.enabled_features "
+            "must be sorted and unique"
+        )
+    rustflags = require_object(
+        build_configuration["rustflags"],
+        f"{label}.comparison_environment.build_configuration.rustflags",
+        (
+            "cargo_encoded_rustflags_present",
+            "encoded_hex",
+            "decoded_arguments",
+            "decode_error",
+        ),
+    )
+    if not isinstance(rustflags["cargo_encoded_rustflags_present"], bool):
+        fail(
+            f"{label}.comparison_environment.build_configuration.rustflags."
+            "cargo_encoded_rustflags_present must be boolean"
+        )
+    if rustflags["decode_error"] is not None:
+        fail(
+            f"{label}.comparison_environment.build_configuration.rustflags.decode_error "
+            "must be null"
+        )
+    encoded_rustflags = validate_hex_blob(
+        rustflags["encoded_hex"],
+        f"{label}.comparison_environment.build_configuration.rustflags.encoded_hex",
+    )
+    if not rustflags["cargo_encoded_rustflags_present"] and encoded_rustflags:
+        fail(
+            f"{label}.comparison_environment.build_configuration.rustflags "
+            "claims absent CARGO_ENCODED_RUSTFLAGS but contains bytes"
+        )
+    try:
+        decoded_rustflags = encoded_rustflags.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(
+            f"{label}.comparison_environment.build_configuration.rustflags "
+            f"are not UTF-8: {error}"
+        )
+    expected_decoded_arguments = [
+        argument for argument in decoded_rustflags.split("\x1f") if argument
+    ]
+    decoded_arguments = require_list(
+        rustflags["decoded_arguments"],
+        f"{label}.comparison_environment.build_configuration.rustflags.decoded_arguments",
+    )
+    if decoded_arguments != expected_decoded_arguments:
+        fail(
+            f"{label}.comparison_environment.build_configuration.rustflags."
+            "decoded_arguments disagree with encoded_hex"
+        )
+    validate_hex_blob(
+        build_configuration["profile_overrides_hex"],
+        f"{label}.comparison_environment.build_configuration.profile_overrides_hex",
+    )
+    validate_hex_blob(
+        build_configuration["native_build_overrides_hex"],
+        f"{label}.comparison_environment.build_configuration.native_build_overrides_hex",
+    )
+    require_known_receipt_value(
+        build_configuration["resolved_dependency_feature_graph_limitation"],
+        f"{label}.comparison_environment.build_configuration."
+        "resolved_dependency_feature_graph_limitation",
+    )
+    invocation = require_object(
+        comparison_environment["invocation"],
+        f"{label}.comparison_environment.invocation",
+        ("argv_lossy", "argv_raw_hex", "raw_encoding", "length_prefixed_argv_sha256"),
+    )
+    argv_lossy = require_list(
+        invocation["argv_lossy"], f"{label}.comparison_environment.invocation.argv_lossy"
+    )
+    argv_raw_hex = require_list(
+        invocation["argv_raw_hex"],
+        f"{label}.comparison_environment.invocation.argv_raw_hex",
+    )
+    if not argv_lossy or len(argv_lossy) != len(argv_raw_hex):
+        fail(f"{label}.comparison_environment.invocation argv receipts are incomplete")
+    if any(not isinstance(argument, str) for argument in argv_lossy):
+        fail(f"{label}.comparison_environment.invocation.argv_lossy must contain strings")
+    require_known_receipt_value(
+        invocation["raw_encoding"],
+        f"{label}.comparison_environment.invocation.raw_encoding",
+    )
+    canonical_argv = bytearray()
+    for index, encoded_argument in enumerate(argv_raw_hex):
+        raw_argument = validate_hex_blob(
+            encoded_argument,
+            f"{label}.comparison_environment.invocation.argv_raw_hex[{index}]",
+        )
+        canonical_argv.extend(len(raw_argument).to_bytes(8, byteorder="little"))
+        canonical_argv.extend(raw_argument)
+    invocation_sha256 = require_lower_hex(
+        invocation["length_prefixed_argv_sha256"],
+        f"{label}.comparison_environment.invocation.length_prefixed_argv_sha256",
+        exact_bytes=32,
+    )
+    if hashlib.sha256(canonical_argv).hexdigest() != invocation_sha256:
+        fail(f"{label}.comparison_environment.invocation digest disagrees with raw argv")
+    measurement_host = require_object(
+        comparison_environment["measurement_host"],
+        f"{label}.comparison_environment.measurement_host",
+        ("host", "before_measurement", "after_measurement"),
+    )
+    static_host = require_object(
+        measurement_host["host"],
+        f"{label}.comparison_environment.measurement_host.host",
+        (
+            "hostname",
+            "cpu_model",
+            "available_parallelism",
+            "cpu_online",
+            "cpu_present",
+            "cpu_possible",
+            "cpu_isolated",
+            "cpu_topology",
+            "scaling_governors_by_cpu",
+            "kernel_release",
+            "kernel_version",
+            "numa_online_nodes",
+            "numa_possible_nodes",
+            "numa_node_directories",
+            "unavailable_fields",
+        ),
+    )
+    for field in (
+        "hostname",
+        "cpu_model",
+        "cpu_online",
+        "cpu_present",
+        "cpu_possible",
+        "kernel_release",
+        "kernel_version",
+    ):
+        require_known_receipt_value(
+            static_host[field],
+            f"{label}.comparison_environment.measurement_host.host.{field}",
+        )
+    host_available_parallelism = require_int(
+        static_host["available_parallelism"],
+        f"{label}.comparison_environment.measurement_host.host.available_parallelism",
+        positive=True,
+    )
+    cpu_topology = require_object(
+        static_host["cpu_topology"],
+        f"{label}.comparison_environment.measurement_host.host.cpu_topology",
+        ("logical_cpu_directories", "physical_package_count", "physical_core_count"),
+    )
+    require_int(
+        cpu_topology["logical_cpu_directories"],
+        f"{label}.comparison_environment.measurement_host.host.cpu_topology."
+        "logical_cpu_directories",
+        positive=True,
+    )
+    for field in ("physical_package_count", "physical_core_count"):
+        if cpu_topology[field] is not None:
+            require_int(
+                cpu_topology[field],
+                f"{label}.comparison_environment.measurement_host.host.cpu_topology.{field}",
+                positive=True,
+            )
+    governors = require_object(
+        static_host["scaling_governors_by_cpu"],
+        f"{label}.comparison_environment.measurement_host.host.scaling_governors_by_cpu",
+    )
+    if any(
+        not isinstance(cpu, str)
+        or not cpu
+        or not isinstance(governor, str)
+        or not governor
+        for cpu, governor in governors.items()
+    ):
+        fail(
+            f"{label}.comparison_environment.measurement_host.host."
+            "scaling_governors_by_cpu must map non-empty strings"
+        )
+    if static_host["cpu_isolated"] is not None:
+        require_nonempty_string(
+            static_host["cpu_isolated"],
+            f"{label}.comparison_environment.measurement_host.host.cpu_isolated",
+        )
+    for field in ("numa_online_nodes", "numa_possible_nodes"):
+        if static_host[field] is not None:
+            require_nonempty_string(
+                static_host[field],
+                f"{label}.comparison_environment.measurement_host.host.{field}",
+            )
+    if static_host["numa_node_directories"] is not None:
+        numa_node_directories = require_int(
+            static_host["numa_node_directories"],
+            f"{label}.comparison_environment.measurement_host.host.numa_node_directories",
+        )
+        if numa_node_directories < 0:
+            fail(
+                f"{label}.comparison_environment.measurement_host.host."
+                "numa_node_directories must be non-negative"
+            )
+    unavailable_fields = require_list(
+        static_host["unavailable_fields"],
+        f"{label}.comparison_environment.measurement_host.host.unavailable_fields",
+    )
+    if any(not isinstance(field, str) or not field for field in unavailable_fields):
+        fail(
+            f"{label}.comparison_environment.measurement_host.host.unavailable_fields "
+            "must contain non-empty strings"
+        )
+    if len(unavailable_fields) != len(set(unavailable_fields)):
+        fail(
+            f"{label}.comparison_environment.measurement_host.host.unavailable_fields "
+            "must be unique"
+        )
+    expected_unavailable_fields = [
+        field
+        for field in (
+            "hostname",
+            "cpu_model",
+            "available_parallelism",
+            "cpu_online",
+            "cpu_present",
+            "cpu_possible",
+            "kernel_release",
+            "kernel_version",
+            "numa_online_nodes",
+            "numa_possible_nodes",
+            "numa_node_directories",
+        )
+        if static_host[field] is None
+    ]
+    if static_host["cpu_isolated"] is None:
+        expected_unavailable_fields.append("cpu_isolated")
+    if not governors:
+        expected_unavailable_fields.append("scaling_governors_by_cpu")
+    if unavailable_fields != expected_unavailable_fields:
+        fail(
+            f"{label}.comparison_environment.measurement_host.host.unavailable_fields "
+            "disagrees with the captured host fields"
+        )
+    dynamic_hosts = {}
+    for field in ("before_measurement", "after_measurement"):
+        dynamic_label = f"{label}.comparison_environment.measurement_host.{field}"
+        dynamic_host = require_object(
+            measurement_host[field],
+            dynamic_label,
+            (
+                "unix_epoch_millis",
+                "process_cpu_affinity_mask",
+                "process_cpu_affinity_list",
+                "proc_self_cgroup",
+                "cpuset_cpus_effective",
+                "cpuset_mems_effective",
+                "load_average",
+                "pressure_cpu",
+                "pressure_memory",
+                "pressure_io",
+            ),
+        )
+        require_int(
+            dynamic_host["unix_epoch_millis"],
+            f"{dynamic_label}.unix_epoch_millis",
+            positive=True,
+        )
+        for placement_field in (
+            "process_cpu_affinity_mask",
+            "process_cpu_affinity_list",
+            "proc_self_cgroup",
+            "cpuset_cpus_effective",
+            "cpuset_mems_effective",
+        ):
+            require_known_receipt_value(
+                dynamic_host[placement_field], f"{dynamic_label}.{placement_field}"
+            )
+        for optional_field in (
+            "load_average",
+            "pressure_cpu",
+            "pressure_memory",
+            "pressure_io",
+        ):
+            if dynamic_host[optional_field] is not None:
+                require_nonempty_string(
+                    dynamic_host[optional_field], f"{dynamic_label}.{optional_field}"
+                )
+        dynamic_hosts[field] = dynamic_host
+    if (
+        dynamic_hosts["after_measurement"]["unix_epoch_millis"]
+        < dynamic_hosts["before_measurement"]["unix_epoch_millis"]
+    ):
+        fail(f"{label} measurement host timestamps are reversed")
     if report.get("workload_shape") != "shared_table":
         fail(f"{label}.workload_shape must be shared_table")
     if require_int(report.get("rows_per_thread"), f"{label}.rows_per_thread", positive=True) != expected_rows:
@@ -656,7 +1315,7 @@ def validate_report(report, label, required_history_path=None):
     }
     for field, expected_interpretation in expected_interpretations.items():
         if report.get(field) != expected_interpretation:
-            fail(f"{label}.{field} does not match the v6 contract")
+            fail(f"{label}.{field} does not match the v7 contract")
 
     pass_over_pass = report.get("pass_over_pass_gate")
     if not isinstance(pass_over_pass, dict):
@@ -669,22 +1328,29 @@ def validate_report(report, label, required_history_path=None):
         pass_over_pass.get("comparable_pair_count"),
         f"{label}.pass_over_pass_gate.comparable_pair_count",
     )
+    previous_report_found = pass_over_pass.get("previous_report_found")
+    if not isinstance(previous_report_found, bool):
+        fail(f"{label}.pass_over_pass_gate.previous_report_found must be boolean")
     if (
         pass_over_pass.get("schema_version")
         != "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1"
         or not close_enough(pass_over_pass_threshold, 5.0)
-        or pass_over_pass.get("status") != "no_prior_report"
-        or pass_over_pass.get("previous_report_found") is not False
+        or pass_over_pass.get("status") != "disabled_non_citable"
         or comparable_pair_count != 0
         or pass_over_pass.get("regressions") != []
     ):
-        fail(f"{label}.pass_over_pass_gate is not the disposable-history v6 receipt")
+        fail(f"{label}.pass_over_pass_gate is not the disabled non-citable v7 receipt")
     history_path = require_nonempty_string(
         pass_over_pass.get("history_json_path"),
         f"{label}.pass_over_pass_gate.history_json_path",
     )
     if required_history_path is not None and history_path != required_history_path:
         fail(f"{label}.pass_over_pass_gate does not match its bound history path")
+    if measurement_mode == "measured" and required_history_path is not None:
+        if previous_report_found:
+            fail(f"{label}.pass_over_pass_gate unexpectedly found per-run history")
+        if os.path.lexists(history_path):
+            fail(f"{label}.pass_over_pass_gate history path must remain absent")
 
     receipts = report.get("configuration_receipts")
     rows = report.get("thread_results")
@@ -715,7 +1381,7 @@ def validate_report(report, label, required_history_path=None):
             positive=True,
         )
         if max_supported_writers != 128:
-            fail(f"{receipt_label}.max_supported_writers does not match the v6 contract")
+            fail(f"{receipt_label}.max_supported_writers does not match the v7 contract")
         if available_parallelism < writers:
             fail(f"{receipt_label} claims support beyond the measured machine capacity")
         available_parallelism_values.add(available_parallelism)
@@ -732,16 +1398,18 @@ def validate_report(report, label, required_history_path=None):
             receipt.get("wal_autocheckpoint_pages"),
             f"{receipt_label}.wal_autocheckpoint_pages",
         ) != 1_000:
-            fail(f"{receipt_label} does not use the v6 default checkpoint cadence")
+            fail(f"{receipt_label} does not use the v7 default checkpoint cadence")
         retry_policy = receipt.get("retry_policy")
         if retry_policy != expected_retry_policy(writers):
-            fail(f"{receipt_label} does not use the exact v6 retry-policy contract")
+            fail(f"{receipt_label} does not use the exact v7 retry-policy contract")
         require_nonempty_string(receipt.get("reason"), f"{receipt_label}.reason")
         receipts_by_thread[writers] = receipt
     if tuple(sorted(receipts_by_thread)) != required_threads:
         fail(f"{label} configurations must be exactly {required_threads}")
     if len(available_parallelism_values) != 1:
         fail(f"{label} configuration receipts disagree on available parallelism")
+    if available_parallelism_values != {host_available_parallelism}:
+        fail(f"{label} host and configuration receipts disagree on available parallelism")
 
     rows_by_thread = {}
     for index, row in enumerate(rows):
@@ -851,9 +1519,32 @@ def validate_report(report, label, required_history_path=None):
         }
         for threads, receipt in receipts_by_thread.items()
     }
+    placement_fields = (
+        "process_cpu_affinity_mask",
+        "process_cpu_affinity_list",
+        "proc_self_cgroup",
+        "cpuset_cpus_effective",
+        "cpuset_mems_effective",
+    )
+    placement_before = {
+        field: measurement_host["before_measurement"][field]
+        for field in placement_fields
+    }
+    placement_after = {
+        field: measurement_host["after_measurement"][field]
+        for field in placement_fields
+    }
+    if placement_before != placement_after:
+        fail(f"{label} CPU/cgroup placement changed during measurement")
+    measurement_comparability = {
+        "build_configuration": build_configuration,
+        "static_host": static_host,
+        "stable_process_placement": placement_before,
+    }
     return {
         "iterations": iterations,
         "history_json_path": history_path,
+        "measurement_comparability": measurement_comparability,
         "contract": {
             "settings_interpretation": report["settings_interpretation"],
             "accounting_interpretation": report["accounting_interpretation"],
@@ -1018,6 +1709,7 @@ try:
         current_report,
         "current report",
         required_current_history_path,
+        run_id if measurement_mode == "measured" else None,
     )
     if capture:
         baseline = {
@@ -1143,11 +1835,17 @@ try:
         baseline_report,
         "baseline report",
         baseline_history_path,
+        baseline_capture_run_id if measurement_mode == "measured" else None,
     )
     if baseline_validated["iterations"] != current_validated["iterations"]:
         fail("baseline and current reports use different iteration counts")
     if baseline_validated["contract"] != current_validated["contract"]:
         fail("baseline and current reports use incompatible benchmark configuration contracts")
+    if (
+        baseline_validated["measurement_comparability"]
+        != current_validated["measurement_comparability"]
+    ):
+        fail("baseline and current reports use incompatible v7 measurement environments")
 
     comparisons = []
     guard_status = "passed"
