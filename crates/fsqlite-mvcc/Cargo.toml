@@ -19,6 +19,9 @@ linux-asupersync-uring = ["fsqlite-pager/linux-asupersync-uring"]
 # default: the fast path (pages 1..=65536) is already lock-free CAS and the
 # sharded tail is rarely the bottleneck.
 mvcc-flat-combining = []
+# Opt-in test support for deterministic, production-shaped commit-combiner
+# evidence. Normal MVCC builds retain the uninstrumented hot path.
+commit-combiner-test-support = []
 
 [dependencies]
 blake3 = { workspace = true }
