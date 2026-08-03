@@ -75,6 +75,25 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   legacy-enabled SQLite may treat it as the string literal `token`. Use
   single-quoted SQL string literals. Ordinary double-quoted identifiers remain
   supported ([#148](https://github.com/Dicklesworthstone/frankensqlite/issues/148)).
+- **The low-level `fsqlite-mvcc::TransactionManager` API is not by itself an
+  SSI dependency collector.** Normal page reads and writes through that direct
+  API do not populate the dangerous-structure flags, so callers must not treat
+  it as a standalone serializable transaction layer. The connection pipeline's
+  dependency tracking is the supported Page-SSI surface
+  ([#189](https://github.com/Dicklesworthstone/frankensqlite/issues/189)).
+- **Default concurrent transactions do not yet reclaim committed freelist
+  pages below the current database size.** Reuse needs snapshot-safe retirement
+  evidence; until that exists, steady-state create/drop or delete/reinsert churn
+  can grow both `page_count` and the freelist
+  ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)).
+  The current insertion-based `VACUUM` rebuild can itself retain freed or
+  trailing pages, so v0.2.0 does not promise a zero-freelist or fixed-point
+  compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
+- **Cancelling an `AsyncConnection` call after dispatch stops the caller's
+  wait, not the already-running worker operation.** Dropping that connection
+  joins the worker and can therefore block until the in-flight operation
+  returns. Applications that require a hard kill deadline must currently use
+  process isolation ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
 
 ### Added
 

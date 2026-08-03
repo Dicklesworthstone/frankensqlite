@@ -99,6 +99,12 @@ Compatibility with existing SQLite databases is a core goal of the current runti
 
 `BEGIN CONCURRENT` targets SERIALIZABLE isolation rather than merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") rejects a transaction that would become a dangerous rw-antidependency pivot. PostgreSQL's SSI results are useful prior art, but they do not establish FrankenSQLite's overhead; that cost remains part of this project's release benchmark matrix. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew. When two writers touch the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder, otherwise the loser retries with `SQLITE_BUSY_SNAPSHOT`. Page-lock acquisition does not wait, so it cannot form a page-lock wait-for cycle.
 
+This guarantee belongs to the connection pipeline, which records the read/write
+dependencies consumed by Page-SSI. The lower-level
+`fsqlite-mvcc::TransactionManager` API does not infer those dependency flags
+from ordinary page reads and writes and must not be used by itself as a
+serializable transaction layer ([#189](https://github.com/Dicklesworthstone/frankensqlite/issues/189)).
+
 ### 6. Strong Types Over Runtime Checks
 
 Page numbers, transaction IDs, page sizes, error codes, opcode variants, and lock levels are all distinct Rust types (newtypes, enums), not bare integers. The compiler catches misuse that would be a runtime bug in C. A `PageNumber` cannot be accidentally passed where a `TxnId` is expected. A `PageSize` that isn't a power of two between 512 and 65536 cannot be constructed.
@@ -320,7 +326,7 @@ Transaction C and D both reach COMMIT:
 	     └── No (different leaf pages) → Both proceed and commit independently.
 ```
 
-The SSI check fires before the first-committer-wins check. This means write skew is caught even when the conflicting transactions touch disjoint pages, because SSI tracks read dependencies (via the `SireadTable`) across all pages.
+In the connection pipeline, the SSI check fires before the first-committer-wins check. This means write skew is caught even when the conflicting transactions touch disjoint pages, because the pipeline records read dependencies through the `SireadTable` across all pages. The direct `TransactionManager` caveat above still applies.
 
 ### MVCC Visibility Rules
 
@@ -490,7 +496,7 @@ Each cursor maintains a stack of `(page_number, cell_index)` pairs representing 
 
 ### Freelist Management
 
-Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. Default file-backed concurrent transactions do not reuse committed free pages at or below the current database size, even when no reader is active; snapshot-safe versioned reclamation is not yet implemented ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)), so steady-state churn may grow the file. VACUUM rewrites the entire database to reclaim freelist space and defragment pages.
+Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. Default file-backed concurrent transactions do not reuse committed free pages at or below the current database size, even when no reader is active; snapshot-safe versioned reclamation is not yet implemented ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)), so steady-state churn may grow the file. `VACUUM` rebuilds the database and can reclaim space, but the current insertion-based builder can retain pages freed during its own construction or leave trailing pages; v0.2.0 does not promise a zero-freelist, fixed-point compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
 
 ---
 
@@ -896,7 +902,7 @@ Every trait method that touches I/O, acquires locks, or could block accepts `&Cx
 
 Cx threads three capabilities through the entire call chain:
 
-- **Cancellation:** Any operation can be cancelled by its caller's context. Long queries check the cancellation token at VDBE instruction boundaries (every N opcodes) and return `SQLITE_INTERRUPT` if cancelled.
+- **Cancellation:** Pollable connection operations carry the caller's context, and long queries check its cancellation token at VDBE instruction boundaries (every N opcodes) and return `SQLITE_INTERRUPT` when they observe cancellation. The worker-backed `AsyncConnection` wrapper is narrower: cancellation after dispatch stops the caller's wait but does not interrupt the in-flight worker operation, and dropping the wrapper joins that worker ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
 - **Deadline propagation:** Timeout budgets flow through the entire call chain. A 5-second query deadline decrements as it passes through the parser, planner, and executor.
 - **Capability narrowing:** Callers can restrict what callees are allowed to do. A read-only connection's Cx prevents write operations at the capability level.
 
