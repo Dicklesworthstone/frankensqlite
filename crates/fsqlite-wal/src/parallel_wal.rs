@@ -2490,11 +2490,8 @@ pub struct ParallelWalDecisionRecord {
 /// Magic number for parallel WAL segment files.
 const SEGMENT_MAGIC: u32 = 0x5057_414C; // "PWAL"
 
-/// Version of the legacy epoch-only segment file format.
-const LEGACY_SEGMENT_VERSION: u16 = 1;
-
-/// Version of the lane-owned segment file format.
-const LANE_OWNED_SEGMENT_VERSION: u16 = 2;
+/// Version of the segment file format.
+const SEGMENT_VERSION: u16 = 1;
 
 /// Segment file header size in bytes.
 const SEGMENT_HEADER_SIZE: usize = 24;
@@ -2526,8 +2523,8 @@ pub enum FsyncPolicy {
 /// Layout (24 bytes):
 /// ```text
 /// [0..4]   magic: u32 (0x5057414C = "PWAL")
-/// [4..6]   version: u16 (`1` epoch-only, `2` lane-owned)
-/// [6..8]   lane id: u16 for version 2, zero-reserved for version 1
+/// [4..6]   version: u16
+/// [6..8]   reserved: u16 (for alignment)
 /// [8..16]  epoch: u64
 /// [16..20] record_count: u32
 /// [20..24] checksum: u32 (CRC32C of header fields 0..20)
@@ -2538,9 +2535,6 @@ pub struct SegmentHeader {
     pub epoch: u64,
     /// Number of records in this segment.
     pub record_count: u32,
-    /// The append lane which durably owns this segment. `None` denotes a
-    /// version-1 epoch-only segment, which remains readable for recovery.
-    pub lane_id: Option<u16>,
 }
 
 impl SegmentHeader {
@@ -2550,17 +2544,6 @@ impl SegmentHeader {
         Self {
             epoch,
             record_count,
-            lane_id: None,
-        }
-    }
-
-    /// Create a lane-owned header for a per-lane durable segment.
-    #[must_use]
-    pub const fn new_lane_owned(epoch: u64, lane_id: u16, record_count: u32) -> Self {
-        Self {
-            epoch,
-            record_count,
-            lane_id: Some(lane_id),
         }
     }
 
@@ -2569,15 +2552,8 @@ impl SegmentHeader {
     pub fn to_bytes(&self) -> [u8; SEGMENT_HEADER_SIZE] {
         let mut buf = [0u8; SEGMENT_HEADER_SIZE];
         buf[0..4].copy_from_slice(&SEGMENT_MAGIC.to_le_bytes());
-        let version = if self.lane_id.is_some() {
-            LANE_OWNED_SEGMENT_VERSION
-        } else {
-            LEGACY_SEGMENT_VERSION
-        };
-        buf[4..6].copy_from_slice(&version.to_le_bytes());
-        if let Some(lane_id) = self.lane_id {
-            buf[6..8].copy_from_slice(&lane_id.to_le_bytes());
-        }
+        buf[4..6].copy_from_slice(&SEGMENT_VERSION.to_le_bytes());
+        // buf[6..8] reserved
         buf[8..16].copy_from_slice(&self.epoch.to_le_bytes());
         buf[16..20].copy_from_slice(&self.record_count.to_le_bytes());
         // Compute CRC32C of bytes 0..20
@@ -2593,11 +2569,9 @@ impl SegmentHeader {
             return Err(format!("invalid segment magic: {magic:#x}"));
         }
         let version = u16::from_le_bytes([buf[4], buf[5]]);
-        if version != LEGACY_SEGMENT_VERSION && version != LANE_OWNED_SEGMENT_VERSION {
+        if version != SEGMENT_VERSION {
             return Err(format!("unsupported segment version: {version}"));
         }
-        let lane_id =
-            (version == LANE_OWNED_SEGMENT_VERSION).then(|| u16::from_le_bytes([buf[6], buf[7]]));
         let epoch = u64::from_le_bytes([
             buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ]);
@@ -2612,7 +2586,6 @@ impl SegmentHeader {
         Ok(Self {
             epoch,
             record_count,
-            lane_id,
         })
     }
 }
@@ -2628,75 +2601,27 @@ pub fn segment_path(db_path: &Path, epoch: u64) -> PathBuf {
     path
 }
 
-/// Generate the unique durable path for a lane-owned segment.
-///
-/// Unlike epoch-only segments, a lane-owned segment is created with
-/// `create_new` and can therefore never overwrite an existing durable record.
-#[must_use]
-pub fn lane_segment_path(db_path: &Path, epoch: u64, lane_id: u16) -> PathBuf {
-    let mut path = db_path.to_path_buf();
-    let file_name = path.file_name().map_or_else(
-        || "db".to_string(),
-        |name| name.to_string_lossy().to_string(),
-    );
-    path.set_file_name(format!(
-        "{file_name}-wal-seg-{epoch:016x}-lane-{lane_id:04x}"
-    ));
-    path
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SegmentPathIdentity {
-    epoch: u64,
-    lane_id: Option<u16>,
-    path: PathBuf,
-}
-
-fn list_segment_identities(db_path: &Path) -> io::Result<Vec<SegmentPathIdentity>> {
+/// List all segment files for a database, sorted by epoch.
+pub fn list_segments(db_path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-    let db_name = db_path.file_name().map_or_else(
-        || "db".to_string(),
-        |name| name.to_string_lossy().to_string(),
-    );
+    let db_name = db_path
+        .file_name()
+        .map_or_else(|| "db".to_string(), |n| n.to_string_lossy().to_string());
     let prefix = format!("{db_name}-wal-seg-");
 
     let mut segments = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(suffix) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        let (epoch_hex, lane_id) = match suffix.split_once("-lane-") {
-            Some((epoch_hex, lane_hex)) if lane_hex.len() == 4 => {
-                let Ok(lane_id) = u16::from_str_radix(lane_hex, 16) else {
-                    continue;
-                };
-                (epoch_hex, Some(lane_id))
+        let name_str = name.to_string_lossy();
+        if let Some(epoch_hex) = name_str.strip_prefix(&prefix) {
+            if let Ok(epoch) = u64::from_str_radix(epoch_hex, 16) {
+                segments.push((epoch, entry.path()));
             }
-            Some(_) => continue,
-            None => (suffix, None),
-        };
-        let Ok(epoch) = u64::from_str_radix(epoch_hex, 16) else {
-            continue;
-        };
-        segments.push(SegmentPathIdentity {
-            epoch,
-            lane_id,
-            path: entry.path(),
-        });
+        }
     }
-    segments.sort_by_key(|segment| (segment.epoch, segment.lane_id));
+    segments.sort_by_key(|(epoch, _)| *epoch);
     Ok(segments)
-}
-
-/// List all segment files for a database, sorted by epoch.
-pub fn list_segments(db_path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
-    Ok(list_segment_identities(db_path)?
-        .into_iter()
-        .map(|segment| (segment.epoch, segment.path))
-        .collect())
 }
 
 /// Write a segment file for the given epoch batch.
@@ -2767,260 +2692,6 @@ pub fn write_segment(
     }
 
     Ok(total_bytes)
-}
-
-/// Receipt for one lane-owned durable segment.
-///
-/// A receipt is emitted only after the lane's file has been flushed and the
-/// selected fsync policy has completed. The path, epoch, and lane id together
-/// are the recovery-visible ownership identity; no later lane can overwrite
-/// that segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParallelWalLaneSegmentReceipt {
-    pub epoch: u64,
-    pub lane_id: u16,
-    pub record_count: u32,
-    pub path: PathBuf,
-    pub bytes_written: usize,
-}
-
-/// Deterministic receipt for one multi-lane segment flush.
-///
-/// `peak_live_segment_writers` is an observed overlap count from the actual
-/// interval after a lane has exclusively created its durable segment and
-/// before that segment's flush/fsync returns. It is deliberately not a
-/// throughput proxy: `1` means the run serialized, while values above `1`
-/// prove distinct lane-owned durable segments were live concurrently.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParallelWalLaneSegmentFlushReceipt {
-    pub segments: Vec<ParallelWalLaneSegmentReceipt>,
-    pub peak_live_segment_writers: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParallelWalLaneSegmentOwnership {
-    epoch: u64,
-    lane_id: u16,
-    path: PathBuf,
-}
-
-#[derive(Debug, Default)]
-struct ParallelWalSegmentWriteTracker {
-    live_writers: AtomicU64,
-    peak_live_writers: AtomicU64,
-}
-
-impl ParallelWalSegmentWriteTracker {
-    fn owner_acquired(&self) -> ParallelWalSegmentWriteOwnerGuard<'_> {
-        let live = self.live_writers.fetch_add(1, Ordering::AcqRel) + 1;
-        let mut observed_peak = self.peak_live_writers.load(Ordering::Acquire);
-        while live > observed_peak {
-            match self.peak_live_writers.compare_exchange_weak(
-                observed_peak,
-                live,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => observed_peak = actual,
-            }
-        }
-        ParallelWalSegmentWriteOwnerGuard { tracker: self }
-    }
-
-    fn peak(&self) -> usize {
-        usize::try_from(self.peak_live_writers.load(Ordering::Acquire)).unwrap_or(usize::MAX)
-    }
-}
-
-struct ParallelWalSegmentWriteOwnerGuard<'a> {
-    tracker: &'a ParallelWalSegmentWriteTracker,
-}
-
-impl Drop for ParallelWalSegmentWriteOwnerGuard<'_> {
-    fn drop(&mut self) {
-        self.tracker.live_writers.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn split_lane_owned_segment_batches(
-    batch: &EpochFlushBatch,
-) -> io::Result<Vec<(u16, Vec<WalRecord>)>> {
-    let declared_records = batch
-        .records_per_core
-        .iter()
-        .try_fold(0_usize, |total, count| {
-            total.checked_add(*count).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "lane record counts overflow usize while splitting parallel WAL segment",
-                )
-            })
-        })?;
-    if declared_records != batch.records.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "lane record counts declare {declared_records} records but batch contains {}",
-                batch.records.len()
-            ),
-        ));
-    }
-
-    let mut offset = 0_usize;
-    let mut lane_batches = Vec::new();
-    for (lane_index, record_count) in batch.records_per_core.iter().enumerate() {
-        if *record_count == 0 {
-            continue;
-        }
-        let lane_id = u16::try_from(lane_index).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "lane count exceeds the u16 parallel WAL lane identity range",
-            )
-        })?;
-        let end = offset.checked_add(*record_count).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "lane record offset overflow while splitting parallel WAL segment",
-            )
-        })?;
-        let records = batch.records.get(offset..end).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "lane record counts exceed the parallel WAL batch length",
-            )
-        })?;
-        lane_batches.push((lane_id, records.to_vec()));
-        offset = end;
-    }
-    Ok(lane_batches)
-}
-
-fn write_lane_owned_segment<F>(
-    db_path: &Path,
-    epoch: u64,
-    lane_id: u16,
-    records: Vec<WalRecord>,
-    fsync_policy: FsyncPolicy,
-    tracker: &ParallelWalSegmentWriteTracker,
-    on_owner_acquired: F,
-) -> io::Result<ParallelWalLaneSegmentReceipt>
-where
-    F: FnOnce(&ParallelWalLaneSegmentOwnership),
-{
-    let ordered_records = ordered_segment_records(epoch, &records)?;
-    for record in &ordered_records {
-        validate_segment_record_images(record)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    }
-    let record_count = u32::try_from(ordered_records.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "lane-owned segment record count exceeds u32 header field",
-        )
-    })?;
-    let path = lane_segment_path(db_path, epoch, lane_id);
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    let owner = ParallelWalLaneSegmentOwnership {
-        epoch,
-        lane_id,
-        path: path.clone(),
-    };
-    let _owner_guard = tracker.owner_acquired();
-    on_owner_acquired(&owner);
-
-    let mut writer = BufWriter::new(file);
-    writer.write_all(&SegmentHeader::new_lane_owned(epoch, lane_id, record_count).to_bytes())?;
-    let mut total_bytes = SEGMENT_HEADER_SIZE;
-    for record in &ordered_records {
-        let record_bytes = serialize_record(record)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let len = u32::try_from(record_bytes.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "lane-owned segment record length exceeds u32 length prefix",
-            )
-        })?;
-        writer.write_all(&len.to_le_bytes())?;
-        writer.write_all(&record_bytes)?;
-        total_bytes += 4 + record_bytes.len();
-    }
-    writer.flush()?;
-    if fsync_policy == FsyncPolicy::Full || fsync_policy == FsyncPolicy::Normal {
-        writer.get_ref().sync_all()?;
-    }
-
-    Ok(ParallelWalLaneSegmentReceipt {
-        epoch,
-        lane_id,
-        record_count,
-        path,
-        bytes_written: total_bytes,
-    })
-}
-
-fn write_parallel_lane_segments_with_observer<F>(
-    db_path: &Path,
-    batch: &EpochFlushBatch,
-    fsync_policy: FsyncPolicy,
-    on_owner_acquired: F,
-) -> io::Result<ParallelWalLaneSegmentFlushReceipt>
-where
-    F: Fn(&ParallelWalLaneSegmentOwnership) + Send + Sync + 'static,
-{
-    let lane_batches = split_lane_owned_segment_batches(batch)?;
-    let tracker = Arc::new(ParallelWalSegmentWriteTracker::default());
-    let observer = Arc::new(on_owner_acquired);
-    let mut workers = Vec::with_capacity(lane_batches.len());
-    for (lane_id, records) in lane_batches {
-        let db_path = db_path.to_path_buf();
-        let tracker = Arc::clone(&tracker);
-        let observer = Arc::clone(&observer);
-        let epoch = batch.epoch;
-        workers.push(std::thread::spawn(move || {
-            write_lane_owned_segment(
-                &db_path,
-                epoch,
-                lane_id,
-                records,
-                fsync_policy,
-                tracker.as_ref(),
-                |ownership| observer(ownership),
-            )
-        }));
-    }
-
-    let mut segments = Vec::with_capacity(workers.len());
-    for worker in workers {
-        segments.push(
-            worker.join().map_err(|_| {
-                io::Error::other("lane-owned parallel WAL segment worker panicked")
-            })??,
-        );
-    }
-    segments.sort_by_key(|segment| segment.lane_id);
-    Ok(ParallelWalLaneSegmentFlushReceipt {
-        segments,
-        peak_live_segment_writers: tracker.peak(),
-    })
-}
-
-/// Persist every non-empty per-core lane as a distinct, collision-safe segment.
-///
-/// Records must be laid out in `records_per_core` lane order, which is the
-/// contract produced by [`EpochOrderCoordinator::flush_epoch`]. Recovery
-/// accepts both these version-2 lane-owned segments and pre-existing
-/// epoch-only version-1 segments, then canonicalizes the combined records.
-pub fn write_parallel_lane_segments(
-    db_path: &Path,
-    batch: &EpochFlushBatch,
-    fsync_policy: FsyncPolicy,
-) -> io::Result<ParallelWalLaneSegmentFlushReceipt> {
-    write_parallel_lane_segments_with_observer(db_path, batch, fsync_policy, |_| {})
 }
 
 /// Read a segment file and return the records.
@@ -3155,7 +2826,7 @@ pub fn recover_segments(
     db_path: &Path,
     options: SegmentRecoveryOptions,
 ) -> io::Result<(SegmentRecoveryResult, Vec<WalRecord>)> {
-    let segments = list_segment_identities(db_path)?;
+    let segments = list_segments(db_path)?;
 
     let mut result = SegmentRecoveryResult {
         segments_recovered: 0,
@@ -3168,9 +2839,7 @@ pub fn recover_segments(
 
     let mut all_records = Vec::new();
 
-    for (segment_index, segment) in segments.iter().enumerate() {
-        let epoch = segment.epoch;
-        let path = &segment.path;
+    for (segment_index, (epoch, path)) in segments.iter().enumerate() {
         // Get file size for byte tracking
         let metadata = fs::metadata(path)?;
         let file_size = metadata.len();
@@ -3178,15 +2847,14 @@ pub fn recover_segments(
         // Try to read the segment
         match read_segment(path) {
             Ok((header, records)) => {
-                if header.epoch != epoch || header.lane_id != segment.lane_id {
+                if header.epoch != *epoch {
                     let error = io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "segment {} has mismatched epoch or lane ownership: header epoch/lane={:?}/{:?}, filename epoch/lane={epoch:?}/{:?}",
+                            "segment {} has mismatched epoch: header={}, filename={}",
                             path.display(),
                             header.epoch,
-                            header.lane_id,
-                            segment.lane_id,
+                            epoch
                         ),
                     );
                     if options.skip_corrupt {
@@ -3197,7 +2865,7 @@ pub fn recover_segments(
                         result.partial_segments.extend(
                             segments[segment_index..]
                                 .iter()
-                                .map(|segment| segment.path.clone()),
+                                .map(|(_, path)| path.clone()),
                         );
                         break;
                     }
@@ -3207,7 +2875,7 @@ pub fn recover_segments(
                 result.segments_recovered += 1;
                 result.records_applied += records.len();
                 result.bytes_read += file_size;
-                result.epochs.push(epoch);
+                result.epochs.push(*epoch);
 
                 all_records.extend(records);
             }
@@ -3220,7 +2888,7 @@ pub fn recover_segments(
                     result.partial_segments.extend(
                         segments[segment_index..]
                             .iter()
-                            .map(|segment| segment.path.clone()),
+                            .map(|(_, path)| path.clone()),
                     );
                     break;
                 }
@@ -3236,8 +2904,8 @@ pub fn recover_segments(
     if options.delete_after_recovery {
         result.deletable_segments = segments
             .iter()
-            .filter(|segment| !result.partial_segments.contains(&segment.path))
-            .map(|segment| segment.path.clone())
+            .filter(|(_, path)| !result.partial_segments.contains(path))
+            .map(|(_, path)| path.clone())
             .collect();
     }
 
@@ -3957,7 +3625,7 @@ mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use std::path::PathBuf;
-    use std::sync::{Barrier, LazyLock, Mutex, MutexGuard};
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use crate::per_core_buffer::reset_slot_counter;
 
@@ -4807,117 +4475,6 @@ mod tests {
             Some(&vec![0x22; 8]),
             "recovery must replay the later commit last even if the flushed batch arrived out of order"
         );
-    }
-
-    #[test]
-    fn bd_3wop3_1_4_lane_owned_segments_have_distinct_durable_owners_and_overlap() {
-        use tempfile::tempdir;
-
-        let _guard = lane_test_guard();
-        let dir = tempdir().expect("create temp dir");
-        let db_path = dir.path().join("lane-owned.db");
-        let epoch = 9;
-        let batch = EpochFlushBatch {
-            epoch,
-            records: vec![
-                WalRecord {
-                    txn_token: TxnToken::new(
-                        fsqlite_types::TxnId::new(2).expect("txn id should be non-zero"),
-                        fsqlite_types::TxnEpoch::new(0),
-                    ),
-                    epoch,
-                    page_id: PageNumber::new(2).expect("page should be non-zero"),
-                    begin_seq: CommitSeq::new(200),
-                    end_seq: Some(CommitSeq::new(200)),
-                    before_image: Vec::new(),
-                    after_image: vec![0x22; 8],
-                },
-                WalRecord {
-                    txn_token: TxnToken::new(
-                        fsqlite_types::TxnId::new(1).expect("txn id should be non-zero"),
-                        fsqlite_types::TxnEpoch::new(0),
-                    ),
-                    epoch,
-                    page_id: PageNumber::new(1).expect("page should be non-zero"),
-                    begin_seq: CommitSeq::new(100),
-                    end_seq: Some(CommitSeq::new(100)),
-                    before_image: Vec::new(),
-                    after_image: vec![0x11; 8],
-                },
-            ],
-            records_per_core: vec![1, 1],
-        };
-        let ownership_barrier = Arc::new(Barrier::new(2));
-        let observed_owners = Arc::new(Mutex::new(Vec::new()));
-        let receipt =
-            write_parallel_lane_segments_with_observer(&db_path, &batch, FsyncPolicy::Full, {
-                let ownership_barrier = Arc::clone(&ownership_barrier);
-                let observed_owners = Arc::clone(&observed_owners);
-                move |ownership| {
-                    observed_owners
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push((ownership.epoch, ownership.lane_id, ownership.path.clone()));
-                    ownership_barrier.wait();
-                }
-            })
-            .expect("lane-owned segments should persist");
-
-        assert_eq!(receipt.peak_live_segment_writers, 2);
-        assert_eq!(receipt.segments.len(), 2);
-        assert_eq!(
-            receipt
-                .segments
-                .iter()
-                .map(|segment| segment.lane_id)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        let observed_owners = observed_owners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        assert_eq!(observed_owners.len(), 2);
-        assert!(
-            observed_owners
-                .iter()
-                .all(|(owner_epoch, _, _)| *owner_epoch == epoch),
-            "both live owners must belong to the flushed epoch"
-        );
-        assert_ne!(observed_owners[0].2, observed_owners[1].2);
-        for segment in &receipt.segments {
-            assert_eq!(
-                segment.path,
-                lane_segment_path(&db_path, epoch, segment.lane_id)
-            );
-            let (header, records) = read_segment(&segment.path).expect("segment should recover");
-            assert_eq!(header.lane_id, Some(segment.lane_id));
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].epoch, epoch);
-        }
-
-        let collision = write_parallel_lane_segments(&db_path, &batch, FsyncPolicy::Full)
-            .expect_err("a second owner must never overwrite an existing durable lane segment");
-        assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
-
-        let (recovery, recovered_records) =
-            recover_segments(&db_path, SegmentRecoveryOptions::default())
-                .expect("recovery should combine lane-owned segments deterministically");
-        assert_eq!(recovery.segments_recovered, 2);
-        assert_eq!(recovery.records_applied, 2);
-        assert_eq!(recovery.epochs, vec![epoch, epoch]);
-        assert_eq!(recovered_records[0].begin_seq, CommitSeq::new(100));
-        assert_eq!(recovered_records[1].begin_seq, CommitSeq::new(200));
-
-        let mut page_contents = HashMap::new();
-        recover_and_apply_segments(
-            &db_path,
-            &mut page_contents,
-            SegmentRecoveryOptions::default(),
-        )
-        .expect("lane-owned recovery should preserve both committed page images");
-        assert_eq!(page_contents.get(&1), Some(&vec![0x11; 8]));
-        assert_eq!(page_contents.get(&2), Some(&vec![0x22; 8]));
     }
 
     #[test]
