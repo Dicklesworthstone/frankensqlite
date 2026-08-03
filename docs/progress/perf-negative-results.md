@@ -48,6 +48,36 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-03 - REJECTED DEFAULT: conflict-topology split policy uses process-global, cross-database state
+
+- Target workload: `mt-mvcc-bench` `shared_table`, 300 rows per thread, at 2,
+  4, and 8 threads. The candidate touched conflict-heat publication in
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` and split advice in
+  `crates/fsqlite-btree/src/instrumentation.rs` and `balance.rs`.
+- Historical evidence: commit `9ef87fdc` recorded three iterations per point in
+  `tests/artifacts/perf/bd-1dp9-6-7-13-2-conflict-topology-20260520T0030Z/`
+  (the artifact files were later untracked by `db922b5a` but remain readable
+  from the introducing commit). Enforced mode improved the isolated 2-thread
+  and 8-thread medians, but regressed the 4-thread FrankenSQLite median from
+  159,173 to 141,595 writes/s (about 11%). The runs were not interleaved, had
+  no A/A null control, reported `no_prior_report`, and their C SQLite control
+  medians also moved substantially, so they do not satisfy the current keep
+  gate.
+- Correctness and contention finding: non-baseline modes use one process-global
+  `Mutex<BTreeMap<PageNumber, ...>>`. Eligible local leaf splits and FCW/SSI
+  conflict recording from otherwise independent databases can serialize on
+  that mutex. Because the key omits database identity, heat and bounded
+  deflection credits for page N in one database can alter decisions for page N
+  in another database.
+- Result: reject `Enforced` as the shipped default and restore `Baseline`.
+  Explicit advisory/enforced overrides remain experimental; default operation
+  bypasses both the heat-update lock and the split-advice lock.
+- Retry only after the state is database-owned and lifecycle-bound, with a
+  non-vacuous two-database isolation keeper plus a counterbalanced A/A and A/B
+  release-perf matrix that exercises non-rightmost local leaf splits. Merely
+  sharding the process-global map or adding database identity under the same
+  global lock does not satisfy the retry condition.
+
 ## 2026-08-02 - INVALIDATED ATTRIBUTION: small-row DML component counters are observer-dominated; scored F/C rows were never inflated (bd-he3ua)
 
 - Target workload: `comprehensive_bench` small-row INSERT profiling, especially

@@ -268,7 +268,13 @@ const ADAPTIVE_FILL_FACTOR_MAX_EXTRA_SHIFT_BPS: usize = 1_500;
 const ADAPTIVE_FILL_FACTOR_LEFT_FLOOR_BPS: usize = 1_500;
 const ADAPTIVE_FILL_FACTOR_RIGHT_CEIL_BPS: usize = 9_000;
 
-static CONFLICT_TOPOLOGY_POLICY_MODE: AtomicU64 = AtomicU64::new(2);
+// Non-baseline modes currently retain process-global, page-number-keyed state.
+// Keep them operator-opt-in until that state is owned by an individual database:
+// enabling them by default would let independent databases serialize here and
+// influence one another's split advice for the same page number.
+const CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW: u64 = 0;
+static CONFLICT_TOPOLOGY_POLICY_MODE: AtomicU64 =
+    AtomicU64::new(CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW);
 static CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
 static ADAPTIVE_FILL_FACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static ADAPTIVE_FILL_FACTOR_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
@@ -473,6 +479,10 @@ pub fn set_conflict_topology_policy_mode(mode: ConflictTopologyPolicyMode) {
 }
 
 /// Current rollout mode for conflict-topology split policy.
+///
+/// The default is [`ConflictTopologyPolicyMode::Baseline`]. Advisory and
+/// enforced modes are experimental operator overrides until their mutable heat
+/// state is scoped to a single database rather than the whole process.
 #[must_use]
 pub fn conflict_topology_policy_mode() -> ConflictTopologyPolicyMode {
     apply_conflict_topology_policy_env_once();
@@ -1838,6 +1848,11 @@ mod tests {
 
         // from_raw maps any out-of-range value to Enforced (defensive default).
         assert_eq!(ConflictTopologyPolicyMode::from_raw(99), Enforced);
+        assert_eq!(
+            ConflictTopologyPolicyMode::from_raw(super::CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW),
+            Baseline,
+            "the shipped default must bypass process-global conflict-topology state"
+        );
     }
 
     #[test]
