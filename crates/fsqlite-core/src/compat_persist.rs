@@ -5806,15 +5806,29 @@ PRAGMA integrity_check;
                 "ord".to_owned()
             ]
         );
+        // Collation names are compared case-insensitively by SQLite
+        // (`sqlite3_strnicmp`), so `key_collations` carries semantic schema
+        // state rather than source spelling. Assert the identity of all four
+        // names — including that `COLLATE DESC` binds a collation *named*
+        // `DESC` rather than being absorbed as a sort direction — without
+        // pinning the case a binder happens to emit. The length and `Some`
+        // checks stay explicit so a dropped or `None` term still fails.
+        let expected_collations = ["RTRIM", "BINARY", "DESC", "DESC"];
         assert_eq!(
-            idx.key_collations,
-            vec![
-                Some("RTRIM".to_owned()),
-                Some("BINARY".to_owned()),
-                Some("DESC".to_owned()),
-                Some("DESC".to_owned())
-            ]
+            idx.key_collations.len(),
+            expected_collations.len(),
+            "every key term must bind a collation: {:?}",
+            idx.key_collations
         );
+        for (term, expected) in expected_collations.iter().enumerate() {
+            let actual = idx.key_collations[term].as_deref().unwrap_or_else(|| {
+                panic!("term {term} must bind collation `{expected}`, found None")
+            });
+            assert!(
+                actual.eq_ignore_ascii_case(expected),
+                "term {term} must bind collation `{expected}` (case-insensitively), found `{actual}`"
+            );
+        }
         assert_eq!(
             idx.key_sort_directions,
             vec![
@@ -6441,7 +6455,10 @@ PRAGMA integrity_check;
                     2,
                     Some("CREATE TABLE other(a)"),
                 )],
-                "declares `other`",
+                // The CREATE TABLE arm names the rejection class before the
+                // offending name (compat_persist.rs:709), unlike the virtual
+                // table arm below, which still renders `declares \`{}\``.
+                "differently named table `other`",
             ),
             (
                 "layout conflict mapping",
