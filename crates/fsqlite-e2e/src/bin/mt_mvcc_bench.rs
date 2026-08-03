@@ -1077,6 +1077,212 @@ fn collect_dynamic_measurement_host() -> DynamicMeasurementHostReceipt {
     }
 }
 
+fn is_known_receipt_value(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value != "unknown" && !value.starts_with("unknown:")
+}
+
+fn file_snapshot_is_complete(snapshot: &FileSnapshotReceipt) -> bool {
+    snapshot.error.is_none()
+        && snapshot
+            .sha256
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && snapshot.bytes_read.is_some_and(|bytes| bytes > 0)
+        && snapshot.metadata_size_bytes == snapshot.bytes_read
+        && matches!(
+            (snapshot.unix_device, snapshot.unix_inode),
+            (Some(_), Some(_)) | (None, None)
+        )
+}
+
+fn executable_identity_is_valid(executable: &ExecutableIdentityReceipt) -> bool {
+    executable
+        .current_exe_path
+        .as_deref()
+        .is_some_and(is_known_receipt_value)
+        && executable
+            .canonical_path
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && executable.path_resolution_error.is_none()
+        && executable.process_id != 0
+        && file_snapshot_is_complete(&executable.before_measurement)
+        && file_snapshot_is_complete(&executable.after_measurement)
+        && file_snapshots_match(
+            &executable.before_measurement,
+            &executable.after_measurement,
+        ) == Some(true)
+        && executable.unchanged_during_measurement == Some(true)
+}
+
+fn runtime_source_capture_is_valid(
+    capture: &RuntimeSourceIdentityReceipt,
+    build_source: &BuildSourceIdentityReceipt,
+) -> bool {
+    capture.workspace_root == build_source.workspace_root
+        && capture
+            .canonical_workspace_root
+            .as_deref()
+            .is_some_and(|root| root == build_source.workspace_root)
+        && capture
+            .git_sha
+            .as_deref()
+            .is_some_and(|sha| sha == build_source.git_sha)
+        && capture
+            .git_branch
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && capture.git_tree_state == "clean"
+        && capture.matches_build_git_sha == Some(true)
+        && capture.discovery_errors.is_empty()
+}
+
+fn source_identity_is_valid(subject: &SubjectIdentityReceipt) -> bool {
+    let build = &subject.build_source;
+    let runtime = &subject.runtime_source;
+    is_known_receipt_value(&build.workspace_root)
+        && is_known_receipt_value(&build.git_sha)
+        && is_known_receipt_value(&build.git_branch)
+        && build.git_tree_state == "clean"
+        && build.build_input_tracking == "complete"
+        && runtime_source_capture_is_valid(&runtime.before_measurement, build)
+        && runtime_source_capture_is_valid(&runtime.after_measurement, build)
+        && runtime.before_measurement.git_branch == runtime.after_measurement.git_branch
+        && runtime.same_clean_git_identity_at_capture_points == Some(true)
+}
+
+fn cargo_lock_identity_is_valid(cargo_lock: &CargoLockIdentityReceipt) -> bool {
+    cargo_lock.embedded_build_size_bytes > 0
+        && is_known_receipt_value(&cargo_lock.embedded_build_sha256)
+        && is_known_receipt_value(&cargo_lock.runtime_path)
+        && file_snapshot_is_complete(&cargo_lock.before_measurement)
+        && file_snapshot_is_complete(&cargo_lock.after_measurement)
+        && cargo_lock.before_measurement.sha256.as_deref()
+            == Some(cargo_lock.embedded_build_sha256.as_str())
+        && cargo_lock.after_measurement.sha256.as_deref()
+            == Some(cargo_lock.embedded_build_sha256.as_str())
+        && cargo_lock.before_measurement.bytes_read == Some(cargo_lock.embedded_build_size_bytes)
+        && cargo_lock.after_measurement.bytes_read == Some(cargo_lock.embedded_build_size_bytes)
+        && file_snapshots_match(
+            &cargo_lock.before_measurement,
+            &cargo_lock.after_measurement,
+        ) == Some(true)
+        && cargo_lock.before_matches_embedded_build == Some(true)
+        && cargo_lock.after_matches_embedded_build == Some(true)
+        && cargo_lock.unchanged_at_capture_points == Some(true)
+}
+
+fn build_configuration_is_valid(configuration: &BuildConfigurationReceipt) -> bool {
+    [
+        configuration.cargo_profile.as_str(),
+        configuration.selected_profile.as_str(),
+        configuration.profile_label.as_str(),
+        configuration.opt_level.as_str(),
+        configuration.debug.as_str(),
+        configuration.target.as_str(),
+        configuration.build_host.as_str(),
+        configuration.rustc_version_verbose.as_str(),
+        configuration.cargo_version.as_str(),
+    ]
+    .into_iter()
+    .all(is_known_receipt_value)
+        && configuration.rustflags.decode_error.is_none()
+        && configuration.rustflags.decoded_arguments.is_some()
+}
+
+fn invocation_is_valid(invocation: &InvocationReceipt) -> bool {
+    !invocation.argv_raw_hex.is_empty()
+        && invocation.argv_raw_hex.len() == invocation.argv_lossy.len()
+        && is_known_receipt_value(invocation.raw_encoding)
+        && is_known_receipt_value(&invocation.length_prefixed_argv_sha256)
+}
+
+fn stable_required_placement(host: &MeasurementHostReceipt) -> bool {
+    let before = &host.before_measurement;
+    let after = &host.after_measurement;
+    let stable_nonempty = |before: Option<&str>, after: Option<&str>| {
+        before.is_some_and(is_known_receipt_value) && before == after
+    };
+    before.unix_epoch_millis.is_some()
+        && after.unix_epoch_millis >= before.unix_epoch_millis
+        && stable_nonempty(
+            before.process_cpu_affinity_mask.as_deref(),
+            after.process_cpu_affinity_mask.as_deref(),
+        )
+        && stable_nonempty(
+            before.process_cpu_affinity_list.as_deref(),
+            after.process_cpu_affinity_list.as_deref(),
+        )
+        && stable_nonempty(
+            before.proc_self_cgroup.as_deref(),
+            after.proc_self_cgroup.as_deref(),
+        )
+        && stable_nonempty(
+            before.cpuset_cpus_effective.as_deref(),
+            after.cpuset_cpus_effective.as_deref(),
+        )
+        && stable_nonempty(
+            before.cpuset_mems_effective.as_deref(),
+            after.cpuset_mems_effective.as_deref(),
+        )
+}
+
+fn measurement_host_is_valid(host: &MeasurementHostReceipt) -> bool {
+    let static_host = &host.host;
+    static_host
+        .hostname
+        .as_deref()
+        .is_some_and(is_known_receipt_value)
+        && static_host
+            .cpu_model
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && static_host
+            .available_parallelism
+            .is_some_and(|count| count > 0)
+        && static_host
+            .cpu_online
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && static_host
+            .cpu_present
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && static_host
+            .cpu_possible
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && static_host
+            .cpu_topology
+            .logical_cpu_directories
+            .is_some_and(|count| count > 0)
+        && static_host
+            .kernel_release
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && static_host
+            .kernel_version
+            .as_deref()
+            .is_some_and(is_known_receipt_value)
+        && stable_required_placement(host)
+}
+
+fn provenance_evidence_is_valid(
+    subject: &SubjectIdentityReceipt,
+    environment: &ComparisonEnvironmentReceipt,
+) -> bool {
+    // This predicate only proves that v7's in-process receipts were complete
+    // and stable for this run. It does not fill the external-verification gaps
+    // listed in NON_CITABLE_REASON, so a true result must remain non-citable.
+    executable_identity_is_valid(&subject.executable)
+        && source_identity_is_valid(subject)
+        && cargo_lock_identity_is_valid(&subject.cargo_lock)
+        && build_configuration_is_valid(&environment.build_configuration)
+        && invocation_is_valid(&environment.invocation)
+        && measurement_host_is_valid(&environment.measurement_host)
+}
+
 impl ProvenanceCapture {
     fn begin() -> Self {
         let build_source = collect_build_source_identity();
@@ -4222,7 +4428,7 @@ fn run(opts: Options) -> Result<(), String> {
         pass_over_pass_gate.comparable_pair_count,
         pass_over_pass_gate.previous_report_found,
     );
-    let measurement_evidence_valid = !history_evidence_is_invalid(
+    let workload_evidence_valid = !history_evidence_is_invalid(
         wal_autocheckpoint_overridden,
         opts.retry_timeout_secs.is_some(),
         opts.rows_per_thread,
@@ -4231,6 +4437,8 @@ fn run(opts: Options) -> Result<(), String> {
         &configuration_receipts,
     );
     let (subject_identity, comparison_environment) = provenance.finish();
+    let measurement_evidence_valid = workload_evidence_valid
+        && provenance_evidence_is_valid(&subject_identity, &comparison_environment);
 
     let full_report = MtMvccBenchReport {
         schema_version: REPORT_SCHEMA_V7,
@@ -4290,7 +4498,7 @@ fn run(opts: Options) -> Result<(), String> {
     if !full_report.measurement_evidence_valid {
         return Err(
             "benchmark evidence is non-comparable or invalid; inspect configuration receipts, \
-             committed-state oracles, and work accounting"
+             committed-state oracles, work accounting, and provenance receipts"
                 .to_owned(),
         );
     }
@@ -4520,6 +4728,99 @@ mod tests {
             file_snapshots_match(&portable_before, &portable_after),
             Some(true)
         );
+    }
+
+    #[test]
+    fn provenance_evidence_requires_complete_stable_subject_and_environment() {
+        let subject = test_subject_identity();
+        let environment = test_comparison_environment();
+        assert!(provenance_evidence_is_valid(&subject, &environment));
+
+        let mut invalid = subject.clone();
+        invalid.executable.path_resolution_error = Some("canonicalize failed".to_owned());
+        assert!(!provenance_evidence_is_valid(&invalid, &environment));
+
+        let mut invalid = subject.clone();
+        invalid.executable.after_measurement.sha256 = Some("changed".to_owned());
+        assert!(!provenance_evidence_is_valid(&invalid, &environment));
+
+        let mut invalid = subject.clone();
+        invalid.build_source.git_tree_state = "dirty".to_owned();
+        assert!(!provenance_evidence_is_valid(&invalid, &environment));
+
+        let mut invalid = subject.clone();
+        invalid
+            .runtime_source
+            .before_measurement
+            .discovery_errors
+            .push("git unavailable".to_owned());
+        assert!(!provenance_evidence_is_valid(&invalid, &environment));
+
+        let mut invalid = subject.clone();
+        invalid
+            .runtime_source
+            .after_measurement
+            .matches_build_git_sha = Some(false);
+        assert!(!provenance_evidence_is_valid(&invalid, &environment));
+
+        let mut invalid = subject.clone();
+        invalid.cargo_lock.before_measurement.sha256 = Some("stale-lock".to_owned());
+        assert!(!provenance_evidence_is_valid(&invalid, &environment));
+
+        let mut invalid = environment.clone();
+        invalid.build_configuration.rustflags.decode_error =
+            Some("invalid encoded rustflags".to_owned());
+        assert!(!provenance_evidence_is_valid(&subject, &invalid));
+
+        let mut invalid = environment.clone();
+        invalid
+            .measurement_host
+            .after_measurement
+            .process_cpu_affinity_list = Some("0-3".to_owned());
+        assert!(!provenance_evidence_is_valid(&subject, &invalid));
+
+        let mut invalid = environment;
+        invalid
+            .measurement_host
+            .before_measurement
+            .cpuset_cpus_effective = None;
+        invalid
+            .measurement_host
+            .after_measurement
+            .cpuset_cpus_effective = None;
+        assert!(!provenance_evidence_is_valid(&subject, &invalid));
+    }
+
+    #[test]
+    fn provenance_evidence_allows_external_nonce_and_optional_host_diagnostics() {
+        let mut subject = test_subject_identity();
+        // Standalone documented invocations do not set the build nonce. The
+        // outer regression gate supplies and verifies one as a stronger
+        // freshness contract, but capture completeness must not require it.
+        subject.build_source.build_nonce = "unknown".to_owned();
+        let mut environment = test_comparison_environment();
+        let host = &mut environment.measurement_host.host;
+        host.cpu_isolated = None;
+        host.scaling_governors_by_cpu.clear();
+        host.numa_online_nodes = None;
+        host.numa_possible_nodes = None;
+        host.numa_node_directories = None;
+        environment.measurement_host.before_measurement.load_average = None;
+        environment.measurement_host.after_measurement.load_average = None;
+        environment.measurement_host.before_measurement.pressure_cpu = None;
+        environment.measurement_host.after_measurement.pressure_cpu = None;
+        environment
+            .measurement_host
+            .before_measurement
+            .pressure_memory = None;
+        environment
+            .measurement_host
+            .after_measurement
+            .pressure_memory = None;
+        environment.measurement_host.before_measurement.pressure_io = None;
+        environment.measurement_host.after_measurement.pressure_io = None;
+
+        assert!(provenance_evidence_is_valid(&subject, &environment));
     }
 
     #[test]
