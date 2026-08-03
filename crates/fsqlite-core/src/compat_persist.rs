@@ -7115,6 +7115,191 @@ PRAGMA integrity_check;
         });
     }
 
+    /// GH #304: the physical index builder must honor declared per-term sort
+    /// directions, not just echo them back into the `CREATE INDEX` DDL.
+    ///
+    /// Before the fix the builder inserted every index record through a plain
+    /// ascending `BtCursor`, so a `DESC` term produced a b-tree whose physical
+    /// order contradicted its own `sqlite_master` declaration. Stock SQLite
+    /// reads the index with `DESC` comparison semantics, so it either reports
+    /// the image as malformed or silently misses rows on a forced-index scan.
+    #[test]
+    fn test_persist_to_sqlite_builds_desc_index_in_declared_key_order() {
+        asupersync::test_utils::run_test(|| async {
+            const ROW_COUNT: i64 = 2_000;
+            const GROUP_COUNT: i64 = 20;
+            const PROBE_GROUP: i64 = 7;
+
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("desc-index-persist.db");
+            let cx = Cx::new();
+
+            let mut db = MemDatabase::new();
+            db.create_table_at(2, 3);
+            let table_data = db.get_table_mut(2).unwrap();
+            for id in 1..=ROW_COUNT {
+                table_data.insert_row(
+                    id,
+                    vec![
+                        SqliteValue::Integer(id),
+                        SqliteValue::Integer(id % GROUP_COUNT),
+                        // Wide enough that the table b-tree spans many pages and
+                        // the index spans multiple leaves under an interior node.
+                        SqliteValue::Text(format!("payload-{id:0>200}").into()),
+                    ],
+                );
+            }
+
+            let schema = vec![TableSchema {
+                name: "live".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "id".to_owned(),
+                        affinity: 'D',
+                        is_ipk: true,
+                        type_name: Some("INTEGER".to_owned()),
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                    ColumnInfo {
+                        name: "grp".to_owned(),
+                        affinity: 'D',
+                        is_ipk: false,
+                        type_name: Some("INTEGER".to_owned()),
+                        notnull: true,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                    ColumnInfo {
+                        name: "payload".to_owned(),
+                        affinity: 'B',
+                        is_ipk: false,
+                        type_name: Some("TEXT".to_owned()),
+                        notnull: true,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                ],
+                indexes: vec![IndexSchema {
+                    name: "idx_live_grp_desc".to_owned(),
+                    root_page: 3,
+                    columns: vec!["grp".to_owned(), "id".to_owned()],
+                    key_expressions: Vec::new(),
+                    key_sort_directions: vec![SortDirection::Asc, SortDirection::Desc],
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: vec![None, None],
+                    conflict_action: None,
+                }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![vec!["id".to_owned()]],
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            }];
+            let header = DatabaseHeader {
+                page_size: DEFAULT_PAGE_SIZE,
+                schema_cookie: 1,
+                change_counter: 1,
+                version_valid_for: 1,
+                ..DatabaseHeader::default()
+            };
+            let mut original_ddl = HashMap::new();
+            original_ddl.insert(
+                "live".to_owned(),
+                "CREATE TABLE live (id INTEGER PRIMARY KEY, grp INTEGER NOT NULL, payload TEXT NOT NULL)"
+                    .to_owned(),
+            );
+            original_ddl.insert(
+                "idx_live_grp_desc".to_owned(),
+                "CREATE INDEX idx_live_grp_desc ON live(grp, id DESC)".to_owned(),
+            );
+
+            persist_to_sqlite_with_header_and_master_entries(
+                &cx,
+                &db_path,
+                &schema,
+                &db,
+                &header,
+                &[],
+                &original_ddl,
+            )
+            .await
+            .unwrap();
+
+            // Stock SQLite is the oracle here: it reads the index using the
+            // DESC semantics declared in sqlite_master.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                integrity, "ok",
+                "stock SQLite must accept a persisted DESC index as structurally sound"
+            );
+
+            let declared_sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_live_grp_desc';",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                declared_sql.to_ascii_lowercase().contains("id desc"),
+                "persisted DDL must keep the DESC term: {declared_sql}"
+            );
+
+            let collect = |sql: &str| -> Vec<i64> {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let rows = stmt
+                    .query_map([PROBE_GROUP], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                rows
+            };
+
+            let forced = collect(
+                "SELECT id FROM live INDEXED BY idx_live_grp_desc \
+                 WHERE grp = ?1 ORDER BY id DESC",
+            );
+            let scanned = collect(
+                "SELECT id FROM live NOT INDEXED WHERE grp = ?1 ORDER BY id DESC",
+            );
+
+            assert!(
+                !scanned.is_empty(),
+                "probe group must actually contain rows"
+            );
+            assert_eq!(
+                forced, scanned,
+                "forced DESC-index lookup must return the same rows as the table scan \
+                 (missing {} of {} rows)",
+                scanned.len().saturating_sub(forced.len()),
+                scanned.len()
+            );
+        });
+    }
+
     #[test]
     fn test_overwrite_existing_file() {
         asupersync::test_utils::run_test(|| async {
