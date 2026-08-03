@@ -101,6 +101,56 @@ Credential presence, secret-key locations, key values, and individual build
 host capacity are operational controls. Keep them in restricted release
 runbooks, not in a repository architecture document.
 
+### Checksum manifest producer gap
+
+Both installers require a `SHA256SUMS.txt` manifest and, when the verifier is
+present, a matching `SHA256SUMS.txt.minisig`. Neither installer falls back to a
+bare `SHA256SUMS` name or to per-asset `.sha256` sidecars.
+
+No current release path produces that file. The crates.io publish workflow
+emits no binary assets or checksums, and the local fallback releaser emits a
+bare `SHA256SUMS` plus per-asset one-liners. The fallback releaser also signs
+only files matching the tool-name prefix, so a checksum manifest is never
+signed automatically under either name.
+
+Publish exactly one manifest. Shipping a bare `SHA256SUMS` alongside the signed
+`SHA256SUMS.txt` publishes a second, unsigned manifest that no installer reads
+and no signature covers; a release must carry the signed manifest only.
+
+Treat the manifest and its signature as an explicit release stage that must be
+produced and verified before upload, not as a by-product of building.
+
+### Artifact-only release path
+
+Building and releasing are separable. The fallback releaser accepts a
+pre-populated artifact directory, so the supported matrix may be produced by
+any builder and released without local compilation on the release host.
+
+That path requires a build manifest in the artifact directory naming every
+archive with its digest, target, and archive format. Given that manifest, the
+upload set is the manifest rows, the manifest itself, and any sidecar matching
+the checksum, signature, SBOM, or provenance patterns. Two properties follow
+and are load-bearing:
+
+- the artifact directory is scanned one level deep, so it must be flat;
+- sidecar selection is pattern-based and unfiltered, so the directory must
+  contain nothing beyond intended assets. Scratch files, superseded manifests,
+  and editor backups matching those patterns are published silently.
+
+For the supported matrix the intended set is thirteen files: five archives, the
+build manifest, the signed checksum manifest and its signature, and one SBOM
+per archive. Any other count means the directory is wrong, not that the
+selection rule is.
+
+Enabling the strict release contract replaces directory scanning with a closed,
+pre-enumerated asset plan and an exact-count gate that aborts the upload on any
+mismatch. Under that mode every intended sidecar must be enumerated in the plan
+itself; nothing is discovered from disk.
+
+SBOM generation is a standalone step, not part of build or release. Generated
+documents are named from a truncated archive basename and carry no license
+field, so a release that requires license provenance must record it separately.
+
 ## Current release gate
 
 The final release-handoff Bead is the tracker authority for outstanding
