@@ -5033,6 +5033,12 @@ enum PagerMaintenanceLeaseKind {
 struct PagerMaintenanceLease {
     gate: Arc<PagerMaintenanceGate>,
     kind: PagerMaintenanceLeaseKind,
+    /// Original lease kind retained while an open or transaction lease is
+    /// upgraded for recovery. This receipt belongs to the persistent lease,
+    /// not to one async recovery future: dropping that future must leave the
+    /// gate fail closed, while a later retry must still know which admission
+    /// count to restore after terminal recovery.
+    exclusive_upgrade_prior: Option<PagerMaintenanceLeaseKind>,
 }
 
 impl PagerMaintenanceGate {
@@ -5049,6 +5055,7 @@ impl PagerMaintenanceGate {
         Ok(PagerMaintenanceLease {
             gate: Arc::clone(self),
             kind: PagerMaintenanceLeaseKind::Open,
+            exclusive_upgrade_prior: None,
         })
     }
 
@@ -5065,6 +5072,7 @@ impl PagerMaintenanceGate {
         Ok(PagerMaintenanceLease {
             gate: Arc::clone(self),
             kind: PagerMaintenanceLeaseKind::Transaction,
+            exclusive_upgrade_prior: None,
         })
     }
 
@@ -5081,6 +5089,7 @@ impl PagerMaintenanceGate {
         Ok(PagerMaintenanceLease {
             gate: Arc::clone(self),
             kind: PagerMaintenanceLeaseKind::Exclusive,
+            exclusive_upgrade_prior: None,
         })
     }
 }
@@ -5096,6 +5105,19 @@ impl PagerMaintenanceLease {
             .state
             .lock()
             .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+        if matches!(self.kind, PagerMaintenanceLeaseKind::Exclusive) {
+            if !state.maintenance_active {
+                return Err(FrankenError::internal(
+                    "exclusive pager maintenance lease lost its active gate",
+                ));
+            }
+            // A cancelled recovery may be retried with this same persistent
+            // lease. Return its original typed receipt rather than treating
+            // the lease's own fail-closed exclusive ownership as contention.
+            return Ok(self
+                .exclusive_upgrade_prior
+                .unwrap_or(PagerMaintenanceLeaseKind::Exclusive));
+        }
         if state.maintenance_active {
             return Err(FrankenError::BusyRecovery);
         }
@@ -5121,14 +5143,41 @@ impl PagerMaintenanceLease {
         }
         state.maintenance_active = true;
         self.kind = PagerMaintenanceLeaseKind::Exclusive;
+        self.exclusive_upgrade_prior = Some(prior);
         Ok(prior)
     }
 
     fn downgrade_from_exclusive(&mut self, prior: PagerMaintenanceLeaseKind) -> Result<()> {
-        if !matches!(self.kind, PagerMaintenanceLeaseKind::Exclusive)
-            || matches!(prior, PagerMaintenanceLeaseKind::Exclusive)
-        {
+        if !matches!(self.kind, PagerMaintenanceLeaseKind::Exclusive) {
             return Ok(());
+        }
+        if matches!(prior, PagerMaintenanceLeaseKind::Exclusive) {
+            return if self.exclusive_upgrade_prior.is_none() {
+                Ok(())
+            } else {
+                Err(FrankenError::internal(
+                    "pager maintenance lease downgrade omitted its recorded prior kind",
+                ))
+            };
+        }
+        let Some(recorded_prior) = self.exclusive_upgrade_prior else {
+            return Err(FrankenError::internal(
+                "upgraded pager maintenance lease lost its prior-kind receipt",
+            ));
+        };
+        if !matches!(
+            (recorded_prior, prior),
+            (
+                PagerMaintenanceLeaseKind::Open,
+                PagerMaintenanceLeaseKind::Open
+            ) | (
+                PagerMaintenanceLeaseKind::Transaction,
+                PagerMaintenanceLeaseKind::Transaction
+            )
+        ) {
+            return Err(FrankenError::internal(
+                "pager maintenance lease downgrade receipt does not match its upgrade",
+            ));
         }
         let mut state = self
             .gate
@@ -5146,6 +5195,7 @@ impl PagerMaintenanceLease {
             PagerMaintenanceLeaseKind::Exclusive => unreachable!(),
         }
         self.kind = prior;
+        self.exclusive_upgrade_prior = None;
         Ok(())
     }
 }
@@ -26523,6 +26573,40 @@ mod tests {
         }
     }
 
+    /// WAL backend whose frame source accepts and copies one tracked append,
+    /// then remains pending until the test-owned source completion is made
+    /// terminal. The returned future itself never reports success: dropping
+    /// it exercises the real group-commit ownership transfer rather than a
+    /// synthetic durability flag transition.
+    struct PendingAcceptedWalBackend {
+        inner: MockWalBackend,
+        append_entered: Arc<AtomicBool>,
+        source_completion: Arc<Mutex<Option<VfsWriteCompletion>>>,
+    }
+
+    impl PendingAcceptedWalBackend {
+        fn new() -> (
+            Self,
+            SharedFrames,
+            Arc<AtomicBool>,
+            Arc<Mutex<Option<VfsWriteCompletion>>>,
+        ) {
+            let (inner, frames, _, _) = MockWalBackend::new();
+            let append_entered = Arc::new(AtomicBool::new(false));
+            let source_completion = Arc::new(Mutex::new(None));
+            (
+                Self {
+                    inner,
+                    append_entered: Arc::clone(&append_entered),
+                    source_completion: Arc::clone(&source_completion),
+                },
+                frames,
+                append_entered,
+                source_completion,
+            )
+        }
+    }
+
     struct FailingGroupCommitWalBackend {
         append_frames_calls: SharedCounter,
     }
@@ -27790,6 +27874,139 @@ mod tests {
                     effective_mode: _mode,
                 })
             })
+        }
+    }
+
+    impl crate::traits::WalBackend for PendingAcceptedWalBackend {
+        fn begin_transaction<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+            self.inner.begin_transaction(cx)
+        }
+
+        fn append_frame<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+            page_data: &'a [u8],
+            db_size_if_commit: u32,
+        ) -> WalFuture<'a, ()> {
+            self.inner
+                .append_frame(cx, page_number, page_data, db_size_if_commit)
+        }
+
+        fn append_frames_tracked<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            frames: &'a [crate::traits::WalFrameRef<'a>],
+            completion: VfsWriteCompletion,
+        ) -> WalFuture<'a, ()> {
+            let append_entered = Arc::clone(&self.append_entered);
+            let source_completion = Arc::clone(&self.source_completion);
+            let written_frames = Arc::clone(&self.inner.frames);
+            let batch_calls = Arc::clone(&self.inner.batch_calls);
+            let mut accepted = false;
+            Box::pin(std::future::poll_fn(move |_| {
+                if !accepted {
+                    *batch_calls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+                    let mut written = written_frames
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for frame in frames {
+                        written.push((
+                            frame.page_number,
+                            frame.page_data.to_vec(),
+                            frame.db_size_if_commit,
+                        ));
+                    }
+                    drop(written);
+                    let replaced = source_completion
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .replace(completion.clone());
+                    assert!(
+                        replaced.is_none(),
+                        "pending WAL fixture accepted more than one tracked append"
+                    );
+                    accepted = true;
+                    append_entered.store(true, AtomicOrdering::Release);
+                }
+                std::task::Poll::Pending
+            }))
+        }
+
+        fn persist_parallel_wal_commit_certificate<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            certificate: &'a ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> WalFuture<'a, ()> {
+            self.inner.persist_parallel_wal_commit_certificate(
+                cx,
+                certificate,
+                wal_frame_start,
+                wal_frame_end,
+                sync,
+            )
+        }
+
+        fn reconcile_parallel_wal_commit<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            certificate: &'a ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> WalFuture<'a, crate::traits::ParallelWalCommitReconciliation> {
+            self.inner.reconcile_parallel_wal_commit(
+                cx,
+                certificate,
+                wal_frame_start,
+                wal_frame_end,
+                sync,
+            )
+        }
+
+        fn read_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            self.inner.read_page(cx, page_number)
+        }
+
+        fn committed_txns_since_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> WalFuture<'a, u64> {
+            self.inner.committed_txns_since_page(cx, page_number)
+        }
+
+        fn committed_txn_count<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, u64> {
+            self.inner.committed_txn_count(cx)
+        }
+
+        fn sync(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
+        }
+
+        fn frame_count(&self) -> usize {
+            self.inner.frame_count()
+        }
+
+        fn checkpoint<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            mode: crate::traits::CheckpointMode,
+            writer: &'a mut dyn crate::traits::CheckpointPageWriter,
+            backfilled_frames: u32,
+            oldest_reader_frame: Option<u32>,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            self.inner
+                .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
         }
     }
 
@@ -29895,6 +30112,153 @@ mod tests {
             assert!(
                 queue_weak.upgrade().is_none(),
                 "bead_id={BEAD} case=terminal_recovery_releases_process_root_without_cycle"
+            );
+        });
+    }
+
+    #[test]
+    fn test_dropped_pending_accepted_wal_commit_keeps_source_and_process_ownership() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("pending accepted WAL test runtime should build");
+        runtime.block_on(async {
+            const BEAD: &str = "bd-6xjma";
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let path = PathBuf::from("/wal-pending-accepted-drop-ownership.db");
+            let pager = vfs.open_file_backed_pager(&path).await.unwrap();
+            let cx = Cx::new();
+            let (backend, frames, append_entered, source_completion) =
+                PendingAcceptedWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            pager
+                .set_wal_commit_sync_policy(WalCommitSyncPolicy::Deferred)
+                .unwrap();
+            let queue = Arc::clone(&pager.group_commit_queue);
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            let committed_page = vec![0x7B; PageSize::DEFAULT.as_usize()];
+            txn.write_page(&cx, page, &committed_page).await.unwrap();
+            let mut commit = Box::pin(txn.commit(&cx));
+
+            std::future::poll_fn(|poll_cx| match commit.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending if append_entered.load(AtomicOrdering::Acquire) => {
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => {
+                    poll_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(result) => {
+                    panic!("pending WAL commit unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+            let accepted_completion = source_completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .cloned()
+                .expect("accepted WAL append must publish its source completion token");
+            assert_eq!(
+                accepted_completion.state(),
+                VfsWriteCompletionState::Pending,
+                "bead_id={BEAD} case=accepted_write_is_genuinely_pending"
+            );
+            assert!(
+                frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .last()
+                    .is_some_and(|frame| frame.2 != 0),
+                "bead_id={BEAD} case=accepted_source_copied_complete_wal_interval"
+            );
+
+            drop(commit);
+            assert_eq!(
+                accepted_completion.state(),
+                VfsWriteCompletionState::Pending,
+                "bead_id={BEAD} case=future_drop_does_not_forge_source_terminal_state"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::Reserved,
+                "bead_id={BEAD} case=pending_source_retains_reserved_fence"
+            );
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "bead_id={BEAD} case=dropped_commit_transfers_physical_owner"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                1,
+                "bead_id={BEAD} case=pending_physical_owner_has_process_root"
+            );
+
+            drop(txn);
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                2,
+                "bead_id={BEAD} case=dropped_transaction_adds_independent_logical_root"
+            );
+            assert!(matches!(
+                settle_pending_group_commit_finalization(&queue).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::Reserved,
+                "bead_id={BEAD} case=pending_source_fails_closed_during_retry"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                2,
+                "bead_id={BEAD} case=nonterminal_retry_preserves_both_roots"
+            );
+
+            assert!(
+                accepted_completion.complete_success(),
+                "bead_id={BEAD} case=source_reports_its_own_terminal_success"
+            );
+            settle_pending_group_commit_finalization(&queue)
+                .await
+                .expect("terminal source must permit exact recovery and logical cleanup");
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::None,
+                "bead_id={BEAD} case=terminal_recovery_restores_final_lock_baseline"
+            );
+            assert_eq!(
+                queue
+                    .rooted_finalization_attempts
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "bead_id={BEAD} case=terminal_recovery_releases_all_process_roots"
+            );
+            assert!(!queue.has_unresolved_in_doubt_epoch());
+
+            let reader = pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .expect("terminal recovery must reopen admission");
+            assert_eq!(
+                reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                committed_page.as_slice(),
+                "bead_id={BEAD} case=terminal_recovery_publishes_accepted_wal_batch"
             );
         });
     }
@@ -32733,6 +33097,191 @@ mod tests {
                 .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| Box::pin(async { Ok(()) }))
                 .await
                 .expect("a later maintenance entrant must not remain fenced");
+        });
+    }
+
+    #[test]
+    fn test_dropped_pending_recovery_upgrade_retains_transaction_lease_receipt() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("pending recovery-upgrade test runtime should build");
+        runtime.block_on(async {
+            const BEAD: &str = "bd-6xjma";
+            let gate = Arc::new(PagerMaintenanceGate::default());
+            let mut lease = gate
+                .enter_transaction()
+                .expect("fixture must begin with one transaction lease");
+            let entered = Arc::new(AtomicBool::new(false));
+            let pending_entered = Arc::clone(&entered);
+            let mut recovery = Box::pin(async {
+                let prior = lease.upgrade_to_exclusive()?;
+                std::future::poll_fn(move |_| {
+                    pending_entered.store(true, AtomicOrdering::Release);
+                    std::task::Poll::<()>::Pending
+                })
+                .await;
+                lease.downgrade_from_exclusive(prior)?;
+                Result::<()>::Ok(())
+            });
+
+            std::future::poll_fn(|poll_cx| match recovery.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending if entered.load(AtomicOrdering::Acquire) => {
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => {
+                    poll_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(result) => {
+                    panic!("pending recovery upgrade unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+            drop(recovery);
+
+            assert!(matches!(lease.kind, PagerMaintenanceLeaseKind::Exclusive));
+            assert!(matches!(
+                lease.exclusive_upgrade_prior,
+                Some(PagerMaintenanceLeaseKind::Transaction)
+            ));
+            {
+                let state = gate
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(
+                    state.maintenance_active,
+                    "bead_id={BEAD} case=dropped_recovery_fails_closed"
+                );
+                assert_eq!(
+                    state.active_openers, 0,
+                    "bead_id={BEAD} case=upgrade_removes_open_admission"
+                );
+                assert_eq!(
+                    state.active_transactions, 0,
+                    "bead_id={BEAD} case=upgrade_removes_transaction_admission"
+                );
+            }
+            assert!(matches!(gate.enter_transaction(), Err(FrankenError::Busy)));
+
+            let prior = lease
+                .upgrade_to_exclusive()
+                .expect("same persistent lease must be able to retry recovery");
+            assert!(matches!(prior, PagerMaintenanceLeaseKind::Transaction));
+            lease
+                .downgrade_from_exclusive(prior)
+                .expect("terminal retry must restore the recorded transaction lease");
+            assert!(matches!(lease.kind, PagerMaintenanceLeaseKind::Transaction));
+            assert!(lease.exclusive_upgrade_prior.is_none());
+            {
+                let state = gate
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(
+                    !state.maintenance_active,
+                    "bead_id={BEAD} case=terminal_retry_reopens_gate"
+                );
+                assert_eq!(
+                    state.active_transactions, 1,
+                    "bead_id={BEAD} case=terminal_retry_restores_exact_prior_count"
+                );
+            }
+            drop(lease);
+            assert_eq!(
+                gate.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_transactions,
+                0,
+                "bead_id={BEAD} case=restored_transaction_lease_drops_exactly_once"
+            );
+        });
+    }
+
+    #[test]
+    fn test_duplicate_maintenance_rejection_preserves_pending_owner_until_drop() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("duplicate pending maintenance test runtime should build");
+        runtime.block_on(async {
+            const BEAD: &str = "bd-6xjma";
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/duplicate-pending-maintenance.db"))
+                .await
+                .unwrap();
+            let entered = Arc::new(AtomicBool::new(false));
+            let mut state = ();
+            let mut first =
+                Box::pin(
+                    pager.with_exclusive_maintenance(&cx, &mut state, |_, _, _, ()| {
+                        let entered = Arc::clone(&entered);
+                        Box::pin(std::future::poll_fn(move |_| {
+                            entered.store(true, AtomicOrdering::Release);
+                            std::task::Poll::<Result<()>>::Pending
+                        }))
+                    }),
+                );
+
+            std::future::poll_fn(|poll_cx| match first.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending if entered.load(AtomicOrdering::Acquire) => {
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => {
+                    poll_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(result) => {
+                    panic!("first maintenance unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::Exclusive,
+                "bead_id={BEAD} case=pending_owner_holds_external_exclusive"
+            );
+            assert!(pager.published_snapshot().checkpoint_active);
+
+            let duplicate = pager
+                .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| Box::pin(async { Ok(()) }))
+                .await;
+            assert!(matches!(duplicate, Err(FrankenError::Busy)));
+            assert!(
+                pager.published_snapshot().checkpoint_active,
+                "bead_id={BEAD} case=duplicate_rejection_preserves_owner_publication"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::Exclusive,
+                "bead_id={BEAD} case=duplicate_rejection_does_not_unlock_owner"
+            );
+
+            drop(first);
+            assert!(
+                !pager.published_snapshot().checkpoint_active,
+                "bead_id={BEAD} case=owner_drop_clears_publication"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::None,
+                "bead_id={BEAD} case=owner_drop_restores_external_baseline"
+            );
+            assert!(
+                !pager
+                    .group_commit_queue
+                    .has_process_root_finalization_attempt(),
+                "bead_id={BEAD} case=uncontended_owner_drop_needs_no_root"
+            );
+            pager
+                .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| Box::pin(async { Ok(()) }))
+                .await
+                .expect("a terminal owner drop must admit later maintenance");
         });
     }
 
