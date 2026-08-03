@@ -2246,14 +2246,13 @@ fn write_canonical_json_stdout(report: &MtMvccBenchReport) -> Result<(), String>
         .map_err(|error| format!("flush mt-mvcc bench stdout report: {error}"))
 }
 
-fn history_update_is_allowed(report: &MtMvccBenchReport) -> bool {
+const fn history_update_is_allowed(_report: &MtMvccBenchReport) -> bool {
     // V7 deliberately carries diagnostic provenance but is not independently
     // citable. Its own `citable` bit cannot authenticate the report, so even a
     // hand-edited v7 document must never become a trusted baseline. A future
-    // schema may re-enable updates once it has an external verification path.
-    report.schema_version != REPORT_SCHEMA_V7
-        && report.citable
-        && report.measurement_evidence_valid
+    // schema may re-enable updates only through an explicit external verifier;
+    // arbitrary new or misspelled schema strings must remain fail-closed.
+    false
 }
 
 fn write_markdown_summary(path: &Path, report: &MtMvccBenchReport) -> Result<(), String> {
@@ -4529,6 +4528,11 @@ mod tests {
 
         assert_eq!(value["schema_version"], REPORT_SCHEMA_V7);
         assert_eq!(value["citable"], false);
+        assert_eq!(value["measurement_evidence_valid"], true);
+        assert_eq!(
+            value["pass_over_pass_gate"]["status"],
+            "disabled_non_citable"
+        );
         assert_eq!(value["release_regression_scope"], RELEASE_REGRESSION_SCOPE);
         assert_eq!(
             value["subject_identity"]["executable"]["unchanged_during_measurement"],
@@ -4556,6 +4560,35 @@ mod tests {
             "test-host"
         );
         assert!(value.get("release_eligible").is_none());
+    }
+
+    #[test]
+    fn invalid_measurement_evidence_is_explicit_in_json() {
+        let mut report = minimal_v7_report();
+        report.measurement_evidence_valid = false;
+
+        let value = serde_json::to_value(report).expect("invalid v7 report must serialize");
+
+        assert_eq!(value["measurement_evidence_valid"], false);
+        assert_eq!(value["citable"], false);
+    }
+
+    #[test]
+    fn v7_history_is_never_baseline_updatable() {
+        let mut report = minimal_v7_report();
+        assert!(!history_update_is_allowed(&report));
+
+        report.citable = true;
+        assert!(report.measurement_evidence_valid);
+        assert!(!history_update_is_allowed(&report));
+
+        report.measurement_evidence_valid = false;
+        assert!(!history_update_is_allowed(&report));
+
+        report.schema_version = "future-or-typo-schema";
+        report.citable = true;
+        report.measurement_evidence_valid = true;
+        assert!(!history_update_is_allowed(&report));
     }
 
     #[test]
@@ -4849,7 +4882,7 @@ mod tests {
         assert!(rendered.contains("- Workload shape: `shared_table`"));
         assert!(rendered.contains("| 8 | unavailable | 6090 | 55406 | 0.110x | unavailable |"));
         assert!(rendered.contains("Pass-over-pass gate"));
-        assert!(rendered.contains("comparable pairs `1`"));
+        assert!(rendered.contains("comparable pairs `0`"));
     }
 
     #[test]
@@ -5224,6 +5257,48 @@ mod tests {
     }
 
     #[test]
+    fn active_v7_history_is_disabled_even_when_json_claims_citable() {
+        let current_rows = vec![valid_history_row(
+            8,
+            90,
+            200,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+        )];
+        let forged_json = serde_json::to_value(history_with_rows(
+            DEFAULT_ROWS_PER_THREAD,
+            vec![valid_history_row(
+                8,
+                100,
+                200,
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            )],
+        ))
+        .expect("test history must serialize");
+        assert_eq!(forged_json["citable"], true);
+        let previous = serde_json::from_value::<HistoricalMtMvccBenchReport>(forged_json)
+            .expect("test history must deserialize");
+        let current_configuration_receipts = configuration_receipts_from_rows(&current_rows);
+
+        let gate = build_pass_over_pass_gate(PassOverPassGateInput {
+            history_json: Path::new(DEFAULT_HISTORY_JSON),
+            previous: Some(&previous),
+            historical_baseline_authentication: HistoricalBaselineAuthentication::Unavailable,
+            current_rows: &current_rows,
+            current_configuration_receipts: &current_configuration_receipts,
+            current_workload_shape: "shared_table",
+            current_rows_per_thread: DEFAULT_ROWS_PER_THREAD,
+            current_iterations: 1,
+            current_wal_autocheckpoint_overridden: false,
+            current_retry_timeout_overridden: false,
+        });
+
+        assert_eq!(gate.status, "disabled_non_citable");
+        assert!(gate.previous_report_found);
+        assert_eq!(gate.comparable_pair_count, 0);
+        assert!(gate.regressions.is_empty());
+    }
+
+    #[test]
     fn loaded_history_requires_exact_top_level_v7_contract() {
         let previous_row = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
         let current_rows = vec![valid_history_row(
@@ -5253,6 +5328,10 @@ mod tests {
         }
 
         for field in [
+            "citable",
+            "measurement_evidence_valid",
+            "subject_identity",
+            "comparison_environment",
             "iterations",
             "configuration_receipts",
             "settings_interpretation",
@@ -5266,6 +5345,13 @@ mod tests {
                 .remove(field);
             let gate = gate_from_serialized_history(missing, &current_rows, 1);
             assert_eq!(gate.status, "no_prior_report", "missing field {field}");
+        }
+
+        for field in ["citable", "measurement_evidence_valid"] {
+            let mut false_claim = base.clone();
+            false_claim[field] = serde_json::json!(false);
+            let gate = gate_from_serialized_history(false_claim, &current_rows, 1);
+            assert_eq!(gate.status, "no_prior_report", "false field {field}");
         }
 
         let mut wrong_iterations = base.clone();
