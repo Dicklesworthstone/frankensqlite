@@ -606,6 +606,160 @@ mod tests {
         assert!(second.path().exists());
     }
 
+    /// GH #304 (cleanup arm): when the rebuild refuses an index whose declared
+    /// collation the builder cannot resolve, the partially written candidate
+    /// must actually be removed, and an unrelated caller-owned file in the same
+    /// directory must be left byte-for-byte alone.
+    ///
+    /// `test_cleanup_refuses_replaced_reservation_and_preserves_replacement`
+    /// already covers the negative half — cleanup declines a path whose identity
+    /// no longer matches. This covers the positive half, which nothing asserted:
+    /// that a genuine mid-rebuild failure leaves a candidate the reservation
+    /// then reclaims. The helper-level `db_path.exists()` assertion in
+    /// `compat_persist` documents only that the persist path does not delete its
+    /// own output; it is not a cleanup proof, and this is.
+    ///
+    /// Scope, stated narrowly: this proves the **explicit** reservation cleanup
+    /// arm behaves correctly when it is invoked — `cleanup_if_owned` reclaims a
+    /// candidate it still owns, spares an unrelated path, and leaves the source
+    /// image untouched. It does **not** prove that every enclosing VACUUM caller
+    /// reaches that call on every failure path; wiring coverage over the callers
+    /// themselves is separate, still-open GH #304 work.
+    #[test]
+    fn test_failed_rebuild_candidate_is_reclaimed_and_bystanders_are_untouched() {
+        asupersync::test_utils::run_test(|| async {
+            use fsqlite_ast::SortDirection;
+            use fsqlite_vdbe::codegen::{ColumnInfo, IndexSchema, TableSchema};
+
+            let cx = Cx::new();
+            let dir = tempfile::tempdir().unwrap();
+
+            // The source must actually exist and carry known bytes, otherwise
+            // "the source image is unchanged" — a GH #304 acceptance criterion —
+            // is unprovable: an absent file trivially satisfies any comparison.
+            let source = dir.path().join("source.db");
+            const SOURCE_SENTINEL: &[u8] = b"source-image-sentinel-do-not-touch";
+            host_fs::write(&source, SOURCE_SENTINEL).unwrap();
+
+            // A pre-existing, caller-owned file that the rebuild has no claim
+            // over. It sits in the same directory the internal reservation is
+            // drawn from, so an identity-blind cleanup would be free to take it.
+            let bystander = dir.path().join("caller-owned.db");
+            host_fs::write(&bystander, b"caller-owned-sentinel").unwrap();
+
+            let target = reserve_temp_rebuild_target(&cx, &source).unwrap();
+            let candidate = target.path().to_owned();
+            assert!(
+                candidate.exists(),
+                "reservation must materialize its target"
+            );
+
+            let mut db = MemDatabase::new();
+            db.create_table_at(2, 2);
+            let table = db.get_table_mut(2).unwrap();
+            for id in 1..=4_i64 {
+                table.insert_row(
+                    id,
+                    vec![
+                        SqliteValue::Integer(id),
+                        SqliteValue::Text(format!("v{id}").into()),
+                    ],
+                );
+            }
+
+            let schema = vec![TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("label", 'B', false),
+                ],
+                indexes: vec![IndexSchema {
+                    name: "idx_t_label_custom".to_owned(),
+                    root_page: 3,
+                    columns: vec!["label".to_owned()],
+                    key_expressions: Vec::new(),
+                    key_sort_directions: vec![SortDirection::Asc],
+                    where_clause: None,
+                    is_unique: false,
+                    // Unresolvable by the builder's registry: the rebuild must
+                    // refuse rather than silently order this index by BINARY.
+                    key_collations: vec![Some("MYCOLL".to_owned())],
+                    conflict_action: None,
+                }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![vec!["id".to_owned()]],
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            }];
+            let mut original_ddl = HashMap::new();
+            original_ddl.insert(
+                "t".to_owned(),
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)".to_owned(),
+            );
+            original_ddl.insert(
+                "idx_t_label_custom".to_owned(),
+                "CREATE INDEX idx_t_label_custom ON t(label COLLATE MYCOLL)".to_owned(),
+            );
+
+            let error = persist_compacted_database(
+                &cx,
+                &target,
+                &schema,
+                &db,
+                &DatabaseHeader::default(),
+                &[],
+                &original_ddl,
+            )
+            .await
+            .expect_err("an unresolvable index collation must fail the rebuild");
+            assert!(
+                matches!(
+                    error,
+                    fsqlite_error::FrankenError::NotImplemented(ref detail)
+                        if detail.contains("MYCOLL")
+                ),
+                "unexpected rebuild failure: {error}"
+            );
+
+            // The persist path does not remove its own output, so the candidate
+            // is still present at this point; the reservation owns reclaiming it.
+            assert!(
+                candidate.exists(),
+                "the failed rebuild must leave its candidate for the reservation"
+            );
+            assert!(
+                target.cleanup_if_owned(&cx).unwrap(),
+                "the reservation still owns the candidate and must reclaim it"
+            );
+            assert!(
+                !candidate.exists(),
+                "the partially written candidate must be gone after cleanup"
+            );
+
+            // GH #304 acceptance: a failed rebuild must leave the source image
+            // byte-for-byte intact.
+            assert!(source.exists(), "the source image must survive the failure");
+            assert_eq!(
+                host_fs::read(&source).unwrap(),
+                SOURCE_SENTINEL,
+                "a failed rebuild must not modify the source image"
+            );
+
+            // The bystander must survive untouched in both existence and bytes.
+            assert!(
+                bystander.exists(),
+                "cleanup must not remove unrelated files"
+            );
+            assert_eq!(
+                host_fs::read(&bystander).unwrap(),
+                b"caller-owned-sentinel",
+                "cleanup must not overwrite unrelated files"
+            );
+        });
+    }
+
     #[test]
     fn test_cleanup_refuses_replaced_reservation_and_preserves_replacement() {
         let cx = Cx::new();

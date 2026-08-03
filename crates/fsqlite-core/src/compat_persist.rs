@@ -1248,10 +1248,17 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 //
                 // Collations resolve against the cursor's default registry
                 // (BINARY/NOCASE/RTRIM only). A collation registered on the
-                // source connection is not reachable from this function, so a
-                // custom-collation term silently falls back to BINARY and its
-                // index remains mis-ordered relative to its own DDL. Also
-                // unfixed, and also part of GH #304 acceptance.
+                // source connection is still not reachable from this function,
+                // but it no longer falls back silently: an unresolvable *name* is
+                // refused below, before any row is inserted, so a mis-ordered
+                // image is never produced for it.
+                //
+                // What remains unresolved for GH #304 is narrower and is a
+                // name-collision problem rather than a missing-name one: a source
+                // connection that overrides a built-in — registering its own
+                // implementation under BINARY, NOCASE, or RTRIM — still passes
+                // the name check and is then built with the default
+                // implementation. See the guard below for the full statement.
                 //
                 // Derive arity from the SAME discriminator the key loop below
                 // uses, not from `key_term_count()`: that helper prefers
@@ -1283,6 +1290,57 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                     index_desc_flags,
                 );
                 let collation_registry = idx_cursor.collation_registry();
+                // GH #304: a collation the builder cannot resolve silently
+                // degrades to BINARY inside the cursor comparator, producing an
+                // index whose physical order contradicts the `COLLATE` term in
+                // its own regenerated DDL — exactly the malformed-image class
+                // this issue was filed for, but without the DESC symptom that
+                // made the original report visible. The source connection's
+                // registry is not reachable from this function, so the honest
+                // outcome is refusal rather than a quietly mis-ordered rebuild.
+                // This mirrors the hidden WITHOUT ROWID primary-key slot, which
+                // is likewise refused instead of approximated.
+                //
+                // This is a supported-schema limitation, not a violated internal
+                // invariant, so it is reported as `NotImplemented`: the schema is
+                // legitimate and the caller can act on it (register the collation
+                // on the rebuilding path, or export without that index).
+                //
+                // KNOWN GAP (GH #304, unresolved): this guard keys on the
+                // presence of a *name*, so it cannot see a source connection that
+                // overrides a built-in — registering its own implementation under
+                // `BINARY`, `NOCASE`, or `RTRIM`. `contains()` answers true, the
+                // guard admits the index, and the builder then orders it with the
+                // default implementation instead of the caller's. That is the
+                // same silently-wrong-order defect this guard exists to prevent,
+                // reachable through a name the guard trusts. Closing it needs the
+                // source connection's registry (or a per-collation identity, not
+                // just a name), which is not reachable from this function.
+                //
+                // Cleanup of the partially written candidate is NOT performed
+                // here — this function never removes its own output on any error
+                // path. The enclosing VACUUM caller owns that through
+                // `VacuumTargetReservation`, which is identity-bound; returning
+                // early simply leaves the reservation to clean up as it already
+                // does for every other failure in this function.
+                {
+                    let registry = collation_registry.lock().map_err(|_| {
+                        FrankenError::internal(
+                            "collation registry lock poisoned while rebuilding an index".to_owned(),
+                        )
+                    })?;
+                    for collation in index_collations.iter().flatten() {
+                        if !registry.contains(collation) {
+                            return Err(FrankenError::not_implemented(format!(
+                                "index `{}` declares collation `{collation}`, which is not \
+                                 available to the compatibility index builder; rebuilding it \
+                                 would order the index by BINARY and contradict its own \
+                                 declaration",
+                                index.name
+                            )));
+                        }
+                    }
+                }
                 idx_cursor.set_index_collation_context(index_collations, collation_registry);
                 configure_btree_cursor_page_size(&mut idx_cursor, usable_size, full_page_size);
                 if let Some(mem_table) = db.get_table(table.root_page) {
@@ -7521,6 +7579,476 @@ PRAGMA integrity_check;
             assert_eq!(
                 forced, scanned,
                 "forced collated-DESC partial-index scan must match the table scan"
+            );
+        });
+    }
+
+    /// GH #304 (UNIQUE + three-term mixed-direction + RTRIM arm): the facets
+    /// `398bab01` explicitly left unverified.
+    ///
+    /// `398bab01` covered rowid tables, built-in collations, and single or
+    /// composite ASC/DESC terms, but stated that the unique/auto arms,
+    /// `quick_check`, and source-versus-candidate record parity were not
+    /// covered. This exercises all of them at once:
+    ///
+    /// * a `UNIQUE` index, whose `is_unique` flag reaches only the regenerated
+    ///   DDL and never the physical builder;
+    /// * three key terms with mixed directions, so a single shared direction
+    ///   flag cannot accidentally satisfy the ordering;
+    /// * `RTRIM`, where `'c0007'` and `'c0007   '` compare equal but sort
+    ///   differently from BINARY, so a builder that ignored the declared
+    ///   collation would place trailing-space rows in the wrong leaf;
+    /// * both `quick_check` and full `integrity_check` under stock SQLite;
+    /// * index-versus-table row-count parity, which catches entries silently
+    ///   dropped or duplicated during the rebuild.
+    #[test]
+    fn test_persist_to_sqlite_builds_unique_mixed_direction_rtrim_index() {
+        asupersync::test_utils::run_test(|| async {
+            const ROW_COUNT: i64 = 1_500;
+            const CODE_GROUPS: i64 = 300;
+            const TIER_COUNT: i64 = 7;
+
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("unique-mixed-rtrim.db");
+            let cx = Cx::new();
+
+            let text_column = |name: &str| ColumnInfo {
+                name: name.to_owned(),
+                affinity: 'B',
+                is_ipk: false,
+                type_name: Some("TEXT".to_owned()),
+                notnull: false,
+                unique: false,
+                default_value: None,
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: None,
+                conflict_action: None,
+            };
+            let int_column = |name: &str, is_ipk: bool| ColumnInfo {
+                name: name.to_owned(),
+                affinity: 'D',
+                is_ipk,
+                type_name: Some("INTEGER".to_owned()),
+                notnull: false,
+                unique: false,
+                default_value: None,
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: None,
+                conflict_action: None,
+            };
+
+            let mut db = MemDatabase::new();
+            db.create_table_at(2, 4);
+            let table_data = db.get_table_mut(2).unwrap();
+            for id in 1..=ROW_COUNT {
+                // Trailing spaces must alternate across *recurrences of the same
+                // base*, so the rule keys on the occurrence (the quotient), not
+                // on `id`. Any rule of the form `id % k` where `k` divides
+                // `CODE_GROUPS` gives every recurrence of a base an identical
+                // spelling — the base repeats every `CODE_GROUPS` rows and
+                // `id % k` is invariant under that step — so RTRIM would never
+                // diverge from BINARY and a BINARY rebuild would satisfy the
+                // ordering assertions below. Alternating by occurrence puts both
+                // `c0007` and `c0007   ` in the table, which RTRIM folds together
+                // and BINARY orders apart.
+                let base = format!("c{:0>4}", id % CODE_GROUPS);
+                let occurrence = id / CODE_GROUPS;
+                let code = if occurrence % 2 == 1 {
+                    format!("{base}   ")
+                } else {
+                    base
+                };
+                table_data.insert_row(
+                    id,
+                    vec![
+                        SqliteValue::Integer(id),
+                        SqliteValue::Text(code.into()),
+                        SqliteValue::Integer(id % TIER_COUNT),
+                        SqliteValue::Text(format!("note-{id:0>200}").into()),
+                    ],
+                );
+            }
+
+            let schema = vec![TableSchema {
+                name: "catalog".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    int_column("id", true),
+                    text_column("code"),
+                    int_column("tier", false),
+                    text_column("note"),
+                ],
+                indexes: vec![IndexSchema {
+                    name: "idx_catalog_mixed".to_owned(),
+                    root_page: 3,
+                    columns: vec!["code".to_owned(), "tier".to_owned(), "id".to_owned()],
+                    key_expressions: Vec::new(),
+                    key_sort_directions: vec![
+                        SortDirection::Asc,
+                        SortDirection::Desc,
+                        SortDirection::Asc,
+                    ],
+                    where_clause: None,
+                    is_unique: true,
+                    key_collations: vec![Some("RTRIM".to_owned()), None, None],
+                    conflict_action: None,
+                }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![vec!["id".to_owned()]],
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            }];
+            let header = DatabaseHeader {
+                page_size: DEFAULT_PAGE_SIZE,
+                schema_cookie: 1,
+                change_counter: 1,
+                version_valid_for: 1,
+                ..DatabaseHeader::default()
+            };
+            let mut original_ddl = HashMap::new();
+            original_ddl.insert(
+                "catalog".to_owned(),
+                "CREATE TABLE catalog (id INTEGER PRIMARY KEY, code TEXT, tier INTEGER, note TEXT)"
+                    .to_owned(),
+            );
+            original_ddl.insert(
+                "idx_catalog_mixed".to_owned(),
+                "CREATE UNIQUE INDEX idx_catalog_mixed \
+                 ON catalog(code COLLATE RTRIM, tier DESC, id)"
+                    .to_owned(),
+            );
+
+            persist_to_sqlite_with_header_and_master_entries(
+                &cx,
+                &db_path,
+                &schema,
+                &db,
+                &header,
+                &[],
+                &original_ddl,
+            )
+            .await
+            .unwrap();
+
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+            let quick: String = conn
+                .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                quick, "ok",
+                "stock SQLite quick_check must accept the rebuilt UNIQUE index"
+            );
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                integrity, "ok",
+                "stock SQLite integrity_check must accept the rebuilt UNIQUE index"
+            );
+
+            let declared_sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE type='index' AND name='idx_catalog_mixed';",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let lowered = declared_sql.to_ascii_lowercase();
+            assert!(
+                lowered.contains("unique") && lowered.contains("rtrim") && lowered.contains("desc"),
+                "persisted DDL must keep UNIQUE, RTRIM and DESC: {declared_sql}"
+            );
+
+            // Every table row must be reachable through the index; a dropped or
+            // duplicated entry shows up here even when integrity_check passes.
+            let indexed_count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM catalog INDEXED BY idx_catalog_mixed;",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let scanned_count: i64 = conn
+                .query_row("SELECT count(*) FROM catalog NOT INDEXED;", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(scanned_count, ROW_COUNT, "fixture must persist every row");
+            assert_eq!(
+                indexed_count, scanned_count,
+                "index must contain exactly one entry per table row"
+            );
+
+            // Compare over ALL rows rather than a `tier` cohort. Same-base rows
+            // recur every `CODE_GROUPS` ids, and `CODE_GROUPS % TIER_COUNT` is 6,
+            // so the five occurrences of a base land on five *distinct* tiers:
+            // any `WHERE tier = ?` cohort therefore contains at most one row per
+            // base, no trimmed/untrimmed pair survives the filter, and RTRIM and
+            // BINARY can agree on the filtered set. An unfiltered traversal keeps
+            // both spellings of every base in the comparison and is also the most
+            // direct exercise of the whole declared key shape — ASC+RTRIM, then
+            // DESC, then ASC.
+            let collect = |sql: &str| -> Vec<i64> {
+                let mut stmt = conn.prepare(sql).unwrap();
+                stmt.query_map([], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+
+            // The fixture must actually be able to tell RTRIM from BINARY,
+            // otherwise the ordering assertion below passes for an index that
+            // was rebuilt with the wrong collation. Prove it on the table scan,
+            // where neither ordering can come from the index under test: if the
+            // two collations agree on this data the fixture is not
+            // discriminatory and the rest of this test proves nothing.
+            let rtrim_scan = collect(
+                "SELECT id FROM catalog NOT INDEXED \
+                 ORDER BY code COLLATE RTRIM, tier DESC, id",
+            );
+            let binary_scan = collect(
+                "SELECT id FROM catalog NOT INDEXED \
+                 ORDER BY code COLLATE BINARY, tier DESC, id",
+            );
+            assert_ne!(
+                rtrim_scan, binary_scan,
+                "fixture must distinguish RTRIM from BINARY, otherwise a BINARY \
+                 rebuild would satisfy the index-order assertion below"
+            );
+            let both_spellings: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM (SELECT rtrim(code) AS b FROM catalog \
+                     GROUP BY b HAVING count(DISTINCT code) > 1);",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                both_spellings > 0,
+                "at least one base must appear both trimmed and untrimmed"
+            );
+
+            let forced = collect(
+                "SELECT id FROM catalog INDEXED BY idx_catalog_mixed \
+                 ORDER BY code COLLATE RTRIM, tier DESC, id",
+            );
+            assert_eq!(
+                forced.len(),
+                usize::try_from(ROW_COUNT).unwrap(),
+                "the forced index traversal must visit every row"
+            );
+            assert_eq!(
+                forced, rtrim_scan,
+                "forced UNIQUE mixed-direction RTRIM index traversal must match the table scan"
+            );
+        });
+    }
+
+    /// GH #304 (custom-collation arm): an index whose declared collation is not
+    /// resolvable by the builder must be refused, not rebuilt under BINARY.
+    ///
+    /// The source connection's collation registry is not reachable from the
+    /// persist path, so a `COLLATE MYCOLL` term previously fell back to BINARY
+    /// while the regenerated DDL kept saying `MYCOLL`. That produces the same
+    /// malformed-image class GH #304 was filed for, minus the DESC symptom that
+    /// made the original report visible — a silently wrong ordering rather than
+    /// a loud one. Refusing keeps the source image intact and surfaces the gap.
+    ///
+    /// Deliberately NOT covered here, and still open on GH #304:
+    ///
+    /// * **Built-in name override.** A source connection may register its own
+    ///   implementation under `BINARY`/`NOCASE`/`RTRIM`. The guard sees the name
+    ///   present and admits the index, which is then built with the *default*
+    ///   implementation — silently mis-ordered. No test asserts this, because
+    ///   provoking it means mutating the process-wide default registry, which
+    ///   would leak into every other test in this binary (the exact global-state
+    ///   hazard tracked by GH #299). It needs registry identity, not a name.
+    /// * **Candidate cleanup.** The `db_path.exists()` assertion below documents
+    ///   *ownership* only — it pins that this function does not delete its own
+    ///   output. It is not a cleanup proof. The release evidence still requires a
+    ///   keeper over the enclosing `VacuumTargetReservation` in `vacuum.rs`
+    ///   showing the partial candidate is actually removed on this failure path
+    ///   and that no caller-owned path is touched.
+    #[test]
+    fn test_persist_to_sqlite_refuses_unresolvable_index_collation() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("unresolvable-collation.db");
+            let cx = Cx::new();
+
+            let mut db = MemDatabase::new();
+            db.create_table_at(2, 2);
+            let table_data = db.get_table_mut(2).unwrap();
+            for id in 1..=8_i64 {
+                table_data.insert_row(
+                    id,
+                    vec![
+                        SqliteValue::Integer(id),
+                        SqliteValue::Text(format!("v{id}").into()),
+                    ],
+                );
+            }
+
+            let schema = vec![TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "id".to_owned(),
+                        affinity: 'D',
+                        is_ipk: true,
+                        type_name: Some("INTEGER".to_owned()),
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                    ColumnInfo {
+                        name: "label".to_owned(),
+                        affinity: 'B',
+                        is_ipk: false,
+                        type_name: Some("TEXT".to_owned()),
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                ],
+                indexes: vec![IndexSchema {
+                    name: "idx_t_label_custom".to_owned(),
+                    root_page: 3,
+                    columns: vec!["label".to_owned()],
+                    key_expressions: Vec::new(),
+                    key_sort_directions: vec![SortDirection::Asc],
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: vec![Some("MYCOLL".to_owned())],
+                    conflict_action: None,
+                }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![vec!["id".to_owned()]],
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            }];
+            let header = DatabaseHeader {
+                page_size: DEFAULT_PAGE_SIZE,
+                schema_cookie: 1,
+                change_counter: 1,
+                version_valid_for: 1,
+                ..DatabaseHeader::default()
+            };
+            let mut original_ddl = HashMap::new();
+            original_ddl.insert(
+                "t".to_owned(),
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)".to_owned(),
+            );
+            original_ddl.insert(
+                "idx_t_label_custom".to_owned(),
+                "CREATE INDEX idx_t_label_custom ON t(label COLLATE MYCOLL)".to_owned(),
+            );
+
+            let error = persist_to_sqlite_with_header_and_master_entries(
+                &cx,
+                &db_path,
+                &schema,
+                &db,
+                &header,
+                &[],
+                &original_ddl,
+            )
+            .await
+            .expect_err("an unresolvable index collation must fail closed");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("MYCOLL") && rendered.contains("contradict its own declaration"),
+                "refusal must name the unresolvable collation and why it is refused: {rendered}"
+            );
+            // A legitimate schema this builder cannot honour is a supported-
+            // schema limitation, not a violated internal invariant.
+            assert!(
+                matches!(error, FrankenError::NotImplemented(_)),
+                "refusal must be typed as NotImplemented, found {error:?}"
+            );
+
+            // Candidate cleanup is deliberately NOT this function's job: it never
+            // removes its own output on any error path, and the enclosing VACUUM
+            // caller owns removal through its identity-bound
+            // `VacuumTargetReservation`. Pin the actual post-failure state so a
+            // future change to that ownership boundary is caught here rather than
+            // silently leaking or silently starting to delete caller-owned paths.
+            let candidate_exists_after_refusal = db_path.exists();
+
+            // A built-in collation on the same shape must still succeed, so the
+            // guard rejects only what it genuinely cannot order. The DDL must be
+            // regenerated to match: reusing the MYCOLL text would persist an
+            // index whose declaration contradicts the key metadata actually
+            // built, which is the very defect this test exists to prevent, and
+            // stock SQLite would reject the unknown collation on open.
+            let mut ok_schema = schema;
+            ok_schema[0].indexes[0].key_collations = vec![Some("NOCASE".to_owned())];
+            let mut ok_ddl = HashMap::new();
+            ok_ddl.insert(
+                "t".to_owned(),
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)".to_owned(),
+            );
+            ok_ddl.insert(
+                "idx_t_label_custom".to_owned(),
+                "CREATE INDEX idx_t_label_custom ON t(label COLLATE NOCASE)".to_owned(),
+            );
+            let ok_path = dir.path().join("resolvable-collation.db");
+            persist_to_sqlite_with_header_and_master_entries(
+                &cx,
+                &ok_path,
+                &ok_schema,
+                &db,
+                &header,
+                &[],
+                &ok_ddl,
+            )
+            .await
+            .expect("a built-in collation must still rebuild");
+            let conn = rusqlite::Connection::open(&ok_path).unwrap();
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            let declared: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE type='index' AND name='idx_t_label_custom';",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                declared.to_ascii_uppercase().contains("NOCASE")
+                    && !declared.to_ascii_uppercase().contains("MYCOLL"),
+                "persisted DDL must declare the collation actually built: {declared}"
+            );
+
+            // Reported after the success path so a leak is described precisely
+            // rather than aborting the more informative assertions above.
+            assert!(
+                candidate_exists_after_refusal,
+                "refusal leaves the partial candidate for the caller's reservation to remove; \
+                 if this now fails, cleanup ownership moved into the persist path and the \
+                 comment above it must be updated"
             );
         });
     }
