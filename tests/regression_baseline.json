@@ -469,6 +469,16 @@
       "cfg_condition": null,
       "kind": "subprocess_helper",
       "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_1_2_parallel_wal_staging.rs",
+          "test_name": "bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_rows"
+        },
+        {
+          "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_1_2_parallel_wal_staging.rs",
+          "test_name": "bd_3wop3_1_2_parallel_wal_staging_lane_overflow_falls_back_without_row_drift"
+        }
+      ],
       "evidence": {
         "requirement": "Designated parent test exits 0 and validates the child status and summary artifact; standalone helper execution is not acceptance evidence.",
         "receipt": null
@@ -481,6 +491,12 @@
       "cfg_condition": null,
       "kind": "subprocess_helper",
       "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_1_3_parallel_wal_publication.rs",
+          "test_name": "bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent"
+        }
+      ],
       "evidence": {
         "requirement": "Designated parent test exits 0 and validates the child status and summary artifact; standalone helper execution is not acceptance evidence.",
         "receipt": null
@@ -493,6 +509,12 @@
       "cfg_condition": null,
       "kind": "subprocess_helper",
       "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_1_3_parallel_wal_publication.rs",
+          "test_name": "bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent"
+        }
+      ],
       "evidence": {
         "requirement": "Production performance parent exits 0 and validates every child status and emitted result artifact; standalone helper execution is not acceptance evidence.",
         "receipt": null
@@ -829,6 +851,12 @@
       "cfg_condition": null,
       "kind": "subprocess_helper",
       "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/correctness_mixed_dml.rs",
+          "test_name": "bd_c9pxw_crash_recovery_discards_unflushed_update_delete_batch"
+        }
+      ],
       "evidence": {
         "requirement": "Designated crash-recovery parent exits 0 and validates the child outcome and recovered state; standalone helper execution is not acceptance evidence.",
         "receipt": null
@@ -853,6 +881,12 @@
       "cfg_condition": null,
       "kind": "subprocess_helper",
       "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/correctness_transactions.rs",
+          "test_name": "txn_file_backed_retained_autocommit_crash_recovery_discards_unflushed_batch"
+        }
+      ],
       "evidence": {
         "requirement": "Designated crash-recovery parent exits 0 and validates the child outcome and recovered state; standalone helper execution is not acceptance evidence.",
         "receipt": null
@@ -925,6 +959,24 @@
       "cfg_condition": null,
       "kind": "subprocess_helper",
       "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs",
+          "test_name": "committed_transaction_survives_crash_recovery"
+        },
+        {
+          "source_path": "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs",
+          "test_name": "only_committed_prefix_survives_multi_transaction_crash"
+        },
+        {
+          "source_path": "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs",
+          "test_name": "recovered_database_accepts_follow_up_schema_and_writes"
+        },
+        {
+          "source_path": "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs",
+          "test_name": "uncommitted_transaction_is_discarded_after_crash"
+        }
+      ],
       "evidence": {
         "requirement": "Designated recovery parents exit 0 and validate child status plus recovered state; standalone helper execution is not acceptance evidence.",
         "receipt": null
@@ -949,6 +1001,12 @@
       "cfg_condition": null,
       "kind": "subprocess_helper",
       "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/recovery_data_loss.rs",
+          "test_name": "two_process_sigkill_recovery_loses_no_committed_writes"
+        }
+      ],
       "evidence": {
         "requirement": "The designated active parent exits 0 and validates every committed row after recovery; standalone helper execution is not acceptance evidence.",
         "receipt": null
