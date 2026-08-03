@@ -74,7 +74,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `asupersync` | Structured async runtime (channels, sync, regions, testing) |
-| `ftui` | TUI framework (crates.io: `ftui = "0.2.1"`) |
+| `ftui` | TUI framework (crates.io: `ftui = "0.5.0"`) |
 | `thiserror` | Derive macro for `Error` trait implementations |
 | `serde` + `serde_json` | Serialization/deserialization |
 | `bitflags` | Type-safe bitflag types for page flags, lock modes, etc. |

@@ -157,7 +157,7 @@ Next full-workspace lockstep release (`0.1.19 -> 0.2.0`).
 - `ftui` 0.4.1 -> 0.5.0, `chacha20poly1305` 0.10 -> 0.11 (RustCrypto `aead`
   0.6 / `hybrid-array`), `criterion` 0.7 -> 0.8, `jsonschema` 0.46.5 -> 0.48.5,
   and a full `Cargo.lock` refresh moving every other dependency to its latest
-  semver-compatible release. `asupersync` remains 0.3.9 with
+  semver-compatible release. `asupersync` is pinned to 0.3.10 with
   `default-features = false`, so no tokio-ecosystem crate enters the graph.
 
 ### Packaging
