@@ -1334,6 +1334,7 @@ mod tests {
     ///
     /// Assertions below must not inspect their own prose: a bare search of the
     /// whole file would match the tokens named in these comments and messages.
+    #[allow(dead_code)] // The harness=false bench build does not register its #[test] callers.
     fn implementation_slice(source: &str) -> &str {
         let start = source
             .find("fn bench_concurrent_csqlite_persistent(")
