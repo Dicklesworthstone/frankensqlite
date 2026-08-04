@@ -24,8 +24,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 const ROWS_PER_THREAD: i64 = 200;
 const MAX_TXN_RETRIES: u32 = 100;
 const RETRY_BACKOFF: Duration = Duration::from_micros(100);
+const SETUP_OPEN_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const T4_SAMPLE_COUNT: usize = 11;
 const T4_REPLAY_CMD: &str = "cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --exact --ignored --nocapture --test-threads=1";
 
@@ -70,15 +71,70 @@ fn artifact_dir() -> PathBuf {
     dir
 }
 
+struct WorkerSetupGuard {
+    barrier: Arc<Barrier>,
+    setup_failed: Arc<AtomicBool>,
+    reached_barrier: bool,
+}
+
+impl WorkerSetupGuard {
+    fn new(barrier: Arc<Barrier>, setup_failed: Arc<AtomicBool>) -> Self {
+        Self {
+            barrier,
+            setup_failed,
+            reached_barrier: false,
+        }
+    }
+
+    #[must_use = "worker admission must be asserted before timing begins"]
+    fn wait(mut self) -> bool {
+        self.reached_barrier = true;
+        self.barrier.wait();
+        !self.setup_failed.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for WorkerSetupGuard {
+    fn drop(&mut self) {
+        if !self.reached_barrier {
+            self.setup_failed.store(true, Ordering::Release);
+            self.barrier.wait();
+        }
+    }
+}
+
 // ── Engine runners ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ThreadResult {
     thread_id: usize,
     rows_inserted: i64,
+    started_ns_since_epoch: u64,
+    finished_ns_since_epoch: u64,
     wall_ms: u64,
     wall_ns: u64,
     retries: u64,
+}
+
+/// Wall-clock span of the concurrent transaction window.
+///
+/// Every worker records start and finish offsets from one shared epoch after
+/// preparation and before connection shutdown. The earliest start through the
+/// latest finish therefore covers the whole useful concurrency window without
+/// charging either engine for setup or close-time ceremony.
+fn concurrent_window(per_thread: &[ThreadResult]) -> Duration {
+    let started_ns = per_thread
+        .iter()
+        .map(|result| result.started_ns_since_epoch)
+        .min()
+        .expect("at least one worker result");
+    let finished_ns = per_thread
+        .iter()
+        .map(|result| result.finished_ns_since_epoch)
+        .max()
+        .expect("at least one worker result");
+    assert!(finished_ns >= started_ns, "worker timing window is ordered");
+    Duration::from_nanos(finished_ns - started_ns)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,28 +218,36 @@ fn run_csqlite_concurrent(n_threads: usize, transaction_shape: TransactionShape)
         }
     }
 
-    let barrier = Arc::new(Barrier::new(n_threads));
+    let setup_barrier = Arc::new(Barrier::new(n_threads + 1));
+    let setup_failed = Arc::new(AtomicBool::new(false));
+    let shared_epoch = Arc::new(OnceLock::new());
     let retry_total = Arc::new(AtomicU64::new(0));
 
-    let start = Instant::now();
     let handles: Vec<_> = (0..n_threads)
         .map(|tid| {
             let p = path.clone();
-            let bar = barrier.clone();
+            let barrier = setup_barrier.clone();
+            let failed = setup_failed.clone();
+            let epoch = shared_epoch.clone();
             let retries = retry_total.clone();
             thread::spawn(move || {
+                let setup = WorkerSetupGuard::new(barrier, failed);
                 let conn = rusqlite::Connection::open(&p).unwrap();
                 conn.execute_batch(
-                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; \
-                     PRAGMA cache_size=-64000; PRAGMA busy_timeout=5000;",
+                    "PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000; \
+                     PRAGMA busy_timeout=5000;",
                 )
                 .unwrap();
-                bar.wait();
-
-                let thread_start = Instant::now();
                 let insert_sql =
                     format!("INSERT INTO bench_{tid} VALUES (?1, ('t' || ?1), (?1 * 7))");
                 let mut stmt = conn.prepare(&insert_sql).unwrap();
+                assert!(
+                    setup.wait(),
+                    "csqlite worker start aborted after a peer setup failure"
+                );
+                let epoch = *epoch.get_or_init(Instant::now);
+
+                let thread_start = epoch.elapsed();
                 let mut local_retries: u64 = 0;
 
                 match transaction_shape {
@@ -219,10 +283,13 @@ fn run_csqlite_concurrent(n_threads: usize, transaction_shape: TransactionShape)
                     }
                 }
                 retries.fetch_add(local_retries, Ordering::Relaxed);
-                let elapsed = thread_start.elapsed();
+                let thread_end = epoch.elapsed();
+                let elapsed = thread_end.saturating_sub(thread_start);
                 ThreadResult {
                     thread_id: tid,
                     rows_inserted: ROWS_PER_THREAD,
+                    started_ns_since_epoch: thread_start.as_nanos().try_into().unwrap_or(u64::MAX),
+                    finished_ns_since_epoch: thread_end.as_nanos().try_into().unwrap_or(u64::MAX),
                     wall_ms: elapsed.as_millis() as u64,
                     wall_ns: elapsed.as_nanos().try_into().unwrap_or(u64::MAX),
                     retries: local_retries,
@@ -231,14 +298,20 @@ fn run_csqlite_concurrent(n_threads: usize, transaction_shape: TransactionShape)
         })
         .collect();
 
-    let per_thread: Vec<ThreadResult> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let total_wall = start.elapsed();
-    let total_rows = n_threads as i64 * ROWS_PER_THREAD;
-    #[allow(clippy::cast_precision_loss)]
-    let throughput = total_rows as f64 / total_wall.as_secs_f64();
-
-    {
+    setup_barrier.wait();
+    let joined = handles
+        .into_iter()
+        .map(|handle| handle.join())
+        .collect::<Vec<_>>();
+    let per_thread: Vec<ThreadResult> = joined
+        .into_iter()
+        .map(|result| result.expect("csqlite worker thread must complete"))
+        .collect();
+    let total_wall = concurrent_window(&per_thread);
+    let expected_total_rows = n_threads as i64 * ROWS_PER_THREAD;
+    let total_rows = {
         let verify = rusqlite::Connection::open(&path).unwrap();
+        let mut verified_rows = 0i64;
         for tid in 0..n_threads {
             let count: i64 = verify
                 .query_row(&format!("SELECT COUNT(*) FROM bench_{tid}"), [], |r| {
@@ -249,8 +322,16 @@ fn run_csqlite_concurrent(n_threads: usize, transaction_shape: TransactionShape)
                 count, ROWS_PER_THREAD,
                 "csqlite thread {tid} row count mismatch"
             );
+            verified_rows += count;
         }
-    }
+        verified_rows
+    };
+    assert_eq!(
+        total_rows, expected_total_rows,
+        "csqlite total row count mismatch"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let throughput = total_rows as f64 / total_wall.as_secs_f64();
 
     BenchResult {
         engine: "csqlite".to_owned(),
@@ -262,6 +343,46 @@ fn run_csqlite_concurrent(n_threads: usize, transaction_shape: TransactionShape)
         throughput_ops_per_sec: throughput,
         total_retries: retry_total.load(Ordering::Relaxed),
         per_thread,
+    }
+}
+
+fn setup_open_retry_delay(attempt: u32, thread_id: usize) -> Duration {
+    let shift = attempt.min(7);
+    let base_us = (100_u64 << shift).min(10_000);
+    let thread_salt = u64::try_from(thread_id).unwrap_or(u64::MAX);
+    let jitter_us = thread_salt
+        .wrapping_mul(6_361)
+        .wrapping_add(u64::from(attempt).wrapping_mul(3_571))
+        % base_us;
+    Duration::from_micros(base_us.saturating_add(jitter_us))
+}
+
+async fn open_fsqlite_worker(path: &str, thread_id: usize) -> fsqlite::Connection {
+    let started = Instant::now();
+    let deadline = started + SETUP_OPEN_RETRY_BUDGET;
+    let mut attempt = 0u32;
+    loop {
+        match fsqlite::Connection::open(path).await {
+            Ok(connection) => return connection,
+            Err(error) if !error.is_transient() => {
+                let open_attempt = attempt.saturating_add(1);
+                panic!(
+                    "fsqlite worker {thread_id} open failed with a non-transient error on attempt {open_attempt}: {error}"
+                );
+            }
+            Err(error) => {
+                let now = Instant::now();
+                assert!(
+                    now < deadline,
+                    "fsqlite worker {thread_id} exhausted the {SETUP_OPEN_RETRY_BUDGET:?} open-retry budget after {attempt} retries in {:?}: {error}",
+                    started.elapsed()
+                );
+                let delay = setup_open_retry_delay(attempt, thread_id)
+                    .min(deadline.saturating_duration_since(now));
+                attempt = attempt.saturating_add(1);
+                asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
+            }
+        }
     }
 }
 
@@ -285,22 +406,26 @@ async fn run_fsqlite_concurrent(
             .await
             .unwrap();
         }
+        conn.close().await.expect("close fsqlite setup connection");
     }
 
-    let barrier = Arc::new(Barrier::new(n_threads));
+    let setup_barrier = Arc::new(Barrier::new(n_threads + 1));
+    let setup_failed = Arc::new(AtomicBool::new(false));
+    let shared_epoch = Arc::new(OnceLock::new());
     let retry_total = Arc::new(AtomicU64::new(0));
 
-    let start = Instant::now();
     let handles: Vec<_> = (0..n_threads)
         .map(|tid| {
             let p = path_str.clone();
-            let bar = barrier.clone();
+            let barrier = setup_barrier.clone();
+            let failed = setup_failed.clone();
+            let epoch = shared_epoch.clone();
             let retries = retry_total.clone();
             thread::spawn(move || {
+                let setup = WorkerSetupGuard::new(barrier, failed);
                 let mut thread_result: Option<ThreadResult> = None;
                 asupersync::test_utils::run_test(|| async {
-                    let conn = fsqlite::Connection::open(&p).await.unwrap();
-                    conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                    let conn = open_fsqlite_worker(&p, tid).await;
                     conn.execute("PRAGMA synchronous = NORMAL;").await.unwrap();
                     conn.execute("PRAGMA cache_size = -64000;").await.unwrap();
                     conn.execute("PRAGMA busy_timeout = 5000;").await.unwrap();
@@ -311,9 +436,13 @@ async fn run_fsqlite_concurrent(
                     let insert_sql =
                         format!("INSERT INTO bench_{tid} VALUES (?1, ('t' || ?1), (?1 * 7));");
                     let stmt = conn.prepare(&insert_sql).await.unwrap();
-                    bar.wait();
+                    assert!(
+                        setup.wait(),
+                        "fsqlite worker start aborted after a peer setup failure"
+                    );
+                    let epoch = *epoch.get_or_init(Instant::now);
 
-                    let thread_start = Instant::now();
+                    let thread_start = epoch.elapsed();
                     let mut local_retries: u64 = 0;
 
                     if transaction_shape == TransactionShape::PerWorker {
@@ -407,28 +536,48 @@ async fn run_fsqlite_concurrent(
                     }
 
                     retries.fetch_add(local_retries, Ordering::Relaxed);
-                    let elapsed = thread_start.elapsed();
-                    thread_result = Some(ThreadResult {
+                    let thread_end = epoch.elapsed();
+                    let elapsed = thread_end.saturating_sub(thread_start);
+                    let result = ThreadResult {
                         thread_id: tid,
                         rows_inserted: ROWS_PER_THREAD,
+                        started_ns_since_epoch: thread_start
+                            .as_nanos()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        finished_ns_since_epoch: thread_end
+                            .as_nanos()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
                         wall_ms: elapsed.as_millis() as u64,
                         wall_ns: elapsed.as_nanos().try_into().unwrap_or(u64::MAX),
                         retries: local_retries,
-                    });
+                    };
+                    drop(stmt);
+                    conn.close_without_checkpoint()
+                        .await
+                        .expect("close fsqlite worker connection without checkpoint");
+                    thread_result = Some(result);
                 });
                 thread_result.expect("fsqlite worker thread produced a result")
             })
         })
         .collect();
 
-    let per_thread: Vec<ThreadResult> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let total_wall = start.elapsed();
-    let total_rows = n_threads as i64 * ROWS_PER_THREAD;
-    #[allow(clippy::cast_precision_loss)]
-    let throughput = total_rows as f64 / total_wall.as_secs_f64();
-
-    {
+    setup_barrier.wait();
+    let joined = handles
+        .into_iter()
+        .map(|handle| handle.join())
+        .collect::<Vec<_>>();
+    let per_thread: Vec<ThreadResult> = joined
+        .into_iter()
+        .map(|result| result.expect("fsqlite worker thread must complete"))
+        .collect();
+    let total_wall = concurrent_window(&per_thread);
+    let expected_total_rows = n_threads as i64 * ROWS_PER_THREAD;
+    let total_rows = {
         let verify = rusqlite::Connection::open(tmp.path()).unwrap();
+        let mut verified_rows = 0i64;
         for tid in 0..n_threads {
             let count: i64 = verify
                 .query_row(&format!("SELECT COUNT(*) FROM bench_{tid}"), [], |r| {
@@ -439,8 +588,16 @@ async fn run_fsqlite_concurrent(
                 count, ROWS_PER_THREAD,
                 "fsqlite thread {tid} row count mismatch (rusqlite verification)"
             );
+            verified_rows += count;
         }
-    }
+        verified_rows
+    };
+    assert_eq!(
+        total_rows, expected_total_rows,
+        "fsqlite total row count mismatch"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let throughput = total_rows as f64 / total_wall.as_secs_f64();
 
     BenchResult {
         engine: "fsqlite_mvcc".to_owned(),
@@ -682,7 +839,7 @@ fn t3_structured_json_has_required_fields() {
         let f_result = run_fsqlite_concurrent(2, TransactionShape::PerWorker).await;
 
         let report = ShowcaseReport {
-            schema_version: "fsqlite-e2e.concurrent_showcase.v2".to_owned(),
+            schema_version: "fsqlite-e2e.concurrent_showcase.v3".to_owned(),
             bead_id: "bd-wsw3p".to_owned(),
             thread_counts: vec![2],
             rows_per_thread: ROWS_PER_THREAD,
@@ -724,6 +881,145 @@ fn median_handles_odd_and_even_sample_counts() {
 
     let mut even = [9.0, 1.0, 7.0, 3.0];
     assert_eq!(median(&mut even), 5.0);
+}
+
+#[test]
+fn concurrent_window_spans_earliest_start_to_latest_finish() {
+    let results = [
+        ThreadResult {
+            thread_id: 0,
+            rows_inserted: 1,
+            started_ns_since_epoch: 0,
+            finished_ns_since_epoch: 10,
+            wall_ms: 0,
+            wall_ns: 10,
+            retries: 0,
+        },
+        ThreadResult {
+            thread_id: 1,
+            rows_inserted: 1,
+            started_ns_since_epoch: 8,
+            finished_ns_since_epoch: 20,
+            wall_ms: 0,
+            wall_ns: 12,
+            retries: 0,
+        },
+    ];
+
+    assert_eq!(concurrent_window(&results), Duration::from_nanos(20));
+}
+
+#[test]
+fn setup_open_retry_backoff_is_bounded_and_staggered() {
+    assert_eq!(setup_open_retry_delay(0, 0), Duration::from_micros(100));
+    assert!(setup_open_retry_delay(6, 0) >= Duration::from_micros(6_400));
+
+    let mut saturated_delays = (0..16)
+        .map(|thread_id| setup_open_retry_delay(32, thread_id))
+        .collect::<Vec<_>>();
+    assert!(
+        saturated_delays
+            .iter()
+            .all(|delay| *delay >= Duration::from_millis(10) && *delay < Duration::from_millis(20))
+    );
+    saturated_delays.sort_unstable();
+    saturated_delays.dedup();
+    assert_eq!(saturated_delays.len(), 16);
+}
+
+#[test]
+fn setup_failure_aborts_ready_peer_without_deadlock() {
+    enum Outcome {
+        CoordinatorReleased,
+        FailureRecorded(bool),
+        PeerAdmitted(bool),
+    }
+
+    let barrier = Arc::new(Barrier::new(3));
+    let setup_failed = Arc::new(AtomicBool::new(false));
+    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let peer_barrier = barrier.clone();
+    let peer_failed = setup_failed.clone();
+    let peer_tx = outcome_tx.clone();
+    let peer = thread::spawn(move || {
+        let admitted = WorkerSetupGuard::new(peer_barrier, peer_failed).wait();
+        peer_tx.send(Outcome::PeerAdmitted(admitted)).unwrap();
+    });
+    let failed_barrier = barrier.clone();
+    let failed_flag = setup_failed.clone();
+    let failed_tx = outcome_tx.clone();
+    let failed_worker = thread::spawn(move || {
+        drop(WorkerSetupGuard::new(failed_barrier, failed_flag.clone()));
+        failed_tx
+            .send(Outcome::FailureRecorded(
+                failed_flag.load(Ordering::Acquire),
+            ))
+            .unwrap();
+    });
+    let coordinator_tx = outcome_tx;
+    let coordinator = thread::spawn(move || {
+        barrier.wait();
+        coordinator_tx.send(Outcome::CoordinatorReleased).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut peer_admitted = true;
+    let mut failed_worker_reported = false;
+    for _ in 0..3 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let outcome = outcome_rx
+            .recv_timeout(remaining)
+            .expect("setup failure must release every barrier participant");
+        match outcome {
+            Outcome::CoordinatorReleased => {}
+            Outcome::FailureRecorded(recorded) => failed_worker_reported = recorded,
+            Outcome::PeerAdmitted(admitted) => peer_admitted = admitted,
+        }
+    }
+    assert!(setup_failed.load(Ordering::Acquire));
+    assert!(failed_worker_reported, "failed worker must report its exit");
+    assert!(
+        !peer_admitted,
+        "ready peer must reject a failed setup cohort"
+    );
+    failed_worker.join().unwrap();
+    peer.join().unwrap();
+    coordinator.join().unwrap();
+}
+
+#[test]
+fn successful_worker_setup_releases_each_participant_once() {
+    let barrier = Arc::new(Barrier::new(3));
+    let setup_failed = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = mpsc::channel();
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let worker_barrier = barrier.clone();
+        let worker_failed = setup_failed.clone();
+        let worker_tx = done_tx.clone();
+        workers.push(thread::spawn(move || {
+            let admitted = WorkerSetupGuard::new(worker_barrier, worker_failed).wait();
+            worker_tx.send(admitted).unwrap();
+        }));
+    }
+    let coordinator = thread::spawn(move || {
+        barrier.wait();
+        done_tx.send(true).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for _ in 0..3 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let admitted = done_rx
+            .recv_timeout(remaining)
+            .expect("successful setup must release every barrier participant");
+        assert!(admitted, "successful setup must admit every worker");
+    }
+    assert!(!setup_failed.load(Ordering::Acquire));
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    coordinator.join().unwrap();
 }
 
 #[test]
@@ -1055,7 +1351,7 @@ fn t5_showcase_4_8_produces_labeled_artifact_bundle() {
         }
 
         let report = ShowcaseReport {
-            schema_version: "fsqlite-e2e.concurrent_showcase.v2".to_owned(),
+            schema_version: "fsqlite-e2e.concurrent_showcase.v3".to_owned(),
             bead_id: "bd-wsw3p".to_owned(),
             thread_counts: thread_counts.clone(),
             rows_per_thread: ROWS_PER_THREAD,
