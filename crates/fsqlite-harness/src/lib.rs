@@ -114,6 +114,7 @@ pub mod test_diagnostics;
 pub mod test_inventory;
 pub mod tla;
 pub mod toolchain_determinism;
+pub mod typed_sql_generator;
 pub mod unit_fixtures;
 pub mod unit_matrix;
 pub mod validation_manifest;
