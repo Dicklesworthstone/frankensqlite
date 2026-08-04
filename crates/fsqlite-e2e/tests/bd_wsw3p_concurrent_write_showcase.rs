@@ -36,7 +36,8 @@ use sha2::{Digest, Sha256};
 const ROWS_PER_THREAD: i64 = 200;
 const MAX_TXN_RETRIES: u32 = 100;
 const RETRY_BACKOFF: Duration = Duration::from_micros(100);
-const SETUP_OPEN_RETRY_BUDGET: Duration = Duration::from_secs(10);
+/// Maximum wall time for one worker to open, configure, and prepare.
+const SETUP_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const T4_SAMPLE_COUNT: usize = 11;
 const T4_REPLAY_CMD: &str = "cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --exact --ignored --nocapture --test-threads=1";
 
@@ -346,7 +347,7 @@ fn run_csqlite_concurrent(n_threads: usize, transaction_shape: TransactionShape)
     }
 }
 
-fn setup_open_retry_delay(attempt: u32, thread_id: usize) -> Duration {
+fn setup_retry_delay(attempt: u32, thread_id: usize) -> Duration {
     let shift = attempt.min(7);
     let base_us = (100_u64 << shift).min(10_000);
     let thread_salt = u64::try_from(thread_id).unwrap_or(u64::MAX);
@@ -357,9 +358,12 @@ fn setup_open_retry_delay(attempt: u32, thread_id: usize) -> Duration {
     Duration::from_micros(base_us.saturating_add(jitter_us))
 }
 
-async fn open_fsqlite_worker(path: &str, thread_id: usize) -> fsqlite::Connection {
-    let started = Instant::now();
-    let deadline = started + SETUP_OPEN_RETRY_BUDGET;
+async fn open_fsqlite_worker(
+    path: &str,
+    thread_id: usize,
+    setup_started: Instant,
+    setup_deadline: Instant,
+) -> fsqlite::Connection {
     let mut attempt = 0u32;
     loop {
         match fsqlite::Connection::open(path).await {
@@ -373,12 +377,78 @@ async fn open_fsqlite_worker(path: &str, thread_id: usize) -> fsqlite::Connectio
             Err(error) => {
                 let now = Instant::now();
                 assert!(
-                    now < deadline,
-                    "fsqlite worker {thread_id} exhausted the {SETUP_OPEN_RETRY_BUDGET:?} open-retry budget after {attempt} retries in {:?}: {error}",
-                    started.elapsed()
+                    now < setup_deadline,
+                    "fsqlite worker {thread_id} exhausted the {SETUP_RETRY_BUDGET:?} open-retry budget after {attempt} retries in {:?}: {error}",
+                    setup_started.elapsed()
                 );
-                let delay = setup_open_retry_delay(attempt, thread_id)
-                    .min(deadline.saturating_duration_since(now));
+                let delay = setup_retry_delay(attempt, thread_id)
+                    .min(setup_deadline.saturating_duration_since(now));
+                attempt = attempt.saturating_add(1);
+                asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
+            }
+        }
+    }
+}
+
+async fn execute_fsqlite_worker_setup(
+    conn: &fsqlite::Connection,
+    sql: &str,
+    thread_id: usize,
+    setup_started: Instant,
+    setup_deadline: Instant,
+) {
+    let mut attempt = 0u32;
+    loop {
+        match conn.execute(sql).await {
+            Ok(_) => return,
+            Err(error) if !error.is_transient() => {
+                let setup_attempt = attempt.saturating_add(1);
+                panic!(
+                    "fsqlite worker {thread_id} setup SQL failed with a non-transient error on attempt {setup_attempt}: {error}"
+                );
+            }
+            Err(error) => {
+                let now = Instant::now();
+                assert!(
+                    now < setup_deadline,
+                    "fsqlite worker {thread_id} exhausted the {SETUP_RETRY_BUDGET:?} setup-SQL retry budget after {attempt} retries in {:?}: {error}",
+                    setup_started.elapsed()
+                );
+                let delay = setup_retry_delay(attempt, thread_id)
+                    .min(setup_deadline.saturating_duration_since(now));
+                attempt = attempt.saturating_add(1);
+                asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
+            }
+        }
+    }
+}
+
+async fn prepare_fsqlite_worker<'conn>(
+    conn: &'conn fsqlite::Connection,
+    sql: &str,
+    thread_id: usize,
+    setup_started: Instant,
+    setup_deadline: Instant,
+) -> fsqlite::PreparedStatement<'conn> {
+    let mut attempt = 0u32;
+    loop {
+        match conn.prepare(sql).await {
+            Ok(statement) => return statement,
+            Err(error) if !error.is_transient() => {
+                let prepare_attempt = attempt.saturating_add(1);
+                panic!(
+                    "fsqlite worker {thread_id} prepare failed with a non-transient error on attempt {prepare_attempt}: {error}"
+                );
+            }
+            Err(error) => {
+                let now = Instant::now();
+                assert!(
+                    now < setup_deadline,
+                    "fsqlite worker {thread_id} exhausted the {SETUP_RETRY_BUDGET:?} prepare-retry budget after {attempt} retries in {:?}: {error}",
+                    setup_started.elapsed()
+                );
+                let delay = setup_retry_delay(attempt, thread_id)
+                    .min(setup_deadline.saturating_duration_since(now));
                 attempt = attempt.saturating_add(1);
                 asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
             }
@@ -425,17 +495,52 @@ async fn run_fsqlite_concurrent(
                 let setup = WorkerSetupGuard::new(barrier, failed);
                 let mut thread_result: Option<ThreadResult> = None;
                 asupersync::test_utils::run_test(|| async {
-                    let conn = open_fsqlite_worker(&p, tid).await;
-                    conn.execute("PRAGMA synchronous = NORMAL;").await.unwrap();
-                    conn.execute("PRAGMA cache_size = -64000;").await.unwrap();
-                    conn.execute("PRAGMA busy_timeout = 5000;").await.unwrap();
-                    conn.execute("PRAGMA fsqlite.concurrent_mode = ON;")
-                        .await
-                        .unwrap();
+                    let setup_started = Instant::now();
+                    let setup_deadline = setup_started + SETUP_RETRY_BUDGET;
+                    let conn = open_fsqlite_worker(&p, tid, setup_started, setup_deadline).await;
+                    execute_fsqlite_worker_setup(
+                        &conn,
+                        "PRAGMA synchronous = NORMAL;",
+                        tid,
+                        setup_started,
+                        setup_deadline,
+                    )
+                    .await;
+                    execute_fsqlite_worker_setup(
+                        &conn,
+                        "PRAGMA cache_size = -64000;",
+                        tid,
+                        setup_started,
+                        setup_deadline,
+                    )
+                    .await;
+                    execute_fsqlite_worker_setup(
+                        &conn,
+                        "PRAGMA busy_timeout = 5000;",
+                        tid,
+                        setup_started,
+                        setup_deadline,
+                    )
+                    .await;
+                    execute_fsqlite_worker_setup(
+                        &conn,
+                        "PRAGMA fsqlite.concurrent_mode = ON;",
+                        tid,
+                        setup_started,
+                        setup_deadline,
+                    )
+                    .await;
 
                     let insert_sql =
                         format!("INSERT INTO bench_{tid} VALUES (?1, ('t' || ?1), (?1 * 7));");
-                    let stmt = conn.prepare(&insert_sql).await.unwrap();
+                    let stmt = prepare_fsqlite_worker(
+                        &conn,
+                        &insert_sql,
+                        tid,
+                        setup_started,
+                        setup_deadline,
+                    )
+                    .await;
                     assert!(
                         setup.wait(),
                         "fsqlite worker start aborted after a peer setup failure"
@@ -910,12 +1015,12 @@ fn concurrent_window_spans_earliest_start_to_latest_finish() {
 }
 
 #[test]
-fn setup_open_retry_backoff_is_bounded_and_staggered() {
-    assert_eq!(setup_open_retry_delay(0, 0), Duration::from_micros(100));
-    assert!(setup_open_retry_delay(6, 0) >= Duration::from_micros(6_400));
+fn setup_retry_backoff_is_bounded_and_staggered() {
+    assert_eq!(setup_retry_delay(0, 0), Duration::from_micros(100));
+    assert!(setup_retry_delay(6, 0) >= Duration::from_micros(6_400));
 
     let mut saturated_delays = (0..16)
-        .map(|thread_id| setup_open_retry_delay(32, thread_id))
+        .map(|thread_id| setup_retry_delay(32, thread_id))
         .collect::<Vec<_>>();
     assert!(
         saturated_delays
