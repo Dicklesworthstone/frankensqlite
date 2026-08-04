@@ -6883,8 +6883,10 @@ PRAGMA integrity_check;
             "reserved lock-byte rootpage",
         );
 
-        let mut auto_vacuum_header = DatabaseHeader::default();
-        auto_vacuum_header.largest_root_page = 3;
+        let auto_vacuum_header = DatabaseHeader {
+            largest_root_page: 3,
+            ..DatabaseHeader::default()
+        };
         assert_implicit_autoindex_catalog_corrupt_with_root_context(
             "auto-vacuum pointer-map root",
             &table_at(2),
