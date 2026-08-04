@@ -1429,8 +1429,13 @@ fn assert_image_matches_candidate(
 #[cfg(unix)]
 fn assert_journal_is_absent_or_non_hot(database_path: &Path, label: &str) {
     let journal_path = journal_path_for(database_path);
-    let Ok(bytes) = std::fs::read(&journal_path) else {
-        return;
+    let bytes = match std::fs::read(&journal_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => panic!(
+            "{label}: could not inspect rollback journal {}: {error}",
+            journal_path.display()
+        ),
     };
     assert!(
         bytes.len() < 8 || bytes[..8].iter().all(|byte| *byte == 0),
@@ -1704,7 +1709,7 @@ fn vacuum_publication_parent_cancellation_after_first_target_write_restores_befo
 
 #[cfg(unix)]
 #[test]
-fn vacuum_silent_replay_corruption_stays_hot_and_recovers_on_fresh_open() {
+fn vacuum_silent_replay_corruption_recovers_before_return_and_fresh_open_succeeds() {
     const LABEL: &str = "silent-replay-page-corruption";
     let fixture = VacuumPublicationFixture::new();
     let original_receipt = fixture.source_receipt.clone();
@@ -1726,16 +1731,18 @@ fn vacuum_silent_replay_corruption_stays_hot_and_recovers_on_fresh_open() {
     );
     assert_eq!(fault_vfs.snapshot().fired_label, Some(LABEL));
 
-    let journal_bytes = std::fs::read(journal_path_for(&fixture.source_path))
-        .expect("failed replay verification must retain its hot journal");
-    assert!(
-        journal_bytes.len() >= 8 && journal_bytes[..8].iter().any(|byte| *byte != 0),
-        "failed replay verification invalidated the only recovery record"
+    assert_eq!(
+        std::fs::read(&fixture.source_path).expect("read source after canonical recovery"),
+        fixture.source_bytes,
+        "canonical recovery did not restore the exact pre-publication bytes before return"
     );
+    let recovered_receipt = block_on(fixture.pager.capture_vacuum_source_image(&fixture.cx))
+        .expect("canonical recovery must leave the existing pager usable");
     assert!(
-        block_on(fixture.pager.capture_vacuum_source_image(&fixture.cx)).is_err(),
-        "a pager with unverified recovery must remain fail-closed"
+        recovered_receipt == original_receipt,
+        "canonical recovery changed the source image receipt"
     );
+    assert_journal_is_absent_or_non_hot(&fixture.source_path, LABEL);
 
     fault_vfs.disarm();
     let recovery_vfs = UnixVfs::new();
@@ -1759,14 +1766,14 @@ fn vacuum_silent_replay_corruption_stays_hot_and_recovers_on_fresh_open() {
         &source_path,
         PageSize::DEFAULT,
     ))
-    .expect("fresh open must retry and verify the retained hot journal");
+    .expect("fresh open must observe the synchronously recovered source image");
     assert_eq!(
         std::fs::read(&source_path).expect("read freshly recovered source"),
         source_bytes,
         "fresh recovery did not restore the exact pre-publication bytes"
     );
     let recovered_receipt = block_on(recovered.capture_vacuum_source_image(&cx))
-        .expect("freshly recovered pager must leave recovery clean");
+        .expect("freshly opened pager must leave recovery clean");
     assert!(
         recovered_receipt == original_receipt,
         "fresh recovery changed the source image receipt"
