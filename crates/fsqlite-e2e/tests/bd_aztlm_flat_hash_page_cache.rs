@@ -1,8 +1,9 @@
 //! Track Q flat-hash page-cache oracle and concurrent-writer evidence for `bd-aztlm`.
 #![recursion_limit = "512"]
 
+use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,10 +22,30 @@ const ROUNDS_PER_WRITER: usize = 250;
 
 static TRACK_Q_E2E_LOCK: Mutex<()> = Mutex::new(());
 
+fn lock_track_q_e2e() -> MutexGuard<'static, ()> {
+    // The mutex protects no shared data; it only serializes process-wide E2E
+    // fixtures. Preserve that isolation even when another test has panicked.
+    TRACK_Q_E2E_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct WriterStats {
     committed: usize,
     retries: u64,
+    transient_rollback_errors: u64,
+}
+
+async fn observe_rollback(conn: &fsqlite::Connection, stats: &mut WriterStats) -> Option<String> {
+    match conn.execute("ROLLBACK;").await {
+        Ok(_) => None,
+        Err(err) if err.is_transient() => {
+            stats.transient_rollback_errors = stats.transient_rollback_errors.saturating_add(1);
+            None
+        }
+        Err(err) => Some(err.to_string()),
+    }
 }
 
 fn emit_track_q_e2e_log(test_name: &str, phase: &str, payload: serde_json::Value) {
@@ -151,9 +172,11 @@ fn rows_per_sec(rows: usize, elapsed: Duration) -> f64 {
 
 #[test]
 fn bd_aztlm_flat_hash_insert_10k_oracle_matches_sqlite() {
+    // Serialize this process-wide E2E fixture before entering the async
+    // runtime. Keeping the synchronous guard outside the future prevents it
+    // from becoming part of a suspended async state machine.
+    let _guard = lock_track_q_e2e();
     asupersync::test_utils::run_test(|| async {
-        let _guard = TRACK_Q_E2E_LOCK.lock().expect("track q e2e lock");
-
         let temp = tempdir().expect("tempdir");
         let fsqlite_db = temp.path().join("track_q_oracle_fsqlite.db");
         let sqlite_db = temp.path().join("track_q_oracle_sqlite.db");
@@ -228,9 +251,10 @@ fn bd_aztlm_flat_hash_insert_10k_oracle_matches_sqlite() {
 
 #[test]
 fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
+    // See the oracle test above: acquire process-wide fixture ownership in
+    // the synchronous harness frame, not inside the async workload.
+    let _guard = lock_track_q_e2e();
     asupersync::test_utils::run_test(|| async {
-        let _guard = TRACK_Q_E2E_LOCK.lock().expect("track q e2e lock");
-
         let temp = tempdir().expect("tempdir");
         let fsqlite_db = temp.path().join("track_q_concurrent_fsqlite.db");
         let sqlite_db = temp.path().join("track_q_concurrent_sqlite.db");
@@ -289,7 +313,13 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
                                 match conn.execute(&insert_sql).await {
                                     Ok(1) => {}
                                     Ok(changes) => {
-                                        drop(conn.execute("ROLLBACK;").await);
+                                        if let Some(rollback_err) =
+                                            observe_rollback(&conn, &mut stats).await
+                                        {
+                                            return Err(format!(
+                                                "writer={writer_id} round={round}: expected 1 inserted row, got {changes}; non-transient ROLLBACK error: {rollback_err}"
+                                            ));
+                                        }
                                         return Err(format!(
                                             "writer={writer_id} round={round}: expected 1 inserted row, got {changes}"
                                         ));
@@ -297,7 +327,13 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
                                     Err(err) if err.is_transient() => {
                                         retries_this_row += 1;
                                         stats.retries = stats.retries.saturating_add(1);
-                                        drop(conn.execute("ROLLBACK;").await);
+                                        if let Some(rollback_err) =
+                                            observe_rollback(&conn, &mut stats).await
+                                        {
+                                            return Err(format!(
+                                                "writer={writer_id} round={round}: transient INSERT error `{err}` was followed by non-transient ROLLBACK error `{rollback_err}`"
+                                            ));
+                                        }
                                         if retries_this_row > MAX_RETRIES_PER_TXN {
                                             return Err(format!(
                                                 "writer={writer_id} round={round}: exceeded retry budget at INSERT"
@@ -307,7 +343,13 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
                                         continue;
                                     }
                                     Err(err) => {
-                                        drop(conn.execute("ROLLBACK;").await);
+                                        if let Some(rollback_err) =
+                                            observe_rollback(&conn, &mut stats).await
+                                        {
+                                            return Err(format!(
+                                                "writer={writer_id} round={round}: non-transient INSERT error `{err}` was followed by non-transient ROLLBACK error `{rollback_err}`"
+                                            ));
+                                        }
                                         return Err(format!(
                                             "writer={writer_id} round={round}: non-transient INSERT error: {err}"
                                         ));
@@ -322,7 +364,13 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
                                     Err(err) if err.is_transient() => {
                                         retries_this_row += 1;
                                         stats.retries = stats.retries.saturating_add(1);
-                                        drop(conn.execute("ROLLBACK;").await);
+                                        if let Some(rollback_err) =
+                                            observe_rollback(&conn, &mut stats).await
+                                        {
+                                            return Err(format!(
+                                                "writer={writer_id} round={round}: transient COMMIT error `{err}` was followed by non-transient ROLLBACK error `{rollback_err}`"
+                                            ));
+                                        }
                                         if retries_this_row > MAX_RETRIES_PER_TXN {
                                             return Err(format!(
                                                 "writer={writer_id} round={round}: exceeded retry budget at COMMIT"
@@ -331,7 +379,13 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
                                         thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
                                     }
                                     Err(err) => {
-                                        drop(conn.execute("ROLLBACK;").await);
+                                        if let Some(rollback_err) =
+                                            observe_rollback(&conn, &mut stats).await
+                                        {
+                                            return Err(format!(
+                                                "writer={writer_id} round={round}: non-transient COMMIT error `{err}` was followed by non-transient ROLLBACK error `{rollback_err}`"
+                                            ));
+                                        }
                                         return Err(format!(
                                             "writer={writer_id} round={round}: non-transient COMMIT error: {err}"
                                         ));
@@ -351,6 +405,7 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
         let started = Instant::now();
         let mut total_committed = 0_usize;
         let mut total_retries = 0_u64;
+        let mut total_transient_rollback_errors = 0_u64;
         for handle in handles {
             let stats = handle
                 .join()
@@ -358,15 +413,49 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
                 .unwrap_or_else(|message| panic!("{message}"));
             total_committed += stats.committed;
             total_retries = total_retries.saturating_add(stats.retries);
+            total_transient_rollback_errors =
+                total_transient_rollback_errors.saturating_add(stats.transient_rollback_errors);
         }
         let elapsed = started.elapsed();
 
         let verifier = open_fsqlite(&fsqlite_db).await;
+        let fsqlite_rows = fetch_fsqlite_rows(&verifier, "writer_rows").await;
+        let unique_ids = fsqlite_rows
+            .iter()
+            .map(|(row_id, _, _)| *row_id)
+            .collect::<BTreeSet<_>>()
+            .len();
+        // The rows are ordered by id, so adjacent equal ids expose physical
+        // duplicates. `unique_ids` remains the authoritative cardinality if
+        // one id appears more than twice and therefore occurs here repeatedly.
+        let duplicate_ids = fsqlite_rows
+            .windows(2)
+            .filter_map(|rows| (rows[0].0 == rows[1].0).then_some(rows[0].0))
+            .collect::<Vec<_>>();
         let total_rows = query_single_integer(&verifier, "SELECT COUNT(*) FROM writer_rows;").await;
+        emit_track_q_e2e_log(
+            "bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss",
+            "pre_assert_counts",
+            json!({
+                "total_retries": total_retries,
+                "total_transient_rollback_errors": total_transient_rollback_errors,
+                "count_star": total_rows,
+                "scan_len": fsqlite_rows.len(),
+                "unique_ids": unique_ids,
+                "duplicate_ids": &duplicate_ids,
+                "total_committed": total_committed,
+                "expected_rows": WRITERS * ROUNDS_PER_WRITER,
+            }),
+        );
+        assert_eq!(
+            usize::try_from(total_rows).expect("row count fits"),
+            fsqlite_rows.len(),
+            "COUNT(*) should agree with an ordered full row scan"
+        );
         assert_eq!(
             total_rows,
             i64::try_from(total_committed).expect("committed count fits"),
-            "final writer row count should match committed transactions"
+            "final writer row count should match committed transactions; unique_ids={unique_ids} duplicate_ids={duplicate_ids:?}"
         );
         assert_eq!(
             total_rows,
@@ -418,7 +507,6 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
             .execute_batch("COMMIT;")
             .expect("sqlite oracle commit");
 
-        let fsqlite_rows = fetch_fsqlite_rows(&verifier, "writer_rows").await;
         let sqlite_rows = fetch_sqlite_rows(&sqlite, "writer_rows");
         assert_eq!(
             fsqlite_rows, sqlite_rows,
@@ -433,6 +521,7 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
                 "rounds_per_writer": ROUNDS_PER_WRITER,
                 "total_committed": total_committed,
                 "total_retries": total_retries,
+                "total_transient_rollback_errors": total_transient_rollback_errors,
                 "elapsed_ms": elapsed.as_millis(),
                 "rows_per_sec": rows_per_sec(total_committed, elapsed),
                 "integrity_check": integrity
