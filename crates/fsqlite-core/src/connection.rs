@@ -15194,9 +15194,9 @@ impl Connection {
         previous_total_changes: usize,
         previous_last_insert_rowid: i64,
     ) {
-        let error_state = self.take_table_program_error_state();
+        let mut error_state = self.take_table_program_error_state();
         if preserve_prior_changes_on_constraint_violation && error_is_constraint_violation(error) {
-            if let Some(state) = error_state {
+            if let Some(state) = error_state.take() {
                 self.restore_change_tracking_state(
                     state.changes,
                     previous_total_changes.saturating_add(state.changes),
@@ -15207,7 +15207,10 @@ impl Connection {
                 return;
             }
         }
-        self.restore_change_tracking_state(0, previous_total_changes, previous_last_insert_rowid);
+        let failed_last_insert_rowid = error_state
+            .and_then(|state| state.last_insert_rowid)
+            .unwrap_or(previous_last_insert_rowid);
+        self.restore_change_tracking_state(0, previous_total_changes, failed_last_insert_rowid);
     }
 
     fn record_last_insert_rowid(&self, rowid: i64) {
@@ -22311,11 +22314,21 @@ impl Connection {
             self.with_internal_statement_savepoint_and_cx(
                 execution_cx,
                 statement_kind,
-                execute_body,
+                async || {
+                    self.with_statement_fk_validation_scope(
+                        preserve_prior_changes_on_constraint_violation,
+                        execute_body,
+                    )
+                    .await
+                },
             )
             .await
         } else {
-            execute_body().await
+            self.with_statement_fk_validation_scope(
+                preserve_prior_changes_on_constraint_violation,
+                execute_body,
+            )
+            .await
         };
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
@@ -27865,7 +27878,7 @@ impl Connection {
             let execute_body_start = hot_path_profile_enabled().then(Instant::now);
             let result = if use_statement_savepoint {
                 self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, async || {
-                    self.execute_statement_dispatch_impl(
+                    self.execute_statement_dispatch_with_fk_scope(
                         &op_cx,
                         statement.as_ref(),
                         params,
@@ -27876,7 +27889,7 @@ impl Connection {
                 })
                 .await
             } else {
-                self.execute_statement_dispatch_impl(
+                self.execute_statement_dispatch_with_fk_scope(
                     &op_cx,
                     statement.as_ref(),
                     params,
@@ -28017,8 +28030,50 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let op_cx = self.op_cx()?;
-        self.execute_statement_dispatch_impl(&op_cx, statement, params, None, None)
+        self.execute_statement_dispatch_with_fk_scope(&op_cx, statement, params, None, None)
             .await
+    }
+
+    /// Establish one final-image FK validation scope around every ordinary DML
+    /// statement. Nested trigger, cascade, and row-replay dispatches join this
+    /// scope so transient intermediate images are not rejected before the
+    /// statement has finished applying all of its rows and FK actions.
+    async fn execute_statement_dispatch_with_fk_scope(
+        &self,
+        cx: &Cx,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+        precompiled: Option<&VdbeProgram>,
+        derived_storage_log_select: Option<&SelectStatement>,
+    ) -> Result<Vec<Row>> {
+        if matches!(
+            statement,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            let preserve_constraint_failure_rows =
+                statement_preserves_prior_changes_on_constraint(statement);
+            return self
+                .with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+                    self.execute_statement_dispatch_impl(
+                        cx,
+                        statement,
+                        params,
+                        precompiled,
+                        derived_storage_log_select,
+                    )
+                    .await
+                })
+                .await;
+        }
+
+        self.execute_statement_dispatch_impl(
+            cx,
+            statement,
+            params,
+            precompiled,
+            derived_storage_log_select,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -32024,6 +32079,11 @@ impl Connection {
         }
 
         let table_name = insert.table.name.as_str();
+        if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+            && self.table_is_foreign_key_parent(table_name)
+        {
+            return false;
+        }
         if self.has_live_vtab_instance(table_name) {
             return false;
         }
@@ -49396,17 +49456,36 @@ impl Connection {
             .split_off(table_start);
         child_tables.sort_by_key(|table| table.to_ascii_lowercase());
         child_tables.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        let retained_changes = self.last_changes.get();
+        let retained_total_changes = self.total_changes.get();
+        let retained_last_insert_rowid = self.current_last_insert_rowid();
 
         let _rechecking_guard =
             BoolCellRestoreGuard::new(&self.statement_fk_validation_rechecking, true);
-        for child_table in &child_tables {
-            let sql = format!("SELECT * FROM {}", quote_identifier(child_table));
-            let rows = self.query(&sql).await?;
-            for row in rows {
-                self.check_fk_parent_exists(child_table, row.values())
-                    .await?;
+        let validation_result = async {
+            for child_table in &child_tables {
+                let sql = format!("SELECT * FROM {}", quote_identifier(child_table));
+                let rows = self.query(&sql).await?;
+                for row in rows {
+                    self.check_fk_parent_exists(child_table, row.values())
+                        .await?;
+                }
             }
+            Ok(())
         }
+        .await;
+        if let Err(error) = validation_result {
+            self.record_table_program_error_state(
+                retained_changes,
+                (retained_changes > 0).then_some(retained_last_insert_rowid),
+            );
+            return Err(error);
+        }
+        self.restore_change_tracking_state(
+            retained_changes,
+            retained_total_changes,
+            retained_last_insert_rowid,
+        );
 
         if let Some(suffix_guard) = suffix_guard.as_mut() {
             suffix_guard.discharge();
@@ -49422,6 +49501,21 @@ impl Connection {
                 .borrow_mut()
                 .push(table_name.to_owned());
         }
+    }
+
+    /// Queue final-image validation after SET DEFAULT writes values while
+    /// ordinary child-side enforcement is suppressed by `fk_cascade_depth`.
+    fn queue_set_default_fk_validation(&self, table_name: &str) -> Result<()> {
+        if self.statement_fk_validation_depth.get() == 0
+            || self.statement_fk_validation_rechecking.get()
+        {
+            return Err(FrankenError::internal(
+                "SET DEFAULT FK validation requires a logical statement scope",
+            ));
+        }
+
+        self.queue_statement_fk_validation_table(table_name);
+        Ok(())
     }
 
     /// Enforce parent-existence checks for rows inserted by an INSERT statement.
@@ -50094,6 +50188,7 @@ impl Connection {
                     self.execute_with_params(&sql, parent_values).await
                 };
                 result?;
+                self.queue_set_default_fk_validation(child_table)?;
                 Ok(())
             }
         }
@@ -50344,6 +50439,7 @@ impl Connection {
                     self.execute_with_params(&sql, old_parent_values).await
                 };
                 result?;
+                self.queue_set_default_fk_validation(child_table)?;
                 Ok(())
             }
         }

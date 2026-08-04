@@ -35352,6 +35352,14 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
             "CREATE TABLE c_default (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_default(id) ON DELETE SET DEFAULT)",
             "INSERT INTO p_default VALUES (0, 'DEFAULT'), (1, 'AAA')",
             "INSERT INTO c_default VALUES (1, 1)",
+            "CREATE TABLE p_without_rowid (tenant TEXT, id INTEGER, symbol TEXT UNIQUE, PRIMARY KEY (tenant, id)) WITHOUT ROWID",
+            "CREATE TABLE c_without_rowid (id INTEGER PRIMARY KEY, tenant TEXT, parent_id INTEGER, FOREIGN KEY (tenant, parent_id) REFERENCES p_without_rowid(tenant, id) ON DELETE CASCADE)",
+            "INSERT INTO p_without_rowid VALUES ('X', 1, 'AAA'), ('X', 2, 'BBB')",
+            "INSERT INTO c_without_rowid VALUES (1, 'X', 1), (2, 'X', 2)",
+            "CREATE TABLE p_update_replace (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+            "CREATE TABLE c_update_replace (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_update_replace(id) ON DELETE CASCADE)",
+            "INSERT INTO p_update_replace VALUES (1, 'AAA'), (2, 'BBB')",
+            "INSERT INTO c_update_replace VALUES (1, 1), (2, 2)",
         ];
         apply_fsqlite_statements(&fconn, &action_setup).await;
         apply_rusqlite_statements(&rconn, &action_setup);
@@ -35376,6 +35384,8 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
         for sql in [
             "INSERT OR REPLACE INTO p_null VALUES (2, 'AAA')",
             "INSERT OR REPLACE INTO p_default VALUES (2, 'AAA')",
+            "INSERT OR REPLACE INTO p_without_rowid VALUES ('X', 10, 'AAA')",
+            "UPDATE OR REPLACE p_update_replace SET symbol = 'BBB' WHERE id = 1",
         ] {
             assert_eq!(fconn.execute(sql).await.unwrap(), 1);
             assert_eq!(rconn.execute(sql, []).unwrap(), 1);
@@ -35393,6 +35403,10 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
                 "SELECT id, parent_id FROM c_cascade ORDER BY id",
                 "SELECT id, parent_id FROM c_null ORDER BY id",
                 "SELECT id, parent_id FROM c_default ORDER BY id",
+                "SELECT tenant, id, symbol FROM p_without_rowid ORDER BY tenant, id",
+                "SELECT id, tenant, parent_id FROM c_without_rowid ORDER BY id",
+                "SELECT id, symbol FROM p_update_replace ORDER BY id",
+                "SELECT id, parent_id FROM c_update_replace ORDER BY id",
                 "PRAGMA foreign_key_check",
                 "SELECT changes(), total_changes(), last_insert_rowid()",
             ],
@@ -35480,6 +35494,104 @@ fn test_conformance_replace_victim_savepoint_rollback_and_reopen_s76r() {
                 "SELECT id, symbol FROM parent ORDER BY id",
                 "SELECT id, parent_id FROM child ORDER BY id",
                 "PRAGMA foreign_key_check",
+            ],
+        )
+        .await;
+    });
+}
+
+/// SET DEFAULT remains subject to the child's FK constraint. The outer DELETE,
+/// UPDATE, or implicit REPLACE delete must fail atomically when the declared
+/// default does not name an existing parent row.
+#[test]
+fn test_conformance_fk_set_default_requires_valid_parent_s76q_default() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p_delete (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_delete (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_delete(id) ON DELETE SET DEFAULT)",
+            "INSERT INTO p_delete VALUES (1)",
+            "INSERT INTO c_delete VALUES (1, 1)",
+            "CREATE TABLE p_update (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_update (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_update(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_update VALUES (1)",
+            "INSERT INTO c_update VALUES (1, 1)",
+            "CREATE TABLE p_replace (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+            "CREATE TABLE c_replace (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_replace(id) ON DELETE SET DEFAULT)",
+            "INSERT INTO p_replace VALUES (1, 'AAA')",
+            "INSERT INTO c_replace VALUES (1, 1)",
+            "CREATE TABLE p_repair (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_repair (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_repair(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_repair VALUES (1), (2)",
+            "INSERT INTO c_repair VALUES (1, 1)",
+        ];
+        apply_fsqlite_statements(&fconn, &setup).await;
+        apply_rusqlite_statements(&rconn, &setup);
+
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "DELETE FROM p_delete WHERE id = 1",
+            "set_default_delete_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_delete_failure_counters",
+            &fconn,
+            &rconn,
+            &["SELECT changes(), total_changes(), last_insert_rowid()"],
+        )
+        .await;
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE p_update SET id = 2 WHERE id = 1",
+            "set_default_update_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_update_failure_counters",
+            &fconn,
+            &rconn,
+            &["SELECT changes(), total_changes(), last_insert_rowid()"],
+        )
+        .await;
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "INSERT OR REPLACE INTO p_replace VALUES (2, 'AAA')",
+            "set_default_replace_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_replace_failure_counters",
+            &fconn,
+            &rconn,
+            &["SELECT changes(), total_changes(), last_insert_rowid()"],
+        )
+        .await;
+
+        let repair_sql = "UPDATE p_repair SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 0 END";
+        assert_eq!(fconn.execute(repair_sql).await.unwrap(), 2);
+        assert_eq!(rconn.execute(repair_sql, []).unwrap(), 2);
+
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_missing_parent",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_delete ORDER BY id",
+                "SELECT id, parent_id FROM c_delete ORDER BY id",
+                "SELECT id FROM p_update ORDER BY id",
+                "SELECT id, parent_id FROM c_update ORDER BY id",
+                "SELECT id, symbol FROM p_replace ORDER BY id",
+                "SELECT id, parent_id FROM c_replace ORDER BY id",
+                "SELECT id FROM p_repair ORDER BY id",
+                "SELECT id, parent_id FROM c_repair ORDER BY id",
+                "PRAGMA foreign_key_check",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
             ],
         )
         .await;
