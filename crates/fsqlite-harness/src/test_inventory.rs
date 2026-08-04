@@ -1277,7 +1277,6 @@ pub fn classify_test_entries(
     let mut records = Vec::new();
     let mut diagnostics = Vec::new();
     for (path, bytes) in entries {
-        let is_rust = path.ends_with(".rs");
         let is_corpus = path.starts_with("conformance/")
             || path.starts_with("crates/fsqlite-harness/conformance/");
         let is_fuzz = path.starts_with("fuzz/fuzz_targets/")

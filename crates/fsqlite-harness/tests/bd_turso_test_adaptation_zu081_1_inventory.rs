@@ -305,7 +305,8 @@ fn report_json_markdown_and_csv_reconcile_from_one_model() {
     )
     .expect("build canonical report");
     let json = render_test_inventory_json(&report).expect("render JSON");
-    let decoded = serde_json::from_str(&json).expect("decode rendered JSON");
+    let decoded: fsqlite_harness::test_inventory::TestInventoryReport =
+        serde_json::from_str(&json).expect("decode rendered JSON");
     assert_eq!(decoded, report);
 
     let markdown = render_test_inventory_markdown(&report);

@@ -1637,12 +1637,10 @@ fn local_toolchain_identity(root: &Path) -> Result<String, String> {
     text(&local(root, "rustc", &["--version", "--verbose"])?)
 }
 fn local(root: &Path, program: &str, args: &[&str]) -> Result<Output, String> {
-    let mut command = match program {
-        "git" => Command::new("git"),
-        "rch" => Command::new("rch"),
-        "rustc" => Command::new("rustc"),
-        _ => return Err(format!("unapproved local program `{program}`")),
-    };
+    if program != "git" {
+        return Err(format!("unapproved local program `{program}`"));
+    }
+    let mut command = Command::new("git");
     let output = command
         .args(args)
         .current_dir(root)
