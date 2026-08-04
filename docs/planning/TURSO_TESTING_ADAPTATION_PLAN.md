@@ -747,6 +747,20 @@ Rules:
 - Numeric performance claims remain outside this plan unless measured by a
   named benchmark artifact under the README performance-claim rules.
 
+Validation is differential until the cross-phase promotion gate:
+
+- Every implementation bead runs and records the repository-wide formatting,
+  check, strict-Clippy, and test commands required by `AGENTS.md`; focused
+  strict gates for every touched crate, target, script, and fixture must pass.
+- A failure already present on the pinned clean pre-task baseline does not make
+  an unrelated bead permanently unclosable. The completion record must name
+  the baseline and candidate SHAs, preserve both command results, prove that
+  the candidate adds no diagnostic in the failing gate, and link the owning
+  debt bead. A failure in a touched surface or any new diagnostic is blocking.
+- Baseline exceptions are temporary accounting, not waivers. Bead `.17` cannot
+  promote a lane or close the program-wide CI gate until the repository-wide
+  commands pass without an exception on the promotion candidate.
+
 ## 9. Observability And Artifacts
 
 Every failure must preserve:
