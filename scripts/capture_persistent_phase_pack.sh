@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bd-db300.1.7.2: Capture authoritative persistent 8t and 16t phase-attribution packs.
+# bd-db300.1.7.2: Capture authoritative persistent 1t, 8t, and 16t phase-attribution packs.
 #
 # Uses the Criterion bench entrypoint:
 #   crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs
@@ -7,14 +7,17 @@
 # Capture surface:
 #   FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR → provenance.json + samples.jsonl
 #
-# Thread counts exercised: 8, 16 (the two degraded regimes from 2026-03-20).
+# Thread counts exercised: 1, 8, and 16. The 1-thread regime anchors both
+# same-pack engine comparison and the 8-over-1 scaling gate; 8 and 16 are the
+# degraded regimes originally identified on 2026-03-20.
 #
 # Usage:
 #   ./scripts/capture_persistent_phase_pack.sh [output_dir]
 #
 # Citation-grade capture contract (fail closed):
 # - clean frozen source revision, 64-hex build nonce, and `cargo -vv` build log;
-# - the daemon-authoritative non-hz1/non-hz2 worker and RCH scheduler-isolation trace;
+# - a daemon-authoritative non-quarantined worker, sampled RCH isolation trace,
+#   and exact remote completion receipt for every build and benchmark job;
 # - a SHA-256-bound running benchmark binary; and
 # - Criterion `estimates.json` inputs, not warmup-mixed phase samples, for headline throughput.
 #
@@ -25,13 +28,25 @@
 # Output:
 #   <output_dir>/
 #     provenance/environment.yaml   — machine/build provenance
+#     provenance/rch_build_status.jsonl
+#     provenance/rch_build_status_completion.json
+#     provenance/citation_receipt.json
+#     1t/provenance.json
+#     1t/samples.jsonl
+#     1t/criterion_stdout.log
+#     1t/rch_status.jsonl
+#     1t/rch_status_completion.json
 #     8t/provenance.json            — Criterion bench provenance (auto-generated)
 #     8t/samples.jsonl              — per-iteration phase attribution (auto-generated)
 #     8t/criterion_stdout.log       — raw Criterion output
+#     8t/rch_status.jsonl
+#     8t/rch_status_completion.json
 #     16t/provenance.json
 #     16t/samples.jsonl
 #     16t/criterion_stdout.log
-#     persistent_scorecard.json     — honest-gate verdicts for 8t / 16t
+#     16t/rch_status.jsonl
+#     16t/rch_status_completion.json
+#     persistent_scorecard.json     — honest-gate verdicts for 1t / 8t / 16t
 #     persistent_pack_manifest.json — machine-readable pack summary
 #     summary.md                    — human-readable critical-regime surface
 #     rerun.sh                      — one-command reproducibility entrypoint
@@ -85,8 +100,21 @@ PHASE_B_COLLAPSE_P99_US="${PHASE_B_COLLAPSE_P99_US:-250000}"
 WAL_APPEND_COLLAPSE_P99_US="${WAL_APPEND_COLLAPSE_P99_US:-250000}"
 FROZEN_COMMIT="${FSQLITE_RELEASE_FROZEN_COMMIT:-}"
 BUILD_NONCE="${FSQLITE_BENCH_BUILD_NONCE:-}"
+RELEASE_SOURCE_CLEAN=false
 ACTUAL_WORKER=""
 ACTUAL_HOST=""
+# Substring the daemon-reported command must carry for a build to be adopted as
+# ours. Present in both the `--no-run` build and every phase invocation.
+RCH_JOB_COMMAND_MARKER="concurrent_write_persistent_bench"
+# Per-job evidence, keyed by the active-trace path so the citation receipt can
+# recover each job's identity without re-parsing transcripts.
+declare -A RCH_JOB_IDS=()
+declare -A RCH_COMPLETION_PATHS=()
+declare -A RCH_ACTIVE_SAMPLES=()
+RCH_PROJECT_ID=""
+LAST_RCH_JOB_ID=""
+LAST_RCH_PROJECT_ID=""
+LAST_RCH_ACTIVE_SAMPLES=""
 CRITERION_SAMPLE_SIZE="${FSQLITE_RELEASE_CRITERION_SAMPLE_SIZE:-}"
 CRITERION_WARMUP_SECS="${FSQLITE_RELEASE_CRITERION_WARMUP_SECS:-}"
 CRITERION_MEASUREMENT_SECS="${FSQLITE_RELEASE_CRITERION_MEASUREMENT_SECS:-}"
@@ -113,19 +141,28 @@ require_positive_integer() {
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$label must be a positive integer"
 }
 
+# Configurable because fleet quarantine is operational state. The release
+# invocation can extend the stable hz1/hz2 baseline without editing the script.
+RELEASE_WORKER_DENYLIST="${FSQLITE_RELEASE_WORKER_DENYLIST:-hz1,hz2}"
+
 require_allowed_remote_worker() {
     local worker="$1"
     [[ -n "$worker" ]] || die "RCH output did not identify a selected worker"
-    [[ "$worker" != "hz1" && "$worker" != "hz2" ]] \
-        || die "quarantined worker ${worker} is prohibited"
+    local -a denied_workers=()
+    IFS=',' read -ra denied_workers <<< "$RELEASE_WORKER_DENYLIST"
+    local denied
+    for denied in "${denied_workers[@]}"; do
+        [[ -n "$denied" ]] || continue
+        [[ "$worker" != "$denied" ]] \
+            || die "quarantined worker ${worker} is prohibited"
+    done
 }
 
-require_requested_actual_match() {
-    local requested_worker="$1"
-    local actual_worker="$2"
-    [[ "$requested_worker" == "$actual_worker" ]] \
-        || die "requested RCH_WORKER ${requested_worker} differs from daemon-selected worker ${actual_worker}"
-}
+# `require_requested_actual_match` was removed with the log-marker parsers that
+# were its only production caller. Requested-versus-actual is now enforced
+# structurally: the daemon trace is scoped to the requested worker, so a
+# relocated job is caught as "no build was ever observed on <worker>", and
+# `assert_worker_marker_agrees` refuses a transcript that names a different one.
 
 # Isolate the benchmark's timing implementation: everything from the shared
 # engine-arm builder up to the first per-thread wrapper. The inline `#[test]`
@@ -255,6 +292,15 @@ validate_emission_scope_is_truthful() {
         || die "provenance still carries the stale group.finish() emission claim"
 }
 
+release_worktree_status() {
+    if [[ "${FSQLITE_CAPTURE_SELF_TEST:-0}" == "1" \
+        && -n "${PERSISTENT_TEST_WORKTREE_STATUS+x}" ]]; then
+        printf '%s' "$PERSISTENT_TEST_WORKTREE_STATUS"
+        return "${PERSISTENT_TEST_WORKTREE_STATUS_RESULT:-0}"
+    fi
+    git -C "$PROJECT_ROOT" status --porcelain --untracked-files=all
+}
+
 validate_citation_contract() {
     [[ "$RENDER_ONLY" == "0" ]] || die "RENDER_ONLY is not valid for a citation-grade capture"
     [[ "$SKIP_RUN" == "0" ]] || die "SKIP_RUN is not valid for a citation-grade capture"
@@ -270,7 +316,11 @@ validate_citation_contract() {
     [[ -n "$FROZEN_COMMIT" ]] || die "FSQLITE_RELEASE_FROZEN_COMMIT is required"
     require_lower_hex "$FROZEN_COMMIT" 40 FSQLITE_RELEASE_FROZEN_COMMIT
     [[ "$(git -C "$PROJECT_ROOT" rev-parse HEAD)" == "$FROZEN_COMMIT" ]] || die "HEAD does not match FSQLITE_RELEASE_FROZEN_COMMIT"
-    [[ -z "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=all)" ]] || die "release source checkout is not clean"
+    local worktree_status
+    worktree_status="$(release_worktree_status)" \
+        || die "cannot read the release source worktree status"
+    [[ -z "$worktree_status" ]] || die "release source checkout is not clean"
+    RELEASE_SOURCE_CLEAN=true
     [[ -n "$BUILD_NONCE" ]] || die "FSQLITE_BENCH_BUILD_NONCE is required"
     require_lower_hex "$BUILD_NONCE" 64 FSQLITE_BENCH_BUILD_NONCE
     require_positive_integer "$CRITERION_SAMPLE_SIZE" FSQLITE_RELEASE_CRITERION_SAMPLE_SIZE
@@ -314,41 +364,109 @@ run_synthetic_contract_checks() {
     if (require_allowed_remote_worker hz1); then
         die "synthetic validation did not reject quarantined hz1"
     fi
-    if (require_requested_actual_match healthy-worker other-worker); then
-        die "synthetic validation did not reject a requested/actual worker mismatch"
+    if (RELEASE_WORKER_DENYLIST="hz1,hz2,maintenance-worker" \
+        require_allowed_remote_worker maintenance-worker); then
+        die "synthetic validation did not honor an extended worker denylist"
     fi
-    local good_trace
-    local wrong_job_trace
-    local missing_job_trace
-    local coresident_trace
-    good_trace='{"data":{"daemon":{"workers":[{"id":"healthy-worker","host":"vmi123","status":"healthy","circuit_state":"closed"}],"active_builds":[{"id":7,"worker_id":"healthy-worker"}]}}}'
-    wrong_job_trace='{"data":{"daemon":{"workers":[{"id":"healthy-worker","host":"vmi123","status":"healthy","circuit_state":"closed"}],"active_builds":[{"id":8,"worker_id":"healthy-worker"}]}}}'
-    missing_job_trace='{"data":{"daemon":{"workers":[{"id":"healthy-worker","host":"vmi123","status":"healthy","circuit_state":"closed"}],"active_builds":[]}}}'
-    coresident_trace='{"data":{"daemon":{"workers":[{"id":"healthy-worker","host":"vmi123","status":"healthy","circuit_state":"closed"}],"active_builds":[{"id":7,"worker_id":"healthy-worker"},{"id":8,"worker_id":"healthy-worker"}]}}}'
-    verify_scheduler_isolation_trace healthy-worker 7 <(printf '%s\n' "$good_trace")
-    [[ "$(actual_host_from_status_trace healthy-worker <(printf '%s\n' "$good_trace"))" == "vmi123" ]] \
+    if (PERSISTENT_TEST_WORKTREE_STATUS="" PERSISTENT_TEST_WORKTREE_STATUS_RESULT=1 \
+        release_worktree_status); then
+        die "synthetic validation masked a worktree-status command failure as clean"
+    fi
+    # Real-shaped fixtures. Job ids are the 17-digit values the daemon actually
+    # issues; OURS and NEIGHBOUR differ only in the last digit and collapse to
+    # the same IEEE-754 double, so the exactness of the comparison is genuinely
+    # exercised. No invented `Job j-N` or `[RCH] remote` fixtures remain: those
+    # markers do not exist in real transcripts, and logs are corroboration only.
+    local ours_id=29960766543102031
+    local near_id=29960766543102030
+    local our_cmd="cargo bench -vv --locked --profile release-perf -p fsqlite-e2e --bench concurrent_write_persistent_bench --no-run"
+    local their_cmd="cargo test -p fsqlite-harness --test phase5_regression_guard"
+    local marker="concurrent_write_persistent_bench"
+    local project="frankensqlite-df8c83ae"
+
+    active_snap() { # $1=builds json, $2=status, $3=circuit
+        printf '{"api_version":"1.0","command":"status","success":true,"data":{"schema_version":"1.0.0","daemon":{"workers":[{"id":"healthy-worker","host":"vmi123","status":"%s","circuit_state":"%s"}],"active_builds":%s,"recent_builds":[]}}}\n' \
+            "${2:-healthy}" "${3:-closed}" "$1"
+    }
+    done_snap() { # $1=id $2=worker $3=project $4=cmd $5=exit $6=location $7=cancellation
+        printf '{"api_version":"1.0","command":"status","success":true,"data":{"schema_version":"1.0.0","daemon":{"workers":[{"id":"healthy-worker","host":"vmi123","status":"healthy","circuit_state":"closed"}],"active_builds":[],"recent_builds":[{"id":%s,"project_id":"%s","worker_id":"%s","command":"%s","exit_code":%s,"duration_ms":1877528,"location":"%s","cancellation":%s}]}}}\n' \
+            "$1" "$3" "$2" "$4" "$5" "$6" "$7"
+    }
+    build_entry() { # $1=id $2=worker $3=cmd
+        printf '[{"id":%s,"worker_id":"%s","project_id":"%s","command":"%s"}]' "$1" "$2" "$project" "$3"
+    }
+
+    local ours idle theirs coresident good_done
+    ours="$(build_entry "$ours_id" healthy-worker "$our_cmd")"
+    idle='[]'
+    theirs="$(build_entry "$ours_id" healthy-worker "$their_cmd")"
+    coresident="$(printf '[{"id":%s,"worker_id":"healthy-worker","project_id":"%s","command":"%s"},{"id":%s,"worker_id":"healthy-worker","project_id":"%s","command":"%s"}]' \
+        "$ours_id" "$project" "$our_cmd" "$near_id" "$project" "$their_cmd")"
+    good_done="$(done_snap "$ours_id" healthy-worker "$project" "$our_cmd" 0 remote null)"
+
+    identity_reject() { # label, active-text, completion-text
+        if ( verify_rch_job_identity healthy-worker "$marker" \
+               <(printf '%s' "$2") <(printf '%s' "$3") ) >/dev/null 2>&1; then
+            die "synthetic validation did not reject $1"
+        fi
+    }
+
+    # Positive: sole active build, observed mid-window, cleanly completed.
+    local reported
+    reported="$(verify_rch_job_identity healthy-worker "$marker" \
+        <(active_snap "$idle"; active_snap "$ours"; active_snap "$idle") \
+        <(printf '%s' "$good_done"))" \
+        || die "synthetic validation rejected a well-formed isolated job"
+    [[ "$(printf '%s' "$reported" | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')" == "$ours_id" ]] \
+        || die "synthetic validation lost job-id precision above 2^53"
+    [[ "$(printf '%s' "$reported" | python3 -c 'import json,sys; print(json.load(sys.stdin)["active_samples"])')" == "3" ]] \
+        || die "synthetic validation miscounted retained active samples"
+    [[ "$(actual_host_from_status_trace healthy-worker <(active_snap "$ours"))" == "vmi123" ]] \
         || die "synthetic validation did not parse nested daemon host identity"
-    [[ "$(rch_job_id_from_log <(printf '%s\n' '[*] Job j-7 submitted to healthy-worker'))" == "7" ]] \
-        || die "synthetic validation did not normalize the RCH log job marker"
-    [[ "$(actual_worker_from_rch_log <(printf '%s\n' '[RCH] remote healthy-worker accepted job j-7'))" == "healthy-worker" ]] \
-        || die "synthetic validation did not parse the daemon-selected worker marker"
-    if (rch_job_id_from_log <(printf '%s\n' 'no submitted job marker')); then
-        die "synthetic validation did not reject a missing RCH job marker"
-    fi
-    if (rch_job_id_from_log <(printf '%s\n' '[*] Job j-7 submitted to healthy-worker' '[*] Job j-8 submitted to healthy-worker')); then
-        die "synthetic validation did not reject multiple RCH job markers"
-    fi
-    if (actual_worker_from_rch_log <(printf '%s\n' '[RCH] remote healthy-worker accepted job j-7' '[RCH] remote other-worker accepted job j-7')); then
-        die "synthetic validation did not reject multiple daemon-selected worker markers"
-    fi
-    if (verify_scheduler_isolation_trace healthy-worker 7 <(printf '%s\n' "$wrong_job_trace")); then
-        die "synthetic validation did not reject a wrong numeric daemon job ID"
-    fi
-    if (verify_scheduler_isolation_trace healthy-worker 7 <(printf '%s\n' "$missing_job_trace")); then
-        die "synthetic validation did not reject an absent expected daemon job ID"
-    fi
-    if (verify_scheduler_isolation_trace healthy-worker 7 <(printf '%s\n' "$coresident_trace")); then
-        die "synthetic validation did not reject a co-resident daemon job"
+
+    identity_reject "a co-resident daemon job" "$(active_snap "$coresident")" "$good_done"
+    identity_reject "a job never observed on the worker" "$(active_snap "$idle")" "$good_done"
+    identity_reject "two distinct job ids across the window" \
+        "$(active_snap "$ours")$(active_snap "$(build_entry "$near_id" healthy-worker "$our_cmd")")" "$good_done"
+    identity_reject "a build whose command lacks the bench marker" "$(active_snap "$theirs")" "$good_done"
+    identity_reject "an unhealthy worker" "$(active_snap "$ours" degraded closed)" "$good_done"
+    identity_reject "an open worker circuit" "$(active_snap "$ours" healthy open)" "$good_done"
+    identity_reject "an active build with a non-integer job id" \
+        "$(active_snap '[{"id":null,"worker_id":"healthy-worker","project_id":"p","command":"'"$our_cmd"'"}]')" "$good_done"
+    identity_reject "an empty active trace" "" "$good_done"
+    identity_reject "a status envelope answering the wrong command" \
+        '{"api_version":"1.0","command":"queue","success":true,"data":{"daemon":{"workers":[],"active_builds":[]}}}' "$good_done"
+    identity_reject "a status envelope reporting success=false" \
+        "$(printf '{"api_version":"1.0","command":"status","success":false,"data":{"daemon":{"workers":[{"id":"healthy-worker","host":"v","status":"healthy","circuit_state":"closed"}],"active_builds":%s}}}' "$ours")" "$good_done"
+
+    identity_reject "a completion record for a neighbouring job id" "$(active_snap "$ours")" \
+        "$(done_snap "$near_id" healthy-worker "$project" "$our_cmd" 0 remote null)"
+    identity_reject "a completion record naming a different worker" "$(active_snap "$ours")" \
+        "$(done_snap "$ours_id" other-worker "$project" "$our_cmd" 0 remote null)"
+    identity_reject "a completion record for a different project" "$(active_snap "$ours")" \
+        "$(done_snap "$ours_id" healthy-worker "other-project" "$our_cmd" 0 remote null)"
+    identity_reject "a completion record whose command differs" "$(active_snap "$ours")" \
+        "$(done_snap "$ours_id" healthy-worker "$project" "$their_cmd" 0 remote null)"
+    identity_reject "a completion record with a non-zero exit code" "$(active_snap "$ours")" \
+        "$(done_snap "$ours_id" healthy-worker "$project" "$our_cmd" 101 remote null)"
+    identity_reject "a completion record that ran locally" "$(active_snap "$ours")" \
+        "$(done_snap "$ours_id" healthy-worker "$project" "$our_cmd" 0 local null)"
+    identity_reject "a cancelled completion record" "$(active_snap "$ours")" \
+        "$(done_snap "$ours_id" healthy-worker "$project" "$our_cmd" 0 remote '{"origin":"stuck_detector"}')"
+    identity_reject "a history with no record for our job" "$(active_snap "$ours")" \
+        '{"api_version":"1.0","command":"status","success":true,"data":{"daemon":{"workers":[],"active_builds":[],"recent_builds":[]}}}'
+    identity_reject "a completion snapshot carrying two documents" "$(active_snap "$ours")" \
+        "${good_done}${good_done}"
+
+    # Logs are corroboration only: absent is accepted, disagreement is not.
+    [[ "$(worker_marker_from_rch_log <(printf 'Selected worker: healthy-worker\n'))" == "healthy-worker" ]] \
+        || die "synthetic validation did not parse the real Selected-worker marker"
+    [[ "$(worker_marker_from_rch_log <(printf 'nothing to see here\n'))" == "absent" ]] \
+        || die "synthetic validation did not tolerate an absent worker marker"
+    assert_worker_marker_agrees absent healthy-worker
+    assert_worker_marker_agrees healthy-worker healthy-worker
+    if (assert_worker_marker_agrees other-worker healthy-worker); then
+        die "synthetic validation did not reject a contradicting worker marker"
     fi
     echo "[$BEAD_ID] synthetic citation-contract validation passed"
 }
@@ -379,32 +497,40 @@ run_cargo() {
     fi
 }
 
-actual_worker_from_rch_log() {
+# Optional corroboration from the retained transcript.
+#
+# The previous implementation required a `[RCH] remote <worker> ` marker and an
+# `[*] Job j-<N> submitted to` line. Neither string appears in any transcript
+# this repository has ever retained, and the daemon in fact emits
+# `Selected worker: <id>` and `Remote command finished: exit=<n>` — the same two
+# markers the phase5 verifier parses. Requiring the invented grammar made every
+# citation-grade capture die during the build step.
+#
+# Identity is therefore taken from the daemon status trace. A recognised marker,
+# if present, must agree; `absent` is accepted. This can only add a refusal.
+worker_marker_from_rch_log() {
     local log_path="$1"
     local worker
     local worker_count
 
-    worker="$(sed -nE 's/.*\[RCH\] remote ([^[:space:]]+) .*/\1/p' "$log_path" | sort -u)"
+    worker="$(sed -nE -e 's/.*\[RCH\] remote ([^[:space:]]+) .*/\1/p' \
+                      -e 's/^[[:space:]]*Selected worker:[[:space:]]*([^[:space:]]+).*/\1/p' \
+              "$log_path" | sort -u)"
     worker_count="$(printf '%s\n' "$worker" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [[ "$worker_count" == "0" ]]; then
+        printf 'absent'
+        return 0
+    fi
     [[ "$worker_count" == "1" ]] \
-        || die "RCH log must contain exactly one daemon-selected worker marker: $log_path"
-    require_allowed_remote_worker "$worker"
-    require_requested_actual_match "$RCH_WORKER" "$worker"
-    printf '%s\n' "$worker"
+        || die "RCH transcript carries ${worker_count} conflicting worker markers: $log_path"
+    printf '%s' "$worker"
 }
 
-rch_job_id_from_log() {
-    local log_path="$1"
-    local job_id
-    local job_count
-
-    job_id="$(sed -nE 's/^\[\*\] Job j-([0-9]+) submitted to .*/\1/p' "$log_path" | sort -u)"
-    job_count="$(printf '%s\n' "$job_id" | sed '/^$/d' | wc -l | tr -d ' ')"
-    [[ "$job_count" == "1" ]] \
-        || die "RCH log must contain exactly one submitted job ID: $log_path"
-    [[ "$job_id" =~ ^[0-9]+$ ]] \
-        || die "RCH job ID must normalize to decimal digits: $log_path"
-    printf '%s\n' "$job_id"
+assert_worker_marker_agrees() {
+    local marker="$1"
+    local daemon_worker="$2"
+    [[ "$marker" == "absent" || "$marker" == "$daemon_worker" ]] \
+        || die "transcript names worker ${marker} but the daemon reports ${daemon_worker}"
 }
 
 capture_status_snapshot() {
@@ -414,23 +540,188 @@ capture_status_snapshot() {
     printf '\n' >> "$trace_path"
 }
 
-verify_scheduler_isolation_trace() {
-    local worker="$1"
-    local expected_job_id="$2"
-    local trace_path="$3"
+# Single snapshot taken once the cargo process has returned, so the daemon's
+# rolling `recent_builds` history has had the chance to record how the job
+# ended. Sampled active views only ever see a job while it is running: they
+# establish isolation but cannot distinguish a job that finished remotely from
+# one cancelled by the stuck detector or exiting non-zero.
+capture_completion_snapshot() {
+    local snapshot_path="$1"
+    "$RCH_BIN" --no-self-healing status --workers --jobs --json > "$snapshot_path" \
+        || die "could not retain daemon completion snapshot in $snapshot_path"
+}
 
-    jq -s -e --arg worker "$worker" --argjson job "$expected_job_id" '
-        length > 0 and
-        all(.[];
-            (.data.daemon.workers | type == "array") and
-            ([.data.daemon.workers[] | select(.id == $worker and .status == "healthy" and .circuit_state == "closed")]
-             | length == 1) and
-            ([.data.daemon.active_builds[]? | select(.worker_id == $worker)] | length <= 1) and
-            all(.data.daemon.active_builds[]? | select(.worker_id == $worker); .id == $job)
-        ) and
-        any(.[]; ([.data.daemon.active_builds[]? | select(.worker_id == $worker and .id == $job)] | length == 1))
-    ' "$trace_path" >/dev/null \
-        || die "RCH status snapshots do not prove exact job ${expected_job_id} as the sole active job on ${worker}"
+# Adjudicate the sampled active trace plus the post-return completion snapshot,
+# and print the job identity they establish.
+#
+# HONEST SCOPE: this proves SAMPLED isolation at the poll interval, not
+# continuous isolation. At every recorded sample the worker carried at most one
+# active build and it was ours; a foreign build contained entirely between two
+# samples is not observable through this interface and is not excluded.
+#
+# Job ids are 17-digit integers exceeding the 2^53 exactly-representable range
+# of a double, so every comparison is done in Python with exact integers rather
+# than in jq, whose numbers round the moment they pass through arithmetic.
+verify_rch_job_identity() {
+    local worker="$1"
+    local command_marker="$2"
+    local active_trace="$3"
+    local completion_snapshot="$4"
+    python3 - "$worker" "$command_marker" "$active_trace" "$completion_snapshot" <<'PY'
+import json
+import sys
+
+worker, marker, active_path, completion_path = sys.argv[1:5]
+
+
+def fail(message):
+    raise SystemExit(f"RCH job identity refused: {message}")
+
+
+def envelope(document, index, description):
+    if not isinstance(document, dict):
+        fail(f"{description} sample {index} is not a JSON object")
+    if document.get("api_version") != "1.0":
+        fail(f"{description} sample {index} has unexpected api_version {document.get('api_version')!r}")
+    if document.get("command") != "status":
+        fail(f"{description} sample {index} answers command {document.get('command')!r}, expected 'status'")
+    if document.get("success") is not True:
+        fail(f"{description} sample {index} reports success={document.get('success')!r}")
+    data = document.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("daemon"), dict):
+        fail(f"{description} sample {index} carries no data.daemon object")
+    return data["daemon"]
+
+
+def samples(path, description):
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    decoder = json.JSONDecoder()
+    index, documents = 0, []
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            document, index = decoder.raw_decode(text, index)
+        except ValueError as error:
+            fail(f"{description} sample {len(documents) + 1} is not valid JSON: {error}")
+        documents.append(envelope(document, len(documents) + 1, description))
+    if not documents:
+        fail(f"{description} trace contains no samples")
+    return documents
+
+
+active_daemons = samples(active_path, "active status")
+
+observed_ids, observed_commands, observed_projects = set(), set(), set()
+positive = 0
+for position, daemon in enumerate(active_daemons, start=1):
+    if not isinstance(daemon.get("workers"), list):
+        fail(f"active status sample {position} carries no workers array")
+    matching = [entry for entry in daemon["workers"] if entry.get("id") == worker]
+    if len(matching) != 1:
+        fail(f"active status sample {position} does not identify exactly one worker named {worker}")
+    health = matching[0]
+    if health.get("status") != "healthy" or health.get("circuit_state") != "closed":
+        fail(
+            f"active status sample {position} reports {worker} as status={health.get('status')!r} "
+            f"circuit_state={health.get('circuit_state')!r}"
+        )
+    builds = daemon.get("active_builds")
+    if not isinstance(builds, list):
+        fail(f"active status sample {position} carries no active_builds array")
+    on_worker = [entry for entry in builds if entry.get("worker_id") == worker]
+    if len(on_worker) > 1:
+        ids = sorted(str(entry.get("id")) for entry in on_worker)
+        fail(
+            f"active status sample {position} shows {len(on_worker)} concurrent builds on {worker} "
+            f"(ids {ids}); the measurement was not isolated"
+        )
+    for entry in on_worker:
+        raw_id = entry.get("id")
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+            fail(
+                f"active status sample {position} reports a build on {worker} whose id is "
+                f"{raw_id!r}, not an integer; refusing an unidentifiable job"
+            )
+        observed_ids.add(str(raw_id))
+        observed_commands.add(str(entry.get("command", "")))
+        observed_projects.add(str(entry.get("project_id", "")))
+        positive += 1
+
+if not observed_ids:
+    fail(
+        f"no build was ever observed on {worker} across {len(active_daemons)} sample(s); "
+        "a build that was never sampled cannot be attested as isolated"
+    )
+if len(observed_ids) > 1:
+    fail(f"{worker} carried more than one distinct job across the window: {sorted(observed_ids)}")
+
+job_id = observed_ids.pop()
+command = observed_commands.pop() if len(observed_commands) == 1 else ""
+project_id = observed_projects.pop() if len(observed_projects) == 1 else ""
+if marker and marker not in command:
+    fail(
+        f"the build observed on {worker} (job {job_id}) runs `{command}`, which does not carry "
+        f"the expected marker `{marker}`; refusing to attribute a foreign build"
+    )
+if not project_id:
+    fail(f"the build observed on {worker} (job {job_id}) reports no single project id")
+
+completion_daemons = samples(completion_path, "completion status")
+if len(completion_daemons) != 1:
+    fail(f"completion snapshot must be a single document, found {len(completion_daemons)}")
+recent = completion_daemons[0].get("recent_builds")
+if not isinstance(recent, list):
+    fail("completion snapshot carries no data.daemon.recent_builds array")
+
+matches = []
+for entry in recent:
+    if not isinstance(entry, dict):
+        continue
+    raw_id = entry.get("id")
+    if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+        continue
+    if str(raw_id) == job_id:
+        matches.append(entry)
+
+if not matches:
+    fail(
+        f"the daemon's recent_builds history carries no record for job {job_id}; "
+        "a build that left no completion record cannot be attested as having finished"
+    )
+if len(matches) > 1:
+    fail(f"the daemon's recent_builds history carries {len(matches)} records for job {job_id}")
+
+done = matches[0]
+if done.get("worker_id") != worker:
+    fail(f"job {job_id} completed on worker {done.get('worker_id')!r}, not {worker!r}")
+if done.get("project_id") != project_id:
+    fail(f"job {job_id} completed for project {done.get('project_id')!r}, not {project_id!r}")
+if done.get("command") != command:
+    fail(f"job {job_id} completed running {done.get('command')!r}, not the command observed while active")
+if done.get("location") != "remote":
+    fail(f"job {job_id} completed with location {done.get('location')!r}, not 'remote'")
+if done.get("exit_code") != 0:
+    fail(f"job {job_id} completed with exit_code {done.get('exit_code')!r}, not 0")
+if done.get("cancellation") is not None:
+    fail(f"job {job_id} was cancelled: {done.get('cancellation')!r}")
+
+print(
+    json.dumps(
+        {
+            "job_id": job_id,
+            "project_id": project_id,
+            "command": command,
+            "active_samples": len(active_daemons),
+            "samples_observing_job": positive,
+        },
+        sort_keys=True,
+    )
+)
+PY
 }
 
 actual_host_from_status_trace() {
@@ -453,16 +744,20 @@ run_cargo_with_scheduler_trace() {
     shift 2
     local cargo_pid
     local cargo_status
+    local completion_path="${trace_path%.jsonl}_completion.json"
+    local identity_json
     local worker
-    local job_id
 
     : > "$log_path"
     : > "$trace_path"
+    : > "$completion_path"
     (
         cd "$PROJECT_ROOT"
         run_cargo "$@"
     ) > "$log_path" 2>&1 &
     cargo_pid=$!
+    # Sampling opens before the daemon can have scheduled anything for this job
+    # and closes when the cargo process exits.
     while kill -0 "$cargo_pid" 2>/dev/null; do
         capture_status_snapshot "$trace_path"
         sleep 1
@@ -472,16 +767,38 @@ run_cargo_with_scheduler_trace() {
     else
         cargo_status=$?
     fi
+    # Captured immediately after the process returns, and captured even when the
+    # build failed: the completion record is the evidence for why it failed and
+    # must not be discarded with the exit status.
+    capture_completion_snapshot "$completion_path"
     cat "$log_path"
     [[ "$cargo_status" -eq 0 ]] || die "RCH cargo command failed; retained transcript: $log_path"
 
-    worker="$(actual_worker_from_rch_log "$log_path")"
-    job_id="$(rch_job_id_from_log "$log_path")"
+    # The requested worker is the scope; the daemon trace says what actually ran
+    # there, and the completion snapshot says how it ended.
+    worker="$RCH_WORKER"
+    require_allowed_remote_worker "$worker"
+    identity_json="$(verify_rch_job_identity \
+        "$worker" "$RCH_JOB_COMMAND_MARKER" "$trace_path" "$completion_path")" || exit 2
+    assert_worker_marker_agrees "$(worker_marker_from_rch_log "$log_path")" "$worker"
+
     if [[ -n "$ACTUAL_WORKER" && "$ACTUAL_WORKER" != "$worker" ]]; then
         die "RCH selected different workers across the release pack: ${ACTUAL_WORKER} then ${worker}"
     fi
     ACTUAL_WORKER="$worker"
-    verify_scheduler_isolation_trace "$worker" "$job_id" "$trace_path"
+    LAST_RCH_JOB_ID="$(printf '%s' "$identity_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')"
+    LAST_RCH_PROJECT_ID="$(printf '%s' "$identity_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["project_id"])')"
+    LAST_RCH_ACTIVE_SAMPLES="$(printf '%s' "$identity_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["active_samples"])')"
+    # Every job in a citation pack must belong to the same RCH project; a
+    # different project id means a different source tree was synced.
+    if [[ -n "$RCH_PROJECT_ID" && "$RCH_PROJECT_ID" != "$LAST_RCH_PROJECT_ID" ]]; then
+        die "RCH reported different project identities across the release pack: ${RCH_PROJECT_ID} then ${LAST_RCH_PROJECT_ID}"
+    fi
+    RCH_PROJECT_ID="$LAST_RCH_PROJECT_ID"
+    RCH_JOB_IDS["$trace_path"]="$LAST_RCH_JOB_ID"
+    RCH_COMPLETION_PATHS["$trace_path"]="$completion_path"
+    RCH_ACTIVE_SAMPLES["$trace_path"]="$LAST_RCH_ACTIVE_SAMPLES"
+
     local host
     host="$(actual_host_from_status_trace "$worker" "$trace_path")"
     if [[ -n "$ACTUAL_HOST" && "$ACTUAL_HOST" != "$host" ]]; then
@@ -504,6 +821,11 @@ write_citation_receipt() {
     local job_1t_id
     local job_8t_id
     local job_16t_id
+    local job_label
+    local completion_build_sha256
+    local completion_1t_sha256
+    local completion_8t_sha256
+    local completion_16t_sha256
 
     build_log_sha256="$(sha256sum "$BUILD_VV_LOG" | awk '{print $1}')"
     binary_sha256="$(jq -r '.running_binary_sha256' "$OUTPUT_DIR/8t/provenance.json")"
@@ -514,10 +836,22 @@ write_citation_receipt() {
     trace_8t_sha256="$(sha256sum "$OUTPUT_DIR/8t/rch_status.jsonl" | awk '{print $1}')"
     trace_16t_sha256="$(sha256sum "$OUTPUT_DIR/16t/rch_status.jsonl" | awk '{print $1}')"
     binary_16t_sha256="$(jq -r '.running_binary_sha256' "$OUTPUT_DIR/16t/provenance.json")"
-    build_job_id="$(rch_job_id_from_log "$BUILD_VV_LOG")"
-    job_1t_id="$(rch_job_id_from_log "$OUTPUT_DIR/1t/criterion_stdout.log")"
-    job_8t_id="$(rch_job_id_from_log "$OUTPUT_DIR/8t/criterion_stdout.log")"
-    job_16t_id="$(rch_job_id_from_log "$OUTPUT_DIR/16t/criterion_stdout.log")"
+    # Job ids come from the daemon traces recorded while each job ran, not from
+    # transcript text. They are carried as decimal STRINGS throughout: real ids
+    # are 17 digits and exceed the 2^53 exactly-representable range of a double,
+    # so `jq --argjson` would be one refactor away from rounding them.
+    build_job_id="${RCH_JOB_IDS[$BUILD_STATUS_TRACE]:-}"
+    job_1t_id="${RCH_JOB_IDS[$OUTPUT_DIR/1t/rch_status.jsonl]:-}"
+    job_8t_id="${RCH_JOB_IDS[$OUTPUT_DIR/8t/rch_status.jsonl]:-}"
+    job_16t_id="${RCH_JOB_IDS[$OUTPUT_DIR/16t/rch_status.jsonl]:-}"
+    for job_label in build:"$build_job_id" 1t:"$job_1t_id" 8t:"$job_8t_id" 16t:"$job_16t_id"; do
+        [[ "${job_label#*:}" =~ ^[1-9][0-9]*$ ]] \
+            || die "no canonical decimal RCH job id was recorded for ${job_label%%:*}"
+    done
+    completion_build_sha256="$(sha256sum "${RCH_COMPLETION_PATHS[$BUILD_STATUS_TRACE]}" | awk '{print $1}')"
+    completion_1t_sha256="$(sha256sum "${RCH_COMPLETION_PATHS[$OUTPUT_DIR/1t/rch_status.jsonl]}" | awk '{print $1}')"
+    completion_8t_sha256="$(sha256sum "${RCH_COMPLETION_PATHS[$OUTPUT_DIR/8t/rch_status.jsonl]}" | awk '{print $1}')"
+    completion_16t_sha256="$(sha256sum "${RCH_COMPLETION_PATHS[$OUTPUT_DIR/16t/rch_status.jsonl]}" | awk '{print $1}')"
     require_lower_hex "$build_log_sha256" 64 cargo_build_vv_log_sha256
     require_lower_hex "$binary_sha256" 64 running_binary_sha256
     require_lower_hex "$binary_1t_sha256" 64 running_binary_1t_sha256
@@ -549,17 +883,28 @@ write_citation_receipt() {
         --arg trace_1t_sha256 "$trace_1t_sha256" \
         --arg trace_8t_sha256 "$trace_8t_sha256" \
         --arg trace_16t_sha256 "$trace_16t_sha256" \
-        --argjson build_job_id "$build_job_id" \
-        --argjson job_1t_id "$job_1t_id" \
-        --argjson job_8t_id "$job_8t_id" \
-        --argjson job_16t_id "$job_16t_id" \
+        --arg build_job_id "$build_job_id" \
+        --arg job_1t_id "$job_1t_id" \
+        --arg job_8t_id "$job_8t_id" \
+        --arg job_16t_id "$job_16t_id" \
+        --arg rch_project_id "$RCH_PROJECT_ID" \
+        --arg worker_denylist "$RELEASE_WORKER_DENYLIST" \
+        --argjson source_clean "$RELEASE_SOURCE_CLEAN" \
+        --argjson samples_build "${RCH_ACTIVE_SAMPLES[$BUILD_STATUS_TRACE]}" \
+        --argjson samples_1t "${RCH_ACTIVE_SAMPLES[$OUTPUT_DIR/1t/rch_status.jsonl]}" \
+        --argjson samples_8t "${RCH_ACTIVE_SAMPLES[$OUTPUT_DIR/8t/rch_status.jsonl]}" \
+        --argjson samples_16t "${RCH_ACTIVE_SAMPLES[$OUTPUT_DIR/16t/rch_status.jsonl]}" \
+        --arg completion_build_sha256 "$completion_build_sha256" \
+        --arg completion_1t_sha256 "$completion_1t_sha256" \
+        --arg completion_8t_sha256 "$completion_8t_sha256" \
+        --arg completion_16t_sha256 "$completion_16t_sha256" \
         --argjson sample_size "$CRITERION_SAMPLE_SIZE" \
         --argjson warmup_secs "$CRITERION_WARMUP_SECS" \
         --argjson measurement_secs "$CRITERION_MEASUREMENT_SECS" \
         '{
-            schema_version: "fsqlite.release_persistent_phase_pack_citation_receipt.v1",
+            schema_version: "fsqlite.release_persistent_phase_pack_citation_receipt.v2",
             bead_id: $bead_id,
-            source: { commit: $frozen_commit, clean: true },
+            source: { commit: $frozen_commit, clean: $source_clean },
             build: {
                 profile: "release-perf",
                 nonce: $build_nonce,
@@ -580,14 +925,25 @@ write_citation_receipt() {
             rch_scheduler_isolation: {
                 build_status_trace: "provenance/rch_build_status.jsonl",
                 build_status_trace_sha256: $status_trace_sha256,
+                build_completion_snapshot: "provenance/rch_build_status_completion.json",
+                build_completion_snapshot_sha256: $completion_build_sha256,
                 build_job_id: $build_job_id,
+                build_active_samples: $samples_build,
                 worker: $actual_worker,
                 host: $actual_host,
-                evidence: "daemon status snapshots sampled while each RCH job ran",
+                project_id: $rch_project_id,
+                worker_denylist: $worker_denylist,
+                method: "sampled_poll",
+                continuous: false,
+                poll_interval_secs: 1,
+                job_id_encoding: "decimal_string",
+                evidence: "daemon active-status snapshots sampled at the recorded interval while each RCH job ran, plus one completion snapshot taken immediately after each job returned",
+                scope: "SAMPLED isolation, not continuous: at every recorded sample the worker carried at most one active build and it was this job. A foreign build contained entirely between two samples is not observable through this interface and is not excluded by this evidence.",
+                completion_contract: "each job must appear exactly once in data.daemon.recent_builds with the same id, project, worker and exact command, location=remote, exit_code=0 and cancellation=null",
                 phase_traces: {
-                    "1t": { path: "1t/rch_status.jsonl", sha256: $trace_1t_sha256, job_id: $job_1t_id },
-                    "8t": { path: "8t/rch_status.jsonl", sha256: $trace_8t_sha256, job_id: $job_8t_id },
-                    "16t": { path: "16t/rch_status.jsonl", sha256: $trace_16t_sha256, job_id: $job_16t_id }
+                    "1t": { path: "1t/rch_status.jsonl", sha256: $trace_1t_sha256, job_id: $job_1t_id, active_samples: $samples_1t, completion: "1t/rch_status_completion.json", completion_sha256: $completion_1t_sha256 },
+                    "8t": { path: "8t/rch_status.jsonl", sha256: $trace_8t_sha256, job_id: $job_8t_id, active_samples: $samples_8t, completion: "8t/rch_status_completion.json", completion_sha256: $completion_8t_sha256 },
+                    "16t": { path: "16t/rch_status.jsonl", sha256: $trace_16t_sha256, job_id: $job_16t_id, active_samples: $samples_16t, completion: "16t/rch_status_completion.json", completion_sha256: $completion_16t_sha256 }
                 }
             },
             workload: {
@@ -704,6 +1060,7 @@ write_environment_provenance() {
         echo "frozen_commit: ${FROZEN_COMMIT}"
         echo "build_nonce: ${BUILD_NONCE}"
         echo "requested_rch_worker: ${RCH_WORKER}"
+        echo "release_worker_denylist: ${RELEASE_WORKER_DENYLIST}"
         echo "daemon_authoritative_worker: recorded_after_execution_in_citation_receipt"
         echo "authoritative_remote_environment: benchmark provenance hostname/kernel_release plus daemon worker/host"
         echo "warmup_measurement_disclaimer: |"
@@ -1488,10 +1845,11 @@ export FSQLITE_USE_RCH=1
 export RCH_REQUIRE_REMOTE=1
 export RCH_NO_SELF_HEALING=1
 export RCH_BIN="\${RCH_BIN:-${RCH_BIN}}"
+export FSQLITE_RELEASE_WORKER_DENYLIST="\${FSQLITE_RELEASE_WORKER_DENYLIST:-${RELEASE_WORKER_DENYLIST}}"
 if [[ -n "\${CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}" ]]; then
     export CARGO_TARGET_DIR="\${CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
 fi
-: "\${RCH_WORKER:?set a freshly verified non-hz1/non-hz2 RCH_WORKER}"
+: "\${RCH_WORKER:?set a freshly verified non-quarantined RCH_WORKER}"
 : "\${FSQLITE_RELEASE_FROZEN_COMMIT:?set the frozen 40-hex source commit}"
 : "\${FSQLITE_BENCH_BUILD_NONCE:?set a fresh 64-hex build nonce}"
 : "\${FSQLITE_RELEASE_CRITERION_SAMPLE_SIZE:?set Criterion sample size}"
