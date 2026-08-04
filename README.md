@@ -1006,6 +1006,9 @@ FTS5 provides full-text indexing with BM25 ranking:
 - **Content modes:** Regular (FTS5 stores a copy), external content (references an existing table), contentless (index-only, no original text stored)
 - **Index structure:** A B-tree of terms mapping to document/position lists, with incremental merge for write performance
 
+Upgrading from 0.1.x with a `porter`-tokenized table requires an FTS rebuild;
+see the v0.2.0 entry in `CHANGELOG.md` for the mode-specific procedure.
+
 ### R-Tree (Spatial Indexing)
 
 The R-tree virtual table indexes N-dimensional bounding boxes for spatial queries:
@@ -1226,7 +1229,13 @@ Tests (SLT format) covering:
 
 For v0.2.0, the supported file-format surface is encoding=1/UTF-8. UTF-16le
 and UTF-16be databases are recognized from their headers and fail closed; they
-are not included in the current parity claim.
+are not included in the current parity claim. Admission reads the pager-visible
+page 1 (WAL-authoritative when a live WAL is installed). After normal pager
+open/recovery and journal/WAL authority setup, the UTF-16 admission gate
+performs no main-image rewrite or checkpoint before rejection; an ordinary
+open may inspect or create sibling WAL state first. `PRAGMA encoding` attempts
+to select `UTF-16`, `UTF-16le`, or `UTF-16be` fail as unsupported before
+changing connection, schema, or exported database state.
 
 The canonical target/version contract is pinned in
 `docs/contracts/sqlite_version_contract.toml` and referenced by parity harness reports.
@@ -2681,9 +2690,13 @@ still serves as an authoritative reference.
 - **Database text encoding is UTF-8-only in v0.2.0.** FrankenSQLite supports
   SQLite header encoding 1. It recognizes encodings 2 (UTF-16le) and 3
   (UTF-16be) as valid SQLite formats but rejects them before schema/text
-  interpretation or durable rewriting. Convert such a database to UTF-8 with
-  stock SQLite before opening it in FrankenSQLite. This restriction concerns
-  SQLite TEXT encoding; arbitrary bytes stored as BLOB values are unaffected.
+  interpretation. After normal pager open/recovery and journal/WAL authority
+  setup, the admission gate performs no main-image rewrite or checkpoint before
+  rejection. `PRAGMA encoding` attempts to select `UTF-16`, `UTF-16le`, or
+  `UTF-16be` fail as unsupported before changing connection, schema, or exported
+  database state. Convert such a database to UTF-8 with stock SQLite before
+  opening it in FrankenSQLite. This restriction concerns SQLite TEXT encoding;
+  arbitrary bytes stored as BLOB values are unaffected.
 - **Legacy SQLite double-quoted-string fallback is intentionally unsupported.**
   FrankenSQLite always interprets double-quoted tokens as identifiers. An
   unresolved `"token"` therefore returns an identifier-resolution error,

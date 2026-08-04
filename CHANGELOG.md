@@ -59,10 +59,18 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   `INSERT INTO table_name(table_name) VALUES('delete-all')` and then reinsert
   every document with its original rowid and indexed text, preferably in one
   transaction.
-  No rebuild is required solely for `unicode61`, `ascii`, or `trigram` indexes.
+  No rebuild is required solely for `unicode61`, `ascii`, or `trigram`
+  indexes. The 1,024-byte term limit now applies to every tokenizer, but an
+  existing index cannot contain an over-long term: writes carrying one failed
+  outright in 0.1.x, so an index built by those releases cannot hold one.
 
 ### Known limitations
 
+- **v0.2.0 makes no numeric performance claim.** The async storage migration
+  invalidated the older benchmark matrices, and the current comprehensive and
+  high-writer-count harnesses remain deliberately non-citable until their
+  fail-closed provenance, workload-equivalence, and shipped-profile gates are
+  complete. The historical results remain diagnostic evidence only.
 - **The runtime-stub inventory is current but not exhaustive.** The v0.2.0
   release inventory records 99 known unsupported-runtime markers, and its
   canonical and root mirrors are byte-identical. Its scanner is line-based,
@@ -111,9 +119,15 @@ semantic and crates.io predecessor, but it is not an ancestor of current
 - **Database text encoding is UTF-8-only in v0.2.0.** The database-header
   codec recognizes all three valid SQLite encoding values, but the runtime
   admits only encoding 1 (UTF-8). Databases declaring encoding 2 (UTF-16le) or
-  3 (UTF-16be) fail closed as unsupported instead of being decoded, modified,
-  checkpointed, or exported with lossy text. Convert them to UTF-8 with stock
-  SQLite before opening them in FrankenSQLite. BLOB bytes are unaffected.
+  3 (UTF-16be) fail closed as unsupported before schema or text is decoded or
+  exported. Admission reads the pager-visible page 1 (WAL-authoritative when a
+  live WAL is installed). After normal pager open/recovery and journal/WAL
+  authority setup, the gate performs no main-image rewrite or checkpoint before
+  rejection; callers must not infer directory or sidecar immutability from this
+  boundary. `PRAGMA encoding` attempts to select `UTF-16`, `UTF-16le`, or
+  `UTF-16be` also fail as unsupported, before changing connection, schema, or
+  exported database state. Convert UTF-16 databases to UTF-8 with stock SQLite
+  before opening them in FrankenSQLite. BLOB bytes are unaffected.
 - **Legacy SQLite double-quoted-string fallback is intentionally unsupported.**
   FrankenSQLite always interprets double-quoted tokens as identifiers. An
   unresolved `"token"` therefore returns an identifier-resolution error, whereas
@@ -131,7 +145,7 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   older local snapshot is active.** When a concurrent transaction is the sole
   active local transaction and its snapshot is current, it reuses committed
   free pages at or below the current database size. Sustained overlap can still
-  grow `page_count` and the freelist pending epoch/versioned-freelist
+  grow `page_count` while free pages remain pending epoch/versioned-freelist
   reclamation ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)).
   The current insertion-based `VACUUM` rebuild can itself retain freed or
   trailing pages, and the rebuilt image's page-1 header may report
