@@ -15,6 +15,7 @@ const BEAD_ID: &str = "bd-2yqp6.4.1";
 struct InventoryDocument {
     meta: InventoryMeta,
     runtime_stubs: Vec<RuntimeStub>,
+    resolved_runtime_stubs: Vec<ResolvedRuntimeStub>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +61,13 @@ struct RuntimeStub {
     owner: String,
     closure_strategy: String,
     anchor: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvedRuntimeStub {
+    stub_id: String,
+    superseded_stub_id: Option<String>,
+    identity_note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +256,33 @@ fn inventory_entries_are_unique_and_well_formed() {
             stub.stub_id
         );
     }
+
+    for stub in &doc.resolved_runtime_stubs {
+        assert!(
+            seen_stub_ids.insert(stub.stub_id.as_str()),
+            "duplicate stub_id across active and resolved entries: {}",
+            stub.stub_id
+        );
+        match (&stub.superseded_stub_id, &stub.identity_note) {
+            (Some(superseded), Some(note)) => {
+                assert_ne!(
+                    superseded, &stub.stub_id,
+                    "renumbered stub {} must supersede a different ID",
+                    stub.stub_id
+                );
+                assert!(
+                    !superseded.trim().is_empty() && !note.trim().is_empty(),
+                    "renumbered stub {} requires non-empty identity provenance",
+                    stub.stub_id
+                );
+            }
+            (None, None) => {}
+            _ => panic!(
+                "renumbered stub {} must record both superseded_stub_id and identity_note",
+                stub.stub_id
+            ),
+        }
+    }
 }
 
 #[test]
@@ -324,4 +359,34 @@ fn parity_critical_severities_are_fully_classified() {
         uncategorized.is_empty(),
         "parity-critical stubs must have feature mappings"
     );
+}
+
+#[test]
+fn canonical_and_root_inventories_are_byte_identical() {
+    let root = workspace_root();
+    let canonical = read_toml(&root.join("docs/contracts/runtime_stub_inventory.toml"));
+    let mirror = read_toml(&root.join("runtime_stub_inventory.toml"));
+    if canonical != mirror {
+        let divergence = canonical
+            .lines()
+            .zip(mirror.lines())
+            .enumerate()
+            .find(|(_, (left, right))| left != right)
+            .map_or_else(
+                || {
+                    format!(
+                        "line counts differ: canonical={}, mirror={}",
+                        canonical.lines().count(),
+                        mirror.lines().count()
+                    )
+                },
+                |(index, (left, right))| {
+                    format!(
+                        "first divergence at line {}: canonical={left:?} mirror={right:?}",
+                        index + 1
+                    )
+                },
+            );
+        panic!("runtime-stub inventory mirrors drifted; {divergence}");
+    }
 }

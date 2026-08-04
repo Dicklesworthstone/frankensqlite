@@ -63,6 +63,16 @@ semantic and crates.io predecessor, but it is not an ancestor of current
 
 ### Known limitations
 
+- **The runtime-stub inventory is current but not exhaustive.** The v0.2.0
+  release inventory records 99 known unsupported-runtime markers, and its
+  canonical and root mirrors are byte-identical. Its scanner is line-based,
+  however, and stops at the first textual `#[cfg(test)]` marker in each source
+  file. That truncation is severe in one file only: it examines about 0.18% of
+  `fsqlite-core/src/connection.rs`, but about 66% and 39% of the two other
+  affected files. A green inventory check therefore proves that the recorded
+  anchors are current; it does not prove that every unsupported runtime path
+  has been inventoried
+  ([#136](https://github.com/Dicklesworthstone/frankensqlite/issues/136)).
 - **Read-only opens are not fully mutation-free in v0.2.0.** A database that
   FrankenSQLite has opened before joins its existing namespace without
   rewriting the `-fsqlite-ns-gate` or `-fsqlite-ns-use` sidecar. First contact
@@ -265,6 +275,21 @@ semantic and crates.io predecessor, but it is not an ancestor of current
 - `VACUUM INTO` preserves `UNIQUE` constraints and validates receipt-bound
   source and candidate generations under cooperating concurrent writers
   ([#141](https://github.com/Dicklesworthstone/frankensqlite/issues/141)).
+- `ALTER TABLE ... RENAME` now carries `sqlite_sequence` metadata with the
+  table, and dropping a renamed AUTOINCREMENT table removes its sequence row.
+  A rename no longer leaves both the old and new names in `sqlite_sequence`
+  ([#150](https://github.com/Dicklesworthstone/frankensqlite/issues/150)).
+- `ON DELETE SET DEFAULT` and `ON UPDATE SET DEFAULT` validate the substituted
+  default against the parent table instead of assigning it unchecked, so an
+  immediate referential action can no longer leave a missing-parent orphan.
+  Both directions now fail the outer statement, matching stock SQLite
+  ([#167](https://github.com/Dicklesworthstone/frankensqlite/issues/167),
+  [#168](https://github.com/Dicklesworthstone/frankensqlite/issues/168)).
+- A successful WAL sync advances the durable-frame watermark used by the
+  two-phase publish invariant, so production accounting no longer leaves
+  `last_fsynced_frame_count` behind `frame_count`. A failed sync preserves the
+  prior watermark, and rebuilding WAL state clears a stale watermark
+  ([#188](https://github.com/Dicklesworthstone/frankensqlite/issues/188)).
 - An invalid WAL header is treated as an empty WAL, matching stock SQLite
   ([#292](https://github.com/Dicklesworthstone/frankensqlite/issues/292)).
 - Explicit `INDEXED BY` is honored in the composite prefix-range seek
