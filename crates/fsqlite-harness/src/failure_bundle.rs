@@ -1899,6 +1899,19 @@ mod tests {
     }
 
     #[test]
+    fn execution_lane_evidence_guard_unit_contract() {
+        execution_lane_match_matrix_is_fail_closed();
+        storage_requirements_reject_any_compatibility_fallback();
+        execution_lane_validation_rejects_duplicates_conflicts_and_registry_drift();
+        incomplete_fallback_capture_is_a_valid_fail_closed_mismatch();
+        execution_lane_fallback_reasons_bind_to_canonical_inventory();
+        execution_lane_serialization_is_stable_and_unknown_values_fail();
+        execution_lane_property_recomputes_requirement();
+        builder_rejects_missing_execution_lane_evidence();
+        builder_rejects_corrupted_execution_lane_evidence();
+    }
+
+    #[test]
     fn builder_rejects_missing_bundle_id() {
         let result = FailureBundleBuilder::new()
             .created_at("2026-02-13T06:00:00Z")

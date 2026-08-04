@@ -1048,6 +1048,16 @@ mod tests {
     }
 
     #[test]
+    fn execution_lane_evidence_guard_bundle_contract() {
+        test_builder_creates_bundle();
+        invalid_lane_evidence_fails_before_artifact_creation();
+        mismatched_lane_scenario_fails_before_artifact_creation();
+        interrupted_manifest_write_is_never_accepted_as_a_bundle();
+        manifest_is_not_a_completion_marker_until_repro_exists();
+        unsafe_artifact_path_fails_before_bundle_creation();
+    }
+
+    #[test]
     fn test_iso8601_format() {
         let timestamp = iso8601_now();
         // Should match ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ

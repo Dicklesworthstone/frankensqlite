@@ -3554,6 +3554,22 @@ mod tests {
     }
 
     #[test]
+    fn execution_lane_evidence_guard_public_paths() {
+        let guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
+        drop(guard);
+
+        run_oplog_fsqlite_basic_serial();
+        public_executor_proves_pager_planner_vdbe_and_mvcc_lanes();
+        public_native_recovery_produces_recovery_lane_evidence();
+        pager_required_rejects_forced_compatibility_fallback_with_reason();
+        pager_required_rejects_allowed_compatibility_fallback_from_core_evidence();
+        lane_diagnostics_are_bounded_counted_and_correlated();
+    }
+
+    #[test]
     fn run_oplog_fsqlite_multi_worker_sequential() {
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 42, 4, 25);
         let report =
