@@ -408,15 +408,14 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 
 fn running_executable_identity() -> std::io::Result<(String, String)> {
     static IDENTITY: OnceLock<std::io::Result<(String, String)>> = OnceLock::new();
-    IDENTITY
-        .get_or_init(|| {
-            let executable = std::env::current_exe()?;
-            let binary_sha256 = sha256_file(&executable)?;
-            Ok((executable.display().to_string(), binary_sha256))
-        })
-        .as_ref()
-        .map(Clone::clone)
-        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+    match IDENTITY.get_or_init(|| {
+        let executable = std::env::current_exe()?;
+        let binary_sha256 = sha256_file(&executable)?;
+        Ok((executable.display().to_string(), binary_sha256))
+    }) {
+        Ok(identity) => Ok(identity.clone()),
+        Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+    }
 }
 
 fn persistent_phase_capture_provenance(
@@ -1334,6 +1333,7 @@ mod tests {
     ///
     /// Assertions below must not inspect their own prose: a bare search of the
     /// whole file would match the tokens named in these comments and messages.
+    #[allow(dead_code)] // The harness=false bench build does not register its #[test] callers.
     fn implementation_slice(source: &str) -> &str {
         let start = source
             .find("fn bench_concurrent_csqlite_persistent(")

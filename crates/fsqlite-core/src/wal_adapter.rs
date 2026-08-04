@@ -3782,31 +3782,24 @@ mod tests {
             self.inner.read(cx, buf, offset)
         }
 
-        fn write<'a>(
-            &'a self,
-            cx: &'a Cx,
-            buf: &'a [u8],
-            offset: u64,
-        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-            async move {
-                let fault = if self.is_checkpoint_handoff {
-                    self.faults
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .next_write
-                        .take()
-                } else {
-                    None
-                };
-                match fault {
-                    Some(CheckpointHandoffWriteFault::Error) => Err(FrankenError::Io(
-                        std::io::Error::other("injected checkpoint handoff write failure"),
-                    )),
-                    Some(CheckpointHandoffWriteFault::Pending) => {
-                        std::future::pending::<Result<()>>().await
-                    }
-                    None => self.inner.write(cx, buf, offset).await,
+        async fn write<'a>(&'a self, cx: &'a Cx, buf: &'a [u8], offset: u64) -> Result<()> {
+            let fault = if self.is_checkpoint_handoff {
+                self.faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .next_write
+                    .take()
+            } else {
+                None
+            };
+            match fault {
+                Some(CheckpointHandoffWriteFault::Error) => Err(FrankenError::Io(
+                    std::io::Error::other("injected checkpoint handoff write failure"),
+                )),
+                Some(CheckpointHandoffWriteFault::Pending) => {
+                    std::future::pending::<Result<()>>().await
                 }
+                None => self.inner.write(cx, buf, offset).await,
             }
         }
 
@@ -5931,20 +5924,29 @@ mod tests {
     }
 
     #[test]
-    fn test_adapter_into_inner_round_trip() {
+    fn test_adapter_into_inner_fails_closed_until_sync() {
         let cx = test_cx();
-        let vfs = MemoryVfs::new();
-        let mut adapter = make_adapter(&vfs, &cx);
+        let staged_vfs = MemoryVfs::new();
+        let mut staged = make_adapter(&staged_vfs, &cx);
 
-        adapter
+        staged
             .append_frame(&cx, 1, &sample_page(0), 1)
             .expect("append");
+        assert!(
+            matches!(staged.into_inner(), Err(FrankenError::Busy)),
+            "an unsynced commit must prevent consuming the adapter"
+        );
 
-        assert_eq!(adapter.inner().frame_count(), 1);
+        let synced_vfs = MemoryVfs::new();
+        let mut synced = make_adapter(&synced_vfs, &cx);
+        synced
+            .append_frame(&cx, 1, &sample_page(0), 1)
+            .expect("append");
+        synced.sync(&cx).expect("sync staged commit");
 
-        let wal = adapter
-            .into_inner()
-            .expect("no staged frames block consuming the adapter");
+        assert_eq!(synced.inner().frame_count(), 1);
+
+        let wal = synced.into_inner().expect("sync drained the staged frames");
         assert_eq!(wal.frame_count(), 1);
     }
 

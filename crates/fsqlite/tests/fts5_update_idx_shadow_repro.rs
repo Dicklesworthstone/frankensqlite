@@ -306,10 +306,25 @@ fn frankensqlite_written_fts5_is_canonical_to_stock_sqlite() {
             // The index must actually work before anything is asserted about
             // the file: a keeper that only proved "stock can read it" would
             // pass just as happily over an empty index.
-            let hits = match_rowids(&conn, "quick").await;
+            //
+            // The MATCH is issued inline rather than through `match_rowids`,
+            // which hardcodes the `commands_fts` table used by the tests above.
+            // This keeper deliberately names its table `fts_messages` to mirror
+            // the reference schema in GH#300.
+            let matched = conn
+                .query(
+                    "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'quick' ORDER BY rowid",
+                )
+                .await
+                .expect("FrankenSQLite MATCH over the freshly written FTS5 index");
+            // `first()` rather than `[0]`: a row with no columns would panic on
+            // direct indexing, whereas this surfaces as a clean `None` in the
+            // assertion below, which also pins the rowid's type and value.
+            let hits: Vec<Option<&fsqlite::SqliteValue>> =
+                matched.iter().map(|row| row.values().first()).collect();
             assert_eq!(
                 hits,
-                vec![1],
+                vec![Some(&fsqlite::SqliteValue::Integer(1))],
                 "FrankenSQLite MATCH must find the indexed row"
             );
 
@@ -325,6 +340,17 @@ fn frankensqlite_written_fts5_is_canonical_to_stock_sqlite() {
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 .await
                 .expect("wal_checkpoint(TRUNCATE) must succeed before the stock integrity proof");
+
+            // Close explicitly rather than relying on drop. Dropping the
+            // connection emits "Connection dropped without explicit close()",
+            // and more importantly it leaves shutdown work unawaited: the stock
+            // reader below would then be racing whatever the drop path still
+            // had to finish. Ordering matters here — the close follows the
+            // checkpoint, so the durable image is already folded into the main
+            // file before the handle goes away.
+            conn.close().await.expect(
+                "FrankenSQLite connection must close cleanly before the stock integrity proof",
+            );
         }
 
         // Everything below runs on stock SQLite (rusqlite, bundled).

@@ -2326,6 +2326,10 @@ impl VfsFile for WindowsFile {
             ));
         }
 
+        // The dedicated stock-main handle is duplicated before any cooperative
+        // slot is taken so an OS duplication failure is reported while the
+        // attempt still owns nothing at all.
+        let stock_main_locks_preheld = self.stock_main_locks.is_some();
         self.ensure_stock_main_locks()?;
         let (write_preheld, checkpoint_preheld) = if wal_mode {
             (
@@ -2344,13 +2348,30 @@ impl VfsFile for WindowsFile {
         // writer/checkpointer slots first, then main-file EXCLUSIVE. Ordinary
         // Windows SHM acquisition publishes the process-local slot and its
         // matching real `-shm` byte together under the shared state mutex.
-        self.acquire_cooperative_wal_maintenance_locks(
+        let mut wal_fence = self.acquire_cooperative_wal_maintenance_locks(
             cx,
             wal_mode,
             write_preheld,
             checkpoint_preheld,
-        )?;
-        self.verify_stock_sqlite_maintenance_locks(wal_mode)?;
+        );
+        if wal_fence.is_ok() {
+            wal_fence = self.verify_stock_sqlite_maintenance_locks(wal_mode);
+        }
+        if let Err(error) = wal_fence {
+            // Real WAL contention leaves the attempt holding no main-file lock,
+            // so the handle this call duplicated must not outlive the failure:
+            // Windows keeps a file undeletable while any handle stays open, and
+            // the retained attempt is restored through the WAL slots alone. A
+            // handle that predates this call belongs to an earlier lock level
+            // and is left exactly as it was found.
+            if !stock_main_locks_preheld {
+                drop(self.stock_main_locks.take());
+            }
+            return Err(error);
+        }
+        // Past this point the WAL fence is settled, so the main-file EXCLUSIVE
+        // step legitimately owns the handle; a failure there is unwound by
+        // `restore_external_maintenance_attempt` via `main_restore_pending`.
         self.lock(cx, LockLevel::Exclusive)?;
         Ok(())
     }
