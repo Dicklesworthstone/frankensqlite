@@ -258,9 +258,7 @@ impl CommitFastPathLockReceipt {
             CommitFastPathLockClass::PagerInner => &self.pager_inner,
             CommitFastPathLockClass::QueueConsolidator => &self.queue_consolidator,
             CommitFastPathLockClass::QueueEpochState => &self.queue_epoch_state,
-            CommitFastPathLockClass::ExactHandleCoordination => {
-                &self.exact_handle_coordination
-            }
+            CommitFastPathLockClass::ExactHandleCoordination => &self.exact_handle_coordination,
             CommitFastPathLockClass::WalBackendSlot => &self.wal_backend_slot,
             CommitFastPathLockClass::WalBackendRead => &self.wal_backend_read,
             CommitFastPathLockClass::WalBackendWrite => &self.wal_backend_write,
@@ -275,9 +273,7 @@ impl CommitFastPathLockReceipt {
             CommitFastPathLockClass::PagerInner => &self.pager_inner,
             CommitFastPathLockClass::QueueConsolidator => &self.queue_consolidator,
             CommitFastPathLockClass::QueueEpochState => &self.queue_epoch_state,
-            CommitFastPathLockClass::ExactHandleCoordination => {
-                &self.exact_handle_coordination
-            }
+            CommitFastPathLockClass::ExactHandleCoordination => &self.exact_handle_coordination,
             CommitFastPathLockClass::WalBackendSlot => &self.wal_backend_slot,
             CommitFastPathLockClass::WalBackendRead => &self.wal_backend_read,
             CommitFastPathLockClass::WalBackendWrite => &self.wal_backend_write,
@@ -18314,7 +18310,9 @@ where
                     loop {
                         let should_flush = {
                             #[cfg(test)]
-                            record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
+                            record_commit_fast_path_lock(
+                                CommitFastPathLockClass::QueueConsolidator,
+                            );
                             let consolidator = queue
                                 .consolidator
                                 .lock()
@@ -18337,36 +18335,37 @@ where
                     u64::try_from(Duration::from_micros(arrival_wait_us).as_nanos())
                         .unwrap_or(u64::MAX);
 
-                let (mut batches, flush_epoch, mut flush_obligation) =
-                    if let Some(prefetched) = prefetched_flush.take() {
-                        prefetched
-                    } else {
-                        let maybe_flush = {
-                            #[cfg(test)]
-                            record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
-                            let mut consolidator = queue
-                                .consolidator
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if !record_initial_metrics
-                                && consolidator.phase() != fsqlite_wal::ConsolidationPhase::Filling
-                            {
-                                None
-                            } else {
-                                let batches = consolidator.begin_flush()?;
-                                let flush_epoch = consolidator.epoch();
-                                Some((batches, flush_epoch))
-                            }
-                        };
-                        let Some(flush) = maybe_flush else {
-                            break;
-                        };
-                        if let Some(obligation) = filling_obligation.as_mut() {
-                            obligation.disarm();
+                let (mut batches, flush_epoch, mut flush_obligation) = if let Some(prefetched) =
+                    prefetched_flush.take()
+                {
+                    prefetched
+                } else {
+                    let maybe_flush = {
+                        #[cfg(test)]
+                        record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
+                        let mut consolidator = queue
+                            .consolidator
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if !record_initial_metrics
+                            && consolidator.phase() != fsqlite_wal::ConsolidationPhase::Filling
+                        {
+                            None
+                        } else {
+                            let batches = consolidator.begin_flush()?;
+                            let flush_epoch = consolidator.epoch();
+                            Some((batches, flush_epoch))
                         }
-                        let flush_obligation = GroupCommitFlushObligation::new(queue, flush.1);
-                        (flush.0, flush.1, flush_obligation)
                     };
+                    let Some(flush) = maybe_flush else {
+                        break;
+                    };
+                    if let Some(obligation) = filling_obligation.as_mut() {
+                        obligation.disarm();
+                    }
+                    let flush_obligation = GroupCommitFlushObligation::new(queue, flush.1);
+                    (flush.0, flush.1, flush_obligation)
+                };
 
                 let t_flush_frame_prep_start = detailed_metrics.then(Instant::now);
                 let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
@@ -19132,7 +19131,9 @@ where
                         }
                         let (completed_epoch, has_promoted) = {
                             #[cfg(test)]
-                            record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
+                            record_commit_fast_path_lock(
+                                CommitFastPathLockClass::QueueConsolidator,
+                            );
                             let mut consolidator = queue
                                 .consolidator
                                 .lock()
@@ -19153,7 +19154,9 @@ where
                             }
                             let claimed_promoted = {
                                 #[cfg(test)]
-                                record_commit_fast_path_lock(CommitFastPathLockClass::QueueConsolidator);
+                                record_commit_fast_path_lock(
+                                    CommitFastPathLockClass::QueueConsolidator,
+                                );
                                 let mut consolidator = queue
                                     .consolidator
                                     .lock()

@@ -13,8 +13,8 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use fsqlite_types::{CommitSeq, ObjectId, PageNumber, TxnToken, WitnessKey};
 use tracing::{debug, info, warn};
