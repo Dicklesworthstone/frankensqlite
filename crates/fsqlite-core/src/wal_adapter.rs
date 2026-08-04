@@ -26,7 +26,7 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{PageNumber, PageSize};
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::DatabaseNamespaceBinding;
-use fsqlite_vfs::{Vfs, VfsFile, VfsWriteCompletion};
+use fsqlite_vfs::{SyncKind, Vfs, VfsFile, VfsWriteCompletion};
 use fsqlite_wal::checkpoint_executor::CheckpointTargetFuture;
 use fsqlite_wal::checksum::{SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
 use fsqlite_wal::wal::WalAppendFrameRef;
@@ -81,14 +81,6 @@ mod test_support {
             T: Debug,
         {
             block_on(self).expect_err(message)
-        }
-
-        fn is_ok(self) -> bool {
-            block_on(self).is_ok()
-        }
-
-        fn is_err(self) -> bool {
-            block_on(self).is_err()
         }
     }
 
@@ -2442,7 +2434,7 @@ where
         let finalization_cx = cx.create_child();
         let _finalization_mask = finalization_cx.masked();
         let sync_result = if sync {
-            file.sync(&finalization_cx, SyncFlags::NORMAL)
+            file.durable_sync(&finalization_cx, SyncKind::FullDurable)
         } else {
             Ok(())
         };
@@ -2491,16 +2483,17 @@ where
             let latest_is_expected = latest
                 .as_ref()
                 .is_some_and(|(_, record)| record == expected);
-            let mut sidecar_changed = safe_end != original_size;
-            if remove_expected_orphan
+            let sidecar_changed = if remove_expected_orphan
                 && let Some((record_start, _)) = latest.as_ref()
                 && latest_is_expected
             {
                 file.truncate(cx, *record_start)?;
-                sidecar_changed = true;
-            }
+                true
+            } else {
+                safe_end != original_size
+            };
             if sync && (latest_is_expected || sidecar_changed) {
-                file.sync(cx, SyncFlags::NORMAL)?;
+                file.durable_sync(cx, SyncKind::FullDurable)?;
             }
             if sync && latest_is_expected && !remove_expected_orphan {
                 // The original write may have created the sidecar but been
@@ -2580,7 +2573,7 @@ where
             );
         }
         let sync_result = if truncate_result.is_ok() {
-            file.sync(&mutation_cx, SyncFlags::NORMAL)
+            file.durable_sync(&mutation_cx, SyncKind::FullDurable)
         } else {
             Ok(())
         };
@@ -3368,7 +3361,7 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     use fsqlite_pager::MockCheckpointPageWriter;
     use fsqlite_pager::traits::WalFrameRef;
@@ -3380,6 +3373,7 @@ mod tests {
     use super::*;
 
     const PAGE_SIZE: u32 = 4096;
+    const CERTIFICATE_PATH: &str = "test.db-wal-cert";
     const CHECKPOINT_HANDOFF_PATH: &str = "test.db-wal-cert-head";
 
     #[derive(Clone, Copy, Debug)]
@@ -3388,10 +3382,17 @@ mod tests {
         Pending,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum CertificateSyncObservation {
+        Ordinary(PathBuf),
+        Durable(PathBuf, SyncKind),
+    }
+
     #[derive(Debug, Default)]
     struct CheckpointHandoffFaultState {
         next_write: Option<CheckpointHandoffWriteFault>,
         fail_next_sync: bool,
+        sync_observations: Vec<CertificateSyncObservation>,
     }
 
     #[derive(Clone, Debug)]
@@ -3428,12 +3429,23 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .fail_next_sync = true;
         }
+
+        fn take_sync_observations(&self) -> Vec<CertificateSyncObservation> {
+            std::mem::take(
+                &mut self
+                    .faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .sync_observations,
+            )
+        }
     }
 
     #[derive(Debug)]
     struct CheckpointHandoffFaultFile {
         inner: <MemoryVfs as Vfs>::File,
         faults: Arc<Mutex<CheckpointHandoffFaultState>>,
+        path: Option<PathBuf>,
         is_checkpoint_handoff: bool,
     }
 
@@ -3457,6 +3469,7 @@ mod tests {
                 CheckpointHandoffFaultFile {
                     inner,
                     faults: Arc::clone(&self.faults),
+                    path: path.map(Path::to_path_buf),
                     is_checkpoint_handoff,
                 },
                 actual_flags,
@@ -3547,21 +3560,50 @@ mod tests {
         }
 
         fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
-            let fail = if self.is_checkpoint_handoff {
-                let mut faults = self
-                    .faults
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                std::mem::take(&mut faults.fail_next_sync)
-            } else {
-                false
-            };
+            let mut faults = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(path) = self.path.as_ref().filter(|path| {
+                path.as_path() == Path::new(CERTIFICATE_PATH)
+                    || path.as_path() == Path::new(CHECKPOINT_HANDOFF_PATH)
+            }) {
+                faults
+                    .sync_observations
+                    .push(CertificateSyncObservation::Ordinary(path.clone()));
+            }
+            let fail = self.is_checkpoint_handoff && std::mem::take(&mut faults.fail_next_sync);
+            drop(faults);
             if fail {
                 Err(FrankenError::Io(std::io::Error::other(
                     "injected checkpoint handoff sync failure",
                 )))
             } else {
                 self.inner.sync(cx, flags)
+            }
+        }
+
+        fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+            let mut faults = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(path) = self.path.as_ref().filter(|path| {
+                path.as_path() == Path::new(CERTIFICATE_PATH)
+                    || path.as_path() == Path::new(CHECKPOINT_HANDOFF_PATH)
+            }) {
+                faults
+                    .sync_observations
+                    .push(CertificateSyncObservation::Durable(path.clone(), kind));
+            }
+            let fail = self.is_checkpoint_handoff && std::mem::take(&mut faults.fail_next_sync);
+            drop(faults);
+            if fail {
+                Err(FrankenError::Io(std::io::Error::other(
+                    "injected checkpoint handoff durable-sync failure",
+                )))
+            } else {
+                self.inner.durable_sync(cx, kind)
             }
         }
 
@@ -3575,6 +3617,22 @@ mod tests {
 
         fn unlock(&mut self, cx: &Cx, level: fsqlite_types::LockLevel) -> Result<()> {
             self.inner.unlock(cx, level)
+        }
+
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_shared_snapshot(cx)
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+            self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_maintenance_attempt(cx)
         }
 
         fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
@@ -3616,19 +3674,42 @@ mod tests {
         }
     }
 
-    fn init_wal_publication_test_tracing() {
-        static TRACING_INIT: OnceLock<()> = OnceLock::new();
-        TRACING_INIT.get_or_init(|| {
-            if tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::TRACE)
-                .with_test_writer()
-                .try_init()
-                .is_err()
-            {
-                // Another test already installed a global subscriber.
-            }
-        });
+    /// Deliberate no-op (frankensqlite#299).
+    ///
+    /// This helper previously installed a process-global `TRACE` subscriber via
+    /// `tracing_subscriber::fmt()...with_test_writer().try_init()`. `try_init()`
+    /// is process-wide and first-caller-wins, so the first of the 9 callers
+    /// changed tracing enablement — and libtest output capture — for every
+    /// unrelated test running afterwards in this binary, making a later failure
+    /// replay the whole captured global trace stream.
+    ///
+    /// `fsqlite-core` already fixed the identical pattern in b262b6a6 for its
+    /// other helpers; this one was missed. No caller here asserts on emitted
+    /// trace events, so the body is simply removed and the call sites are kept
+    /// so the diff stays test-only.
+    ///
+    /// See `wal_publication_tracing_helper_installs_no_global_subscriber`.
+    fn init_wal_publication_test_tracing() {}
+
+    /// frankensqlite#299 regression: the WAL publication tracing helper must not
+    /// install, or otherwise disturb, a process-global subscriber.
+    ///
+    /// Only the equality assertion is made, deliberately. Unlike the pager
+    /// crate, this test binary contains another global-subscriber installation
+    /// site outside this file, so an absolute `!has_been_set()` assertion would
+    /// be order-dependent and could fail for reasons unrelated to this helper.
+    /// Comparing dispatcher state across the call is untaintable and proves the
+    /// exact property under test: that this helper is inert.
+    #[test]
+    fn wal_publication_tracing_helper_installs_no_global_subscriber() {
+        let before = tracing::dispatcher::has_been_set();
+        init_wal_publication_test_tracing();
+
+        assert_eq!(
+            before,
+            tracing::dispatcher::has_been_set(),
+            "init_wal_publication_test_tracing must not install or alter a global subscriber"
+        );
     }
 
     fn test_cx() -> Cx {
@@ -4505,6 +4586,56 @@ mod tests {
     }
 
     #[test]
+    fn certificate_and_handoff_fences_request_full_durability() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let (mut backend, certificate, _) = make_checkpoint_handoff_fault_backend(&vfs, &cx);
+
+        assert_eq!(
+            vfs.take_sync_observations(),
+            vec![CertificateSyncObservation::Durable(
+                PathBuf::from(CERTIFICATE_PATH),
+                SyncKind::FullDurable,
+            )],
+            "certificate append must use the strongest durability intent"
+        );
+
+        assert_eq!(
+            backend
+                .reconcile_parallel_wal_commit(&cx, &certificate, 1, 1, true)
+                .wait()
+                .expect("reconcile committed certificate"),
+            ParallelWalCommitReconciliation::Authorized
+        );
+        assert_eq!(
+            vfs.take_sync_observations(),
+            vec![CertificateSyncObservation::Durable(
+                PathBuf::from(CERTIFICATE_PATH),
+                SyncKind::FullDurable,
+            )],
+            "certificate reconciliation must preserve full durability intent"
+        );
+
+        let record = backend
+            .latest_authorized_durable_certificate_record(&cx)
+            .wait()
+            .expect("read authorized certificate record")
+            .expect("authorized certificate record must exist");
+        backend
+            .persist_checkpoint_certificate_handoff(&cx, &record)
+            .wait()
+            .expect("persist checkpoint certificate handoff");
+        assert_eq!(
+            vfs.take_sync_observations(),
+            vec![CertificateSyncObservation::Durable(
+                PathBuf::from(CHECKPOINT_HANDOFF_PATH),
+                SyncKind::FullDurable,
+            )],
+            "checkpoint handoff must use the strongest durability intent"
+        );
+    }
+
+    #[test]
     fn checkpoint_handoff_write_failure_preserves_authoritative_wal_generation() {
         let cx = test_cx();
         let vfs = CheckpointHandoffFaultVfs::new();
@@ -4533,7 +4664,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_handoff_sync_failure_preserves_authoritative_wal_generation() {
+    fn checkpoint_handoff_durable_sync_failure_preserves_authoritative_wal_generation() {
         let cx = test_cx();
         let vfs = CheckpointHandoffFaultVfs::new();
         let (mut backend, certificate, committed_page) =
@@ -4554,8 +4685,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("injected checkpoint handoff sync failure"),
-            "unexpected handoff sync error: {error}"
+                .contains("injected checkpoint handoff durable-sync failure"),
+            "unexpected handoff durable-sync error: {error}"
         );
         assert_authoritative_wal_unchanged(&mut backend, &vfs, &cx, &before);
     }

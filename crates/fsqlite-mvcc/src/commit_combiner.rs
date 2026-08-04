@@ -26,6 +26,10 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+#[cfg(feature = "commit-combiner-test-support")]
+use std::sync::{Condvar, Mutex as StdMutex, MutexGuard};
+#[cfg(feature = "commit-combiner-test-support")]
+use std::time::{Duration, Instant as StdInstant};
 
 use smallvec::SmallVec;
 
@@ -51,13 +55,6 @@ const SPIN_BEFORE_YIELD: u32 = 1024;
 // Metrics
 // ---------------------------------------------------------------------------
 
-static COMMIT_COMBINE_BATCHES: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_OPS: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_BATCH_SIZE_SUM: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_BATCH_SIZE_MAX: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static COMMIT_COMBINE_WAIT_NS_MAX: AtomicU64 = AtomicU64::new(0);
-
 /// Snapshot of commit combining metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct CommitCombineMetrics {
@@ -69,27 +66,254 @@ pub struct CommitCombineMetrics {
     pub wait_ns_max: u64,
 }
 
-/// Read current commit combining metrics.
-#[must_use]
-pub fn commit_combine_metrics() -> CommitCombineMetrics {
-    CommitCombineMetrics {
-        batches_total: COMMIT_COMBINE_BATCHES.load(Ordering::Relaxed),
-        ops_total: COMMIT_COMBINE_OPS.load(Ordering::Relaxed),
-        batch_size_sum: COMMIT_COMBINE_BATCH_SIZE_SUM.load(Ordering::Relaxed),
-        batch_size_max: COMMIT_COMBINE_BATCH_SIZE_MAX.load(Ordering::Relaxed),
-        wait_ns_total: COMMIT_COMBINE_WAIT_NS_TOTAL.load(Ordering::Relaxed),
-        wait_ns_max: COMMIT_COMBINE_WAIT_NS_MAX.load(Ordering::Relaxed),
+/// Quiescent, instance-local receipt for the feature-gated staged combiner
+/// keeper.
+///
+/// Callers must join all staged allocation callers before taking this receipt.
+/// It proves which public allocation route was used without reaching into
+/// combiner slots or process-global counters. Combiners without a staging
+/// control report zero route counts so feature-unified benchmark builds do not
+/// pay route-counter atomics.
+#[cfg(feature = "commit-combiner-test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitCombineTestReceipt {
+    pub next_seq: u64,
+    pub metrics: CommitCombineMetrics,
+    pub registered_allocations: u64,
+    pub one_shot_allocations: u64,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+struct CommitCombineTestMetricRecorder {
+    registered_allocations: AtomicU64,
+    one_shot_allocations: AtomicU64,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+impl CommitCombineTestMetricRecorder {
+    const fn new() -> Self {
+        Self {
+            registered_allocations: AtomicU64::new(0),
+            one_shot_allocations: AtomicU64::new(0),
+        }
     }
 }
 
-/// Reset metrics (for tests).
-pub fn reset_commit_combine_metrics() {
-    COMMIT_COMBINE_BATCHES.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_OPS.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_BATCH_SIZE_SUM.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_BATCH_SIZE_MAX.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
-    COMMIT_COMBINE_WAIT_NS_MAX.store(0, Ordering::Relaxed);
+/// Snapshot of a completed deterministic staging phase.
+#[cfg(feature = "commit-combiner-test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitCombineStagingReceipt {
+    pub expected_callers: usize,
+    pub staged_callers: usize,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+struct CommitCombineStagingState {
+    staged_callers: usize,
+    released: bool,
+}
+
+/// Test-only control that holds real registered callers after they publish a
+/// pending allocation and before they attempt the normal combining path.
+///
+/// It is available only with `commit-combiner-test-support`. Production builds
+/// do not contain the controller, its wait path, or its counters.
+#[cfg(feature = "commit-combiner-test-support")]
+pub struct CommitCombineStagingControl {
+    expected_callers: usize,
+    state: StdMutex<CommitCombineStagingState>,
+    all_staged: Condvar,
+    release_waiters: Condvar,
+    route_metrics: CommitCombineTestMetricRecorder,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+impl CommitCombineStagingControl {
+    /// Create one staging control for exactly `expected_callers` registered
+    /// allocation calls.
+    #[must_use]
+    pub fn new(expected_callers: usize) -> Self {
+        assert!(
+            expected_callers > 0 && expected_callers <= MAX_COMMIT_THREADS,
+            "staging control requires 1..=MAX_COMMIT_THREADS callers"
+        );
+        Self {
+            expected_callers,
+            state: StdMutex::new(CommitCombineStagingState {
+                staged_callers: 0,
+                released: false,
+            }),
+            all_staged: Condvar::new(),
+            release_waiters: Condvar::new(),
+            route_metrics: CommitCombineTestMetricRecorder::new(),
+        }
+    }
+
+    /// Wait until every expected caller has published a real pending request.
+    #[must_use]
+    pub fn wait_until_all_staged(&self, timeout: Duration) -> bool {
+        let deadline = StdInstant::now() + timeout;
+        let mut state = self.lock_state();
+        while state.staged_callers < self.expected_callers {
+            let Some(remaining) = deadline.checked_duration_since(StdInstant::now()) else {
+                return false;
+            };
+            let (next_state, timeout_result) = self
+                .all_staged
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if timeout_result.timed_out() && state.staged_callers < self.expected_callers {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Release an entirely staged batch into the existing combiner path.
+    #[must_use]
+    pub fn release_when_all_staged(&self) -> CommitCombineStagingReceipt {
+        let mut state = self.lock_state();
+        assert_eq!(
+            state.staged_callers, self.expected_callers,
+            "cannot release a partial staged batch"
+        );
+        state.released = true;
+        self.release_waiters.notify_all();
+        CommitCombineStagingReceipt {
+            expected_callers: self.expected_callers,
+            staged_callers: state.staged_callers,
+        }
+    }
+
+    /// Create an RAII fallback that releases waiters if a keeper assertion
+    /// fails before the normal release point.
+    #[must_use]
+    pub fn release_guard(self: &Arc<Self>) -> CommitCombineStagingReleaseGuard {
+        CommitCombineStagingReleaseGuard {
+            control: Arc::clone(self),
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, CommitCombineStagingState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn stage_registered_call(&self) {
+        let mut state = self.lock_state();
+        if state.released {
+            return;
+        }
+        assert!(
+            state.staged_callers < self.expected_callers,
+            "staging control received more callers than configured"
+        );
+        state.staged_callers += 1;
+        if state.staged_callers == self.expected_callers {
+            self.all_staged.notify_all();
+        }
+        while !state.released {
+            state = self
+                .release_waiters
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release_for_drop(&self) {
+        let mut state = self.lock_state();
+        state.released = true;
+        self.release_waiters.notify_all();
+    }
+
+    fn record_registered_allocation(&self) {
+        self.route_metrics
+            .registered_allocations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_one_shot_allocation(&self) {
+        self.route_metrics
+            .one_shot_allocations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn route_metrics(&self) -> (u64, u64) {
+        (
+            self.route_metrics
+                .registered_allocations
+                .load(Ordering::Acquire),
+            self.route_metrics
+                .one_shot_allocations
+                .load(Ordering::Acquire),
+        )
+    }
+}
+
+/// RAII release for a [`CommitCombineStagingControl`] keeper.
+#[cfg(feature = "commit-combiner-test-support")]
+pub struct CommitCombineStagingReleaseGuard {
+    control: Arc<CommitCombineStagingControl>,
+}
+
+#[cfg(feature = "commit-combiner-test-support")]
+impl Drop for CommitCombineStagingReleaseGuard {
+    fn drop(&mut self) {
+        self.control.release_for_drop();
+    }
+}
+
+/// Per-combiner metric recorder.
+///
+/// Keeping these counters beside their owning combiner makes a test or
+/// diagnostic snapshot independent of unrelated database instances. The
+/// recording work is unchanged from the former process-global counters.
+struct CommitCombineMetricRecorder {
+    batches_total: AtomicU64,
+    ops_total: AtomicU64,
+    batch_size_sum: AtomicU64,
+    batch_size_max: AtomicU64,
+    wait_ns_total: AtomicU64,
+    wait_ns_max: AtomicU64,
+}
+
+impl CommitCombineMetricRecorder {
+    const fn new() -> Self {
+        Self {
+            batches_total: AtomicU64::new(0),
+            ops_total: AtomicU64::new(0),
+            batch_size_sum: AtomicU64::new(0),
+            batch_size_max: AtomicU64::new(0),
+            wait_ns_total: AtomicU64::new(0),
+            wait_ns_max: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> CommitCombineMetrics {
+        CommitCombineMetrics {
+            batches_total: self.batches_total.load(Ordering::Relaxed),
+            ops_total: self.ops_total.load(Ordering::Relaxed),
+            batch_size_sum: self.batch_size_sum.load(Ordering::Relaxed),
+            batch_size_max: self.batch_size_max.load(Ordering::Relaxed),
+            wait_ns_total: self.wait_ns_total.load(Ordering::Relaxed),
+            wait_ns_max: self.wait_ns_max.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_wait(&self, elapsed_ns: u64) {
+        self.wait_ns_total.fetch_add(elapsed_ns, Ordering::Relaxed);
+        update_max(&self.wait_ns_max, elapsed_ns);
+    }
+
+    fn record_batch(&self, pending_count: u64) {
+        self.batches_total.fetch_add(1, Ordering::Relaxed);
+        self.ops_total.fetch_add(pending_count, Ordering::Relaxed);
+        self.batch_size_sum
+            .fetch_add(pending_count, Ordering::Relaxed);
+        update_max(&self.batch_size_max, pending_count);
+    }
 }
 
 fn update_max(metric: &AtomicU64, val: u64) {
@@ -156,6 +380,11 @@ pub struct CommitSequenceCombiner {
     /// this registry before signaling waiters, ensuring sequences are registered
     /// as active atomically with allocation (no gap for `finish_commit_seq`).
     active_registry: Option<Arc<Mutex<SmallVec<[u64; 16]>>>>,
+    /// Instance-local observability for this combiner's batches and wait time.
+    metrics: CommitCombineMetricRecorder,
+    /// Deterministic staging exists only for test-support consumers.
+    #[cfg(feature = "commit-combiner-test-support")]
+    staging_control: Option<Arc<CommitCombineStagingControl>>,
 }
 
 impl CommitSequenceCombiner {
@@ -167,6 +396,9 @@ impl CommitSequenceCombiner {
             owners: std::array::from_fn(|_| AtomicU64::new(0)),
             combiner_lock: Mutex::new(()),
             active_registry: None,
+            metrics: CommitCombineMetricRecorder::new(),
+            #[cfg(feature = "commit-combiner-test-support")]
+            staging_control: None,
         }
     }
 
@@ -186,7 +418,23 @@ impl CommitSequenceCombiner {
             owners: std::array::from_fn(|_| AtomicU64::new(0)),
             combiner_lock: Mutex::new(()),
             active_registry: Some(registry),
+            metrics: CommitCombineMetricRecorder::new(),
+            #[cfg(feature = "commit-combiner-test-support")]
+            staging_control: None,
         }
+    }
+
+    /// Create a combiner whose registered callers can be staged by the
+    /// feature-gated test controller before entering the existing combine path.
+    #[cfg(feature = "commit-combiner-test-support")]
+    #[must_use]
+    pub fn new_with_staging_control(
+        initial_commit_seq: u64,
+        staging_control: Arc<CommitCombineStagingControl>,
+    ) -> Self {
+        let mut combiner = Self::new(initial_commit_seq);
+        combiner.staging_control = Some(staging_control);
+        combiner
     }
 
     /// Register a thread. Returns a handle with an assigned slot,
@@ -228,6 +476,30 @@ impl CommitSequenceCombiner {
             .iter()
             .filter(|o| o.load(Ordering::Relaxed) != 0)
             .count()
+    }
+
+    /// Snapshot metric counters for this combiner instance only.
+    #[must_use]
+    pub fn metrics(&self) -> CommitCombineMetrics {
+        self.metrics.snapshot()
+    }
+
+    /// Return a quiescent, instance-local keeper receipt.
+    ///
+    /// Callers must join all allocation callers before sampling it.
+    #[cfg(feature = "commit-combiner-test-support")]
+    #[must_use]
+    pub fn test_support_receipt(&self) -> CommitCombineTestReceipt {
+        let (registered_allocations, one_shot_allocations) = self
+            .staging_control
+            .as_ref()
+            .map_or((0, 0), |staging_control| staging_control.route_metrics());
+        CommitCombineTestReceipt {
+            next_seq: self.next_seq(),
+            metrics: self.metrics(),
+            registered_allocations,
+            one_shot_allocations,
+        }
     }
 
     /// Claim a temporary slot for one-shot allocation.
@@ -299,8 +571,12 @@ impl CommitSequenceCombiner {
 
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ns = start.elapsed().as_nanos() as u64;
-        COMMIT_COMBINE_WAIT_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
-        update_max(&COMMIT_COMBINE_WAIT_NS_MAX, elapsed_ns);
+        self.metrics.record_wait(elapsed_ns);
+
+        #[cfg(feature = "commit-combiner-test-support")]
+        if let Some(staging_control) = &self.staging_control {
+            staging_control.record_one_shot_allocation();
+        }
 
         seq
     }
@@ -378,10 +654,7 @@ impl CommitSequenceCombiner {
         debug_assert_eq!(assigned, pending_count);
 
         // Update metrics.
-        COMMIT_COMBINE_BATCHES.fetch_add(1, Ordering::Relaxed);
-        COMMIT_COMBINE_OPS.fetch_add(pending_count, Ordering::Relaxed);
-        COMMIT_COMBINE_BATCH_SIZE_SUM.fetch_add(pending_count, Ordering::Relaxed);
-        update_max(&COMMIT_COMBINE_BATCH_SIZE_MAX, pending_count);
+        self.metrics.record_batch(pending_count);
 
         tracing::debug!(
             target: "fsqlite.commit_combine",
@@ -426,6 +699,14 @@ impl CommitCombineHandle<'_> {
             .state
             .store(SLOT_PENDING, Ordering::Release);
 
+        #[cfg(feature = "commit-combiner-test-support")]
+        let staging_control = self.combiner.staging_control.as_ref();
+
+        #[cfg(feature = "commit-combiner-test-support")]
+        if let Some(staging_control) = staging_control {
+            staging_control.stage_registered_call();
+        }
+
         // Try to become the combiner.
         if let Some(_guard) = self.combiner.combiner_lock.try_lock() {
             self.combiner.combine_locked();
@@ -447,8 +728,12 @@ impl CommitCombineHandle<'_> {
 
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
-                COMMIT_COMBINE_WAIT_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
-                update_max(&COMMIT_COMBINE_WAIT_NS_MAX, elapsed_ns);
+                self.combiner.metrics.record_wait(elapsed_ns);
+
+                #[cfg(feature = "commit-combiner-test-support")]
+                if let Some(staging_control) = staging_control {
+                    staging_control.record_registered_allocation();
+                }
 
                 return CommitSeq::new(seq);
             }
@@ -527,6 +812,70 @@ mod tests {
 
         drop(handle);
         assert_eq!(combiner.next_seq(), 103);
+    }
+
+    #[test]
+    fn test_combiner_private_staged_batch_records_one_batch() {
+        let combiner = CommitSequenceCombiner::new(100);
+
+        // This is a private unit-level setup, not production-shaped staged
+        // control. It avoids scheduler-dependent publication races while
+        // checking how one already-staged batch is recorded.
+        for slot in combiner.slots.iter().take(8) {
+            slot.state.store(SLOT_PENDING, Ordering::Release);
+        }
+        let guard = combiner.combiner_lock.lock();
+        combiner.combine_locked();
+        drop(guard);
+
+        let metrics = combiner.metrics();
+        assert_eq!(metrics.ops_total, 8);
+        assert_eq!(metrics.batches_total, 1);
+        assert_eq!(metrics.batch_size_sum, 8);
+        assert_eq!(metrics.batch_size_max, 8);
+        assert_eq!(combiner.next_seq(), 108);
+
+        // The private batch uses one sequence allocation for eight requests.
+        // Public e2e release gates remain blocked on production-shaped staged
+        // control and a receipt that external gates can consume.
+        assert!(metrics.batches_total < metrics.ops_total);
+    }
+
+    #[test]
+    fn test_combiner_metrics_are_instance_local() {
+        let active = CommitSequenceCombiner::new(0);
+        let untouched = CommitSequenceCombiner::new(0);
+
+        active.alloc_one_shot();
+
+        assert_eq!(active.metrics().ops_total, 1);
+        assert_eq!(
+            untouched.metrics(),
+            CommitCombineMetrics {
+                batches_total: 0,
+                ops_total: 0,
+                batch_size_sum: 0,
+                batch_size_max: 0,
+                wait_ns_total: 0,
+                wait_ns_max: 0,
+            }
+        );
+    }
+
+    #[cfg(feature = "commit-combiner-test-support")]
+    #[test]
+    fn test_support_receipt_route_counts_require_staging_control() {
+        let combiner = CommitSequenceCombiner::new(100);
+
+        assert_eq!(combiner.alloc_one_shot().get(), 100);
+        let handle = combiner.register().expect("first slot must be available");
+        assert_eq!(handle.alloc_commit_seq().get(), 101);
+        drop(handle);
+
+        let receipt = combiner.test_support_receipt();
+        assert_eq!(receipt.next_seq, 102);
+        assert_eq!(receipt.registered_allocations, 0);
+        assert_eq!(receipt.one_shot_allocations, 0);
     }
 
     #[test]

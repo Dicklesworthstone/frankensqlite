@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-wal"
-version = "0.1.19"
+version = "0.2.0"
 description = "Write-ahead logging"
 edition.workspace = true
 license-file.workspace = true
@@ -16,7 +16,7 @@ fault-injection = []
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.19", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.2.0", default-features = false }
 xxhash-rust = { workspace = true }
 crc32c = { workspace = true }
 blake3 = { workspace = true }
@@ -27,6 +27,10 @@ serde = { workspace = true }
 asupersync = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The final browser package owns canonical asupersync profile selection.
+asupersync = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

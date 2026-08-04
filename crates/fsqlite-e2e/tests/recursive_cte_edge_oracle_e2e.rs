@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,10 +57,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -82,11 +82,13 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in stmts {
-        f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+        f.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
         r.execute_batch(s)
             .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
@@ -95,66 +97,79 @@ fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn recursive_cycle_terminates_via_union() {
-    let (f, r) = setup(&[
-        "CREATE TABLE edges (a INTEGER, b INTEGER)",
-        "INSERT INTO edges VALUES (1,2),(2,3),(3,1),(3,4)", // 1->2->3->1 cycle, 3->4
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            // UNION de-dups, so the cycle terminates; reachable from 1 = {1,2,3,4}.
-            "WITH RECURSIVE reach(n) AS (SELECT 1 UNION SELECT b FROM edges JOIN reach ON edges.a = reach.n) \
-             SELECT n FROM reach ORDER BY n",
-            "WITH RECURSIVE reach(n) AS (SELECT 1 UNION SELECT b FROM edges JOIN reach ON edges.a = reach.n) \
-             SELECT count(*) FROM reach", // 4
-        ],
-        "recursive_cycle_terminates_via_union",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE edges (a INTEGER, b INTEGER)",
+            "INSERT INTO edges VALUES (1,2),(2,3),(3,1),(3,4)", // 1->2->3->1 cycle, 3->4
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                // UNION de-dups, so the cycle terminates; reachable from 1 = {1,2,3,4}.
+                "WITH RECURSIVE reach(n) AS (SELECT 1 UNION SELECT b FROM edges JOIN reach ON edges.a = reach.n) \
+                 SELECT n FROM reach ORDER BY n",
+                "WITH RECURSIVE reach(n) AS (SELECT 1 UNION SELECT b FROM edges JOIN reach ON edges.a = reach.n) \
+                 SELECT count(*) FROM reach", // 4
+            ],
+            "recursive_cycle_terminates_via_union",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn recursive_multiple_anchor_rows() {
-    let (f, r) = setup(&[]);
-    check(
-        &f,
-        &r,
-        &[
-            // Two anchors (1 and 10); only values <3 recurse. -> 1,2,3,10.
-            "WITH RECURSIVE c(n) AS (VALUES (1),(10) UNION ALL SELECT n+1 FROM c WHERE n < 3) \
-             SELECT n FROM c ORDER BY n",
-        ],
-        "recursive_multiple_anchor_rows",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[]).await;
+        check(
+            &f,
+            &r,
+            &[
+                // Two anchors (1 and 10); only values <3 recurse. -> 1,2,3,10.
+                "WITH RECURSIVE c(n) AS (VALUES (1),(10) UNION ALL SELECT n+1 FROM c WHERE n < 3) \
+                 SELECT n FROM c ORDER BY n",
+            ],
+            "recursive_multiple_anchor_rows",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn recursive_factorial_running_value() {
-    let (f, r) = setup(&[]);
-    check(
-        &f,
-        &r,
-        &[
-            "WITH RECURSIVE f(n, fact) AS (SELECT 1, 1 UNION ALL SELECT n+1, fact*(n+1) FROM f WHERE n < 5) \
-             SELECT n, fact FROM f ORDER BY n", // (1,1),(2,2),(3,6),(4,24),(5,120)
-        ],
-        "recursive_factorial_running_value",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[]).await;
+        check(
+            &f,
+            &r,
+            &[
+                "WITH RECURSIVE f(n, fact) AS (SELECT 1, 1 UNION ALL SELECT n+1, fact*(n+1) FROM f WHERE n < 5) \
+                 SELECT n, fact FROM f ORDER BY n", // (1,1),(2,2),(3,6),(4,24),(5,120)
+            ],
+            "recursive_factorial_running_value",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn recursive_limit_cuts_infinite() {
-    let (f, r) = setup(&[]);
-    check(
-        &f,
-        &r,
-        &[
-            // No WHERE termination; LIMIT cuts the otherwise-infinite recursion.
-            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c LIMIT 5", // 1..5
-            "WITH RECURSIVE c(n) AS (SELECT 0 UNION ALL SELECT n+2 FROM c) SELECT n FROM c LIMIT 4", // 0,2,4,6
-        ],
-        "recursive_limit_cuts_infinite",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[]).await;
+        check(
+            &f,
+            &r,
+            &[
+                // No WHERE termination; LIMIT cuts the otherwise-infinite recursion.
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c LIMIT 5", // 1..5
+                "WITH RECURSIVE c(n) AS (SELECT 0 UNION ALL SELECT n+2 FROM c) SELECT n FROM c LIMIT 4", // 0,2,4,6
+            ],
+            "recursive_limit_cuts_infinite",
+        )
+        .await;
+    });
 }
 
 /// bd-fuxgg (recursive extension): SQLite rejects an aggregate in a recursive
@@ -162,14 +177,17 @@ fn recursive_limit_cuts_infinite() {
 /// instead. Same missing-aggregate-validation class as the other misuse cases.
 #[test]
 fn recursive_aggregate_in_recursive_term_errors() {
-    let (f, r) = setup(&[]);
-    check(
-        &f,
-        &r,
-        &[
-            // An aggregate in the recursive term is not allowed -> error on both.
-            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM c) SELECT * FROM c",
-        ],
-        "recursive_aggregate_in_recursive_term_errors",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[]).await;
+        check(
+            &f,
+            &r,
+            &[
+                // An aggregate in the recursive term is not allowed -> error on both.
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM c) SELECT * FROM c",
+            ],
+            "recursive_aggregate_in_recursive_term_errors",
+        )
+        .await;
+    });
 }

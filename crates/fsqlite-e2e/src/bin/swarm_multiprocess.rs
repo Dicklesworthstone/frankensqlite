@@ -5,6 +5,12 @@
 //! concurrency invariants from frankensqlite#70.
 
 #![allow(clippy::struct_excessive_bools, clippy::too_many_lines)]
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per transaction attempt; boxing them would put an allocation inside the
+// timed window.
+#![allow(clippy::large_futures)]
+#![recursion_limit = "512"]
 
 use std::env;
 use std::fs::{self, File};
@@ -513,7 +519,7 @@ fn run_child_workload(
         }
     }
 
-    conn.close()
+    fsqlite_e2e::block_on(conn.close())
         .map_err(|err| format!("worker connection close/checkpoint failed: {err}"))
 }
 
@@ -542,84 +548,107 @@ fn commit_mixed_transaction(
         rng.random::<u32>()
     );
 
+    // bd-mnlk2 / bd-zavyn: one runtime entry per transaction attempt (the
+    // deadline loop scores iterations/sec, so per-op entries inflated the
+    // denominator). retry_fsqlite's backoff sleep already sits outside the
+    // closure, i.e. outside the entered runtime.
     retry_fsqlite(config, counters, "mixed write transaction", || {
-        conn.begin_transaction()?;
-        let mut in_txn = true;
-        let result = (|| -> Result<(), FrankenError> {
-            let inserted = conn.execute_with_params(
-                "INSERT INTO swarm_rows \
-                 (id, owner, seq, payload, touched_by, generation, deleted) \
-                 VALUES (?1, ?2, ?3, ?4, ?2, 0, 0)",
-                &[
-                    SqliteValue::Integer(id),
-                    SqliteValue::Integer(i64::try_from(child.worker_id).unwrap_or(i64::MAX)),
-                    SqliteValue::Integer(seq),
-                    SqliteValue::Text(payload.clone().into()),
-                ],
-            )?;
-            if inserted != 1 {
-                return Err(FrankenError::Internal(format!(
-                    "insert affected {inserted} rows for id={id}"
-                )));
-            }
-
-            let updated = conn.execute_with_params(
-                "UPDATE swarm_rows \
-                 SET payload = ?1, touched_by = ?2, generation = generation + 1 \
-                 WHERE id = ?3",
-                &[
-                    SqliteValue::Text(update_payload.clone().into()),
-                    SqliteValue::Integer(i64::try_from(child.worker_id).unwrap_or(i64::MAX)),
-                    SqliteValue::Integer(update_id),
-                ],
-            )?;
-            if updated != 1 {
-                return Err(FrankenError::Internal(format!(
-                    "update affected {updated} rows for id={update_id}"
-                )));
-            }
-
-            if let Some(delete_id) = deleted_id {
-                let deleted = conn.execute_with_params(
-                    "DELETE FROM swarm_rows WHERE id = ?1 AND owner = ?2",
-                    &[
-                        SqliteValue::Integer(delete_id),
-                        SqliteValue::Integer(i64::try_from(child.worker_id).unwrap_or(i64::MAX)),
-                    ],
-                )?;
-                if deleted != 1 {
+        fsqlite_e2e::block_on(async {
+            conn.begin_transaction().await?;
+            let mut in_txn = true;
+            let result = async {
+                let inserted = conn
+                    .execute_with_params(
+                        "INSERT INTO swarm_rows \
+                         (id, owner, seq, payload, touched_by, generation, deleted) \
+                         VALUES (?1, ?2, ?3, ?4, ?2, 0, 0)",
+                        &[
+                            SqliteValue::Integer(id),
+                            SqliteValue::Integer(
+                                i64::try_from(child.worker_id).unwrap_or(i64::MAX),
+                            ),
+                            SqliteValue::Integer(seq),
+                            SqliteValue::Text(payload.clone().into()),
+                        ],
+                    )
+                    .await?;
+                if inserted != 1 {
                     return Err(FrankenError::Internal(format!(
-                        "delete affected {deleted} rows for id={delete_id}"
+                        "insert affected {inserted} rows for id={id}"
                     )));
                 }
-            }
 
-            let progressed = conn.execute_with_params(
-                "UPDATE worker_progress \
-                 SET last_id = ?1, last_seq = ?2, payload = ?3, observed_epoch = ?2 \
-                 WHERE worker_id = ?4",
-                &[
-                    SqliteValue::Integer(id),
-                    SqliteValue::Integer(seq),
-                    SqliteValue::Text(payload.clone().into()),
-                    SqliteValue::Integer(i64::try_from(child.worker_id).unwrap_or(i64::MAX)),
-                ],
-            )?;
-            if progressed != 1 {
-                return Err(FrankenError::Internal(format!(
-                    "progress update affected {progressed} rows for worker={}",
-                    child.worker_id
-                )));
-            }
+                let updated = conn
+                    .execute_with_params(
+                        "UPDATE swarm_rows \
+                         SET payload = ?1, touched_by = ?2, generation = generation + 1 \
+                         WHERE id = ?3",
+                        &[
+                            SqliteValue::Text(update_payload.clone().into()),
+                            SqliteValue::Integer(
+                                i64::try_from(child.worker_id).unwrap_or(i64::MAX),
+                            ),
+                            SqliteValue::Integer(update_id),
+                        ],
+                    )
+                    .await?;
+                if updated != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "update affected {updated} rows for id={update_id}"
+                    )));
+                }
 
-            conn.commit_transaction()?;
-            in_txn = false;
-            Ok(())
-        })();
-        if result.is_err() && in_txn {
-            let _ = conn.rollback_transaction();
-        }
-        result
+                if let Some(delete_id) = deleted_id {
+                    let deleted = conn
+                        .execute_with_params(
+                            "DELETE FROM swarm_rows WHERE id = ?1 AND owner = ?2",
+                            &[
+                                SqliteValue::Integer(delete_id),
+                                SqliteValue::Integer(
+                                    i64::try_from(child.worker_id).unwrap_or(i64::MAX),
+                                ),
+                            ],
+                        )
+                        .await?;
+                    if deleted != 1 {
+                        return Err(FrankenError::Internal(format!(
+                            "delete affected {deleted} rows for id={delete_id}"
+                        )));
+                    }
+                }
+
+                let progressed = conn
+                    .execute_with_params(
+                        "UPDATE worker_progress \
+                         SET last_id = ?1, last_seq = ?2, payload = ?3, observed_epoch = ?2 \
+                         WHERE worker_id = ?4",
+                        &[
+                            SqliteValue::Integer(id),
+                            SqliteValue::Integer(seq),
+                            SqliteValue::Text(payload.clone().into()),
+                            SqliteValue::Integer(
+                                i64::try_from(child.worker_id).unwrap_or(i64::MAX),
+                            ),
+                        ],
+                    )
+                    .await?;
+                if progressed != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "progress update affected {progressed} rows for worker={}",
+                        child.worker_id
+                    )));
+                }
+
+                conn.commit_transaction().await?;
+                in_txn = false;
+                Ok(())
+            }
+            .await;
+            if result.is_err() && in_txn {
+                drop(conn.rollback_transaction().await);
+            }
+            result
+        })
     })?;
     trace_swarm_post_commit_visibility(conn, config, child.worker_id, id, seq, &payload);
 
@@ -769,10 +798,10 @@ fn query_pk(
     id: i64,
 ) -> HarnessResult<Option<ObservedRow>> {
     let rows = retry_fsqlite(config, counters, "pk lookup", || {
-        conn.query_with_params(
+        fsqlite_e2e::block_on(conn.query_with_params(
             "SELECT id, owner, seq, payload, deleted FROM swarm_rows WHERE id = ?1",
             &[SqliteValue::Integer(id)],
-        )
+        ))
     })?;
     counters.pk_selects = counters.pk_selects.saturating_add(1);
     counters.wrong_row_checks = counters.wrong_row_checks.saturating_add(1);
@@ -803,11 +832,11 @@ fn query_progress(
 ) -> HarnessResult<ProgressRow> {
     let worker = i64::try_from(worker_id).map_err(|err| format!("worker id overflow: {err}"))?;
     let rows = retry_fsqlite(config, counters, "worker progress lookup", || {
-        conn.query_with_params(
+        fsqlite_e2e::block_on(conn.query_with_params(
             "SELECT worker_id, last_id, last_seq, payload \
              FROM worker_progress WHERE worker_id = ?1",
             &[SqliteValue::Integer(worker)],
-        )
+        ))
     })?;
     if rows.len() != 1 {
         return Err(format!(
@@ -887,12 +916,11 @@ fn trace_swarm_post_commit_visibility(
 }
 
 fn count_rows_by_id(conn: &Connection, id: i64) -> HarnessResult<i64> {
-    let rows = conn
-        .query_with_params(
-            "SELECT COUNT(*) FROM swarm_rows WHERE id = ?1",
-            &[SqliteValue::Integer(id)],
-        )
-        .map_err(|err| format!("count by id failed for id={id}: {err}"))?;
+    let rows = fsqlite_e2e::block_on(conn.query_with_params(
+        "SELECT COUNT(*) FROM swarm_rows WHERE id = ?1",
+        &[SqliteValue::Integer(id)],
+    ))
+    .map_err(|err| format!("count by id failed for id={id}: {err}"))?;
     if rows.len() != 1 {
         return Err(format!(
             "count by id for id={id} returned {} rows",
@@ -904,12 +932,11 @@ fn count_rows_by_id(conn: &Connection, id: i64) -> HarnessResult<i64> {
 
 fn count_progress_last_id(conn: &Connection, worker_id: usize) -> HarnessResult<Option<i64>> {
     let worker = i64::try_from(worker_id).map_err(|err| format!("worker id overflow: {err}"))?;
-    let rows = conn
-        .query_with_params(
-            "SELECT last_id FROM worker_progress WHERE worker_id = ?1",
-            &[SqliteValue::Integer(worker)],
-        )
-        .map_err(|err| format!("progress last_id query failed for worker={worker_id}: {err}"))?;
+    let rows = fsqlite_e2e::block_on(conn.query_with_params(
+        "SELECT last_id FROM worker_progress WHERE worker_id = ?1",
+        &[SqliteValue::Integer(worker)],
+    ))
+    .map_err(|err| format!("progress last_id query failed for worker={worker_id}: {err}"))?;
     match rows.len() {
         0 => Ok(None),
         1 => value_i64(&rows[0], 0).map(Some),
@@ -930,18 +957,18 @@ where
     F: FnOnce(&mut WorkerCounters) -> HarnessResult<T>,
 {
     retry_fsqlite(config, counters, label, || {
-        conn.execute("BEGIN DEFERRED;").map(|_| ())
+        fsqlite_e2e::block_on(conn.execute("BEGIN DEFERRED;")).map(|_| ())
     })?;
     match read(counters) {
         Ok(value) => {
-            if let Err(error) = conn.commit_transaction() {
-                let _ = conn.rollback_transaction();
+            if let Err(error) = fsqlite_e2e::block_on(conn.commit_transaction()) {
+                drop(fsqlite_e2e::block_on(conn.rollback_transaction()));
                 return Err(format!("{label} commit failed: {error}"));
             }
             Ok(value)
         }
         Err(error) => {
-            let _ = conn.rollback_transaction();
+            drop(fsqlite_e2e::block_on(conn.rollback_transaction()));
             Err(error)
         }
     }
@@ -984,7 +1011,7 @@ where
 fn initialize_database(db_path: &Path, config: &RunConfig) -> HarnessResult<()> {
     let conn = open_fsqlite(db_path)?;
     configure_fsqlite(&conn, config)?;
-    conn.execute_batch(
+    fsqlite_e2e::block_on(conn.execute_batch(
         "CREATE TABLE swarm_rows (
             id INTEGER PRIMARY KEY,
             owner INTEGER NOT NULL,
@@ -1001,24 +1028,24 @@ fn initialize_database(db_path: &Path, config: &RunConfig) -> HarnessResult<()> 
             payload TEXT NOT NULL,
             observed_epoch INTEGER NOT NULL
         );",
-    )
+    ))
     .map_err(|err| format!("failed to create swarm schema: {err}"))?;
 
     for worker_id in 0..config.workers {
-        conn.execute_with_params(
+        fsqlite_e2e::block_on(conn.execute_with_params(
             "INSERT INTO worker_progress \
              (worker_id, last_id, last_seq, payload, observed_epoch) \
              VALUES (?1, 0, 0, '', 0)",
             &[SqliteValue::Integer(
                 i64::try_from(worker_id).map_err(|err| format!("worker id overflow: {err}"))?,
             )],
-        )
+        ))
         .map_err(|err| format!("failed to seed progress row for worker {worker_id}: {err}"))?;
     }
 
     for offset in 0..DEFAULT_HOT_ROWS {
         let id = HOT_ROW_BASE - offset;
-        conn.execute_with_params(
+        fsqlite_e2e::block_on(conn.execute_with_params(
             "INSERT INTO swarm_rows \
              (id, owner, seq, payload, touched_by, generation, deleted) \
              VALUES (?1, -1, ?2, ?3, -1, 0, 0)",
@@ -1027,7 +1054,7 @@ fn initialize_database(db_path: &Path, config: &RunConfig) -> HarnessResult<()> 
                 SqliteValue::Integer(offset),
                 SqliteValue::Text(format!("hot-row-{offset}").into()),
             ],
-        )
+        ))
         .map_err(|err| format!("failed to seed hot row {id}: {err}"))?;
     }
     Ok(())
@@ -1044,10 +1071,12 @@ fn run_sequential_open_check(run_dir: &Path, config: &RunConfig) -> HarnessResul
             ));
         }
         if index == 0 {
-            conn.execute("CREATE TABLE open_check (id INTEGER PRIMARY KEY, v TEXT);")
-                .map_err(|err| format!("sequential open schema create failed: {err}"))?;
+            fsqlite_e2e::block_on(
+                conn.execute("CREATE TABLE open_check (id INTEGER PRIMARY KEY, v TEXT);"),
+            )
+            .map_err(|err| format!("sequential open schema create failed: {err}"))?;
         }
-        conn.execute_with_params(
+        fsqlite_e2e::block_on(conn.execute_with_params(
             "INSERT INTO open_check (id, v) VALUES (?1, ?2)",
             &[
                 SqliteValue::Integer(
@@ -1055,7 +1084,7 @@ fn run_sequential_open_check(run_dir: &Path, config: &RunConfig) -> HarnessResul
                 ),
                 SqliteValue::Text(format!("open-{index}").into()),
             ],
-        )
+        ))
         .map_err(|err| format!("sequential open insert #{index} failed: {err}"))?;
     }
     Ok(format!(
@@ -1317,8 +1346,7 @@ fn validate_wal_shape(db_path: &Path) -> HarnessResult<String> {
 fn run_fsqlite_checkpoint(db_path: &Path, config: &RunConfig) -> HarnessResult<String> {
     let conn = open_fsqlite(db_path)?;
     configure_fsqlite(&conn, config)?;
-    let rows = conn
-        .query("PRAGMA wal_checkpoint(TRUNCATE);")
+    let rows = fsqlite_e2e::block_on(conn.query("PRAGMA wal_checkpoint(TRUNCATE);"))
         .map_err(|err| format!("fsqlite wal_checkpoint(TRUNCATE) failed: {err}"))?;
     Ok(format!("fsqlite checkpoint returned {} row(s)", rows.len()))
 }
@@ -1326,8 +1354,7 @@ fn run_fsqlite_checkpoint(db_path: &Path, config: &RunConfig) -> HarnessResult<S
 fn run_fsqlite_integrity_check(db_path: &Path, config: &RunConfig) -> HarnessResult<String> {
     let conn = open_fsqlite(db_path)?;
     configure_fsqlite(&conn, config)?;
-    let rows = conn
-        .query("PRAGMA integrity_check;")
+    let rows = fsqlite_e2e::block_on(conn.query("PRAGMA integrity_check;"))
         .map_err(|err| format!("fsqlite integrity_check failed: {err}"))?;
     let messages = integrity_messages_from_fsqlite_rows(&rows)?;
     if messages == ["ok"] {
@@ -1394,9 +1421,10 @@ fn verify_final_progress_visibility(db_path: &Path, config: &RunConfig) -> Harne
         &mut counters,
         "final progress consistency snapshot",
         |counters| {
-            let rows = conn
-                .query("SELECT worker_id, last_id, last_seq, payload FROM worker_progress;")
-                .map_err(|err| format!("failed to query final worker_progress: {err}"))?;
+            let rows = fsqlite_e2e::block_on(
+                conn.query("SELECT worker_id, last_id, last_seq, payload FROM worker_progress;"),
+            )
+            .map_err(|err| format!("failed to query final worker_progress: {err}"))?;
             if rows.len() != config.workers {
                 return Err(format!(
                     "worker_progress has {} rows, expected {}",
@@ -1476,8 +1504,7 @@ fn collect_row_counts(db_path: &Path, config: &RunConfig) -> RowCounts {
 }
 
 fn query_count(conn: &Connection, sql: &str) -> HarnessResult<i64> {
-    let rows = conn
-        .query(sql)
+    let rows = fsqlite_e2e::block_on(conn.query(sql))
         .map_err(|err| format!("count query `{sql}` failed: {err}"))?;
     if rows.len() != 1 {
         return Err(format!("count query `{sql}` returned {} rows", rows.len()));
@@ -2019,17 +2046,20 @@ fn open_fsqlite(db_path: &Path) -> HarnessResult<Connection> {
     let path = db_path
         .to_str()
         .ok_or_else(|| format!("path `{}` is not valid UTF-8", db_path.display()))?;
-    Connection::open(path.to_owned()).map_err(|err| format!("fsqlite open `{path}` failed: {err}"))
+    fsqlite_e2e::block_on(Connection::open(path.to_owned()))
+        .map_err(|err| format!("fsqlite open `{path}` failed: {err}"))
 }
 
 fn configure_fsqlite(conn: &Connection, config: &RunConfig) -> HarnessResult<()> {
-    conn.execute(&format!("PRAGMA busy_timeout={};", config.busy_timeout_ms))
-        .map_err(|err| format!("failed to set busy_timeout: {err}"))?;
-    conn.execute("PRAGMA journal_mode=WAL;")
+    fsqlite_e2e::block_on(
+        conn.execute(&format!("PRAGMA busy_timeout={};", config.busy_timeout_ms)),
+    )
+    .map_err(|err| format!("failed to set busy_timeout: {err}"))?;
+    fsqlite_e2e::block_on(conn.execute("PRAGMA journal_mode=WAL;"))
         .map_err(|err| format!("failed to set journal_mode=WAL: {err}"))?;
-    conn.execute("PRAGMA synchronous=NORMAL;")
+    fsqlite_e2e::block_on(conn.execute("PRAGMA synchronous=NORMAL;"))
         .map_err(|err| format!("failed to set synchronous=NORMAL: {err}"))?;
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+    fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"))
         .map_err(|err| format!("failed to set concurrent_mode=ON: {err}"))?;
     if !conn.is_concurrent_mode_default() {
         return Err("concurrent_mode default is not ON after configuration".to_owned());

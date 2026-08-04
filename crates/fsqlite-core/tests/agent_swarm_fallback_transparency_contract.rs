@@ -328,7 +328,7 @@ fn sql_bool(value: bool) -> &'static str {
     if value { "1" } else { "0" }
 }
 
-fn install_fallback_schema(conn: &Connection) -> TestResult {
+async fn install_fallback_schema(conn: &Connection) -> TestResult {
     conn.execute(
         "CREATE TABLE fsqlite_fallback_reason_codes_contract(
             reason_code TEXT NOT NULL PRIMARY KEY,
@@ -341,7 +341,8 @@ fn install_fallback_schema(conn: &Connection) -> TestResult {
             latency_impact TEXT NOT NULL,
             human_text TEXT NOT NULL
         );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE TABLE fsqlite_fallback_events_contract(
             event_seq INTEGER NOT NULL PRIMARY KEY,
@@ -363,7 +364,8 @@ fn install_fallback_schema(conn: &Connection) -> TestResult {
             diagnostics_available INTEGER NOT NULL,
             first_failure_diag TEXT NOT NULL
         );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE INDEX idx_fsqlite_fallback_events_contract_aggregate
             ON fsqlite_fallback_events_contract(
@@ -373,7 +375,8 @@ fn install_fallback_schema(conn: &Connection) -> TestResult {
                 workload_lane,
                 fallback_reason
             );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE TABLE fsqlite_fallback_decision_events_contract(
             event_seq INTEGER NOT NULL PRIMARY KEY,
@@ -391,7 +394,8 @@ fn install_fallback_schema(conn: &Connection) -> TestResult {
             source_touchpoint TEXT NOT NULL,
             first_failure_diag TEXT NOT NULL
         );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE INDEX idx_fsqlite_fallback_decision_events_contract_lookup
             ON fsqlite_fallback_decision_events_contract(
@@ -401,12 +405,13 @@ fn install_fallback_schema(conn: &Connection) -> TestResult {
                 fallback_boundary,
                 decision_outcome
             );",
-    )?;
-    seed_fallback_reason_codes(conn)?;
+    )
+    .await?;
+    seed_fallback_reason_codes(conn).await?;
     Ok(())
 }
 
-fn seed_fallback_reason_codes(conn: &Connection) -> TestResult {
+async fn seed_fallback_reason_codes(conn: &Connection) -> TestResult {
     conn.execute(
         "INSERT INTO fsqlite_fallback_reason_codes_contract(
             reason_code,
@@ -463,11 +468,12 @@ fn seed_fallback_reason_codes(conn: &Connection) -> TestResult {
                 'unknown',
                 'Fallback classification was unavailable for this statement.'
             );",
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
-fn record_fallback_event(conn: &Connection, event: FallbackEvent<'_>) -> TestResult {
+async fn record_fallback_event(conn: &Connection, event: FallbackEvent<'_>) -> TestResult {
     conn.execute(&format!(
         "INSERT INTO fsqlite_fallback_events_contract(
             event_seq,
@@ -523,7 +529,8 @@ fn record_fallback_event(conn: &Connection, event: FallbackEvent<'_>) -> TestRes
         latency_impact = sql_text(event.latency_impact),
         diagnostics_available = sql_bool(event.diagnostics_available),
         first_failure_diag = sql_text(event.first_failure_diag)
-    ))?;
+    ))
+    .await?;
     trace_fallback_event(&event);
     Ok(())
 }
@@ -646,7 +653,7 @@ fn validate_fallback_decision_event(event: &FallbackDecisionEvent<'_>) -> TestRe
     Ok(())
 }
 
-fn record_fallback_decision_event(
+async fn record_fallback_decision_event(
     conn: &Connection,
     event_seq: i64,
     event: FallbackDecisionEvent<'_>,
@@ -698,7 +705,8 @@ fn record_fallback_decision_event(
         decision_outcome = sql_text(event.decision_outcome),
         source_touchpoint = sql_text(event.source_touchpoint),
         first_failure_diag = sql_text(event.first_failure_diag)
-    ))?;
+    ))
+    .await?;
     Ok(())
 }
 
@@ -729,30 +737,33 @@ fn inventory_has_boundary_id(boundary_id: &str) -> bool {
     FALLBACK_BOUNDARY_INVENTORY.contains(&format!("boundary_id = \"{boundary_id}\""))
 }
 
-fn assert_strict_replay_denial(scenario: &StrictSqlReplayScenario) -> TestResult {
+async fn assert_strict_replay_denial(scenario: &StrictSqlReplayScenario) -> TestResult {
     let dir = tempfile::tempdir()?;
     let db_path = dir
         .path()
         .join(format!("{}.db", scenario.scenario_id.replace('-', "_")));
     let db = db_path.to_string_lossy();
-    let conn = Connection::open(db.as_ref())?;
+    let conn = Connection::open(db.as_ref()).await?;
     assert!(
         conn.is_concurrent_mode_default(),
         "G9 replay scenarios must not disable concurrent-writer mode"
     );
 
     for setup in scenario.setup_sql {
-        conn.execute(setup)?;
+        conn.execute(setup).await?;
     }
-    conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+    conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+        .await?;
 
     let error = match scenario.operation {
         ReplayOperation::Execute => conn
             .execute(scenario.sql)
+            .await
             .map(|_| ())
             .expect_err("strict replay scenario should deny compatibility fallback"),
         ReplayOperation::Query => conn
             .query(scenario.sql)
+            .await
             .map(|_| ())
             .expect_err("strict replay scenario should deny compatibility fallback"),
     };
@@ -877,8 +888,10 @@ fn source_contains_anchor(source_file: &str, source_anchor: &str) -> bool {
     }
 }
 
-fn fallback_count(conn: &Connection) -> TestResult<i64> {
-    let rows = conn.query("SELECT count(*) FROM fsqlite_fallback_events_contract;")?;
+async fn fallback_count(conn: &Connection) -> TestResult<i64> {
+    let rows = conn
+        .query("SELECT count(*) FROM fsqlite_fallback_events_contract;")
+        .await?;
     let row = rows.first().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -970,12 +983,15 @@ fn fallback_boundary_inventory_covers_runtime_reason_strings() {
 
 #[test]
 fn fallback_decision_contract_validates_schema_fields_and_outcomes() -> TestResult {
-    let conn = Connection::open(":memory:")?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+    let conn = Connection::open(":memory:").await?;
     assert!(
         conn.is_concurrent_mode_default(),
         "fallback telemetry must not disable concurrent-writer mode"
     );
-    install_fallback_schema(&conn)?;
+    install_fallback_schema(&conn).await?;
 
     let decision_events = [
         FallbackDecisionEvent {
@@ -1059,15 +1075,18 @@ fn fallback_decision_contract_validates_schema_fields_and_outcomes() -> TestResu
             &conn,
             i64::try_from(idx + 1).expect("test event count fits i64"),
             event,
-        )?;
+        )
+        .await?;
     }
 
-    let rows = conn.query(
-        "SELECT decision_outcome, count(*)
+    let rows = conn
+        .query(
+            "SELECT decision_outcome, count(*)
            FROM fsqlite_fallback_decision_events_contract
           GROUP BY decision_outcome
           ORDER BY decision_outcome;",
-    )?;
+        )
+        .await?;
     assert_eq!(
         rows.len(),
         5,
@@ -1096,6 +1115,10 @@ fn fallback_decision_contract_validates_schema_fields_and_outcomes() -> TestResu
     );
 
     Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
@@ -1128,33 +1151,47 @@ fn production_fallback_decision_sources_expose_required_schema_fields() {
 
 #[test]
 fn strict_denial_error_names_fallback_boundary_and_outcome() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+                .await?;
 
-    let err = conn
-        .query("WITH c(x) AS (SELECT 1) SELECT x FROM c;")
-        .expect_err("strict parity-cert must reject WITH-clause MemDatabase materialization");
-    let message = err.to_string();
-    for expected in [
-        "in-memory fallback disabled in strict parity-cert mode",
-        "statement_kind=select",
-        "decision_reason=with_clause_materialization",
-        "decision_outcome=denied",
-        "fallback_boundary=conn.select.with_clause_materialization",
-        "source_touchpoint=",
-        "first_failure_diag=",
-    ] {
-        assert!(
-            message.contains(expected),
-            "strict fallback denial did not include {expected:?}: {message}"
-        );
-    }
+            let err = conn
+                .query("WITH c(x) AS (SELECT 1) SELECT x FROM c;")
+                .await
+                .expect_err(
+                    "strict parity-cert must reject WITH-clause MemDatabase materialization",
+                );
+            let message = err.to_string();
+            for expected in [
+                "in-memory fallback disabled in strict parity-cert mode",
+                "statement_kind=select",
+                "decision_reason=with_clause_materialization",
+                "decision_outcome=denied",
+                "fallback_boundary=conn.select.with_clause_materialization",
+                "source_touchpoint=",
+                "first_failure_diag=",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "strict fallback denial did not include {expected:?}: {message}"
+                );
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn deterministic_fallback_denial_replay_matrix_covers_inventory_and_controls() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
     assert!(
         REPLAY_MATRIX_SCENARIOS.len() >= 10,
         "G9.3 replay matrix must include strict denials plus controls"
@@ -1164,8 +1201,8 @@ fn deterministic_fallback_denial_replay_matrix_covers_inventory_and_controls() -
     let mut strict_denials = 0;
     let mut non_cert_controls = 0;
     let mut real_backend_controls = 0;
-    let conn = Connection::open(":memory:")?;
-    install_fallback_schema(&conn)?;
+    let conn = Connection::open(":memory:").await?;
+    install_fallback_schema(&conn).await?;
 
     for (idx, scenario) in REPLAY_MATRIX_SCENARIOS.iter().copied().enumerate() {
         assert!(
@@ -1206,7 +1243,8 @@ fn deterministic_fallback_denial_replay_matrix_covers_inventory_and_controls() -
             &conn,
             i64::try_from(idx + 1).expect("G9 replay matrix event count fits i64"),
             event,
-        )?;
+        )
+        .await?;
 
         let known_outcome = match scenario.decision_outcome {
             "denied" | "vdbe_mempage_fallback_rejected" => {
@@ -1258,38 +1296,51 @@ fn deterministic_fallback_denial_replay_matrix_covers_inventory_and_controls() -
         "G9.3 must include at least one positive real-backend control"
     );
 
-    let rows = conn.query(
-        "SELECT decision_outcome, count(*)
+    let rows = conn
+        .query(
+            "SELECT decision_outcome, count(*)
            FROM fsqlite_fallback_decision_events_contract
           GROUP BY decision_outcome
           ORDER BY decision_outcome;",
-    )?;
+        )
+        .await?;
     assert!(
         rows.len() >= 4,
         "G9 replay matrix should persist denied, VDBE rejected, real-backend, and non-cert outcomes"
     );
 
     Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn deterministic_fallback_denial_replay_exercises_real_strict_sql_boundaries() -> TestResult {
-    for scenario in STRICT_SQL_REPLAY_SCENARIOS {
-        assert!(
-            inventory_has_boundary_id(scenario.fallback_boundary),
-            "strict SQL replay scenario {} references boundary missing from inventory: {}",
-            scenario.scenario_id,
-            scenario.fallback_boundary
-        );
-        assert!(
-            inventory_has_decision_reason(scenario.decision_reason),
-            "strict SQL replay scenario {} references reason missing from inventory: {}",
-            scenario.scenario_id,
-            scenario.decision_reason
-        );
-        assert_strict_replay_denial(scenario)?;
-    }
-    Ok(())
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            for scenario in STRICT_SQL_REPLAY_SCENARIOS {
+                assert!(
+                    inventory_has_boundary_id(scenario.fallback_boundary),
+                    "strict SQL replay scenario {} references boundary missing from inventory: {}",
+                    scenario.scenario_id,
+                    scenario.fallback_boundary
+                );
+                assert!(
+                    inventory_has_decision_reason(scenario.decision_reason),
+                    "strict SQL replay scenario {} references reason missing from inventory: {}",
+                    scenario.scenario_id,
+                    scenario.decision_reason
+                );
+                assert_strict_replay_denial(scenario).await?;
+            }
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
@@ -1315,24 +1366,34 @@ fn deterministic_fallback_denial_replay_script_is_copyable_rch_gate() {
 
 #[test]
 fn real_backend_strict_execution_and_non_cert_fallback_remain_distinguishable() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("g9_decision_real_backend.db");
     let db = db_path.to_string_lossy();
-    let conn = Connection::open(db.as_ref())?;
-    conn.execute("CREATE TABLE agent_jobs(id INTEGER PRIMARY KEY, status TEXT);")?;
-    conn.execute("INSERT INTO agent_jobs(status) VALUES ('ready');")?;
-    conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+    let conn = Connection::open(db.as_ref()).await?;
+    conn.execute("CREATE TABLE agent_jobs(id INTEGER PRIMARY KEY, status TEXT);")
+        .await?;
+    conn.execute("INSERT INTO agent_jobs(status) VALUES ('ready');")
+        .await?;
+    conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+        .await?;
 
-    let rows = conn.query("SELECT status FROM agent_jobs WHERE id = 1;")?;
+    let rows = conn
+        .query("SELECT status FROM agent_jobs WHERE id = 1;")
+        .await?;
     assert_eq!(
         row_values(&rows[0]),
         &[SqliteValue::Text("ready".into())],
         "strict certifying mode should still execute real backend table reads"
     );
 
-    let compat = Connection::open(":memory:")?;
-    compat.execute("PRAGMA fsqlite.parity_cert = OFF;")?;
-    let rows = compat.query("WITH c(x) AS (SELECT 7) SELECT x FROM c;")?;
+    let compat = Connection::open(":memory:").await?;
+    compat.execute("PRAGMA fsqlite.parity_cert = OFF;").await?;
+    let rows = compat
+        .query("WITH c(x) AS (SELECT 7) SELECT x FROM c;")
+        .await?;
     assert_eq!(
         row_values(&rows[0]),
         &[SqliteValue::Integer(7)],
@@ -1340,89 +1401,105 @@ fn real_backend_strict_execution_and_non_cert_fallback_remain_distinguishable() 
     );
 
     Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn fallback_reason_codes_are_stable_and_queryable() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "fallback transparency must not disable concurrent-writer mode"
-    );
-    install_fallback_schema(&conn)?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "fallback transparency must not disable concurrent-writer mode"
+            );
+            install_fallback_schema(&conn).await?;
 
-    let rows = conn.query(
-        "SELECT reason_code, fallback_surface, severity, retryable,
+            let rows = conn
+                .query(
+                    "SELECT reason_code, fallback_surface, severity, retryable,
                 concurrency_impact, durability_impact, memory_impact,
                 latency_impact
            FROM fsqlite_fallback_reason_codes_contract
           ORDER BY reason_code;",
-    )?;
-    assert_eq!(rows.len(), 4);
-    assert_eq!(
-        row_values(&rows[0]),
-        &[
-            SqliteValue::Text("diagnostics_unavailable".into()),
-            SqliteValue::Text("diagnostic".into()),
-            SqliteValue::Text("warning".into()),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("unknown".into()),
-            SqliteValue::Text("unknown".into()),
-            SqliteValue::Text("unknown".into()),
-            SqliteValue::Text("unknown".into()),
-        ]
-    );
-    assert_eq!(
-        row_values(&rows[1]),
-        &[
-            SqliteValue::Text("planner_bypass".into()),
-            SqliteValue::Text("planner".into()),
-            SqliteValue::Text("notice".into()),
-            SqliteValue::Integer(0),
-            SqliteValue::Text("unchanged".into()),
-            SqliteValue::Text("unchanged".into()),
-            SqliteValue::Text("none".into()),
-            SqliteValue::Text("may_increase_latency".into()),
-        ]
-    );
-    assert_eq!(
-        row_values(&rows[2]),
-        &[
-            SqliteValue::Text("storage_fallback".into()),
-            SqliteValue::Text("storage".into()),
-            SqliteValue::Text("warning".into()),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("may_block_conflicting_pages".into()),
-            SqliteValue::Text("unchanged".into()),
-            SqliteValue::Text("bounded_extra_memory".into()),
-            SqliteValue::Text("may_increase_latency".into()),
-        ]
-    );
-    assert_eq!(
-        row_values(&rows[3]),
-        &[
-            SqliteValue::Text("unsupported_sql_shape".into()),
-            SqliteValue::Text("planner".into()),
-            SqliteValue::Text("notice".into()),
-            SqliteValue::Integer(0),
-            SqliteValue::Text("may_reduce_parallelism".into()),
-            SqliteValue::Text("unchanged".into()),
-            SqliteValue::Text("bounded_extra_memory".into()),
-            SqliteValue::Text("may_increase_latency".into()),
-        ]
-    );
+                )
+                .await?;
+            assert_eq!(rows.len(), 4);
+            assert_eq!(
+                row_values(&rows[0]),
+                &[
+                    SqliteValue::Text("diagnostics_unavailable".into()),
+                    SqliteValue::Text("diagnostic".into()),
+                    SqliteValue::Text("warning".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("unknown".into()),
+                    SqliteValue::Text("unknown".into()),
+                    SqliteValue::Text("unknown".into()),
+                    SqliteValue::Text("unknown".into()),
+                ]
+            );
+            assert_eq!(
+                row_values(&rows[1]),
+                &[
+                    SqliteValue::Text("planner_bypass".into()),
+                    SqliteValue::Text("planner".into()),
+                    SqliteValue::Text("notice".into()),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Text("unchanged".into()),
+                    SqliteValue::Text("unchanged".into()),
+                    SqliteValue::Text("none".into()),
+                    SqliteValue::Text("may_increase_latency".into()),
+                ]
+            );
+            assert_eq!(
+                row_values(&rows[2]),
+                &[
+                    SqliteValue::Text("storage_fallback".into()),
+                    SqliteValue::Text("storage".into()),
+                    SqliteValue::Text("warning".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("may_block_conflicting_pages".into()),
+                    SqliteValue::Text("unchanged".into()),
+                    SqliteValue::Text("bounded_extra_memory".into()),
+                    SqliteValue::Text("may_increase_latency".into()),
+                ]
+            );
+            assert_eq!(
+                row_values(&rows[3]),
+                &[
+                    SqliteValue::Text("unsupported_sql_shape".into()),
+                    SqliteValue::Text("planner".into()),
+                    SqliteValue::Text("notice".into()),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Text("may_reduce_parallelism".into()),
+                    SqliteValue::Text("unchanged".into()),
+                    SqliteValue::Text("bounded_extra_memory".into()),
+                    SqliteValue::Text("may_increase_latency".into()),
+                ]
+            );
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn supported_fast_path_records_no_fallback_reason() -> TestResult {
-    let conn = Connection::open(":memory:")?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+    let conn = Connection::open(":memory:").await?;
     assert!(
         conn.is_concurrent_mode_default(),
         "fallback transparency must not disable concurrent-writer mode"
     );
-    install_fallback_schema(&conn)?;
+    install_fallback_schema(&conn).await?;
 
     record_fallback_event(
         &conn,
@@ -1442,14 +1519,17 @@ fn supported_fast_path_records_no_fallback_reason() -> TestResult {
             diagnostics_available: true,
             first_failure_diag: "none",
         },
-    )?;
+    )
+    .await?;
 
-    let aggregate = conn.query(
-        "SELECT statement_fingerprint, plan_id, table_name, workload_lane,
+    let aggregate = conn
+        .query(
+            "SELECT statement_fingerprint, plan_id, table_name, workload_lane,
                 fallback_reason, supported_fast_path, diagnostics_available
            FROM fsqlite_fallback_events_contract
           WHERE statement_fingerprint = 'insert-fast-path';",
-    )?;
+        )
+        .await?;
     assert_eq!(aggregate.len(), 1);
     assert_eq!(
         row_values(&aggregate[0]),
@@ -1465,11 +1545,13 @@ fn supported_fast_path_records_no_fallback_reason() -> TestResult {
         "fast-path statements must keep fallback_reason empty while diagnostics remain available"
     );
 
-    let fallback_only = conn.query(
-        "SELECT count(*)
+    let fallback_only = conn
+        .query(
+            "SELECT count(*)
            FROM fsqlite_fallback_events_contract
           WHERE supported_fast_path = 0;",
-    )?;
+        )
+        .await?;
     assert_eq!(
         row_values(&fallback_only[0]),
         &[SqliteValue::Integer(0)],
@@ -1477,16 +1559,23 @@ fn supported_fast_path_records_no_fallback_reason() -> TestResult {
     );
 
     Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn mixed_workload_aggregates_frequency_by_statement_plan_table_and_lane() -> TestResult {
-    let conn = Connection::open(":memory:")?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+    let conn = Connection::open(":memory:").await?;
     assert!(
         conn.is_concurrent_mode_default(),
         "fallback transparency must not disable concurrent-writer mode"
     );
-    install_fallback_schema(&conn)?;
+    install_fallback_schema(&conn).await?;
 
     for event in [
         FallbackEvent {
@@ -1570,11 +1659,12 @@ fn mixed_workload_aggregates_frequency_by_statement_plan_table_and_lane() -> Tes
             first_failure_diag: "fallback classifier did not receive planner context",
         },
     ] {
-        record_fallback_event(&conn, event)?;
+        record_fallback_event(&conn, event).await?;
     }
 
-    let rows = conn.query(
-        "SELECT statement_fingerprint, plan_id, table_name, workload_lane,
+    let rows = conn
+        .query(
+            "SELECT statement_fingerprint, plan_id, table_name, workload_lane,
                 fallback_reason, count(*) AS fallback_count,
                 min(concurrency_impact), min(durability_impact),
                 min(memory_impact), min(latency_impact),
@@ -1584,7 +1674,8 @@ fn mixed_workload_aggregates_frequency_by_statement_plan_table_and_lane() -> Tes
           GROUP BY statement_fingerprint, plan_id, table_name, workload_lane,
                    fallback_reason
           ORDER BY fallback_count DESC, statement_fingerprint ASC;",
-    )?;
+        )
+        .await?;
     assert_eq!(rows.len(), 4);
     assert_eq!(
         row_values(&rows[0]),
@@ -1657,93 +1748,106 @@ fn mixed_workload_aggregates_frequency_by_statement_plan_table_and_lane() -> Tes
     );
 
     Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn fallback_events_are_transactional_and_resettable() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("fallback_events_transactional.db");
-    let db = db_path.to_string_lossy().to_string();
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let db_path = dir.path().join("fallback_events_transactional.db");
+            let db = db_path.to_string_lossy().to_string();
 
-    let conn = Connection::open(&db)?;
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")?;
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "fallback transparency must not disable concurrent-writer mode"
-    );
-    install_fallback_schema(&conn)?;
+            let conn = Connection::open(&db).await?;
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await?;
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "fallback transparency must not disable concurrent-writer mode"
+            );
+            install_fallback_schema(&conn).await?;
 
-    conn.execute("BEGIN CONCURRENT;")?;
-    record_fallback_event(
-        &conn,
-        FallbackEvent {
-            event_seq: 1,
-            statement_fingerprint: "rollback-fallback",
-            plan_id: "compat-select-v1",
-            table_name: "agent_jobs",
-            workload_lane: "ingest",
-            fallback_surface: "planner",
-            fallback_reason: Some("unsupported_sql_shape"),
-            supported_fast_path: false,
-            concurrency_impact: "may_reduce_parallelism",
-            durability_impact: "unchanged",
-            memory_impact: "bounded_extra_memory",
-            latency_impact: "may_increase_latency",
-            diagnostics_available: true,
-            first_failure_diag: "rolled-back fallback event",
-        },
-    )?;
-    assert_eq!(fallback_count(&conn)?, 1);
-    conn.execute("ROLLBACK;")?;
-    assert_eq!(
-        fallback_count(&conn)?,
-        0,
-        "rollback must discard fallback diagnostic rows from the transaction"
-    );
+            conn.execute("BEGIN CONCURRENT;").await?;
+            record_fallback_event(
+                &conn,
+                FallbackEvent {
+                    event_seq: 1,
+                    statement_fingerprint: "rollback-fallback",
+                    plan_id: "compat-select-v1",
+                    table_name: "agent_jobs",
+                    workload_lane: "ingest",
+                    fallback_surface: "planner",
+                    fallback_reason: Some("unsupported_sql_shape"),
+                    supported_fast_path: false,
+                    concurrency_impact: "may_reduce_parallelism",
+                    durability_impact: "unchanged",
+                    memory_impact: "bounded_extra_memory",
+                    latency_impact: "may_increase_latency",
+                    diagnostics_available: true,
+                    first_failure_diag: "rolled-back fallback event",
+                },
+            )
+            .await?;
+            assert_eq!(fallback_count(&conn).await?, 1);
+            conn.execute("ROLLBACK;").await?;
+            assert_eq!(
+                fallback_count(&conn).await?,
+                0,
+                "rollback must discard fallback diagnostic rows from the transaction"
+            );
 
-    for event in [
-        FallbackEvent {
-            event_seq: 2,
-            statement_fingerprint: "reset-fallback-a",
-            plan_id: "compat-select-v1",
-            table_name: "agent_jobs",
-            workload_lane: "ingest",
-            fallback_surface: "planner",
-            fallback_reason: Some("unsupported_sql_shape"),
-            supported_fast_path: false,
-            concurrency_impact: "may_reduce_parallelism",
-            durability_impact: "unchanged",
-            memory_impact: "bounded_extra_memory",
-            latency_impact: "may_increase_latency",
-            diagnostics_available: true,
-            first_failure_diag: "reset event a",
-        },
-        FallbackEvent {
-            event_seq: 3,
-            statement_fingerprint: "reset-fallback-b",
-            plan_id: "compat-update-v1",
-            table_name: "agent_jobs",
-            workload_lane: "maintenance",
-            fallback_surface: "planner",
-            fallback_reason: Some("planner_bypass"),
-            supported_fast_path: false,
-            concurrency_impact: "unchanged",
-            durability_impact: "unchanged",
-            memory_impact: "none",
-            latency_impact: "may_increase_latency",
-            diagnostics_available: true,
-            first_failure_diag: "reset event b",
-        },
-    ] {
-        record_fallback_event(&conn, event)?;
-    }
-    assert_eq!(fallback_count(&conn)?, 2);
-    conn.execute("DELETE FROM fsqlite_fallback_events_contract;")?;
-    assert_eq!(
-        fallback_count(&conn)?,
-        0,
-        "diagnostic reset must clear bounded fallback event state"
-    );
+            for event in [
+                FallbackEvent {
+                    event_seq: 2,
+                    statement_fingerprint: "reset-fallback-a",
+                    plan_id: "compat-select-v1",
+                    table_name: "agent_jobs",
+                    workload_lane: "ingest",
+                    fallback_surface: "planner",
+                    fallback_reason: Some("unsupported_sql_shape"),
+                    supported_fast_path: false,
+                    concurrency_impact: "may_reduce_parallelism",
+                    durability_impact: "unchanged",
+                    memory_impact: "bounded_extra_memory",
+                    latency_impact: "may_increase_latency",
+                    diagnostics_available: true,
+                    first_failure_diag: "reset event a",
+                },
+                FallbackEvent {
+                    event_seq: 3,
+                    statement_fingerprint: "reset-fallback-b",
+                    plan_id: "compat-update-v1",
+                    table_name: "agent_jobs",
+                    workload_lane: "maintenance",
+                    fallback_surface: "planner",
+                    fallback_reason: Some("planner_bypass"),
+                    supported_fast_path: false,
+                    concurrency_impact: "unchanged",
+                    durability_impact: "unchanged",
+                    memory_impact: "none",
+                    latency_impact: "may_increase_latency",
+                    diagnostics_available: true,
+                    first_failure_diag: "reset event b",
+                },
+            ] {
+                record_fallback_event(&conn, event).await?;
+            }
+            assert_eq!(fallback_count(&conn).await?, 2);
+            conn.execute("DELETE FROM fsqlite_fallback_events_contract;")
+                .await?;
+            assert_eq!(
+                fallback_count(&conn).await?,
+                0,
+                "diagnostic reset must clear bounded fallback event state"
+            );
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }

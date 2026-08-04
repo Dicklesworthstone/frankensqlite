@@ -2075,6 +2075,10 @@ mod tests {
             self.inner.sync(cx, flags)
         }
 
+        fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<(), FrankenError> {
+            self.inner.durable_sync(cx, kind)
+        }
+
         fn file_size(&self, cx: &Cx) -> Result<u64, FrankenError> {
             self.inner.file_size(cx)
         }
@@ -2085,6 +2089,29 @@ mod tests {
 
         fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<(), FrankenError> {
             self.inner.unlock(cx, level)
+        }
+
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<(), FrankenError> {
+            self.inner.lock_external_shared_snapshot(cx)
+        }
+
+        fn restore_external_shared_snapshot_attempt(
+            &mut self,
+            cx: &Cx,
+        ) -> Result<(), FrankenError> {
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_maintenance(
+            &mut self,
+            cx: &Cx,
+            wal_mode: bool,
+        ) -> Result<(), FrankenError> {
+            self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<(), FrankenError> {
+            self.inner.restore_external_maintenance_attempt(cx)
         }
 
         fn check_reserved_lock(&self, cx: &Cx) -> Result<bool, FrankenError> {

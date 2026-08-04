@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-c-api"
-version = "0.1.19"
+version = "0.2.0"
 description = "SQLite C API compatibility shim for drop-in replacement"
 edition.workspace = true
 license-file.workspace = true
@@ -17,6 +17,10 @@ fsqlite-error = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-types = { workspace = true }
 tracing = { workspace = true }
+# The C ABI is a hard synchronous boundary: `extern "C"` entry points cannot be
+# `async` and a C caller cannot supply a `Cx`. This shim therefore owns a
+# runtime and drives the engine's futures to completion itself.
+asupersync = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

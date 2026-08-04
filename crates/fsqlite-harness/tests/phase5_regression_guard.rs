@@ -1,15 +1,1813 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use syn::parse::{ParseStream, Parser};
+use syn::spanned::Spanned;
+use syn::visit::Visit;
+use syn::{Attribute, Expr, Item, Lit, Meta, Token};
 
 const BEAD_ID: &str = "bd-16e7";
 const LOG_PREFIX: &str = "[REGR_GUARD]";
 const REGRESSION_BASELINE_PATH: &str = "tests/regression_baseline.json";
-const CHILD_ENV: &str = "FSQLITE_REGRESSION_GUARD_CHILD";
+// The canonical workspace run and every opt-in release run are captured at
+// `tested_commit`. Their immutable artifacts plus this manifest are then
+// committed as the only changes in a descendant evidence commit. This avoids
+// putting the evidence commit's own hash inside the manifest.
+const EVIDENCE_MANIFEST_ENV: &str = "FSQLITE_REGRESSION_GUARD_EVIDENCE_MANIFEST";
+const EVIDENCE_MANIFEST_BLAKE3_ENV: &str = "FSQLITE_REGRESSION_GUARD_EVIDENCE_MANIFEST_BLAKE3";
+const CLEAN_SNAPSHOT_KEEPER_ENV: &str = "FSQLITE_REGRESSION_GUARD_TEST_CLEAN_SNAPSHOT";
+const EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const EVIDENCE_PATH_PREFIX: &str = "tests/artifacts/release-evidence/";
+const EVIDENCE_DIGEST_ALGORITHM: &str = "blake3-256";
+const INVENTORY_SHA256_ALGORITHM: &str = "sha2-256";
+const RCH_RECEIPT_SCHEMA_VERSION: &str = "fsqlite.phase5.rch_execution_receipt.v1";
+const C1_SCORECARD_SCHEMA_VERSION: &str = "bd-db300.c1_evidence_pack_scorecard.v1";
+const C1_MANIFEST_SCHEMA_VERSION: &str = "bd-db300.c1_evidence_pack_manifest.v1";
+const PERSISTENT_SCORECARD_SCHEMA_VERSION: &str = "bd-db300.persistent_phase_pack_scorecard.v5";
+const PERSISTENT_MANIFEST_SCHEMA_VERSION: &str = "bd-db300.persistent_phase_pack_manifest.v4";
+const PERSISTENT_CITATION_SCHEMA_VERSION: &str =
+    "fsqlite.release_persistent_phase_pack_citation_receipt.v2";
+const MINISIGN_BINARY: &str = "/usr/bin/minisign";
+const MINISIGN_PUBLIC_KEY_EPOCH_2: &str =
+    "RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70";
+const RELEASE_GUARD_LOCATOR: &str = concat!(
+    "crates/fsqlite-harness/tests/phase5_regression_guard.rs::",
+    "phase5_regression_guard_full_workspace_against_baseline"
+);
+// Parent-coverage parsing relies on one parent test completing before another
+// starts in the same Cargo target. Without this harness setting, nested child
+// process summaries from concurrently running parents can interleave with the
+// outer libtest result lines and make an authentic parent success ambiguous.
+const CANONICAL_WORKSPACE_TEST_ARGV: &[&str] = &[
+    "cargo",
+    "test",
+    "--locked",
+    "--workspace",
+    "--",
+    "--test-threads=1",
+];
+// These edges are a reviewed release contract, not baseline-authored metadata.
+// Keeping the expected graph in executable code prevents a baseline-only edit
+// from replacing a real subprocess driver with an unrelated passing test while
+// preserving the same number of parent edges.
+const AUDITED_COVERED_PARENT_CONTRACT: &[(&str, &[&str])] = &[
+    (
+        "crates/fsqlite-e2e/tests/bd_3wop3_1_2_parallel_wal_staging.rs::bd_3wop3_1_2_parallel_wal_staging_child_entrypoint",
+        &[
+            "crates/fsqlite-e2e/tests/bd_3wop3_1_2_parallel_wal_staging.rs::bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_rows",
+            "crates/fsqlite-e2e/tests/bd_3wop3_1_2_parallel_wal_staging.rs::bd_3wop3_1_2_parallel_wal_staging_lane_overflow_falls_back_without_row_drift",
+        ],
+    ),
+    (
+        "crates/fsqlite-e2e/tests/bd_3wop3_1_3_parallel_wal_publication.rs::bd_3wop3_1_3_parallel_wal_publication_child_entrypoint",
+        &[
+            "crates/fsqlite-e2e/tests/bd_3wop3_1_3_parallel_wal_publication.rs::bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent",
+        ],
+    ),
+    (
+        "crates/fsqlite-e2e/tests/bd_3wop3_1_3_parallel_wal_publication.rs::bd_3wop3_1_3_parallel_wal_publication_performance_child_entrypoint",
+        &[
+            "crates/fsqlite-e2e/tests/bd_3wop3_1_3_parallel_wal_publication.rs::bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent",
+        ],
+    ),
+    (
+        "crates/fsqlite-e2e/tests/correctness_mixed_dml.rs::bd_c9pxw_crash_helper_entrypoint",
+        &[
+            "crates/fsqlite-e2e/tests/correctness_mixed_dml.rs::bd_c9pxw_crash_recovery_discards_unflushed_update_delete_batch",
+        ],
+    ),
+    (
+        "crates/fsqlite-e2e/tests/correctness_transactions.rs::retained_autocommit_crash_helper_entrypoint",
+        &[
+            "crates/fsqlite-e2e/tests/correctness_transactions.rs::txn_file_backed_retained_autocommit_crash_recovery_discards_unflushed_batch",
+        ],
+    ),
+    (
+        "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs::crash_helper_entrypoint",
+        &[
+            "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs::committed_transaction_survives_crash_recovery",
+            "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs::only_committed_prefix_survives_multi_transaction_crash",
+            "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs::recovered_database_accepts_follow_up_schema_and_writes",
+            "crates/fsqlite-e2e/tests/recovery_crash_wal_replay.rs::uncommitted_transaction_is_discarded_after_crash",
+        ],
+    ),
+    (
+        "crates/fsqlite-e2e/tests/recovery_data_loss.rs::yfdb6_producer_helper",
+        &[
+            "crates/fsqlite-e2e/tests/recovery_data_loss.rs::two_process_sigkill_recovery_loses_no_committed_writes",
+        ],
+    ),
+];
+const UNINSPECTED_RUST_SOURCE_PATHS: &[&str] = &["crates/fsqlite-core/src/connection.rs"];
+/// Library sources reached through a `#[path = "..."]` module declaration.
+/// Their libtest runtime module path is decided by the *declaring* module, not
+/// by their own file path, so the file-derived derivation in
+/// [`canonical_runtime_test_name`] cannot address them. They fail closed until
+/// a typed declaration contract exists. `phase5_path_remapped_library_sources_are_audited`
+/// keeps this list exactly in sync with the tree.
+const PATH_REMAPPED_LIBRARY_SOURCES: &[&str] = &[
+    "crates/fsqlite-core/src/policy_controller.rs",
+    "crates/fsqlite-parser/src/semantic_test.rs",
+];
+const SOURCE_INVENTORY_SOUNDNESS_LIMITATIONS: &[&str] = &[
+    "attribute and opaque item-macro expansions are not compiler-audited",
+    "out-of-line modules and include sites do not propagate cfg, identity, or multiplicity",
+    "ignored doctest directives are not inventoried by the Rust item collector",
+    "active test identities are not baseline-validated, so aggregate counts cannot detect identity substitution",
+    "run_for_release prose requirements are not yet represented as machine-auditable typed contracts",
+    "run_for_release source-to-Cargo-package mapping is convention-derived rather than metadata-audited",
+    "exact-test transcripts do not carry a trusted runner attestation of Cargo package identity",
+    "the baseline workspace transcript is content- and command-bound but carries no trusted runner attestation that the canonical command produced it",
+    "library runtime module paths are derived from file paths, so `#[path]`-remapped sources are refused rather than addressed",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnoredTestSource {
+    source_path: String,
+    test_name: String,
+    reason: String,
+    cfg_condition: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryIgnoreInventory {
+    records: Vec<IgnoredTestSource>,
+    uninspected_sources: Vec<String>,
+    soundness_limitations: Vec<String>,
+}
+
+impl IgnoredTestSource {
+    fn locator(&self) -> String {
+        format!("{}::{}", self.source_path, self.test_name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CfgCondition {
+    Atom(String),
+    All(Vec<Self>),
+    Any(Vec<Self>),
+    Not(Box<Self>),
+}
+
+impl CfgCondition {
+    fn all(conditions: impl IntoIterator<Item = Self>) -> Self {
+        let mut flattened = Vec::new();
+        for condition in conditions {
+            match condition {
+                Self::All(nested) => flattened.extend(nested),
+                other => flattened.push(other),
+            }
+        }
+        flattened.sort_by_key(Self::render);
+        flattened.dedup();
+        if flattened.len() == 1 {
+            flattened.pop().expect("one condition was present")
+        } else {
+            Self::All(flattened)
+        }
+    }
+
+    fn any(conditions: impl IntoIterator<Item = Self>) -> Self {
+        let mut flattened = Vec::new();
+        for condition in conditions {
+            match condition {
+                Self::Any(nested) => flattened.extend(nested),
+                other => flattened.push(other),
+            }
+        }
+        flattened.sort_by_key(Self::render);
+        flattened.dedup();
+        if flattened.len() == 1 {
+            flattened.pop().expect("one condition was present")
+        } else {
+            Self::Any(flattened)
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Atom(atom) => atom.clone(),
+            Self::All(conditions) => format!(
+                "all({})",
+                conditions
+                    .iter()
+                    .map(Self::render)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Self::Any(conditions) => format!(
+                "any({})",
+                conditions
+                    .iter()
+                    .map(Self::render)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Self::Not(condition) => format!("not({})", condition.render()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IgnoreAnnotation {
+    reason: String,
+    guard: Option<CfgCondition>,
+}
+
+fn normalize_source_path(path: &Path) -> Result<String, String> {
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| "source path is not valid UTF-8".to_owned())?
+        .replace('\\', "/");
+    let bytes = path_text.as_bytes();
+    if path_text.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    {
+        return Err(format!(
+            "source path must be repository-relative, found `{path_text}`"
+        ));
+    }
+
+    let mut components = Vec::new();
+    for component in path_text.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(format!(
+                        "source path escapes the repository root: `{path_text}`"
+                    ));
+                }
+            }
+            normal => components.push(normal),
+        }
+    }
+    if components.is_empty() {
+        return Err(format!(
+            "source path must identify a file, found `{path_text}`"
+        ));
+    }
+    Ok(components.join("/"))
+}
+
+fn canonical_meta_path(path: &syn::Path) -> Result<String, String> {
+    if path.leading_colon.is_some() {
+        return Err("cfg predicate paths must not start with `::`".to_owned());
+    }
+    let mut segments = Vec::new();
+    for segment in &path.segments {
+        if !matches!(segment.arguments, syn::PathArguments::None) {
+            return Err(format!(
+                "cfg predicate path segment `{}` must not have arguments",
+                segment.ident
+            ));
+        }
+        segments.push(segment.ident.to_string());
+    }
+    if segments.is_empty() {
+        return Err("cfg predicate path must not be empty".to_owned());
+    }
+    Ok(segments.join("::"))
+}
+
+fn parse_meta_list(list: &syn::MetaList) -> Result<Vec<Meta>, String> {
+    syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated
+        .parse2(list.tokens.clone())
+        .map(|items| items.into_iter().collect())
+        .map_err(|error| {
+            format!(
+                "unable to parse `{}` attribute arguments: {error}",
+                list.path.segments.last().map_or_else(
+                    || "<unknown>".to_owned(),
+                    |segment| segment.ident.to_string()
+                )
+            )
+        })
+}
+
+fn canonical_cfg_condition(meta: &Meta) -> Result<CfgCondition, String> {
+    match meta {
+        Meta::Path(path) => canonical_meta_path(path).map(CfgCondition::Atom),
+        Meta::NameValue(name_value) => {
+            let key = canonical_meta_path(&name_value.path)?;
+            let Expr::Lit(expression) = &name_value.value else {
+                return Err(format!(
+                    "cfg predicate `{key}` must use a string literal value"
+                ));
+            };
+            let Lit::Str(value) = &expression.lit else {
+                return Err(format!(
+                    "cfg predicate `{key}` must use a string literal value"
+                ));
+            };
+            Ok(CfgCondition::Atom(format!("{key}={:?}", value.value())))
+        }
+        Meta::List(list) => {
+            let operator = canonical_meta_path(&list.path)?;
+            let operands = parse_meta_list(list)?;
+            match operator.as_str() {
+                "all" => operands
+                    .iter()
+                    .map(canonical_cfg_condition)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(CfgCondition::all),
+                "any" => operands
+                    .iter()
+                    .map(canonical_cfg_condition)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(CfgCondition::any),
+                "not" => {
+                    if operands.len() != 1 {
+                        return Err(format!(
+                            "cfg `not(...)` requires exactly one predicate, found {}",
+                            operands.len()
+                        ));
+                    }
+                    canonical_cfg_condition(&operands[0])
+                        .map(Box::new)
+                        .map(CfgCondition::Not)
+                }
+                _ => Err(format!(
+                    "unsupported cfg predicate operator `{operator}`; expected all, any, or not"
+                )),
+            }
+        }
+    }
+}
+
+fn conjoin_cfg(left: Option<CfgCondition>, right: Option<CfgCondition>) -> Option<CfgCondition> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(CfgCondition::all([left, right])),
+        (Some(condition), None) | (None, Some(condition)) => Some(condition),
+        (None, None) => None,
+    }
+}
+
+fn cfg_gate_from_meta(meta: &Meta) -> Result<Option<CfgCondition>, String> {
+    if meta.path().is_ident("cfg") {
+        let Meta::List(list) = meta else {
+            return Err("cfg must use parenthesized arguments".to_owned());
+        };
+        let predicates = parse_meta_list(list)?;
+        if predicates.len() != 1 {
+            return Err(format!(
+                "cfg requires exactly one predicate, found {}",
+                predicates.len()
+            ));
+        }
+        return canonical_cfg_condition(&predicates[0]).map(Some);
+    }
+
+    if !meta.path().is_ident("cfg_attr") {
+        return Ok(None);
+    }
+    let Meta::List(list) = meta else {
+        return Err("cfg_attr must use parenthesized arguments".to_owned());
+    };
+    let arguments = parse_meta_list(list)?;
+    if arguments.len() < 2 {
+        return Err(format!(
+            "cfg_attr requires a condition and at least one attribute, found {} argument(s)",
+            arguments.len()
+        ));
+    }
+
+    let application_guard = canonical_cfg_condition(&arguments[0])?;
+    let nested_gates = arguments[1..]
+        .iter()
+        .map(cfg_gate_from_meta)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if nested_gates.is_empty() {
+        return Ok(None);
+    }
+
+    let nested_gate = CfgCondition::all(nested_gates);
+    Ok(Some(CfgCondition::any([
+        CfgCondition::Not(Box::new(application_guard)),
+        nested_gate,
+    ])))
+}
+
+fn cfg_gate_from_attributes(attrs: &[Attribute]) -> Result<Option<CfgCondition>, String> {
+    let gates = attrs
+        .iter()
+        .map(|attr| cfg_gate_from_meta(&attr.meta))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if gates.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(CfgCondition::all(gates)))
+    }
+}
+
+fn effective_cfg_context(
+    inherited: Option<CfgCondition>,
+    attrs: &[Attribute],
+) -> Result<Option<CfgCondition>, String> {
+    cfg_gate_from_attributes(attrs).map(|local| conjoin_cfg(inherited, local))
+}
+
+fn parse_reasoned_ignore(meta: &Meta) -> Result<String, String> {
+    let Meta::NameValue(name_value) = meta else {
+        return Err("ignore attributes require a reason: use `#[ignore = \"reason\"]`".to_owned());
+    };
+    let Expr::Lit(expression) = &name_value.value else {
+        return Err("ignore reason must be a string literal".to_owned());
+    };
+    let Lit::Str(reason) = &expression.lit else {
+        return Err("ignore reason must be a string literal".to_owned());
+    };
+    let reason = reason.value();
+    if reason.trim().is_empty() {
+        return Err("ignore reason must not be empty or whitespace-only".to_owned());
+    }
+    if reason.trim() != reason {
+        return Err("ignore reason must not have leading or trailing whitespace".to_owned());
+    }
+    Ok(reason)
+}
+
+fn collect_ignore_meta(
+    meta: &Meta,
+    inherited_condition: Option<CfgCondition>,
+    annotations: &mut Vec<IgnoreAnnotation>,
+) -> Result<(), String> {
+    if meta.path().is_ident("ignore") {
+        annotations.push(IgnoreAnnotation {
+            reason: parse_reasoned_ignore(meta)?,
+            guard: inherited_condition,
+        });
+        return Ok(());
+    }
+
+    if !meta.path().is_ident("cfg_attr") {
+        return Ok(());
+    }
+    let Meta::List(list) = meta else {
+        return Err("cfg_attr must use parenthesized arguments".to_owned());
+    };
+    let arguments = parse_meta_list(list)?;
+    if arguments.len() < 2 {
+        return Err(format!(
+            "cfg_attr requires a condition and at least one attribute, found {} argument(s)",
+            arguments.len()
+        ));
+    }
+    let local_condition = canonical_cfg_condition(&arguments[0])?;
+    let combined_condition = if let Some(inherited) = inherited_condition {
+        CfgCondition::all([inherited, local_condition])
+    } else {
+        local_condition
+    };
+    for nested_attribute in &arguments[1..] {
+        collect_ignore_meta(
+            nested_attribute,
+            Some(combined_condition.clone()),
+            annotations,
+        )?;
+    }
+    Ok(())
+}
+
+fn analyze_ignore_attribute(attr: &Attribute) -> Result<Vec<IgnoreAnnotation>, String> {
+    let mut annotations = Vec::new();
+    collect_ignore_meta(&attr.meta, None, &mut annotations)?;
+    Ok(annotations)
+}
+
+fn is_ordinary_test_function(function: &syn::ItemFn) -> bool {
+    function
+        .attrs
+        .iter()
+        .any(|attr| matches!(&attr.meta, Meta::Path(path) if path.is_ident("test")))
+}
+
+struct IgnoreSourceCollector<'a> {
+    source_path: &'a str,
+    module_path: Vec<String>,
+    records: Vec<IgnoredTestSource>,
+    allowed_attributes: HashSet<*const Attribute>,
+    locators: HashSet<String>,
+}
+
+impl IgnoreSourceCollector<'_> {
+    fn test_name(&self, function_name: &str) -> String {
+        if self.module_path.is_empty() {
+            function_name.to_owned()
+        } else {
+            format!("{}::{function_name}", self.module_path.join("::"))
+        }
+    }
+
+    fn collect_items(
+        &mut self,
+        items: &[Item],
+        inherited_cfg: Option<CfgCondition>,
+    ) -> Result<(), String> {
+        for item in items {
+            match item {
+                Item::Fn(function) => {
+                    self.collect_function(function, inherited_cfg.clone())?;
+                }
+                Item::Mod(module) => {
+                    if let Some((_, nested_items)) = &module.content {
+                        let module_name = self.test_name(&module.ident.to_string());
+                        let module_cfg =
+                            effective_cfg_context(inherited_cfg.clone(), &module.attrs).map_err(
+                                |error| format!("{}::{module_name}: {error}", self.source_path),
+                            )?;
+                        self.module_path.push(module.ident.to_string());
+                        let result = self.collect_items(nested_items, module_cfg);
+                        self.module_path.pop();
+                        result?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_function(
+        &mut self,
+        function: &syn::ItemFn,
+        inherited_cfg: Option<CfgCondition>,
+    ) -> Result<(), String> {
+        let test_name = self.test_name(&function.sig.ident.to_string());
+        let function_cfg = effective_cfg_context(inherited_cfg, &function.attrs)
+            .map_err(|error| format!("{}::{test_name}: {error}", self.source_path))?;
+        let mut annotations = Vec::new();
+        let mut ignore_attribute_pointers = Vec::new();
+        for attr in &function.attrs {
+            let parsed = analyze_ignore_attribute(attr)
+                .map_err(|error| format!("{}::{test_name}: {error}", self.source_path))?;
+            if !parsed.is_empty() {
+                ignore_attribute_pointers.push(std::ptr::from_ref(attr));
+                annotations.extend(parsed);
+            }
+        }
+        if annotations.is_empty() {
+            return Ok(());
+        }
+        if !is_ordinary_test_function(function) {
+            return Err(format!(
+                "{}::{test_name}: ignore-bearing attributes must attach to an ordinary `#[test]` function",
+                self.source_path
+            ));
+        }
+
+        let unique: HashSet<_> = annotations.iter().cloned().collect();
+        if unique.len() != annotations.len() {
+            return Err(format!(
+                "{}::{test_name}: duplicate ignore annotation",
+                self.source_path
+            ));
+        }
+        if annotations.len() != 1 {
+            return Err(format!(
+                "{}::{test_name}: {} ignore annotations are overlapping or ambiguous; exactly one is allowed",
+                self.source_path,
+                annotations.len()
+            ));
+        }
+        let annotation = annotations.pop().expect("one annotation was present");
+        let effective_ignore_cfg = conjoin_cfg(function_cfg, annotation.guard);
+        let record = IgnoredTestSource {
+            source_path: self.source_path.to_owned(),
+            test_name,
+            reason: annotation.reason,
+            cfg_condition: effective_ignore_cfg.map(|condition| condition.render()),
+        };
+        let locator = record.locator();
+        if !self.locators.insert(locator.clone()) {
+            return Err(format!("duplicate ignored-test locator `{locator}`"));
+        }
+        self.allowed_attributes.extend(ignore_attribute_pointers);
+        self.records.push(record);
+        Ok(())
+    }
+}
+
+fn scan_tokens_for_ident(input: ParseStream<'_>, expected: &str) -> syn::Result<bool> {
+    let mut found = false;
+    while !input.is_empty() {
+        if input.peek(Lit) {
+            let _: Lit = input.parse()?;
+            continue;
+        }
+        if input.peek(syn::Ident) {
+            let ident: syn::Ident = input.parse()?;
+            if ident == expected {
+                found = true;
+            }
+            continue;
+        }
+        if input.peek(syn::token::Paren) {
+            let nested;
+            syn::parenthesized!(nested in input);
+            if scan_tokens_for_ident(&nested, expected)? {
+                found = true;
+            }
+            continue;
+        }
+        if input.peek(syn::token::Bracket) {
+            let nested;
+            syn::bracketed!(nested in input);
+            if scan_tokens_for_ident(&nested, expected)? {
+                found = true;
+            }
+            continue;
+        }
+        if input.peek(syn::token::Brace) {
+            let nested;
+            syn::braced!(nested in input);
+            if scan_tokens_for_ident(&nested, expected)? {
+                found = true;
+            }
+            continue;
+        }
+        input.step(|cursor| {
+            let Some((_, next)) = cursor.token_tree() else {
+                return Err(cursor.error("expected a macro token"));
+            };
+            Ok(((), next))
+        })?;
+    }
+    Ok(found)
+}
+
+fn scan_tokens_for_dollar(input: ParseStream<'_>) -> syn::Result<bool> {
+    let mut found = false;
+    while !input.is_empty() {
+        if input.peek(Lit) {
+            let _: Lit = input.parse()?;
+            continue;
+        }
+        if input.peek(Token![$]) {
+            let _: Token![$] = input.parse()?;
+            found = true;
+            continue;
+        }
+        if input.peek(syn::token::Paren) {
+            let nested;
+            syn::parenthesized!(nested in input);
+            if scan_tokens_for_dollar(&nested)? {
+                found = true;
+            }
+            continue;
+        }
+        if input.peek(syn::token::Bracket) {
+            let nested;
+            syn::bracketed!(nested in input);
+            if scan_tokens_for_dollar(&nested)? {
+                found = true;
+            }
+            continue;
+        }
+        if input.peek(syn::token::Brace) {
+            let nested;
+            syn::braced!(nested in input);
+            if scan_tokens_for_dollar(&nested)? {
+                found = true;
+            }
+            continue;
+        }
+        input.step(|cursor| {
+            let Some((_, next)) = cursor.token_tree() else {
+                return Err(cursor.error("expected a macro token"));
+            };
+            Ok(((), next))
+        })?;
+    }
+    Ok(found)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroFinding {
+    TestAttribute,
+    IgnoreAttribute,
+    MetavariableAttribute,
+    DynamicMacroCallee,
+}
+
+impl MacroFinding {
+    const fn description(self) -> &'static str {
+        match self {
+            Self::TestAttribute => "a test attribute",
+            Self::IgnoreAttribute => "an ignore-bearing attribute",
+            Self::MetavariableAttribute => "a macro-forwarded attribute",
+            Self::DynamicMacroCallee => "a dynamically selected macro invocation",
+        }
+    }
+
+    const fn priority(self) -> u8 {
+        match self {
+            Self::TestAttribute => 1,
+            Self::IgnoreAttribute => 2,
+            Self::MetavariableAttribute | Self::DynamicMacroCallee => 3,
+        }
+    }
+}
+
+fn record_macro_finding(finding: &mut Option<MacroFinding>, candidate: MacroFinding) {
+    if finding.is_none_or(|current| candidate.priority() > current.priority()) {
+        *finding = Some(candidate);
+    }
+}
+
+fn meta_macro_finding(meta: &Meta) -> Option<MacroFinding> {
+    if meta.path().is_ident("test") {
+        return Some(MacroFinding::TestAttribute);
+    }
+    if meta.path().is_ident("ignore") {
+        return Some(MacroFinding::IgnoreAttribute);
+    }
+    let Meta::List(list) = meta else {
+        return None;
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return None;
+    }
+    let Ok(arguments) = parse_meta_list(list) else {
+        return Some(MacroFinding::MetavariableAttribute);
+    };
+    let mut finding = None;
+    for argument in arguments.iter().skip(1) {
+        if let Some(candidate) = meta_macro_finding(argument) {
+            record_macro_finding(&mut finding, candidate);
+        }
+    }
+    finding
+}
+
+fn macro_attribute_at_cursor_finding(input: ParseStream<'_>) -> syn::Result<Option<MacroFinding>> {
+    let fork = input.fork();
+    if !fork.peek(Token![#]) {
+        return Ok(None);
+    }
+    let _: Token![#] = fork.parse()?;
+    if fork.peek(Token![!]) {
+        let _: Token![!] = fork.parse()?;
+    }
+    if !fork.peek(syn::token::Bracket) {
+        return Ok(None);
+    }
+    let content;
+    syn::bracketed!(content in fork);
+    let meta_input = content.fork();
+    if let Ok(meta) = meta_input.parse::<Meta>() {
+        if meta_input.is_empty() {
+            return Ok(meta_macro_finding(&meta));
+        }
+    }
+
+    if scan_tokens_for_dollar(&content.fork())? {
+        return Ok(Some(MacroFinding::MetavariableAttribute));
+    }
+    if scan_tokens_for_ident(&content.fork(), "ignore")? {
+        return Ok(Some(MacroFinding::IgnoreAttribute));
+    }
+    if scan_tokens_for_ident(&content.fork(), "test")? {
+        return Ok(Some(MacroFinding::TestAttribute));
+    }
+    Ok(None)
+}
+
+fn dynamic_macro_callee_at_cursor(input: ParseStream<'_>) -> syn::Result<bool> {
+    let fork = input.fork();
+    if !fork.peek(Token![$]) {
+        return Ok(false);
+    }
+    let _: Token![$] = fork.parse()?;
+    if !fork.peek(syn::Ident) {
+        return Ok(false);
+    }
+    let _: syn::Ident = fork.parse()?;
+    Ok(fork.peek(Token![!]))
+}
+
+fn validate_literal_include(
+    input: ParseStream<'_>,
+    source_path: &str,
+    inventory_universe: &HashSet<String>,
+) -> syn::Result<()> {
+    let literal: syn::LitStr = input.parse().map_err(|error| {
+        syn::Error::new(
+            error.span(),
+            "include! must use one tracked repository-relative Rust string literal",
+        )
+    })?;
+    if input.peek(Token![,]) {
+        let _: Token![,] = input.parse()?;
+    }
+    if !input.is_empty() {
+        return Err(input.error("include! accepts exactly one string literal"));
+    }
+
+    let source_parent = Path::new(source_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let include_path = source_parent.join(literal.value());
+    let normalized = normalize_source_path(&include_path)
+        .map_err(|error| syn::Error::new(literal.span(), error))?;
+    if Path::new(&normalized)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("rs")
+    {
+        return Err(syn::Error::new(
+            literal.span(),
+            format!("include! target must be a `.rs` file, found `{normalized}`"),
+        ));
+    }
+    if !inventory_universe.contains(&normalized) {
+        return Err(syn::Error::new(
+            literal.span(),
+            format!("include! target is not tracked by the source inventory: `{normalized}`"),
+        ));
+    }
+    Ok(())
+}
+
+fn static_include_at_cursor(
+    input: ParseStream<'_>,
+    source_path: &str,
+    inventory_universe: &HashSet<String>,
+) -> syn::Result<bool> {
+    let fork = input.fork();
+    if !fork.peek(syn::Ident) {
+        return Ok(false);
+    }
+    let macro_name: syn::Ident = fork.parse()?;
+    if macro_name != "include" || !fork.peek(Token![!]) {
+        return Ok(false);
+    }
+    let _: Token![!] = fork.parse()?;
+    if fork.peek(syn::token::Paren) {
+        let nested;
+        syn::parenthesized!(nested in fork);
+        validate_literal_include(&nested, source_path, inventory_universe)?;
+    } else if fork.peek(syn::token::Bracket) {
+        let nested;
+        syn::bracketed!(nested in fork);
+        validate_literal_include(&nested, source_path, inventory_universe)?;
+    } else if fork.peek(syn::token::Brace) {
+        let nested;
+        syn::braced!(nested in fork);
+        validate_literal_include(&nested, source_path, inventory_universe)?;
+    } else {
+        return Err(fork.error("include! must use a delimited argument"));
+    }
+    Ok(true)
+}
+
+fn scan_macro_tokens(
+    input: ParseStream<'_>,
+    source_path: &str,
+    inventory_universe: &HashSet<String>,
+) -> syn::Result<Option<MacroFinding>> {
+    let mut finding = None;
+    while !input.is_empty() {
+        if let Some(candidate) = macro_attribute_at_cursor_finding(input)? {
+            record_macro_finding(&mut finding, candidate);
+        }
+        static_include_at_cursor(input, source_path, inventory_universe)?;
+        if dynamic_macro_callee_at_cursor(input)? {
+            record_macro_finding(&mut finding, MacroFinding::DynamicMacroCallee);
+        }
+        if input.peek(Lit) {
+            let _: Lit = input.parse()?;
+            continue;
+        }
+        if input.peek(syn::token::Paren) {
+            let nested;
+            syn::parenthesized!(nested in input);
+            if let Some(nested_finding) =
+                scan_macro_tokens(&nested, source_path, inventory_universe)?
+            {
+                record_macro_finding(&mut finding, nested_finding);
+            }
+            continue;
+        }
+        if input.peek(syn::token::Bracket) {
+            let nested;
+            syn::bracketed!(nested in input);
+            if let Some(nested_finding) =
+                scan_macro_tokens(&nested, source_path, inventory_universe)?
+            {
+                record_macro_finding(&mut finding, nested_finding);
+            }
+            continue;
+        }
+        if input.peek(syn::token::Brace) {
+            let nested;
+            syn::braced!(nested in input);
+            if let Some(nested_finding) =
+                scan_macro_tokens(&nested, source_path, inventory_universe)?
+            {
+                record_macro_finding(&mut finding, nested_finding);
+            }
+            continue;
+        }
+        input.step(|cursor| {
+            let Some((_, next)) = cursor.token_tree() else {
+                return Err(cursor.error("expected a macro token"));
+            };
+            Ok(((), next))
+        })?;
+    }
+    Ok(finding)
+}
+
+struct IgnorePlacementAudit<'a> {
+    source_path: &'a str,
+    inventory_universe: &'a HashSet<String>,
+    allowed_attributes: &'a HashSet<*const Attribute>,
+    error: Option<String>,
+}
+
+fn is_audited_proptest_macro(path: &syn::Path) -> bool {
+    if path.is_ident("proptest") {
+        return true;
+    }
+    if path.leading_colon.is_some() {
+        return false;
+    }
+    let mut segments = path.segments.iter();
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some(first), Some(second), None)
+            if first.ident == "proptest" && second.ident == "proptest"
+    )
+}
+
+impl<'ast> Visit<'ast> for IgnorePlacementAudit<'_> {
+    fn visit_attribute(&mut self, attr: &'ast Attribute) {
+        if self.error.is_some() || self.allowed_attributes.contains(&std::ptr::from_ref(attr)) {
+            return;
+        }
+        match analyze_ignore_attribute(attr) {
+            Ok(annotations) if !annotations.is_empty() => {
+                self.error = Some(format!(
+                    "{}: ignore-bearing attributes must attach to an ordinary `#[test]` function",
+                    self.source_path
+                ));
+            }
+            Err(error) => {
+                self.error = Some(format!("{}: {error}", self.source_path));
+            }
+            Ok(_) => {}
+        }
+    }
+
+    fn visit_macro(&mut self, item_macro: &'ast syn::Macro) {
+        if self.error.is_some() {
+            return;
+        }
+        let macro_name = item_macro
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        if item_macro
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "include")
+        {
+            let parser = |input: ParseStream<'_>| {
+                validate_literal_include(input, self.source_path, self.inventory_universe)
+            };
+            if let Err(error) = parser.parse2(item_macro.tokens.clone()) {
+                self.error = Some(format!(
+                    "{}: invalid include! source boundary: {error}",
+                    self.source_path
+                ));
+            }
+            return;
+        }
+
+        let parser = |input: ParseStream<'_>| {
+            scan_macro_tokens(input, self.source_path, self.inventory_universe)
+        };
+        match parser.parse2(item_macro.tokens.clone()) {
+            Ok(Some(MacroFinding::TestAttribute))
+                if is_audited_proptest_macro(&item_macro.path) => {}
+            Ok(Some(finding)) => {
+                self.error = Some(format!(
+                    "{}: macro `{macro_name}!` contains {} that cannot be audited without expansion",
+                    self.source_path,
+                    finding.description()
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.error = Some(format!(
+                    "{}: unable to audit macro token tree at {:?}: {error}",
+                    self.source_path,
+                    item_macro.span()
+                ));
+            }
+        }
+    }
+}
+
+fn collect_ignored_tests(path: &Path, source: &str) -> Result<Vec<IgnoredTestSource>, String> {
+    let source_path = normalize_source_path(path)?;
+    let inventory_universe = HashSet::from([source_path]);
+    collect_ignored_tests_with_inventory(path, source, &inventory_universe)
+}
+
+fn collect_ignored_tests_with_inventory(
+    path: &Path,
+    source: &str,
+    inventory_universe: &HashSet<String>,
+) -> Result<Vec<IgnoredTestSource>, String> {
+    let source_path = normalize_source_path(path)?;
+    if !inventory_universe.contains(&source_path) {
+        return Err(format!(
+            "source path is absent from the tracked inventory universe: `{source_path}`"
+        ));
+    }
+    let syntax = syn::parse_file(source)
+        .map_err(|error| format!("{source_path}: unable to parse Rust source: {error}"))?;
+    let mut collector = IgnoreSourceCollector {
+        source_path: &source_path,
+        module_path: Vec::new(),
+        records: Vec::new(),
+        allowed_attributes: HashSet::new(),
+        locators: HashSet::new(),
+    };
+    let file_cfg = cfg_gate_from_attributes(&syntax.attrs)
+        .map_err(|error| format!("{source_path}: {error}"))?;
+    collector.collect_items(&syntax.items, file_cfg)?;
+
+    let mut audit = IgnorePlacementAudit {
+        source_path: &source_path,
+        inventory_universe,
+        allowed_attributes: &collector.allowed_attributes,
+        error: None,
+    };
+    audit.visit_file(&syntax);
+    if let Some(error) = audit.error {
+        return Err(error);
+    }
+
+    collector.records.sort_by_key(IgnoredTestSource::locator);
+    Ok(collector.records)
+}
+
+fn tracked_rust_source_paths(root: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--", "*.rs"])
+        .output()
+        .map_err(|error| format!("unable to enumerate tracked Rust sources: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "tracked Rust source enumeration failed with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let mut paths = Vec::new();
+    let mut unique = HashSet::new();
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let raw_path = std::str::from_utf8(raw_path)
+            .map_err(|error| format!("tracked Rust source path is not valid UTF-8: {error}"))?;
+        let normalized = normalize_source_path(Path::new(raw_path))?;
+        if normalized != raw_path {
+            return Err(format!(
+                "tracked Rust source path is not canonically spelled: `{raw_path}` -> `{normalized}`"
+            ));
+        }
+        if !unique.insert(normalized.clone()) {
+            return Err(format!(
+                "tracked Rust source enumeration returned duplicate path `{normalized}`"
+            ));
+        }
+
+        let metadata = fs::symlink_metadata(root.join(&normalized)).map_err(|error| {
+            format!("unable to inspect tracked Rust source `{normalized}`: {error}")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "tracked Rust source must be a regular non-symlink file: `{normalized}`"
+            ));
+        }
+        paths.push(normalized);
+    }
+    if paths.is_empty() {
+        return Err("tracked Rust source inventory is empty".to_owned());
+    }
+    paths.sort_unstable();
+    Ok(paths)
+}
+
+fn clean_snapshot_rust_source_paths(
+    root: &Path,
+    cargo_target_dir: &Path,
+    runtime_temp_dir: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("unable to canonicalize clean snapshot root: {error}"))?;
+    let cargo_target_dir = if cargo_target_dir.is_absolute() {
+        cargo_target_dir.to_path_buf()
+    } else {
+        root.join(cargo_target_dir)
+    }
+    .canonicalize()
+    .map_err(|error| format!("unable to canonicalize clean snapshot target directory: {error}"))?;
+    if cargo_target_dir == root || !cargo_target_dir.starts_with(&root) {
+        return Err(format!(
+            "clean snapshot target directory must be nested below the snapshot root: {}",
+            cargo_target_dir.display()
+        ));
+    }
+    let runtime_temp_dir = runtime_temp_dir
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            }
+            .canonicalize()
+            .map_err(|error| {
+                format!("unable to canonicalize clean snapshot runtime temp directory: {error}")
+            })?;
+            if path == root {
+                return Err(
+                    "clean snapshot root cannot also be its runtime temp directory".to_owned(),
+                );
+            }
+            Ok(path.starts_with(&root).then_some(path))
+        })
+        .transpose()?
+        .flatten();
+
+    let git_path = root.join(".git");
+    let conventional_target_path = root.join("target");
+    let mut pending = vec![root.clone()];
+    let mut paths = Vec::new();
+    let mut unique = HashSet::new();
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "unable to enumerate clean snapshot directory `{}`: {error}",
+                directory.display()
+            )
+        })?;
+        let mut entries = entries
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|error| format!("unable to read clean snapshot entry: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_unstable();
+        for path in entries {
+            if path == git_path
+                || path == conventional_target_path
+                || path == cargo_target_dir
+                || runtime_temp_dir
+                    .as_ref()
+                    .is_some_and(|temp| path == temp.as_path())
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "unable to inspect clean snapshot path `{}`: {error}",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "clean snapshot path must not be a symlink: {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(format!(
+                    "clean snapshot Rust source must be a regular non-symlink file: {}",
+                    path.display()
+                ));
+            }
+            let relative = path.strip_prefix(&root).map_err(|error| {
+                format!(
+                    "clean snapshot Rust source is outside the snapshot root `{}`: {error}",
+                    path.display()
+                )
+            })?;
+            let normalized = normalize_source_path(relative)?;
+            if !unique.insert(normalized.clone()) {
+                return Err(format!(
+                    "clean snapshot Rust source inventory contains duplicate path `{normalized}`"
+                ));
+            }
+            paths.push(normalized);
+        }
+    }
+    if paths.is_empty() {
+        return Err("clean snapshot Rust source inventory is empty".to_owned());
+    }
+    paths.sort_unstable();
+    Ok(paths)
+}
+
+fn collect_repository_ignored_tests_from_paths_with_reader<F>(
+    source_paths: &[String],
+    uninspected_source_paths: &[&str],
+    mut read_source: F,
+) -> Result<RepositoryIgnoreInventory, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    let mut ordered_source_paths = source_paths.to_vec();
+    ordered_source_paths.sort_unstable();
+    let mut inventory_universe = HashSet::new();
+    for source_path in &ordered_source_paths {
+        let normalized = normalize_source_path(Path::new(source_path))?;
+        if normalized != *source_path {
+            return Err(format!(
+                "tracked Rust source path is not canonically spelled: `{source_path}` -> `{normalized}`"
+            ));
+        }
+        if Path::new(source_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("rs")
+        {
+            return Err(format!(
+                "tracked Rust source must identify a `.rs` file: `{source_path}`"
+            ));
+        }
+        if !inventory_universe.insert(source_path.clone()) {
+            return Err(format!(
+                "tracked Rust source inventory contains duplicate path `{source_path}`"
+            ));
+        }
+    }
+    if inventory_universe.is_empty() {
+        return Err("tracked Rust source inventory is empty".to_owned());
+    }
+
+    let mut uninspected = HashSet::new();
+    for source_path in uninspected_source_paths {
+        let normalized = normalize_source_path(Path::new(source_path))?;
+        if normalized != *source_path {
+            return Err(format!(
+                "uninspected Rust source path is not canonically spelled: `{source_path}` -> `{normalized}`"
+            ));
+        }
+        if !inventory_universe.contains(&normalized) {
+            return Err(format!(
+                "uninspected Rust source is not tracked: `{normalized}`"
+            ));
+        }
+        if !uninspected.insert(normalized.clone()) {
+            return Err(format!(
+                "duplicate uninspected Rust source path: `{normalized}`"
+            ));
+        }
+    }
+
+    let mut records = Vec::new();
+    let mut locators = HashSet::new();
+    let mut encountered_uninspected = Vec::new();
+
+    for source_path in ordered_source_paths {
+        if uninspected.contains(&source_path) {
+            encountered_uninspected.push(source_path);
+            continue;
+        }
+        let source = read_source(&source_path)?;
+        for record in collect_ignored_tests_with_inventory(
+            Path::new(&source_path),
+            &source,
+            &inventory_universe,
+        )? {
+            let locator = record.locator();
+            if !locators.insert(locator.clone()) {
+                return Err(format!(
+                    "tracked Rust source inventory contains duplicate ignored-test locator `{locator}`"
+                ));
+            }
+            records.push(record);
+        }
+    }
+
+    records.sort_by_key(IgnoredTestSource::locator);
+    Ok(RepositoryIgnoreInventory {
+        records,
+        uninspected_sources: encountered_uninspected,
+        soundness_limitations: Vec::new(),
+    })
+}
+
+fn collect_repository_ignored_tests_from_source_paths(
+    root: &Path,
+    source_paths: &[String],
+    uninspected_source_paths: &[&str],
+) -> Result<RepositoryIgnoreInventory, String> {
+    let mut snapshots = Vec::new();
+    let mut inventory = collect_repository_ignored_tests_from_paths_with_reader(
+        source_paths,
+        uninspected_source_paths,
+        |source_path| {
+            let bytes = fs::read(root.join(source_path)).map_err(|error| {
+                format!("unable to read tracked Rust source `{source_path}`: {error}")
+            })?;
+            let source = String::from_utf8(bytes).map_err(|error| {
+                format!("tracked Rust source `{source_path}` is not valid UTF-8: {error}")
+            })?;
+            snapshots.push((source_path.to_owned(), blake3::hash(source.as_bytes())));
+            Ok(source)
+        },
+    )?;
+
+    for (source_path, expected_hash) in snapshots {
+        let metadata = fs::symlink_metadata(root.join(&source_path)).map_err(|error| {
+            format!("unable to re-inspect tracked Rust source `{source_path}`: {error}")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "tracked Rust source changed file type during inventory: `{source_path}`"
+            ));
+        }
+        let current = fs::read(root.join(&source_path)).map_err(|error| {
+            format!("unable to re-read tracked Rust source `{source_path}`: {error}")
+        })?;
+        if blake3::hash(&current) != expected_hash {
+            return Err(format!(
+                "tracked Rust source changed during inventory; retry from a stable snapshot: `{source_path}`"
+            ));
+        }
+    }
+
+    inventory.soundness_limitations = SOURCE_INVENTORY_SOUNDNESS_LIMITATIONS
+        .iter()
+        .map(|limitation| (*limitation).to_owned())
+        .collect();
+
+    Ok(inventory)
+}
+
+fn collect_repository_ignored_tests(
+    root: &Path,
+    uninspected_source_paths: &[&str],
+) -> Result<RepositoryIgnoreInventory, String> {
+    let source_paths = tracked_rust_source_paths(root)?;
+    collect_repository_ignored_tests_from_source_paths(
+        root,
+        &source_paths,
+        uninspected_source_paths,
+    )
+}
+
+// RCH clean-overlay tests intentionally run from a source snapshot without
+// `.git`. This opt-in path exists only for the non-release keeper below. The
+// ignored release guard continues to call `collect_repository_ignored_tests`
+// directly, so release authorization always remains Git- and commit-bound.
+fn collect_repository_ignored_tests_for_nonrelease_keeper(
+    root: &Path,
+    uninspected_source_paths: &[&str],
+) -> Result<RepositoryIgnoreInventory, String> {
+    match fs::symlink_metadata(root.join(".git")) {
+        Ok(_) => collect_repository_ignored_tests(root, uninspected_source_paths),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let opt_in = std::env::var(CLEAN_SNAPSHOT_KEEPER_ENV).map_err(|_| {
+                format!(
+                    "repository metadata is absent; set {CLEAN_SNAPSHOT_KEEPER_ENV}=1 only for an immutable clean-snapshot keeper run"
+                )
+            })?;
+            if opt_in != "1" {
+                return Err(format!(
+                    "{CLEAN_SNAPSHOT_KEEPER_ENV} must equal `1`, found {opt_in:?}"
+                ));
+            }
+            let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").ok_or_else(|| {
+                "clean-snapshot keeper mode requires an explicit CARGO_TARGET_DIR".to_owned()
+            })?;
+            let runtime_temp_dir = std::env::var_os("TMPDIR");
+            let source_paths = clean_snapshot_rust_source_paths(
+                root,
+                Path::new(&cargo_target_dir),
+                runtime_temp_dir.as_deref().map(Path::new),
+            )?;
+            collect_repository_ignored_tests_from_source_paths(
+                root,
+                &source_paths,
+                uninspected_source_paths,
+            )
+        }
+        Err(error) => Err(format!(
+            "unable to inspect repository metadata for non-release keeper: {error}"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum IgnoreKind {
+    KnownBug,
+    Placeholder,
+    Performance,
+    Stress,
+    Diagnostic,
+    SubprocessHelper,
+    ArtifactGeneration,
+    EnvironmentSpecific,
+    ReleaseGate,
+}
+
+impl IgnoreKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::KnownBug => "known_bug",
+            Self::Placeholder => "placeholder",
+            Self::Performance => "performance",
+            Self::Stress => "stress",
+            Self::Diagnostic => "diagnostic",
+            Self::SubprocessHelper => "subprocess_helper",
+            Self::ArtifactGeneration => "artifact_generation",
+            Self::EnvironmentSpecific => "environment_specific",
+            Self::ReleaseGate => "release_gate",
+        }
+    }
+
+    const fn allows_policy(self, policy: IgnorePolicy) -> bool {
+        match self {
+            Self::KnownBug | Self::Placeholder => matches!(policy, IgnorePolicy::BlockRelease),
+            Self::Performance => {
+                matches!(policy, IgnorePolicy::RunForRelease | IgnorePolicy::Exempt)
+            }
+            Self::Stress => matches!(policy, IgnorePolicy::RunForRelease),
+            Self::Diagnostic | Self::ArtifactGeneration | Self::EnvironmentSpecific => {
+                matches!(policy, IgnorePolicy::Exempt)
+            }
+            Self::SubprocessHelper => matches!(policy, IgnorePolicy::CoveredByParent),
+            Self::ReleaseGate => {
+                matches!(
+                    policy,
+                    IgnorePolicy::BlockRelease | IgnorePolicy::RunForRelease
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum IgnorePolicy {
+    BlockRelease,
+    RunForRelease,
+    CoveredByParent,
+    Exempt,
+}
+
+impl IgnorePolicy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockRelease => "block_release",
+            Self::RunForRelease => "run_for_release",
+            Self::CoveredByParent => "covered_by_parent",
+            Self::Exempt => "exempt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct IgnoreEvidence {
+    requirement: String,
+    receipt: Option<IgnoreEvidenceReceipt>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct TestIdentity {
+    source_path: String,
+    test_name: String,
+}
+
+impl TestIdentity {
+    fn locator(&self) -> String {
+        format!("{}::{}", self.source_path, self.test_name)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_source_test_identity(&self.source_path, &self.test_name)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct IgnoreEvidenceReceipt {
+    source_commit: String,
+    artifact_path: String,
+    artifact_blake3: String,
+}
+
+fn is_lowercase_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_source_test_identity(source_path: &str, test_name: &str) -> Result<(), String> {
+    let normalized = normalize_source_path(Path::new(source_path))?;
+    if normalized != source_path {
+        return Err(format!(
+            "source_path is not canonically spelled: `{source_path}` -> `{normalized}`"
+        ));
+    }
+    if Path::new(source_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("rs")
+    {
+        return Err("source_path must identify a `.rs` file".to_owned());
+    }
+    if test_name.trim() != test_name
+        || test_name
+            .split("::")
+            .any(|segment| segment.is_empty() || syn::parse_str::<syn::Ident>(segment).is_err())
+    {
+        return Err(format!(
+            "test_name must be a canonical Rust identifier path, found {test_name:?}"
+        ));
+    }
+    Ok(())
+}
+
+impl IgnoreEvidenceReceipt {
+    fn validate(&self) -> Result<(), String> {
+        if self.source_commit.len() != 40 || !is_lowercase_hex(&self.source_commit) {
+            return Err(
+                "receipt.source_commit must be a 40-digit lowercase hexadecimal commit".to_owned(),
+            );
+        }
+        if self.artifact_blake3.len() != 64 || !is_lowercase_hex(&self.artifact_blake3) {
+            return Err(
+                "receipt.artifact_blake3 must be a 64-digit lowercase hexadecimal digest"
+                    .to_owned(),
+            );
+        }
+        let normalized_artifact = normalize_source_path(Path::new(&self.artifact_path))?;
+        if normalized_artifact != self.artifact_path {
+            return Err(format!(
+                "receipt.artifact_path is not canonically spelled: `{}` -> `{normalized_artifact}`",
+                self.artifact_path
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct IgnoredTestBaseline {
+    source_path: String,
+    test_name: String,
+    reason: String,
+    cfg_condition: Option<String>,
+    kind: IgnoreKind,
+    policy: IgnorePolicy,
+    #[serde(default)]
+    parent_tests: Vec<TestIdentity>,
+    evidence: IgnoreEvidence,
+}
+
+impl IgnoredTestBaseline {
+    fn locator(&self) -> String {
+        format!("{}::{}", self.source_path, self.test_name)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !self.kind.allows_policy(self.policy) {
+            return Err(format!(
+                "kind `{}` cannot use policy `{}`",
+                self.kind.as_str(),
+                self.policy.as_str()
+            ));
+        }
+        validate_source_test_identity(&self.source_path, &self.test_name)?;
+        if self.reason.trim().is_empty() || self.reason.trim() != self.reason {
+            return Err("reason must be nonempty and have no surrounding whitespace".to_owned());
+        }
+        if let Some(condition) = &self.cfg_condition {
+            let meta = syn::parse_str::<Meta>(condition).map_err(|error| {
+                format!("cfg_condition is not valid cfg syntax `{condition}`: {error}")
+            })?;
+            let canonical = canonical_cfg_condition(&meta)?.render();
+            if canonical != *condition {
+                return Err(format!(
+                    "cfg_condition is not canonical: `{condition}` -> `{canonical}`"
+                ));
+            }
+        }
+        if self.evidence.requirement.trim().is_empty()
+            || self.evidence.requirement.trim() != self.evidence.requirement
+        {
+            return Err(
+                "evidence.requirement must be nonempty and have no surrounding whitespace"
+                    .to_owned(),
+            );
+        }
+
+        match self.policy {
+            IgnorePolicy::CoveredByParent if self.parent_tests.is_empty() => {
+                return Err("covered_by_parent policy requires at least one parent test".to_owned());
+            }
+            IgnorePolicy::CoveredByParent => {}
+            _ if !self.parent_tests.is_empty() => {
+                return Err("only covered_by_parent entries may name parent tests".to_owned());
+            }
+            _ => {}
+        }
+
+        let locator = self.locator();
+        let mut previous_parent = None;
+        for parent in &self.parent_tests {
+            parent
+                .validate()
+                .map_err(|error| format!("invalid parent test identity: {error}"))?;
+            let parent_locator = parent.locator();
+            if parent_locator == locator {
+                return Err("covered_by_parent entry cannot name itself as parent".to_owned());
+            }
+            if parent_locator == RELEASE_GUARD_LOCATOR {
+                return Err(
+                    "covered_by_parent entry cannot name the live release guard as parent"
+                        .to_owned(),
+                );
+            }
+            if previous_parent
+                .as_ref()
+                .is_some_and(|previous| previous >= &parent_locator)
+            {
+                return Err(format!(
+                    "parent_tests locators must be strictly sorted and unique: `{parent_locator}` follows `{}`",
+                    previous_parent.as_deref().unwrap_or_default()
+                ));
+            }
+            previous_parent = Some(parent_locator);
+        }
+
+        if let Some(receipt) = &self.evidence.receipt {
+            receipt.validate()?;
+        }
+        Ok(())
+    }
+
+    fn source_identity(&self) -> IgnoredTestSource {
+        IgnoredTestSource {
+            source_path: self.source_path.clone(),
+            test_name: self.test_name.clone(),
+            reason: self.reason.clone(),
+            cfg_condition: self.cfg_condition.clone(),
+        }
+    }
+}
+
+fn validate_parent_coverage_graph(entries: &[IgnoredTestBaseline]) -> Result<(), String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VisitState {
+        Visiting,
+        Visited,
+    }
+
+    fn visit(
+        locator: &str,
+        edges: &HashMap<String, Vec<String>>,
+        states: &mut HashMap<String, VisitState>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), String> {
+        match states.get(locator) {
+            Some(VisitState::Visited) => return Ok(()),
+            Some(VisitState::Visiting) => {
+                let cycle_start = stack.iter().position(|entry| entry == locator).unwrap_or(0);
+                let mut cycle = stack[cycle_start..].to_vec();
+                cycle.push(locator.to_owned());
+                return Err(format!(
+                    "covered_by_parent graph contains a cycle: {}",
+                    cycle.join(" -> ")
+                ));
+            }
+            None => {}
+        }
+
+        states.insert(locator.to_owned(), VisitState::Visiting);
+        stack.push(locator.to_owned());
+        if let Some(parents) = edges.get(locator) {
+            for parent in parents {
+                if edges.contains_key(parent) {
+                    visit(parent, edges, states, stack)?;
+                }
+            }
+        }
+        let popped = stack.pop();
+        debug_assert_eq!(popped.as_deref(), Some(locator));
+        states.insert(locator.to_owned(), VisitState::Visited);
+        Ok(())
+    }
+
+    let edges = entries
+        .iter()
+        .filter(|entry| entry.policy == IgnorePolicy::CoveredByParent)
+        .map(|entry| {
+            (
+                entry.locator(),
+                entry
+                    .parent_tests
+                    .iter()
+                    .map(TestIdentity::locator)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut locators = edges.keys().cloned().collect::<Vec<_>>();
+    locators.sort_unstable();
+    let mut states = HashMap::new();
+    let mut stack = Vec::new();
+    for locator in locators {
+        visit(&locator, &edges, &mut states, &mut stack)?;
+    }
+    Ok(())
+}
+
+fn validate_audited_covered_parent_contract(entries: &[IgnoredTestBaseline]) -> Result<(), String> {
+    let mut actual = entries
+        .iter()
+        .filter(|entry| entry.policy == IgnorePolicy::CoveredByParent)
+        .map(|entry| {
+            (
+                entry.locator(),
+                entry
+                    .parent_tests
+                    .iter()
+                    .map(TestIdentity::locator)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (child, expected_parents) in AUDITED_COVERED_PARENT_CONTRACT {
+        let actual_parents = actual.remove(*child).ok_or_else(|| {
+            format!("audited covered_by_parent contract is missing child `{child}`")
+        })?;
+        if actual_parents
+            .iter()
+            .map(String::as_str)
+            .ne(expected_parents.iter().copied())
+        {
+            return Err(format!(
+                "audited covered_by_parent child `{child}` has parent locators {actual_parents:?}; expected {expected_parents:?}"
+            ));
+        }
+    }
+
+    if !actual.is_empty() {
+        let mut unexpected = actual.into_keys().collect::<Vec<_>>();
+        unexpected.sort_unstable();
+        return Err(format!(
+            "covered_by_parent baseline contains unaudited child locators: {unexpected:?}"
+        ));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegressionBaseline {
     as_of_phase: String,
     total_tests: u64,
@@ -17,6 +1815,71 @@ struct RegressionBaseline {
     failed: u64,
     ignored: u64,
     baseline_commit: String,
+    #[serde(default)]
+    baseline_evidence: Option<BaselineEvidence>,
+    ignored_tests: Vec<IgnoredTestBaseline>,
+}
+
+impl RegressionBaseline {
+    fn validate(&self) -> Result<(), String> {
+        if self.as_of_phase.trim().is_empty() {
+            return Err("as_of_phase must not be empty".to_owned());
+        }
+        if self.total_tests == 0 {
+            return Err("total_tests must be greater than zero".to_owned());
+        }
+
+        let accounted_tests = self
+            .passed
+            .checked_add(self.failed)
+            .and_then(|count| count.checked_add(self.ignored))
+            .ok_or_else(|| "baseline test counts overflowed u64".to_owned())?;
+        if self.total_tests != accounted_tests {
+            return Err(format!(
+                "total_tests={} does not equal passed + failed + ignored={accounted_tests}",
+                self.total_tests
+            ));
+        }
+        if self.failed != 0 {
+            return Err(format!(
+                "release regression baseline must have zero failures, found {}",
+                self.failed
+            ));
+        }
+        // The provenance anchor must be a full object name. An abbreviated
+        // anchor cannot be compared for exact equality against the 40-digit
+        // `source_commit` carried by a typed workspace receipt, so accepting
+        // one makes the receipt contract unsatisfiable rather than merely
+        // unproven.
+        let commit = &self.baseline_commit;
+        if commit.len() != 40 || !is_lowercase_hex(commit) {
+            return Err(format!(
+                "baseline_commit must be a full untrimmed 40-digit lowercase hexadecimal Git object name, found `{commit}`"
+            ));
+        }
+
+        let mut previous_locator = None;
+        for entry in &self.ignored_tests {
+            let locator = entry.locator();
+            entry
+                .validate()
+                .map_err(|error| format!("ignored_tests entry `{locator}` is invalid: {error}"))?;
+            if previous_locator
+                .as_ref()
+                .is_some_and(|previous| previous >= &locator)
+            {
+                return Err(format!(
+                    "ignored_tests locators must be strictly sorted and unique: `{locator}` follows `{}`",
+                    previous_locator.as_deref().unwrap_or_default()
+                ));
+            }
+            previous_locator = Some(locator);
+        }
+
+        validate_parent_coverage_graph(&self.ignored_tests)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,12 +1900,230 @@ impl RegressionCounts {
         }
     }
 
-    fn add(&mut self, rhs: Self) {
-        self.total_tests = self.total_tests.saturating_add(rhs.total_tests);
-        self.passed = self.passed.saturating_add(rhs.passed);
-        self.failed = self.failed.saturating_add(rhs.failed);
-        self.ignored = self.ignored.saturating_add(rhs.ignored);
+    fn checked_add(&mut self, rhs: Self) -> Result<(), String> {
+        let total_tests = self
+            .total_tests
+            .checked_add(rhs.total_tests)
+            .ok_or_else(|| "aggregate total_tests overflowed u64".to_owned())?;
+        let passed = self
+            .passed
+            .checked_add(rhs.passed)
+            .ok_or_else(|| "aggregate passed count overflowed u64".to_owned())?;
+        let failed = self
+            .failed
+            .checked_add(rhs.failed)
+            .ok_or_else(|| "aggregate failed count overflowed u64".to_owned())?;
+        let ignored = self
+            .ignored
+            .checked_add(rhs.ignored)
+            .ok_or_else(|| "aggregate ignored count overflowed u64".to_owned())?;
+
+        *self = Self {
+            total_tests,
+            passed,
+            failed,
+            ignored,
+        };
+        Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CommandEvidence {
+    argv: Vec<String>,
+    exit_status: i32,
+    stdout: StreamEvidence,
+    stderr: StreamEvidence,
+    transcript: EvidenceLeaf,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StreamCapture {
+    Observed,
+    SynthesizedEmpty,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StreamEvidence {
+    capture: StreamCapture,
+    leaf: EvidenceLeaf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct EvidenceLeaf {
+    path: String,
+    digest_algorithm: String,
+    digest: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RchExecutionReceipt {
+    schema_version: String,
+    inner_cargo_argv: Vec<String>,
+    job_id: String,
+    active_status: EvidenceLeaf,
+    completed_status: EvidenceLeaf,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RunEvidenceV2 {
+    execution: CommandEvidence,
+    runner_receipt: EvidenceLeaf,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ScorecardEvidence {
+    scorecard: EvidenceLeaf,
+    pack_manifest: EvidenceLeaf,
+    commit_provenance: EvidenceLeaf,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuxiliaryScorecards {
+    c1: ScorecardEvidence,
+    persistent: ScorecardEvidence,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompilerInventoryRuns {
+    all_targets: RunEvidenceV2,
+    all_targets_ignored: RunEvidenceV2,
+    doctests: RunEvidenceV2,
+    doctests_ignored: RunEvidenceV2,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompilerDerivedInventoryAttestation {
+    tested_tree_blake3: String,
+    cargo_metadata_blake3: String,
+    target_mappings_blake3: String,
+    active_identities_blake3: String,
+    ignored_identities_blake3: String,
+    doctest_identities_blake3: String,
+    expanded_identities_blake3: String,
+    cfg_profile: String,
+    inventory_runs: CompilerInventoryRuns,
+    inventory_leaves: Vec<CompilerInventoryLeaf>,
+    targets: Vec<CompilerDerivedTarget>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompilerInventoryLeaf {
+    role: String,
+    path: String,
+    sha256_algorithm: String,
+    sha256: String,
+    blake3_algorithm: String,
+    blake3: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompilerDerivedTarget {
+    target: String,
+    source_inventory_blake3: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BaselineEvidence {
+    source_commit: String,
+    workspace: RunEvidenceV2,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CurrentRunReceipt {
+    source_path: String,
+    test_name: String,
+    requirement_blake3: String,
+    evidence: RunEvidenceV2,
+}
+
+impl CurrentRunReceipt {
+    fn locator(&self) -> String {
+        format!("{}::{}", self.source_path, self.test_name)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReleaseEvidenceManifest {
+    schema_version: u32,
+    tested_commit: String,
+    signature_path: String,
+    signer_attestation: EvidenceLeaf,
+    cargo_lock: EvidenceLeaf,
+    rust_toolchain: EvidenceLeaf,
+    pre_capture_untracked: EvidenceLeaf,
+    compiler_inventory_attestation: EvidenceLeaf,
+    workspace: RunEvidenceV2,
+    run_receipts: Vec<CurrentRunReceipt>,
+    auxiliary_scorecards: AuxiliaryScorecards,
+    evidence_pack: Vec<EvidenceLeaf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ValidatedCurrentRunReceipts {
+    locators: HashSet<String>,
+}
+
+impl ValidatedCurrentRunReceipts {
+    fn contains(&self, locator: &str) -> bool {
+        self.locators.contains(locator)
+    }
+
+    #[cfg(test)]
+    fn from_test_locators(locators: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            locators: locators.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ValidatedParentCoverage {
+    covered_children: HashSet<String>,
+}
+
+impl ValidatedParentCoverage {
+    fn contains(&self, locator: &str) -> bool {
+        self.covered_children.contains(locator)
+    }
+
+    #[cfg(test)]
+    fn from_test_locators(locators: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            covered_children: locators.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedReleaseEvidence {
+    tested_commit: String,
+    workspace_transcript: String,
+    workspace_counts: RegressionCounts,
+    current_run_receipts: ValidatedCurrentRunReceipts,
+    parent_coverage: ValidatedParentCoverage,
+    compiler_inventory_attested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoTestTarget {
+    Library,
+    Integration(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,15 +2153,2738 @@ fn baseline_path(root: &Path) -> PathBuf {
     root.join(REGRESSION_BASELINE_PATH)
 }
 
-fn load_regression_baseline(path: &Path) -> Result<RegressionBaseline, String> {
+fn canonical_evidence_path(path: &str, description: &str) -> Result<String, String> {
+    let normalized = normalize_source_path(Path::new(path))?;
+    if normalized != path {
+        return Err(format!(
+            "{description} is not canonically spelled: `{path}` -> `{normalized}`"
+        ));
+    }
+    if !path.starts_with(EVIDENCE_PATH_PREFIX) {
+        return Err(format!(
+            "{description} must be stored below `{EVIDENCE_PATH_PREFIX}`: `{path}`"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn canonical_commit_evidence_path(
+    path: &str,
+    tested_commit: &str,
+    description: &str,
+) -> Result<String, String> {
+    let normalized = canonical_evidence_path(path, description)?;
+    let expected_prefix = format!("{EVIDENCE_PATH_PREFIX}{tested_commit}/");
+    if !normalized.starts_with(&expected_prefix) {
+        return Err(format!(
+            "{description} must be stored below commit-specific namespace `{expected_prefix}`: `{path}`"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_command_evidence_shape(
+    evidence: &CommandEvidence,
+    description: &str,
+) -> Result<(), String> {
+    if evidence.argv.is_empty()
+        || evidence
+            .argv
+            .iter()
+            .any(|argument| argument.is_empty() || argument.contains('\0'))
+    {
+        return Err(format!(
+            "{description}.argv must contain nonempty, NUL-free argument tokens"
+        ));
+    }
+    if evidence.exit_status != 0 {
+        return Err(format!("{description} must record zero command status"));
+    }
+    for (name, stream) in [("stdout", &evidence.stdout), ("stderr", &evidence.stderr)] {
+        validate_evidence_leaf_shape(&stream.leaf, &format!("{description}.{name}"))?;
+        if stream.capture != StreamCapture::Observed {
+            return Err(format!(
+                "{description}.{name} must retain an observed stream; synthesized empty bytes are not citation-grade"
+            ));
+        }
+    }
+    validate_evidence_leaf_shape(&evidence.transcript, &format!("{description}.transcript"))?;
+    if evidence.transcript != evidence.stderr.leaf {
+        return Err(format!(
+            "{description}.transcript must exactly alias the retained raw RCH stderr stream"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_evidence_leaf_shape(leaf: &EvidenceLeaf, description: &str) -> Result<(), String> {
+    canonical_evidence_path(&leaf.path, &format!("{description}.path"))?;
+    if leaf.digest_algorithm != EVIDENCE_DIGEST_ALGORITHM {
+        return Err(format!(
+            "{description}.digest_algorithm must be `{EVIDENCE_DIGEST_ALGORITHM}`"
+        ));
+    }
+    if leaf.digest.len() != 64 || !is_lowercase_hex(&leaf.digest) {
+        return Err(format!(
+            "{description}.digest must be a 64-digit lowercase hexadecimal digest"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_command_evidence_commit_paths(
+    evidence: &CommandEvidence,
+    tested_commit: &str,
+    description: &str,
+) -> Result<(), String> {
+    for (name, leaf) in [
+        ("stdout", &evidence.stdout.leaf),
+        ("stderr", &evidence.stderr.leaf),
+        ("transcript", &evidence.transcript),
+    ] {
+        canonical_commit_evidence_path(
+            &leaf.path,
+            tested_commit,
+            &format!("{description}.{name}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_scorecard_evidence_shape(
+    evidence: &ScorecardEvidence,
+    tested_commit: &str,
+    kind: &str,
+) -> Result<(), String> {
+    for (name, leaf) in [
+        ("scorecard", &evidence.scorecard),
+        ("pack_manifest", &evidence.pack_manifest),
+        ("commit_provenance", &evidence.commit_provenance),
+    ] {
+        validate_evidence_leaf_shape(leaf, &format!("{kind} {name}"))?;
+        canonical_commit_evidence_path(&leaf.path, tested_commit, &format!("{kind} {name}"))?;
+    }
+    let root = format!("{EVIDENCE_PATH_PREFIX}{tested_commit}/performance/{kind}");
+    let expected = if kind == "c1" {
+        [
+            format!("{root}/c1_scorecard.json"),
+            format!("{root}/manifest.json"),
+            format!("{root}/build_metadata.json"),
+        ]
+    } else if kind == "persistent" {
+        [
+            format!("{root}/persistent_scorecard.json"),
+            format!("{root}/manifest.json"),
+            format!("{root}/provenance/citation_receipt.json"),
+        ]
+    } else {
+        return Err(format!("unknown auxiliary scorecard kind `{kind}`"));
+    };
+    let actual = [
+        evidence.scorecard.path.as_str(),
+        evidence.pack_manifest.path.as_str(),
+        evidence.commit_provenance.path.as_str(),
+    ];
+    if actual
+        .iter()
+        .copied()
+        .ne(expected.iter().map(String::as_str))
+    {
+        return Err(format!(
+            "{kind} scorecard evidence must use exact commit-specific pack paths {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scorecard_evidence(
+    root: &Path,
+    evidence: &ScorecardEvidence,
+    kind: &str,
+    tested_commit: &str,
+) -> Result<(), String> {
+    validate_scorecard_evidence_shape(evidence, tested_commit, kind)?;
+    #[derive(Deserialize)]
+    struct Scorecard {
+        schema_version: String,
+        run_id: String,
+        honest_gate_summary: HonestGateSummary,
+    }
+    #[derive(Deserialize)]
+    struct HonestGateSummary {
+        verdict: String,
+    }
+    #[derive(Deserialize)]
+    struct PackManifest {
+        schema_version: String,
+        run_id: String,
+        build_metadata_json: Option<String>,
+        build_metadata: Option<serde_json::Value>,
+        citation_receipt_json: Option<String>,
+    }
+    let scorecard_bytes =
+        read_evidence_leaf(root, &evidence.scorecard, &format!("{kind} scorecard"))?;
+    let scorecard = serde_json::from_slice::<Scorecard>(&scorecard_bytes)
+        .map_err(|error| format!("unable to parse {kind} scorecard: {error}"))?;
+    let pack_bytes = read_evidence_leaf(
+        root,
+        &evidence.pack_manifest,
+        &format!("{kind} pack manifest"),
+    )?;
+    let pack = serde_json::from_slice::<PackManifest>(&pack_bytes)
+        .map_err(|error| format!("unable to parse {kind} pack manifest: {error}"))?;
+    let (scorecard_schema, manifest_schema) = match kind {
+        "c1" => (C1_SCORECARD_SCHEMA_VERSION, C1_MANIFEST_SCHEMA_VERSION),
+        "persistent" => (
+            PERSISTENT_SCORECARD_SCHEMA_VERSION,
+            PERSISTENT_MANIFEST_SCHEMA_VERSION,
+        ),
+        _ => return Err(format!("unknown auxiliary scorecard kind `{kind}`")),
+    };
+    if scorecard.schema_version != scorecard_schema
+        || pack.schema_version != manifest_schema
+        || scorecard.run_id.trim().is_empty()
+        || scorecard.run_id != pack.run_id
+        || scorecard.honest_gate_summary.verdict != "pass"
+    {
+        return Err(format!(
+            "{kind} scorecard and pack manifest must use their canonical schemas, share a nonempty run_id, and record honest_gate_summary.verdict=pass"
+        ));
+    }
+    if (kind == "c1"
+        && (pack.build_metadata_json.as_deref() != Some("build_metadata.json")
+            || pack.build_metadata.is_none()
+            || pack.citation_receipt_json.is_some()))
+        || (kind == "persistent"
+            && (pack.citation_receipt_json.as_deref() != Some("provenance/citation_receipt.json")
+                || pack.build_metadata_json.is_some()
+                || pack.build_metadata.is_some()))
+    {
+        return Err(format!(
+            "{kind} pack manifest does not name its exact retained commit-provenance leaf"
+        ));
+    }
+    let provenance_bytes = read_evidence_leaf(
+        root,
+        &evidence.commit_provenance,
+        &format!("{kind} commit provenance"),
+    )?;
+    match kind {
+        "c1" => {
+            #[derive(Deserialize)]
+            struct C1BuildMetadata {
+                run_id: String,
+                release_mode: bool,
+                frozen_commit: Option<String>,
+                clean_checkout: bool,
+            }
+            let provenance = serde_json::from_slice::<C1BuildMetadata>(&provenance_bytes)
+                .map_err(|error| format!("unable to parse C1 build metadata: {error}"))?;
+            let provenance_value =
+                serde_json::from_slice::<serde_json::Value>(&provenance_bytes)
+                    .map_err(|error| format!("unable to parse C1 build metadata value: {error}"))?;
+            if provenance.run_id != scorecard.run_id
+                || !provenance.release_mode
+                || !provenance.clean_checkout
+                || provenance.frozen_commit.as_deref() != Some(tested_commit)
+                || pack.build_metadata.as_ref() != Some(&provenance_value)
+            {
+                return Err(
+                    "C1 pack provenance does not bind its run_id to the clean tested commit"
+                        .to_owned(),
+                );
+            }
+        }
+        "persistent" => {
+            validate_persistent_citation_receipt_bytes(&provenance_bytes, tested_commit)?;
+        }
+        _ => return Err(format!("unknown auxiliary scorecard kind `{kind}`")),
+    }
+    Ok(())
+}
+
+fn validate_persistent_citation_receipt_bytes(
+    bytes: &[u8],
+    tested_commit: &str,
+) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct PersistentCitationReceipt {
+        schema_version: String,
+        source: PersistentSource,
+        rch_scheduler_isolation: PersistentRchSchedulerIsolation,
+    }
+    #[derive(Deserialize)]
+    struct PersistentSource {
+        commit: String,
+        clean: bool,
+    }
+    #[derive(Deserialize)]
+    struct PersistentRchSchedulerIsolation {
+        build_status_trace: String,
+        build_status_trace_sha256: String,
+        build_completion_snapshot: String,
+        build_completion_snapshot_sha256: String,
+        build_job_id: String,
+        build_active_samples: u64,
+        job_id_encoding: String,
+        phase_traces: HashMap<String, PersistentPhaseTrace>,
+    }
+    #[derive(Deserialize)]
+    struct PersistentPhaseTrace {
+        path: String,
+        sha256: String,
+        job_id: String,
+        active_samples: u64,
+        completion: String,
+        completion_sha256: String,
+    }
+
+    fn canonical_job_id(value: &str) -> bool {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value.len() == 1 || !value.starts_with('0'))
+    }
+
+    fn canonical_sha256(value: &str) -> bool {
+        value.len() == 64 && is_lowercase_hex(value)
+    }
+
+    let provenance = serde_json::from_slice::<PersistentCitationReceipt>(bytes)
+        .map_err(|error| format!("unable to parse persistent citation receipt: {error}"))?;
+    if provenance.schema_version != PERSISTENT_CITATION_SCHEMA_VERSION
+        || provenance.source.commit != tested_commit
+        || !provenance.source.clean
+    {
+        return Err(
+            "persistent pack citation receipt does not bind the clean tested commit".to_owned(),
+        );
+    }
+
+    let isolation = provenance.rch_scheduler_isolation;
+    if isolation.build_status_trace != "provenance/rch_build_status.jsonl"
+        || isolation.build_completion_snapshot != "provenance/rch_build_status_completion.json"
+        || !canonical_sha256(&isolation.build_status_trace_sha256)
+        || !canonical_sha256(&isolation.build_completion_snapshot_sha256)
+        || !canonical_job_id(&isolation.build_job_id)
+        || isolation.build_active_samples == 0
+        || isolation.job_id_encoding != "decimal_string"
+    {
+        return Err(
+            "persistent pack citation receipt does not retain the canonical build RCH status and completion binding"
+                .to_owned(),
+        );
+    }
+    if isolation.phase_traces.len() != 3 {
+        return Err(
+            "persistent pack citation receipt must retain exactly the 1t, 8t, and 16t RCH phase bindings"
+                .to_owned(),
+        );
+    }
+    for phase in ["1t", "8t", "16t"] {
+        let trace = isolation.phase_traces.get(phase).ok_or_else(|| {
+            format!("persistent pack citation receipt omits the {phase} RCH phase binding")
+        })?;
+        if trace.path != format!("{phase}/rch_status.jsonl")
+            || trace.completion != format!("{phase}/rch_status_completion.json")
+            || !canonical_sha256(&trace.sha256)
+            || !canonical_sha256(&trace.completion_sha256)
+            || !canonical_job_id(&trace.job_id)
+            || trace.active_samples == 0
+        {
+            return Err(format!(
+                "persistent pack citation receipt carries a malformed {phase} RCH phase binding"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expected_test_target(source_path: &str) -> Result<CargoTestTarget, String> {
+    let components = source_path.split('/').collect::<Vec<_>>();
+    if components.len() < 4 || components[0] != "crates" {
+        return Err(format!(
+            "test source is outside a supported workspace crate target: `{source_path}`"
+        ));
+    }
+    match components[2] {
+        "src" if components[3] != "main.rs" && components[3] != "bin" => {
+            Ok(CargoTestTarget::Library)
+        }
+        "tests" if components.len() == 4 => {
+            let target = Path::new(components[3])
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    format!("integration-test target has no UTF-8 file stem: `{source_path}`")
+                })?;
+            Ok(CargoTestTarget::Integration(target.to_owned()))
+        }
+        _ => Err(format!(
+            "test source is not an unambiguous library or integration-test target: `{source_path}`"
+        )),
+    }
+}
+
+/// libtest reports a library unit test under its full module path, which
+/// includes the module implied by the source file itself. The baseline stores
+/// the in-file identity (`tests::foo`) so that locators and the source
+/// inventory stay anchored to what the file literally declares, but an exact
+/// `--exact` filter and the transcript success line must both use the
+/// file-derived runtime name (`page_cache::tests::foo`). Using the entry name
+/// verbatim selects zero tests for every library source other than
+/// `src/lib.rs`, which makes a canonical command silently vacuous.
+///
+/// An integration test is its own crate root, so its runtime name is the entry
+/// name unchanged.
+fn canonical_runtime_test_name(source_path: &str, test_name: &str) -> Result<String, String> {
+    if test_name.trim().is_empty() {
+        return Err(format!(
+            "test name must not be empty for source `{source_path}`"
+        ));
+    }
+    match expected_test_target(source_path)? {
+        CargoTestTarget::Integration(_) => Ok(test_name.to_owned()),
+        CargoTestTarget::Library => {
+            // A `#[path]`-remapped source is mounted under the module path of
+            // whichever module declares it, which this file-derived
+            // reconstruction cannot see. Refuse it instead of emitting a
+            // confidently wrong `--exact` filter that would select no tests.
+            if PATH_REMAPPED_LIBRARY_SOURCES.contains(&source_path) {
+                return Err(format!(
+                    "library test source is mounted through a `#[path]` declaration and has no file-derived runtime module path: `{source_path}`"
+                ));
+            }
+            // `expected_test_target` already proved the shape
+            // `crates/<package>/src/<relative...>`.
+            let components = source_path.split('/').collect::<Vec<_>>();
+            let relative = &components[3..];
+            let mut modules = Vec::new();
+            for (index, component) in relative.iter().enumerate() {
+                let is_final = index + 1 == relative.len();
+                if is_final {
+                    let stem = component.strip_suffix(".rs").ok_or_else(|| {
+                        format!("library test source is not a Rust file: `{source_path}`")
+                    })?;
+                    match stem {
+                        // Only `src/lib.rs` is the crate root; a nested
+                        // `lib.rs` is an ordinary module named `lib`.
+                        "lib" if relative.len() == 1 => {}
+                        // `foo/mod.rs` is the module `foo`, already pushed by
+                        // its parent directory component.
+                        "mod" if relative.len() > 1 => {}
+                        "mod" => {
+                            return Err(format!(
+                                "library test source has no addressable module path: `{source_path}`"
+                            ));
+                        }
+                        "" => {
+                            return Err(format!(
+                                "library test source has an empty module name: `{source_path}`"
+                            ));
+                        }
+                        named => modules.push(named.to_owned()),
+                    }
+                } else if component.is_empty() || component.ends_with(".rs") {
+                    return Err(format!(
+                        "library test source has a malformed module directory: `{source_path}`"
+                    ));
+                } else {
+                    modules.push((*component).to_owned());
+                }
+            }
+            if modules.is_empty() {
+                Ok(test_name.to_owned())
+            } else {
+                Ok(format!("{}::{test_name}", modules.join("::")))
+            }
+        }
+    }
+}
+
+fn expected_current_run_target(entry: &IgnoredTestBaseline) -> Result<CargoTestTarget, String> {
+    expected_test_target(&entry.source_path)
+}
+
+fn expected_current_run_argv(entry: &IgnoredTestBaseline) -> Result<Vec<String>, String> {
+    let package = entry.source_path.split('/').nth(1).ok_or_else(|| {
+        format!(
+            "run_for_release source has no crate directory: `{}`",
+            entry.source_path
+        )
+    })?;
+    let target = expected_current_run_target(entry)?;
+    let needs_ignored_filter = match entry.cfg_condition.as_deref() {
+        None | Some("test") => true,
+        Some("debug_assertions" | "all(debug_assertions,test)") => false,
+        Some(condition) => {
+            return Err(format!(
+                "run_for_release ignore condition `{condition}` requires a typed compilation contract"
+            ));
+        }
+    };
+    let mut argv = vec![
+        "cargo".to_owned(),
+        "test".to_owned(),
+        "--locked".to_owned(),
+        "--profile".to_owned(),
+        "release-perf".to_owned(),
+        "--package".to_owned(),
+        package.to_owned(),
+    ];
+    match target {
+        CargoTestTarget::Library => argv.push("--lib".to_owned()),
+        CargoTestTarget::Integration(target) => {
+            argv.push("--test".to_owned());
+            argv.push(target);
+        }
+    }
+    argv.extend([
+        canonical_runtime_test_name(&entry.source_path, &entry.test_name)?,
+        "--".to_owned(),
+        "--exact".to_owned(),
+    ]);
+    if needs_ignored_filter {
+        argv.push("--ignored".to_owned());
+    }
+    argv.push("--nocapture".to_owned());
+    argv.push("--test-threads=1".to_owned());
+    Ok(argv)
+}
+
+fn validate_cargo_manifest_target_contract(
+    manifest: &toml::Table,
+    crate_directory: &str,
+    entry: &IgnoredTestBaseline,
+) -> Result<(), String> {
+    validate_cargo_manifest_test_target_contract(manifest, crate_directory, &entry.source_path)
+}
+
+fn validate_cargo_manifest_test_target_contract(
+    manifest: &toml::Table,
+    crate_directory: &str,
+    source_path: &str,
+) -> Result<(), String> {
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "crate manifest has no [package] table".to_owned())?;
+    let package_name = package
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| "crate manifest has no package.name".to_owned())?;
+    if package_name != crate_directory {
+        return Err(format!(
+            "crate directory `{crate_directory}` does not equal package.name `{package_name}`; a typed target contract is required"
+        ));
+    }
+
+    match expected_test_target(source_path)? {
+        CargoTestTarget::Library => {
+            if package
+                .get("autolib")
+                .and_then(toml::Value::as_bool)
+                .is_some_and(|enabled| !enabled)
+            {
+                return Err(
+                    "run_for_release library target requires Cargo auto-discovery".to_owned(),
+                );
+            }
+            if let Some(library) = manifest.get("lib").and_then(toml::Value::as_table) {
+                if library
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|path| path != "src/lib.rs")
+                    || library
+                        .get("test")
+                        .and_then(toml::Value::as_bool)
+                        .is_some_and(|enabled| !enabled)
+                    || library
+                        .get("harness")
+                        .and_then(toml::Value::as_bool)
+                        .is_some_and(|enabled| !enabled)
+                    || library.contains_key("required-features")
+                {
+                    return Err(
+                        "run_for_release library target has a noncanonical Cargo override"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        CargoTestTarget::Integration(target) => {
+            if package
+                .get("autotests")
+                .and_then(toml::Value::as_bool)
+                .is_some_and(|enabled| !enabled)
+            {
+                return Err(
+                    "run_for_release integration target requires Cargo auto-discovery".to_owned(),
+                );
+            }
+            let relative_source = source_path
+                .strip_prefix(&format!("crates/{crate_directory}/"))
+                .expect("source identity already established the crate directory");
+            if let Some(tests) = manifest.get("test").and_then(toml::Value::as_array) {
+                for test in tests.iter().filter_map(toml::Value::as_table) {
+                    let same_name =
+                        test.get("name").and_then(toml::Value::as_str) == Some(target.as_str());
+                    let same_path = test
+                        .get("path")
+                        .and_then(toml::Value::as_str)
+                        .map(|path| normalize_source_path(Path::new(path)))
+                        .transpose()?
+                        .as_deref()
+                        == Some(relative_source);
+                    if same_name || same_path {
+                        return Err(
+                            "run_for_release integration target has an explicit Cargo override"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cargo_target_mapping(root: &Path, entry: &IgnoredTestBaseline) -> Result<(), String> {
+    validate_test_cargo_target_mapping(root, &entry.source_path, "run_for_release")
+}
+
+fn validate_test_cargo_target_mapping(
+    root: &Path,
+    source_path: &str,
+    description: &str,
+) -> Result<(), String> {
+    let crate_directory = source_path
+        .split('/')
+        .nth(1)
+        .ok_or_else(|| format!("{description} source has no crate directory: `{source_path}`"))?;
+    let manifest_path = format!("crates/{crate_directory}/Cargo.toml");
+    let manifest_description = format!("{description} crate manifest");
+    require_clean_tracked_path(root, &manifest_path, &manifest_description)?;
+    require_regular_non_symlink_path(root, &manifest_path, &manifest_description)?;
+    let manifest = fs::read_to_string(root.join(&manifest_path)).map_err(|error| {
+        format!("unable to read {description} crate manifest `{manifest_path}`: {error}")
+    })?;
+    let manifest = toml::from_str::<toml::Table>(&manifest).map_err(|error| {
+        format!("unable to parse {description} crate manifest `{manifest_path}`: {error}")
+    })?;
+    validate_cargo_manifest_test_target_contract(&manifest, crate_directory, source_path)
+        .map_err(|error| format!("invalid target mapping in `{manifest_path}`: {error}"))?;
+    if expected_test_target(source_path)? == CargoTestTarget::Library {
+        let library_root = format!("crates/{crate_directory}/src/lib.rs");
+        let library_description = format!("{description} library root");
+        require_clean_tracked_path(root, &library_root, &library_description)?;
+        require_regular_non_symlink_path(root, &library_root, &library_description)?;
+    }
+    Ok(())
+}
+
+fn count_ordinary_test_identity(
+    items: &[Item],
+    module_path: &mut Vec<String>,
+    expected_test_name: &str,
+) -> usize {
+    let mut matches = 0;
+    for item in items {
+        match item {
+            Item::Fn(function) if is_ordinary_test_function(function) => {
+                let function_name = function.sig.ident.to_string();
+                let test_name = if module_path.is_empty() {
+                    function_name
+                } else {
+                    format!("{}::{function_name}", module_path.join("::"))
+                };
+                if test_name == expected_test_name {
+                    matches += 1;
+                }
+            }
+            Item::Mod(module) => {
+                if let Some((_, nested_items)) = &module.content {
+                    module_path.push(module.ident.to_string());
+                    matches +=
+                        count_ordinary_test_identity(nested_items, module_path, expected_test_name);
+                    module_path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    matches
+}
+
+fn validate_ordinary_test_source(
+    source_path: &str,
+    source: &str,
+    test_name: &str,
+) -> Result<(), String> {
+    validate_source_test_identity(source_path, test_name)?;
+    let syntax = syn::parse_file(source)
+        .map_err(|error| format!("{source_path}: unable to parse Rust source: {error}"))?;
+    let mut module_path = Vec::new();
+    let matches = count_ordinary_test_identity(&syntax.items, &mut module_path, test_name);
+    if matches != 1 {
+        return Err(format!(
+            "declared parent `{source_path}::{test_name}` must identify exactly one ordinary #[test] function, found {matches}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_declared_parent_source(root: &Path, parent: &TestIdentity) -> Result<(), String> {
+    parent.validate()?;
+    let locator = parent.locator();
+    let description = format!("covered_by_parent source `{locator}`");
+    require_clean_tracked_path(root, &parent.source_path, &description)?;
+    require_regular_non_symlink_path(root, &parent.source_path, &description)?;
+    let bytes = fs::read(root.join(&parent.source_path)).map_err(|error| {
+        format!(
+            "unable to read covered_by_parent source `{}`: {error}",
+            parent.source_path
+        )
+    })?;
+    let source = String::from_utf8(bytes).map_err(|error| {
+        format!(
+            "covered_by_parent source `{}` is not valid UTF-8: {error}",
+            parent.source_path
+        )
+    })?;
+    validate_ordinary_test_source(&parent.source_path, &source, &parent.test_name)?;
+    validate_test_cargo_target_mapping(root, &parent.source_path, "covered_by_parent")
+}
+
+fn validate_release_evidence_manifest(
+    manifest: &ReleaseEvidenceManifest,
+    baseline: &RegressionBaseline,
+) -> Result<ValidatedCurrentRunReceipts, String> {
+    baseline
+        .validate()
+        .map_err(|error| format!("release evidence baseline is invalid: {error}"))?;
+    if manifest.schema_version != EVIDENCE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported release evidence schema version {}; expected {EVIDENCE_SCHEMA_VERSION}",
+            manifest.schema_version
+        ));
+    }
+    if manifest.tested_commit.len() != 40 || !is_lowercase_hex(&manifest.tested_commit) {
+        return Err(
+            "release evidence tested_commit must be a 40-digit lowercase hexadecimal commit"
+                .to_owned(),
+        );
+    }
+    canonical_evidence_path(&manifest.signature_path, "manifest.signature_path")?;
+    canonical_commit_evidence_path(
+        &manifest.signature_path,
+        &manifest.tested_commit,
+        "manifest.signature_path",
+    )?;
+    for (description, leaf) in [
+        ("manifest.signer_attestation", &manifest.signer_attestation),
+        ("manifest.cargo_lock", &manifest.cargo_lock),
+        ("manifest.rust_toolchain", &manifest.rust_toolchain),
+        (
+            "manifest.pre_capture_untracked",
+            &manifest.pre_capture_untracked,
+        ),
+        (
+            "manifest.compiler_inventory_attestation",
+            &manifest.compiler_inventory_attestation,
+        ),
+        (
+            "workspace.runner_receipt",
+            &manifest.workspace.runner_receipt,
+        ),
+    ] {
+        validate_evidence_leaf_shape(leaf, description)?;
+        canonical_commit_evidence_path(&leaf.path, &manifest.tested_commit, description)?;
+    }
+    validate_scorecard_evidence_shape(
+        &manifest.auxiliary_scorecards.c1,
+        &manifest.tested_commit,
+        "c1",
+    )?;
+    validate_scorecard_evidence_shape(
+        &manifest.auxiliary_scorecards.persistent,
+        &manifest.tested_commit,
+        "persistent",
+    )?;
+    validate_command_evidence_shape(&manifest.workspace.execution, "workspace")?;
+    validate_command_evidence_commit_paths(
+        &manifest.workspace.execution,
+        &manifest.tested_commit,
+        "workspace",
+    )?;
+    let expected_workspace_argv = CANONICAL_WORKSPACE_TEST_ARGV
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect::<Vec<_>>();
+    if manifest.workspace.execution.argv != expected_workspace_argv {
+        return Err(format!(
+            "workspace.argv must exactly equal the canonical command: {expected_workspace_argv:?}"
+        ));
+    }
+
+    let by_locator = baseline
+        .ignored_tests
+        .iter()
+        .map(|entry| (entry.locator(), entry))
+        .collect::<HashMap<_, _>>();
+    let guard_entry = by_locator.get(RELEASE_GUARD_LOCATOR).ok_or_else(|| {
+        format!("release baseline is missing its live guard entry `{RELEASE_GUARD_LOCATOR}`")
+    })?;
+    if guard_entry.kind != IgnoreKind::ReleaseGate
+        || guard_entry.policy != IgnorePolicy::RunForRelease
+    {
+        return Err(format!(
+            "live release guard `{RELEASE_GUARD_LOCATOR}` must retain release_gate kind and run_for_release policy"
+        ));
+    }
+
+    let expected_locators = baseline
+        .ignored_tests
+        .iter()
+        .filter(|entry| {
+            entry.policy == IgnorePolicy::RunForRelease && entry.locator() != RELEASE_GUARD_LOCATOR
+        })
+        .map(IgnoredTestBaseline::locator)
+        .collect::<HashSet<_>>();
+    let mut locators = HashSet::new();
+    let mut artifact_paths = HashSet::from([
+        manifest.workspace.execution.stdout.leaf.path.clone(),
+        manifest.workspace.execution.stderr.leaf.path.clone(),
+    ]);
+    let mut previous_locator: Option<String> = None;
+    for receipt in &manifest.run_receipts {
+        validate_source_test_identity(&receipt.source_path, &receipt.test_name)
+            .map_err(|error| format!("invalid current-run receipt identity: {error}"))?;
+        let locator = receipt.locator();
+        if previous_locator
+            .as_ref()
+            .is_some_and(|previous| previous >= &locator)
+        {
+            return Err(format!(
+                "current-run receipts must be strictly sorted and unique: `{locator}` follows `{}`",
+                previous_locator.as_deref().unwrap_or_default()
+            ));
+        }
+        previous_locator = Some(locator.clone());
+        if locator == RELEASE_GUARD_LOCATOR {
+            return Err(
+                "the live release guard cannot supply a circular external receipt".to_owned(),
+            );
+        }
+        let entry = by_locator
+            .get(&locator)
+            .ok_or_else(|| format!("current-run receipt names unknown ignored test `{locator}`"))?;
+        if entry.policy != IgnorePolicy::RunForRelease {
+            return Err(format!(
+                "current-run receipt `{locator}` targets policy `{}` instead of run_for_release",
+                entry.policy.as_str()
+            ));
+        }
+        let expected_requirement = blake3::hash(entry.evidence.requirement.as_bytes())
+            .to_hex()
+            .to_string();
+        if receipt.requirement_blake3 != expected_requirement {
+            return Err(format!(
+                "current-run receipt `{locator}` does not match the current evidence requirement"
+            ));
+        }
+        validate_command_evidence_shape(
+            &receipt.evidence.execution,
+            &format!("receipt `{locator}`"),
+        )?;
+        validate_evidence_leaf_shape(
+            &receipt.evidence.runner_receipt,
+            &format!("receipt `{locator}` runner_receipt"),
+        )?;
+        canonical_commit_evidence_path(
+            &receipt.evidence.runner_receipt.path,
+            &manifest.tested_commit,
+            &format!("receipt `{locator}` runner_receipt"),
+        )?;
+        validate_command_evidence_commit_paths(
+            &receipt.evidence.execution,
+            &manifest.tested_commit,
+            &format!("receipt `{locator}`"),
+        )?;
+        let expected_argv = expected_current_run_argv(entry)?;
+        if receipt.evidence.execution.argv != expected_argv {
+            return Err(format!(
+                "current-run receipt `{locator}` does not use its canonical exact-test command"
+            ));
+        }
+        for leaf in [
+            &receipt.evidence.execution.stdout.leaf,
+            &receipt.evidence.execution.stderr.leaf,
+        ] {
+            if !artifact_paths.insert(leaf.path.clone()) {
+                return Err(format!(
+                    "release evidence stream paths must be unique across commands: `{}`",
+                    leaf.path
+                ));
+            }
+        }
+        locators.insert(locator);
+    }
+    if locators != expected_locators {
+        let mut missing = expected_locators
+            .difference(&locators)
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort();
+        return Err(format!(
+            "current-run receipts do not cover every non-circular run_for_release entry; missing={missing:?}"
+        ));
+    }
+    let mut expected_leaves = vec![
+        manifest.signer_attestation.clone(),
+        manifest.cargo_lock.clone(),
+        manifest.rust_toolchain.clone(),
+        manifest.pre_capture_untracked.clone(),
+        manifest.compiler_inventory_attestation.clone(),
+        manifest.workspace.runner_receipt.clone(),
+        manifest.auxiliary_scorecards.c1.scorecard.clone(),
+        manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
+        manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
+        manifest.auxiliary_scorecards.persistent.scorecard.clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .pack_manifest
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .commit_provenance
+            .clone(),
+        manifest.workspace.execution.stdout.leaf.clone(),
+        manifest.workspace.execution.stderr.leaf.clone(),
+    ];
+    for receipt in &manifest.run_receipts {
+        expected_leaves.push(receipt.evidence.runner_receipt.clone());
+        expected_leaves.push(receipt.evidence.execution.stdout.leaf.clone());
+        expected_leaves.push(receipt.evidence.execution.stderr.leaf.clone());
+    }
+    expected_leaves.sort_by(|left, right| left.path.cmp(&right.path));
+    if expected_leaves
+        .windows(2)
+        .any(|pair| pair[0].path == pair[1].path)
+    {
+        return Err("manifest evidence leaves must have unique paths".to_owned());
+    }
+    if expected_leaves
+        .iter()
+        .any(|leaf| leaf.path == manifest.signature_path)
+    {
+        return Err("detached manifest signature cannot also be an evidence-pack leaf".to_owned());
+    }
+    let mut previous_pack_path: Option<&str> = None;
+    for leaf in &manifest.evidence_pack {
+        validate_evidence_leaf_shape(leaf, "evidence_pack leaf")?;
+        if previous_pack_path.is_some_and(|previous| previous >= leaf.path.as_str()) {
+            return Err("evidence_pack leaves must be strictly path-sorted and unique".to_owned());
+        }
+        previous_pack_path = Some(&leaf.path);
+    }
+    if expected_leaves.iter().any(|expected| {
+        !manifest
+            .evidence_pack
+            .iter()
+            .any(|actual| actual == expected)
+    }) {
+        return Err(
+            "evidence_pack must include every core non-self-referential evidence leaf".to_owned(),
+        );
+    }
+    Ok(ValidatedCurrentRunReceipts { locators })
+}
+
+fn require_tracked_receipt_path(root: &Path, path: &str, description: &str) -> Result<(), String> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--error-unmatch", "--", path])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("unable to verify {description} `{path}`: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{description} must be tracked by Git: `{path}`"))
+    }
+}
+
+fn require_clean_tracked_path(root: &Path, path: &str, description: &str) -> Result<(), String> {
+    require_tracked_receipt_path(root, path, description)?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--quiet", "HEAD", "--", path])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("unable to verify {description} is clean: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{description} must match the current commit exactly: `{path}`"
+        ))
+    }
+}
+
+fn require_regular_non_symlink_path(
+    root: &Path,
+    path: &str,
+    description: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(root.join(path))
+        .map_err(|error| format!("unable to inspect {description} `{path}`: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{description} must be a regular non-symlink file: `{path}`"
+        ));
+    }
+    Ok(())
+}
+
+fn read_regular_evidence_file(
+    root: &Path,
+    path: &str,
+    expected_digest: &str,
+    description: &str,
+) -> Result<Vec<u8>, String> {
+    require_clean_tracked_path(root, path, description)?;
+    require_regular_non_symlink_path(root, path, description)?;
+    let absolute_path = root.join(path);
+    let bytes = fs::read(&absolute_path)
+        .map_err(|error| format!("unable to read {description} `{path}`: {error}"))?;
+    let actual_digest = blake3::hash(&bytes).to_hex().to_string();
+    if actual_digest != expected_digest {
+        return Err(format!("{description} content hash mismatch: `{path}`"));
+    }
+    Ok(bytes)
+}
+
+fn validate_baseline_workspace_evidence(
+    root: &Path,
+    baseline: &RegressionBaseline,
+) -> Result<(), String> {
+    let evidence = baseline.baseline_evidence.as_ref().ok_or_else(|| {
+        "release regression baseline lacks a typed workspace receipt; recover it from a clean ancestor-bound run"
+            .to_owned()
+    })?;
+    if evidence.source_commit.len() != 40 || !is_lowercase_hex(&evidence.source_commit) {
+        return Err(
+            "baseline workspace receipt source_commit must be a 40-digit lowercase hexadecimal commit"
+                .to_owned(),
+        );
+    }
+    if evidence.source_commit != baseline.baseline_commit {
+        return Err(format!(
+            "baseline workspace receipt source_commit `{}` does not exactly match baseline_commit `{}`",
+            evidence.source_commit, baseline.baseline_commit
+        ));
+    }
+    validate_command_evidence_shape(&evidence.workspace.execution, "baseline workspace receipt")?;
+    let expected_argv = CANONICAL_WORKSPACE_TEST_ARGV
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect::<Vec<_>>();
+    if evidence.workspace.execution.argv != expected_argv {
+        return Err(format!(
+            "baseline workspace receipt.argv must exactly equal the canonical command: {expected_argv:?}"
+        ));
+    }
+    let transcript = validate_rch_execution(
+        root,
+        &evidence.workspace,
+        &evidence.source_commit,
+        "baseline workspace receipt",
+    )?;
+    let actual = parse_workspace_test_counts(&transcript)?;
+    let expected = RegressionCounts {
+        total_tests: baseline.total_tests,
+        passed: baseline.passed,
+        failed: baseline.failed,
+        ignored: baseline.ignored,
+    };
+    if actual != expected {
+        return Err(format!(
+            "baseline workspace transcript counts {actual:?} do not match declared baseline counts {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn release_status_record_is_allowed(record: &[u8]) -> bool {
+    record.starts_with(b"!! target/")
+}
+
+fn require_pristine_release_checkout(root: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ])
+        .output()
+        .map_err(|error| format!("unable to inspect release worktree state: {error}"))?;
+    if !output.status.success() {
+        return Err("unable to inspect release worktree state".to_owned());
+    }
+    if output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .all(release_status_record_is_allowed)
+    {
+        Ok(())
+    } else {
+        Err(
+            "release evidence requires a pristine checkout; only ignored target/ build output is allowed"
+                .to_owned(),
+        )
+    }
+}
+
+fn changed_paths_between(root: &Path, base: &str, head: &str) -> Result<HashSet<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base,
+            head,
+            "--",
+        ])
+        .output()
+        .map_err(|error| format!("unable to inspect release evidence commit delta: {error}"))?;
+    if !output.status.success() {
+        return Err("unable to inspect release evidence commit delta".to_owned());
+    }
+    let mut paths = HashSet::new();
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let raw_path = std::str::from_utf8(raw_path)
+            .map_err(|error| format!("release evidence delta path is not UTF-8: {error}"))?;
+        let normalized = normalize_source_path(Path::new(raw_path))?;
+        if normalized != raw_path || !paths.insert(normalized) {
+            return Err(format!(
+                "release evidence delta contains a noncanonical or duplicate path: `{raw_path}`"
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+fn verify_tested_commit(root: &Path, tested_commit: &str, head: &str) -> Result<(), String> {
+    if tested_commit == head {
+        return Err(
+            "release evidence must be committed in an evidence-only descendant of tested_commit"
+                .to_owned(),
+        );
+    }
+    let commit_object = format!("{tested_commit}^{{commit}}");
+    let exists = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "-e", &commit_object])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("unable to verify tested_commit: {error}"))?;
+    if !exists.success() {
+        return Err(format!(
+            "release evidence tested_commit does not resolve to a commit: `{tested_commit}`"
+        ));
+    }
+    let ancestor = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-base", "--is-ancestor", tested_commit, head])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("unable to compare tested_commit with current commit: {error}"))?;
+    if ancestor.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "release evidence tested_commit `{tested_commit}` is not an ancestor of `{head}`"
+        ))
+    }
+}
+
+fn require_direct_evidence_descendant(
+    root: &Path,
+    tested_commit: &str,
+    head: &str,
+) -> Result<(), String> {
+    verify_tested_commit(root, tested_commit, head)?;
+    let parent = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD^"])
+        .output()
+        .map_err(|error| format!("unable to resolve evidence commit parent: {error}"))?;
+    if !parent.status.success() {
+        return Err("release evidence commit must have exactly one direct parent".to_owned());
+    }
+    let parent = std::str::from_utf8(&parent.stdout)
+        .map_err(|error| format!("evidence commit parent is not UTF-8: {error}"))?
+        .trim();
+    if parent != tested_commit {
+        return Err(format!(
+            "release evidence requires HEAD^ == tested_commit; parent={parent} tested_commit={tested_commit}"
+        ));
+    }
+    let second_parent = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD^2"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("unable to inspect evidence commit parent count: {error}"))?;
+    if second_parent.success() {
+        return Err("release evidence commit must not be a merge commit".to_owned());
+    }
+    Ok(())
+}
+
+fn tested_tree_blake3(root: &Path, tested_commit: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-tree", "-r", "--full-tree", tested_commit])
+        .output()
+        .map_err(|error| format!("unable to enumerate tested tree: {error}"))?;
+    if !output.status.success() {
+        return Err("unable to enumerate tested tree".to_owned());
+    }
+    Ok(blake3::hash(&output.stdout).to_hex().to_string())
+}
+
+fn git_blob_at_commit(root: &Path, commit: &str, path: &str) -> Result<Vec<u8>, String> {
+    let object = format!("{commit}:{path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", &object])
+        .output()
+        .map_err(|error| format!("unable to read `{path}` from tested commit: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "unable to read `{path}` from tested commit `{commit}`"
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn validate_tested_commit_input(
+    root: &Path,
+    leaf: &EvidenceLeaf,
+    tested_commit: &str,
+    source_path: &str,
+) -> Result<(), String> {
+    let retained = read_evidence_leaf(root, leaf, &format!("retained `{source_path}` input"))?;
+    let committed = git_blob_at_commit(root, tested_commit, source_path)?;
+    if retained != committed {
+        return Err(format!(
+            "retained `{source_path}` bytes do not equal `git show {tested_commit}:{source_path}`"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pre_capture_untracked(
+    root: &Path,
+    leaf: &EvidenceLeaf,
+    tested_commit: &str,
+) -> Result<(), String> {
+    let bytes = read_evidence_leaf(root, leaf, "pre-capture NUL Git status transcript")?;
+    validate_pre_capture_untracked_bytes(&bytes, tested_commit)
+}
+
+fn validate_pre_capture_untracked_bytes(bytes: &[u8], tested_commit: &str) -> Result<(), String> {
+    let mut records = bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            std::str::from_utf8(record)
+                .map(str::to_owned)
+                .map_err(|error| format!("pre-capture Git status is not UTF-8: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !bytes.is_empty() && !bytes.ends_with(&[0]) {
+        return Err("pre-capture Git status transcript must retain its terminal NUL".to_owned());
+    }
+    let prefix = format!("{EVIDENCE_PATH_PREFIX}{tested_commit}/performance");
+    let expected = vec![
+        format!("?? {prefix}/c1/c1_scorecard.json"),
+        format!("?? {prefix}/persistent/persistent_scorecard.json"),
+    ];
+    if records.windows(2).any(|pair| pair[0] >= pair[1]) || records != expected {
+        records.sort();
+        return Err(format!(
+            "pre-capture Git status must be sorted and name only the two exact preexisting scorecards; found {records:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn read_evidence_leaf(
+    root: &Path,
+    leaf: &EvidenceLeaf,
+    description: &str,
+) -> Result<Vec<u8>, String> {
+    validate_evidence_leaf_shape(leaf, description)?;
+    read_regular_evidence_file(root, &leaf.path, &leaf.digest, description)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RchStatusEnvelope {
+    api_version: String,
+    command: String,
+    success: bool,
+    data: RchStatusData,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RchStatusData {
+    daemon: RchDaemonStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RchDaemonStatus {
+    active_builds: Vec<RchActiveBuild>,
+    recent_builds: Vec<RchCompletedBuild>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RchActiveBuild {
+    id: u64,
+    project_id: String,
+    worker_id: String,
+    command: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RchCompletedBuild {
+    id: u64,
+    project_id: String,
+    worker_id: String,
+    command: String,
+    exit_code: i32,
+    location: String,
+    cancellation: Option<serde_json::Value>,
+}
+
+fn parse_rch_status(bytes: &[u8], description: &str) -> Result<RchStatusEnvelope, String> {
+    let status = serde_json::from_slice::<RchStatusEnvelope>(bytes)
+        .map_err(|error| format!("unable to parse {description}: {error}"))?;
+    if status.api_version != "1.0" || status.command != "status" || !status.success {
+        return Err(format!(
+            "{description} must be a successful RCH status API v1 response"
+        ));
+    }
+    Ok(status)
+}
+
+fn one_rch_stderr_value(stderr: &str, marker: &str, description: &str) -> Result<String, String> {
+    let values = stderr
+        .lines()
+        .filter_map(|line| line.split_once(marker).map(|(_, suffix)| suffix))
+        .map(|suffix| {
+            suffix
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+                })
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [value] if !value.is_empty() => Ok(value.clone()),
+        _ => Err(format!(
+            "{description} must contain exactly one nonempty `{marker}` value"
+        )),
+    }
+}
+
+fn parse_rch_command_tokens(command: &str) -> Result<Vec<String>, String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut started = false;
+    let mut token = String::new();
+    let mut tokens = Vec::new();
+    for character in command.chars() {
+        if character == '\0' || character == '\n' || character == '\r' {
+            return Err("RCH status command contains a forbidden control character".to_owned());
+        }
+        if escaped {
+            token.push(character);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                } else {
+                    token.push(character);
+                }
+                started = true;
+            }
+            Quote::Double => {
+                match character {
+                    '"' => quote = Quote::None,
+                    '\\' => escaped = true,
+                    '$' | '`' => {
+                        return Err(
+                            "RCH status command uses unsupported shell expansion syntax".to_owned()
+                        );
+                    }
+                    _ => token.push(character),
+                }
+                started = true;
+            }
+            Quote::None => match character {
+                '\'' => {
+                    quote = Quote::Single;
+                    started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    started = true;
+                }
+                '\\' => {
+                    escaped = true;
+                    started = true;
+                }
+                value if value.is_whitespace() => {
+                    if started {
+                        tokens.push(std::mem::take(&mut token));
+                        started = false;
+                    }
+                }
+                '$' | '`' | ';' | '|' | '&' | '<' | '>' => {
+                    return Err("RCH status command uses unsupported shell syntax".to_owned());
+                }
+                _ => {
+                    token.push(character);
+                    started = true;
+                }
+            },
+        }
+    }
+    if escaped || quote != Quote::None {
+        return Err("RCH status command has an incomplete escape or quote".to_owned());
+    }
+    if started {
+        tokens.push(token);
+    }
+    if tokens.is_empty() || tokens.iter().any(String::is_empty) {
+        return Err("RCH status command must contain nonempty argument tokens".to_owned());
+    }
+    Ok(tokens)
+}
+
+fn validate_rch_status_binding(
+    receipt: &RchExecutionReceipt,
+    execution: &CommandEvidence,
+    stderr: &str,
+    active: &RchStatusEnvelope,
+    completed: &RchStatusEnvelope,
+    description: &str,
+) -> Result<(), String> {
+    let job_id = receipt
+        .job_id
+        .parse::<u64>()
+        .map_err(|error| format!("{description} RCH job id is outside u64: {error}"))?;
+    let active_matches = active
+        .data
+        .daemon
+        .active_builds
+        .iter()
+        .filter(|build| build.id == job_id)
+        .collect::<Vec<_>>();
+    let [active_build] = active_matches.as_slice() else {
+        return Err(format!(
+            "{description} active status must contain exactly one build with job id {}",
+            receipt.job_id
+        ));
+    };
+    if active_build.project_id.trim().is_empty()
+        || active_build.worker_id.trim().is_empty()
+        || parse_rch_command_tokens(&active_build.command)?.as_slice() != execution.argv.as_slice()
+        || active
+            .data
+            .daemon
+            .active_builds
+            .iter()
+            .filter(|build| build.worker_id == active_build.worker_id)
+            .count()
+            != 1
+    {
+        return Err(format!(
+            "{description} active status does not bind the sole worker-active job to its exact command"
+        ));
+    }
+    let completed_matches = completed
+        .data
+        .daemon
+        .recent_builds
+        .iter()
+        .filter(|build| build.id == job_id)
+        .collect::<Vec<_>>();
+    let [completed_build] = completed_matches.as_slice() else {
+        return Err(format!(
+            "{description} completed status must contain exactly one recent build with job id {}",
+            receipt.job_id
+        ));
+    };
+    if completed_build.project_id != active_build.project_id
+        || completed_build.worker_id != active_build.worker_id
+        || parse_rch_command_tokens(&completed_build.command)?.as_slice()
+            != execution.argv.as_slice()
+        || completed_build.exit_code != execution.exit_status
+        || completed_build.location != "remote"
+        || completed_build.cancellation.is_some()
+    {
+        return Err(format!(
+            "{description} completed status does not prove the same uncancelled remote job and exit"
+        ));
+    }
+    let selected_worker = one_rch_stderr_value(stderr, "Selected worker: ", description)?;
+    let remote_exit = one_rch_stderr_value(stderr, "Remote command finished: exit=", description)?;
+    if selected_worker != active_build.worker_id
+        || remote_exit.parse::<i32>().ok() != Some(execution.exit_status)
+    {
+        return Err(format!(
+            "{description} raw stderr does not bind the status-selected worker and terminal remote exit"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rch_execution(
+    root: &Path,
+    run: &RunEvidenceV2,
+    tested_commit: &str,
+    description: &str,
+) -> Result<String, String> {
+    validate_command_evidence_shape(&run.execution, description)?;
+    validate_command_evidence_commit_paths(&run.execution, tested_commit, description)?;
+    let stdout = read_evidence_leaf(
+        root,
+        &run.execution.stdout.leaf,
+        &format!("{description} raw stdout"),
+    )?;
+    let stderr = read_evidence_leaf(
+        root,
+        &run.execution.stderr.leaf,
+        &format!("{description} raw stderr/transcript"),
+    )?;
+    if run.execution.stdout.capture == StreamCapture::SynthesizedEmpty
+        || run.execution.stderr.capture == StreamCapture::SynthesizedEmpty
+    {
+        return Err(format!(
+            "{description} cannot certify a synthesized command stream"
+        ));
+    }
+    drop(stdout);
+    let stderr = String::from_utf8(stderr)
+        .map_err(|error| format!("{description} raw stderr is not UTF-8: {error}"))?;
+    if stderr.contains('\u{1b}') {
+        return Err(format!(
+            "{description} raw RCH stderr must be captured with color disabled"
+        ));
+    }
+
+    let receipt_bytes = read_evidence_leaf(
+        root,
+        &run.runner_receipt,
+        &format!("{description} RCH execution receipt"),
+    )?;
+    let receipt = serde_json::from_slice::<RchExecutionReceipt>(&receipt_bytes)
+        .map_err(|error| format!("unable to parse {description} RCH receipt: {error}"))?;
+    if receipt.schema_version != RCH_RECEIPT_SCHEMA_VERSION
+        || receipt.inner_cargo_argv != run.execution.argv
+        || receipt.job_id.is_empty()
+        || !receipt.job_id.bytes().all(|byte| byte.is_ascii_digit())
+        || (receipt.job_id.len() > 1 && receipt.job_id.starts_with('0'))
+    {
+        return Err(format!(
+            "{description} RCH receipt must use the canonical schema and bind Cargo argv plus a canonical decimal job id"
+        ));
+    }
+    for (name, leaf) in [
+        ("active_status", &receipt.active_status),
+        ("completed_status", &receipt.completed_status),
+    ] {
+        validate_evidence_leaf_shape(leaf, &format!("{description} {name}"))?;
+        canonical_commit_evidence_path(
+            &leaf.path,
+            tested_commit,
+            &format!("{description} {name}"),
+        )?;
+    }
+    let active_bytes = read_evidence_leaf(
+        root,
+        &receipt.active_status,
+        &format!("{description} active RCH status"),
+    )?;
+    let completed_bytes = read_evidence_leaf(
+        root,
+        &receipt.completed_status,
+        &format!("{description} completed RCH status"),
+    )?;
+    let active = parse_rch_status(&active_bytes, &format!("{description} active RCH status"))?;
+    let completed = parse_rch_status(
+        &completed_bytes,
+        &format!("{description} completed RCH status"),
+    )?;
+    validate_rch_status_binding(
+        &receipt,
+        &run.execution,
+        &stderr,
+        &active,
+        &completed,
+        description,
+    )?;
+    Ok(stderr)
+}
+
+fn run_evidence_pack_leaves(
+    root: &Path,
+    run: &RunEvidenceV2,
+    description: &str,
+) -> Result<Vec<EvidenceLeaf>, String> {
+    let receipt_bytes = read_evidence_leaf(
+        root,
+        &run.runner_receipt,
+        &format!("{description} RCH execution receipt"),
+    )?;
+    let receipt = serde_json::from_slice::<RchExecutionReceipt>(&receipt_bytes)
+        .map_err(|error| format!("unable to parse {description} RCH receipt: {error}"))?;
+    Ok(vec![
+        run.execution.stdout.leaf.clone(),
+        run.execution.stderr.leaf.clone(),
+        run.runner_receipt.clone(),
+        receipt.active_status,
+        receipt.completed_status,
+    ])
+}
+
+fn verify_manifest_signature(
+    root: &Path,
+    manifest_path: &str,
+    signature_path: &str,
+) -> Result<(), String> {
+    canonical_evidence_path(signature_path, "manifest.signature_path")?;
+    require_clean_tracked_path(root, signature_path, "detached manifest signature")?;
+    require_regular_non_symlink_path(root, signature_path, "detached manifest signature")?;
+    let status = Command::new(MINISIGN_BINARY)
+        .current_dir(root)
+        .args([
+            "-Vm",
+            manifest_path,
+            "-x",
+            signature_path,
+            "-P",
+            MINISIGN_PUBLIC_KEY_EPOCH_2,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            format!("required minisign verifier `{MINISIGN_BINARY}` is unavailable: {error}")
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(
+            "detached release evidence manifest signature did not verify with epoch-2 key"
+                .to_owned(),
+        )
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn read_compiler_inventory_leaf(
+    root: &Path,
+    leaf: &CompilerInventoryLeaf,
+    tested_commit: &str,
+) -> Result<Vec<u8>, String> {
+    canonical_commit_evidence_path(
+        &leaf.path,
+        tested_commit,
+        &format!("compiler inventory leaf `{}` path", leaf.role),
+    )?;
+    if leaf.role.trim().is_empty()
+        || leaf.role.contains('\0')
+        || leaf.sha256_algorithm != INVENTORY_SHA256_ALGORITHM
+        || leaf.sha256.len() != 64
+        || !is_lowercase_hex(&leaf.sha256)
+        || leaf.blake3_algorithm != EVIDENCE_DIGEST_ALGORITHM
+        || leaf.blake3.len() != 64
+        || !is_lowercase_hex(&leaf.blake3)
+    {
+        return Err(
+            "compiler inventory leaves require nonempty roles and lowercase SHA-256 digests"
+                .to_owned(),
+        );
+    }
+    require_clean_tracked_path(
+        root,
+        &leaf.path,
+        &format!("compiler inventory leaf `{}`", leaf.role),
+    )?;
+    require_regular_non_symlink_path(
+        root,
+        &leaf.path,
+        &format!("compiler inventory leaf `{}`", leaf.role),
+    )?;
+    let bytes = fs::read(root.join(&leaf.path)).map_err(|error| {
+        format!(
+            "unable to read compiler inventory leaf `{}`: {error}",
+            leaf.path
+        )
+    })?;
+    if sha256_hex(&bytes) != leaf.sha256 {
+        return Err(format!(
+            "compiler inventory leaf SHA-256 mismatch: `{}`",
+            leaf.path
+        ));
+    }
+    if blake3::hash(&bytes).to_hex().as_str() != leaf.blake3 {
+        return Err(format!(
+            "compiler inventory leaf BLAKE3 mismatch: `{}`",
+            leaf.path
+        ));
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct CompilerListedIdentity {
+    target: String,
+    name: String,
+    kind: String,
+}
+
+fn compiler_list_identities(transcript: &str) -> Result<Vec<CompilerListedIdentity>, String> {
+    struct TargetSection {
+        target: String,
+        tests: usize,
+        benchmarks: usize,
+    }
+
+    fn parse_list_summary(line: &str) -> Option<(usize, usize)> {
+        fn parse_count(value: &str, singular: &str, plural: &str) -> Option<usize> {
+            let (count, used_singular) = if let Some(count) = value.strip_suffix(singular) {
+                (count, true)
+            } else {
+                (value.strip_suffix(plural)?, false)
+            };
+            let count = count.parse::<usize>().ok()?;
+            ((count == 1) == used_singular).then_some(count)
+        }
+
+        let (tests, benchmarks) = line.trim().split_once(", ")?;
+        let tests = parse_count(tests, " test", " tests")?;
+        let benchmarks = parse_count(benchmarks, " benchmark", " benchmarks")?;
+        Some((tests, benchmarks))
+    }
+
+    let mut target: Option<TargetSection> = None;
+    let mut identities = Vec::new();
+    for line in transcript.lines() {
+        if let Some(section) = cargo_target_section(line) {
+            if let Some(previous) = target.take() {
+                return Err(format!(
+                    "compiler list target `{}` is missing its canonical count summary",
+                    previous.target
+                ));
+            }
+            let target_name = if line.starts_with("   Doc-tests ") {
+                format!("doc:{section}")
+            } else {
+                section
+                    .rsplit_once(" (")
+                    .and_then(|(_, path)| path.strip_suffix(')'))
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        format!("compiler list target has no canonical binary path: `{line}`")
+                    })?
+            };
+            target = Some(TargetSection {
+                target: target_name,
+                tests: 0,
+                benchmarks: 0,
+            });
+            continue;
+        }
+        if let Some((declared_tests, declared_benchmarks)) = parse_list_summary(line) {
+            let section = target.take().ok_or_else(|| {
+                "compiler list transcript contains a duplicate or unframed count summary".to_owned()
+            })?;
+            if section.tests != declared_tests || section.benchmarks != declared_benchmarks {
+                return Err(format!(
+                    "compiler list target `{}` declares {declared_tests} tests and {declared_benchmarks} benchmarks but retained {} tests and {} benchmarks",
+                    section.target, section.tests, section.benchmarks
+                ));
+            }
+            continue;
+        }
+        let Some((name, kind)) = line.rsplit_once(": ") else {
+            if target.is_some() && !line.trim().is_empty() {
+                return Err(format!(
+                    "compiler list target contains an unrecognized pre-summary line: `{line}`"
+                ));
+            }
+            continue;
+        };
+        if !matches!(kind, "test" | "benchmark") {
+            if target.is_some() {
+                return Err(format!(
+                    "compiler list target contains an unrecognized identity kind: `{line}`"
+                ));
+            }
+            continue;
+        }
+        let Some(section) = target.as_mut() else {
+            return Err(format!(
+                "compiler list identity `{name}` appeared outside a Cargo target section"
+            ));
+        };
+        if kind == "test" {
+            section.tests += 1;
+        } else {
+            section.benchmarks += 1;
+        }
+        identities.push(CompilerListedIdentity {
+            target: section.target.clone(),
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+        });
+    }
+    if let Some(section) = target {
+        return Err(format!(
+            "compiler list target `{}` is truncated before its canonical count summary",
+            section.target
+        ));
+    }
+    identities.sort();
+    if identities.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(
+            "compiler list transcript must contain a unique normalized identity set".to_owned(),
+        );
+    }
+    Ok(identities)
+}
+
+fn parse_attested_identities(
+    bytes: &[u8],
+    role: &str,
+) -> Result<Vec<CompilerListedIdentity>, String> {
+    let identities = serde_json::from_slice::<Vec<CompilerListedIdentity>>(bytes)
+        .map_err(|error| format!("unable to parse compiler `{role}` identities: {error}"))?;
+    if identities.is_empty()
+        || identities.windows(2).any(|pair| pair[0] >= pair[1])
+        || identities.iter().any(|identity| {
+            identity.target.trim().is_empty()
+                || identity.name.trim().is_empty()
+                || !matches!(identity.kind.as_str(), "test" | "benchmark")
+        })
+    {
+        return Err(format!(
+            "compiler `{role}` identities must be nonempty, strictly sorted, unique, and canonical"
+        ));
+    }
+    Ok(identities)
+}
+
+fn validate_compiler_inventory_attestation(
+    root: &Path,
+    leaf: &EvidenceLeaf,
+    tested_commit: &str,
+) -> Result<CompilerDerivedInventoryAttestation, String> {
+    let bytes = read_evidence_leaf(root, leaf, "compiler inventory attestation")?;
+    let attestation = serde_json::from_slice::<CompilerDerivedInventoryAttestation>(&bytes)
+        .map_err(|error| format!("unable to parse compiler inventory attestation: {error}"))?;
+    let expected_tree = tested_tree_blake3(root, tested_commit)?;
+    if attestation.tested_tree_blake3 != expected_tree {
+        return Err(
+            "compiler inventory attestation does not bind the exact tested tree".to_owned(),
+        );
+    }
+    for (name, digest) in [
+        ("cargo_metadata_blake3", &attestation.cargo_metadata_blake3),
+        (
+            "target_mappings_blake3",
+            &attestation.target_mappings_blake3,
+        ),
+        (
+            "active_identities_blake3",
+            &attestation.active_identities_blake3,
+        ),
+        (
+            "ignored_identities_blake3",
+            &attestation.ignored_identities_blake3,
+        ),
+        (
+            "doctest_identities_blake3",
+            &attestation.doctest_identities_blake3,
+        ),
+        (
+            "expanded_identities_blake3",
+            &attestation.expanded_identities_blake3,
+        ),
+    ] {
+        if digest.len() != 64 || !is_lowercase_hex(digest) {
+            return Err(format!(
+                "compiler inventory attestation {name} must be a 64-digit lowercase hexadecimal digest"
+            ));
+        }
+    }
+    if attestation.cfg_profile.trim().is_empty()
+        || attestation.targets.is_empty()
+        || attestation.inventory_leaves.is_empty()
+    {
+        return Err(
+            "compiler inventory attestation must contain cfg/profile and per-target inventories"
+                .to_owned(),
+        );
+    }
+    let expected_inventory_runs = [
+        (
+            "all_targets",
+            &attestation.inventory_runs.all_targets,
+            vec![
+                "cargo",
+                "test",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "--list",
+            ],
+        ),
+        (
+            "all_targets_ignored",
+            &attestation.inventory_runs.all_targets_ignored,
+            vec![
+                "cargo",
+                "test",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "--list",
+                "--ignored",
+            ],
+        ),
+        (
+            "doctests",
+            &attestation.inventory_runs.doctests,
+            vec![
+                "cargo",
+                "test",
+                "--locked",
+                "--workspace",
+                "--doc",
+                "--",
+                "--list",
+            ],
+        ),
+        (
+            "doctests_ignored",
+            &attestation.inventory_runs.doctests_ignored,
+            vec![
+                "cargo",
+                "test",
+                "--locked",
+                "--workspace",
+                "--doc",
+                "--",
+                "--list",
+                "--ignored",
+            ],
+        ),
+    ];
+    for (name, run, expected) in expected_inventory_runs {
+        validate_command_evidence_shape(&run.execution, &format!("compiler {name}"))?;
+        validate_command_evidence_commit_paths(
+            &run.execution,
+            tested_commit,
+            &format!("compiler {name}"),
+        )?;
+        validate_evidence_leaf_shape(
+            &run.runner_receipt,
+            &format!("compiler {name} runner receipt"),
+        )?;
+        canonical_commit_evidence_path(
+            &run.runner_receipt.path,
+            tested_commit,
+            &format!("compiler {name} runner receipt"),
+        )?;
+        if run.execution.argv != expected.into_iter().map(str::to_owned).collect::<Vec<_>>() {
+            return Err(format!(
+                "compiler inventory run `{name}` does not use its canonical remote Cargo list command"
+            ));
+        }
+    }
+    let mut leaves = HashMap::new();
+    let mut previous_leaf: Option<(&str, &str)> = None;
+    for leaf in &attestation.inventory_leaves {
+        if previous_leaf
+            .is_some_and(|(role, path)| (role, path) >= (leaf.role.as_str(), leaf.path.as_str()))
+        {
+            return Err(
+                "compiler inventory leaves must be strictly sorted by role and path".to_owned(),
+            );
+        }
+        previous_leaf = Some((&leaf.role, &leaf.path));
+        let bytes = read_compiler_inventory_leaf(root, leaf, tested_commit)?;
+        if leaves.insert(leaf.role.as_str(), bytes).is_some() {
+            return Err("compiler inventory leaves must use unique roles".to_owned());
+        }
+    }
+    let required_globals = [
+        ("cargo_metadata", &attestation.cargo_metadata_blake3),
+        ("target_mappings", &attestation.target_mappings_blake3),
+        ("active_identities", &attestation.active_identities_blake3),
+        ("ignored_identities", &attestation.ignored_identities_blake3),
+        ("doctest_identities", &attestation.doctest_identities_blake3),
+        (
+            "expanded_identities",
+            &attestation.expanded_identities_blake3,
+        ),
+    ];
+    for (role, expected_hash) in required_globals {
+        let bytes = leaves.get(role).ok_or_else(|| {
+            format!("compiler inventory attestation is missing required `{role}` leaf")
+        })?;
+        if blake3::hash(bytes).to_hex().as_str() != expected_hash {
+            return Err(format!(
+                "compiler inventory `{role}` aggregate does not bind its verified leaf"
+            ));
+        }
+    }
+    let all_targets_transcript = validate_rch_execution(
+        root,
+        &attestation.inventory_runs.all_targets,
+        tested_commit,
+        "compiler all-target list",
+    )?;
+    let ignored_targets_transcript = validate_rch_execution(
+        root,
+        &attestation.inventory_runs.all_targets_ignored,
+        tested_commit,
+        "compiler ignored all-target list",
+    )?;
+    let doctest_transcript = validate_rch_execution(
+        root,
+        &attestation.inventory_runs.doctests,
+        tested_commit,
+        "compiler doctest list",
+    )?;
+    let ignored_doctest_transcript = validate_rch_execution(
+        root,
+        &attestation.inventory_runs.doctests_ignored,
+        tested_commit,
+        "compiler ignored doctest list",
+    )?;
+    let listed_all = compiler_list_identities(&all_targets_transcript)?;
+    let listed_ignored = compiler_list_identities(&ignored_targets_transcript)?;
+    let listed_doctests = compiler_list_identities(&doctest_transcript)?;
+    let listed_ignored_doctests = compiler_list_identities(&ignored_doctest_transcript)?;
+    if listed_all.is_empty() || listed_doctests.is_empty() {
+        return Err(
+            "compiler all-target and doctest list transcripts must both be nonempty".to_owned(),
+        );
+    }
+    let attested_all = parse_attested_identities(
+        leaves
+            .get("active_identities")
+            .ok_or_else(|| "missing active identities leaf".to_owned())?,
+        "active",
+    )?;
+    let attested_ignored = parse_attested_identities(
+        leaves
+            .get("ignored_identities")
+            .ok_or_else(|| "missing ignored identities leaf".to_owned())?,
+        "ignored",
+    )?;
+    let attested_doctests = parse_attested_identities(
+        leaves
+            .get("doctest_identities")
+            .ok_or_else(|| "missing doctest identities leaf".to_owned())?,
+        "doctest",
+    )?;
+    if listed_all != attested_all
+        || listed_ignored != attested_ignored
+        || listed_doctests != attested_doctests
+        || listed_ignored
+            .iter()
+            .any(|identity| listed_all.binary_search(identity).is_err())
+        || listed_ignored_doctests
+            .iter()
+            .any(|identity| listed_doctests.binary_search(identity).is_err())
+    {
+        return Err(
+            "compiler-derived identity leaves do not exactly match retained remote Cargo list transcripts"
+                .to_owned(),
+        );
+    }
+    let mut previous = None;
+    for target in &attestation.targets {
+        if target.target.trim().is_empty()
+            || previous
+                .as_ref()
+                .is_some_and(|last: &String| last >= &target.target)
+            || target.source_inventory_blake3.len() != 64
+            || !is_lowercase_hex(&target.source_inventory_blake3)
+        {
+            return Err("compiler inventory attestation targets must be strictly sorted, unique, and fully hashed".to_owned());
+        }
+        let source_role = format!("target:{}:source_inventory", target.target);
+        let source = leaves.get(source_role.as_str()).ok_or_else(|| {
+            format!("compiler inventory attestation is missing `{source_role}` leaf")
+        })?;
+        if blake3::hash(source).to_hex().as_str() != target.source_inventory_blake3 {
+            return Err(format!(
+                "compiler target `{}` source inventory hash does not bind its verified leaf",
+                target.target
+            ));
+        }
+        #[derive(Deserialize)]
+        struct SourceInventory {
+            executable: String,
+            full_inventory: SourceListedInventory,
+            ignored_inventory: SourceListedInventory,
+        }
+        #[derive(Deserialize)]
+        struct SourceListedInventory {
+            entries: Vec<SourceListedTest>,
+        }
+        #[derive(Deserialize)]
+        struct SourceListedTest {
+            name: String,
+            kind: String,
+        }
+        let source_inventory =
+            serde_json::from_slice::<SourceInventory>(source).map_err(|error| {
+                format!(
+                    "unable to parse compiler target `{}` source-derived inventory: {error}",
+                    target.target
+                )
+            })?;
+        if source_inventory.executable != target.target {
+            return Err(format!(
+                "compiler target `{}` source inventory names a different target",
+                target.target
+            ));
+        }
+        let normalize = |entries: Vec<SourceListedTest>| {
+            let mut identities = entries
+                .into_iter()
+                .map(|entry| CompilerListedIdentity {
+                    target: target.target.clone(),
+                    name: entry.name,
+                    kind: entry.kind,
+                })
+                .collect::<Vec<_>>();
+            identities.sort();
+            identities
+        };
+        let source_all = normalize(source_inventory.full_inventory.entries);
+        let source_ignored = normalize(source_inventory.ignored_inventory.entries);
+        let listed_for_target = attested_all
+            .iter()
+            .filter(|identity| identity.target == target.target)
+            .cloned()
+            .collect::<Vec<_>>();
+        let ignored_for_target = attested_ignored
+            .iter()
+            .filter(|identity| identity.target == target.target)
+            .cloned()
+            .collect::<Vec<_>>();
+        if source_all != listed_for_target || source_ignored != ignored_for_target {
+            return Err(format!(
+                "compiler target `{}` source-derived inventory does not match remote Cargo list identities",
+                target.target
+            ));
+        }
+        previous = Some(target.target.clone());
+    }
+    if leaves.len() != required_globals.len() + attestation.targets.len() {
+        return Err(
+            "compiler inventory attestation contains an unknown leaf; binary hash receipts are not admissible"
+                .to_owned(),
+        );
+    }
+    Ok(attestation)
+}
+
+fn validate_single_test_transcript(
+    transcript: &str,
+    entry: &IgnoredTestBaseline,
+) -> Result<(), String> {
+    let test_name = &entry.test_name;
+    let counts = parse_workspace_test_counts(transcript)?;
+    if counts
+        != (RegressionCounts {
+            total_tests: 1,
+            passed: 1,
+            failed: 0,
+            ignored: 0,
+        })
+    {
+        return Err(format!(
+            "exact-test receipt for `{test_name}` must report exactly one selected passing test"
+        ));
+    }
+    let expected_header_prefix = match expected_current_run_target(entry)? {
+        CargoTestTarget::Library => "     Running unittests src/lib.rs (".to_owned(),
+        CargoTestTarget::Integration(target) => {
+            format!("     Running tests/{target}.rs (")
+        }
+    };
+    let target_headers = transcript
+        .lines()
+        .filter(|line| cargo_target_section(line).is_some())
+        .collect::<Vec<_>>();
+    if !matches!(
+        target_headers.as_slice(),
+        [header] if header.starts_with(&expected_header_prefix)
+    ) {
+        return Err(format!(
+            "exact-test receipt for `{test_name}` does not identify its canonical Cargo target"
+        ));
+    }
+    // libtest prints the file-derived runtime module path, not the in-file
+    // identity the baseline stores, so the success line must be matched
+    // against the same canonical name the argv filter selects.
+    let runtime_test_name = canonical_runtime_test_name(&entry.source_path, test_name)?;
+    let expected_result = format!("test {runtime_test_name} ... ok");
+    if transcript
+        .lines()
+        .filter(|line| line.trim() == expected_result)
+        .count()
+        != 1
+    {
+        return Err(format!(
+            "exact-test receipt does not contain one matching success line for `{runtime_test_name}`"
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_current_head(root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .map_err(|error| format!("unable to resolve current release commit: {error}"))?;
+    if !output.status.success() {
+        return Err("unable to resolve current release commit".to_owned());
+    }
+    let head = std::str::from_utf8(&output.stdout)
+        .map_err(|error| format!("current release commit is not valid UTF-8: {error}"))?
+        .trim_end_matches(['\r', '\n']);
+    if head.len() != 40 || !is_lowercase_hex(head) {
+        return Err(format!(
+            "current release commit is not a canonical full Git object name: `{head}`"
+        ));
+    }
+    Ok(head.to_owned())
+}
+
+fn load_release_evidence_manifest(
+    root: &Path,
+    head: &str,
+    baseline: &RegressionBaseline,
+) -> Result<ValidatedReleaseEvidence, String> {
+    let manifest_path = std::env::var(EVIDENCE_MANIFEST_ENV)
+        .map_err(|error| format!("missing {EVIDENCE_MANIFEST_ENV}: {error}"))?;
+    let expected_manifest_digest = parse_required_lowercase_hex(EVIDENCE_MANIFEST_BLAKE3_ENV, 64)?;
+    load_release_evidence_manifest_from_path(
+        root,
+        head,
+        baseline,
+        &manifest_path,
+        &expected_manifest_digest,
+    )
+}
+
+fn load_release_evidence_manifest_from_path(
+    root: &Path,
+    head: &str,
+    baseline: &RegressionBaseline,
+    manifest_path: &str,
+    expected_manifest_digest: &str,
+) -> Result<ValidatedReleaseEvidence, String> {
+    canonical_evidence_path(manifest_path, "release evidence manifest path")?;
+    let manifest_bytes = read_regular_evidence_file(
+        root,
+        manifest_path,
+        expected_manifest_digest,
+        "release evidence manifest",
+    )?;
+    let manifest = serde_json::from_slice::<ReleaseEvidenceManifest>(&manifest_bytes)
+        .map_err(|error| format!("unable to parse release evidence manifest: {error}"))?;
+    let current_run_receipts = validate_release_evidence_manifest(&manifest, baseline)?;
+    for entry in baseline.ignored_tests.iter().filter(|entry| {
+        entry.policy == IgnorePolicy::RunForRelease && entry.locator() != RELEASE_GUARD_LOCATOR
+    }) {
+        validate_cargo_target_mapping(root, entry)?;
+    }
+    require_direct_evidence_descendant(root, &manifest.tested_commit, head)?;
+
+    let baseline_commit_object = format!("{}^{{commit}}", baseline.baseline_commit);
+    let baseline_is_ancestor = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            &baseline_commit_object,
+            &manifest.tested_commit,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("unable to compare baseline and tested commits: {error}"))?;
+    if !baseline_is_ancestor.success() {
+        return Err(format!(
+            "baseline_commit `{}` is not an ancestor of tested_commit `{}`",
+            baseline.baseline_commit, manifest.tested_commit
+        ));
+    }
+
+    verify_manifest_signature(root, manifest_path, &manifest.signature_path)?;
+    let expected_manifest_path = format!(
+        "{EVIDENCE_PATH_PREFIX}{}/manifest.json",
+        manifest.tested_commit
+    );
+    let expected_signature_path = format!(
+        "{EVIDENCE_PATH_PREFIX}{}/signing/manifest.minisig",
+        manifest.tested_commit
+    );
+    if manifest_path != expected_manifest_path || manifest.signature_path != expected_signature_path
+    {
+        return Err(format!(
+            "release manifest and signature must use exact commit-specific paths `{expected_manifest_path}` and `{expected_signature_path}`"
+        ));
+    }
+    validate_tested_commit_input(
+        root,
+        &manifest.cargo_lock,
+        &manifest.tested_commit,
+        "Cargo.lock",
+    )?;
+    validate_tested_commit_input(
+        root,
+        &manifest.rust_toolchain,
+        &manifest.tested_commit,
+        "rust-toolchain.toml",
+    )?;
+    validate_pre_capture_untracked(
+        root,
+        &manifest.pre_capture_untracked,
+        &manifest.tested_commit,
+    )?;
+    let compiler_inventory = validate_compiler_inventory_attestation(
+        root,
+        &manifest.compiler_inventory_attestation,
+        &manifest.tested_commit,
+    )?;
+    let mut expected_pack = HashMap::new();
+    let mut insert_pack_leaf = |leaf: EvidenceLeaf| -> Result<(), String> {
+        if expected_pack
+            .insert(
+                leaf.path.clone(),
+                (leaf.digest_algorithm.clone(), leaf.digest),
+            )
+            .is_some()
+        {
+            return Err("release evidence pack has duplicate declared leaf paths".to_owned());
+        }
+        Ok(())
+    };
+    for leaf in [
+        manifest.signer_attestation.clone(),
+        manifest.cargo_lock.clone(),
+        manifest.rust_toolchain.clone(),
+        manifest.pre_capture_untracked.clone(),
+        manifest.compiler_inventory_attestation.clone(),
+        manifest.auxiliary_scorecards.c1.scorecard.clone(),
+        manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
+        manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
+        manifest.auxiliary_scorecards.persistent.scorecard.clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .pack_manifest
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .commit_provenance
+            .clone(),
+    ] {
+        insert_pack_leaf(leaf)?;
+    }
+    for leaf in run_evidence_pack_leaves(root, &manifest.workspace, "workspace")? {
+        insert_pack_leaf(leaf)?;
+    }
+    for receipt in &manifest.run_receipts {
+        for leaf in run_evidence_pack_leaves(
+            root,
+            &receipt.evidence,
+            &format!("current-run receipt `{}`", receipt.locator()),
+        )? {
+            insert_pack_leaf(leaf)?;
+        }
+    }
+    for (name, run) in [
+        (
+            "compiler all-target list",
+            &compiler_inventory.inventory_runs.all_targets,
+        ),
+        (
+            "compiler ignored all-target list",
+            &compiler_inventory.inventory_runs.all_targets_ignored,
+        ),
+        (
+            "compiler doctest list",
+            &compiler_inventory.inventory_runs.doctests,
+        ),
+        (
+            "compiler ignored doctest list",
+            &compiler_inventory.inventory_runs.doctests_ignored,
+        ),
+    ] {
+        for leaf in run_evidence_pack_leaves(root, run, name)? {
+            insert_pack_leaf(leaf)?;
+        }
+    }
+    for leaf in &compiler_inventory.inventory_leaves {
+        insert_pack_leaf(EvidenceLeaf {
+            path: leaf.path.clone(),
+            digest_algorithm: leaf.blake3_algorithm.clone(),
+            digest: leaf.blake3.clone(),
+        })?;
+    }
+    drop(insert_pack_leaf);
+    let actual_pack = manifest
+        .evidence_pack
+        .iter()
+        .map(|leaf| {
+            (
+                leaf.path.clone(),
+                (leaf.digest_algorithm.clone(), leaf.digest.clone()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    if actual_pack != expected_pack {
+        return Err("evidence_pack must exactly cover all verified compiler inventory leaves and core evidence leaves".to_owned());
+    }
+    let _signer_attestation =
+        read_evidence_leaf(root, &manifest.signer_attestation, "signer attestation")?;
+    validate_scorecard_evidence(
+        root,
+        &manifest.auxiliary_scorecards.c1,
+        "c1",
+        &manifest.tested_commit,
+    )?;
+    validate_scorecard_evidence(
+        root,
+        &manifest.auxiliary_scorecards.persistent,
+        "persistent",
+        &manifest.tested_commit,
+    )?;
+    let mut evidence_paths =
+        HashSet::from([manifest_path.to_owned(), manifest.signature_path.clone()]);
+    for leaf in &manifest.evidence_pack {
+        evidence_paths.insert(leaf.path.clone());
+    }
+    let changed_paths = changed_paths_between(root, &manifest.tested_commit, head)?;
+    if changed_paths != evidence_paths {
+        let mut unexpected = changed_paths
+            .difference(&evidence_paths)
+            .cloned()
+            .collect::<Vec<_>>();
+        unexpected.sort();
+        let mut stale = evidence_paths
+            .difference(&changed_paths)
+            .cloned()
+            .collect::<Vec<_>>();
+        stale.sort();
+        return Err(format!(
+            "tested_commit..HEAD must be an exact evidence-only delta; unexpected={unexpected:?} unchanged_evidence={stale:?}"
+        ));
+    }
+    require_pristine_release_checkout(root)?;
+
+    let workspace_transcript = validate_rch_execution(
+        root,
+        &manifest.workspace,
+        &manifest.tested_commit,
+        "workspace",
+    )?;
+    let workspace_counts = parse_workspace_test_counts(&workspace_transcript)?;
+    for receipt in &manifest.run_receipts {
+        let transcript = validate_rch_execution(
+            root,
+            &receipt.evidence,
+            &manifest.tested_commit,
+            &format!("current-run receipt `{}`", receipt.locator()),
+        )?;
+        let entry = baseline
+            .ignored_tests
+            .iter()
+            .find(|entry| entry.locator() == receipt.locator())
+            .ok_or_else(|| {
+                format!(
+                    "validated current-run receipt disappeared from baseline: `{}`",
+                    receipt.locator()
+                )
+            })?;
+        validate_single_test_transcript(&transcript, entry)?;
+    }
+
+    let parent_coverage = validate_covered_by_parent_evidence(
+        root,
+        baseline,
+        &workspace_transcript,
+        &current_run_receipts,
+    )?;
+
+    Ok(ValidatedReleaseEvidence {
+        tested_commit: manifest.tested_commit,
+        workspace_transcript,
+        workspace_counts,
+        current_run_receipts,
+        parent_coverage,
+        compiler_inventory_attested: true,
+    })
+}
+
+fn parse_regression_baseline(path: &Path) -> Result<RegressionBaseline, String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("unable to read baseline at {}: {error}", path.display()))?;
-    serde_json::from_slice::<RegressionBaseline>(&bytes).map_err(|error| {
+    let baseline = serde_json::from_slice::<RegressionBaseline>(&bytes).map_err(|error| {
         format!(
             "unable to parse baseline JSON at {}: {error}",
             path.display()
         )
-    })
+    })?;
+    baseline
+        .validate()
+        .map_err(|error| format!("invalid regression baseline at {}: {error}", path.display()))?;
+    Ok(baseline)
+}
+
+fn load_regression_baseline(
+    path: &Path,
+    root: &Path,
+    head: &str,
+) -> Result<RegressionBaseline, String> {
+    let relative_path = path.strip_prefix(root).map_err(|error| {
+        format!(
+            "regression baseline path is outside the repository root: {}: {error}",
+            path.display()
+        )
+    })?;
+    let relative_path = normalize_source_path(relative_path)?;
+    if relative_path != REGRESSION_BASELINE_PATH {
+        return Err(format!(
+            "release regression baseline must use `{REGRESSION_BASELINE_PATH}`, found `{relative_path}`"
+        ));
+    }
+    require_clean_tracked_path(root, &relative_path, "release regression baseline")?;
+    require_regular_non_symlink_path(root, &relative_path, "release regression baseline")?;
+    let baseline = parse_regression_baseline(path)?;
+    let commit_object = format!("{}^{{commit}}", baseline.baseline_commit);
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "-e", &commit_object])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("unable to verify baseline_commit: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "baseline_commit `{}` does not resolve to a Git commit in {}",
+            baseline.baseline_commit,
+            root.display()
+        ));
+    }
+    validate_baseline_workspace_evidence(root, &baseline)?;
+    let baseline_ancestor_status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            &baseline.baseline_commit,
+            head,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            format!("unable to compare baseline_commit with current commit: {error}")
+        })?;
+    if !baseline_ancestor_status.success() {
+        return Err(format!(
+            "baseline_commit `{}` is not an ancestor of current commit `{head}`",
+            baseline.baseline_commit
+        ));
+    }
+    for entry in &baseline.ignored_tests {
+        let Some(receipt) = &entry.evidence.receipt else {
+            continue;
+        };
+        let receipt_commit = format!("{}^{{commit}}", receipt.source_commit);
+        let commit_status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["cat-file", "-e", &receipt_commit])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("unable to verify receipt source commit: {error}"))?;
+        if !commit_status.success() {
+            return Err(format!(
+                "ignored-test receipt for `{}` names a missing source commit {}",
+                entry.locator(),
+                receipt.source_commit
+            ));
+        }
+        let ancestor_status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["merge-base", "--is-ancestor", &receipt.source_commit, head])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("unable to compare receipt source commit: {error}"))?;
+        if !ancestor_status.success() {
+            return Err(format!(
+                "ignored-test receipt source commit {} is not an ancestor of current commit {head}",
+                receipt.source_commit
+            ));
+        }
+        require_tracked_receipt_path(root, &entry.source_path, "receipt-covered source")?;
+        require_tracked_receipt_path(root, &receipt.artifact_path, "receipt artifact")?;
+        let mut diff_command = Command::new("git");
+        diff_command
+            .arg("-C")
+            .arg(root)
+            .args(["diff", "--quiet", &receipt.source_commit, head, "--"])
+            .arg(&entry.source_path);
+        let diff_status = diff_command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("unable to compare receipt-covered sources: {error}"))?;
+        match diff_status.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Err(format!(
+                    "ignored-test receipt for `{}` is stale because its covered source changed",
+                    entry.locator()
+                ));
+            }
+            _ => return Err("unable to compare receipt-covered sources".to_owned()),
+        }
+        let mut worktree_command = Command::new("git");
+        worktree_command
+            .arg("-C")
+            .arg(root)
+            .args(["diff", "--quiet", "HEAD", "--"])
+            .arg(&entry.source_path)
+            .arg(&receipt.artifact_path);
+        let worktree_status = worktree_command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("unable to verify receipt inputs are clean: {error}"))?;
+        if !worktree_status.success() {
+            return Err(format!(
+                "ignored-test receipt for `{}` has uncommitted source or artifact changes",
+                entry.locator()
+            ));
+        }
+        let artifact_path = root.join(&receipt.artifact_path);
+        let metadata = fs::symlink_metadata(&artifact_path).map_err(|error| {
+            format!(
+                "unable to inspect ignored-test receipt artifact `{}`: {error}",
+                receipt.artifact_path
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "ignored-test receipt artifact must be a regular non-symlink file: `{}`",
+                receipt.artifact_path
+            ));
+        }
+        let artifact = fs::read(&artifact_path).map_err(|error| {
+            format!(
+                "unable to read ignored-test receipt artifact `{}`: {error}",
+                receipt.artifact_path
+            )
+        })?;
+        let actual_digest = blake3::hash(&artifact).to_hex().to_string();
+        if actual_digest != receipt.artifact_blake3 {
+            return Err(format!(
+                "ignored-test receipt artifact digest mismatch for `{}`",
+                receipt.artifact_path
+            ));
+        }
+    }
+    Ok(baseline)
 }
 
 fn parse_count_segment(segment: &str, label: &str) -> Option<u64> {
@@ -91,7 +4895,9 @@ fn parse_count_segment(segment: &str, label: &str) -> Option<u64> {
 }
 
 fn parse_summary_line(line: &str) -> Option<RegressionCounts> {
-    if !line.contains("test result:") {
+    let result = line.strip_prefix("test result: ")?;
+    let outcome = result.split_whitespace().next()?;
+    if !matches!(outcome, "ok." | "FAILED.") {
         return None;
     }
 
@@ -100,21 +4906,30 @@ fn parse_summary_line(line: &str) -> Option<RegressionCounts> {
     let mut ignored = None;
 
     for segment in line.split(';') {
-        if passed.is_none() {
-            passed = parse_count_segment(segment, "passed");
+        if let Some(count) = parse_count_segment(segment, "passed") {
+            if passed.replace(count).is_some() {
+                return None;
+            }
         }
-        if failed.is_none() {
-            failed = parse_count_segment(segment, "failed");
+        if let Some(count) = parse_count_segment(segment, "failed") {
+            if failed.replace(count).is_some() {
+                return None;
+            }
         }
-        if ignored.is_none() {
-            ignored = parse_count_segment(segment, "ignored");
+        if let Some(count) = parse_count_segment(segment, "ignored") {
+            if ignored.replace(count).is_some() {
+                return None;
+            }
         }
     }
 
     let passed = passed?;
     let failed = failed?;
     let ignored = ignored?;
-    let total_tests = passed.saturating_add(failed).saturating_add(ignored);
+    if (outcome == "ok." && failed != 0) || (outcome == "FAILED." && failed == 0) {
+        return None;
+    }
+    let total_tests = passed.checked_add(failed)?.checked_add(ignored)?;
 
     Some(RegressionCounts {
         total_tests,
@@ -124,22 +4939,253 @@ fn parse_summary_line(line: &str) -> Option<RegressionCounts> {
     })
 }
 
-fn parse_workspace_test_counts(output: &str) -> Result<RegressionCounts, String> {
-    let mut totals = RegressionCounts::zero();
-    let mut summary_lines = 0_u64;
-
-    for line in output.lines() {
-        if let Some(parsed) = parse_summary_line(line) {
-            summary_lines = summary_lines.saturating_add(1);
-            totals.add(parsed);
+fn cargo_target_section(line: &str) -> Option<&str> {
+    if let Some(section) = line.strip_prefix("     Running ") {
+        if !section.is_empty() && section.contains(" (") && section.ends_with(')') {
+            return Some(section);
         }
     }
 
-    if summary_lines == 0 {
-        return Err("no cargo test summary lines were found in output".to_owned());
+    let section = line.strip_prefix("   Doc-tests ")?;
+    (!section.trim().is_empty() && section == section.trim_end()).then_some(section)
+}
+
+fn parse_workspace_test_counts(output: &str) -> Result<RegressionCounts, String> {
+    if output.contains('\u{1b}') {
+        return Err("workspace transcript contains ANSI escape sequences".to_owned());
     }
 
+    let mut totals = RegressionCounts::zero();
+    let mut active_section: Option<String> = None;
+    let mut active_summary: Option<RegressionCounts> = None;
+
+    for line in output.lines() {
+        if let Some(section_header) = cargo_target_section(line) {
+            if let Some(section) = active_section.take() {
+                let summary = active_summary.take().ok_or_else(|| {
+                    format!("cargo target section `{section}` had no test-result summary")
+                })?;
+                totals.checked_add(summary)?;
+            }
+            active_section = Some(section_header.to_owned());
+            continue;
+        }
+
+        if line.starts_with("test result: ") {
+            let parsed = parse_summary_line(line)
+                .ok_or_else(|| format!("malformed cargo test summary line: {line}"))?;
+            if active_section.is_none() {
+                return Err(format!(
+                    "cargo test summary appeared outside a target section: {line}"
+                ));
+            }
+            // Subprocess helpers can emit their own summaries into a parent
+            // target's captured output. The outer harness summary is last and
+            // is therefore the only authoritative count for this section.
+            active_summary = Some(parsed);
+        }
+    }
+
+    let section = active_section
+        .ok_or_else(|| "no cargo test target sections were found in output".to_owned())?;
+    let summary = active_summary
+        .ok_or_else(|| format!("cargo target section `{section}` had no test-result summary"))?;
+    totals.checked_add(summary)?;
+
     Ok(totals)
+}
+
+fn workspace_parent_test_passed(output: &str, parent: &TestIdentity) -> Result<bool, String> {
+    if output.contains('\u{1b}') {
+        return Err("workspace transcript contains ANSI escape sequences".to_owned());
+    }
+    let expected_header_prefix = match expected_test_target(&parent.source_path)? {
+        CargoTestTarget::Library => "     Running unittests src/lib.rs (".to_owned(),
+        CargoTestTarget::Integration(target) => {
+            format!("     Running tests/{target}.rs (")
+        }
+    };
+    let expected_result = format!("test {} ... ok", parent.test_name);
+    let mut matching_sections = 0_usize;
+    let mut in_matching_section = false;
+    let mut successes_since_summary = 0_u64;
+    let mut authoritative_successes = 0_u64;
+    let mut authoritative_passed = 0_u64;
+    let mut matching_summaries = 0_usize;
+    let mut matching_summary_is_green = false;
+
+    for line in output.lines() {
+        if cargo_target_section(line).is_some() {
+            in_matching_section = line.starts_with(&expected_header_prefix);
+            if in_matching_section {
+                matching_sections += 1;
+            }
+            continue;
+        }
+        if !in_matching_section {
+            continue;
+        }
+        if line == expected_result {
+            successes_since_summary += 1;
+        }
+        if line.starts_with("test result: ") {
+            let summary = parse_summary_line(line).ok_or_else(|| {
+                format!(
+                    "malformed Cargo summary in parent target for `{}`: {line}",
+                    parent.locator()
+                )
+            })?;
+            matching_summaries += 1;
+            authoritative_successes = successes_since_summary;
+            authoritative_passed = summary.passed;
+            successes_since_summary = 0;
+            matching_summary_is_green = summary.failed == 0;
+        }
+    }
+
+    if matching_sections == 0 {
+        return Ok(false);
+    }
+    if successes_since_summary != 0 {
+        return Err(format!(
+            "declared parent `{}` has an exact success line after its final authoritative test summary",
+            parent.locator()
+        ));
+    }
+    if matching_sections != 1 {
+        return Err(format!(
+            "declared parent `{}` has {matching_sections} matching Cargo target sections; source-to-target binding is ambiguous",
+            parent.locator()
+        ));
+    }
+    if matching_summaries == 0 {
+        return Err(format!(
+            "declared parent `{}` target has no authoritative test summary",
+            parent.locator()
+        ));
+    }
+    if !matching_summary_is_green {
+        return Ok(false);
+    }
+    if authoritative_successes > 1 {
+        return Err(format!(
+            "declared parent `{}` has duplicate exact success lines",
+            parent.locator()
+        ));
+    }
+    if authoritative_successes > authoritative_passed {
+        return Err(format!(
+            "declared parent `{}` has an exact success line but its authoritative summary reports {authoritative_passed} passed tests",
+            parent.locator()
+        ));
+    }
+    Ok(authoritative_successes == 1)
+}
+
+fn resolve_parent_coverage(
+    entries: &[IgnoredTestBaseline],
+    direct_parent_executions: &HashSet<String>,
+) -> ValidatedParentCoverage {
+    let mut covered_entries = entries
+        .iter()
+        .filter(|entry| entry.policy == IgnorePolicy::CoveredByParent)
+        .collect::<Vec<_>>();
+    covered_entries.sort_by_key(|entry| entry.locator());
+
+    let mut proven = direct_parent_executions.clone();
+    let mut covered_children = HashSet::new();
+    loop {
+        let mut made_progress = false;
+        for entry in &covered_entries {
+            let locator = entry.locator();
+            if covered_children.contains(&locator) {
+                continue;
+            }
+            if entry
+                .parent_tests
+                .iter()
+                .map(TestIdentity::locator)
+                .all(|parent| proven.contains(&parent))
+            {
+                proven.insert(locator.clone());
+                covered_children.insert(locator);
+                made_progress = true;
+            }
+        }
+        if !made_progress {
+            break;
+        }
+    }
+
+    ValidatedParentCoverage { covered_children }
+}
+
+fn validate_covered_by_parent_evidence(
+    root: &Path,
+    baseline: &RegressionBaseline,
+    workspace_transcript: &str,
+    current_run_receipts: &ValidatedCurrentRunReceipts,
+) -> Result<ValidatedParentCoverage, String> {
+    let covered_locators = baseline
+        .ignored_tests
+        .iter()
+        .filter(|entry| entry.policy == IgnorePolicy::CoveredByParent)
+        .map(IgnoredTestBaseline::locator)
+        .collect::<HashSet<_>>();
+    let mut parents = baseline
+        .ignored_tests
+        .iter()
+        .flat_map(|entry| entry.parent_tests.iter().cloned())
+        .collect::<Vec<_>>();
+    parents.sort();
+    parents.dedup();
+
+    let mut direct_parent_executions = HashSet::new();
+    for parent in parents {
+        validate_declared_parent_source(root, &parent)?;
+        let locator = parent.locator();
+        if covered_locators.contains(&locator) {
+            continue;
+        }
+        if current_run_receipts.contains(&locator)
+            || workspace_parent_test_passed(workspace_transcript, &parent)?
+        {
+            direct_parent_executions.insert(locator);
+        }
+    }
+
+    Ok(resolve_parent_coverage(
+        &baseline.ignored_tests,
+        &direct_parent_executions,
+    ))
+}
+
+fn parse_required_lowercase_hex(name: &str, expected_len: usize) -> Result<String, String> {
+    let value = std::env::var(name).map_err(|error| format!("missing {name}: {error}"))?;
+    if value.len() != expected_len || !is_lowercase_hex(&value) {
+        return Err(format!(
+            "{name} must be exactly {expected_len} lowercase hexadecimal digits"
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_live_release_guard_invocation(arguments: &[String]) -> Result<(), String> {
+    let test_name = RELEASE_GUARD_LOCATOR
+        .rsplit_once("::")
+        .map(|(_, test_name)| test_name)
+        .expect("release guard locator contains a test name");
+    if !arguments.iter().any(|argument| argument == test_name)
+        || !arguments.iter().any(|argument| argument == "--exact")
+        || !arguments.iter().any(|argument| argument == "--ignored")
+        || arguments.iter().any(|argument| argument == "--skip")
+    {
+        return Err(
+            "live release guard must be selected by its exact name with --exact and --ignored"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn as_i64(value: i128) -> i64 {
@@ -185,12 +5231,6 @@ fn compare_against_baseline(
             baseline.passed, actual.passed
         ));
     }
-    if actual.ignored > baseline.ignored {
-        reasons.push(format!(
-            "ignored increased from {} to {}",
-            baseline.ignored, actual.ignored
-        ));
-    }
     if actual.total_tests < baseline.total_tests {
         reasons.push(format!(
             "total tests decreased from {} to {}",
@@ -219,10 +5259,1245 @@ fn extract_failed_tests(output: &str) -> Vec<String> {
     failed
 }
 
+fn compare_ignored_test_taxonomy(
+    expected: &[IgnoredTestBaseline],
+    actual: &[IgnoredTestSource],
+) -> Vec<String> {
+    let mut expected = expected.iter().collect::<Vec<_>>();
+    expected.sort_by_key(|entry| entry.locator());
+    let mut actual = actual.iter().collect::<Vec<_>>();
+    actual.sort_by_key(|entry| entry.locator());
+
+    let mut mismatches = Vec::new();
+    let mut expected_index = 0;
+    let mut actual_index = 0;
+    while expected_index < expected.len() || actual_index < actual.len() {
+        match (expected.get(expected_index), actual.get(actual_index)) {
+            (Some(expected_entry), Some(actual_entry)) => {
+                let expected_locator = expected_entry.locator();
+                let actual_locator = actual_entry.locator();
+                match expected_locator.cmp(&actual_locator) {
+                    std::cmp::Ordering::Less => {
+                        mismatches.push(format!(
+                            "missing {expected_locator}: baseline entry has no matching source ignore"
+                        ));
+                        expected_index += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        mismatches.push(format!(
+                            "unclassified {actual_locator}: reason={:?} cfg_condition={:?}",
+                            actual_entry.reason, actual_entry.cfg_condition
+                        ));
+                        actual_index += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let expected_source = expected_entry.source_identity();
+                        let mut changed_fields = Vec::new();
+                        if expected_source.reason != actual_entry.reason {
+                            changed_fields.push(format!(
+                                "reason expected={:?} actual={:?}",
+                                expected_source.reason, actual_entry.reason
+                            ));
+                        }
+                        if expected_source.cfg_condition != actual_entry.cfg_condition {
+                            changed_fields.push(format!(
+                                "cfg_condition expected={:?} actual={:?}",
+                                expected_source.cfg_condition, actual_entry.cfg_condition
+                            ));
+                        }
+                        if !changed_fields.is_empty() {
+                            mismatches.push(format!(
+                                "changed {expected_locator}: {}",
+                                changed_fields.join("; ")
+                            ));
+                        }
+                        expected_index += 1;
+                        actual_index += 1;
+                    }
+                }
+            }
+            (Some(expected_entry), None) => {
+                let locator = expected_entry.locator();
+                mismatches.push(format!(
+                    "missing {locator}: baseline entry has no matching source ignore"
+                ));
+                expected_index += 1;
+            }
+            (None, Some(actual_entry)) => {
+                mismatches.push(format!(
+                    "unclassified {}: reason={:?} cfg_condition={:?}",
+                    actual_entry.locator(),
+                    actual_entry.reason,
+                    actual_entry.cfg_condition
+                ));
+                actual_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    mismatches
+}
+
+fn ignored_test_release_blockers(
+    entries: &[IgnoredTestBaseline],
+    current_run_receipts: &ValidatedCurrentRunReceipts,
+    parent_coverage: &ValidatedParentCoverage,
+    live_release_guard: bool,
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let locator = entry.locator();
+            match entry.policy {
+                IgnorePolicy::BlockRelease => Some(format!(
+                    "{locator}: block_release policy remains unresolved"
+                )),
+                IgnorePolicy::RunForRelease
+                    if !(current_run_receipts.contains(&locator)
+                        || (live_release_guard && locator == RELEASE_GUARD_LOCATOR)) =>
+                {
+                    Some(format!(
+                        "{locator}: run_for_release lacks validated current-run evidence"
+                    ))
+                }
+                IgnorePolicy::CoveredByParent if !parent_coverage.contains(&locator) => {
+                    Some(format!(
+                        "{locator}: covered_by_parent lacks validated execution evidence for every declared parent"
+                    ))
+                }
+                IgnorePolicy::CoveredByParent
+                | IgnorePolicy::RunForRelease
+                | IgnorePolicy::Exempt => None,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseGateEvaluation {
+    aggregate: RegressionReport,
+    uninspected_sources: Vec<String>,
+    inventory_soundness_limitations: Vec<String>,
+    taxonomy_mismatches: Vec<String>,
+    policy_blockers: Vec<String>,
+}
+
+impl ReleaseGateEvaluation {
+    fn passes(&self) -> bool {
+        self.aggregate.pass
+            && self.uninspected_sources.is_empty()
+            && self.inventory_soundness_limitations.is_empty()
+            && self.taxonomy_mismatches.is_empty()
+            && self.policy_blockers.is_empty()
+    }
+
+    fn failure_summary(&self) -> String {
+        let mut reasons = Vec::new();
+        if let Some(reason) = &self.aggregate.reason {
+            reasons.push(reason.clone());
+        }
+        if !self.uninspected_sources.is_empty() {
+            reasons.push(format!(
+                "{} tracked Rust source(s) remain explicitly uninspected",
+                self.uninspected_sources.len()
+            ));
+        }
+        if !self.inventory_soundness_limitations.is_empty() {
+            reasons.push(format!(
+                "ignored-test inventory has {} unresolved soundness limitation(s)",
+                self.inventory_soundness_limitations.len()
+            ));
+        }
+        if !self.taxonomy_mismatches.is_empty() {
+            reasons.push(format!(
+                "ignored-test taxonomy has {} mismatch(es)",
+                self.taxonomy_mismatches.len()
+            ));
+        }
+        if !self.policy_blockers.is_empty() {
+            reasons.push(format!(
+                "ignored-test policy has {} unresolved release blocker(s)",
+                self.policy_blockers.len()
+            ));
+        }
+        if reasons.is_empty() {
+            "release gate failed without a classified reason".to_owned()
+        } else {
+            reasons.join("; ")
+        }
+    }
+}
+
+fn evaluate_release_gate(
+    baseline: &RegressionBaseline,
+    actual_counts: &RegressionCounts,
+    inventory: &RepositoryIgnoreInventory,
+    current_run_receipts: &ValidatedCurrentRunReceipts,
+    parent_coverage: &ValidatedParentCoverage,
+    live_release_guard: bool,
+) -> ReleaseGateEvaluation {
+    ReleaseGateEvaluation {
+        aggregate: compare_against_baseline(baseline, actual_counts),
+        uninspected_sources: inventory.uninspected_sources.clone(),
+        inventory_soundness_limitations: inventory.soundness_limitations.clone(),
+        taxonomy_mismatches: compare_ignored_test_taxonomy(
+            &baseline.ignored_tests,
+            &inventory.records,
+        ),
+        policy_blockers: ignored_test_release_blockers(
+            &baseline.ignored_tests,
+            current_run_receipts,
+            parent_coverage,
+            live_release_guard,
+        ),
+    }
+}
+
+fn sample_ignored_baseline(source_path: &str, test_name: &str) -> IgnoredTestBaseline {
+    IgnoredTestBaseline {
+        source_path: source_path.to_owned(),
+        test_name: test_name.to_owned(),
+        reason: "tracked gap".to_owned(),
+        cfg_condition: None,
+        kind: IgnoreKind::KnownBug,
+        policy: IgnorePolicy::BlockRelease,
+        parent_tests: Vec::new(),
+        evidence: IgnoreEvidence {
+            requirement: "close the tracked correctness gap with an exact keeper".to_owned(),
+            receipt: None,
+        },
+    }
+}
+
+fn sample_ignore_receipt() -> IgnoreEvidenceReceipt {
+    IgnoreEvidenceReceipt {
+        source_commit: "a".repeat(40),
+        artifact_path: "tests/artifacts/receipt.json".to_owned(),
+        artifact_blake3: "b".repeat(64),
+    }
+}
+
+fn sample_test_identity(source_path: &str, test_name: &str) -> TestIdentity {
+    TestIdentity {
+        source_path: source_path.to_owned(),
+        test_name: test_name.to_owned(),
+    }
+}
+
+fn sample_covered_baseline(
+    source_path: &str,
+    test_name: &str,
+    parent_tests: Vec<TestIdentity>,
+) -> IgnoredTestBaseline {
+    let mut entry = sample_ignored_baseline(source_path, test_name);
+    entry.kind = IgnoreKind::SubprocessHelper;
+    entry.policy = IgnorePolicy::CoveredByParent;
+    entry.parent_tests = parent_tests;
+    entry
+}
+
+fn sample_command_evidence(argv: Vec<String>, transcript_path: &str) -> CommandEvidence {
+    let stderr = sample_leaf(transcript_path);
+    CommandEvidence {
+        argv,
+        exit_status: 0,
+        stdout: StreamEvidence {
+            capture: StreamCapture::Observed,
+            leaf: sample_leaf(&format!("{transcript_path}.stdout")),
+        },
+        stderr: StreamEvidence {
+            capture: StreamCapture::Observed,
+            leaf: stderr.clone(),
+        },
+        transcript: stderr,
+    }
+}
+
+fn sample_leaf(path: &str) -> EvidenceLeaf {
+    EvidenceLeaf {
+        path: path.to_owned(),
+        digest_algorithm: EVIDENCE_DIGEST_ALGORITHM.to_owned(),
+        digest: "b".repeat(64),
+    }
+}
+
+fn sample_runner_evidence(
+    argv: Vec<String>,
+    artifact_path: &str,
+    runner_path: &str,
+) -> RunEvidenceV2 {
+    RunEvidenceV2 {
+        execution: sample_command_evidence(argv, artifact_path),
+        runner_receipt: sample_leaf(runner_path),
+    }
+}
+
+fn sample_release_evidence() -> (RegressionBaseline, ReleaseEvidenceManifest) {
+    let tested_commit = "a".repeat(40);
+    let evidence_root = format!("{EVIDENCE_PATH_PREFIX}{tested_commit}");
+    let mut release_run = sample_ignored_baseline(
+        "crates/fsqlite-e2e/tests/manual_release.rs",
+        "manual_release_case",
+    );
+    release_run.kind = IgnoreKind::Stress;
+    release_run.policy = IgnorePolicy::RunForRelease;
+    let mut live_guard = sample_ignored_baseline(
+        "crates/fsqlite-harness/tests/phase5_regression_guard.rs",
+        "phase5_regression_guard_full_workspace_against_baseline",
+    );
+    live_guard.kind = IgnoreKind::ReleaseGate;
+    live_guard.policy = IgnorePolicy::RunForRelease;
+    let requirement_blake3 = blake3::hash(release_run.evidence.requirement.as_bytes())
+        .to_hex()
+        .to_string();
+    let execution = sample_command_evidence(
+        expected_current_run_argv(&release_run).expect("sample command must be supported"),
+        &format!("{evidence_root}/transcripts/manual-release.stderr"),
+    );
+    let mut manifest = ReleaseEvidenceManifest {
+        schema_version: EVIDENCE_SCHEMA_VERSION,
+        tested_commit,
+        signature_path: format!("{evidence_root}/signing/manifest.minisig"),
+        signer_attestation: sample_leaf(&format!(
+            "{evidence_root}/signing/signer-attestation.json"
+        )),
+        cargo_lock: sample_leaf(&format!("{evidence_root}/inputs/Cargo.lock")),
+        rust_toolchain: sample_leaf(&format!("{evidence_root}/inputs/rust-toolchain.toml")),
+        pre_capture_untracked: sample_leaf(&format!(
+            "{evidence_root}/inputs/pre-capture-git-status.z"
+        )),
+        compiler_inventory_attestation: sample_leaf(&format!(
+            "{evidence_root}/compiler/compiler-inventory.json"
+        )),
+        workspace: sample_runner_evidence(
+            CANONICAL_WORKSPACE_TEST_ARGV
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            &format!("{evidence_root}/transcripts/workspace.stderr"),
+            &format!("{evidence_root}/runner/workspace.json"),
+        ),
+        run_receipts: vec![CurrentRunReceipt {
+            source_path: release_run.source_path.clone(),
+            test_name: release_run.test_name.clone(),
+            requirement_blake3,
+            evidence: sample_runner_evidence(
+                execution.argv.clone(),
+                &execution.transcript.path,
+                &format!("{evidence_root}/runner/manual-release.json"),
+            ),
+        }],
+        auxiliary_scorecards: AuxiliaryScorecards {
+            c1: ScorecardEvidence {
+                scorecard: sample_leaf(&format!(
+                    "{evidence_root}/performance/c1/c1_scorecard.json"
+                )),
+                pack_manifest: sample_leaf(&format!(
+                    "{evidence_root}/performance/c1/manifest.json"
+                )),
+                commit_provenance: sample_leaf(&format!(
+                    "{evidence_root}/performance/c1/build_metadata.json"
+                )),
+            },
+            persistent: ScorecardEvidence {
+                scorecard: sample_leaf(&format!(
+                    "{evidence_root}/performance/persistent/persistent_scorecard.json"
+                )),
+                pack_manifest: sample_leaf(&format!(
+                    "{evidence_root}/performance/persistent/manifest.json"
+                )),
+                commit_provenance: sample_leaf(&format!(
+                    "{evidence_root}/performance/persistent/provenance/citation_receipt.json"
+                )),
+            },
+        },
+        evidence_pack: Vec::new(),
+    };
+    manifest.evidence_pack = vec![
+        manifest.signer_attestation.clone(),
+        manifest.cargo_lock.clone(),
+        manifest.rust_toolchain.clone(),
+        manifest.pre_capture_untracked.clone(),
+        manifest.compiler_inventory_attestation.clone(),
+        manifest.workspace.runner_receipt.clone(),
+        manifest.workspace.execution.stdout.leaf.clone(),
+        manifest.workspace.execution.stderr.leaf.clone(),
+        manifest.run_receipts[0].evidence.runner_receipt.clone(),
+        manifest.run_receipts[0]
+            .evidence
+            .execution
+            .stdout
+            .leaf
+            .clone(),
+        manifest.run_receipts[0]
+            .evidence
+            .execution
+            .stderr
+            .leaf
+            .clone(),
+        manifest.auxiliary_scorecards.c1.scorecard.clone(),
+        manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
+        manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
+        manifest.auxiliary_scorecards.persistent.scorecard.clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .pack_manifest
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .commit_provenance
+            .clone(),
+    ];
+    manifest
+        .evidence_pack
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    let baseline = RegressionBaseline {
+        as_of_phase: "checkpoint_1".to_owned(),
+        total_tests: 1,
+        passed: 1,
+        failed: 0,
+        ignored: 0,
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
+        ignored_tests: vec![release_run, live_guard],
+    };
+    (baseline, manifest)
+}
+
+#[test]
+fn test_ignore_source_collector_records_direct_reason_and_normalized_identity() {
+    let source = r#"
+#[test]
+#[ignore = "tracked correctness gap"]
+fn direct_case() {}
+"#;
+    let records =
+        collect_ignored_tests(Path::new("./crates/example/../example/src\\lib.rs"), source)
+            .expect("direct reasoned ignore should be collected");
+    assert_eq!(
+        records,
+        vec![IgnoredTestSource {
+            source_path: "crates/example/src/lib.rs".to_owned(),
+            test_name: "direct_case".to_owned(),
+            reason: "tracked correctness gap".to_owned(),
+            cfg_condition: None,
+        }]
+    );
+    assert_eq!(
+        records[0].locator(),
+        "crates/example/src/lib.rs::direct_case"
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_parses_multiline_cfg_attr() {
+    let source = r#"
+#[test]
+#[cfg_attr(
+    all(target_os = "linux", feature = "slow-tests"),
+    ignore = "requires the slow-test fixture",
+)]
+fn conditional_case() {}
+"#;
+    let records = collect_ignored_tests(Path::new("tests/conditional.rs"), source)
+        .expect("multiline cfg_attr ignore should be collected");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].test_name, "conditional_case");
+    assert_eq!(
+        records[0].cfg_condition.as_deref(),
+        Some("all(feature=\"slow-tests\",target_os=\"linux\")")
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_canonicalizes_nested_all_any_not_conditions() {
+    let source = r#"
+#[test]
+#[cfg_attr(
+    all(unix, any(feature = "b", not(miri), feature = "a")),
+    cfg_attr(
+        not(any(target_os = "windows", target_os = "macos")),
+        ignore = "nested conditional gap",
+    ),
+)]
+fn nested_case() {}
+"#;
+    let records = collect_ignored_tests(Path::new("tests/nested.rs"), source)
+        .expect("nested cfg_attr ignore should be collected");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].cfg_condition.as_deref(),
+        Some(
+            "all(any(feature=\"a\",feature=\"b\",not(miri)),not(any(target_os=\"macos\",target_os=\"windows\")),unix)"
+        )
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_combines_file_module_function_and_ignore_cfg() {
+    let source = r#"
+#![cfg(feature = "file")]
+
+#[cfg(unix)]
+mod suite {
+    #[cfg(feature = "module")]
+    mod nested {
+        #[test]
+        #[cfg(feature = "function-b")]
+        #[cfg(feature = "function-a")]
+        #[cfg_attr(feature = "slow", ignore = "conditional stress case")]
+        fn conditional_case() {}
+    }
+}
+"#;
+    let records = collect_ignored_tests(Path::new("tests/cfg_context.rs"), source)
+        .expect("file, module, function, and ignore cfgs should combine");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].test_name, "suite::nested::conditional_case");
+    assert_eq!(
+        records[0].cfg_condition.as_deref(),
+        Some(
+            "all(feature=\"file\",feature=\"function-a\",feature=\"function-b\",feature=\"module\",feature=\"slow\",unix)"
+        )
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_models_cfg_attr_availability_and_restores_siblings() {
+    let source = r#"
+#[cfg_attr(feature = "portable", cfg(unix))]
+mod gated {
+    #[test]
+    #[cfg_attr(feature = "backend", cfg(target_os = "linux"))]
+    #[cfg_attr(feature = "slow", ignore = "conditional case")]
+    fn conditional_case() {}
+}
+
+#[test]
+#[ignore = "ungated sibling"]
+fn sibling_case() {}
+"#;
+    let records = collect_ignored_tests(Path::new("tests/cfg_attr_context.rs"), source)
+        .expect("cfg_attr availability should be symbolic and sibling-local");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].test_name, "gated::conditional_case");
+    assert_eq!(
+        records[0].cfg_condition.as_deref(),
+        Some(
+            "all(any(not(feature=\"backend\"),target_os=\"linux\"),any(not(feature=\"portable\"),unix),feature=\"slow\")"
+        )
+    );
+    assert_eq!(records[1].test_name, "sibling_case");
+    assert_eq!(records[1].cfg_condition, None);
+}
+
+#[test]
+fn test_ignore_source_collector_models_nested_and_multi_gate_cfg_attrs() {
+    let source = r#"
+#[cfg_attr(
+    feature = "outer",
+    cfg_attr(unix, cfg(target_os = "linux")),
+)]
+mod nested {
+    #[test]
+    #[ignore = "nested availability"]
+    fn nested_case() {}
+}
+
+#[test]
+#[cfg_attr(
+    feature = "x",
+    cfg(unix),
+    cfg(target_pointer_width = "64"),
+)]
+#[ignore = "multiple availability gates"]
+fn multiple_gate_case() {}
+"#;
+    let records = collect_ignored_tests(Path::new("tests/nested_availability.rs"), source)
+        .expect("nested and multi-gate cfg_attr should be modeled");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].test_name, "multiple_gate_case");
+    assert_eq!(
+        records[0].cfg_condition.as_deref(),
+        Some("any(all(target_pointer_width=\"64\",unix),not(feature=\"x\"))")
+    );
+    assert_eq!(records[1].test_name, "nested::nested_case");
+    assert_eq!(
+        records[1].cfg_condition.as_deref(),
+        Some("any(not(feature=\"outer\"),not(unix),target_os=\"linux\")")
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_rejects_malformed_cfg_gate() {
+    let source = r#"
+#[test]
+#[cfg(unix, windows)]
+#[ignore = "malformed availability"]
+fn malformed_case() {}
+"#;
+    let error = collect_ignored_tests(Path::new("tests/malformed_cfg.rs"), source)
+        .expect_err("cfg with multiple predicates must fail closed");
+    assert!(error.contains("cfg requires exactly one predicate"));
+}
+
+#[test]
+fn test_ignore_source_collector_ignores_comments_docs_strings_and_literal_only_macros() {
+    let source = r##"
+// #[ignore = "comment text is not an attribute"]
+/// #[ignore = "doc text is not an attribute"]
+#[doc = "#[ignore = \"doc literal is not an attribute\"]"]
+const DOCUMENTED: &str = "#[ignore = \"ordinary string\"]";
+
+macro_rules! literal_only {
+    () => { r#"#[cfg_attr(unix, ignore = \"macro string\")]"# };
+}
+
+#[test]
+fn active_case() {
+    let _ = DOCUMENTED;
+}
+"##;
+    let records = collect_ignored_tests(Path::new("tests/noise.rs"), source)
+        .expect("ignore-like text in literals and documentation must not fail the audit");
+    assert!(records.is_empty());
+}
+
+#[test]
+fn test_ignore_source_collector_distinguishes_same_name_in_inline_modules() {
+    let source = r#"
+mod beta {
+    mod nested {
+        #[test]
+        #[ignore = "beta gap"]
+        fn same_name() {}
+    }
+}
+
+mod alpha {
+    #[test]
+    #[ignore = "alpha gap"]
+    fn same_name() {}
+}
+"#;
+    let records = collect_ignored_tests(Path::new("tests/modules.rs"), source)
+        .expect("inline module paths should disambiguate test names");
+    let identities = records
+        .iter()
+        .map(IgnoredTestSource::locator)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        vec![
+            "tests/modules.rs::alpha::same_name",
+            "tests/modules.rs::beta::nested::same_name",
+        ]
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_rejects_duplicate_and_overlapping_ignores() {
+    let duplicate = r#"
+#[test]
+#[ignore = "same gap"]
+#[ignore = "same gap"]
+fn duplicate_case() {}
+"#;
+    let error = collect_ignored_tests(Path::new("tests/duplicate.rs"), duplicate)
+        .expect_err("duplicate ignore attributes must fail closed");
+    assert!(error.contains("tests/duplicate.rs::duplicate_case"));
+    assert!(error.contains("duplicate ignore annotation"));
+
+    let overlapping = r#"
+#[test]
+#[ignore = "unconditional gap"]
+#[cfg_attr(unix, ignore = "conditional gap")]
+fn overlapping_case() {}
+"#;
+    let error = collect_ignored_tests(Path::new("tests/overlap.rs"), overlapping)
+        .expect_err("potentially overlapping ignore policies must fail closed");
+    assert!(error.contains("tests/overlap.rs::overlapping_case"));
+    assert!(error.contains("overlapping or ambiguous"));
+}
+
+#[test]
+fn test_ignore_source_collector_rejects_bare_empty_and_nonliteral_reasons() {
+    let cases = [
+        (
+            "bare",
+            r"
+#[test]
+#[ignore]
+fn malformed_case() {}
+",
+            "require a reason",
+        ),
+        (
+            "empty",
+            r#"
+#[test]
+#[ignore = "   "]
+fn malformed_case() {}
+"#,
+            "must not be empty",
+        ),
+        (
+            "padded",
+            r#"
+#[test]
+#[ignore = " padded reason "]
+fn malformed_case() {}
+"#,
+            "leading or trailing whitespace",
+        ),
+        (
+            "nonliteral",
+            r#"
+#[test]
+#[ignore = concat!("computed", " reason")]
+fn malformed_case() {}
+"#,
+            "must be a string literal",
+        ),
+        (
+            "nested_bare",
+            r#"
+#[test]
+#[cfg_attr(all(unix, not(miri)), cfg_attr(feature = "x", ignore))]
+fn malformed_case() {}
+"#,
+            "require a reason",
+        ),
+    ];
+
+    for (case_name, source, expected) in cases {
+        let path = PathBuf::from(format!("tests/{case_name}.rs"));
+        let error = collect_ignored_tests(&path, source)
+            .expect_err("malformed ignore policy must fail closed");
+        assert!(
+            error.contains(expected),
+            "case={case_name} expected={expected:?} error={error:?}"
+        );
+    }
+}
+
+#[test]
+fn test_ignore_source_collector_rejects_ignore_on_non_test_items() {
+    let non_test_function = r#"
+#[ignore = "not a test"]
+fn helper() {}
+"#;
+    let error = collect_ignored_tests(Path::new("tests/non_test_fn.rs"), non_test_function)
+        .expect_err("ignore on a non-test function must fail closed");
+    assert!(error.contains("non_test_fn.rs::helper"));
+    assert!(error.contains("ordinary `#[test]` function"));
+
+    let non_test_item = r#"
+#[ignore = "not a test"]
+struct Helper;
+"#;
+    let error = collect_ignored_tests(Path::new("tests/non_test_item.rs"), non_test_item)
+        .expect_err("ignore on a non-function item must fail closed");
+    assert!(error.contains("ordinary `#[test]` function"));
+}
+
+#[test]
+fn test_ignore_source_collector_fails_closed_on_ignore_bearing_macro_tokens() {
+    let generated = r#"
+macro_rules! generated_test {
+    () => {
+        #[test]
+        #[ignore = "hidden by expansion"]
+        fn generated_case() {}
+    };
+}
+"#;
+    let error = collect_ignored_tests(Path::new("tests/generated.rs"), generated)
+        .expect_err("ignore generated by macro tokens must fail closed");
+    assert!(
+        error.contains("macro `macro_rules!`"),
+        "unexpected collector error: {error}"
+    );
+    assert!(
+        error.contains("cannot be audited without expansion"),
+        "unexpected collector error: {error}"
+    );
+
+    let invocation = r#"
+generate_case! {
+    #[test]
+    #[cfg_attr(all(unix, not(miri)), ignore = "hidden invocation")]
+    fn generated_case() {}
+}
+"#;
+    let error = collect_ignored_tests(Path::new("tests/invocation.rs"), invocation)
+        .expect_err("nested cfg_attr ignore in macro input must fail closed");
+    assert!(
+        error.contains("macro `generate_case!`"),
+        "unexpected collector error: {error}"
+    );
+    assert!(
+        error.contains("cannot be audited without expansion"),
+        "unexpected collector error: {error}"
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_rejects_macro_generated_test_boundaries() {
+    let cases = [
+        (
+            "forwarded_attribute",
+            r"
+macro_rules! forwarded_attribute {
+    ($attr:meta) => { #[$attr] fn generated_case() {} };
+}
+",
+            "macro-forwarded attribute",
+        ),
+        (
+            "repeated_attributes",
+            r"
+macro_rules! repeated_attributes {
+    ($(#[$attr:meta])*) => { $(#[$attr])* fn generated_case() {} };
+}
+",
+            "macro-forwarded attribute",
+        ),
+        (
+            "nested_forwarding",
+            r"
+macro_rules! nested_forwarding {
+    ($attr:meta) => { #[cfg_attr(unix, $attr)] fn generated_case() {} };
+}
+",
+            "macro-forwarded attribute",
+        ),
+        (
+            "generated_test",
+            r"
+macro_rules! generated_test {
+    () => { #[test] fn generated_case() {} };
+}
+",
+            "test attribute",
+        ),
+        (
+            "dynamic_callee",
+            r"
+macro_rules! dynamic_callee {
+    ($callee:ident) => { $callee! { fn generated_case() {} } };
+}
+",
+            "dynamically selected macro invocation",
+        ),
+    ];
+
+    for (case_name, source, expected) in cases {
+        let path = PathBuf::from(format!("tests/{case_name}.rs"));
+        let error = collect_ignored_tests(&path, source)
+            .expect_err("dynamic macro test boundaries must fail closed");
+        assert!(
+            error.contains(expected),
+            "case={case_name} expected={expected:?} error={error:?}"
+        );
+    }
+}
+
+#[test]
+fn test_ignore_source_collector_preserves_ordinary_non_test_macros() {
+    let source = r#"
+macro_rules! log_values {
+    ($($arg:tt)*) => { println!($($arg)*); };
+}
+
+#[test]
+fn active_case() {
+    log_values!("active");
+}
+"#;
+    let records = collect_ignored_tests(Path::new("tests/logging_macro.rs"), source)
+        .expect("ordinary non-test macros must remain auditable");
+    assert!(records.is_empty());
+}
+
+#[test]
+fn test_ignore_source_collector_allows_active_proptest_but_rejects_ignored_proptest() {
+    let active = r"
+proptest! {
+    #[test]
+    fn generated_case(value in 0_u8..10) {
+        prop_assert!(value < 10);
+    }
+}
+";
+    let records = collect_ignored_tests(Path::new("tests/active_proptest.rs"), active)
+        .expect("audited active proptest boundaries should be allowed");
+    assert!(records.is_empty());
+
+    let namespaced_impostor = r"
+local::proptest! {
+    #[test]
+    fn generated_case() {}
+}
+";
+    let error = collect_ignored_tests(Path::new("tests/impostor_proptest.rs"), namespaced_impostor)
+        .expect_err("an arbitrary namespaced macro must not inherit the proptest exception");
+    assert!(error.contains("test attribute"));
+
+    let ignored_cases = [
+        r#"
+proptest! {
+    #[test]
+    #[ignore = "hidden generated case"]
+    fn generated_case(value in 0_u8..10) {
+        prop_assert!(value < 10);
+    }
+}
+"#,
+        r#"
+proptest! {
+    #[cfg_attr(unix, test, ignore = "hidden after test")]
+    fn generated_case(value in 0_u8..10) {
+        prop_assert!(value < 10);
+    }
+}
+"#,
+        r#"
+proptest! {
+    #[cfg_attr(unix, ignore = "hidden before test", test)]
+    fn generated_case(value in 0_u8..10) {
+        prop_assert!(value < 10);
+    }
+}
+"#,
+        r#"
+proptest! {
+    #[cfg_attr(unix, test, cfg_attr(miri, ignore = "nested hidden ignore"))]
+    fn generated_case(value in 0_u8..10) {
+        prop_assert!(value < 10);
+    }
+}
+"#,
+    ];
+    for (case_index, ignored) in ignored_cases.into_iter().enumerate() {
+        let error = collect_ignored_tests(Path::new("tests/ignored_proptest.rs"), ignored)
+            .expect_err("ignored proptest boundaries must fail closed");
+        assert!(
+            error.contains("ignore-bearing attribute"),
+            "case {case_index} returned the wrong finding: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_ignore_source_collector_accepts_only_tracked_literal_rust_includes() {
+    let host_path = Path::new("tests/include_host.rs");
+    let target_path = Path::new("tests/fixtures/tracked.rs");
+    let inventory = HashSet::from([
+        normalize_source_path(host_path).expect("normalize host"),
+        normalize_source_path(target_path).expect("normalize target"),
+    ]);
+    let host = r#"include!("fixtures/tracked.rs");"#;
+    let target = r#"
+#[test]
+#[ignore = "tracked included test"]
+fn included_case() {}
+"#;
+
+    let host_records = collect_ignored_tests_with_inventory(host_path, host, &inventory)
+        .expect("tracked literal Rust include should be accepted");
+    assert!(host_records.is_empty());
+    let qualified_host = r#"std::include!("fixtures/tracked.rs");"#;
+    let host_records = collect_ignored_tests_with_inventory(host_path, qualified_host, &inventory)
+        .expect("qualified tracked literal Rust include should be accepted");
+    assert!(host_records.is_empty());
+    let target_records = collect_ignored_tests_with_inventory(target_path, target, &inventory)
+        .expect("included source is inventoried independently");
+    assert_eq!(target_records.len(), 1);
+    assert_eq!(target_records[0].test_name, "included_case");
+}
+
+#[test]
+fn test_ignore_source_collector_rejects_uncontrolled_includes() {
+    let cases = [
+        (
+            "computed",
+            r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+            "must use one tracked repository-relative Rust string literal",
+        ),
+        (
+            "qualified_computed",
+            r#"std::include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+            "must use one tracked repository-relative Rust string literal",
+        ),
+        (
+            "untracked",
+            r#"include!("fixtures/missing.rs");"#,
+            "not tracked by the source inventory",
+        ),
+        (
+            "non_rust",
+            r#"include!("fixtures/data.txt");"#,
+            "must be a `.rs` file",
+        ),
+        (
+            "absolute",
+            r#"include!("/tmp/generated.rs");"#,
+            "repository-relative",
+        ),
+        (
+            "escaping",
+            r#"include!("../../outside.rs");"#,
+            "escapes the repository root",
+        ),
+        (
+            "nested",
+            r#"
+outer! {
+    include!("fixtures/missing.rs");
+}
+"#,
+            "not tracked by the source inventory",
+        ),
+    ];
+
+    for (case_name, source, expected) in cases {
+        let path = PathBuf::from(format!("tests/{case_name}.rs"));
+        let mut inventory =
+            HashSet::from([normalize_source_path(&path).expect("normalize include host")]);
+        if case_name == "non_rust" {
+            inventory.insert("tests/fixtures/data.txt".to_owned());
+        }
+        let error = collect_ignored_tests_with_inventory(&path, source, &inventory)
+            .expect_err("uncontrolled include boundaries must fail closed");
+        assert!(
+            error.contains(expected),
+            "case={case_name} expected={expected:?} error={error:?}"
+        );
+    }
+}
+
+#[test]
+fn test_ignore_source_collector_exact_uninspected_boundary_never_reads_the_source() {
+    let source_paths = vec![
+        "tests/z.rs".to_owned(),
+        "tests/opaque_extra.rs".to_owned(),
+        "tests/opaque.rs".to_owned(),
+        "tests/a.rs".to_owned(),
+    ];
+    let mut reads = Vec::new();
+    let inventory = collect_repository_ignored_tests_from_paths_with_reader(
+        &source_paths,
+        &["tests/opaque.rs"],
+        |source_path| {
+            assert_ne!(
+                source_path, "tests/opaque.rs",
+                "the exact uninspected source must never reach the reader"
+            );
+            reads.push(source_path.to_owned());
+            if source_path == "tests/opaque_extra.rs" {
+                Ok("#[test]\n#[ignore = \"near-prefix gap\"]\nfn near_prefix() {}\n".to_owned())
+            } else if source_path == "tests/z.rs" {
+                Ok("#[test]\n#[ignore = \"z gap\"]\nfn z_case() {}\n".to_owned())
+            } else {
+                Ok("#[test]\nfn active_case() {}\n".to_owned())
+            }
+        },
+    )
+    .expect("exact uninspected boundary should preserve the inspected inventory");
+
+    assert_eq!(inventory.uninspected_sources, ["tests/opaque.rs"]);
+    assert_eq!(reads, ["tests/a.rs", "tests/opaque_extra.rs", "tests/z.rs"]);
+    assert_eq!(
+        inventory
+            .records
+            .iter()
+            .map(IgnoredTestSource::locator)
+            .collect::<Vec<_>>(),
+        ["tests/opaque_extra.rs::near_prefix", "tests/z.rs::z_case"]
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_rejects_invalid_uninspected_boundaries() {
+    let empty_reader = |_: &str| Ok::<String, String>(String::new());
+
+    let duplicate_sources = vec!["tests/a.rs".to_owned(), "tests/a.rs".to_owned()];
+    assert!(
+        collect_repository_ignored_tests_from_paths_with_reader(
+            &duplicate_sources,
+            &[],
+            empty_reader,
+        )
+        .expect_err("duplicate tracked paths must fail")
+        .contains("duplicate path")
+    );
+
+    let noncanonical_sources = vec!["./tests/a.rs".to_owned()];
+    assert!(
+        collect_repository_ignored_tests_from_paths_with_reader(
+            &noncanonical_sources,
+            &[],
+            empty_reader,
+        )
+        .expect_err("noncanonical tracked paths must fail")
+        .contains("not canonically spelled")
+    );
+
+    let tracked_sources = vec!["tests/a.rs".to_owned()];
+    assert!(
+        collect_repository_ignored_tests_from_paths_with_reader(
+            &tracked_sources,
+            &["tests/missing.rs"],
+            empty_reader,
+        )
+        .expect_err("untracked opaque paths must fail")
+        .contains("not tracked")
+    );
+    assert!(
+        collect_repository_ignored_tests_from_paths_with_reader(
+            &tracked_sources,
+            &["tests/a.rs", "tests/a.rs"],
+            empty_reader,
+        )
+        .expect_err("duplicate opaque paths must fail")
+        .contains("duplicate uninspected")
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_reports_scoped_repository_inventory() {
+    let root = repo_root();
+    let inventory = collect_repository_ignored_tests_for_nonrelease_keeper(
+        &root,
+        UNINSPECTED_RUST_SOURCE_PATHS,
+    )
+    .expect("every inspected repository Rust source must be syntax-auditable");
+    assert_eq!(
+        inventory.uninspected_sources, UNINSPECTED_RUST_SOURCE_PATHS,
+        "the exact uninspected boundary must remain visible and deterministic"
+    );
+    assert_eq!(
+        inventory.soundness_limitations, SOURCE_INVENTORY_SOUNDNESS_LIMITATIONS,
+        "known collector soundness limits must remain explicit release blockers"
+    );
+    assert!(
+        !inventory.records.is_empty(),
+        "repository source inventory unexpectedly found no ignored tests"
+    );
+    assert!(
+        inventory
+            .records
+            .windows(2)
+            .all(|pair| pair[0].locator() < pair[1].locator()),
+        "repository ignored-test locators must be strictly ordered and unique"
+    );
+    let baseline = parse_regression_baseline(&baseline_path(&root))
+        .expect("tracked ignored-test taxonomy must be schema-valid");
+    let mismatches = compare_ignored_test_taxonomy(&baseline.ignored_tests, &inventory.records);
+    assert!(
+        mismatches.is_empty(),
+        "inspected ignored-test taxonomy drifted: {mismatches:#?}"
+    );
+}
+
+#[test]
+fn test_ignore_source_collector_clean_snapshot_inventory_excludes_transport_metadata() {
+    let snapshot = tempfile::tempdir().expect("create clean snapshot fixture");
+    let root = snapshot.path();
+    let target = root.join(".rch-target-fixture");
+    let runtime_temp = root.join(".rch-tmp-fixture");
+    let conventional_target = root.join("target");
+    let unrelated_hidden_source = root.join(".rch-target-other");
+    let unrelated_temp_named_source = root.join(".rch-tmp-other");
+    fs::create_dir_all(root.join("src")).expect("create source directory");
+    fs::create_dir_all(root.join("tests")).expect("create tests directory");
+    fs::create_dir_all(target.join("generated")).expect("create target directory");
+    fs::create_dir_all(runtime_temp.join("ephemeral")).expect("create runtime temp directory");
+    fs::create_dir_all(conventional_target.join("generated"))
+        .expect("create conventional target directory");
+    fs::create_dir_all(&unrelated_hidden_source).expect("create unrelated hidden source directory");
+    fs::create_dir_all(&unrelated_temp_named_source)
+        .expect("create unrelated temp-named source directory");
+    fs::create_dir_all(root.join(".git")).expect("create transport metadata directory");
+    fs::write(root.join("src/lib.rs"), "fn library() {}\n").expect("write library source");
+    fs::write(root.join("tests/case.rs"), "fn case() {}\n").expect("write test source");
+    fs::write(target.join("generated/output.rs"), "fn generated() {}\n")
+        .expect("write generated target source");
+    fs::write(
+        runtime_temp.join("ephemeral/output.rs"),
+        "fn ephemeral() {}\n",
+    )
+    .expect("write runtime temp source");
+    fs::write(
+        conventional_target.join("generated/output.rs"),
+        "fn conventional_generated() {}\n",
+    )
+    .expect("write conventional generated target source");
+    fs::write(
+        unrelated_hidden_source.join("kept.rs"),
+        "fn unrelated_hidden_source() {}\n",
+    )
+    .expect("write unrelated hidden source");
+    fs::write(
+        unrelated_temp_named_source.join("kept.rs"),
+        "fn unrelated_temp_named_source() {}\n",
+    )
+    .expect("write unrelated temp-named source");
+    fs::write(root.join(".git/metadata.rs"), "fn metadata() {}\n")
+        .expect("write transport metadata source");
+
+    assert_eq!(
+        clean_snapshot_rust_source_paths(root, &target, Some(&runtime_temp))
+            .expect("clean snapshot source inventory must be deterministic"),
+        vec![
+            ".rch-target-other/kept.rs".to_owned(),
+            ".rch-tmp-other/kept.rs".to_owned(),
+            "src/lib.rs".to_owned(),
+            "tests/case.rs".to_owned(),
+        ]
+    );
+    assert!(
+        clean_snapshot_rust_source_paths(root, root, Some(&runtime_temp))
+            .expect_err("the snapshot root cannot also be its excluded target directory")
+            .contains("nested below")
+    );
+    assert!(
+        clean_snapshot_rust_source_paths(root, &target, Some(root))
+            .expect_err("the snapshot root cannot also be its runtime temp directory")
+            .contains("runtime temp directory")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_ignore_source_collector_clean_snapshot_rejects_symlinked_directories() {
+    use std::os::unix::fs::symlink;
+
+    let snapshot = tempfile::tempdir().expect("create clean snapshot fixture");
+    let root = snapshot.path();
+    let target = root.join("target-fixture");
+    fs::create_dir_all(root.join("src")).expect("create source directory");
+    fs::create_dir_all(&target).expect("create target directory");
+    fs::write(root.join("src/lib.rs"), "fn library() {}\n").expect("write library source");
+    symlink(root.join("src"), root.join("linked_src")).expect("create source-directory symlink");
+
+    let error = clean_snapshot_rust_source_paths(root, &target, None)
+        .expect_err("clean snapshot inventory must reject symlinked directories");
+    assert!(
+        error.contains("must not be a symlink"),
+        "unexpected clean snapshot symlink error: {error}"
+    );
+}
+
 #[test]
 fn test_regression_guard_parses_cargo_output() {
     let sample = r"
+     Running unittests src/lib.rs (target/debug/deps/example-a1)
 test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/integration.rs (target/debug/deps/integration-b2)
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ";
 
@@ -247,6 +6522,2611 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 }
 
 #[test]
+fn test_regression_guard_uses_last_summary_per_target_section() {
+    let sample = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests example
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+
+    let counts = parse_workspace_test_counts(sample)
+        .expect("last summary in each target section should be authoritative");
+    assert_eq!(counts.total_tests, 7);
+    assert_eq!(counts.passed, 6);
+    assert_eq!(counts.failed, 0);
+    assert_eq!(counts.ignored, 1);
+}
+
+#[test]
+fn test_regression_guard_rejects_unframed_malformed_and_colored_summaries() {
+    let unframed = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+    assert!(
+        parse_workspace_test_counts(unframed)
+            .expect_err("summary without target section must fail")
+            .contains("outside a target section")
+    );
+
+    let malformed = "     Running tests/example.rs (example)\ntest result: ok. not-a-count passed";
+    assert!(
+        parse_workspace_test_counts(malformed)
+            .expect_err("malformed summary must fail")
+            .contains("malformed cargo test summary")
+    );
+
+    let missing = "     Running tests/example.rs (example)";
+    assert!(
+        parse_workspace_test_counts(missing)
+            .expect_err("missing summary must fail")
+            .contains("had no test-result summary")
+    );
+
+    let colored = "\u{1b}[32mRunning tests/example.rs (example)\u{1b}[0m";
+    assert!(
+        parse_workspace_test_counts(colored)
+            .expect_err("colored transcript must fail closed")
+            .contains("ANSI escape")
+    );
+
+    let invalid_outcome = "     Running tests/example.rs (example)\ntest result: MAYBE. 1 passed; 0 failed; 0 ignored";
+    assert!(
+        parse_workspace_test_counts(invalid_outcome)
+            .expect_err("unknown libtest outcome must fail")
+            .contains("malformed cargo test summary")
+    );
+}
+
+#[test]
+fn test_regression_guard_ignores_unanchored_subprocess_noise() {
+    let sample = r"
+     Running tests/outer.rs (target/debug/deps/outer-a1)
+helper: test result: ok. 90 passed; 0 failed; 0 ignored
+  Running tests/not-a-cargo-header.rs (helper)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+
+    let counts = parse_workspace_test_counts(sample)
+        .expect("unanchored subprocess output must not alter Cargo target counts");
+    assert_eq!(counts.total_tests, 2);
+    assert_eq!(counts.passed, 2);
+    assert_eq!(counts.failed, 0);
+    assert_eq!(counts.ignored, 0);
+}
+
+#[test]
+fn test_regression_guard_exact_test_transcript_rejects_zero_or_wrong_tests() {
+    let mut entry = sample_ignored_baseline("crates/example/tests/case.rs", "exact_case");
+    entry.kind = IgnoreKind::Stress;
+    entry.policy = IgnorePolicy::RunForRelease;
+    let passing = r"
+     Running tests/case.rs (target/debug/deps/case-a1)
+test exact_case ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+    assert_eq!(validate_single_test_transcript(passing, &entry), Ok(()));
+
+    let zero = r"
+     Running tests/case.rs (target/debug/deps/case-a1)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+";
+    assert!(
+        validate_single_test_transcript(zero, &entry)
+            .expect_err("zero selected tests must fail")
+            .contains("exactly one selected")
+    );
+    let mut different_test = entry.clone();
+    different_test.test_name = "different_case".to_owned();
+    assert!(
+        validate_single_test_transcript(passing, &different_test)
+            .expect_err("a different passing test must not satisfy the receipt")
+            .contains("matching success line")
+    );
+
+    let wrong_target = passing.replace("tests/case.rs", "tests/other.rs");
+    assert!(
+        validate_single_test_transcript(&wrong_target, &entry)
+            .expect_err("a same-named test from another target must fail")
+            .contains("canonical Cargo target")
+    );
+}
+
+/// libtest addresses a library unit test by its file-derived module path. The
+/// baseline stores the in-file identity, so the canonical runtime name must be
+/// reconstructed from the source path before it is used as an exact filter or
+/// matched against a transcript success line.
+#[test]
+fn test_regression_guard_canonical_runtime_test_name_matches_libtest_module_paths() {
+    // The crate root declares no extra module.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/lib.rs", "tests::foo"),
+        Ok("tests::foo".to_owned())
+    );
+    // A single-file module contributes exactly its file stem. This is the
+    // shape that previously produced a command selecting zero tests.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/page_cache.rs", "tests::foo"),
+        Ok("page_cache::tests::foo".to_owned())
+    );
+    // `foo/mod.rs` is the module `foo`, not `foo::mod`.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/foo/mod.rs", "tests::foo"),
+        Ok("foo::tests::foo".to_owned())
+    );
+    // Nested modules accumulate every directory component.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/foo/bar.rs", "tests::foo"),
+        Ok("foo::bar::tests::foo".to_owned())
+    );
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/foo/bar/mod.rs", "tests::foo"),
+        Ok("foo::bar::tests::foo".to_owned())
+    );
+    // A nested `lib.rs` is an ordinary module named `lib`, not a crate root.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/foo/lib.rs", "tests::foo"),
+        Ok("foo::lib::tests::foo".to_owned())
+    );
+    // An integration test is its own crate root and keeps the entry name.
+    assert_eq!(
+        canonical_runtime_test_name("crates/fsqlite-e2e/tests/case.rs", "exact_case"),
+        Ok("exact_case".to_owned())
+    );
+
+    // Invalid or unaddressable sources must fail closed rather than produce a
+    // filter that silently selects nothing.
+    for (source_path, expected_fragment) in [
+        (
+            "crates/fsqlite-pager/src/mod.rs",
+            "no addressable module path",
+        ),
+        (
+            "crates/fsqlite-pager/src/foo.rs/bar.rs",
+            "malformed module directory",
+        ),
+        ("crates/fsqlite-pager/src/main.rs", "unambiguous library"),
+        (
+            "crates/fsqlite-pager/benches/bench.rs",
+            "unambiguous library",
+        ),
+        // Too few components to name a target directory at all, which is a
+        // distinct rejection from an unambiguous-target failure.
+        (
+            "crates/fsqlite-pager/README.md",
+            "outside a supported workspace crate target",
+        ),
+        ("src/page_cache.rs", "outside a supported workspace crate"),
+    ] {
+        let error = canonical_runtime_test_name(source_path, "tests::foo")
+            .expect_err(&format!("`{source_path}` must fail closed"));
+        assert!(
+            error.contains(expected_fragment),
+            "unexpected rejection reason for `{source_path}`: {error}"
+        );
+    }
+
+    assert!(
+        canonical_runtime_test_name("crates/fsqlite-pager/src/page_cache.rs", "   ")
+            .expect_err("an empty test name must fail closed")
+            .contains("must not be empty")
+    );
+}
+
+/// The exact-run command and the transcript check must agree on the same
+/// canonical runtime name, otherwise the canonical command runs zero tests
+/// while its receipt still appears well formed.
+#[test]
+fn test_regression_guard_library_exact_argv_and_transcript_use_runtime_module_path() {
+    let mut entry = sample_ignored_baseline(
+        "crates/fsqlite-pager/src/page_cache.rs",
+        "tests::test_sharded_cache_throughput_vs_single",
+    );
+    entry.kind = IgnoreKind::Performance;
+    entry.policy = IgnorePolicy::RunForRelease;
+
+    let argv = expected_current_run_argv(&entry).expect("library source has a canonical target");
+    let filter_index = argv
+        .iter()
+        .position(|argument| argument == "--lib")
+        .expect("library target selects --lib")
+        + 1;
+    assert_eq!(
+        argv[filter_index], "page_cache::tests::test_sharded_cache_throughput_vs_single",
+        "the exact filter must address the file-derived runtime module path"
+    );
+    assert!(
+        !argv.contains(&"tests::test_sharded_cache_throughput_vs_single".to_owned()),
+        "the bare in-file identity must never be used as an exact filter"
+    );
+
+    let passing = r"
+     Running unittests src/lib.rs (target/debug/deps/fsqlite_pager-a1)
+test page_cache::tests::test_sharded_cache_throughput_vs_single ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+    assert_eq!(validate_single_test_transcript(passing, &entry), Ok(()));
+
+    // A transcript carrying the bare in-file identity is exactly what the old
+    // command would have produced, and must no longer satisfy the receipt.
+    let unqualified = passing.replace(
+        "test page_cache::tests::test_sharded_cache_throughput_vs_single ... ok",
+        "test tests::test_sharded_cache_throughput_vs_single ... ok",
+    );
+    assert!(
+        validate_single_test_transcript(&unqualified, &entry)
+            .expect_err("an unqualified success line must fail")
+            .contains("page_cache::tests::test_sharded_cache_throughput_vs_single")
+    );
+}
+
+/// Structurally discovers `#[path = "..."]` module declarations in one parsed
+/// source. A textual scan cannot be trusted here: attribute spacing, multiline
+/// attributes, `cfg_attr` wrapping, and `#[path]` inside comments or string
+/// literals all defeat it, and an under-count silently narrows the audited
+/// list. Parsing with `syn` and inspecting `ItemMod` attributes gives an exact
+/// answer.
+///
+/// Forms whose target this reconstruction cannot resolve are rejected rather
+/// than skipped:
+/// * `#[cfg_attr(..., path = "...")]`, whose applicability is configuration
+///   dependent;
+/// * a `#[path]` on an inline module, or on a module nested inside one, where
+///   rustc resolves the target against the enclosing module directory rather
+///   than the file directory;
+/// * a non-string-literal `path` value.
+fn collect_module_path_attributes(source_path: &str, source: &str) -> Result<Vec<String>, String> {
+    struct Collector<'a> {
+        source_path: &'a str,
+        inline_depth: usize,
+        values: Vec<String>,
+        error: Option<String>,
+    }
+
+    impl Collector<'_> {
+        fn fail(&mut self, message: String) {
+            if self.error.is_none() {
+                self.error = Some(message);
+            }
+        }
+
+        fn inspect(&mut self, node: &syn::ItemMod) {
+            for attribute in &node.attrs {
+                match &attribute.meta {
+                    Meta::NameValue(pair) => {
+                        if canonical_meta_path(&pair.path).as_deref() != Ok("path") {
+                            continue;
+                        }
+                        if self.inline_depth > 0 || node.content.is_some() {
+                            self.fail(format!(
+                                "`{}` declares a `#[path]` module in an unsupported inline position; its target is not file-directory relative",
+                                self.source_path
+                            ));
+                            continue;
+                        }
+                        match &pair.value {
+                            Expr::Lit(literal) => match &literal.lit {
+                                Lit::Str(value) => self.values.push(value.value()),
+                                _ => self.fail(format!(
+                                    "`{}` declares a non-string `#[path]` value",
+                                    self.source_path
+                                )),
+                            },
+                            _ => self.fail(format!(
+                                "`{}` declares a non-literal `#[path]` value",
+                                self.source_path
+                            )),
+                        }
+                    }
+                    Meta::List(list) => {
+                        if canonical_meta_path(&list.path).as_deref() != Ok("cfg_attr") {
+                            continue;
+                        }
+                        // `cfg_attr` bodies are not always parseable as nested
+                        // `Meta`; fall back to a token check so a conditional
+                        // `path` can never be silently dropped.
+                        let mentions_path = match parse_meta_list(list) {
+                            Ok(nested) => nested.iter().any(|meta| {
+                                canonical_meta_path(meta.path()).as_deref() == Ok("path")
+                            }),
+                            Err(_) => list.tokens.to_string().contains("path"),
+                        };
+                        if mentions_path {
+                            self.fail(format!(
+                                "`{}` declares a configuration-dependent `#[cfg_attr(..., path = ...)]` module",
+                                self.source_path
+                            ));
+                        }
+                    }
+                    Meta::Path(_) => {}
+                }
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Collector<'_> {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            self.inspect(node);
+            if node.content.is_some() {
+                self.inline_depth += 1;
+                syn::visit::visit_item_mod(self, node);
+                self.inline_depth -= 1;
+            } else {
+                syn::visit::visit_item_mod(self, node);
+            }
+        }
+    }
+
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("unable to parse `{source_path}` for `#[path]` audit: {error}"))?;
+    let mut collector = Collector {
+        source_path,
+        inline_depth: 0,
+        values: Vec::new(),
+        error: None,
+    };
+    collector.visit_file(&file);
+    if let Some(error) = collector.error {
+        return Err(error);
+    }
+    Ok(collector.values)
+}
+
+/// The `#[path]` audit is only as exact as its discovery, so the structural
+/// collector is pinned against the textual shapes a line scan would miss or
+/// invent.
+#[test]
+fn test_regression_guard_module_path_attribute_discovery_is_structural() {
+    // Spacing variants and multiline attributes are found.
+    let spaced = r#"
+        #[path="a.rs"]
+        mod a;
+        #[ path = "b.rs" ]
+        mod b;
+        #[path
+            = "c.rs"]
+        mod c;
+    "#;
+    assert_eq!(
+        collect_module_path_attributes("crates/x/src/lib.rs", spaced),
+        Ok(vec![
+            "a.rs".to_owned(),
+            "b.rs".to_owned(),
+            "c.rs".to_owned()
+        ])
+    );
+
+    // Comments and string literals must not be mistaken for declarations.
+    let decoys = r##"
+        // #[path = "commented.rs"]
+        /* #[path = "blocked.rs"] */
+        const DOC: &str = r#"#[path = "quoted.rs"]"#;
+        mod ordinary;
+    "##;
+    assert_eq!(
+        collect_module_path_attributes("crates/x/src/lib.rs", decoys),
+        Ok(Vec::new())
+    );
+
+    // Configuration-dependent remapping is refused, not skipped.
+    let conditional = r#"
+        #[cfg_attr(test, path = "conditional.rs")]
+        mod conditional;
+    "#;
+    assert!(
+        collect_module_path_attributes("crates/x/src/lib.rs", conditional)
+            .expect_err("cfg_attr path remapping must fail closed")
+            .contains("configuration-dependent")
+    );
+
+    // A `#[path]` nested inside an inline module resolves against the
+    // enclosing module directory, which this reconstruction cannot model.
+    let nested = r#"
+        mod outer {
+            #[path = "inner.rs"]
+            mod inner;
+        }
+    "#;
+    assert!(
+        collect_module_path_attributes("crates/x/src/lib.rs", nested)
+            .expect_err("nested `#[path]` must fail closed")
+            .contains("unsupported inline position")
+    );
+
+    // Unparseable sources fail closed rather than reporting zero declarations.
+    assert!(
+        collect_module_path_attributes("crates/x/src/lib.rs", "mod broken {")
+            .expect_err("an unparseable source must fail closed")
+            .contains("unable to parse")
+    );
+}
+
+/// `PATH_REMAPPED_LIBRARY_SOURCES` is a hand-audited list, so it must be kept
+/// exactly in sync with the tree. This scans every tracked library source for
+/// `#[path]` module declarations, resolves each target relative to its
+/// declaring file, and requires the audited list to match precisely — a new
+/// remap cannot be added without also being refused by
+/// [`canonical_runtime_test_name`].
+///
+/// Scope note: `#[path]` declarations that live in integration-test sources
+/// pull a library file into a *second* target. That multiplicity is a distinct
+/// concern already carried as a registered inventory soundness limitation, and
+/// is deliberately out of scope here.
+#[test]
+fn phase5_path_remapped_library_sources_are_audited() {
+    let root = repo_root();
+    let tracked = tracked_rust_source_paths(&root).expect("enumerate tracked Rust sources");
+
+    let mut discovered = Vec::new();
+    for source_path in tracked {
+        let mut components = source_path.split('/');
+        if components.next() != Some("crates") {
+            continue;
+        }
+        let Some(_package) = components.next() else {
+            continue;
+        };
+        if components.next() != Some("src") {
+            continue;
+        }
+        // An unreadable tracked source must fail closed: skipping it would
+        // shrink the discovered set and let this audit claim exactness over a
+        // tree it did not actually read.
+        let contents = fs::read_to_string(root.join(&source_path))
+            .map_err(|error| {
+                format!("unable to read tracked library source `{source_path}`: {error}")
+            })
+            .expect("every tracked library source must be readable for the `#[path]` audit");
+        let parent = Path::new(&source_path)
+            .parent()
+            .expect("library source has a parent directory")
+            .to_path_buf();
+        let declared = collect_module_path_attributes(&source_path, &contents)
+            .expect("`#[path]` audit must resolve every tracked library source");
+        for value in declared {
+            let target = normalize_source_path(&parent.join(&value))
+                .expect("`#[path]` target resolves inside the repository");
+            // Only library-mounted targets are addressed by the file-derived
+            // runtime-name derivation.
+            if target.split('/').nth(2) == Some("src") {
+                discovered.push(target);
+            }
+        }
+    }
+    discovered.sort();
+    discovered.dedup();
+
+    let audited = PATH_REMAPPED_LIBRARY_SOURCES
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        discovered, audited,
+        "PATH_REMAPPED_LIBRARY_SOURCES must list exactly the `#[path]`-remapped library sources present in the tree"
+    );
+
+    // Every audited source must actually fail closed.
+    for source_path in PATH_REMAPPED_LIBRARY_SOURCES {
+        let error = canonical_runtime_test_name(source_path, "tests::foo").expect_err(
+            "a `#[path]`-remapped library source must not yield a file-derived runtime name",
+        );
+        assert!(
+            error.contains("`#[path]` declaration"),
+            "unexpected rejection reason for `{source_path}`: {error}"
+        );
+    }
+
+    // The limitation stays registered so the release gate cannot silently
+    // treat this derivation as machine-audited.
+    assert!(
+        SOURCE_INVENTORY_SOUNDNESS_LIMITATIONS
+            .iter()
+            .any(|limitation| limitation.contains("`#[path]`-remapped sources are refused")),
+        "the `#[path]` derivation limitation must remain registered"
+    );
+}
+
+#[test]
+fn test_regression_guard_release_perf_command_matches_conditional_ignore() {
+    let mut entry = sample_ignored_baseline(
+        "crates/fsqlite-e2e/tests/manual_release.rs",
+        "manual_release_case",
+    );
+    entry.kind = IgnoreKind::Performance;
+    entry.policy = IgnorePolicy::RunForRelease;
+
+    let unconditional = expected_current_run_argv(&entry)
+        .expect("an unconditional ignore has a canonical release command");
+    assert_eq!(
+        unconditional,
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "--profile",
+            "release-perf",
+            "--package",
+            "fsqlite-e2e",
+            "--test",
+            "manual_release",
+            "manual_release_case",
+            "--",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+    );
+
+    entry.cfg_condition = Some("debug_assertions".to_owned());
+    let debug_only = expected_current_run_argv(&entry)
+        .expect("release-perf disables a debug-assertions-only ignore");
+    assert_eq!(
+        debug_only,
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "--profile",
+            "release-perf",
+            "--package",
+            "fsqlite-e2e",
+            "--test",
+            "manual_release",
+            "manual_release_case",
+            "--",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+    );
+
+    entry.cfg_condition = Some("all(debug_assertions,test)".to_owned());
+    assert_eq!(
+        expected_current_run_argv(&entry)
+            .expect("test-module debug-only ignores use the same release contract"),
+        debug_only
+    );
+
+    entry.cfg_condition = Some("unix".to_owned());
+    assert!(
+        expected_current_run_argv(&entry)
+            .expect_err("unmodeled conditional ignores must fail closed")
+            .contains("typed compilation contract")
+    );
+}
+
+#[test]
+fn test_regression_guard_release_manifest_requires_complete_typed_receipts() {
+    let (baseline, manifest) = sample_release_evidence();
+    let validated = validate_release_evidence_manifest(&manifest, &baseline)
+        .expect("complete canonical evidence must validate structurally");
+    assert!(validated.contains("crates/fsqlite-e2e/tests/manual_release.rs::manual_release_case"));
+    assert!(!validated.contains(RELEASE_GUARD_LOCATOR));
+
+    let mut missing = manifest.clone();
+    missing.run_receipts.clear();
+    assert!(
+        validate_release_evidence_manifest(&missing, &baseline)
+            .expect_err("missing run_for_release evidence must fail")
+            .contains("missing=")
+    );
+
+    let mut wrong_requirement = manifest.clone();
+    wrong_requirement.run_receipts[0].requirement_blake3 = "c".repeat(64);
+    assert!(
+        validate_release_evidence_manifest(&wrong_requirement, &baseline)
+            .expect_err("stale requirement evidence must fail")
+            .contains("current evidence requirement")
+    );
+
+    let mut wrong_command = manifest.clone();
+    wrong_command.run_receipts[0]
+        .evidence
+        .execution
+        .argv
+        .push("--nocapture".to_owned());
+    assert!(
+        validate_release_evidence_manifest(&wrong_command, &baseline)
+            .expect_err("noncanonical command evidence must fail")
+            .contains("canonical exact-test command")
+    );
+
+    let mut failed_command = manifest.clone();
+    failed_command.run_receipts[0]
+        .evidence
+        .execution
+        .exit_status = 1;
+    assert!(
+        validate_release_evidence_manifest(&failed_command, &baseline)
+            .expect_err("failed command evidence must fail")
+            .contains("zero command status")
+    );
+
+    let mut conditional_baseline = baseline.clone();
+    conditional_baseline.ignored_tests[0].cfg_condition = Some("unix".to_owned());
+    assert!(
+        validate_release_evidence_manifest(&manifest, &conditional_baseline)
+            .expect_err("cfg-dependent evidence without a typed build contract must fail")
+            .contains("typed compilation contract")
+    );
+
+    let mut wrong_guard_kind = baseline.clone();
+    wrong_guard_kind
+        .ignored_tests
+        .iter_mut()
+        .find(|entry| entry.locator() == RELEASE_GUARD_LOCATOR)
+        .expect("sample baseline contains live guard")
+        .kind = IgnoreKind::Performance;
+    assert!(
+        validate_release_evidence_manifest(&manifest, &wrong_guard_kind)
+            .expect_err("live guard kind drift must fail")
+            .contains("release_gate kind")
+    );
+}
+
+#[test]
+fn test_regression_guard_v2_manifest_and_rch_receipts_fail_closed() {
+    let (baseline, manifest) = sample_release_evidence();
+    assert!(validate_release_evidence_manifest(&manifest, &baseline).is_ok());
+
+    let mut synthesized_stream = manifest.clone();
+    synthesized_stream.workspace.execution.stdout.capture = StreamCapture::SynthesizedEmpty;
+    assert!(
+        validate_release_evidence_manifest(&synthesized_stream, &baseline)
+            .expect_err("synthesized empty stdout must fail closed")
+            .contains("synthesized empty")
+    );
+
+    let self_asserted_runner = serde_json::json!({
+        "schema_version": RCH_RECEIPT_SCHEMA_VERSION,
+        "inner_cargo_argv": manifest.workspace.execution.argv,
+        "job_id": "29960766543102032",
+        "active_status": sample_leaf("tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/runner/active.json"),
+        "completed_status": sample_leaf("tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/runner/completed.json"),
+        "selected_worker": "worker-a",
+        "local_fallback": false,
+        "toolchain": "nightly"
+    });
+    assert!(
+        serde_json::from_value::<RchExecutionReceipt>(self_asserted_runner)
+            .expect_err("self-asserted worker/fallback/toolchain claims must be rejected")
+            .to_string()
+            .contains("unknown field")
+    );
+
+    let mut missing_leaf = manifest.clone();
+    missing_leaf.evidence_pack.pop();
+    assert!(
+        validate_release_evidence_manifest(&missing_leaf, &baseline)
+            .expect_err("a missing evidence leaf must fail")
+            .contains("evidence_pack")
+    );
+    let mut duplicate_leaf = manifest.clone();
+    duplicate_leaf
+        .evidence_pack
+        .push(duplicate_leaf.evidence_pack[0].clone());
+    assert!(
+        validate_release_evidence_manifest(&duplicate_leaf, &baseline)
+            .expect_err("duplicate evidence paths must fail")
+            .contains("evidence_pack")
+    );
+    let mut non_evidence_signature = manifest;
+    non_evidence_signature.signature_path = "manifest.minisig".to_owned();
+    assert!(
+        validate_release_evidence_manifest(&non_evidence_signature, &baseline)
+            .expect_err("a signature outside the evidence namespace must fail")
+            .contains("manifest.signature_path")
+    );
+}
+
+#[test]
+fn test_regression_guard_plain_command_evidence_cannot_establish_baseline_counts() {
+    let plain_hashed_transcript = serde_json::json!({
+        "source_commit": "a".repeat(40),
+        "workspace": {
+            "argv": CANONICAL_WORKSPACE_TEST_ARGV,
+            "exit_status": 0,
+            "stdout": {
+                "capture": "observed",
+                "leaf": sample_leaf("tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/baseline.stdout")
+            },
+            "stderr": {
+                "capture": "observed",
+                "leaf": sample_leaf("tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/baseline.stderr")
+            },
+            "transcript": sample_leaf("tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/baseline.stderr")
+        }
+    });
+    assert!(
+        serde_json::from_value::<BaselineEvidence>(plain_hashed_transcript)
+            .expect_err("baseline must require a typed RCH execution receipt")
+            .to_string()
+            .contains("unknown field `argv`")
+    );
+}
+
+#[test]
+fn test_regression_guard_rch_command_parser_matches_verbatim_live_quoted_grammar() {
+    let command = "cargo test --locked --workspace -- '--test-threads=1'";
+    assert_eq!(
+        parse_rch_command_tokens(command),
+        Ok(vec![
+            "cargo".to_owned(),
+            "test".to_owned(),
+            "--locked".to_owned(),
+            "--workspace".to_owned(),
+            "--".to_owned(),
+            "--test-threads=1".to_owned(),
+        ])
+    );
+    for unsafe_command in [
+        "cargo test; true",
+        "cargo test $(true)",
+        "cargo test `true`",
+        "cargo test 'unterminated",
+    ] {
+        assert!(parse_rch_command_tokens(unsafe_command).is_err());
+    }
+}
+
+#[test]
+fn test_regression_guard_rch_status_binding_rejects_mixed_or_local_jobs() {
+    let execution = sample_command_evidence(
+        vec!["cargo".to_owned(), "test".to_owned(), "--locked".to_owned()],
+        "tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/transcripts/test.stderr",
+    );
+    let receipt = RchExecutionReceipt {
+        schema_version: RCH_RECEIPT_SCHEMA_VERSION.to_owned(),
+        inner_cargo_argv: execution.argv.clone(),
+        job_id: "29960766543102039".to_owned(),
+        active_status: sample_leaf(
+            "tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/status/active.json",
+        ),
+        completed_status: sample_leaf(
+            "tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/status/completed.json",
+        ),
+    };
+    let active_build = RchActiveBuild {
+        id: 29_960_766_543_102_039,
+        project_id: "frankensqlite-df8c83ae".to_owned(),
+        worker_id: "worker-a".to_owned(),
+        command: "cargo test --locked".to_owned(),
+    };
+    let completed_build = RchCompletedBuild {
+        id: active_build.id,
+        project_id: active_build.project_id.clone(),
+        worker_id: active_build.worker_id.clone(),
+        command: active_build.command.clone(),
+        exit_code: 0,
+        location: "remote".to_owned(),
+        cancellation: None,
+    };
+    let envelope = |active_builds, recent_builds| RchStatusEnvelope {
+        api_version: "1.0".to_owned(),
+        command: "status".to_owned(),
+        success: true,
+        data: RchStatusData {
+            daemon: RchDaemonStatus {
+                active_builds,
+                recent_builds,
+            },
+        },
+    };
+    let active = envelope(vec![active_build.clone()], Vec::new());
+    let completed = envelope(Vec::new(), vec![completed_build.clone()]);
+    let stderr = concat!(
+        "Selected worker: worker-a at root@example.invalid\n",
+        "Remote command finished: exit=0 in 123ms\n",
+    );
+    assert!(
+        validate_rch_status_binding(&receipt, &execution, stderr, &active, &completed, "keeper",)
+            .is_ok()
+    );
+
+    let mut local = completed_build.clone();
+    local.location = "local".to_owned();
+    let mut wrong_worker = completed_build.clone();
+    wrong_worker.worker_id = "worker-b".to_owned();
+    let mut cancelled = completed_build.clone();
+    cancelled.cancellation = Some(serde_json::json!({"origin": "user"}));
+    let mut wrong_command = completed_build;
+    wrong_command.command = "cargo test".to_owned();
+    for invalid in [local, wrong_worker, cancelled, wrong_command] {
+        let invalid_completed = envelope(Vec::new(), vec![invalid]);
+        assert!(
+            validate_rch_status_binding(
+                &receipt,
+                &execution,
+                stderr,
+                &active,
+                &invalid_completed,
+                "keeper",
+            )
+            .is_err()
+        );
+    }
+
+    let shared_worker = envelope(vec![active_build.clone(), active_build], Vec::new());
+    assert!(
+        validate_rch_status_binding(
+            &receipt,
+            &execution,
+            stderr,
+            &shared_worker,
+            &completed,
+            "keeper",
+        )
+        .is_err()
+    );
+    assert!(
+        validate_rch_status_binding(
+            &receipt,
+            &execution,
+            "Selected worker: worker-b\nRemote command finished: exit=0\n",
+            &active,
+            &completed,
+            "keeper",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn test_regression_guard_rejects_fabricated_libtest_binary_hash_receipts() {
+    let fabricated = serde_json::json!({
+        "target": "target/release-perf/deps/example-a1",
+        "source_inventory_blake3": "b".repeat(64),
+        "libtest_binary_blake3": "c".repeat(64)
+    });
+    assert!(
+        serde_json::from_value::<CompilerDerivedTarget>(fabricated)
+            .expect_err("self-asserted per-binary hashes must not deserialize")
+            .to_string()
+            .contains("unknown field `libtest_binary_blake3`")
+    );
+}
+
+#[test]
+fn test_regression_guard_compiler_list_requires_exact_per_target_summaries() {
+    let valid = concat!(
+        "     Running unittests src/lib.rs (target/release-perf/deps/example-a1)\n",
+        "tests::ordinary: test\n",
+        "benches::throughput: benchmark\n",
+        "1 test, 1 benchmark\n",
+    );
+    let identities = compiler_list_identities(valid).expect("canonical list must parse");
+    assert_eq!(identities.len(), 2);
+    assert_eq!(
+        identities
+            .iter()
+            .filter(|identity| identity.kind == "benchmark")
+            .count(),
+        1
+    );
+
+    let truncated = valid.replace("1 test, 1 benchmark\n", "");
+    let count_mismatch = valid.replace("1 test, 1 benchmark", "2 tests, 1 benchmark");
+    let benchmark_mismatch = valid.replace("1 test, 1 benchmark", "1 test, 0 benchmarks");
+    let duplicate_summary = format!("{valid}1 test, 1 benchmark\n");
+    let missing_first_summary = concat!(
+        "     Running unittests src/lib.rs (target/release-perf/deps/example-a1)\n",
+        "tests::ordinary: test\n",
+        "     Running tests/other.rs (target/release-perf/deps/other-a1)\n",
+        "other: test\n",
+        "1 test, 0 benchmarks\n",
+    );
+    for invalid in [
+        truncated.as_str(),
+        count_mismatch.as_str(),
+        benchmark_mismatch.as_str(),
+        duplicate_summary.as_str(),
+        missing_first_summary,
+    ] {
+        assert!(compiler_list_identities(invalid).is_err());
+    }
+}
+
+#[test]
+fn test_regression_guard_scorecard_paths_are_exactly_commit_namespaced() {
+    let tested_commit = "a".repeat(40);
+    let root = format!("{EVIDENCE_PATH_PREFIX}{tested_commit}/performance/c1");
+    let canonical = ScorecardEvidence {
+        scorecard: sample_leaf(&format!("{root}/c1_scorecard.json")),
+        pack_manifest: sample_leaf(&format!("{root}/manifest.json")),
+        commit_provenance: sample_leaf(&format!("{root}/build_metadata.json")),
+    };
+    assert!(validate_scorecard_evidence_shape(&canonical, &tested_commit, "c1").is_ok());
+
+    let mut stale_namespace = canonical.clone();
+    stale_namespace.scorecard.path = format!(
+        "{EVIDENCE_PATH_PREFIX}{}/performance/c1/c1_scorecard.json",
+        "b".repeat(40)
+    );
+    assert!(validate_scorecard_evidence_shape(&stale_namespace, &tested_commit, "c1").is_err());
+
+    let mut invented_filename = canonical;
+    invented_filename.scorecard.path = format!("{root}/scorecard.json");
+    assert!(validate_scorecard_evidence_shape(&invented_filename, &tested_commit, "c1").is_err());
+}
+
+#[test]
+fn test_regression_guard_persistent_citation_requires_v2_job_receipts() {
+    let tested_commit = "a".repeat(40);
+    let digest = "b".repeat(64);
+    let phase_trace = |phase: &str, job_id: &str| {
+        serde_json::json!({
+            "path": format!("{phase}/rch_status.jsonl"),
+            "sha256": digest,
+            "job_id": job_id,
+            "active_samples": 3,
+            "completion": format!("{phase}/rch_status_completion.json"),
+            "completion_sha256": digest,
+        })
+    };
+    let mut citation = serde_json::json!({
+        "schema_version": PERSISTENT_CITATION_SCHEMA_VERSION,
+        "source": { "commit": tested_commit, "clean": true },
+        "rch_scheduler_isolation": {
+            "build_status_trace": "provenance/rch_build_status.jsonl",
+            "build_status_trace_sha256": digest,
+            "build_completion_snapshot": "provenance/rch_build_status_completion.json",
+            "build_completion_snapshot_sha256": digest,
+            "build_job_id": "29960952048779266",
+            "build_active_samples": 3,
+            "job_id_encoding": "decimal_string",
+            "phase_traces": {
+                "1t": phase_trace("1t", "29960952048779267"),
+                "8t": phase_trace("8t", "29960952048779268"),
+                "16t": phase_trace("16t", "29960952048779269"),
+            },
+        },
+    });
+    let encoded = serde_json::to_vec(&citation).expect("encode canonical v2 citation receipt");
+    assert!(validate_persistent_citation_receipt_bytes(&encoded, &tested_commit).is_ok());
+
+    citation["schema_version"] = serde_json::Value::String(
+        "fsqlite.release_persistent_phase_pack_citation_receipt.v1".to_owned(),
+    );
+    let legacy = serde_json::to_vec(&citation).expect("encode legacy citation receipt");
+    assert!(validate_persistent_citation_receipt_bytes(&legacy, &tested_commit).is_err());
+
+    citation["schema_version"] =
+        serde_json::Value::String(PERSISTENT_CITATION_SCHEMA_VERSION.to_owned());
+    citation["rch_scheduler_isolation"]["build_job_id"] =
+        serde_json::json!(29_960_952_048_779_266_u64);
+    let rounded_number =
+        serde_json::to_vec(&citation).expect("encode non-string citation receipt job id");
+    assert!(
+        validate_persistent_citation_receipt_bytes(&rounded_number, &tested_commit).is_err(),
+        "numeric job ids above 2^53 must not deserialize as exact receipt identities"
+    );
+}
+
+#[test]
+fn test_regression_guard_pre_capture_untracked_census_fails_closed() {
+    let tested_commit = "a".repeat(40);
+    let prefix = format!("{EVIDENCE_PATH_PREFIX}{tested_commit}/performance");
+    let authentic = format!(
+        "?? {prefix}/c1/c1_scorecard.json\0?? {prefix}/persistent/persistent_scorecard.json\0"
+    );
+    assert!(validate_pre_capture_untracked_bytes(authentic.as_bytes(), &tested_commit).is_ok());
+
+    for invalid in [
+        authentic.trim_end_matches('\0').as_bytes().to_vec(),
+        format!("{authentic}?? README.md\0").into_bytes(),
+        format!(
+            " M Cargo.lock\0?? {prefix}/c1/c1_scorecard.json\0?? {prefix}/persistent/persistent_scorecard.json\0"
+        )
+        .into_bytes(),
+    ] {
+        assert!(validate_pre_capture_untracked_bytes(&invalid, &tested_commit).is_err());
+    }
+}
+
+#[test]
+fn test_regression_guard_v2_requires_direct_evidence_parent() {
+    let repository = tempfile::tempdir().expect("create direct-parent repository");
+    let root = repository.path();
+    let git = |arguments: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run Git command")
+    };
+    assert!(git(&["init", "--initial-branch=main"]).success());
+    assert!(git(&["config", "user.name", "Verifier Keeper"]).success());
+    assert!(git(&["config", "user.email", "keeper@example.invalid"]).success());
+    fs::write(root.join("first.txt"), "first\n").expect("write first commit");
+    assert!(git(&["add", "first.txt"]).success());
+    assert!(git(&["commit", "-m", "first"]).success());
+    let first = resolve_current_head(root).expect("resolve first commit");
+    fs::write(root.join("second.txt"), "second\n").expect("write second commit");
+    assert!(git(&["add", "second.txt"]).success());
+    assert!(git(&["commit", "-m", "second"]).success());
+    let second = resolve_current_head(root).expect("resolve second commit");
+    fs::write(root.join("third.txt"), "third\n").expect("write evidence commit");
+    assert!(git(&["add", "third.txt"]).success());
+    assert!(git(&["commit", "-m", "evidence"]).success());
+    let head = resolve_current_head(root).expect("resolve evidence head");
+    assert!(require_direct_evidence_descendant(root, &second, &head).is_ok());
+    assert!(
+        require_direct_evidence_descendant(root, &first, &head)
+            .expect_err("an indirect tested ancestor must fail")
+            .contains("HEAD^ == tested_commit")
+    );
+}
+
+#[test]
+fn test_regression_guard_cargo_target_mapping_rejects_manifest_overrides() {
+    let mut library_entry = sample_ignored_baseline("crates/example/src/lib.rs", "library_case");
+    library_entry.kind = IgnoreKind::Stress;
+    library_entry.policy = IgnorePolicy::RunForRelease;
+    let custom_library = toml::from_str::<toml::Table>(
+        r#"
+            [package]
+            name = "example"
+            [lib]
+            path = "src/custom.rs"
+        "#,
+    )
+    .expect("parse custom library manifest");
+    assert!(
+        validate_cargo_manifest_target_contract(&custom_library, "example", &library_entry)
+            .expect_err("custom library paths require a typed target contract")
+            .contains("noncanonical Cargo override")
+    );
+    let custom_harness = toml::from_str::<toml::Table>(
+        r#"
+            [package]
+            name = "example"
+            [lib]
+            harness = false
+        "#,
+    )
+    .expect("parse custom harness manifest");
+    assert!(
+        validate_cargo_manifest_target_contract(&custom_harness, "example", &library_entry)
+            .expect_err("custom library harnesses require a typed target contract")
+            .contains("noncanonical Cargo override")
+    );
+
+    let mut integration_entry =
+        sample_ignored_baseline("crates/example/tests/case.rs", "integration_case");
+    integration_entry.kind = IgnoreKind::Stress;
+    integration_entry.policy = IgnorePolicy::RunForRelease;
+    let explicit_test = toml::from_str::<toml::Table>(
+        r#"
+            [package]
+            name = "example"
+            [[test]]
+            name = "renamed_case"
+            path = "./tests/case.rs"
+            required-features = ["special"]
+        "#,
+    )
+    .expect("parse explicit test manifest");
+    assert!(
+        validate_cargo_manifest_target_contract(&explicit_test, "example", &integration_entry)
+            .expect_err("explicit test targets require a typed target contract")
+            .contains("explicit Cargo override")
+    );
+}
+
+#[test]
+fn test_regression_guard_release_manifest_rejects_circular_or_ambiguous_evidence() {
+    let (baseline, manifest) = sample_release_evidence();
+
+    let mut circular = manifest.clone();
+    let guard = baseline
+        .ignored_tests
+        .iter()
+        .find(|entry| entry.locator() == RELEASE_GUARD_LOCATOR)
+        .expect("sample baseline contains live guard");
+    circular.run_receipts.push(CurrentRunReceipt {
+        source_path: guard.source_path.clone(),
+        test_name: guard.test_name.clone(),
+        requirement_blake3: blake3::hash(guard.evidence.requirement.as_bytes())
+            .to_hex()
+            .to_string(),
+        evidence: sample_runner_evidence(
+            expected_current_run_argv(guard).expect("guard source has a canonical target"),
+            "tests/artifacts/release-evidence/live-guard.txt",
+            "tests/artifacts/release-evidence/live-guard-runner.json",
+        ),
+    });
+    assert!(
+        validate_release_evidence_manifest(&circular, &baseline)
+            .expect_err("external live-guard evidence must fail")
+            .contains("circular external receipt")
+    );
+
+    let mut duplicate_artifact = manifest.clone();
+    duplicate_artifact.run_receipts[0]
+        .evidence
+        .execution
+        .stdout
+        .leaf = duplicate_artifact.workspace.execution.stdout.leaf.clone();
+    assert!(
+        validate_release_evidence_manifest(&duplicate_artifact, &baseline)
+            .expect_err("reused evidence artifacts must fail")
+            .contains("stream paths must be unique")
+    );
+
+    let unknown_field = r#"{
+        "unexpected": true,
+        "schema_version": 1,
+        "tested_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "workspace": {
+            "argv": ["cargo"],
+            "exit_status": 0,
+            "stdout": {},
+            "stderr": {},
+            "transcript": {}
+        },
+        "run_receipts": []
+    }"#;
+    assert!(
+        serde_json::from_str::<ReleaseEvidenceManifest>(unknown_field)
+            .expect_err("unknown manifest fields must fail closed")
+            .to_string()
+            .contains("unknown field `unexpected`")
+    );
+}
+
+#[test]
+fn test_regression_guard_live_self_receipt_requires_exact_ignored_invocation() {
+    let test_name = "phase5_regression_guard_full_workspace_against_baseline".to_owned();
+    let exact = vec![
+        "test-binary".to_owned(),
+        test_name.clone(),
+        "--exact".to_owned(),
+        "--ignored".to_owned(),
+    ];
+    assert_eq!(validate_live_release_guard_invocation(&exact), Ok(()));
+
+    for invalid in [
+        vec!["test-binary".to_owned(), test_name.clone()],
+        vec![
+            "test-binary".to_owned(),
+            test_name.clone(),
+            "--exact".to_owned(),
+        ],
+        vec![
+            "test-binary".to_owned(),
+            test_name,
+            "--exact".to_owned(),
+            "--ignored".to_owned(),
+            "--skip".to_owned(),
+        ],
+    ] {
+        assert!(validate_live_release_guard_invocation(&invalid).is_err());
+    }
+}
+
+#[test]
+fn test_regression_guard_baseline_schema_rejects_unknown_fields() {
+    let baseline = r#"{
+        "as_of_phase": "checkpoint_1",
+        "total_tests": 1,
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "baseline_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "ignored_tests": [],
+        "unexpected": true
+    }"#;
+    let error = serde_json::from_str::<RegressionBaseline>(baseline)
+        .expect_err("unknown baseline fields must fail closed");
+    assert!(error.to_string().contains("unknown field `unexpected`"));
+}
+
+#[test]
+fn test_regression_guard_tracked_baseline_is_valid() {
+    let root = repo_root();
+    let baseline = parse_regression_baseline(&baseline_path(&root))
+        .expect("tracked regression baseline must be schema-valid");
+    validate_audited_covered_parent_contract(&baseline.ignored_tests)
+        .expect("tracked covered_by_parent edges must match the reviewed release contract");
+    assert!(
+        !baseline.ignored_tests.is_empty(),
+        "tracked regression baseline must inventory reasoned ignores"
+    );
+}
+
+#[test]
+fn test_regression_guard_release_loader_verifies_git_provenance_and_rename_delta() {
+    let repository = tempfile::tempdir().expect("create isolated Git repository");
+    let root = repository.path();
+    let git = |arguments: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run Git command")
+    };
+    assert!(git(&["init", "--initial-branch=main"]).success());
+    assert!(git(&["config", "user.name", "Regression Guard Keeper"]).success());
+    assert!(git(&["config", "user.email", "guard@example.invalid"]).success());
+    assert!(git(&["config", "commit.gpgsign", "false"]).success());
+    assert!(git(&["config", "core.autocrlf", "false"]).success());
+    assert!(git(&["config", "core.hooksPath", ".no-hooks"]).success());
+    fs::write(root.join("seed.txt"), "seed\n").expect("write seed");
+    fs::write(root.join("source.rs"), "fn source() {}\n").expect("write source");
+    fs::write(
+        root.join(".gitignore"),
+        format!("/{REGRESSION_BASELINE_PATH}\n"),
+    )
+    .expect("write ignore rule");
+    assert!(git(&["add", "--force", ".gitignore", "seed.txt", "source.rs",]).success());
+    assert!(git(&["commit", "-m", "seed"]).success());
+    let baseline_commit = resolve_current_head(root).expect("resolve isolated HEAD");
+    let baseline_path = root.join(REGRESSION_BASELINE_PATH);
+    fs::create_dir_all(baseline_path.parent().expect("baseline has parent"))
+        .expect("create baseline directory");
+    let evidence_root = format!("{EVIDENCE_PATH_PREFIX}{baseline_commit}");
+    let evidence_directory = root.join(&evidence_root);
+    fs::create_dir_all(evidence_directory.join("transcripts"))
+        .expect("create baseline transcript directory");
+    fs::create_dir_all(evidence_directory.join("runner"))
+        .expect("create baseline runner directory");
+    fs::create_dir_all(evidence_directory.join("status"))
+        .expect("create baseline status directory");
+    let workspace_path = format!("{evidence_root}/transcripts/baseline-workspace.stderr");
+    let workspace_stdout_path = format!("{evidence_root}/transcripts/baseline-workspace.stdout");
+    let runner_path = format!("{evidence_root}/runner/baseline-workspace.json");
+    let active_status_path = format!("{evidence_root}/status/baseline-workspace-active.json");
+    let completed_status_path = format!("{evidence_root}/status/baseline-workspace-completed.json");
+    let workspace = concat!(
+        "     Running unittests src/lib.rs (target/debug/deps/example-a1)\n",
+        "test baseline_case ... ok\n",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+        "Selected worker: worker-a at root@example.invalid\n",
+        "Remote command finished: exit=0 in 123ms\n",
+    );
+    fs::write(root.join(&workspace_path), workspace).expect("write baseline workspace transcript");
+    fs::write(root.join(&workspace_stdout_path), []).expect("write observed empty stdout");
+    let workspace_digest = blake3::hash(workspace.as_bytes()).to_hex().to_string();
+    let workspace_stdout_digest = blake3::hash(&[]).to_hex().to_string();
+    let status = |active_builds: serde_json::Value, recent_builds: serde_json::Value| {
+        serde_json::json!({
+            "api_version": "1.0",
+            "command": "status",
+            "success": true,
+            "data": {"daemon": {"active_builds": active_builds, "recent_builds": recent_builds}}
+        })
+    };
+    let command = "cargo test --locked --workspace -- '--test-threads=1'";
+    let active_build = serde_json::json!({
+        "id": 29960766543102039_u64,
+        "project_id": "frankensqlite-keeper",
+        "worker_id": "worker-a",
+        "command": command,
+    });
+    let completed_build = serde_json::json!({
+        "id": 29960766543102039_u64,
+        "project_id": "frankensqlite-keeper",
+        "worker_id": "worker-a",
+        "command": command,
+        "exit_code": 0,
+        "location": "remote",
+        "cancellation": null,
+    });
+    let active_status = serde_json::to_vec_pretty(&status(
+        serde_json::json!([active_build]),
+        serde_json::json!([]),
+    ))
+    .expect("serialize active status");
+    let completed_status = serde_json::to_vec_pretty(&status(
+        serde_json::json!([]),
+        serde_json::json!([completed_build]),
+    ))
+    .expect("serialize completed status");
+    fs::write(root.join(&active_status_path), &active_status).expect("write active status");
+    fs::write(root.join(&completed_status_path), &completed_status)
+        .expect("write completed status");
+    let active_status_digest = blake3::hash(&active_status).to_hex().to_string();
+    let completed_status_digest = blake3::hash(&completed_status).to_hex().to_string();
+    let runner = serde_json::json!({
+        "schema_version": RCH_RECEIPT_SCHEMA_VERSION,
+        "inner_cargo_argv": CANONICAL_WORKSPACE_TEST_ARGV,
+        "job_id": "29960766543102039",
+        "active_status": {"path": active_status_path, "digest_algorithm": "blake3-256", "digest": active_status_digest},
+        "completed_status": {"path": completed_status_path, "digest_algorithm": "blake3-256", "digest": completed_status_digest},
+    });
+    let runner = serde_json::to_vec_pretty(&runner).expect("serialize runner receipt");
+    fs::write(root.join(&runner_path), &runner).expect("write runner receipt");
+    let runner_digest = blake3::hash(&runner).to_hex().to_string();
+    fs::write(
+        &baseline_path,
+        format!(
+            r#"{{
+                "as_of_phase": "checkpoint_1",
+                "total_tests": 1,
+                "passed": 1,
+                "failed": 0,
+                "ignored": 0,
+                "baseline_commit": "{baseline_commit}",
+                "baseline_evidence": {{
+                    "source_commit": "{baseline_commit}",
+                    "workspace": {{
+                        "execution": {{
+                            "argv": ["cargo", "test", "--locked", "--workspace", "--", "--test-threads=1"],
+                            "exit_status": 0,
+                            "stdout": {{
+                                "capture": "observed",
+                                "leaf": {{"path": "{workspace_stdout_path}", "digest_algorithm": "blake3-256", "digest": "{workspace_stdout_digest}"}}
+                            }},
+                            "stderr": {{
+                                "capture": "observed",
+                                "leaf": {{"path": "{workspace_path}", "digest_algorithm": "blake3-256", "digest": "{workspace_digest}"}}
+                            }},
+                            "transcript": {{"path": "{workspace_path}", "digest_algorithm": "blake3-256", "digest": "{workspace_digest}"}}
+                        }},
+                        "runner_receipt": {{"path": "{runner_path}", "digest_algorithm": "blake3-256", "digest": "{runner_digest}"}}
+                    }}
+                }},
+                "ignored_tests": []
+            }}"#
+        ),
+    )
+    .expect("write valid baseline");
+    assert!(
+        load_regression_baseline(&baseline_path, root, &baseline_commit)
+            .expect_err("ignored untracked baseline must fail")
+            .contains("tracked by Git")
+    );
+    assert!(
+        git(&["add", "--force", REGRESSION_BASELINE_PATH, &evidence_root,]).success(),
+        "force-add the intentionally ignored keeper baseline and its transcript"
+    );
+    assert!(git(&["commit", "-m", "add baseline"]).success());
+    let baseline_head = resolve_current_head(root).expect("resolve baseline HEAD");
+    let loaded = load_regression_baseline(&baseline_path, root, &baseline_head)
+        .expect("typed baseline workspace receipt must validate");
+    let mut missing_receipt = loaded.clone();
+    missing_receipt.baseline_evidence = None;
+    assert!(
+        validate_baseline_workspace_evidence(root, &missing_receipt)
+            .expect_err("unattested baseline counters must fail closed")
+            .contains("lacks a typed workspace receipt")
+    );
+    let mut count_mismatch = loaded.clone();
+    count_mismatch.passed = 2;
+    count_mismatch.total_tests = 2;
+    assert!(
+        validate_baseline_workspace_evidence(root, &count_mismatch)
+            .expect_err("a count-preserving-looking baseline must still match its transcript")
+            .contains("do not match declared baseline counts")
+    );
+
+    let missing_commit = "f".repeat(40);
+    fs::write(
+        &baseline_path,
+        format!(
+            r#"{{
+                "as_of_phase": "checkpoint_1",
+                "total_tests": 1,
+                "passed": 1,
+                "failed": 0,
+                "ignored": 0,
+                "baseline_commit": "{missing_commit}",
+                "ignored_tests": []
+            }}"#
+        ),
+    )
+    .expect("write missing-commit baseline");
+    assert!(git(&["add", "--force", REGRESSION_BASELINE_PATH]).success());
+    assert!(git(&["commit", "-m", "use missing baseline commit"]).success());
+    let missing_head = resolve_current_head(root).expect("resolve missing-commit HEAD");
+    assert!(
+        load_regression_baseline(&baseline_path, root, &missing_head)
+            .expect_err("missing baseline commit must fail")
+            .contains("does not resolve")
+    );
+
+    let evidence_directory = root.join(EVIDENCE_PATH_PREFIX);
+    fs::create_dir_all(&evidence_directory).expect("create evidence directory");
+    fs::rename(
+        root.join("source.rs"),
+        evidence_directory.join("renamed.txt"),
+    )
+    .expect("rename source into evidence directory");
+    assert!(git(&["add", "--all"]).success());
+    assert!(git(&["commit", "-m", "rename source as evidence"]).success());
+    let renamed_head = resolve_current_head(root).expect("resolve renamed HEAD");
+    let changed = changed_paths_between(root, &missing_head, &renamed_head)
+        .expect("rename delta must remain inspectable");
+    assert!(changed.contains("source.rs"));
+    assert!(changed.contains("tests/artifacts/release-evidence/renamed.txt"));
+}
+
+#[test]
+fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
+    let repository = tempfile::tempdir().expect("create isolated evidence repository");
+    let root = repository.path();
+    let git = |arguments: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run Git command")
+    };
+    assert!(git(&["init", "--initial-branch=main"]).success());
+    assert!(git(&["config", "user.name", "Release Evidence Keeper"]).success());
+    assert!(git(&["config", "user.email", "evidence@example.invalid"]).success());
+    assert!(git(&["config", "commit.gpgsign", "false"]).success());
+    assert!(git(&["config", "core.autocrlf", "false"]).success());
+    assert!(git(&["config", "core.hooksPath", ".no-hooks"]).success());
+    fs::write(root.join("seed.txt"), "tested tree\n").expect("write tested tree");
+    assert!(git(&["add", "--force", "seed.txt"]).success());
+    assert!(git(&["commit", "-m", "tested tree"]).success());
+    let tested_commit = resolve_current_head(root).expect("resolve tested commit");
+
+    let mut live_guard = sample_ignored_baseline(
+        "crates/fsqlite-harness/tests/phase5_regression_guard.rs",
+        "phase5_regression_guard_full_workspace_against_baseline",
+    );
+    live_guard.kind = IgnoreKind::ReleaseGate;
+    live_guard.policy = IgnorePolicy::RunForRelease;
+    let baseline = RegressionBaseline {
+        as_of_phase: "checkpoint_1".to_owned(),
+        total_tests: 1,
+        passed: 1,
+        failed: 0,
+        ignored: 0,
+        baseline_commit: tested_commit.clone(),
+        baseline_evidence: None,
+        ignored_tests: vec![live_guard],
+    };
+
+    let evidence_directory = root.join(EVIDENCE_PATH_PREFIX);
+    fs::create_dir_all(&evidence_directory).expect("create evidence directory");
+    let workspace_path = format!("{EVIDENCE_PATH_PREFIX}workspace.txt");
+    let workspace = concat!(
+        "     Running unittests src/lib.rs (target/release-perf/deps/example-a1)\n",
+        "test exact_case ... ok\n",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    );
+    fs::write(root.join(&workspace_path), workspace).expect("write workspace transcript");
+    let workspace_digest = blake3::hash(workspace.as_bytes()).to_hex().to_string();
+    let manifest_path = format!("{EVIDENCE_PATH_PREFIX}manifest.json");
+    let manifest = serde_json::json!({
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "tested_commit": tested_commit.clone(),
+        "workspace": {
+            "argv": CANONICAL_WORKSPACE_TEST_ARGV,
+            "exit_status": 0,
+            "stdout": {
+                "capture": "observed",
+                "leaf": {"path": workspace_path.clone(), "digest_algorithm": "blake3-256", "digest": workspace_digest.clone()},
+            },
+            "stderr": {
+                "capture": "observed",
+                "leaf": {"path": workspace_path.clone(), "digest_algorithm": "blake3-256", "digest": workspace_digest.clone()},
+            },
+            "transcript": {"path": workspace_path.clone(), "digest_algorithm": "blake3-256", "digest": workspace_digest.clone()},
+        },
+        "run_receipts": [],
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+    let manifest_digest = blake3::hash(&manifest_bytes).to_hex().to_string();
+    fs::write(root.join(&manifest_path), manifest_bytes).expect("write evidence manifest");
+    assert!(git(&["add", "--force", "tests/artifacts/release-evidence",]).success());
+    assert!(git(&["commit", "-m", "release evidence"]).success());
+    let evidence_head = resolve_current_head(root).expect("resolve evidence commit");
+
+    assert!(
+        load_release_evidence_manifest_from_path(
+            root,
+            &evidence_head,
+            &baseline,
+            &manifest_path,
+            &manifest_digest,
+        )
+        .expect_err("a v1 release manifest must fail closed under the v2 verifier")
+        .contains("missing field `signature_path`")
+    );
+
+    fs::write(root.join(&workspace_path), "tampered\n").expect("tamper transcript");
+    assert!(
+        load_release_evidence_manifest_from_path(
+            root,
+            &evidence_head,
+            &baseline,
+            &manifest_path,
+            &manifest_digest,
+        )
+        .expect_err("a v1 release manifest must remain rejected after tampering")
+        .contains("missing field `signature_path`")
+    );
+    assert!(git(&["add", &workspace_path]).success());
+    assert!(git(&["commit", "-m", "tamper evidence"]).success());
+    let tampered_head = resolve_current_head(root).expect("resolve tampered evidence commit");
+    assert!(
+        load_release_evidence_manifest_from_path(
+            root,
+            &tampered_head,
+            &baseline,
+            &manifest_path,
+            &manifest_digest,
+        )
+        .expect_err("a v1 release manifest must remain rejected after commit changes")
+        .contains("missing field `signature_path`")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_regression_guard_release_inputs_reject_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("create symlink keeper directory");
+    fs::write(directory.path().join("outside.json"), "{}\n").expect("write symlink target");
+    symlink("outside.json", directory.path().join("baseline.json"))
+        .expect("create baseline symlink");
+    assert!(
+        require_regular_non_symlink_path(directory.path(), "baseline.json", "baseline")
+            .expect_err("symlinked release input must fail")
+            .contains("regular non-symlink")
+    );
+}
+
+#[test]
+fn test_regression_guard_pristine_checkout_allows_only_target_output() {
+    assert!(release_status_record_is_allowed(b"!! target/"));
+    assert!(release_status_record_is_allowed(
+        b"!! target/release-perf/deps/"
+    ));
+    assert!(!release_status_record_is_allowed(b"!! .env"));
+    assert!(!release_status_record_is_allowed(b"?? local-fixture.db"));
+    assert!(!release_status_record_is_allowed(b" M Cargo.lock"));
+}
+
+#[test]
+fn test_regression_guard_ignore_taxonomy_schema_is_closed() {
+    let unknown_kind = r#"{
+        "source_path": "tests/case.rs",
+        "test_name": "case",
+        "reason": "tracked gap",
+        "cfg_condition": null,
+        "kind": "mystery",
+        "policy": "block_release",
+        "evidence": { "requirement": "exact proof", "receipt": null }
+    }"#;
+    let error = serde_json::from_str::<IgnoredTestBaseline>(unknown_kind)
+        .expect_err("unknown taxonomy kind must fail closed");
+    assert!(error.to_string().contains("unknown variant `mystery`"));
+
+    let unknown_evidence_field = r#"{
+        "source_path": "tests/case.rs",
+        "test_name": "case",
+        "reason": "tracked gap",
+        "cfg_condition": null,
+        "kind": "known_bug",
+        "policy": "block_release",
+        "evidence": {
+            "requirement": "exact proof",
+            "receipt": null,
+            "unexpected": true
+        }
+    }"#;
+    let error = serde_json::from_str::<IgnoredTestBaseline>(unknown_evidence_field)
+        .expect_err("unknown nested evidence fields must fail closed");
+    assert!(error.to_string().contains("unknown field `unexpected`"));
+}
+
+#[test]
+fn test_regression_guard_ignore_taxonomy_entry_validation_fails_closed() {
+    let valid = sample_ignored_baseline("tests/case.rs", "case");
+    assert_eq!(valid.validate(), Ok(()));
+
+    let mut noncanonical_path = valid.clone();
+    noncanonical_path.source_path = "./tests/case.rs".to_owned();
+    assert!(
+        noncanonical_path
+            .validate()
+            .expect_err("noncanonical source path must fail")
+            .contains("not canonically spelled")
+    );
+
+    let mut noncanonical_cfg = valid.clone();
+    noncanonical_cfg.cfg_condition = Some("all(unix,feature=\"a\")".to_owned());
+    assert!(
+        noncanonical_cfg
+            .validate()
+            .expect_err("noncanonical cfg condition must fail")
+            .contains("cfg_condition is not canonical")
+    );
+
+    let mut blank_requirement = valid.clone();
+    blank_requirement.evidence.requirement = "  ".to_owned();
+    assert!(
+        blank_requirement
+            .validate()
+            .expect_err("blank evidence requirement must fail")
+            .contains("evidence.requirement")
+    );
+
+    let mut blank_receipt = valid.clone();
+    let mut malformed_receipt = sample_ignore_receipt();
+    malformed_receipt.artifact_blake3 = " ".to_owned();
+    blank_receipt.evidence.receipt = Some(malformed_receipt);
+    assert!(
+        blank_receipt
+            .validate()
+            .expect_err("malformed evidence receipt must fail")
+            .contains("artifact_blake3")
+    );
+
+    let mut uncovered_parent = valid;
+    uncovered_parent.policy = IgnorePolicy::CoveredByParent;
+    assert!(
+        uncovered_parent
+            .validate()
+            .expect_err("known bugs cannot delegate to a parent test")
+            .contains("known_bug")
+    );
+
+    let mut invalid_placeholder =
+        sample_ignored_baseline("tests/placeholder.rs", "placeholder_case");
+    invalid_placeholder.kind = IgnoreKind::Placeholder;
+    invalid_placeholder.policy = IgnorePolicy::Exempt;
+    assert!(
+        invalid_placeholder
+            .validate()
+            .expect_err("placeholders cannot be exempt")
+            .contains("placeholder")
+    );
+
+    let mut invalid_helper = sample_ignored_baseline("tests/helper.rs", "child");
+    invalid_helper.kind = IgnoreKind::SubprocessHelper;
+    invalid_helper.policy = IgnorePolicy::RunForRelease;
+    assert!(
+        invalid_helper
+            .validate()
+            .expect_err("subprocess helpers require parent coverage")
+            .contains("subprocess_helper")
+    );
+}
+
+#[test]
+fn test_regression_guard_ignore_taxonomy_kind_policy_matrix_is_closed() {
+    let policies = [
+        IgnorePolicy::BlockRelease,
+        IgnorePolicy::RunForRelease,
+        IgnorePolicy::CoveredByParent,
+        IgnorePolicy::Exempt,
+    ];
+    let cases: &[(IgnoreKind, &[IgnorePolicy])] = &[
+        (IgnoreKind::KnownBug, &[IgnorePolicy::BlockRelease]),
+        (IgnoreKind::Placeholder, &[IgnorePolicy::BlockRelease]),
+        (
+            IgnoreKind::Performance,
+            &[IgnorePolicy::RunForRelease, IgnorePolicy::Exempt],
+        ),
+        (IgnoreKind::Stress, &[IgnorePolicy::RunForRelease]),
+        (IgnoreKind::Diagnostic, &[IgnorePolicy::Exempt]),
+        (
+            IgnoreKind::SubprocessHelper,
+            &[IgnorePolicy::CoveredByParent],
+        ),
+        (IgnoreKind::ArtifactGeneration, &[IgnorePolicy::Exempt]),
+        (IgnoreKind::EnvironmentSpecific, &[IgnorePolicy::Exempt]),
+        (
+            IgnoreKind::ReleaseGate,
+            &[IgnorePolicy::BlockRelease, IgnorePolicy::RunForRelease],
+        ),
+    ];
+
+    for (kind, allowed) in cases {
+        for policy in policies {
+            assert_eq!(
+                kind.allows_policy(policy),
+                allowed.contains(&policy),
+                "kind={} policy={}",
+                kind.as_str(),
+                policy.as_str()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_regression_guard_ignore_taxonomy_requires_sorted_unique_locators() {
+    let baseline_with = |ignored_tests| RegressionBaseline {
+        as_of_phase: "checkpoint_1".to_owned(),
+        total_tests: 1,
+        passed: 1,
+        failed: 0,
+        ignored: 0,
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
+        ignored_tests,
+    };
+
+    let duplicate = sample_ignored_baseline("tests/a.rs", "case");
+    let error = baseline_with(vec![duplicate.clone(), duplicate])
+        .validate()
+        .expect_err("duplicate taxonomy locators must fail");
+    assert!(error.contains("strictly sorted and unique"));
+
+    let error = baseline_with(vec![
+        sample_ignored_baseline("tests/z.rs", "case"),
+        sample_ignored_baseline("tests/a.rs", "case"),
+    ])
+    .validate()
+    .expect_err("out-of-order taxonomy locators must fail");
+    assert!(error.contains("strictly sorted and unique"));
+}
+
+#[test]
+fn test_regression_guard_ignore_taxonomy_reports_exact_drift_deterministically() {
+    let mut expected_cfg = sample_ignored_baseline("tests/b.rs", "case");
+    expected_cfg.cfg_condition = Some("unix".to_owned());
+    let expected = vec![
+        sample_ignored_baseline("tests/a.rs", "case"),
+        expected_cfg,
+        sample_ignored_baseline("tests/c.rs", "case"),
+    ];
+
+    let actual = vec![
+        IgnoredTestSource {
+            source_path: "tests/d.rs".to_owned(),
+            test_name: "case".to_owned(),
+            reason: "new gap".to_owned(),
+            cfg_condition: None,
+        },
+        IgnoredTestSource {
+            source_path: "tests/b.rs".to_owned(),
+            test_name: "case".to_owned(),
+            reason: "tracked gap".to_owned(),
+            cfg_condition: None,
+        },
+        IgnoredTestSource {
+            source_path: "tests/a.rs".to_owned(),
+            test_name: "case".to_owned(),
+            reason: "changed reason".to_owned(),
+            cfg_condition: None,
+        },
+    ];
+
+    assert_eq!(
+        compare_ignored_test_taxonomy(&expected, &actual),
+        vec![
+            "changed tests/a.rs::case: reason expected=\"tracked gap\" actual=\"changed reason\"",
+            "changed tests/b.rs::case: cfg_condition expected=Some(\"unix\") actual=None",
+            "missing tests/c.rs::case: baseline entry has no matching source ignore",
+            "unclassified tests/d.rs::case: reason=\"new gap\" cfg_condition=None",
+        ]
+    );
+}
+
+#[test]
+fn test_regression_guard_block_release_ignores_static_and_current_receipts() {
+    let mut blocker = sample_ignored_baseline("tests/blocker.rs", "case");
+    blocker.evidence.receipt = Some(sample_ignore_receipt());
+    let receipts = ValidatedCurrentRunReceipts::from_test_locators([blocker.locator()]);
+    let blockers = ignored_test_release_blockers(
+        &[blocker],
+        &receipts,
+        &ValidatedParentCoverage::default(),
+        false,
+    );
+    assert_eq!(blockers.len(), 1);
+    assert!(blockers[0].contains("block_release policy remains unresolved"));
+
+    let mut release_run = sample_ignored_baseline("tests/manual.rs", "case");
+    release_run.kind = IgnoreKind::Stress;
+    release_run.policy = IgnorePolicy::RunForRelease;
+    release_run.evidence.receipt = Some(sample_ignore_receipt());
+    assert_eq!(
+        ignored_test_release_blockers(
+            &[release_run.clone()],
+            &ValidatedCurrentRunReceipts::default(),
+            &ValidatedParentCoverage::default(),
+            false,
+        )
+        .len(),
+        1
+    );
+    assert!(
+        ignored_test_release_blockers(
+            &[release_run.clone()],
+            &ValidatedCurrentRunReceipts::from_test_locators([release_run.locator()]),
+            &ValidatedParentCoverage::default(),
+            false,
+        )
+        .is_empty()
+    );
+
+    let mut covered_by_parent = sample_ignored_baseline("tests/helper.rs", "child");
+    covered_by_parent.kind = IgnoreKind::SubprocessHelper;
+    covered_by_parent.policy = IgnorePolicy::CoveredByParent;
+    covered_by_parent.parent_tests = vec![TestIdentity {
+        source_path: "tests/parent.rs".to_owned(),
+        test_name: "parent_case".to_owned(),
+    }];
+    assert_eq!(covered_by_parent.validate(), Ok(()));
+    let blockers = ignored_test_release_blockers(
+        &[covered_by_parent.clone()],
+        &ValidatedCurrentRunReceipts::default(),
+        &ValidatedParentCoverage::default(),
+        false,
+    );
+    assert_eq!(blockers.len(), 1);
+    assert!(blockers[0].contains("every declared parent"));
+
+    covered_by_parent.evidence.receipt = Some(sample_ignore_receipt());
+    assert_eq!(covered_by_parent.validate(), Ok(()));
+    let covered_locator = covered_by_parent.locator();
+    let blockers = ignored_test_release_blockers(
+        &[covered_by_parent.clone()],
+        &ValidatedCurrentRunReceipts::default(),
+        &ValidatedParentCoverage::default(),
+        false,
+    );
+    assert_eq!(blockers.len(), 1);
+    assert!(blockers[0].contains("every declared parent"));
+    assert!(
+        ignored_test_release_blockers(
+            &[covered_by_parent],
+            &ValidatedCurrentRunReceipts::default(),
+            &ValidatedParentCoverage::from_test_locators([covered_locator]),
+            false,
+        )
+        .is_empty(),
+        "only machine-validated parent coverage should clear the helper policy"
+    );
+}
+
+#[test]
+fn test_regression_guard_covered_parent_schema_fails_closed() {
+    let missing_parent = sample_covered_baseline("tests/helper.rs", "child", Vec::new());
+    assert!(
+        missing_parent
+            .validate()
+            .expect_err("covered helpers must declare a parent")
+            .contains("at least one parent")
+    );
+
+    let parent = sample_test_identity("tests/parent.rs", "parent_case");
+    let valid = sample_covered_baseline("tests/helper.rs", "child", vec![parent.clone()]);
+    assert_eq!(valid.validate(), Ok(()));
+
+    let mut non_covered = sample_ignored_baseline("tests/known.rs", "known_case");
+    non_covered.parent_tests = vec![parent.clone()];
+    assert!(
+        non_covered
+            .validate()
+            .expect_err("non-covered policies cannot delegate")
+            .contains("only covered_by_parent")
+    );
+
+    let self_parent = sample_covered_baseline(
+        "tests/helper.rs",
+        "child",
+        vec![sample_test_identity("tests/helper.rs", "child")],
+    );
+    assert!(
+        self_parent
+            .validate()
+            .expect_err("self-parenting must fail")
+            .contains("itself")
+    );
+
+    let live_guard_parent = sample_covered_baseline(
+        "tests/helper.rs",
+        "child",
+        vec![sample_test_identity(
+            "crates/fsqlite-harness/tests/phase5_regression_guard.rs",
+            "phase5_regression_guard_full_workspace_against_baseline",
+        )],
+    );
+    assert!(
+        live_guard_parent
+            .validate()
+            .expect_err("the live guard cannot be parent evidence")
+            .contains("live release guard")
+    );
+
+    let unsorted = sample_covered_baseline(
+        "tests/helper.rs",
+        "child",
+        vec![
+            sample_test_identity("tests/parent.rs", "z_parent"),
+            sample_test_identity("tests/parent.rs", "a_parent"),
+        ],
+    );
+    assert!(
+        unsorted
+            .validate()
+            .expect_err("parent identities must be sorted")
+            .contains("strictly sorted")
+    );
+
+    let duplicate =
+        sample_covered_baseline("tests/helper.rs", "child", vec![parent.clone(), parent]);
+    assert!(
+        duplicate
+            .validate()
+            .expect_err("parent identities must be unique")
+            .contains("strictly sorted")
+    );
+
+    let malformed = sample_covered_baseline(
+        "tests/helper.rs",
+        "child",
+        vec![sample_test_identity("../parent.rs", "parent_case")],
+    );
+    assert!(
+        malformed
+            .validate()
+            .expect_err("noncanonical parent paths must fail")
+            .contains("invalid parent test identity")
+    );
+}
+
+#[test]
+fn test_regression_guard_covered_parent_graph_rejects_cycles_and_accepts_dags() {
+    let a = sample_covered_baseline(
+        "tests/a.rs",
+        "a",
+        vec![sample_test_identity("tests/b.rs", "b")],
+    );
+    let b = sample_covered_baseline(
+        "tests/b.rs",
+        "b",
+        vec![sample_test_identity("tests/a.rs", "a")],
+    );
+    let error = validate_parent_coverage_graph(&[a, b])
+        .expect_err("mutual parent coverage must not self-authorize");
+    assert_eq!(
+        error,
+        "covered_by_parent graph contains a cycle: tests/a.rs::a -> tests/b.rs::b -> tests/a.rs::a"
+    );
+
+    let a = sample_covered_baseline(
+        "tests/a.rs",
+        "a",
+        vec![sample_test_identity("tests/b.rs", "b")],
+    );
+    let b = sample_covered_baseline(
+        "tests/b.rs",
+        "b",
+        vec![sample_test_identity("tests/c.rs", "c")],
+    );
+    let c = sample_covered_baseline(
+        "tests/c.rs",
+        "c",
+        vec![sample_test_identity("tests/a.rs", "a")],
+    );
+    assert!(
+        validate_parent_coverage_graph(&[a, b, c])
+            .expect_err("long cycles must fail")
+            .contains("tests/a.rs::a -> tests/b.rs::b -> tests/c.rs::c -> tests/a.rs::a")
+    );
+
+    let shared_parent = sample_test_identity("tests/root.rs", "root");
+    let a = sample_covered_baseline("tests/a.rs", "a", vec![shared_parent.clone()]);
+    let b = sample_covered_baseline("tests/b.rs", "b", vec![shared_parent]);
+    assert_eq!(validate_parent_coverage_graph(&[a, b]), Ok(()));
+}
+
+#[test]
+fn test_regression_guard_declared_parent_source_requires_exact_ordinary_test() {
+    let source = r"
+mod suite {
+    #[test]
+    fn parent_case() {}
+}
+
+fn not_a_test() {}
+";
+    assert_eq!(
+        validate_ordinary_test_source("tests/parent.rs", source, "suite::parent_case"),
+        Ok(())
+    );
+    assert!(
+        validate_ordinary_test_source("tests/parent.rs", source, "parent_case")
+            .expect_err("wrong module identity must fail")
+            .contains("found 0")
+    );
+    assert!(
+        validate_ordinary_test_source("tests/parent.rs", source, "not_a_test")
+            .expect_err("ordinary functions cannot act as test parents")
+            .contains("ordinary #[test]")
+    );
+    assert!(
+        validate_ordinary_test_source("tests/parent.rs", "this is not rust", "parent_case")
+            .expect_err("unparseable parent source must fail")
+            .contains("unable to parse Rust source")
+    );
+}
+
+#[test]
+fn test_regression_guard_workspace_parent_evidence_requires_serial_harness() {
+    assert_eq!(
+        CANONICAL_WORKSPACE_TEST_ARGV,
+        &[
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--",
+            "--test-threads=1",
+        ]
+    );
+
+    let (baseline, mut manifest) = sample_release_evidence();
+    manifest.workspace.execution.argv = vec![
+        "cargo".to_owned(),
+        "test".to_owned(),
+        "--locked".to_owned(),
+        "--workspace".to_owned(),
+    ];
+    assert!(
+        validate_release_evidence_manifest(&manifest, &baseline)
+            .expect_err("parallel workspace evidence must not authorize parent coverage")
+            .contains("canonical command")
+    );
+}
+
+#[test]
+fn test_regression_guard_workspace_parent_execution_is_target_bound_and_fail_closed() {
+    let parent = sample_test_identity("crates/example/tests/parent.rs", "parent_case");
+    let passing = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+running 1 test
+test child_helper ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test parent_case ... ok
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+    assert_eq!(workspace_parent_test_passed(passing, &parent), Ok(true));
+
+    let wrong_target = passing.replace("tests/parent.rs", "tests/other.rs");
+    assert_eq!(
+        workspace_parent_test_passed(&wrong_target, &parent),
+        Ok(false)
+    );
+
+    let ignored = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+test parent_case ... ignored
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+    assert_eq!(workspace_parent_test_passed(ignored, &parent), Ok(false));
+
+    let success_with_zero_passed = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+test parent_case ... ok
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+    assert!(
+        workspace_parent_test_passed(success_with_zero_passed, &parent)
+            .expect_err("an exact success line cannot outrank the authoritative summary")
+            .contains("authoritative summary reports 0 passed")
+    );
+
+    let duplicate_count = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+test parent_case ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 99 passed; 0 measured; 0 filtered out; finished in 0.00s
+";
+    assert!(
+        workspace_parent_test_passed(duplicate_count, &parent)
+            .expect_err("duplicate authoritative count fields must fail closed")
+            .contains("malformed Cargo summary")
+    );
+
+    let failed = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+test parent_case ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+    assert_eq!(workspace_parent_test_passed(failed, &parent), Ok(false));
+
+    let subprocess_noise = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+helper: test parent_case ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+    assert_eq!(
+        workspace_parent_test_passed(subprocess_noise, &parent),
+        Ok(false)
+    );
+
+    let nested_same_name_only = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+test parent_case ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+    assert_eq!(
+        workspace_parent_test_passed(nested_same_name_only, &parent),
+        Ok(false),
+        "a nested subprocess success before its own summary cannot prove the outer parent"
+    );
+
+    let duplicate_section = format!("{passing}{passing}");
+    assert!(
+        workspace_parent_test_passed(&duplicate_section, &parent)
+            .expect_err("duplicate target sections are package-ambiguous")
+            .contains("ambiguous")
+    );
+
+    let duplicate_success = passing.replace(
+        "test parent_case ... ok\n",
+        "test parent_case ... ok\ntest parent_case ... ok\n",
+    );
+    assert!(
+        workspace_parent_test_passed(&duplicate_success, &parent)
+            .expect_err("duplicate parent success lines must fail")
+            .contains("duplicate exact success")
+    );
+
+    let trailing_success = r"
+     Running tests/parent.rs (target/debug/deps/parent-a1)
+test child_helper ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test parent_case ... ok
+";
+    assert!(
+        workspace_parent_test_passed(trailing_success, &parent)
+            .expect_err("an exact success without a following authoritative summary must fail")
+            .contains("after its final authoritative test summary")
+    );
+}
+
+#[test]
+fn test_regression_guard_parent_coverage_requires_all_parents_and_resolves_dags() {
+    let root = sample_test_identity("tests/root.rs", "root");
+    let middle = sample_covered_baseline("tests/middle.rs", "middle", vec![root.clone()]);
+    let leaf = sample_covered_baseline(
+        "tests/leaf.rs",
+        "leaf",
+        vec![sample_test_identity("tests/middle.rs", "middle")],
+    );
+    let direct = HashSet::from([root.locator()]);
+    let coverage = resolve_parent_coverage(&[leaf.clone(), middle.clone()], &direct);
+    assert!(coverage.contains(&middle.locator()));
+    assert!(coverage.contains(&leaf.locator()));
+
+    let multi_parent = sample_covered_baseline(
+        "tests/multi.rs",
+        "multi",
+        vec![
+            sample_test_identity("tests/parent_a.rs", "parent_a"),
+            sample_test_identity("tests/parent_b.rs", "parent_b"),
+        ],
+    );
+    let incomplete = HashSet::from(["tests/parent_a.rs::parent_a".to_owned()]);
+    let coverage = resolve_parent_coverage(&[multi_parent.clone()], &incomplete);
+    assert!(
+        !coverage.contains(&multi_parent.locator()),
+        "one parent cannot satisfy an all-parent contract"
+    );
+
+    let complete = HashSet::from([
+        "tests/parent_a.rs::parent_a".to_owned(),
+        "tests/parent_b.rs::parent_b".to_owned(),
+    ]);
+    let coverage = resolve_parent_coverage(&[multi_parent.clone()], &complete);
+    assert!(coverage.contains(&multi_parent.locator()));
+
+    let shared = sample_test_identity("tests/shared.rs", "shared");
+    let first = sample_covered_baseline("tests/first.rs", "first", vec![shared.clone()]);
+    let second = sample_covered_baseline("tests/second.rs", "second", vec![shared.clone()]);
+    let coverage = resolve_parent_coverage(
+        &[first.clone(), second.clone()],
+        &HashSet::from([shared.locator()]),
+    );
+    assert!(coverage.contains(&first.locator()));
+    assert!(coverage.contains(&second.locator()));
+
+    let no_direct_evidence = resolve_parent_coverage(&[leaf, middle], &HashSet::new());
+    assert!(no_direct_evidence.covered_children.is_empty());
+}
+
+#[test]
+fn test_regression_guard_live_baseline_has_typed_covered_parent_graph() {
+    let baseline = serde_json::from_str::<RegressionBaseline>(include_str!(
+        "../../../tests/regression_baseline.json"
+    ))
+    .expect("live regression baseline must parse");
+    baseline
+        .validate()
+        .expect("live regression baseline parent graph must validate");
+    validate_audited_covered_parent_contract(&baseline.ignored_tests)
+        .expect("live covered_by_parent edges must match the reviewed release contract");
+
+    let mut substituted = baseline.clone();
+    let covered = substituted
+        .ignored_tests
+        .iter_mut()
+        .find(|entry| entry.policy == IgnorePolicy::CoveredByParent)
+        .expect("live baseline must contain covered_by_parent entries");
+    covered.parent_tests[0].test_name = "unrelated_but_passing_test".to_owned();
+    assert!(
+        validate_audited_covered_parent_contract(&substituted.ignored_tests)
+            .expect_err("a count-preserving parent substitution must fail")
+            .contains("expected")
+    );
+}
+
+#[test]
+fn test_regression_guard_release_evaluator_fails_each_independent_gate() {
+    let baseline_with = |ignored_tests| RegressionBaseline {
+        as_of_phase: "checkpoint_1".to_owned(),
+        total_tests: 1,
+        passed: 1,
+        failed: 0,
+        ignored: 0,
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
+        ignored_tests,
+    };
+    let green_counts = RegressionCounts {
+        total_tests: 1,
+        passed: 1,
+        failed: 0,
+        ignored: 0,
+    };
+    let empty_inventory = RepositoryIgnoreInventory {
+        records: Vec::new(),
+        uninspected_sources: Vec::new(),
+        soundness_limitations: Vec::new(),
+    };
+    let empty_baseline = baseline_with(Vec::new());
+    let empty_receipts = ValidatedCurrentRunReceipts::default();
+    let empty_parent_coverage = ValidatedParentCoverage::default();
+    assert!(
+        evaluate_release_gate(
+            &empty_baseline,
+            &green_counts,
+            &empty_inventory,
+            &empty_receipts,
+            &empty_parent_coverage,
+            false,
+        )
+        .passes()
+    );
+
+    let opaque_inventory = RepositoryIgnoreInventory {
+        records: Vec::new(),
+        uninspected_sources: vec!["tests/opaque.rs".to_owned()],
+        soundness_limitations: Vec::new(),
+    };
+    let evaluation = evaluate_release_gate(
+        &empty_baseline,
+        &green_counts,
+        &opaque_inventory,
+        &empty_receipts,
+        &empty_parent_coverage,
+        false,
+    );
+    assert!(!evaluation.passes());
+    assert!(
+        evaluation
+            .failure_summary()
+            .contains("explicitly uninspected")
+    );
+
+    let limited_inventory = RepositoryIgnoreInventory {
+        records: Vec::new(),
+        uninspected_sources: Vec::new(),
+        soundness_limitations: vec!["macro expansion is unresolved".to_owned()],
+    };
+    let evaluation = evaluate_release_gate(
+        &empty_baseline,
+        &green_counts,
+        &limited_inventory,
+        &empty_receipts,
+        &empty_parent_coverage,
+        false,
+    );
+    assert!(!evaluation.passes());
+    assert!(
+        evaluation
+            .failure_summary()
+            .contains("soundness limitation")
+    );
+
+    let taxonomy_inventory = RepositoryIgnoreInventory {
+        records: vec![IgnoredTestSource {
+            source_path: "tests/new.rs".to_owned(),
+            test_name: "new_case".to_owned(),
+            reason: "unclassified".to_owned(),
+            cfg_condition: None,
+        }],
+        uninspected_sources: Vec::new(),
+        soundness_limitations: Vec::new(),
+    };
+    let evaluation = evaluate_release_gate(
+        &empty_baseline,
+        &green_counts,
+        &taxonomy_inventory,
+        &empty_receipts,
+        &empty_parent_coverage,
+        false,
+    );
+    assert!(!evaluation.passes());
+    assert_eq!(evaluation.taxonomy_mismatches.len(), 1);
+
+    let blocker = sample_ignored_baseline("tests/blocker.rs", "case");
+    let blocker_inventory = RepositoryIgnoreInventory {
+        records: vec![blocker.source_identity()],
+        uninspected_sources: Vec::new(),
+        soundness_limitations: Vec::new(),
+    };
+    let evaluation = evaluate_release_gate(
+        &baseline_with(vec![blocker]),
+        &green_counts,
+        &blocker_inventory,
+        &empty_receipts,
+        &empty_parent_coverage,
+        false,
+    );
+    assert!(!evaluation.passes());
+    assert_eq!(evaluation.policy_blockers.len(), 1);
+
+    let mut release_run = sample_ignored_baseline("tests/manual.rs", "case");
+    release_run.kind = IgnoreKind::Stress;
+    release_run.policy = IgnorePolicy::RunForRelease;
+    let release_locator = release_run.locator();
+    let release_inventory = RepositoryIgnoreInventory {
+        records: vec![release_run.source_identity()],
+        uninspected_sources: Vec::new(),
+        soundness_limitations: Vec::new(),
+    };
+    assert!(
+        !evaluate_release_gate(
+            &baseline_with(vec![release_run.clone()]),
+            &green_counts,
+            &release_inventory,
+            &empty_receipts,
+            &empty_parent_coverage,
+            false,
+        )
+        .passes()
+    );
+    assert!(
+        evaluate_release_gate(
+            &baseline_with(vec![release_run]),
+            &green_counts,
+            &release_inventory,
+            &ValidatedCurrentRunReceipts::from_test_locators([release_locator]),
+            &empty_parent_coverage,
+            false,
+        )
+        .passes()
+    );
+
+    let mut covered = sample_ignored_baseline("tests/helper.rs", "child");
+    covered.kind = IgnoreKind::SubprocessHelper;
+    covered.policy = IgnorePolicy::CoveredByParent;
+    covered.parent_tests = vec![TestIdentity {
+        source_path: "tests/parent.rs".to_owned(),
+        test_name: "parent_case".to_owned(),
+    }];
+    let covered_locator = covered.locator();
+    let covered_inventory = RepositoryIgnoreInventory {
+        records: vec![covered.source_identity()],
+        uninspected_sources: Vec::new(),
+        soundness_limitations: Vec::new(),
+    };
+    assert!(
+        !evaluate_release_gate(
+            &baseline_with(vec![covered.clone()]),
+            &green_counts,
+            &covered_inventory,
+            &empty_receipts,
+            &empty_parent_coverage,
+            false,
+        )
+        .passes()
+    );
+    covered.evidence.receipt = Some(sample_ignore_receipt());
+    assert!(
+        !evaluate_release_gate(
+            &baseline_with(vec![covered.clone()]),
+            &green_counts,
+            &covered_inventory,
+            &empty_receipts,
+            &empty_parent_coverage,
+            false,
+        )
+        .passes()
+    );
+    assert!(
+        evaluate_release_gate(
+            &baseline_with(vec![covered]),
+            &green_counts,
+            &covered_inventory,
+            &empty_receipts,
+            &ValidatedParentCoverage::from_test_locators([covered_locator]),
+            false,
+        )
+        .passes()
+    );
+
+    let mut live_guard = sample_ignored_baseline(
+        "crates/fsqlite-harness/tests/phase5_regression_guard.rs",
+        "phase5_regression_guard_full_workspace_against_baseline",
+    );
+    live_guard.kind = IgnoreKind::ReleaseGate;
+    live_guard.policy = IgnorePolicy::RunForRelease;
+    let live_inventory = RepositoryIgnoreInventory {
+        records: vec![live_guard.source_identity()],
+        uninspected_sources: Vec::new(),
+        soundness_limitations: Vec::new(),
+    };
+    assert!(
+        !evaluate_release_gate(
+            &baseline_with(vec![live_guard.clone()]),
+            &green_counts,
+            &live_inventory,
+            &empty_receipts,
+            &empty_parent_coverage,
+            false,
+        )
+        .passes()
+    );
+    assert!(
+        evaluate_release_gate(
+            &baseline_with(vec![live_guard]),
+            &green_counts,
+            &live_inventory,
+            &empty_receipts,
+            &empty_parent_coverage,
+            true,
+        )
+        .passes()
+    );
+
+    let red_counts = RegressionCounts {
+        total_tests: 1,
+        passed: 0,
+        failed: 1,
+        ignored: 0,
+    };
+    assert!(
+        !evaluate_release_gate(
+            &empty_baseline,
+            &red_counts,
+            &empty_inventory,
+            &empty_receipts,
+            &empty_parent_coverage,
+            false,
+        )
+        .passes()
+    );
+}
+
+#[test]
+fn test_regression_guard_baseline_validation_fails_closed() {
+    let valid = RegressionBaseline {
+        as_of_phase: "checkpoint_1".to_owned(),
+        total_tests: 3,
+        passed: 3,
+        failed: 0,
+        ignored: 0,
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
+        ignored_tests: Vec::new(),
+    };
+    assert_eq!(valid.validate(), Ok(()));
+
+    let mut inconsistent = valid.clone();
+    inconsistent.total_tests = 4;
+    assert!(
+        inconsistent
+            .validate()
+            .expect_err("inconsistent totals must fail")
+            .contains("does not equal")
+    );
+
+    let mut failing = valid.clone();
+    failing.total_tests = 4;
+    failing.failed = 1;
+    assert!(
+        failing
+            .validate()
+            .expect_err("a failing release baseline must fail")
+            .contains("zero failures")
+    );
+
+    let mut ignored = valid.clone();
+    ignored.total_tests = 4;
+    ignored.ignored = 1;
+    assert_eq!(
+        ignored.validate(),
+        Ok(()),
+        "aggregate ignored counts are telemetry; exact taxonomy owns policy"
+    );
+
+    let mut bad_commit = valid;
+    bad_commit.baseline_commit = "not-a-commit".to_owned();
+    assert!(
+        bad_commit
+            .validate()
+            .expect_err("invalid commit provenance must fail")
+            .contains("hexadecimal Git object name")
+    );
+}
+
+/// An abbreviated `baseline_commit` can never equal the 40-digit
+/// `source_commit` that `validate_baseline_workspace_evidence` requires, so
+/// accepting one would make the typed workspace receipt permanently
+/// unsatisfiable instead of merely unproven. The anchor must therefore be a
+/// full object name before any receipt is authored against it.
+#[test]
+fn test_regression_guard_baseline_rejects_abbreviated_provenance_anchor() {
+    let full_anchor = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    assert_eq!(full_anchor.len(), 40, "fixture anchor must be a full OID");
+
+    let baseline = RegressionBaseline {
+        as_of_phase: "checkpoint_1".to_owned(),
+        total_tests: 1,
+        passed: 1,
+        failed: 0,
+        ignored: 0,
+        baseline_commit: full_anchor.to_owned(),
+        baseline_evidence: None,
+        ignored_tests: Vec::new(),
+    };
+    assert_eq!(
+        baseline.validate(),
+        Ok(()),
+        "a full 40-digit lowercase anchor must remain valid"
+    );
+
+    // Every abbreviation Git itself would accept must still fail closed here,
+    // including the previously permitted 7-digit floor and the 39-digit
+    // boundary immediately below a full object name.
+    for length in [7_usize, 8, 12, 39] {
+        let mut abbreviated = baseline.clone();
+        abbreviated.baseline_commit = full_anchor[..length].to_owned();
+        let error = abbreviated.validate().expect_err(&format!(
+            "a {length}-digit abbreviated provenance anchor must fail closed"
+        ));
+        assert!(
+            error.contains("full untrimmed 40-digit lowercase hexadecimal Git object name"),
+            "unexpected rejection reason for a {length}-digit anchor: {error}"
+        );
+    }
+
+    // Over-long and non-lowercase-hex anchors stay rejected for the same reason.
+    let mut over_long = baseline.clone();
+    over_long.baseline_commit = format!("{full_anchor}0");
+    assert!(
+        over_long
+            .validate()
+            .expect_err("a 41-digit anchor must fail closed")
+            .contains("hexadecimal Git object name")
+    );
+
+    let mut uppercase = baseline;
+    uppercase.baseline_commit = full_anchor.to_uppercase();
+    assert!(
+        uppercase
+            .validate()
+            .expect_err("an uppercase anchor must fail closed")
+            .contains("hexadecimal Git object name")
+    );
+}
+
+#[test]
 fn test_regression_guard_detects_failure() {
     let baseline = RegressionBaseline {
         as_of_phase: "checkpoint_1".to_owned(),
@@ -254,7 +9134,9 @@ fn test_regression_guard_detects_failure() {
         passed: 5_319,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
+        ignored_tests: Vec::new(),
     };
     let actual = RegressionCounts {
         total_tests: 5_319,
@@ -283,7 +9165,9 @@ fn test_regression_guard_baseline_comparison() {
         passed: 5_319,
         failed: 0,
         ignored: 0,
-        baseline_commit: "deadbeef".to_owned(),
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
+        ignored_tests: Vec::new(),
     };
     let actual = RegressionCounts {
         total_tests: 5_322,
@@ -308,75 +9192,120 @@ fn test_regression_guard_baseline_comparison() {
 }
 
 #[test]
-#[ignore = "Runs full cargo test --workspace and compares against regression baseline JSON"]
-fn phase5_regression_guard_full_workspace_against_baseline() -> Result<(), String> {
-    if std::env::var_os(CHILD_ENV).is_some() {
-        return Ok(());
-    }
+fn test_regression_guard_treats_aggregate_ignored_delta_as_telemetry() {
+    let baseline = RegressionBaseline {
+        as_of_phase: "checkpoint_1".to_owned(),
+        total_tests: 5,
+        passed: 5,
+        failed: 0,
+        ignored: 0,
+        baseline_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        baseline_evidence: None,
+        ignored_tests: Vec::new(),
+    };
+    let actual = RegressionCounts {
+        total_tests: 6,
+        passed: 5,
+        failed: 0,
+        ignored: 1,
+    };
 
+    let report = compare_against_baseline(&baseline, &actual);
+    assert!(
+        report.pass,
+        "aggregate ignored growth alone must defer to the exact taxonomy: {report:?}"
+    );
+    assert_eq!(report.delta.delta_ignored, 1);
+}
+
+#[test]
+#[ignore = "Validates a commit-bound release evidence manifest and canonical workspace transcript against the regression baseline"]
+fn phase5_regression_guard_full_workspace_against_baseline() -> Result<(), String> {
     let root = repo_root();
+    let captured_head = resolve_current_head(&root)
+        .map_err(|error| format!("bead_id={BEAD_ID} case=current_commit error={error}"))?;
+    require_pristine_release_checkout(&root)
+        .map_err(|error| format!("bead_id={BEAD_ID} case=initial_worktree_check error={error}"))?;
     let baseline_file = baseline_path(&root);
-    let baseline = load_regression_baseline(&baseline_file)
+    let baseline = load_regression_baseline(&baseline_file, &root, &captured_head)
         .map_err(|error| format!("bead_id={BEAD_ID} case=load_baseline_failed error={error}"))?;
+    validate_audited_covered_parent_contract(&baseline.ignored_tests).map_err(|error| {
+        format!("bead_id={BEAD_ID} case=covered_parent_contract_failed error={error}")
+    })?;
+    let evidence = load_release_evidence_manifest(&root, &captured_head, &baseline)
+        .map_err(|error| format!("bead_id={BEAD_ID} case=load_evidence_failed error={error}"))?;
+    let live_arguments = std::env::args().collect::<Vec<_>>();
+    validate_live_release_guard_invocation(&live_arguments)
+        .map_err(|error| format!("bead_id={BEAD_ID} case=live_guard_invocation error={error}"))?;
 
     eprintln!(
-        "{LOG_PREFIX}[phase={}][step=run_tests] Starting full workspace test suite",
-        baseline.as_of_phase
+        "{LOG_PREFIX}[phase={}][step=validate_evidence] tested_commit={}",
+        baseline.as_of_phase, evidence.tested_commit,
     );
 
-    let output = Command::new("cargo")
-        .arg("test")
-        .arg("--workspace")
-        .arg("--")
-        .arg("--nocapture")
-        .current_dir(&root)
-        .env(CHILD_ENV, "1")
-        .output()
-        .map_err(|error| format!("bead_id={BEAD_ID} case=spawn_cargo_test_failed error={error}"))?;
-
-    let combined_output = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let counts = parse_workspace_test_counts(&combined_output).map_err(|error| {
-        format!("bead_id={BEAD_ID} case=parse_workspace_output_failed error={error}")
-    })?;
+    let counts = evidence.workspace_counts;
 
     eprintln!(
         "{LOG_PREFIX}[phase={}][step=parse_results] total={} passed={} failed={} ignored={}",
         baseline.as_of_phase, counts.total_tests, counts.passed, counts.failed, counts.ignored
     );
 
-    let report = compare_against_baseline(&baseline, &counts);
+    let mut inventory = collect_repository_ignored_tests(&root, UNINSPECTED_RUST_SOURCE_PATHS)
+        .map_err(|error| format!("bead_id={BEAD_ID} case=source_inventory_failed error={error}"))?;
+    if evidence.compiler_inventory_attested {
+        // The signed compiler-derived inventory is the release authority for
+        // source identities that this guard deliberately does not inspect.
+        // Keep collecting the ordinary source inventory for taxonomy drift,
+        // but discharge only these explicit soundness limits through the
+        // exact-tree-bound compiler attestation validated above.
+        inventory.uninspected_sources.clear();
+        inventory.soundness_limitations.clear();
+    }
+    let evaluation = evaluate_release_gate(
+        &baseline,
+        &counts,
+        &inventory,
+        &evidence.current_run_receipts,
+        &evidence.parent_coverage,
+        true,
+    );
     eprintln!(
-        "{LOG_PREFIX}[phase={}][step=compare_baseline] delta_passed={} delta_failed={} new_tests={}",
+        "{LOG_PREFIX}[phase={}][step=compare_baseline] delta_passed={} delta_failed={} delta_ignored={} new_tests={}",
         baseline.as_of_phase,
-        report.delta.delta_passed,
-        report.delta.delta_failed,
-        report.delta.new_tests
+        evaluation.aggregate.delta.delta_passed,
+        evaluation.aggregate.delta.delta_failed,
+        evaluation.aggregate.delta.delta_ignored,
+        evaluation.aggregate.delta.new_tests
     );
 
-    if report.pass {
+    if evaluation.passes() {
+        let final_head = resolve_current_head(&root)
+            .map_err(|error| format!("bead_id={BEAD_ID} case=final_commit error={error}"))?;
+        if final_head != captured_head {
+            return Err(format!(
+                "bead_id={BEAD_ID} case=repository_moved error=HEAD changed during release-gate evaluation"
+            ));
+        }
+        require_pristine_release_checkout(&root).map_err(|error| {
+            format!("bead_id={BEAD_ID} case=final_worktree_check error={error}")
+        })?;
         eprintln!(
-            "{LOG_PREFIX}[phase={}][result=PASS] All baseline tests preserved against commit {}",
-            baseline.as_of_phase, baseline.baseline_commit
+            "{LOG_PREFIX}[phase={}][result=PASS] aggregate counts, evidence manifest, ignored-test taxonomy, and release policies validated at commit {}",
+            baseline.as_of_phase, captured_head
         );
         return Ok(());
     }
 
-    for failed in extract_failed_tests(&combined_output) {
+    for failed in extract_failed_tests(&evidence.workspace_transcript) {
         eprintln!(
             "{LOG_PREFIX}[phase={}][step=failures] test_name=\"{}\"",
             baseline.as_of_phase, failed
         );
     }
 
-    let reason = report
-        .reason
-        .unwrap_or_else(|| "unknown regression detected".to_owned());
+    let reason = evaluation.failure_summary();
     Err(format!(
-        "{LOG_PREFIX}[phase={}][result=FAIL] {reason}; baseline_commit={} cargo_status={}",
-        baseline.as_of_phase, baseline.baseline_commit, output.status
+        "{LOG_PREFIX}[phase={}][result=FAIL] {reason}; baseline_commit={} tested_commit={}",
+        baseline.as_of_phase, baseline.baseline_commit, evidence.tested_commit
     ))
 }

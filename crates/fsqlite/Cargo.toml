@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite"
-version = "0.1.19"
+version = "0.2.0"
 description = "Public API facade"
 edition.workspace = true
 license-file.workspace = true
@@ -9,10 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 asupersync = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-core = { version = "0.1.19", path = "../fsqlite-core", default-features = false }
-fsqlite-vfs = { version = "0.1.19", path = "../fsqlite-vfs", default-features = false }
+fsqlite-core = { version = "0.2.0", path = "../fsqlite-core", default-features = false }
+fsqlite-vfs = { version = "0.2.0", path = "../fsqlite-vfs", default-features = false }
 fsqlite-ext-json = { workspace = true, optional = true }
 fsqlite-ext-fts5 = { workspace = true, optional = true }
 fsqlite-ext-fts3 = { workspace = true, optional = true }
@@ -21,6 +22,7 @@ fsqlite-ext-session = { workspace = true, optional = true }
 fsqlite-ext-icu = { workspace = true, optional = true }
 fsqlite-ext-misc = { workspace = true, optional = true }
 fsqlite-parser = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree"]
@@ -34,17 +36,28 @@ rtree = ["dep:fsqlite-ext-rtree"]
 session = ["dep:fsqlite-ext-session"]
 icu = ["dep:fsqlite-ext-icu"]
 misc = ["dep:fsqlite-ext-misc"]
-async-api = ["dep:asupersync", "fsqlite-types/native"]
+async-api = ["dep:asupersync", "dep:futures-lite", "fsqlite-types/native"]
 raptorq = []
 mvcc = []
 
 [dev-dependencies]
+# The whole storage stack is `async` now, so every test must drive a runtime.
+# `asupersync` is an optional *dependency* (gated behind `async-api`), but tests
+# need `asupersync::test_utils::run_test` unconditionally — hence a non-optional
+# dev-dependency as well.
+asupersync = { workspace = true, features = ["test-internals"] }
 fsqlite-ast = { workspace = true }
 fsqlite-func = { workspace = true }
 fsqlite-pager = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true, features = ["functions"] }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "minmax_prefix_contract_bench"
+path = "tests/minmax_prefix_profile.rs"
+harness = false
 
 [lints]
 workspace = true

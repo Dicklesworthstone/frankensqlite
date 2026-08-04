@@ -6,6 +6,11 @@
 //! epoch, and 256-row epoch. Reports rust-hot-cache-warm timings side by side
 //! so the only changing variable is the micro-batcher itself.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use std::time::Instant;
 
 const WARMUP: usize = 4;
@@ -46,28 +51,35 @@ fn measure(cfg: Config, rows: usize) -> (Vec<u64>, u64) {
     let mut samples = Vec::with_capacity(ITERS);
     let mut total_hits = 0u64;
     for run in 0..(WARMUP + ITERS) {
-        let conn = fsqlite::Connection::open(":memory:").unwrap();
+        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
         let pragma = if cfg.enabled {
             "PRAGMA fsqlite.stmt_microbatch = ON;"
         } else {
             "PRAGMA fsqlite.stmt_microbatch = OFF;"
         };
-        conn.execute(pragma).unwrap();
+        fsqlite_e2e::block_on(conn.execute(pragma)).unwrap();
         if let Some(r) = cfg.max_r {
-            conn.execute(&format!("PRAGMA fsqlite.stmt_microbatch_max_r = {r};"))
-                .unwrap();
-        }
-        conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY)")
+            fsqlite_e2e::block_on(
+                conn.execute(&format!("PRAGMA fsqlite.stmt_microbatch_max_r = {r};")),
+            )
             .unwrap();
-        conn.execute("BEGIN").unwrap();
-        let stmt = conn.prepare("INSERT INTO bench VALUES (?1)").unwrap();
-        let start = Instant::now();
-        #[allow(clippy::cast_possible_wrap)]
-        for i in 0..rows as i64 {
-            stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                .unwrap();
         }
-        conn.execute("COMMIT").unwrap();
+        fsqlite_e2e::block_on(conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY)")).unwrap();
+        fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
+        let stmt = fsqlite_e2e::block_on(conn.prepare("INSERT INTO bench VALUES (?1)")).unwrap();
+        // bd-mnlk2 / bd-zavyn: one runtime entry for the whole timed
+        // insert+commit window, so the sample measures the engine rather
+        // than a ~333 ns bridge entry per row.
+        let start = Instant::now();
+        fsqlite_e2e::block_on(async {
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 0..rows as i64 {
+                stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
+                    .await
+                    .unwrap();
+            }
+            conn.execute("COMMIT").await.unwrap();
+        });
         let elapsed = start.elapsed();
         drop(stmt);
         if cfg.enabled {
@@ -82,8 +94,7 @@ fn measure(cfg: Config, rows: usize) -> (Vec<u64>, u64) {
 }
 
 fn core_microbatch_hits(conn: &fsqlite::Connection) -> u64 {
-    let rows = conn
-        .query("PRAGMA fsqlite.stmt_microbatch_stats;")
+    let rows = fsqlite_e2e::block_on(conn.query("PRAGMA fsqlite.stmt_microbatch_stats;"))
         .unwrap_or_default();
     if let Some(row) = rows.first() {
         if let Some(fsqlite::SqliteValue::Text(text)) = row.values().first() {

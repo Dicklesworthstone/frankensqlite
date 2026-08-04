@@ -1893,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "microbench; run with --release --ignored --nocapture bench_parse_page_header"]
+    #[ignore = "microbench; run with --profile release-perf -- --ignored --nocapture bench_parse_page_header"]
     fn bench_parse_page_header() {
         use std::hint::black_box;
         use std::time::Instant;
@@ -1993,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "microbench; run with --release --ignored --nocapture bench_cell_pointers"]
+    #[ignore = "microbench; run with --profile release-perf -- --ignored --nocapture bench_cell_pointers"]
     fn bench_cell_pointers() {
         use std::hint::black_box;
         use std::time::Instant;
@@ -2155,7 +2155,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "microbench; run with --release --ignored --nocapture bench_read_cell_pointer_inline"]
+    #[ignore = "microbench; run with --profile release-perf -- --ignored --nocapture bench_read_cell_pointer_inline"]
     fn bench_read_cell_pointer_inline() {
         use std::hint::black_box;
         use std::time::Instant;

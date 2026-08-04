@@ -17,6 +17,11 @@
 //! Output: one row per thread count, pipe-separated, suitable for piping
 //! into a markdown table or jq.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use serde::Serialize;
 use std::error::Error;
 use std::fs;
@@ -238,23 +243,26 @@ fn run_fsqlite(n_threads: usize, rows: i64, reads_per_thread: usize) -> EngineMe
 
     // Seed
     {
-        let conn = fsqlite::Connection::open(path.clone()).expect("fsqlite open seed");
-        let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-        conn.execute("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT)")
-            .expect("create");
-        conn.execute("BEGIN").expect("begin");
-        let stmt = conn
-            .prepare("INSERT INTO bench (id, payload) VALUES (?1, ?2)")
-            .expect("prepare insert");
+        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.clone()))
+            .expect("fsqlite open seed");
+        let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"));
+        fsqlite_e2e::block_on(
+            conn.execute("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT)"),
+        )
+        .expect("create");
+        fsqlite_e2e::block_on(conn.execute("BEGIN")).expect("begin");
+        let stmt =
+            fsqlite_e2e::block_on(conn.prepare("INSERT INTO bench (id, payload) VALUES (?1, ?2)"))
+                .expect("prepare insert");
         let payload = "x".repeat(PAYLOAD_SIZE);
         for id in 1..=rows {
             let params = [
                 fsqlite::SqliteValue::Integer(id),
                 fsqlite::SqliteValue::Text(payload.clone().into()),
             ];
-            stmt.execute_with_params(&params).expect("insert");
+            fsqlite_e2e::block_on(stmt.execute_with_params(&params)).expect("insert");
         }
-        conn.execute("COMMIT").expect("commit");
+        fsqlite_e2e::block_on(conn.execute("COMMIT")).expect("commit");
     }
 
     let path = Arc::new(path);
@@ -265,22 +273,28 @@ fn run_fsqlite(n_threads: usize, rows: i64, reads_per_thread: usize) -> EngineMe
         let path = Arc::clone(&path);
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
-            let conn = fsqlite::Connection::open(path.as_str().to_owned()).expect("fsqlite open");
-            let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-            let stmt = conn
-                .prepare("SELECT payload FROM bench WHERE id = ?1")
-                .expect("prepare select");
+            let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.as_str().to_owned()))
+                .expect("fsqlite open");
+            let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"));
+            let stmt =
+                fsqlite_e2e::block_on(conn.prepare("SELECT payload FROM bench WHERE id = ?1"))
+                    .expect("prepare select");
             barrier.wait();
-            let mut state = 0x0102_0304_0506_0708_u64 ^ (tid as u64).wrapping_mul(0x9e37);
-            for _ in 0..reads_per_thread {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                #[allow(clippy::cast_possible_wrap)]
-                let id = ((state % rows as u64) + 1) as i64;
-                let params = [fsqlite::SqliteValue::Integer(id)];
-                let _ = stmt.query_with_params(&params).expect("query");
-            }
+            // bd-mnlk2 / bd-zavyn: one runtime entry for the whole read
+            // loop; the rusqlite arm pays no bridge, so per-read entries
+            // inflated only the FrankenSQLite side of the ratio.
+            fsqlite_e2e::block_on(async {
+                let mut state = 0x0102_0304_0506_0708_u64 ^ (tid as u64).wrapping_mul(0x9e37);
+                for _ in 0..reads_per_thread {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let id = ((state % rows as u64) + 1) as i64;
+                    let params = [fsqlite::SqliteValue::Integer(id)];
+                    let _ = stmt.query_with_params(&params).await.expect("query");
+                }
+            });
         }));
     }
     for h in handles {

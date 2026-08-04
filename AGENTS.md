@@ -74,7 +74,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `asupersync` | Structured async runtime (channels, sync, regions, testing) |
-| `ftui` | TUI framework (crates.io: `ftui = "0.2.1"`) |
+| `ftui` | TUI framework (crates.io: `ftui = "0.5.0"`) |
 | `thiserror` | Derive macro for `Error` trait implementations |
 | `serde` + `serde_json` | Serialization/deserialization |
 | `bitflags` | Type-safe bitflag types for page flags, lock modes, etc. |
@@ -118,6 +118,13 @@ For throughput benchmarking and perf work, a separate profile exists:
 inherits = "release"
 opt-level = 3
 ```
+
+For HOST-TUNED perf measurement on a known machine (e.g. Zen3 Threadripper,
+Apple M-series), additionally set `RUSTFLAGS="-C target-cpu=native"` on the
+`release-perf` build. Never bake `target-cpu` into the shipped `release`
+profile or committed cargo config — release artifacts must stay
+baseline-portable — and record the flag in any perf artifact's provenance,
+since host-tuned and portable binaries are not comparable.
 
 ### Performance Negative Results Ledger
 

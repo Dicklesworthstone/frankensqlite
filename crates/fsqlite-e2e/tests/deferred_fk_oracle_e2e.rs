@@ -6,6 +6,7 @@
 //! the time the transaction commits. An ordinary (immediate) FK fails at the
 //! statement. These verify both, INSERT-only, against rusqlite. Each scenario is
 //! its own test so any failure is isolated.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -23,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,11 +57,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -70,7 +71,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -96,83 +97,95 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 /// COMMIT, so this valid children-first transaction fails.
 #[test]
 fn deferred_fk_temporary_violation_resolved_by_commit() {
-    scenario(
-        &[
-            "PRAGMA foreign_keys = ON",
-            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER \
-             REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-            "BEGIN",
-            "INSERT INTO child VALUES (10, 1)", // parent 1 not present yet -> OK (deferred)
-            "INSERT INTO parent VALUES (1)",    // now satisfied
-            "COMMIT",                           // constraint holds -> commits
-        ],
-        &[
-            "SELECT id, pid FROM child ORDER BY id", // (10,1)
-            "SELECT id FROM parent ORDER BY id",     // (1)
-        ],
-        "deferred_fk_temporary_violation_resolved_by_commit",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER \
+                 REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+                "BEGIN",
+                "INSERT INTO child VALUES (10, 1)", // parent 1 not present yet -> OK (deferred)
+                "INSERT INTO parent VALUES (1)",    // now satisfied
+                "COMMIT",                           // constraint holds -> commits
+            ],
+            &[
+                "SELECT id, pid FROM child ORDER BY id", // (10,1)
+                "SELECT id FROM parent ORDER BY id",     // (1)
+            ],
+            "deferred_fk_temporary_violation_resolved_by_commit",
+        )
+        .await;
+    });
 }
 
 /// bd-do0d6: the violation should surface at COMMIT, but frank raises it at the
 /// INSERT (deferral unimplemented).
 #[test]
 fn deferred_fk_unresolved_violation_fails_at_commit() {
-    scenario(
-        &[
-            "PRAGMA foreign_keys = ON",
-            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER \
-             REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-            "INSERT INTO parent VALUES (1)",
-            "BEGIN",
-            "INSERT INTO child VALUES (10, 99)", // parent 99 never added -> OK so far (deferred)
-            "COMMIT",                            // violation still present -> COMMIT fails on both
-        ],
-        &[
-            // The failed COMMIT rolls back the child insert.
-            "SELECT count(*) FROM child",        // 0
-            "SELECT id FROM parent ORDER BY id", // (1)
-        ],
-        "deferred_fk_unresolved_violation_fails_at_commit",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER \
+                 REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+                "INSERT INTO parent VALUES (1)",
+                "BEGIN",
+                "INSERT INTO child VALUES (10, 99)", // parent 99 never added -> OK so far (deferred)
+                "COMMIT", // violation still present -> COMMIT fails on both
+            ],
+            &[
+                // The failed COMMIT rolls back the child insert.
+                "SELECT count(*) FROM child",        // 0
+                "SELECT id FROM parent ORDER BY id", // (1)
+            ],
+            "deferred_fk_unresolved_violation_fails_at_commit",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn immediate_fk_fails_at_statement() {
-    scenario(
-        &[
-            "PRAGMA foreign_keys = ON",
-            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
-            "INSERT INTO parent VALUES (1)",
-            // Not deferred: this fails immediately on both engines.
-            "INSERT INTO child VALUES (10, 99)",
-        ],
-        &["SELECT count(*) FROM child"], // 0
-        "immediate_fk_fails_at_statement",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+                "INSERT INTO parent VALUES (1)",
+                // Not deferred: this fails immediately on both engines.
+                "INSERT INTO child VALUES (10, 99)",
+            ],
+            &["SELECT count(*) FROM child"], // 0
+            "immediate_fk_fails_at_statement",
+        )
+        .await;
+    });
 }
 
 /// bd-do0d6: building a self-referential tree children-first within a txn relies
 /// on deferral; frank checks immediately and fails on the first insert.
 #[test]
 fn deferred_fk_self_reference_within_txn() {
-    scenario(
-        &[
-            "PRAGMA foreign_keys = ON",
-            // Self-referential tree with a deferred FK: insert children before
-            // parents in one transaction.
-            "CREATE TABLE node (id INTEGER PRIMARY KEY, parent INTEGER \
-             REFERENCES node(id) DEFERRABLE INITIALLY DEFERRED)",
-            "BEGIN",
-            "INSERT INTO node VALUES (3, 2)", // 2 not present yet
-            "INSERT INTO node VALUES (2, 1)", // 1 not present yet
-            "INSERT INTO node VALUES (1, NULL)",
-            "COMMIT",
-        ],
-        &["SELECT id, parent FROM node ORDER BY id"], // (1,NULL),(2,1),(3,2)
-        "deferred_fk_self_reference_within_txn",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA foreign_keys = ON",
+                // Self-referential tree with a deferred FK: insert children before
+                // parents in one transaction.
+                "CREATE TABLE node (id INTEGER PRIMARY KEY, parent INTEGER \
+                 REFERENCES node(id) DEFERRABLE INITIALLY DEFERRED)",
+                "BEGIN",
+                "INSERT INTO node VALUES (3, 2)", // 2 not present yet
+                "INSERT INTO node VALUES (2, 1)", // 1 not present yet
+                "INSERT INTO node VALUES (1, NULL)",
+                "COMMIT",
+            ],
+            &["SELECT id, parent FROM node ORDER BY id"], // (1,NULL),(2,1),(3,2)
+            "deferred_fk_self_reference_within_txn",
+        )
+        .await;
+    });
 }

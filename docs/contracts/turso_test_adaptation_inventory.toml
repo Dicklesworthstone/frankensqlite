@@ -1,0 +1,501 @@
+# Turso test-system adaptation intake and overlap contract v1.0.0
+#
+# This is a metadata-only clean-room inventory. It records upstream Git tree
+# paths and counts, but contains no copied Turso test source or fixtures.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-turso-test-adaptation-zu081.1"
+contract_owner = "fsqlite-harness::test_inventory"
+reviewed_at = "2026-08-04"
+reviewer = "FrostyPike"
+source_policy = "metadata-and-concepts-only; no Turso source or fixtures copied"
+update_policy = "Re-fetch the pinned GitHub tree, review every added or removed testing top-level entry, update counts and decisions, and retain an explicit rationale for every baseline delta."
+
+[source]
+repository = "https://github.com/tursodatabase/turso"
+commit = "19d1952c62b17012cba6392e14581b48db05ec1e"
+committed_at = "2026-08-03T11:43:52Z"
+testing_path = "testing"
+testing_tree_sha = "12f3e77fd1951c6258f1e8e23a648aeaf32b051a"
+testing_entry_count = 373
+top_level_entry_count = 17
+license_path = "LICENSE.md"
+license_blob_sha = "9573cadaf0b69893bf64bb595f06c4be150366e3"
+license_spdx = "MIT"
+license_class = "permissive"
+
+[[baseline]]
+metric = "harness_top_level_integration_files"
+reference_value = 236
+reference_command = "find crates/fsqlite-harness/tests -maxdepth 1 -type f -name '*.rs' | wc -l"
+delta_policy = "Tracked Git-object inventory must reproduce the value or carry a reviewed explanation."
+
+[[baseline]]
+metric = "harness_tracker_shaped_files"
+reference_value = 68
+reference_command = "rg -l 'issues\\.jsonl' crates/fsqlite-harness/tests --glob '*.rs' | wc -l"
+delta_policy = "A delta must identify every added or removed tracker-metadata file."
+
+[[baseline]]
+metric = "harness_literal_beads_path_files"
+reference_value = 64
+reference_command = "rg -l '\\.beads/issues\\.jsonl' crates/fsqlite-harness/tests --glob '*.rs' | wc -l"
+delta_policy = "A delta must identify every added or removed literal repository-tracker reader."
+
+[[baseline]]
+metric = "e2e_top_level_integration_files"
+reference_value = 269
+reference_command = "find crates/fsqlite-e2e/tests -maxdepth 1 -type f -name '*.rs' | wc -l"
+delta_policy = "The canonical scanner counts tracked Git objects; filesystem-only scratch files require an explicit explanation."
+
+[[baseline]]
+metric = "e2e_rusqlite_files"
+reference_value = 214
+reference_command = "rg -l 'rusqlite' crates/fsqlite-e2e/tests --glob '*.rs' | wc -l"
+delta_policy = "The canonical scanner counts tracked Git objects; filesystem-only scratch files require an explicit explanation."
+
+[[baseline]]
+metric = "fuzz_targets"
+reference_value = 5
+reference_command = "find fuzz/fuzz_targets -maxdepth 1 -type f -name '*.rs' | wc -l"
+delta_policy = "Every target addition or removal must name its engine surface and corpus owner."
+
+[[baseline]]
+metric = "fuzz_corpus_files"
+reference_value = 0
+reference_command = "find fuzz -type f -path '*/corpus/*' | wc -l"
+delta_policy = "Corpus growth is expected but must identify its canonical root and promotion policy."
+
+[[baseline]]
+metric = "slt_files"
+reference_value = 1
+reference_command = "find conformance -type f -name '*.slt' | wc -l"
+delta_policy = "Every new SLT file must remain owned by the canonical corpus and fixture-root contracts."
+
+[[baseline_delta_explanation]]
+metric = "e2e_top_level_integration_files"
+observed_value = 268
+rationale = "The 2026-08-03 find-based count included ignored scratch file crates/fsqlite-e2e/tests/zz_scratch_mw_race.rs. The canonical inventory uses tracked Git objects and therefore reports 268."
+
+[[baseline_delta_explanation]]
+metric = "e2e_rusqlite_files"
+observed_value = 213
+rationale = "The ignored scratch file crates/fsqlite-e2e/tests/zz_scratch_mw_race.rs imports rusqlite. Excluding non-versioned scratch state changes the tracked count from 214 to 213."
+
+[[portfolio]]
+source_path = "testing/README.md"
+source_kind = "file"
+entry_count = 1
+blob_count = 1
+tree_count = 0
+decision = "defer"
+translation_class = "provenance_only"
+owner_beads = ["bd-turso-test-adaptation-zu081.1"]
+owner_paths = ["docs/planning/TURSO_TESTING_ADAPTATION_PLAN.md"]
+surface_ids = []
+execution_lanes = []
+duplicate_owners = ["docs/planning/TURSO_TESTING_ADAPTATION_PLAN.md"]
+adaptations = "Retain only repository organization and extension-test placement notes as research provenance."
+dedup_rationale = "Project-specific contributor guidance is not executable test value."
+reviewer = "FrostyPike"
+update_policy = "Review only when the pinned upstream commit changes."
+
+[[portfolio]]
+source_path = "testing/pyproject.toml"
+source_kind = "file"
+entry_count = 1
+blob_count = 1
+tree_count = 0
+decision = "reject"
+translation_class = "provenance_only"
+owner_beads = ["bd-turso-test-adaptation-zu081.1"]
+owner_paths = ["Cargo.toml"]
+surface_ids = []
+execution_lanes = []
+duplicate_owners = ["Cargo.toml"]
+adaptations = "None. FrankenSQLite test tooling remains Cargo-only."
+dedup_rationale = "The Python workspace manifest is upstream test infrastructure, not a portable testing method."
+reviewer = "FrostyPike"
+update_policy = "Reject unless FrankenSQLite explicitly declares a Python test-tool surface."
+
+[[portfolio]]
+source_path = "testing/antithesis"
+source_kind = "directory"
+entry_count = 40
+blob_count = 31
+tree_count = 9
+decision = "defer"
+translation_class = "external_tool"
+owner_beads = ["bd-turso-test-adaptation-zu081.14"]
+owner_paths = ["crates/fsqlite-harness/src/fslab.rs", "crates/fsqlite-harness/src/fault_profiles.rs"]
+surface_ids = ["SURF-TXN-MVCC-CONCURRENT-006", "SURF-WAL-CRASH-RECOVERY-008"]
+execution_lanes = ["mvcc_required", "recovery_required"]
+duplicate_owners = ["fsqlite-harness::fslab", "fsqlite-harness::fault_profiles"]
+adaptations = "Evaluate only service-unique deterministic exploration and multiverse-debugging value. Local deterministic campaigns remain authoritative."
+dedup_rationale = "FsLab, LabRuntime, FaultVfs, and local crash campaigns already own deterministic fault exploration."
+reviewer = "FrostyPike"
+update_policy = "Revisit only through the bounded .14 feasibility decision."
+
+[[portfolio]]
+source_path = "testing/cli_tests"
+source_kind = "directory"
+entry_count = 16
+blob_count = 14
+tree_count = 2
+decision = "adopt"
+translation_class = "gap_only"
+owner_beads = ["bd-turso-test-adaptation-zu081.16"]
+owner_paths = ["crates/fsqlite-cli/src/main.rs", "crates/fsqlite-harness/tests/bd_3fve_2_phase9_cli_conformance_replication_compliance.rs"]
+surface_ids = ["SURF-CLI-COMPAT-018"]
+execution_lanes = ["sql_result_only", "pager_backed_required"]
+duplicate_owners = ["fsqlite-cli", "fsqlite-harness CLI conformance"]
+adaptations = "Import only verified missing user-visible shell cases into the existing CLI harness."
+dedup_rationale = "FrankenSQLite already has a CLI and CLI conformance ownership; wholesale Python-suite import would duplicate it."
+reviewer = "FrostyPike"
+update_policy = "Re-audit gaps when the declared CLI surface changes."
+
+[[portfolio]]
+source_path = "testing/concurrent-simulator"
+source_kind = "directory"
+entry_count = 25
+blob_count = 23
+tree_count = 2
+decision = "adopt"
+translation_class = "conceptual_adaptation"
+owner_beads = ["bd-turso-test-adaptation-zu081.7", "bd-turso-test-adaptation-zu081.8", "bd-turso-test-adaptation-zu081.19", "bd-turso-test-adaptation-zu081.9"]
+owner_paths = ["crates/fsqlite-e2e/src/workload.rs", "crates/fsqlite-harness/src/fslab.rs", "crates/fsqlite-harness/src/tla.rs", "crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs"]
+surface_ids = ["SURF-TXN-MVCC-CONCURRENT-006", "SURF-WAL-CRASH-RECOVERY-008"]
+execution_lanes = ["pager_backed_required", "mvcc_required", "recovery_required"]
+duplicate_owners = ["fsqlite-e2e seeded workloads", "fsqlite-harness LabRuntime and DPOR", "swarm_multiprocess"]
+adaptations = "Adapt typed histories, independent serializability checking, schedule/history reduction, and restart workload shapes. Do not copy Shuttle/Tokio runtime code or accept snapshot isolation as sufficient."
+dedup_rationale = "Existing runtime, DPOR, workload, and multiprocess machinery must be extended rather than replaced."
+reviewer = "FrostyPike"
+update_policy = "Coordinate all changes with bd-2lt76 and related bead bd-28z4i.5."
+
+[[portfolio]]
+source_path = "testing/conformance"
+source_kind = "directory"
+entry_count = 10
+blob_count = 6
+tree_count = 4
+decision = "defer"
+translation_class = "defer"
+owner_beads = ["bd-turso-test-adaptation-zu081.16"]
+owner_paths = ["crates/fsqlite-harness/src/corpus_ingest.rs", "crates/fsqlite-harness/src/tcl_conformance.rs"]
+surface_ids = ["SURF-CONFORMANCE-NATIVE-019", "SURF-CONFORMANCE-TCL-020"]
+execution_lanes = ["sql_result_only"]
+duplicate_owners = ["fsqlite-harness corpus ingestion", "fsqlite-harness TCL conformance"]
+adaptations = "Defer JavaScript binding cases until that API is declared; retain only engine-level gaps that reproduce through native public APIs."
+dedup_rationale = "The checked subtree is JavaScript product-surface coverage while FrankenSQLite currently declares native Rust conformance."
+reviewer = "FrostyPike"
+update_policy = "Revisit when a JavaScript binding becomes a declared supported surface."
+
+[[portfolio]]
+source_path = "testing/differential-oracle"
+source_kind = "directory"
+entry_count = 77
+blob_count = 67
+tree_count = 10
+decision = "adopt"
+translation_class = "conceptual_adaptation"
+owner_beads = ["bd-turso-test-adaptation-zu081.3", "bd-turso-test-adaptation-zu081.4", "bd-turso-test-adaptation-zu081.5"]
+owner_paths = ["crates/fsqlite-harness/src/differential_v2.rs", "crates/fsqlite-harness/src/corpus_ingest.rs", "crates/fsqlite-core/tests/differential_proptest.rs"]
+surface_ids = ["SURF-SQL-CORE-001", "SURF-SQL-COMPOUND-002", "SURF-CONFORMANCE-NATIVE-019"]
+execution_lanes = ["sql_result_only", "planner_required", "vdbe_required", "pager_backed_required"]
+duplicate_owners = ["fsqlite-harness::differential_v2", "fsqlite-harness::corpus_ingest", "fsqlite-core differential_proptest scaffold"]
+adaptations = "Build an independent typed SQL AST, contract-derived profiles, generation traces, and adapters into existing differential and corpus envelopes."
+dedup_rationale = "The independent generator is novel; execution, comparison, corpus, replay, and failure ownership already exist."
+reviewer = "FrostyPike"
+update_policy = "Re-diff generator concepts whenever the pinned upstream revision changes."
+
+[[portfolio]]
+source_path = "testing/simulator"
+source_kind = "directory"
+entry_count = 58
+blob_count = 49
+tree_count = 9
+decision = "adopt"
+translation_class = "conceptual_adaptation"
+owner_beads = ["bd-turso-test-adaptation-zu081.20", "bd-turso-test-adaptation-zu081.6"]
+owner_paths = ["crates/fsqlite-e2e/src/oplog.rs", "crates/fsqlite-e2e/src/workload.rs", "crates/fsqlite-harness/src/mismatch_minimizer.rs", "crates/fsqlite-harness/src/fslab.rs"]
+surface_ids = ["SURF-SQL-CORE-001", "SURF-CONFORMANCE-NATIVE-019", "SURF-WAL-CRASH-RECOVERY-008"]
+execution_lanes = ["sql_result_only", "pager_backed_required", "recovery_required"]
+duplicate_owners = ["fsqlite-e2e operation logs and workloads", "fsqlite-harness minimizer and FsLab"]
+adaptations = "Adapt stateful interaction plans, independent model properties, hierarchical shrinking, and bugbase promotion through existing operation logs and replay."
+dedup_rationale = "FrankenSQLite already owns execution, faults, reduction, corpus, and replay; only the stateful-plan model is missing."
+reviewer = "FrostyPike"
+update_policy = "Keep state-machine semantics separate from concurrent-history scheduling ownership."
+
+[[portfolio]]
+source_path = "testing/sqlancer"
+source_kind = "directory"
+entry_count = 17
+blob_count = 14
+tree_count = 3
+decision = "adopt"
+translation_class = "external_tool"
+owner_beads = ["bd-turso-test-adaptation-zu081.10", "bd-turso-test-adaptation-zu081.11"]
+owner_paths = ["crates/fsqlite-harness/src/differential_v2.rs", "crates/fsqlite-harness/src/corpus_ingest.rs"]
+surface_ids = ["SURF-SQL-CORE-001", "SURF-SQL-COMPOUND-002", "SURF-CONFORMANCE-NATIVE-019"]
+execution_lanes = ["planner_required", "vdbe_required", "pager_backed_required"]
+duplicate_owners = ["fsqlite-harness differential and corpus adapters"]
+adaptations = "Build a pinned provider feasibility spike, then a bounded nightly trial only if Java/JDBC integration is production-honest."
+dedup_rationale = "SQLancer provides an independent oracle, but its runner and provider wiring must not fork FrankenSQLite's comparison, reduction, or corpus paths."
+reviewer = "FrostyPike"
+update_policy = "Keep provider and upstream commits pinned and budget comparisons equal."
+
+[[portfolio]]
+source_path = "testing/sqlite_test_ext"
+source_kind = "directory"
+entry_count = 9
+blob_count = 6
+tree_count = 3
+decision = "reject"
+translation_class = "reject"
+owner_beads = ["bd-turso-test-adaptation-zu081.16"]
+owner_paths = ["crates/fsqlite-harness/src/extension_parity_matrix.rs"]
+surface_ids = ["SURF-CONFORMANCE-NATIVE-019"]
+execution_lanes = []
+duplicate_owners = ["fsqlite-harness extension parity"]
+adaptations = "None unless a specific engine-visible extension gap is independently reproduced without importing the C helper."
+dedup_rationale = "The subtree contains Turso-specific Rust/C test-extension plumbing and vendored SQLite headers, not a portable clean-room testing method."
+reviewer = "FrostyPike"
+update_policy = "Rejected by default; reopen only for a named missing extension behavior."
+
+[[portfolio]]
+source_path = "testing/sqlright"
+source_kind = "directory"
+entry_count = 23
+blob_count = 19
+tree_count = 4
+decision = "defer"
+translation_class = "external_tool"
+owner_beads = ["bd-turso-test-adaptation-zu081.12"]
+owner_paths = ["fuzz/fuzz_targets", "crates/fsqlite-harness/src/differential_v2.rs"]
+surface_ids = ["SURF-SQL-CORE-001", "SURF-CONFORMANCE-NATIVE-019"]
+execution_lanes = ["planner_required", "vdbe_required", "pager_backed_required"]
+duplicate_owners = ["five libFuzzer targets", "fsqlite-harness differential runner"]
+adaptations = "Run an equal-budget feasibility comparison only after the SQLancer baseline; adopt only if unique coverage or defects justify the native toolchain cost."
+dedup_rationale = "The current fuzz baseline has five targets and no corpus, but SQLRight carries substantial external build and patch cost."
+reviewer = "FrostyPike"
+update_policy = "Decision remains downstream of the bounded SQLancer trial."
+
+[[portfolio]]
+source_path = "testing/sqltest"
+source_kind = "directory"
+entry_count = 59
+blob_count = 42
+tree_count = 17
+decision = "adopt"
+translation_class = "conceptual_adaptation"
+owner_beads = ["bd-turso-test-adaptation-zu081.13"]
+owner_paths = ["crates/fsqlite-harness/src/corpus_ingest.rs", "conformance/slt/smoke/basic.slt"]
+surface_ids = ["SURF-SQL-CORE-001", "SURF-CONFORMANCE-NATIVE-019", "SURF-CONFORMANCE-TCL-020"]
+execution_lanes = ["sql_result_only", "pager_backed_required"]
+duplicate_owners = ["JSON conformance fixtures", "existing SLT parser and one-file corpus", "Rust integration tests"]
+adaptations = "Pilot readability, capability annotations, setup reuse, and comparison modes using existing syntax before adding any DSL. Never port the Tokio runner."
+dedup_rationale = "Most runner mechanics overlap; only a bounded authoring-format comparison can establish incremental value."
+reviewer = "FrostyPike"
+update_policy = "Pilot must end in adopt, defer, or reject with authoring and runtime evidence."
+
+[[portfolio]]
+source_path = "testing/sqltests"
+source_kind = "directory"
+entry_count = 3
+blob_count = 1
+tree_count = 2
+decision = "adopt"
+translation_class = "gap_only"
+owner_beads = ["bd-turso-test-adaptation-zu081.13", "bd-turso-test-adaptation-zu081.16"]
+owner_paths = ["crates/fsqlite-harness/src/corpus_ingest.rs", "conformance/slt/smoke/basic.slt"]
+surface_ids = ["SURF-SQL-COMPOUND-002", "SURF-CONFORMANCE-NATIVE-019"]
+execution_lanes = ["sql_result_only"]
+duplicate_owners = ["canonical JSON/SLT corpus"]
+adaptations = "Evaluate the single checked SQL case as a gap; translate only if missing and in scope."
+dedup_rationale = "A one-case upstream directory does not justify a parallel corpus root."
+reviewer = "FrostyPike"
+update_policy = "Close with an explicit duplicate or translated-gap record."
+
+[[portfolio]]
+source_path = "testing/stress-go"
+source_kind = "directory"
+entry_count = 5
+blob_count = 4
+tree_count = 1
+decision = "defer"
+translation_class = "defer"
+owner_beads = ["bd-turso-test-adaptation-zu081.16"]
+owner_paths = ["crates/fsqlite-e2e/src/workload.rs"]
+surface_ids = []
+execution_lanes = []
+duplicate_owners = ["fsqlite-e2e workload generator"]
+adaptations = "None until a Go binding becomes a declared target; engine-level workload gaps may be restated through the native harness."
+dedup_rationale = "The Go binding and client surface are outside FrankenSQLite's declared product scope."
+reviewer = "FrostyPike"
+update_policy = "Revisit only after a Go API surface is declared."
+
+[[portfolio]]
+source_path = "testing/stress"
+source_kind = "directory"
+entry_count = 16
+blob_count = 14
+tree_count = 2
+decision = "adopt"
+translation_class = "conceptual_adaptation"
+owner_beads = ["bd-turso-test-adaptation-zu081.7"]
+owner_paths = ["crates/fsqlite-e2e/src/workload.rs", "crates/fsqlite-e2e/src/oplog.rs", "crates/fsqlite-harness/src/fslab.rs"]
+surface_ids = ["SURF-TXN-MVCC-CONCURRENT-006"]
+execution_lanes = ["pager_backed_required", "mvcc_required"]
+duplicate_owners = ["fsqlite-e2e seeded workloads", "asupersync LabRuntime"]
+adaptations = "Mine mixed-workload and progress-invariant shapes; express scheduling through asupersync rather than Shuttle or Tokio."
+dedup_rationale = "The runtime and stress runner overlap, while selected workload shapes can improve native campaigns."
+reviewer = "FrostyPike"
+update_policy = "Only independently modeled workload properties are candidates."
+
+[[portfolio]]
+source_path = "testing/system"
+source_kind = "directory"
+entry_count = 10
+blob_count = 9
+tree_count = 1
+decision = "adopt"
+translation_class = "gap_only"
+owner_beads = ["bd-turso-test-adaptation-zu081.16"]
+owner_paths = ["crates/fsqlite-harness/src/tcl_conformance.rs", "crates/fsqlite-harness/src/corpus_ingest.rs"]
+surface_ids = ["SURF-CONFORMANCE-TCL-020", "SURF-WAL-CRASH-RECOVERY-008", "SURF-PRAGMA-CORE-009"]
+execution_lanes = ["pager_backed_required", "recovery_required"]
+duplicate_owners = ["TCL conformance", "hash-locked corpus", "generated database tests"]
+adaptations = "Deduplicate TCL and fixed-database cases; import only missing in-scope behaviors through canonical corpus ownership."
+dedup_rationale = "FrankenSQLite already owns TCL accounting and generated/file-backed fixtures, so the value is gap discovery only."
+reviewer = "FrostyPike"
+update_policy = "Every retained case needs a canonical feature ID and corpus owner."
+
+[[portfolio]]
+source_path = "testing/unreliable-libc"
+source_kind = "directory"
+entry_count = 3
+blob_count = 2
+tree_count = 1
+decision = "defer"
+translation_class = "conceptual_adaptation"
+owner_beads = ["bd-turso-test-adaptation-zu081.15"]
+owner_paths = ["crates/fsqlite-harness/src/fault_vfs.rs", "crates/fsqlite-harness/src/fault_profiles.rs"]
+surface_ids = ["SURF-WAL-CRASH-RECOVERY-008"]
+execution_lanes = ["recovery_required"]
+duplicate_owners = ["FaultVfs and deterministic fault profiles"]
+adaptations = "Evaluate only faults below the VFS abstraction against a Unix-native VFS; never make libc interposition a default lane."
+dedup_rationale = "Logical I/O failures are already covered, while syscall-level gaps remain unmeasured."
+reviewer = "FrostyPike"
+update_policy = "Adopt only if the .15 experiment finds a unique reproducible gap."
+
+[[contract_authority]]
+logical_name = "supported_surface_matrix"
+canonical_path = "docs/contracts/supported_surface_matrix.toml"
+canonical_sha256 = "fbb1a914c0cbf2894eaa8cf3ce0cb24c3e8b8cc4eca7c48f6444641116ba35e7"
+root_duplicate_path = "supported_surface_matrix.toml"
+root_duplicate_sha256 = "a283b0e5b86fb1a80e9212825b3d22b1c9a75a9ed7cce87827788dfa2421ac22"
+authority_owner = "crates/fsqlite-harness/src/canonical_parity_contract.rs::SUPPORTED_SURFACE_MATRIX_PATH"
+handoff_bead = "bd-turso-test-adaptation-zu081.18"
+live_root_consumers = []
+disposition = "Canonical docs/contracts path is live; root duplicate is divergent and must be made inert or removed only with explicit user permission."
+
+[[contract_authority]]
+logical_name = "feature_universe_ledger"
+canonical_path = "docs/contracts/feature_universe_ledger.toml"
+canonical_sha256 = "55b5ac49dc88506c4a179693de8299791da715ee6218404ad15820cc3091f387"
+root_duplicate_path = "feature_universe_ledger.toml"
+root_duplicate_sha256 = "fb99af2ef838b65e7b68c2486babda56e060125fbafb6bfcf91094e7bb6ef942"
+authority_owner = "crates/fsqlite-harness/src/canonical_parity_contract.rs::FEATURE_UNIVERSE_LEDGER_PATH"
+handoff_bead = "bd-turso-test-adaptation-zu081.18"
+live_root_consumers = []
+disposition = "Canonical docs/contracts path is live; root duplicate is divergent and must be made inert or removed only with explicit user permission."
+
+[[contract_authority]]
+logical_name = "parity_taxonomy"
+canonical_path = "docs/contracts/parity_taxonomy.toml"
+canonical_sha256 = "113c29111dbe54e626a190b6ba87634ba8bc7ad9340f131b87a99a97023f47f4"
+root_duplicate_path = "parity_taxonomy.toml"
+root_duplicate_sha256 = "5b613ef86775d288a993251addc3c550e22efb0bc8c438d8e04ff17da65a03f6"
+authority_owner = "crates/fsqlite-harness/tests/parity_taxonomy_test.rs and scripts/verify_parity_taxonomy.sh"
+handoff_bead = "bd-turso-test-adaptation-zu081.18"
+live_root_consumers = []
+disposition = "Canonical docs/contracts path is enforced; root duplicate is divergent and must be made inert or removed only with explicit user permission."
+
+[[contract_authority.root_reference]]
+path = "crates/fsqlite-harness/src/parity_status_report.rs"
+anchor = "artifact_path: Some(\"parity_taxonomy.toml\".to_owned())"
+classification = "report_artifact_leaf"
+resolves_repository_root = false
+rationale = "This is a report artifact name, not a read of the repository-root duplicate."
+
+[[contract_authority]]
+logical_name = "sqlite_version_contract"
+canonical_path = "docs/contracts/sqlite_version_contract.toml"
+canonical_sha256 = "50613ab0a488ac0a125f09bd5cc10ed34fb5b0668cd69aee85589cfdb2974d0b"
+root_duplicate_path = "sqlite_version_contract.toml"
+root_duplicate_sha256 = "030709b0753886c15650e3aa2325c8c89dd01889326a0b8dd94a0117d1e25353"
+authority_owner = "crates/fsqlite-harness/src/canonical_parity_contract.rs::SQLITE_VERSION_CONTRACT_PATH"
+handoff_bead = "bd-turso-test-adaptation-zu081.18"
+live_root_consumers = []
+disposition = "Canonical docs/contracts path is live; root duplicate is divergent and must be made inert or removed only with explicit user permission."
+
+[[contract_authority]]
+logical_name = "corpus_manifest"
+canonical_path = "docs/contracts/corpus_manifest.toml"
+canonical_sha256 = "1be2a6be550dbca036f108cd066c1ee93fe44a38ccfd1cdd661c66d25e20d755"
+root_duplicate_path = "corpus_manifest.toml"
+root_duplicate_sha256 = "01e2a4daab3332aab7859d7b849dba3773afe22903e52c3af1ab92be6bce0894"
+authority_owner = "crates/fsqlite-harness/src/fixture_root_contract.rs::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH"
+handoff_bead = "bd-turso-test-adaptation-zu081.18"
+live_root_consumers = []
+disposition = "Canonical docs/contracts path is live and has a different fixture content hash; root duplicate must be made inert or removed only with explicit user permission."
+
+[[contract_authority.root_reference]]
+path = "crates/fsqlite-harness/src/feature_coverage_dashboard.rs"
+anchor = "workspace.join(\"corpus_manifest.toml\")"
+classification = "synthetic_temp_fixture"
+resolves_repository_root = false
+rationale = "The reference occurs under cfg(test) and joins a TempDir workspace."
+
+[[contract_authority.root_reference]]
+path = "crates/fsqlite-harness/src/fixture_root_contract.rs"
+anchor = "workspace_root.join(\"corpus_manifest.toml\")"
+classification = "synthetic_temp_fixture"
+resolves_repository_root = false
+rationale = "The reference occurs under cfg(test) and joins a TempDir workspace."
+
+[[contract_authority.root_reference]]
+path = "crates/fsqlite-harness/tests/bd_2yqp6_2_5_oracle_preflight_doctor.rs"
+anchor = "workspace_root.join(\"corpus_manifest.toml\")"
+classification = "synthetic_temp_fixture"
+resolves_repository_root = false
+rationale = "The integration test constructs a complete temporary workspace and manifest."
+
+[[contract_authority.root_reference]]
+path = "crates/fsqlite-harness/tests/bd_mblr_3_5_1_1_manifest_ingestion_regression.rs"
+anchor = "fixture_root_manifest_path: \"corpus_manifest.toml\".to_owned()"
+classification = "serialized_report_fixture"
+resolves_repository_root = false
+rationale = "The value is synthetic report metadata and is never opened as the repository-root contract."
+
+[[contract_authority.root_reference]]
+path = "crates/fsqlite-harness/tests/bd_mblr_3_5_unified_quality_evidence_rollup.rs"
+anchor = "fixture_root_manifest_path: \"corpus_manifest.toml\".to_owned()"
+classification = "serialized_report_fixture"
+resolves_repository_root = false
+rationale = "The value is synthetic report metadata and is never opened as the repository-root contract."
+
+[[contract_authority.root_reference]]
+path = "crates/fsqlite-harness/tests/bd_mblr_3_5_2_operator_release_readiness_report.rs"
+anchor = "fixture_root_manifest_path: \"corpus_manifest.toml\".to_owned()"
+classification = "serialized_report_fixture"
+resolves_repository_root = false
+rationale = "The value is synthetic report metadata and is never opened as the repository-root contract."
+
+[[contract_authority.root_reference]]
+path = "crates/fsqlite-harness/tests/bd_2yqp6_2_9_artifact_hash_integrity_ratchet.rs"
+anchor = "fixture_root_manifest_path: \"corpus_manifest.toml\".to_owned()"
+classification = "serialized_report_fixture"
+resolves_repository_root = false
+rationale = "The value is synthetic report metadata and is never opened as the repository-root contract."

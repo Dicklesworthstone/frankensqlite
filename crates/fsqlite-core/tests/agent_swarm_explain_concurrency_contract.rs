@@ -57,7 +57,7 @@ fn rows_to_values(rows: &[Row]) -> Vec<Vec<SqliteValue>> {
     rows.iter().map(row_values).collect()
 }
 
-fn install_concurrency_schema(conn: &Connection) -> TestResult {
+async fn install_concurrency_schema(conn: &Connection) -> TestResult {
     conn.execute(
         "CREATE TABLE fsqlite_concurrency_reason_codes_contract(
             reason_code TEXT NOT NULL PRIMARY KEY,
@@ -69,7 +69,8 @@ fn install_concurrency_schema(conn: &Connection) -> TestResult {
             suggested_next_inspection TEXT NOT NULL,
             human_text TEXT NOT NULL
         );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE TABLE fsqlite_explain_concurrency_contract(
             event_seq INTEGER NOT NULL PRIMARY KEY,
@@ -104,7 +105,8 @@ fn install_concurrency_schema(conn: &Connection) -> TestResult {
             suggested_next_inspection TEXT NOT NULL,
             first_failure_diag TEXT NOT NULL
         );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE INDEX idx_fsqlite_explain_concurrency_contract_join
             ON fsqlite_explain_concurrency_contract(
@@ -113,12 +115,13 @@ fn install_concurrency_schema(conn: &Connection) -> TestResult {
                 table_name,
                 hotspot_kind
             );",
-    )?;
-    seed_reason_codes(conn)?;
+    )
+    .await?;
+    seed_reason_codes(conn).await?;
     Ok(())
 }
 
-fn seed_reason_codes(conn: &Connection) -> TestResult {
+async fn seed_reason_codes(conn: &Connection) -> TestResult {
     conn.execute(
         "INSERT INTO fsqlite_concurrency_reason_codes_contract(
             reason_code,
@@ -190,11 +193,12 @@ fn seed_reason_codes(conn: &Connection) -> TestResult {
                 'inspect_first_failure_diag',
                 'Concurrency diagnostics were unavailable.'
             );",
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
-fn record_diagnostic(conn: &Connection, diagnostic: ConcurrencyDiagnostic<'_>) -> TestResult {
+async fn record_diagnostic(conn: &Connection, diagnostic: ConcurrencyDiagnostic<'_>) -> TestResult {
     conn.execute(&format!(
         "INSERT INTO fsqlite_explain_concurrency_contract(
             event_seq,
@@ -289,7 +293,8 @@ fn record_diagnostic(conn: &Connection, diagnostic: ConcurrencyDiagnostic<'_>) -
         diagnostics_available = sql_bool(diagnostic.diagnostics_available),
         suggested_next_inspection = sql_text(diagnostic.suggested_next_inspection),
         first_failure_diag = sql_text(diagnostic.first_failure_diag),
-    ))?;
+    ))
+    .await?;
     trace_concurrency_diagnostic(&diagnostic);
     Ok(())
 }
@@ -324,7 +329,7 @@ fn trace_concurrency_diagnostic(diagnostic: &ConcurrencyDiagnostic<'_>) {
     );
 }
 
-fn seed_diagnostic_examples(conn: &Connection) -> TestResult {
+async fn seed_diagnostic_examples(conn: &Connection) -> TestResult {
     let examples = [
         ConcurrencyDiagnostic {
             event_seq: 1,
@@ -532,18 +537,22 @@ fn seed_diagnostic_examples(conn: &Connection) -> TestResult {
     ];
 
     for example in examples {
-        record_diagnostic(conn, example)?;
+        record_diagnostic(conn, example).await?;
     }
     Ok(())
 }
 
 #[test]
 fn reason_codes_are_stable_and_dimensioned() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    install_concurrency_schema(&conn)?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            install_concurrency_schema(&conn).await?;
 
-    let rows = conn.query(
-        "SELECT reason_code,
+            let rows = conn
+                .query(
+                    "SELECT reason_code,
                 hotspot_kind,
                 retryable,
                 contention_family,
@@ -551,73 +560,82 @@ fn reason_codes_are_stable_and_dimensioned() -> TestResult {
                 suggested_next_inspection
            FROM fsqlite_concurrency_reason_codes_contract
           ORDER BY reason_code;",
-    )?;
+                )
+                .await?;
 
-    assert_eq!(
-        rows_to_values(&rows),
-        vec![
-            vec![
-                SqliteValue::Text("compatibility_fallback".into()),
-                SqliteValue::Text("fallback".into()),
-                SqliteValue::Integer(0),
-                SqliteValue::Text("compatibility".into()),
-                SqliteValue::Text("may_reduce_parallelism".into()),
-                SqliteValue::Text("inspect_fallback_reason".into()),
-            ],
-            vec![
-                SqliteValue::Text("coordination_wait".into()),
-                SqliteValue::Text("coordination".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Text("queue_lease_range".into()),
-                SqliteValue::Text("ownership_wait_only".into()),
-                SqliteValue::Text("inspect_coordination_owner".into()),
-            ],
-            vec![
-                SqliteValue::Text("diagnostics_unavailable".into()),
-                SqliteValue::Text("unknown".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Text("unknown".into()),
-                SqliteValue::Text("unknown".into()),
-                SqliteValue::Text("inspect_first_failure_diag".into()),
-            ],
-            vec![
-                SqliteValue::Text("external_resource_wait".into()),
-                SqliteValue::Text("external".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Text("external".into()),
-                SqliteValue::Text("outside_mvcc".into()),
-                SqliteValue::Text("inspect_vfs_or_runtime_wait".into()),
-            ],
-            vec![
-                SqliteValue::Text("hot_page_predicted".into()),
-                SqliteValue::Text("page".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Text("page_mvcc".into()),
-                SqliteValue::Text("retry_may_increase".into()),
-                SqliteValue::Text("inspect_page_heat".into()),
-            ],
-            vec![
-                SqliteValue::Text("ok_low_conflict".into()),
-                SqliteValue::Text("none".into()),
-                SqliteValue::Integer(0),
-                SqliteValue::Text("page_mvcc".into()),
-                SqliteValue::Text("lock_free_expected".into()),
-                SqliteValue::Text("none".into()),
-            ],
-        ]
-    );
+            assert_eq!(
+                rows_to_values(&rows),
+                vec![
+                    vec![
+                        SqliteValue::Text("compatibility_fallback".into()),
+                        SqliteValue::Text("fallback".into()),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Text("compatibility".into()),
+                        SqliteValue::Text("may_reduce_parallelism".into()),
+                        SqliteValue::Text("inspect_fallback_reason".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("coordination_wait".into()),
+                        SqliteValue::Text("coordination".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("queue_lease_range".into()),
+                        SqliteValue::Text("ownership_wait_only".into()),
+                        SqliteValue::Text("inspect_coordination_owner".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("diagnostics_unavailable".into()),
+                        SqliteValue::Text("unknown".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("unknown".into()),
+                        SqliteValue::Text("unknown".into()),
+                        SqliteValue::Text("inspect_first_failure_diag".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("external_resource_wait".into()),
+                        SqliteValue::Text("external".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("external".into()),
+                        SqliteValue::Text("outside_mvcc".into()),
+                        SqliteValue::Text("inspect_vfs_or_runtime_wait".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("hot_page_predicted".into()),
+                        SqliteValue::Text("page".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("page_mvcc".into()),
+                        SqliteValue::Text("retry_may_increase".into()),
+                        SqliteValue::Text("inspect_page_heat".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("ok_low_conflict".into()),
+                        SqliteValue::Text("none".into()),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Text("page_mvcc".into()),
+                        SqliteValue::Text("lock_free_expected".into()),
+                        SqliteValue::Text("none".into()),
+                    ],
+                ]
+            );
 
-    Ok(())
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn diagnostic_rows_cover_operator_contention_questions() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    install_concurrency_schema(&conn)?;
-    seed_diagnostic_examples(&conn)?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            install_concurrency_schema(&conn).await?;
+            seed_diagnostic_examples(&conn).await?;
 
-    let rows = conn.query(
-        "SELECT hotspot_kind,
+            let rows = conn
+                .query(
+                    "SELECT hotspot_kind,
                 statement_fingerprint,
                 plan_id,
                 table_name,
@@ -629,109 +647,118 @@ fn diagnostic_rows_cover_operator_contention_questions() -> TestResult {
                 suggested_next_inspection
            FROM fsqlite_explain_concurrency_contract
           ORDER BY event_seq;",
-    )?;
+                )
+                .await?;
 
-    assert_eq!(
-        rows_to_values(&rows),
-        vec![
-            vec![
-                SqliteValue::Text("none".into()),
-                SqliteValue::Text("fp-low-conflict-insert".into()),
-                SqliteValue::Text("plan-insert-disjoint-leaf".into()),
-                SqliteValue::Text("jobs".into()),
-                SqliteValue::Integer(40),
-                SqliteValue::Text("none".into()),
-                SqliteValue::Text("ok_low_conflict".into()),
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Text("none".into()),
-            ],
-            vec![
-                SqliteValue::Text("page".into()),
-                SqliteValue::Text("fp-hot-page-update".into()),
-                SqliteValue::Text("plan-update-leaf-47".into()),
-                SqliteValue::Text("jobs".into()),
-                SqliteValue::Integer(47),
-                SqliteValue::Text("busy_snapshot".into()),
-                SqliteValue::Text("hot_page_predicted".into()),
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Text("inspect_page_heat".into()),
-            ],
-            vec![
-                SqliteValue::Text("coordination".into()),
-                SqliteValue::Text("fp-queue-claim".into()),
-                SqliteValue::Text("plan-queue-claim".into()),
-                SqliteValue::Text("fsqlite_queue".into()),
-                SqliteValue::Null,
-                SqliteValue::Text("busy".into()),
-                SqliteValue::Text("coordination_wait".into()),
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Text("inspect_coordination_owner".into()),
-            ],
-            vec![
-                SqliteValue::Text("coordination".into()),
-                SqliteValue::Text("fp-lease-renew".into()),
-                SqliteValue::Text("plan-lease-renew".into()),
-                SqliteValue::Text("fsqlite_lease".into()),
-                SqliteValue::Null,
-                SqliteValue::Text("none".into()),
-                SqliteValue::Text("coordination_wait".into()),
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Text("inspect_coordination_owner".into()),
-            ],
-            vec![
-                SqliteValue::Text("range".into()),
-                SqliteValue::Text("fp-range-backfill".into()),
-                SqliteValue::Text("plan-range-disjoint".into()),
-                SqliteValue::Text("events".into()),
-                SqliteValue::Null,
-                SqliteValue::Text("none".into()),
-                SqliteValue::Text("ok_low_conflict".into()),
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Text("inspect_range_balance".into()),
-            ],
-            vec![
-                SqliteValue::Text("fallback".into()),
-                SqliteValue::Text("fp-window-fallback".into()),
-                SqliteValue::Text("plan-window-compat".into()),
-                SqliteValue::Text("events".into()),
-                SqliteValue::Null,
-                SqliteValue::Text("none".into()),
-                SqliteValue::Null,
-                SqliteValue::Text("compatibility_fallback".into()),
-                SqliteValue::Null,
-                SqliteValue::Text("inspect_fallback_reason".into()),
-            ],
-            vec![
-                SqliteValue::Text("external".into()),
-                SqliteValue::Text("fp-vfs-wait".into()),
-                SqliteValue::Text("plan-checkpoint".into()),
-                SqliteValue::Text("events".into()),
-                SqliteValue::Null,
-                SqliteValue::Text("busy_recovery".into()),
-                SqliteValue::Text("external_resource_wait".into()),
-                SqliteValue::Null,
-                SqliteValue::Text("checkpoint_backpressure".into()),
-                SqliteValue::Text("inspect_vfs_or_runtime_wait".into()),
-            ],
-        ]
-    );
+            assert_eq!(
+                rows_to_values(&rows),
+                vec![
+                    vec![
+                        SqliteValue::Text("none".into()),
+                        SqliteValue::Text("fp-low-conflict-insert".into()),
+                        SqliteValue::Text("plan-insert-disjoint-leaf".into()),
+                        SqliteValue::Text("jobs".into()),
+                        SqliteValue::Integer(40),
+                        SqliteValue::Text("none".into()),
+                        SqliteValue::Text("ok_low_conflict".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Null,
+                        SqliteValue::Text("none".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("page".into()),
+                        SqliteValue::Text("fp-hot-page-update".into()),
+                        SqliteValue::Text("plan-update-leaf-47".into()),
+                        SqliteValue::Text("jobs".into()),
+                        SqliteValue::Integer(47),
+                        SqliteValue::Text("busy_snapshot".into()),
+                        SqliteValue::Text("hot_page_predicted".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Null,
+                        SqliteValue::Text("inspect_page_heat".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("coordination".into()),
+                        SqliteValue::Text("fp-queue-claim".into()),
+                        SqliteValue::Text("plan-queue-claim".into()),
+                        SqliteValue::Text("fsqlite_queue".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Text("busy".into()),
+                        SqliteValue::Text("coordination_wait".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Null,
+                        SqliteValue::Text("inspect_coordination_owner".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("coordination".into()),
+                        SqliteValue::Text("fp-lease-renew".into()),
+                        SqliteValue::Text("plan-lease-renew".into()),
+                        SqliteValue::Text("fsqlite_lease".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Text("none".into()),
+                        SqliteValue::Text("coordination_wait".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Null,
+                        SqliteValue::Text("inspect_coordination_owner".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("range".into()),
+                        SqliteValue::Text("fp-range-backfill".into()),
+                        SqliteValue::Text("plan-range-disjoint".into()),
+                        SqliteValue::Text("events".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Text("none".into()),
+                        SqliteValue::Text("ok_low_conflict".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Null,
+                        SqliteValue::Text("inspect_range_balance".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("fallback".into()),
+                        SqliteValue::Text("fp-window-fallback".into()),
+                        SqliteValue::Text("plan-window-compat".into()),
+                        SqliteValue::Text("events".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Text("none".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Text("compatibility_fallback".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Text("inspect_fallback_reason".into()),
+                    ],
+                    vec![
+                        SqliteValue::Text("external".into()),
+                        SqliteValue::Text("fp-vfs-wait".into()),
+                        SqliteValue::Text("plan-checkpoint".into()),
+                        SqliteValue::Text("events".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Text("busy_recovery".into()),
+                        SqliteValue::Text("external_resource_wait".into()),
+                        SqliteValue::Null,
+                        SqliteValue::Text("checkpoint_backpressure".into()),
+                        SqliteValue::Text("inspect_vfs_or_runtime_wait".into()),
+                    ],
+                ]
+            );
 
-    Ok(())
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn summary_surface_distinguishes_mvcc_coordination_fallback_and_external_waits() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    install_concurrency_schema(&conn)?;
-    seed_diagnostic_examples(&conn)?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            install_concurrency_schema(&conn).await?;
+            seed_diagnostic_examples(&conn).await?;
 
-    let rows = conn.query(
-        "SELECT hotspot_kind,
+            let rows = conn
+                .query(
+                    "SELECT hotspot_kind,
                 COUNT(*),
                 SUM(predicted_conflict_count),
                 SUM(observed_conflict_count),
@@ -740,135 +767,154 @@ fn summary_surface_distinguishes_mvcc_coordination_fallback_and_external_waits()
            FROM fsqlite_explain_concurrency_contract
           GROUP BY hotspot_kind
           ORDER BY hotspot_kind;",
-    )?;
+                )
+                .await?;
 
-    assert_eq!(
-        rows_to_values(&rows),
-        vec![
-            vec![
-                SqliteValue::Text("coordination".into()),
-                SqliteValue::Integer(2),
-                SqliteValue::Integer(2),
-                SqliteValue::Integer(2),
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(0),
-            ],
-            vec![
-                SqliteValue::Text("external".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(2),
-                SqliteValue::Integer(0),
-            ],
-            vec![
-                SqliteValue::Text("fallback".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-            ],
-            vec![
-                SqliteValue::Text("none".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-            ],
-            vec![
-                SqliteValue::Text("page".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(3),
-                SqliteValue::Integer(2),
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(1),
-            ],
-            vec![
-                SqliteValue::Text("range".into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-                SqliteValue::Integer(0),
-            ],
-        ]
-    );
+            assert_eq!(
+                rows_to_values(&rows),
+                vec![
+                    vec![
+                        SqliteValue::Text("coordination".into()),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(0),
+                    ],
+                    vec![
+                        SqliteValue::Text("external".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Integer(0),
+                    ],
+                    vec![
+                        SqliteValue::Text("fallback".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                    ],
+                    vec![
+                        SqliteValue::Text("none".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                    ],
+                    vec![
+                        SqliteValue::Text("page".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(3),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(1),
+                    ],
+                    vec![
+                        SqliteValue::Text("range".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                    ],
+                ]
+            );
 
-    let serialized_rows = conn.query(
-        "SELECT coordination_strategy
+            let serialized_rows = conn
+                .query(
+                    "SELECT coordination_strategy
            FROM fsqlite_explain_concurrency_contract
           WHERE coordination_strategy = 'global_writer_lock';",
-    )?;
-    assert!(
-        serialized_rows.is_empty(),
-        "diagnostics must never prescribe a global writer lock"
-    );
+                )
+                .await?;
+            assert!(
+                serialized_rows.is_empty(),
+                "diagnostics must never prescribe a global writer lock"
+            );
 
-    Ok(())
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn rollback_removes_unpublished_diagnostics() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    install_concurrency_schema(&conn)?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            install_concurrency_schema(&conn).await?;
 
-    conn.execute("BEGIN;")?;
-    record_diagnostic(
-        &conn,
-        ConcurrencyDiagnostic {
-            event_seq: 99,
-            diagnostic_surface: "EXPLAIN CONCURRENCY",
-            statement_fingerprint: "fp-rolled-back",
-            plan_id: "plan-rolled-back",
-            table_name: "jobs",
-            index_name: None,
-            range_id: None,
-            queue_name: None,
-            lease_key: None,
-            worker_id: "worker-z",
-            transaction_id: "txn-rollback",
-            hotspot_kind: "page",
-            page_number: Some(55),
-            page_start: Some(55),
-            page_end: Some(55),
-            predicted_conflict_count: 1,
-            observed_conflict_count: 1,
-            retry_count: 0,
-            abort_count: 0,
-            busy_family: "busy_snapshot",
-            conflict_reason: Some("hot_page_predicted"),
-            fallback_reason: None,
-            external_wait: None,
-            coordination_strategy: "page_mvcc",
-            diagnostics_available: true,
-            suggested_next_inspection: "inspect_page_heat",
-            first_failure_diag: "temporary page hotspot",
-        },
-    )?;
+            conn.execute("BEGIN;").await?;
+            record_diagnostic(
+                &conn,
+                ConcurrencyDiagnostic {
+                    event_seq: 99,
+                    diagnostic_surface: "EXPLAIN CONCURRENCY",
+                    statement_fingerprint: "fp-rolled-back",
+                    plan_id: "plan-rolled-back",
+                    table_name: "jobs",
+                    index_name: None,
+                    range_id: None,
+                    queue_name: None,
+                    lease_key: None,
+                    worker_id: "worker-z",
+                    transaction_id: "txn-rollback",
+                    hotspot_kind: "page",
+                    page_number: Some(55),
+                    page_start: Some(55),
+                    page_end: Some(55),
+                    predicted_conflict_count: 1,
+                    observed_conflict_count: 1,
+                    retry_count: 0,
+                    abort_count: 0,
+                    busy_family: "busy_snapshot",
+                    conflict_reason: Some("hot_page_predicted"),
+                    fallback_reason: None,
+                    external_wait: None,
+                    coordination_strategy: "page_mvcc",
+                    diagnostics_available: true,
+                    suggested_next_inspection: "inspect_page_heat",
+                    first_failure_diag: "temporary page hotspot",
+                },
+            )
+            .await?;
 
-    let inside_txn = conn.query(
-        "SELECT COUNT(*)
+            let inside_txn = conn
+                .query(
+                    "SELECT COUNT(*)
            FROM fsqlite_explain_concurrency_contract
           WHERE statement_fingerprint = 'fp-rolled-back';",
-    )?;
-    assert_eq!(
-        rows_to_values(&inside_txn),
-        vec![vec![SqliteValue::Integer(1)]]
-    );
+                )
+                .await?;
+            assert_eq!(
+                rows_to_values(&inside_txn),
+                vec![vec![SqliteValue::Integer(1)]]
+            );
 
-    conn.execute("ROLLBACK;")?;
+            conn.execute("ROLLBACK;").await?;
 
-    let after_rollback = conn.query(
-        "SELECT COUNT(*)
+            let after_rollback = conn
+                .query(
+                    "SELECT COUNT(*)
            FROM fsqlite_explain_concurrency_contract
           WHERE statement_fingerprint = 'fp-rolled-back';",
-    )?;
-    assert_eq!(
-        rows_to_values(&after_rollback),
-        vec![vec![SqliteValue::Integer(0)]]
-    );
+                )
+                .await?;
+            assert_eq!(
+                rows_to_values(&after_rollback),
+                vec![vec![SqliteValue::Integer(0)]]
+            );
 
-    Ok(())
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+    });
+    outcome
 }

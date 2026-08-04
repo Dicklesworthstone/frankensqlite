@@ -6,8 +6,8 @@
 #   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.sh?$(date +%s)" | bash
 #
 # Examples:
-#   bash install.sh --version v0.1.19
-#   bash install.sh --offline ./fsqlite-0.1.19-linux_amd64.tar.gz --checksum SHA256
+#   bash install.sh --version v0.2.0
+#   bash install.sh --offline ./fsqlite-0.2.0-linux_amd64.tar.gz --checksum SHA256
 #
 set -euo pipefail
 umask 022
@@ -16,6 +16,10 @@ shopt -s lastpipe 2>/dev/null || true
 OWNER="${FSQLITE_GITHUB_OWNER:-Dicklesworthstone}"
 REPO="${FSQLITE_GITHUB_REPO:-frankensqlite}"
 VERSION="${FSQLITE_VERSION:-}"
+VERSION_EXPLICIT=0
+if [[ -n "$VERSION" ]]; then
+  VERSION_EXPLICIT=1
+fi
 DEST="${FSQLITE_INSTALL_DIR:-$HOME/.local/bin}"
 OFFLINE_ARCHIVE=""
 OFFLINE_CHECKSUM=""
@@ -33,7 +37,17 @@ STAGED_BINARY=""
 LOCK_DIR="${FSQLITE_INSTALL_LOCK_DIR:-${TMPDIR:-/tmp}/fsqlite-install.lock.d}"
 LOCKED=0
 PROXY_ARGS=()
-MINISIGN_PUBLIC_KEY="RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+# Signing epoch 1 (key id 36B847D11BA5A0D0,
+# SHA-256 4c6a3589921c0ab1c5ca0b96271039cf5a055aeddf002cde3e209e59e6793c92):
+# published v0.1.16 and v0.1.17 manifests only.
+MINISIGN_PUBLIC_KEY_EPOCH_1="RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+# Signing epoch 2 (key id 1BBD79B28BF718D0,
+# SHA-256 2c41b1e61b65cffb7cfa4174d0940f99213dfaeb60eb4494a60f1e2a7a63cb59):
+# v0.2.0 and later manifests.
+MINISIGN_PUBLIC_KEY_EPOCH_2="RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70"
+MINISIGN_PUBLIC_KEY=""
+VERSION_PATTERN='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+VERSION_PATTERN_NO_PREFIX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
 
 if command -v gum >/dev/null 2>&1 && [[ -t 1 ]]; then
   HAS_GUM=1
@@ -185,7 +199,7 @@ require_value() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --version) require_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
+    --version) require_value "$1" "${2:-}"; VERSION="$2"; VERSION_EXPLICIT=1; shift 2 ;;
     --dest) require_value "$1" "${2:-}"; DEST="$2"; DEST_EXPLICIT=1; shift 2 ;;
     --system) SYSTEM=1; DEST="/usr/local/bin"; shift ;;
     --easy-mode) EASY_MODE=1; shift ;;
@@ -227,8 +241,8 @@ curl_fetch() {
 
 resolve_version() {
   if [[ -n "$VERSION" ]]; then
-    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] && VERSION="v$VERSION"
-    [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
+    [[ "$VERSION" =~ $VERSION_PATTERN_NO_PREFIX ]] && VERSION="v$VERSION"
+    [[ "$VERSION" =~ $VERSION_PATTERN ]] \
       || die "invalid version '$VERSION'; expected vX.Y.Z"
     return 0
   fi
@@ -238,15 +252,38 @@ resolve_version() {
     --connect-timeout 5 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
     -H 'Accept: application/vnd.github+json' "$api" \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || true
-  if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  if [[ ! "$tag" =~ $VERSION_PATTERN ]]; then
     tag=$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
       --connect-timeout 5 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
       --output /dev/null --write-out '%{url_effective}' \
       "https://github.com/${OWNER}/${REPO}/releases/latest" | sed -E 's|.*/tag/||') || true
   fi
-  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
+  [[ "$tag" =~ $VERSION_PATTERN ]] \
     || die "could not resolve the latest release; pass --version vX.Y.Z"
   VERSION="$tag"
+}
+
+select_minisign_public_key() {
+  local major minor
+  case "$VERSION" in
+    v0.1.16|v0.1.17)
+      [[ "$VERSION_EXPLICIT" -eq 1 ]] \
+        || die "automatic version resolution returned legacy release $VERSION; pass --version $VERSION explicitly"
+      MINISIGN_PUBLIC_KEY="$MINISIGN_PUBLIC_KEY_EPOCH_1"
+      return 0
+      ;;
+  esac
+
+  if [[ "$VERSION" =~ $VERSION_PATTERN ]]; then
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    if [[ "$major" != "0" || ( "$minor" != "0" && "$minor" != "1" ) ]]; then
+      MINISIGN_PUBLIC_KEY="$MINISIGN_PUBLIC_KEY_EPOCH_2"
+      return 0
+    fi
+  fi
+
+  die "release $VERSION has no installer signing-key trust policy"
 }
 
 detect_platform() {
@@ -440,6 +477,9 @@ post_install_verify() {
 
 setup_proxy
 resolve_version
+if [[ "$FROM_SOURCE" -eq 0 && -z "$OFFLINE_ARCHIVE" && "$NO_VERIFY" -eq 0 ]]; then
+  select_minisign_public_key
+fi
 detect_platform
 
 if [[ "$QUIET" -eq 0 ]]; then

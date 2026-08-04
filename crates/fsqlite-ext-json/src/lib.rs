@@ -2422,6 +2422,10 @@ impl ScalarFunction for JsonArrowFunc {
     fn name(&self) -> &'static str {
         "json_arrow"
     }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
+    }
 }
 
 pub struct JsonDoubleArrowFunc;
@@ -2437,6 +2441,42 @@ impl ScalarFunction for JsonDoubleArrowFunc {
 
     fn name(&self) -> &'static str {
         "json_double_arrow"
+    }
+}
+
+pub struct JsonArrowOperatorFunc;
+
+impl ScalarFunction for JsonArrowOperatorFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        invoke_json_arrow(self.name(), args, false)
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "->"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
+    }
+}
+
+pub struct JsonDoubleArrowOperatorFunc;
+
+impl ScalarFunction for JsonDoubleArrowOperatorFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        invoke_json_arrow(self.name(), args, true)
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "->>"
     }
 }
 
@@ -3170,6 +3210,8 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonbExtractFunc);
     registry.register_scalar(JsonArrowFunc);
     registry.register_scalar(JsonDoubleArrowFunc);
+    registry.register_scalar(JsonArrowOperatorFunc);
+    registry.register_scalar(JsonDoubleArrowOperatorFunc);
     registry.register_scalar(JsonArrayFunc);
     registry.register_scalar(JsonbArrayFunc);
     registry.register_scalar(JsonObjectFunc);
@@ -3246,6 +3288,8 @@ mod tests {
             "jsonb_extract",
             "json_arrow",
             "json_double_arrow",
+            "->",
+            "->>",
             "json_set",
             "jsonb_set",
             "json_remove",
@@ -3295,6 +3339,12 @@ mod tests {
             ])
             .expect("json_arrow should normalize bare labels");
         assert_eq!(out, SqliteValue::Text(SmallText::from_string("1")));
+        assert_eq!(func.result_subtype(), Some(JSON_SUBTYPE));
+
+        let operator = registry
+            .find_scalar("->", 2)
+            .expect("JSON arrow operator should be registered");
+        assert_eq!(operator.result_subtype(), Some(JSON_SUBTYPE));
     }
 
     #[test]

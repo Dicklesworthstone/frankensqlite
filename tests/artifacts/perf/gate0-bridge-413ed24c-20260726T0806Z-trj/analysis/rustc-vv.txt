@@ -1,0 +1,7 @@
+rustc 1.99.0-nightly (008fa22ce 2026-07-25)
+binary: rustc
+commit-hash: 008fa22ce3f8d3c8dfaca2e6486043c2b21851eb
+commit-date: 2026-07-25
+host: x86_64-unknown-linux-gnu
+release: 1.99.0-nightly
+LLVM version: 22.1.8

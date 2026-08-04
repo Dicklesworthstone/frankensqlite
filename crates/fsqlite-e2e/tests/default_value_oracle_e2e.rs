@@ -8,6 +8,7 @@
 //! valid), and CURRENT_TIMESTAMP / CURRENT_DATE defaults (checked by storage
 //! class + length, which are deterministic regardless of the wall clock). DML
 //! is autocommit.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -25,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,21 +59,23 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+        f.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
         r.execute_batch(s)
             .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
     (f, r)
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -96,42 +99,50 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 
 #[test]
 fn default_literal_values() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, \
-           i INTEGER DEFAULT 7, \
-           r REAL DEFAULT 1.5, \
-           s TEXT DEFAULT 'hi', \
-           n INTEGER DEFAULT NULL, \
-           neg INTEGER DEFAULT -3)",
-        "INSERT INTO t DEFAULT VALUES",
-        "INSERT INTO t(id, i) VALUES (2, 99)", // others use defaults
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id, i, r, s, n, neg FROM t ORDER BY id",
-            "SELECT typeof(i), typeof(r), typeof(s), typeof(n) FROM t WHERE id = 1",
-        ],
-        "default_literal_values",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+               i INTEGER DEFAULT 7, \
+               r REAL DEFAULT 1.5, \
+               s TEXT DEFAULT 'hi', \
+               n INTEGER DEFAULT NULL, \
+               neg INTEGER DEFAULT -3)",
+            "INSERT INTO t DEFAULT VALUES",
+            "INSERT INTO t(id, i) VALUES (2, 99)", // others use defaults
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id, i, r, s, n, neg FROM t ORDER BY id",
+                "SELECT typeof(i), typeof(r), typeof(s), typeof(n) FROM t WHERE id = 1",
+            ],
+            "default_literal_values",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn default_expression_values() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, \
-           a INTEGER DEFAULT (2 + 3 * 4), \
-           b INTEGER DEFAULT (abs(-5)), \
-           c TEXT DEFAULT ('x' || 'y'))",
-        "INSERT INTO t(id) VALUES (1)",
-    ]);
-    check(
-        &f,
-        &r,
-        &["SELECT id, a, b, c FROM t ORDER BY id"],
-        "default_expression_values",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+               a INTEGER DEFAULT (2 + 3 * 4), \
+               b INTEGER DEFAULT (abs(-5)), \
+               c TEXT DEFAULT ('x' || 'y'))",
+            "INSERT INTO t(id) VALUES (1)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &["SELECT id, a, b, c FROM t ORDER BY id"],
+            "default_expression_values",
+        )
+        .await;
+    });
 }
 
 #[test]
@@ -139,34 +150,42 @@ fn default_affinity_coercion() {
     // The default literal is coerced to the column's declared affinity, like a
     // normal inserted value (this is the CREATE TABLE path, cf. bd-v7y8q for the
     // ALTER ADD COLUMN path).
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, \
-           n INTEGER DEFAULT '42', \
-           s TEXT DEFAULT 100, \
-           rr REAL DEFAULT 5)",
-        "INSERT INTO t(id) VALUES (1)",
-    ]);
-    check(
-        &f,
-        &r,
-        &["SELECT id, typeof(n), n, typeof(s), s, typeof(rr), rr FROM t ORDER BY id"],
-        "default_affinity_coercion",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+               n INTEGER DEFAULT '42', \
+               s TEXT DEFAULT 100, \
+               rr REAL DEFAULT 5)",
+            "INSERT INTO t(id) VALUES (1)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &["SELECT id, typeof(n), n, typeof(s), s, typeof(rr), rr FROM t ORDER BY id"],
+            "default_affinity_coercion",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn default_omitted_columns_multi_row() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 0, b TEXT DEFAULT 'z')",
-        "INSERT INTO t(id) VALUES (1),(2),(3)", // a,b default for all
-        "INSERT INTO t(id, a) VALUES (4, 40),(5, 50)", // b defaults
-    ]);
-    check(
-        &f,
-        &r,
-        &["SELECT id, a, b FROM t ORDER BY id"],
-        "default_omitted_columns_multi_row",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 0, b TEXT DEFAULT 'z')",
+            "INSERT INTO t(id) VALUES (1),(2),(3)", // a,b default for all
+            "INSERT INTO t(id, a) VALUES (4, 40),(5, 50)", // b defaults
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &["SELECT id, a, b FROM t ORDER BY id"],
+            "default_omitted_columns_multi_row",
+        )
+        .await;
+    });
 }
 
 #[test]
@@ -177,21 +196,24 @@ fn default_explicit_keyword() {
     // 200)` is a syntax error in real SQLite, so for parity FrankenSQLite must
     // reject it too. (Verified vs sqlite3 CLI 3.46.1 and the bundled rusqlite;
     // bd-yw5kx was filed on a mistaken premise that SQLite accepts it.)
-    let f = Connection::open(":memory:").expect("open frank");
-    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
-    let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 11, b INTEGER DEFAULT 22)";
-    f.execute(ddl).expect("frank create");
-    r.execute_batch(ddl).expect("rusqlite create");
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("open frank");
+        let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        let ddl =
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 11, b INTEGER DEFAULT 22)";
+        f.execute(ddl).await.expect("frank create");
+        r.execute_batch(ddl).expect("rusqlite create");
 
-    let bad = "INSERT INTO t(id, a, b) VALUES (1, DEFAULT, 200)";
-    assert!(
-        f.execute(bad).is_err(),
-        "frank must reject the DEFAULT keyword inside a VALUES tuple (parity with SQLite)"
-    );
-    assert!(
-        r.execute_batch(bad).is_err(),
-        "oracle (rusqlite/SQLite) rejects the DEFAULT keyword inside a VALUES tuple"
-    );
+        let bad = "INSERT INTO t(id, a, b) VALUES (1, DEFAULT, 200)";
+        assert!(
+            f.execute(bad).await.is_err(),
+            "frank must reject the DEFAULT keyword inside a VALUES tuple (parity with SQLite)"
+        );
+        assert!(
+            r.execute_batch(bad).is_err(),
+            "oracle (rusqlite/SQLite) rejects the DEFAULT keyword inside a VALUES tuple"
+        );
+    });
 }
 
 #[test]
@@ -199,21 +221,25 @@ fn default_current_timestamp_shape() {
     // CURRENT_* default values depend on the clock, so compare their storage
     // class and length (deterministic): TIMESTAMP -> 'YYYY-MM-DD HH:MM:SS' (19),
     // DATE -> 'YYYY-MM-DD' (10), TIME -> 'HH:MM:SS' (8).
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, \
-           ts TEXT DEFAULT CURRENT_TIMESTAMP, \
-           d  TEXT DEFAULT CURRENT_DATE, \
-           tm TEXT DEFAULT CURRENT_TIME)",
-        "INSERT INTO t(id) VALUES (1)",
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT typeof(ts), length(ts), typeof(d), length(d), typeof(tm), length(tm) FROM t",
-            // The date portion of ts must equal CURRENT_DATE's value (same day).
-            "SELECT date(ts) = d FROM t",
-        ],
-        "default_current_timestamp_shape",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+               ts TEXT DEFAULT CURRENT_TIMESTAMP, \
+               d  TEXT DEFAULT CURRENT_DATE, \
+               tm TEXT DEFAULT CURRENT_TIME)",
+            "INSERT INTO t(id) VALUES (1)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT typeof(ts), length(ts), typeof(d), length(d), typeof(tm), length(tm) FROM t",
+                // The date portion of ts must equal CURRENT_DATE's value (same day).
+                "SELECT date(ts) = d FROM t",
+            ],
+            "default_current_timestamp_shape",
+        )
+        .await;
+    });
 }

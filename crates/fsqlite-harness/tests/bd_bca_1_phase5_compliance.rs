@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Output};
 
-use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::cursor::{BtCursor, TransactionPageIo};
 use fsqlite_btree::{BtreeCursorOps, SeekResult};
 use fsqlite_pager::{
@@ -353,596 +352,719 @@ fn test_e2e_bd_bca_1() -> Result<(), String> {
 
 #[test]
 fn test_persistence_create_close_reopen() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let path = PathBuf::from("/bd_bca_1_persistence.db");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let expected = sample_page(0x2A, page_size);
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/bd_bca_1_persistence.db");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let expected = sample_page(0x2A, page_size);
 
-    let page_no = {
-        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
-            .map_err(|error| format!("open_pager_for_write_failed error={error}"))?;
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .map_err(|error| format!("begin_writer_failed error={error}"))?;
-        let page_no = txn
-            .allocate_page(&cx)
-            .map_err(|error| format!("allocate_page_failed error={error}"))?;
-        txn.write_page(&cx, page_no, &expected)
-            .map_err(|error| format!("write_page_failed error={error}"))?;
-        txn.commit(&cx)
-            .map_err(|error| format!("commit_failed error={error}"))?;
-        page_no
-    };
+            let page_no = {
+                let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .map_err(|error| format!("open_pager_for_write_failed error={error}"))?;
+                let mut txn = pager
+                    .begin(&cx, TransactionMode::Immediate)
+                    .await
+                    .map_err(|error| format!("begin_writer_failed error={error}"))?;
+                let page_no = txn
+                    .allocate_page(&cx)
+                    .await
+                    .map_err(|error| format!("allocate_page_failed error={error}"))?;
+                txn.write_page(&cx, page_no, &expected)
+                    .await
+                    .map_err(|error| format!("write_page_failed error={error}"))?;
+                txn.commit(&cx)
+                    .await
+                    .map_err(|error| format!("commit_failed error={error}"))?;
+                page_no
+            };
 
-    let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
-        .map_err(|error| format!("open_pager_for_read_failed error={error}"))?;
-    let txn = pager
-        .begin(&cx, TransactionMode::ReadOnly)
-        .map_err(|error| format!("begin_reader_failed error={error}"))?;
-    let observed = txn
-        .get_page(&cx, page_no)
-        .map_err(|error| format!("read_page_failed error={error}"))?;
+            let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
+                .await
+                .map_err(|error| format!("open_pager_for_read_failed error={error}"))?;
+            let txn = pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .map_err(|error| format!("begin_reader_failed error={error}"))?;
+            let observed = txn
+                .get_page(&cx, page_no)
+                .await
+                .map_err(|error| format!("read_page_failed error={error}"))?;
 
-    if observed.as_ref() != expected.as_slice() {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=persistence_create_close_reopen_mismatch first={} last={}",
-            observed.as_ref().first().copied().unwrap_or_default(),
-            observed.as_ref().last().copied().unwrap_or_default()
-        ));
-    }
+            if observed.as_ref() != expected.as_slice() {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=persistence_create_close_reopen_mismatch first={} last={}",
+                    observed.as_ref().first().copied().unwrap_or_default(),
+                    observed.as_ref().last().copied().unwrap_or_default()
+                ));
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_btree_cursor_insert_reopen_roundtrip() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let path = PathBuf::from("/bd_bca_1_btree_cursor_roundtrip.db");
-    let usable_size = PageSize::DEFAULT.usable(0);
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/bd_bca_1_btree_cursor_roundtrip.db");
+            let usable_size = PageSize::DEFAULT.usable(0);
 
-    let root_page = {
-        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
-            .map_err(|error| format!("open_pager_for_write_failed error={error}"))?;
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .map_err(|error| format!("begin_writer_failed error={error}"))?;
+            let root_page = {
+                let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .map_err(|error| format!("open_pager_for_write_failed error={error}"))?;
+                let mut txn = pager
+                    .begin(&cx, TransactionMode::Immediate)
+                    .await
+                    .map_err(|error| format!("begin_writer_failed error={error}"))?;
 
-        let root_page = txn
-            .allocate_page(&cx)
-            .map_err(|error| format!("allocate_root_page_failed error={error}"))?;
+                let root_page = txn
+                    .allocate_page(&cx)
+                    .await
+                    .map_err(|error| format!("allocate_root_page_failed error={error}"))?;
 
-        let mut root = vec![0_u8; PageSize::DEFAULT.as_usize()];
-        root[0] = 0x0D; // LeafTable
-        root[3..5].copy_from_slice(&0u16.to_be_bytes()); // cell_count = 0
-        let content_start = u16::try_from(PageSize::DEFAULT.get()).map_err(|_| {
-            format!(
-                "content_start_u16_overflow page_size={}",
-                PageSize::DEFAULT.get()
-            )
-        })?;
-        root[5..7].copy_from_slice(&content_start.to_be_bytes()); // cell content at end of page
+                let mut root = vec![0_u8; PageSize::DEFAULT.as_usize()];
+                root[0] = 0x0D; // LeafTable
+                root[3..5].copy_from_slice(&0u16.to_be_bytes()); // cell_count = 0
+                let content_start = u16::try_from(PageSize::DEFAULT.get()).map_err(|_| {
+                    format!(
+                        "content_start_u16_overflow page_size={}",
+                        PageSize::DEFAULT.get()
+                    )
+                })?;
+                root[5..7].copy_from_slice(&content_start.to_be_bytes()); // cell content at end of page
 
-        txn.write_page(&cx, root_page, &root)
-            .map_err(|error| format!("write_root_page_failed error={error}"))?;
+                txn.write_page(&cx, root_page, &root)
+                    .await
+                    .map_err(|error| format!("write_root_page_failed error={error}"))?;
 
-        {
+                {
+                    let mut cursor = BtCursor::new(
+                        TransactionPageIo::new(&mut txn),
+                        root_page,
+                        usable_size,
+                        true,
+                    );
+                    cursor
+                        .table_insert(&cx, 1, b"hello")
+                        .await
+                        .map_err(|error| format!("btree_insert_failed error={error}"))?;
+                }
+
+                txn.commit(&cx)
+                    .await
+                    .map_err(|error| format!("commit_failed error={error}"))?;
+                root_page
+            };
+
+            let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
+                .await
+                .map_err(|error| format!("open_pager_for_read_failed error={error}"))?;
+            let mut txn = pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .map_err(|error| format!("begin_reader_failed error={error}"))?;
+
             let mut cursor = BtCursor::new(
                 TransactionPageIo::new(&mut txn),
                 root_page,
                 usable_size,
                 true,
             );
-            cursor
-                .table_insert(&cx, 1, b"hello")
-                .map_err(|error| format!("btree_insert_failed error={error}"))?;
+            let seek = cursor
+                .table_move_to(&cx, 1)
+                .await
+                .map_err(|error| format!("btree_seek_failed error={error}"))?;
+            if seek != SeekResult::Found {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=btree_seek_not_found root_page={}",
+                    root_page.get()
+                ));
+            }
+
+            let payload = cursor
+                .payload(&cx)
+                .await
+                .map_err(|error| format!("btree_payload_failed error={error}"))?;
+            if payload.as_slice() != b"hello" {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=btree_payload_mismatch len={}",
+                    payload.len()
+                ));
+            }
+
+            Ok(())
         }
-
-        txn.commit(&cx)
-            .map_err(|error| format!("commit_failed error={error}"))?;
-        root_page
-    };
-
-    let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
-        .map_err(|error| format!("open_pager_for_read_failed error={error}"))?;
-    let mut txn = pager
-        .begin(&cx, TransactionMode::ReadOnly)
-        .map_err(|error| format!("begin_reader_failed error={error}"))?;
-
-    let mut cursor = BtCursor::new(
-        TransactionPageIo::new(&mut txn),
-        root_page,
-        usable_size,
-        true,
-    );
-    let seek = cursor
-        .table_move_to(&cx, 1)
-        .map_err(|error| format!("btree_seek_failed error={error}"))?;
-    if seek != SeekResult::Found {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=btree_seek_not_found root_page={}",
-            root_page.get()
-        ));
-    }
-
-    let payload = cursor
-        .payload(&cx)
-        .map_err(|error| format!("btree_payload_failed error={error}"))?;
-    if payload.as_slice() != b"hello" {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=btree_payload_mismatch len={}",
-            payload.len()
-        ));
-    }
-
-    Ok(())
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_journal_crash_recovery() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let path = PathBuf::from("/bd_bca_1_hot_journal.db");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let original = sample_page(0x11, page_size);
-    let corrupted = sample_page(0x99, page_size);
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/bd_bca_1_hot_journal.db");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let original = sample_page(0x11, page_size);
+            let corrupted = sample_page(0x99, page_size);
 
-    let page_no = {
-        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
-            .map_err(|error| format!("open_pager_initial_failed error={error}"))?;
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .map_err(|error| format!("begin_initial_writer_failed error={error}"))?;
-        let page_no = txn
-            .allocate_page(&cx)
-            .map_err(|error| format!("allocate_initial_page_failed error={error}"))?;
-        txn.write_page(&cx, page_no, &original)
-            .map_err(|error| format!("write_initial_page_failed error={error}"))?;
-        txn.commit(&cx)
-            .map_err(|error| format!("commit_initial_page_failed error={error}"))?;
-        page_no
-    };
+            let page_no = {
+                let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .map_err(|error| format!("open_pager_initial_failed error={error}"))?;
+                let mut txn = pager
+                    .begin(&cx, TransactionMode::Immediate)
+                    .await
+                    .map_err(|error| format!("begin_initial_writer_failed error={error}"))?;
+                let page_no = txn
+                    .allocate_page(&cx)
+                    .await
+                    .map_err(|error| format!("allocate_initial_page_failed error={error}"))?;
+                txn.write_page(&cx, page_no, &original)
+                    .await
+                    .map_err(|error| format!("write_initial_page_failed error={error}"))?;
+                txn.commit(&cx)
+                    .await
+                    .map_err(|error| format!("commit_initial_page_failed error={error}"))?;
+                page_no
+            };
 
-    {
-        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
-        let (mut db_file, _) = vfs
-            .open(&cx, Some(&path), flags)
-            .map_err(|error| format!("open_db_for_corruption_failed error={error}"))?;
-        let offset = u64::from(page_no.get().saturating_sub(1))
-            * u64::try_from(page_size)
-                .map_err(|error| format!("page_size_u64_conversion_failed error={error}"))?;
-        db_file
-            .write(&cx, &corrupted, offset)
-            .map_err(|error| format!("write_corrupted_db_page_failed error={error}"))?;
-    }
+            {
+                let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+                let (db_file, _) = vfs
+                    .open(&cx, Some(&path), flags)
+                    .map_err(|error| format!("open_db_for_corruption_failed error={error}"))?;
+                let offset = u64::from(page_no.get().saturating_sub(1))
+                    * u64::try_from(page_size).map_err(|error| {
+                        format!("page_size_u64_conversion_failed error={error}")
+                    })?;
+                db_file
+                    .write(&cx, &corrupted, offset)
+                    .await
+                    .map_err(|error| format!("write_corrupted_db_page_failed error={error}"))?;
+            }
 
-    let journal_path = journal_path_for(&path);
-    {
-        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
-        let (mut journal_file, _) = vfs
-            .open(&cx, Some(&journal_path), flags)
-            .map_err(|error| format!("open_journal_for_recovery_failed error={error}"))?;
+            let journal_path = journal_path_for(&path);
+            {
+                let flags =
+                    VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+                let (journal_file, _) = vfs
+                    .open(&cx, Some(&journal_path), flags)
+                    .map_err(|error| format!("open_journal_for_recovery_failed error={error}"))?;
 
-        let header = JournalHeader {
-            page_count: 1,
-            nonce: 42,
-            initial_db_size: page_no.get(),
-            sector_size: 512,
-            page_size: PageSize::DEFAULT.get(),
-        };
-        let header_bytes = header.encode_padded();
-        journal_file
-            .write(&cx, &header_bytes, 0)
-            .map_err(|error| format!("write_journal_header_failed error={error}"))?;
+                let header = JournalHeader {
+                    page_count: 1,
+                    nonce: 42,
+                    initial_db_size: page_no.get(),
+                    sector_size: 512,
+                    page_size: PageSize::DEFAULT.get(),
+                };
+                let header_bytes = header.encode_padded();
+                journal_file
+                    .write(&cx, &header_bytes, 0)
+                    .await
+                    .map_err(|error| format!("write_journal_header_failed error={error}"))?;
 
-        let record = JournalPageRecord::new(page_no.get(), original.clone(), header.nonce);
-        let record_bytes = record.encode();
-        journal_file
-            .write(
-                &cx,
-                &record_bytes,
-                u64::try_from(header_bytes.len())
-                    .map_err(|error| format!("journal_header_len_to_u64_failed error={error}"))?,
-            )
-            .map_err(|error| format!("write_journal_record_failed error={error}"))?;
-    }
+                let record = JournalPageRecord::new(page_no.get(), original.clone(), header.nonce);
+                let record_bytes = record.encode();
+                journal_file
+                    .write(
+                        &cx,
+                        &record_bytes,
+                        u64::try_from(header_bytes.len()).map_err(|error| {
+                            format!("journal_header_len_to_u64_failed error={error}")
+                        })?,
+                    )
+                    .await
+                    .map_err(|error| format!("write_journal_record_failed error={error}"))?;
+            }
 
-    let reopened = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
-        .map_err(|error| format!("reopen_pager_for_recovery_failed error={error}"))?;
-    let read_txn = reopened
-        .begin(&cx, TransactionMode::ReadOnly)
-        .map_err(|error| format!("begin_reader_after_recovery_failed error={error}"))?;
-    let recovered = read_txn
-        .get_page(&cx, page_no)
-        .map_err(|error| format!("read_recovered_page_failed error={error}"))?;
+            let reopened = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .map_err(|error| format!("reopen_pager_for_recovery_failed error={error}"))?;
+            let read_txn = reopened
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .map_err(|error| format!("begin_reader_after_recovery_failed error={error}"))?;
+            let recovered = read_txn
+                .get_page(&cx, page_no)
+                .await
+                .map_err(|error| format!("read_recovered_page_failed error={error}"))?;
 
-    if recovered.as_ref() != original.as_slice() {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=journal_crash_recovery_content_mismatch first={} last={}",
-            recovered.as_ref().first().copied().unwrap_or_default(),
-            recovered.as_ref().last().copied().unwrap_or_default()
-        ));
-    }
+            if recovered.as_ref() != original.as_slice() {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=journal_crash_recovery_content_mismatch first={} last={}",
+                    recovered.as_ref().first().copied().unwrap_or_default(),
+                    recovered.as_ref().last().copied().unwrap_or_default()
+                ));
+            }
 
-    let journal_exists = vfs
-        .access(&cx, &journal_path, AccessFlags::EXISTS)
-        .map_err(|error| format!("check_journal_deleted_failed error={error}"))?;
-    if journal_exists {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=journal_crash_recovery_journal_not_deleted path={}",
-            journal_path.display()
-        ));
-    }
+            let journal_exists = vfs
+                .access(&cx, &journal_path, AccessFlags::EXISTS)
+                .map_err(|error| format!("check_journal_deleted_failed error={error}"))?;
+            if journal_exists {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=journal_crash_recovery_journal_not_deleted path={}",
+                    journal_path.display()
+                ));
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_checksum_corruption() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_bca_1_checksum.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_bca_1_checksum.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_for_checksum_test_failed error={error}"))?;
-        wal.append_frame(&cx, 1, &sample_page(0x21, page_size), 0)
-            .map_err(|error| format!("append_frame_1_failed error={error}"))?;
-        wal.append_frame(&cx, 2, &sample_page(0x22, page_size), 2)
-            .map_err(|error| format!("append_frame_2_failed error={error}"))?;
-        wal.close(&cx)
-            .map_err(|error| format!("close_wal_for_checksum_test_failed error={error}"))?;
-    }
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| {
+                        format!("create_wal_for_checksum_test_failed error={error}")
+                    })?;
+                wal.append_frame(&cx, 1, &sample_page(0x21, page_size), 0)
+                    .await
+                    .map_err(|error| format!("append_frame_1_failed error={error}"))?;
+                wal.append_frame(&cx, 2, &sample_page(0x22, page_size), 2)
+                    .await
+                    .map_err(|error| format!("append_frame_2_failed error={error}"))?;
+                wal.close(&cx)
+                    .map_err(|error| format!("close_wal_for_checksum_test_failed error={error}"))?;
+            }
 
-    let mut wal_bytes = {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let file_size = wal_file
-            .file_size(&cx)
-            .map_err(|error| format!("read_wal_size_failed error={error}"))?;
-        let mut bytes = vec![
-            0_u8;
-            usize::try_from(file_size).map_err(|error| format!(
-                "wal_size_to_usize_failed error={error}"
-            ))?
-        ];
-        wal_file
-            .read(&cx, &mut bytes, 0)
-            .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
-        bytes
-    };
+            let mut wal_bytes = {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let file_size = wal_file
+                    .file_size(&cx)
+                    .map_err(|error| format!("read_wal_size_failed error={error}"))?;
+                let mut bytes = vec![
+                    0_u8;
+                    usize::try_from(file_size).map_err(|error| format!(
+                        "wal_size_to_usize_failed error={error}"
+                    ))?
+                ];
+                wal_file
+                    .read(&cx, &mut bytes, 0)
+                    .await
+                    .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
+                bytes
+            };
 
-    let corrupt_offset = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 17;
-    if corrupt_offset >= wal_bytes.len() {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=checksum_corruption_offset_out_of_range offset={corrupt_offset} len={}",
-            wal_bytes.len()
-        ));
-    }
-    wal_bytes[corrupt_offset] ^= 0x40;
+            let corrupt_offset = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 17;
+            if corrupt_offset >= wal_bytes.len() {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=checksum_corruption_offset_out_of_range offset={corrupt_offset} len={}",
+                    wal_bytes.len()
+                ));
+            }
+            wal_bytes[corrupt_offset] ^= 0x40;
 
-    {
-        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        wal_file
-            .write(&cx, &wal_bytes, 0)
-            .map_err(|error| format!("write_corrupted_wal_bytes_failed error={error}"))?;
-        wal_file
-            .sync(&cx, SyncFlags::NORMAL)
-            .map_err(|error| format!("sync_corrupted_wal_failed error={error}"))?;
-    }
+            {
+                let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                wal_file
+                    .write(&cx, &wal_bytes, 0)
+                    .await
+                    .map_err(|error| format!("write_corrupted_wal_bytes_failed error={error}"))?;
+                wal_file
+                    .sync(&cx, SyncFlags::NORMAL)
+                    .map_err(|error| format!("sync_corrupted_wal_failed error={error}"))?;
+            }
 
-    let validation = validate_wal_chain(&wal_bytes, page_size, false)
-        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
-    if validation.valid {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_checksum_corruption_not_detected validation={validation:?}"
-        ));
-    }
-    if validation.reason != Some(WalChainInvalidReason::FrameChecksumMismatch) {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_checksum_corruption_reason_mismatch reason={:?}",
-            validation.reason
-        ));
-    }
+            let validation = validate_wal_chain(&wal_bytes, page_size, false)
+                .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+            if validation.valid {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_checksum_corruption_not_detected validation={validation:?}"
+                ));
+            }
+            if validation.reason != Some(WalChainInvalidReason::FrameChecksumMismatch) {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_checksum_corruption_reason_mismatch reason={:?}",
+                    validation.reason
+                ));
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_recovery_stops_at_first_invalid_frame() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_bca_1_first_invalid_prefix.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_bca_1_first_invalid_prefix.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_for_prefix_cutoff_test_failed error={error}"))?;
-        for (index, seed) in [0x41_u8, 0x42, 0x43, 0x44].iter().copied().enumerate() {
-            let frame_no = u32::try_from(index + 1)
-                .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
-            wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
-                .map_err(|error| {
-                    format!("append_frame_failed frame_no={frame_no} error={error}")
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| {
+                        format!("create_wal_for_prefix_cutoff_test_failed error={error}")
+                    })?;
+                for (index, seed) in [0x41_u8, 0x42, 0x43, 0x44].iter().copied().enumerate() {
+                    let frame_no = u32::try_from(index + 1)
+                        .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
+                    wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
+                        .await
+                        .map_err(|error| {
+                            format!("append_frame_failed frame_no={frame_no} error={error}")
+                        })?;
+                }
+                wal.close(&cx).map_err(|error| {
+                    format!("close_wal_for_prefix_cutoff_test_failed error={error}")
                 })?;
+            }
+
+            let mut wal_bytes = {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let file_size = wal_file
+                    .file_size(&cx)
+                    .map_err(|error| format!("read_wal_size_failed error={error}"))?;
+                let mut bytes = vec![
+                    0_u8;
+                    usize::try_from(file_size).map_err(|error| format!(
+                        "wal_size_to_usize_failed error={error}"
+                    ))?
+                ];
+                wal_file
+                    .read(&cx, &mut bytes, 0)
+                    .await
+                    .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
+                bytes
+            };
+
+            let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+            let invalid_frame = 2_usize;
+            let corrupt_offset =
+                WAL_HEADER_SIZE + frame_size * invalid_frame + WAL_FRAME_HEADER_SIZE + 9;
+            if corrupt_offset >= wal_bytes.len() {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_offset_out_of_range offset={corrupt_offset} len={}",
+                    wal_bytes.len()
+                ));
+            }
+            wal_bytes[corrupt_offset] ^= 0x7F;
+
+            let validation = validate_wal_chain(&wal_bytes, page_size, false)
+                .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+            if validation.reason != Some(WalChainInvalidReason::FrameChecksumMismatch) {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_reason_mismatch reason={:?}",
+                    validation.reason
+                ));
+            }
+            if validation.valid_frame_count != invalid_frame {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_valid_count_mismatch expected={invalid_frame} actual={}",
+                    validation.valid_frame_count
+                ));
+            }
+            if validation.first_invalid_frame != Some(invalid_frame) {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_index_mismatch expected={invalid_frame} actual={:?}",
+                    validation.first_invalid_frame
+                ));
+            }
+            if validation.replayable_frame_count != invalid_frame {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_replayable_count_mismatch expected={invalid_frame} actual={}",
+                    validation.replayable_frame_count
+                ));
+            }
+
+            Ok(())
         }
-        wal.close(&cx)
-            .map_err(|error| format!("close_wal_for_prefix_cutoff_test_failed error={error}"))?;
-    }
-
-    let mut wal_bytes = {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let file_size = wal_file
-            .file_size(&cx)
-            .map_err(|error| format!("read_wal_size_failed error={error}"))?;
-        let mut bytes = vec![
-            0_u8;
-            usize::try_from(file_size).map_err(|error| format!(
-                "wal_size_to_usize_failed error={error}"
-            ))?
-        ];
-        wal_file
-            .read(&cx, &mut bytes, 0)
-            .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
-        bytes
-    };
-
-    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
-    let invalid_frame = 2_usize;
-    let corrupt_offset = WAL_HEADER_SIZE + frame_size * invalid_frame + WAL_FRAME_HEADER_SIZE + 9;
-    if corrupt_offset >= wal_bytes.len() {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_offset_out_of_range offset={corrupt_offset} len={}",
-            wal_bytes.len()
-        ));
-    }
-    wal_bytes[corrupt_offset] ^= 0x7F;
-
-    let validation = validate_wal_chain(&wal_bytes, page_size, false)
-        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
-    if validation.reason != Some(WalChainInvalidReason::FrameChecksumMismatch) {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_reason_mismatch reason={:?}",
-            validation.reason
-        ));
-    }
-    if validation.valid_frame_count != invalid_frame {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_valid_count_mismatch expected={invalid_frame} actual={}",
-            validation.valid_frame_count
-        ));
-    }
-    if validation.first_invalid_frame != Some(invalid_frame) {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_index_mismatch expected={invalid_frame} actual={:?}",
-            validation.first_invalid_frame
-        ));
-    }
-    if validation.replayable_frame_count != invalid_frame {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_replayable_count_mismatch expected={invalid_frame} actual={}",
-            validation.replayable_frame_count
-        ));
-    }
-
-    Ok(())
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_recovery_salt_mismatch_stops_at_frame() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_bca_1_salt_mismatch.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_bca_1_salt_mismatch.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_for_salt_mismatch_test_failed error={error}"))?;
-        for (index, seed) in [0x51_u8, 0x52, 0x53].iter().copied().enumerate() {
-            let frame_no = u32::try_from(index + 1)
-                .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
-            wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
-                .map_err(|error| {
-                    format!("append_frame_failed frame_no={frame_no} error={error}")
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| {
+                        format!("create_wal_for_salt_mismatch_test_failed error={error}")
+                    })?;
+                for (index, seed) in [0x51_u8, 0x52, 0x53].iter().copied().enumerate() {
+                    let frame_no = u32::try_from(index + 1)
+                        .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
+                    wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
+                        .await
+                        .map_err(|error| {
+                            format!("append_frame_failed frame_no={frame_no} error={error}")
+                        })?;
+                }
+                wal.close(&cx).map_err(|error| {
+                    format!("close_wal_for_salt_mismatch_test_failed error={error}")
                 })?;
+            }
+
+            let mut wal_bytes = {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let file_size = wal_file
+                    .file_size(&cx)
+                    .map_err(|error| format!("read_wal_size_failed error={error}"))?;
+                let mut bytes = vec![
+                    0_u8;
+                    usize::try_from(file_size).map_err(|error| format!(
+                        "wal_size_to_usize_failed error={error}"
+                    ))?
+                ];
+                wal_file
+                    .read(&cx, &mut bytes, 0)
+                    .await
+                    .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
+                bytes
+            };
+
+            let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+            let invalid_frame = 1_usize;
+            let header_start = WAL_HEADER_SIZE + frame_size * invalid_frame;
+            let header_end = header_start + WAL_FRAME_HEADER_SIZE;
+            if header_end > wal_bytes.len() {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_header_out_of_range start={header_start} end={header_end} len={}",
+                    wal_bytes.len()
+                ));
+            }
+            write_wal_frame_salts(
+                &mut wal_bytes[header_start..header_end],
+                WalSalts {
+                    salt1: 0xDEAD_BEEF,
+                    salt2: 0xFEED_CAFE,
+                },
+            )
+            .map_err(|error| format!("rewrite_frame_salts_failed error={error}"))?;
+
+            let validation = validate_wal_chain(&wal_bytes, page_size, false)
+                .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+            if validation.reason != Some(WalChainInvalidReason::SaltMismatch) {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_reason_mismatch reason={:?}",
+                    validation.reason
+                ));
+            }
+            if validation.valid_frame_count != invalid_frame {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_valid_count_mismatch expected={invalid_frame} actual={}",
+                    validation.valid_frame_count
+                ));
+            }
+            if validation.first_invalid_frame != Some(invalid_frame) {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_index_mismatch expected={invalid_frame} actual={:?}",
+                    validation.first_invalid_frame
+                ));
+            }
+
+            Ok(())
         }
-        wal.close(&cx)
-            .map_err(|error| format!("close_wal_for_salt_mismatch_test_failed error={error}"))?;
-    }
-
-    let mut wal_bytes = {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let file_size = wal_file
-            .file_size(&cx)
-            .map_err(|error| format!("read_wal_size_failed error={error}"))?;
-        let mut bytes = vec![
-            0_u8;
-            usize::try_from(file_size).map_err(|error| format!(
-                "wal_size_to_usize_failed error={error}"
-            ))?
-        ];
-        wal_file
-            .read(&cx, &mut bytes, 0)
-            .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
-        bytes
-    };
-
-    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
-    let invalid_frame = 1_usize;
-    let header_start = WAL_HEADER_SIZE + frame_size * invalid_frame;
-    let header_end = header_start + WAL_FRAME_HEADER_SIZE;
-    if header_end > wal_bytes.len() {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_header_out_of_range start={header_start} end={header_end} len={}",
-            wal_bytes.len()
-        ));
-    }
-    write_wal_frame_salts(
-        &mut wal_bytes[header_start..header_end],
-        WalSalts {
-            salt1: 0xDEAD_BEEF,
-            salt2: 0xFEED_CAFE,
-        },
-    )
-    .map_err(|error| format!("rewrite_frame_salts_failed error={error}"))?;
-
-    let validation = validate_wal_chain(&wal_bytes, page_size, false)
-        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
-    if validation.reason != Some(WalChainInvalidReason::SaltMismatch) {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_reason_mismatch reason={:?}",
-            validation.reason
-        ));
-    }
-    if validation.valid_frame_count != invalid_frame {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_valid_count_mismatch expected={invalid_frame} actual={}",
-            validation.valid_frame_count
-        ));
-    }
-    if validation.first_invalid_frame != Some(invalid_frame) {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_index_mismatch expected={invalid_frame} actual={:?}",
-            validation.first_invalid_frame
-        ));
-    }
-
-    Ok(())
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_frame_checksum_excludes_salt_header_bytes() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_bca_1_checksum_excludes_salt.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_bca_1_checksum_excludes_salt.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal =
-            WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts()).map_err(|error| {
-                format!("create_wal_for_checksum_excludes_salt_test_failed error={error}")
-            })?;
-        wal.append_frame(&cx, 1, &sample_page(0x6D, page_size), 1)
-            .map_err(|error| format!("append_frame_failed error={error}"))?;
-        wal.close(&cx).map_err(|error| {
-            format!("close_wal_for_checksum_excludes_salt_test_failed error={error}")
-        })?;
-    }
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| {
+                        format!("create_wal_for_checksum_excludes_salt_test_failed error={error}")
+                    })?;
+                wal.append_frame(&cx, 1, &sample_page(0x6D, page_size), 1)
+                    .await
+                    .map_err(|error| format!("append_frame_failed error={error}"))?;
+                wal.close(&cx).map_err(|error| {
+                    format!("close_wal_for_checksum_excludes_salt_test_failed error={error}")
+                })?;
+            }
 
-    let wal_bytes = {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let file_size = wal_file
-            .file_size(&cx)
-            .map_err(|error| format!("read_wal_size_failed error={error}"))?;
-        let mut bytes = vec![
-            0_u8;
-            usize::try_from(file_size).map_err(|error| format!(
-                "wal_size_to_usize_failed error={error}"
-            ))?
-        ];
-        wal_file
-            .read(&cx, &mut bytes, 0)
-            .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
-        bytes
-    };
+            let wal_bytes = {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let file_size = wal_file
+                    .file_size(&cx)
+                    .map_err(|error| format!("read_wal_size_failed error={error}"))?;
+                let mut bytes = vec![
+                    0_u8;
+                    usize::try_from(file_size).map_err(|error| format!(
+                        "wal_size_to_usize_failed error={error}"
+                    ))?
+                ];
+                wal_file
+                    .read(&cx, &mut bytes, 0)
+                    .await
+                    .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
+                bytes
+            };
 
-    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
-    let seed = read_wal_header_checksum(&wal_bytes[..WAL_HEADER_SIZE])
-        .map_err(|error| format!("read_wal_header_checksum_failed error={error}"))?;
-    let frame = &wal_bytes[WAL_HEADER_SIZE..WAL_HEADER_SIZE + frame_size];
-    let baseline = compute_wal_frame_checksum(frame, page_size, seed, false)
-        .map_err(|error| format!("compute_wal_frame_checksum_baseline_failed error={error}"))?;
+            let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+            let seed = read_wal_header_checksum(&wal_bytes[..WAL_HEADER_SIZE])
+                .map_err(|error| format!("read_wal_header_checksum_failed error={error}"))?;
+            let frame = &wal_bytes[WAL_HEADER_SIZE..WAL_HEADER_SIZE + frame_size];
+            let baseline = compute_wal_frame_checksum(frame, page_size, seed, false)
+                .map_err(|error| {
+                    format!("compute_wal_frame_checksum_baseline_failed error={error}")
+                })?;
 
-    let mut salted_variant = frame.to_vec();
-    write_wal_frame_salts(
-        &mut salted_variant[..WAL_FRAME_HEADER_SIZE],
-        WalSalts {
-            salt1: 0x0102_0304,
-            salt2: 0x0506_0708,
-        },
-    )
-    .map_err(|error| format!("rewrite_frame_salts_failed error={error}"))?;
-    let variant = compute_wal_frame_checksum(&salted_variant, page_size, seed, false)
-        .map_err(|error| format!("compute_wal_frame_checksum_variant_failed error={error}"))?;
+            let mut salted_variant = frame.to_vec();
+            write_wal_frame_salts(
+                &mut salted_variant[..WAL_FRAME_HEADER_SIZE],
+                WalSalts {
+                    salt1: 0x0102_0304,
+                    salt2: 0x0506_0708,
+                },
+            )
+            .map_err(|error| format!("rewrite_frame_salts_failed error={error}"))?;
+            let variant = compute_wal_frame_checksum(&salted_variant, page_size, seed, false)
+                .map_err(|error| {
+                    format!("compute_wal_frame_checksum_variant_failed error={error}")
+                })?;
 
-    if baseline != variant {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_frame_checksum_excludes_salt_header_bytes_mismatch baseline={baseline:?} variant={variant:?}"
-        ));
-    }
+            if baseline != variant {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_frame_checksum_excludes_salt_header_bytes_mismatch baseline={baseline:?} variant={variant:?}"
+                ));
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_recovery_torn_write() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_bca_1_torn_tail.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
-    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_bca_1_torn_tail.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
+            let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_for_torn_tail_test_failed error={error}"))?;
-        wal.append_frame(&cx, 1, &sample_page(0x31, page_size), 0)
-            .map_err(|error| format!("append_frame_1_failed error={error}"))?;
-        wal.append_frame(&cx, 2, &sample_page(0x32, page_size), 0)
-            .map_err(|error| format!("append_frame_2_failed error={error}"))?;
-        wal.append_frame(&cx, 3, &sample_page(0x33, page_size), 3)
-            .map_err(|error| format!("append_frame_3_failed error={error}"))?;
-        wal.close(&cx)
-            .map_err(|error| format!("close_wal_for_torn_tail_test_failed error={error}"))?;
-    }
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| {
+                        format!("create_wal_for_torn_tail_test_failed error={error}")
+                    })?;
+                wal.append_frame(&cx, 1, &sample_page(0x31, page_size), 0)
+                    .await
+                    .map_err(|error| format!("append_frame_1_failed error={error}"))?;
+                wal.append_frame(&cx, 2, &sample_page(0x32, page_size), 0)
+                    .await
+                    .map_err(|error| format!("append_frame_2_failed error={error}"))?;
+                wal.append_frame(&cx, 3, &sample_page(0x33, page_size), 3)
+                    .await
+                    .map_err(|error| format!("append_frame_3_failed error={error}"))?;
+                wal.close(&cx)
+                    .map_err(|error| format!("close_wal_for_torn_tail_test_failed error={error}"))?;
+            }
 
-    {
-        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let torn_len = WAL_HEADER_SIZE + frame_size * 2 + frame_size / 2;
-        wal_file
-            .truncate(
-                &cx,
-                u64::try_from(torn_len)
-                    .map_err(|error| format!("torn_len_to_u64_failed error={error}"))?,
-            )
-            .map_err(|error| format!("truncate_wal_tail_failed error={error}"))?;
-    }
+            {
+                let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let torn_len = WAL_HEADER_SIZE + frame_size * 2 + frame_size / 2;
+                wal_file
+                    .truncate(
+                        &cx,
+                        u64::try_from(torn_len)
+                            .map_err(|error| format!("torn_len_to_u64_failed error={error}"))?,
+                    )
+                    .map_err(|error| format!("truncate_wal_tail_failed error={error}"))?;
+            }
 
-    let recovered_file = open_wal_file(&vfs, &cx, &wal_path)?;
-    let mut recovered = WalFile::open(&cx, recovered_file)
-        .map_err(|error| format!("open_recovered_wal_failed error={error}"))?;
-    if recovered.frame_count() != 0 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_torn_write_expected_prefix expected=0 actual={}",
-            recovered.frame_count()
-        ));
-    }
-    recovered
-        .append_frame(&cx, 4, &sample_page(0x34, page_size), 4)
-        .map_err(|error| format!("append_after_torn_tail_recovery_failed error={error}"))?;
-    if recovered.frame_count() != 1 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_append_after_recovery expected=1 actual={}",
-            recovered.frame_count()
-        ));
-    }
+            let recovered_file = open_wal_file(&vfs, &cx, &wal_path)?;
+            let mut recovered = WalFile::open(&cx, recovered_file)
+                .await
+                .map_err(|error| format!("open_recovered_wal_failed error={error}"))?;
+            if recovered.frame_count() != 0 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_torn_write_expected_prefix expected=0 actual={}",
+                    recovered.frame_count()
+                ));
+            }
+            recovered
+                .append_frame(&cx, 4, &sample_page(0x34, page_size), 4)
+                .await
+                .map_err(|error| format!("append_after_torn_tail_recovery_failed error={error}"))?;
+            if recovered.frame_count() != 1 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_append_after_recovery expected=1 actual={}",
+                    recovered.frame_count()
+                ));
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 fn build_raptorq_wal_repair_fixture(
@@ -1285,224 +1407,281 @@ fn test_encryption_aad_swap_resistance() -> Result<(), String> {
 
 #[test]
 fn test_checkpoint_all_4_modes() -> Result<(), String> {
-    let cx = test_cx();
-    let runtime = RuntimeBuilder::current_thread()
-        .build()
-        .map_err(|error| format!("checkpoint_test_runtime_build_failed error={error}"))?;
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
-    let cases = [
-        (CheckpointMode::Passive, false),
-        (CheckpointMode::Full, false),
-        (CheckpointMode::Restart, true),
-        (CheckpointMode::Truncate, true),
-    ];
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
+            let cases = [
+                (CheckpointMode::Passive, false),
+                (CheckpointMode::Full, false),
+                (CheckpointMode::Restart, true),
+                (CheckpointMode::Truncate, true),
+            ];
 
-    for (mode, expects_reset) in cases {
-        let mode_label = match mode {
-            CheckpointMode::Passive => "passive",
-            CheckpointMode::Full => "full",
-            CheckpointMode::Restart => "restart",
-            CheckpointMode::Truncate => "truncate",
-        };
-        let vfs = MemoryVfs::new();
-        let wal_path = PathBuf::from(format!("/bd_bca_1_checkpoint_{mode_label}.db-wal"));
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal =
-            WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts()).map_err(|error| {
-                format!("create_wal_for_checkpoint_mode_failed mode={mode_label} error={error}")
-            })?;
-        wal.append_frame(&cx, 1, &sample_page(0x41, page_size), 0)
-            .map_err(|error| format!("append_checkpoint_frame_1_failed error={error}"))?;
-        wal.append_frame(&cx, 2, &sample_page(0x42, page_size), 0)
-            .map_err(|error| format!("append_checkpoint_frame_2_failed error={error}"))?;
-        wal.append_frame(&cx, 3, &sample_page(0x43, page_size), 3)
-            .map_err(|error| format!("append_checkpoint_frame_3_failed error={error}"))?;
+            for (mode, expects_reset) in cases {
+                let mode_label = match mode {
+                    CheckpointMode::Passive => "passive",
+                    CheckpointMode::Full => "full",
+                    CheckpointMode::Restart => "restart",
+                    CheckpointMode::Truncate => "truncate",
+                };
+                let vfs = MemoryVfs::new();
+                let wal_path = PathBuf::from(format!("/bd_bca_1_checkpoint_{mode_label}.db-wal"));
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "create_wal_for_checkpoint_mode_failed mode={mode_label} error={error}"
+                        )
+                    })?;
+                wal.append_frame(&cx, 1, &sample_page(0x41, page_size), 0)
+                    .await
+                    .map_err(|error| format!("append_checkpoint_frame_1_failed error={error}"))?;
+                wal.append_frame(&cx, 2, &sample_page(0x42, page_size), 0)
+                    .await
+                    .map_err(|error| format!("append_checkpoint_frame_2_failed error={error}"))?;
+                wal.append_frame(&cx, 3, &sample_page(0x43, page_size), 3)
+                    .await
+                    .map_err(|error| format!("append_checkpoint_frame_3_failed error={error}"))?;
 
-        let mut target = RecordingCheckpointTarget::default();
-        let state = CheckpointState {
-            total_frames: 3,
-            backfilled_frames: 0,
-            oldest_reader_frame: None,
-        };
-        let result = runtime
-            .block_on(execute_checkpoint(&cx, &mut wal, mode, state, &mut target))
-            .map_err(|error| {
-                format!("execute_checkpoint_failed mode={mode_label} error={error}")
-            })?;
+                let mut target = RecordingCheckpointTarget::default();
+                let state = CheckpointState {
+                    total_frames: 3,
+                    backfilled_frames: 0,
+                    oldest_reader_frame: None,
+                };
+                let result = execute_checkpoint(&cx, &mut wal, mode, state, &mut target)
+                    .await
+                    .map_err(|error| {
+                        format!("execute_checkpoint_failed mode={mode_label} error={error}")
+                    })?;
 
-        if result.frames_backfilled != 3 {
-            return Err(format!(
-                "bead_id={BEAD_ID} case=checkpoint_mode_frames mode={mode_label} expected=3 actual={}",
-                result.frames_backfilled
-            ));
-        }
-        if result.wal_was_reset != expects_reset {
-            return Err(format!(
-                "bead_id={BEAD_ID} case=checkpoint_mode_reset mode={mode_label} expected={expects_reset} actual={}",
-                result.wal_was_reset
-            ));
-        }
-        if target.writes.len() != 3 {
-            return Err(format!(
-                "bead_id={BEAD_ID} case=checkpoint_mode_writes mode={mode_label} expected=3 actual={}",
-                target.writes.len()
-            ));
-        }
-        if target.sync_calls == 0 {
-            return Err(format!(
-                "bead_id={BEAD_ID} case=checkpoint_mode_sync_missing mode={mode_label}"
-            ));
-        }
-    }
+                if result.frames_backfilled != 3 {
+                    return Err(format!(
+                        "bead_id={BEAD_ID} case=checkpoint_mode_frames mode={mode_label} expected=3 actual={}",
+                        result.frames_backfilled
+                    ));
+                }
+                if result.wal_was_reset != expects_reset {
+                    return Err(format!(
+                        "bead_id={BEAD_ID} case=checkpoint_mode_reset mode={mode_label} expected={expects_reset} actual={}",
+                        result.wal_was_reset
+                    ));
+                }
+                if target.writes.len() != 3 {
+                    return Err(format!(
+                        "bead_id={BEAD_ID} case=checkpoint_mode_writes mode={mode_label} expected=3 actual={}",
+                        target.writes.len()
+                    ));
+                }
+                if target.sync_calls == 0 {
+                    return Err(format!(
+                        "bead_id={BEAD_ID} case=checkpoint_mode_sync_missing mode={mode_label}"
+                    ));
+                }
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_savepoints_nested() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let path = PathBuf::from("/bd_bca_1_savepoints.db");
-    let page_size = PageSize::DEFAULT.as_usize();
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/bd_bca_1_savepoints.db");
+            let page_size = PageSize::DEFAULT.as_usize();
 
-    let page_no = {
-        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
-            .map_err(|error| format!("open_pager_for_savepoint_test_failed error={error}"))?;
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .map_err(|error| format!("begin_savepoint_writer_failed error={error}"))?;
+            let page_no = {
+                let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .map_err(|error| {
+                        format!("open_pager_for_savepoint_test_failed error={error}")
+                    })?;
+                let mut txn = pager
+                    .begin(&cx, TransactionMode::Immediate)
+                    .await
+                    .map_err(|error| format!("begin_savepoint_writer_failed error={error}"))?;
 
-        let page_no = txn
-            .allocate_page(&cx)
-            .map_err(|error| format!("allocate_savepoint_page_failed error={error}"))?;
-        txn.write_page(&cx, page_no, &sample_page(0x11, page_size))
-            .map_err(|error| format!("write_initial_savepoint_page_failed error={error}"))?;
+                let page_no = txn
+                    .allocate_page(&cx)
+                    .await
+                    .map_err(|error| format!("allocate_savepoint_page_failed error={error}"))?;
+                txn.write_page(&cx, page_no, &sample_page(0x11, page_size))
+                    .await
+                    .map_err(|error| {
+                        format!("write_initial_savepoint_page_failed error={error}")
+                    })?;
 
-        txn.savepoint(&cx, "outer")
-            .map_err(|error| format!("savepoint_outer_failed error={error}"))?;
-        txn.write_page(&cx, page_no, &sample_page(0x22, page_size))
-            .map_err(|error| format!("write_after_outer_savepoint_failed error={error}"))?;
+                txn.savepoint(&cx, "outer")
+                    .map_err(|error| format!("savepoint_outer_failed error={error}"))?;
+                txn.write_page(&cx, page_no, &sample_page(0x22, page_size))
+                    .await
+                    .map_err(|error| {
+                        format!("write_after_outer_savepoint_failed error={error}")
+                    })?;
 
-        txn.savepoint(&cx, "inner")
-            .map_err(|error| format!("savepoint_inner_failed error={error}"))?;
-        txn.write_page(&cx, page_no, &sample_page(0x33, page_size))
-            .map_err(|error| format!("write_after_inner_savepoint_failed error={error}"))?;
+                txn.savepoint(&cx, "inner")
+                    .map_err(|error| format!("savepoint_inner_failed error={error}"))?;
+                txn.write_page(&cx, page_no, &sample_page(0x33, page_size))
+                    .await
+                    .map_err(|error| {
+                        format!("write_after_inner_savepoint_failed error={error}")
+                    })?;
 
-        txn.rollback_to_savepoint(&cx, "inner")
-            .map_err(|error| format!("rollback_to_inner_failed error={error}"))?;
-        let after_inner_rollback = txn
-            .get_page(&cx, page_no)
-            .map_err(|error| format!("read_after_inner_rollback_failed error={error}"))?;
-        if after_inner_rollback.as_ref()[0] != 0x22 {
-            return Err(format!(
-                "bead_id={BEAD_ID} case=savepoints_nested_inner_rollback_mismatch expected=34 actual={}",
-                after_inner_rollback.as_ref()[0]
-            ));
+                txn.rollback_to_savepoint(&cx, "inner")
+                    .map_err(|error| format!("rollback_to_inner_failed error={error}"))?;
+                let after_inner_rollback = txn
+                    .get_page(&cx, page_no)
+                    .await
+                    .map_err(|error| format!("read_after_inner_rollback_failed error={error}"))?;
+                if after_inner_rollback.as_ref()[0] != 0x22 {
+                    return Err(format!(
+                        "bead_id={BEAD_ID} case=savepoints_nested_inner_rollback_mismatch expected=34 actual={}",
+                        after_inner_rollback.as_ref()[0]
+                    ));
+                }
+
+                txn.release_savepoint(&cx, "inner")
+                    .map_err(|error| format!("release_inner_savepoint_failed error={error}"))?;
+                txn.rollback_to_savepoint(&cx, "outer")
+                    .map_err(|error| format!("rollback_to_outer_failed error={error}"))?;
+                txn.release_savepoint(&cx, "outer")
+                    .map_err(|error| format!("release_outer_savepoint_failed error={error}"))?;
+                txn.commit(&cx)
+                    .await
+                    .map_err(|error| format!("commit_savepoint_test_failed error={error}"))?;
+                page_no
+            };
+
+            let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
+                .await
+                .map_err(|error| {
+                    format!("open_pager_for_savepoint_readback_failed error={error}")
+                })?;
+            let read_txn = pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .map_err(|error| format!("begin_savepoint_reader_failed error={error}"))?;
+            let persisted = read_txn
+                .get_page(&cx, page_no)
+                .await
+                .map_err(|error| {
+                    format!("read_savepoint_page_after_commit_failed error={error}")
+                })?;
+            if persisted.as_ref()[0] != 0x11 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=savepoints_nested_outer_rollback_mismatch expected=17 actual={}",
+                    persisted.as_ref()[0]
+                ));
+            }
+
+            Ok(())
         }
-
-        txn.release_savepoint(&cx, "inner")
-            .map_err(|error| format!("release_inner_savepoint_failed error={error}"))?;
-        txn.rollback_to_savepoint(&cx, "outer")
-            .map_err(|error| format!("rollback_to_outer_failed error={error}"))?;
-        txn.release_savepoint(&cx, "outer")
-            .map_err(|error| format!("release_outer_savepoint_failed error={error}"))?;
-        txn.commit(&cx)
-            .map_err(|error| format!("commit_savepoint_test_failed error={error}"))?;
-        page_no
-    };
-
-    let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
-        .map_err(|error| format!("open_pager_for_savepoint_readback_failed error={error}"))?;
-    let read_txn = pager
-        .begin(&cx, TransactionMode::ReadOnly)
-        .map_err(|error| format!("begin_savepoint_reader_failed error={error}"))?;
-    let persisted = read_txn
-        .get_page(&cx, page_no)
-        .map_err(|error| format!("read_savepoint_page_after_commit_failed error={error}"))?;
-    if persisted.as_ref()[0] != 0x11 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=savepoints_nested_outer_rollback_mismatch expected=17 actual={}",
-            persisted.as_ref()[0]
-        ));
-    }
-
-    Ok(())
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_concurrent_readers_writer() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_bca_1_concurrent_readers_writer.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_bca_1_concurrent_readers_writer.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_for_reader_writer_test_failed error={error}"))?;
-        wal.append_frame(&cx, 1, &sample_page(0x51, page_size), 1)
-            .map_err(|error| format!("append_initial_writer_frame_failed error={error}"))?;
-        wal.close(&cx)
-            .map_err(|error| format!("close_initial_writer_wal_failed error={error}"))?;
-    }
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| {
+                        format!("create_wal_for_reader_writer_test_failed error={error}")
+                    })?;
+                wal.append_frame(&cx, 1, &sample_page(0x51, page_size), 1)
+                    .await
+                    .map_err(|error| format!("append_initial_writer_frame_failed error={error}"))?;
+                wal.close(&cx)
+                    .map_err(|error| format!("close_initial_writer_wal_failed error={error}"))?;
+            }
 
-    let reader_snapshot = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
-        .map_err(|error| format!("open_reader_snapshot_failed error={error}"))?;
-    if reader_snapshot.frame_count() != 1 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_reader_snapshot_initial_count expected=1 actual={}",
-            reader_snapshot.frame_count()
-        ));
-    }
+            let reader_snapshot = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
+                .await
+                .map_err(|error| format!("open_reader_snapshot_failed error={error}"))?;
+            if reader_snapshot.frame_count() != 1 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_reader_snapshot_initial_count expected=1 actual={}",
+                    reader_snapshot.frame_count()
+                ));
+            }
 
-    {
-        let mut writer = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
-            .map_err(|error| format!("open_writer_failed error={error}"))?;
-        writer
-            .append_frame(&cx, 2, &sample_page(0x52, page_size), 2)
-            .map_err(|error| format!("append_second_writer_frame_failed error={error}"))?;
-        writer
-            .close(&cx)
-            .map_err(|error| format!("close_writer_failed error={error}"))?;
-    }
+            {
+                let mut writer = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
+                    .await
+                    .map_err(|error| format!("open_writer_failed error={error}"))?;
+                writer
+                    .append_frame(&cx, 2, &sample_page(0x52, page_size), 2)
+                    .await
+                    .map_err(|error| format!("append_second_writer_frame_failed error={error}"))?;
+                writer
+                    .close(&cx)
+                    .map_err(|error| format!("close_writer_failed error={error}"))?;
+            }
 
-    if reader_snapshot.frame_count() != 1 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_reader_snapshot_stability expected=1 actual={}",
-            reader_snapshot.frame_count()
-        ));
-    }
-    let (_, snapshot_page) = reader_snapshot
-        .read_frame(&cx, 0)
-        .map_err(|error| format!("read_snapshot_reader_frame_failed error={error}"))?;
-    if snapshot_page[0] != 0x51 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_reader_snapshot_content_mismatch expected=81 actual={}",
-            snapshot_page[0]
-        ));
-    }
+            if reader_snapshot.frame_count() != 1 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_reader_snapshot_stability expected=1 actual={}",
+                    reader_snapshot.frame_count()
+                ));
+            }
+            let (_, snapshot_page) = reader_snapshot
+                .read_frame(&cx, 0)
+                .await
+                .map_err(|error| format!("read_snapshot_reader_frame_failed error={error}"))?;
+            if snapshot_page[0] != 0x51 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_reader_snapshot_content_mismatch expected=81 actual={}",
+                    snapshot_page[0]
+                ));
+            }
 
-    let reader_latest = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
-        .map_err(|error| format!("open_latest_reader_failed error={error}"))?;
-    if reader_latest.frame_count() != 2 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_reader_latest_count expected=2 actual={}",
-            reader_latest.frame_count()
-        ));
-    }
-    let (_, latest_page) = reader_latest
-        .read_frame(&cx, 1)
-        .map_err(|error| format!("read_latest_reader_frame_failed error={error}"))?;
-    if latest_page[0] != 0x52 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_reader_latest_content_mismatch expected=82 actual={}",
-            latest_page[0]
-        ));
-    }
+            let reader_latest = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
+                .await
+                .map_err(|error| format!("open_latest_reader_failed error={error}"))?;
+            if reader_latest.frame_count() != 2 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_reader_latest_count expected=2 actual={}",
+                    reader_latest.frame_count()
+                ));
+            }
+            let (_, latest_page) = reader_latest
+                .read_frame(&cx, 1)
+                .await
+                .map_err(|error| format!("read_latest_reader_frame_failed error={error}"))?;
+            if latest_page[0] != 0x52 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_reader_latest_content_mismatch expected=82 actual={}",
+                    latest_page[0]
+                ));
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }

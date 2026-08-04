@@ -8,6 +8,7 @@
 //! wins (later branches are not consulted). The result's storage class comes
 //! from the selected branch. These verify all of that against rusqlite, plus
 //! CASE used in SELECT / WHERE / ORDER BY / GROUP BY / aggregate positions.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -25,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,16 +59,16 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
-    check(&f, &r, queries, label);
+    check(&f, &r, queries, label).await;
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -91,107 +92,128 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 
 #[test]
 fn case_simple_form() {
-    assert_scalar(
-        &[
-            "SELECT CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' WHEN 3 THEN 'c' END", // 'b'
-            "SELECT CASE 5 WHEN 1 THEN 'a' WHEN 2 THEN 'b' END",                 // NULL (no match)
-            "SELECT CASE 5 WHEN 1 THEN 'a' ELSE 'other' END",                    // 'other'
-            "SELECT CASE 'x' WHEN 'x' THEN 1 ELSE 0 END",                        // 1
-        ],
-        "case_simple_form",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' WHEN 3 THEN 'c' END", // 'b'
+                "SELECT CASE 5 WHEN 1 THEN 'a' WHEN 2 THEN 'b' END", // NULL (no match)
+                "SELECT CASE 5 WHEN 1 THEN 'a' ELSE 'other' END",    // 'other'
+                "SELECT CASE 'x' WHEN 'x' THEN 1 ELSE 0 END",        // 1
+            ],
+            "case_simple_form",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn case_searched_form() {
-    assert_scalar(
-        &[
-            "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END", // 'b'
-            // 0 is false, NULL is not true -> ELSE.
-            "SELECT CASE WHEN 0 THEN 'a' WHEN NULL THEN 'b' ELSE 'c' END", // 'c'
-            "SELECT CASE WHEN 1 THEN 'yes' END",                           // 'yes'
-        ],
-        "case_searched_form",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END", // 'b'
+                // 0 is false, NULL is not true -> ELSE.
+                "SELECT CASE WHEN 0 THEN 'a' WHEN NULL THEN 'b' ELSE 'c' END", // 'c'
+                "SELECT CASE WHEN 1 THEN 'yes' END",                           // 'yes'
+            ],
+            "case_searched_form",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn case_when_null_never_matches() {
-    assert_scalar(
-        &[
-            // Simple CASE uses x = v; NULL = anything is never true.
-            "SELECT CASE NULL WHEN NULL THEN 'matched' ELSE 'no' END", // 'no'
-            "SELECT CASE 1 WHEN NULL THEN 'a' ELSE 'b' END",           // 'b'
-            "SELECT CASE NULL WHEN 1 THEN 'a' ELSE 'b' END",           // 'b'
-        ],
-        "case_when_null_never_matches",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                // Simple CASE uses x = v; NULL = anything is never true.
+                "SELECT CASE NULL WHEN NULL THEN 'matched' ELSE 'no' END", // 'no'
+                "SELECT CASE 1 WHEN NULL THEN 'a' ELSE 'b' END",           // 'b'
+                "SELECT CASE NULL WHEN 1 THEN 'a' ELSE 'b' END",           // 'b'
+            ],
+            "case_when_null_never_matches",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn case_no_else_yields_null() {
-    assert_scalar(
-        &[
-            "SELECT CASE WHEN 1 > 2 THEN 'a' END",               // NULL
-            "SELECT typeof(CASE WHEN 0 THEN 1 END)",             // 'null'
-            "SELECT CASE 9 WHEN 1 THEN 'a' WHEN 2 THEN 'b' END", // NULL
-        ],
-        "case_no_else_yields_null",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CASE WHEN 1 > 2 THEN 'a' END",               // NULL
+                "SELECT typeof(CASE WHEN 0 THEN 1 END)",             // 'null'
+                "SELECT CASE 9 WHEN 1 THEN 'a' WHEN 2 THEN 'b' END", // NULL
+            ],
+            "case_no_else_yields_null",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn case_first_match_wins() {
-    assert_scalar(
-        &[
-            // Overlapping conditions: first true branch is selected.
-            "SELECT CASE WHEN 20 > 0 THEN 'pos' WHEN 20 > 10 THEN 'big' ELSE 'neg' END", // 'pos'
-            "SELECT CASE 1 WHEN 1 THEN 'one' WHEN 1 THEN 'also-one' END",                // 'one'
-        ],
-        "case_first_match_wins",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                // Overlapping conditions: first true branch is selected.
+                "SELECT CASE WHEN 20 > 0 THEN 'pos' WHEN 20 > 10 THEN 'big' ELSE 'neg' END", // 'pos'
+                "SELECT CASE 1 WHEN 1 THEN 'one' WHEN 1 THEN 'also-one' END", // 'one'
+            ],
+            "case_first_match_wins",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn case_branch_type_coercion() {
-    assert_scalar(
-        &[
-            "SELECT CASE WHEN 1 THEN 1 ELSE 'x' END", // 1 (integer branch chosen)
-            "SELECT typeof(CASE WHEN 1 THEN 1 ELSE 2.5 END)", // integer
-            "SELECT CASE WHEN 0 THEN 1 ELSE 2.5 END", // 2.5
-            "SELECT typeof(CASE WHEN 0 THEN 1 ELSE 2.5 END)", // real
-        ],
-        "case_branch_type_coercion",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CASE WHEN 1 THEN 1 ELSE 'x' END", // 1 (integer branch chosen)
+                "SELECT typeof(CASE WHEN 1 THEN 1 ELSE 2.5 END)", // integer
+                "SELECT CASE WHEN 0 THEN 1 ELSE 2.5 END", // 2.5
+                "SELECT typeof(CASE WHEN 0 THEN 1 ELSE 2.5 END)", // real
+            ],
+            "case_branch_type_coercion",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn case_in_query_positions() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
-        "INSERT INTO t VALUES (1,2),(2,7),(3,4),(4,11),(5,6)",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    check(
-        &f,
-        &r,
-        &[
-            // Projection.
-            "SELECT id, CASE WHEN n % 2 = 0 THEN 'even' ELSE 'odd' END FROM t ORDER BY id",
-            // WHERE.
-            "SELECT id FROM t WHERE CASE WHEN n > 5 THEN 1 ELSE 0 END = 1 ORDER BY id",
-            // GROUP BY on a CASE alias.
-            "SELECT CASE WHEN n > 5 THEN 'hi' ELSE 'lo' END AS bucket, count(*) \
-             FROM t GROUP BY bucket ORDER BY bucket",
-            // Conditional aggregate.
-            "SELECT sum(CASE WHEN n > 5 THEN n ELSE 0 END) FROM t",
-            // ORDER BY a CASE key.
-            "SELECT id FROM t ORDER BY CASE WHEN n % 2 = 0 THEN 0 ELSE 1 END, id",
-        ],
-        "case_in_query_positions",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+            "INSERT INTO t VALUES (1,2),(2,7),(3,4),(4,11),(5,6)",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        check(
+            &f,
+            &r,
+            &[
+                // Projection.
+                "SELECT id, CASE WHEN n % 2 = 0 THEN 'even' ELSE 'odd' END FROM t ORDER BY id",
+                // WHERE.
+                "SELECT id FROM t WHERE CASE WHEN n > 5 THEN 1 ELSE 0 END = 1 ORDER BY id",
+                // GROUP BY on a CASE alias.
+                "SELECT CASE WHEN n > 5 THEN 'hi' ELSE 'lo' END AS bucket, count(*) \
+                 FROM t GROUP BY bucket ORDER BY bucket",
+                // Conditional aggregate.
+                "SELECT sum(CASE WHEN n > 5 THEN n ELSE 0 END) FROM t",
+                // ORDER BY a CASE key.
+                "SELECT id FROM t ORDER BY CASE WHEN n % 2 = 0 THEN 0 ELSE 1 END, id",
+            ],
+            "case_in_query_positions",
+        )
+        .await;
+    });
 }

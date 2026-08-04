@@ -23,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,11 +56,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -70,7 +70,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -94,121 +94,145 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn unique_column_violation() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
-            "INSERT INTO t VALUES (1,'a@x'),(2,'b@x')",
-            "INSERT INTO t VALUES (3,'a@x')", // dup email -> error on both
-            "INSERT INTO t VALUES (4,'c@x')", // ok
-        ],
-        &["SELECT id, email FROM t ORDER BY id"], // 1,2,4
-        "unique_column_violation",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+                "INSERT INTO t VALUES (1,'a@x'),(2,'b@x')",
+                "INSERT INTO t VALUES (3,'a@x')", // dup email -> error on both
+                "INSERT INTO t VALUES (4,'c@x')", // ok
+            ],
+            &["SELECT id, email FROM t ORDER BY id"], // 1,2,4
+            "unique_column_violation",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn unique_multi_column() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE(a, b))",
-            "INSERT INTO t VALUES (1,1,2),(2,1,3),(3,2,2)", // distinct (a,b)
-            "INSERT INTO t VALUES (4,1,2)",                 // dup (1,2) -> error
-            "INSERT INTO t VALUES (5,2,3)",                 // ok
-        ],
-        &["SELECT id, a, b FROM t ORDER BY id"], // 1,2,3,5
-        "unique_multi_column",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE(a, b))",
+                "INSERT INTO t VALUES (1,1,2),(2,1,3),(3,2,2)", // distinct (a,b)
+                "INSERT INTO t VALUES (4,1,2)",                 // dup (1,2) -> error
+                "INSERT INTO t VALUES (5,2,3)",                 // ok
+            ],
+            &["SELECT id, a, b FROM t ORDER BY id"], // 1,2,3,5
+            "unique_multi_column",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn unique_allows_multiple_nulls() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT UNIQUE)",
-            "INSERT INTO t VALUES (1,NULL),(2,NULL),(3,'x')", // multiple NULLs allowed
-            "INSERT INTO t VALUES (4,'x')",                   // dup 'x' -> error
-        ],
-        &[
-            "SELECT id, tag FROM t ORDER BY id", // 1,2,3
-            "SELECT count(*) FROM t WHERE tag IS NULL",
-        ],
-        "unique_allows_multiple_nulls",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT UNIQUE)",
+                "INSERT INTO t VALUES (1,NULL),(2,NULL),(3,'x')", // multiple NULLs allowed
+                "INSERT INTO t VALUES (4,'x')",                   // dup 'x' -> error
+            ],
+            &[
+                "SELECT id, tag FROM t ORDER BY id", // 1,2,3
+                "SELECT count(*) FROM t WHERE tag IS NULL",
+            ],
+            "unique_allows_multiple_nulls",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn not_null_violation_and_default() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL DEFAULT 'd')",
-            "INSERT INTO t VALUES (1,'x','y')",    // ok
-            "INSERT INTO t(id, a) VALUES (2,'z')", // b uses default 'd'
-            "INSERT INTO t VALUES (3, NULL, 'q')", // a NULL -> NOT NULL violation
-            "INSERT INTO t(id, b) VALUES (4,'w')", // a missing+no default -> NOT NULL violation
-        ],
-        &["SELECT id, a, b FROM t ORDER BY id"], // 1 and 2
-        "not_null_violation_and_default",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL DEFAULT 'd')",
+                "INSERT INTO t VALUES (1,'x','y')",    // ok
+                "INSERT INTO t(id, a) VALUES (2,'z')", // b uses default 'd'
+                "INSERT INTO t VALUES (3, NULL, 'q')", // a NULL -> NOT NULL violation
+                "INSERT INTO t(id, b) VALUES (4,'w')", // a missing+no default -> NOT NULL violation
+            ],
+            &["SELECT id, a, b FROM t ORDER BY id"], // 1 and 2
+            "not_null_violation_and_default",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn insert_or_ignore() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, v INTEGER)",
-            "INSERT INTO t VALUES (1,'a@x',10)",
-            "INSERT OR IGNORE INTO t VALUES (2,'a@x',20)", // conflict -> row skipped, no error
-            "INSERT OR IGNORE INTO t VALUES (3,'b@x',30)", // ok
-            // PK conflict also ignored.
-            "INSERT OR IGNORE INTO t VALUES (1,'c@x',99)",
-        ],
-        &["SELECT id, email, v FROM t ORDER BY id"], // 1 (unchanged) and 3
-        "insert_or_ignore",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES (1,'a@x',10)",
+                "INSERT OR IGNORE INTO t VALUES (2,'a@x',20)", // conflict -> row skipped, no error
+                "INSERT OR IGNORE INTO t VALUES (3,'b@x',30)", // ok
+                // PK conflict also ignored.
+                "INSERT OR IGNORE INTO t VALUES (1,'c@x',99)",
+            ],
+            &["SELECT id, email, v FROM t ORDER BY id"], // 1 (unchanged) and 3
+            "insert_or_ignore",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn insert_or_replace_and_replace_into() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, v INTEGER)",
-            "INSERT INTO t VALUES (1,'a@x',10),(2,'b@x',20)",
-            // OR REPLACE on a UNIQUE(email) conflict deletes the old row, inserts new.
-            "INSERT OR REPLACE INTO t VALUES (3,'a@x',99)", // removes id=1, adds id=3
-            "REPLACE INTO t VALUES (2,'b@x',77)",           // PK conflict -> replaces id=2's row
-        ],
-        &["SELECT id, email, v FROM t ORDER BY id"], // (2,b,77) and (3,a,99)
-        "insert_or_replace",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES (1,'a@x',10),(2,'b@x',20)",
+                // OR REPLACE on a UNIQUE(email) conflict deletes the old row, inserts new.
+                "INSERT OR REPLACE INTO t VALUES (3,'a@x',99)", // removes id=1, adds id=3
+                "REPLACE INTO t VALUES (2,'b@x',77)", // PK conflict -> replaces id=2's row
+            ],
+            &["SELECT id, email, v FROM t ORDER BY id"], // (2,b,77) and (3,a,99)
+            "insert_or_replace",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn insert_or_fail_errors() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
-            "INSERT INTO t VALUES (1,'a@x')",
-            "INSERT OR FAIL INTO t VALUES (2,'a@x')", // conflict -> error on both
-            "INSERT OR ABORT INTO t VALUES (3,'a@x')", // conflict -> error on both
-            "INSERT INTO t VALUES (4,'b@x')",         // ok
-        ],
-        &["SELECT id, email FROM t ORDER BY id"], // 1 and 4
-        "insert_or_fail_errors",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+                "INSERT INTO t VALUES (1,'a@x')",
+                "INSERT OR FAIL INTO t VALUES (2,'a@x')", // conflict -> error on both
+                "INSERT OR ABORT INTO t VALUES (3,'a@x')", // conflict -> error on both
+                "INSERT INTO t VALUES (4,'b@x')",         // ok
+            ],
+            &["SELECT id, email FROM t ORDER BY id"], // 1 and 4
+            "insert_or_fail_errors",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn column_level_on_conflict_ignore() {
-    scenario(
-        &[
-            // Column-level ON CONFLICT IGNORE: a plain INSERT that conflicts is
-            // silently skipped (the column's conflict clause applies).
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT UNIQUE ON CONFLICT IGNORE)",
-            "INSERT INTO t VALUES (1,'a')",
-            "INSERT INTO t VALUES (2,'a')", // conflict -> ignored (no OR clause needed)
-            "INSERT INTO t VALUES (3,'b')", // ok
-        ],
-        &["SELECT id, code FROM t ORDER BY id"], // 1 and 3
-        "column_level_on_conflict_ignore",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                // Column-level ON CONFLICT IGNORE: a plain INSERT that conflicts is
+                // silently skipped (the column's conflict clause applies).
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT UNIQUE ON CONFLICT IGNORE)",
+                "INSERT INTO t VALUES (1,'a')",
+                "INSERT INTO t VALUES (2,'a')", // conflict -> ignored (no OR clause needed)
+                "INSERT INTO t VALUES (3,'b')", // ok
+            ],
+            &["SELECT id, code FROM t ORDER BY id"], // 1 and 3
+            "column_level_on_conflict_ignore",
+        )
+        .await;
+    });
 }

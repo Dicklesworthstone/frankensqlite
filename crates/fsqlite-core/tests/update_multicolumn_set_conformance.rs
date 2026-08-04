@@ -55,13 +55,13 @@ fn rusqlite_rows(conn: &rusqlite::Connection, sql: &str) -> TestResult<Vec<Vec<S
     Ok(rows)
 }
 
-fn assert_query_matches_rusqlite(
+async fn assert_query_matches_rusqlite(
     fconn: &Connection,
     rconn: &rusqlite::Connection,
     sql: &str,
 ) -> TestResult {
     assert_eq!(
-        format_fsqlite_rows(fconn.query(sql)?),
+        format_fsqlite_rows(fconn.query(sql).await?),
         rusqlite_rows(rconn, sql)?,
         "{sql}"
     );
@@ -70,43 +70,51 @@ fn assert_query_matches_rusqlite(
 
 #[test]
 fn update_multicolumn_set_matches_rusqlite() -> TestResult {
-    let fconn = Connection::open(":memory:")?;
-    let rconn = rusqlite::Connection::open_in_memory()?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let fconn = Connection::open(":memory:").await?;
+            let rconn = rusqlite::Connection::open_in_memory()?;
 
-    for sql in [
-        "CREATE TABLE items(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, label TEXT);",
-        "CREATE INDEX idx_items_ab ON items(a, b);",
-        "INSERT INTO items VALUES
+            for sql in [
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, label TEXT);",
+                "CREATE INDEX idx_items_ab ON items(a, b);",
+                "INSERT INTO items VALUES
             (1, 10, 100, 'alpha'),
             (2, 20, 200, 'beta'),
             (3, NULL, 300, 'gamma');",
-    ] {
-        fconn.execute(sql)?;
-        rconn.execute_batch(sql)?;
-    }
+            ] {
+                fconn.execute(sql).await?;
+                rconn.execute_batch(sql)?;
+            }
 
-    for sql in [
-        "UPDATE items
+            for sql in [
+                "UPDATE items
          SET (a, b) = (b, a)
          WHERE id = 1
          RETURNING id, a, b, label",
-        "UPDATE items
+                "UPDATE items
          SET (a, b, label) = (a + 1, b + 2, label || '-x')
          WHERE id IN (2, 3)
          RETURNING id, typeof(a), a, b, label",
-        "UPDATE items
+                "UPDATE items
          SET (a, b) = (NULL, 5)
          WHERE id = 3
          RETURNING id, typeof(a), a, b, label",
-    ] {
-        assert_query_matches_rusqlite(&fconn, &rconn, sql)?;
-    }
+            ] {
+                assert_query_matches_rusqlite(&fconn, &rconn, sql).await?;
+            }
 
-    assert_query_matches_rusqlite(
-        &fconn,
-        &rconn,
-        "SELECT id, typeof(a), a, b, label FROM items ORDER BY id",
-    )?;
+            assert_query_matches_rusqlite(
+                &fconn,
+                &rconn,
+                "SELECT id, typeof(a), a, b, label FROM items ORDER BY id",
+            )
+            .await?;
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }

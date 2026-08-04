@@ -292,22 +292,27 @@ The WAL can be recovered using standard checksum-chain scanning.
 
 ---
 
-### F11. Deadlock in group-commit queue under thread starvation (P1+P2)
+### F11. Lost group-commit waiter delivery (P1+P2)
 
-**Trigger:** The flusher thread holds the consolidator lock and the inner
-lock simultaneously (impossible in current design — they're acquired
-sequentially with releases between). But if a Condvar wait (pager.rs:3812)
-is not properly notified, waiter threads hang indefinitely.
+**Trigger:** A completion is published after a waiter has checked its keyed
+generation, but the corresponding `Notify` delivery is lost. Without a bounded
+eventcount recheck, the waiter could remain parked indefinitely.
 
-**Current guard:** `publish_completed_epoch()` calls `condvar.notify_all()`.
-Additionally, `wait_for_epoch_outcome()` uses a timed wait with 100ms timeout
-to prevent permanent hangs.
+**Current guard:** `publish_completed_epoch()` stores the completed epoch before
+signaling its targeted keyed slot. `wait_for_epoch_outcome_async()` samples the
+slot generation before checking the epoch, then uses a 200ms bounded wait. A
+timeout rechecks the generation and completed epoch, so both a missed delivery
+and a delivery that races registration remain observable.
 
-**Injection hook:** `fault_inject_drop_condvar_notify` — suppress the
-`notify_all()` call to verify that the timeout-based recovery works.
+**Injection hook:** `drop_waiter_notify` — preserve the completed-epoch store and
+targeted keyed-generation advance while suppressing the active wait strategy's
+direct delivery.
 
-**Proof obligation:** All waiter threads eventually unblock (via timeout
-or notification). No permanent hangs.
+**Proof obligation:** A waiter already inside the exact keyed wait boundary
+recovers through the timeout-generation path and observes the completed epoch.
+The publisher is joined before assertions, leaving no background worker behind.
+An arbitrary synchronous publisher deadlock is outside this injected-delivery
+keeper and requires process-isolated timeout coverage.
 
 ---
 
@@ -325,7 +330,7 @@ or notification). No permanent hangs.
 | `fault_inject_close_wal_before_commit` | F8/zna34 | unix.rs:1555 | Close WAL fd pre-commit |
 | `fault_inject_crash_header_truncate` | F9 | wal.rs:1157→1159 | Crash between ops |
 | `fault_inject_fec_hook_failure` | F10 | wal_adapter.rs:837 | Error after append |
-| `fault_inject_drop_condvar_notify` | F11 | condvar.notify_all | Suppress notify |
+| `drop_waiter_notify` | F11 | `publish_completed_epoch` waiter delivery | Advance targeted eventcount; suppress direct delivery |
 
 ---
 

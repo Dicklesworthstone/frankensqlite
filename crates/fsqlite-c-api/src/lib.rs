@@ -28,6 +28,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fsqlite::Connection;
 use fsqlite_ast::Statement;
 use fsqlite_error::{ErrorCode, FrankenError};
+
+/// Drive an engine future to completion on this shim's own runtime.
+///
+/// The C ABI is a hard synchronous boundary — `extern "C"` functions cannot be
+/// `async`, and a C caller has no `Cx` to hand down. So unlike the rest of the
+/// workspace (where AGENTS.md forbids building a runtime), this crate MUST own
+/// one: it is the consumer on behalf of the C caller.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    thread_local! {
+        static RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build fsqlite-c-api runtime");
+    }
+    RUNTIME.with(|runtime| runtime.block_on(future))
+}
 use fsqlite_parser::{Parser, parse_first_statement_with_tail};
 use fsqlite_types::value::SqliteValue;
 
@@ -171,9 +187,7 @@ impl Sqlite3 {
     }
 
     fn refresh_last_changes(&self) {
-        let changes = self
-            .conn
-            .query_row("SELECT changes();")
+        let changes = block_on(self.conn.query_row("SELECT changes();"))
             .ok()
             .and_then(|row| match row.get(0) {
                 Some(SqliteValue::Integer(n)) => Some(i64_to_c_int_saturating(*n)),
@@ -380,7 +394,7 @@ fn validate_and_classify_prepared_sql(
     let consumed_sql = &sql[..tail_offset];
     let step_mode = prepared_step_mode(&statement);
     let column_count = if can_prepare_statement(&statement) {
-        let prepared = conn.prepare(consumed_sql)?;
+        let prepared = block_on(conn.prepare(consumed_sql))?;
         c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX)
     } else {
         0
@@ -420,7 +434,7 @@ fn best_effort_exec_callback_column_names(conn: &Connection, sql: &str) -> Optio
         return None;
     }
 
-    match conn.prepare(&statement.to_string()) {
+    match block_on(conn.prepare(&statement.to_string())) {
         Ok(prepared) => Some(prepared.column_names().to_vec()),
         Err(error) => {
             tracing::warn!(
@@ -575,7 +589,7 @@ unsafe fn execute_exec_batch(
         };
 
         let statement_sql = &trimmed[..tail_offset];
-        let rows = match handle.conn.query(statement_sql) {
+        let rows = match block_on(handle.conn.query(statement_sql)) {
             Ok(rows) => rows,
             Err(FrankenError::QueryReturnedNoRows) => Vec::new(),
             Err(error) => {
@@ -671,8 +685,9 @@ pub unsafe extern "C" fn sqlite3_open(filename: *const c_char, pp_db: *mut *mut 
 
     tracing::info!(target: "fsqlite.compat", path = %path, "sqlite3_open");
 
-    let open_result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Connection::open(&path)));
+    let open_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(Connection::open(&path))
+    }));
 
     match open_result {
         Ok(Ok(conn)) => {
@@ -728,7 +743,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
     }
 
     let close_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle.conn.close_in_place()
+        block_on(handle.conn.close_in_place())
     }));
 
     match close_result {
@@ -1000,8 +1015,8 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
 
         let execute_result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match s.step_mode {
-                PreparedStepMode::Query => db.conn.query(&s.sql).map(Some),
-                PreparedStepMode::Execute => db.conn.execute(&s.sql).map(|_| None),
+                PreparedStepMode::Query => block_on(db.conn.query(&s.sql)).map(Some),
+                PreparedStepMode::Execute => block_on(db.conn.execute(&s.sql)).map(|_| None),
             }));
 
         match execute_result {
@@ -2290,14 +2305,12 @@ mod tests {
     fn test_column_text_preserves_embedded_nul_bytes() {
         unsafe {
             let db = open_memory();
-            (*db).conn.execute("CREATE TABLE t(v TEXT)").unwrap();
-            (*db)
-                .conn
-                .execute_with_params(
-                    "INSERT INTO t(v) VALUES (?)",
-                    &[SqliteValue::Text(fsqlite_types::SmallText::from("a\0b"))],
-                )
-                .unwrap();
+            block_on((*db).conn.execute("CREATE TABLE t(v TEXT)")).unwrap();
+            block_on((*db).conn.execute_with_params(
+                "INSERT INTO t(v) VALUES (?)",
+                &[SqliteValue::Text(fsqlite_types::SmallText::from("a\0b"))],
+            ))
+            .unwrap();
 
             let sql = CString::new("SELECT v FROM t;").unwrap();
             let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
@@ -2337,14 +2350,14 @@ mod tests {
                 SQLITE_OK
             }
 
-            let conn = Connection::open(":memory:").unwrap();
-            conn.execute("CREATE TABLE t(v TEXT)").unwrap();
-            conn.execute_with_params(
+            let conn = block_on(Connection::open(":memory:")).unwrap();
+            block_on(conn.execute("CREATE TABLE t(v TEXT)")).unwrap();
+            block_on(conn.execute_with_params(
                 "INSERT INTO t(v) VALUES (?)",
                 &[SqliteValue::Text(fsqlite_types::SmallText::from("a\0b"))],
-            )
+            ))
             .unwrap();
-            let rows = conn.query("SELECT v FROM t").unwrap();
+            let rows = block_on(conn.query("SELECT v FROM t")).unwrap();
             let handle = Sqlite3::new(conn, None);
             let mut captured: Vec<u8> = Vec::new();
 
@@ -2476,8 +2489,8 @@ mod tests {
                 SQLITE_OK
             }
 
-            let conn = Connection::open(":memory:").unwrap();
-            let rows = conn.query("SELECT X'CAFE'").unwrap();
+            let conn = block_on(Connection::open(":memory:")).unwrap();
+            let rows = block_on(conn.query("SELECT X'CAFE'")).unwrap();
             let handle = Sqlite3::new(conn, None);
             let mut captured: Vec<u8> = Vec::new();
 

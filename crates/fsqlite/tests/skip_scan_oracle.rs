@@ -1,0 +1,691 @@
+//! bd-nax2y: `SELECT <cols> FROM t WHERE <second_col> = <const>` where the constrained column is the
+//! SECOND term of a two-column index whose LEADING term is unconstrained (a MySQL-style SKIP SCAN, no
+//! single-column index on the target column). The emitter enumerates distinct leading values and
+//! per value seeks/walks the `(leading, const)` run. Byte-identical to C SQLite (compared as a sorted
+//! set — no ORDER BY, so emission order is implementation-defined). Covers low- and high-cardinality
+//! leading columns (walk vs seek paths), NULLs in both columns, covering and non-covering output,
+//! duplicate `(leading, const)` runs, and the empty result. A single-column index on the target
+//! column, or a leading-column constraint, must decline the skip scan.
+
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
+
+fn render(v: &SqliteValue) -> String {
+    match v {
+        SqliteValue::Null => "NULL".to_owned(),
+        SqliteValue::Integer(n) => n.to_string(),
+        SqliteValue::Float(f) => format!("{f:?}"),
+        SqliteValue::Text(s) => format!("'{s}'"),
+        SqliteValue::Blob(_) => "blob".to_owned(),
+    }
+}
+
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+    conn.query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
+        .iter()
+        .map(|row| row.values().iter().map(render).collect())
+        .collect()
+}
+
+fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let n = stmt.column_count();
+    stmt.query_map([], |row| {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(match row.get_unwrap::<_, rusqlite::types::Value>(i) {
+                rusqlite::types::Value::Null => "NULL".to_owned(),
+                rusqlite::types::Value::Integer(x) => x.to_string(),
+                rusqlite::types::Value::Real(f) => format!("{f:?}"),
+                rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                rusqlite::types::Value::Blob(_) => "blob".to_owned(),
+            });
+        }
+        Ok(out)
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+async fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
+        )
+}
+
+async fn both(ddl: &[&str], inserts: &[String]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("frank");
+    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+    for stmt in ddl {
+        f.execute(stmt).await.unwrap();
+        r.execute_batch(stmt).unwrap();
+    }
+    for stmt in inserts {
+        f.execute(stmt).await.unwrap();
+        r.execute_batch(stmt).unwrap();
+    }
+    (f, r)
+}
+
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    let mut a = frank_rows(f, sql).await;
+    let mut b = sqlite_rows(r, sql);
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "diverged: `{sql}`");
+}
+
+/// Compare WITH order preserved — for ORDER BY queries the skip scan must emit exactly the sorted order
+/// (no sorter), so the raw emission sequence must equal C SQLite's.
+async fn cmp_ordered(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    assert_eq!(
+        frank_rows(f, sql).await,
+        sqlite_rows(r, sql),
+        "ordered diverged: `{sql}`"
+    );
+}
+
+#[test]
+fn skip_scan_low_cardinality_leading_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // Few distinct leading `x` values (12), many rows each -> the seek path dominates. NULLs in both.
+        let mut ins = Vec::new();
+        for i in 1..=4000_i64 {
+            let x = if i % 53 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 12).to_string()
+            };
+            let a = if i % 37 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 8).to_string()
+            };
+            ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {});", i % 4));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+            ],
+            &ins,
+        )
+        .await;
+        // The skip scan must fire: it emits a SeekGT to advance between distinct leading values (a full
+        // scan never does), and never opens/rewinds the base table for a covering query.
+        assert!(
+            has_op(&f, "SELECT x, a FROM t WHERE a = 5", "SeekGT").await,
+            "skip scan should serve WHERE a = 5 over idx_xa(x, a) (SeekGT advance present)"
+        );
+        for a in [0, 3, 5, 7, 999] {
+            cmp(&f, &r, &format!("SELECT x, a FROM t WHERE a = {a}")).await; // covering
+            cmp(&f, &r, &format!("SELECT id, c FROM t WHERE a = {a}")).await; // non-covering
+            cmp(
+                &f,
+                &r,
+                &format!("SELECT COUNT(id) FROM t WHERE a = {a} GROUP BY x"),
+            )
+            .await; // sanity via a different shape
+        }
+    });
+}
+
+#[test]
+fn skip_scan_high_cardinality_leading_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // Near-unique leading `x` (every row a distinct x) -> the adaptive walk path dominates (never
+        // worse than a full covering scan). The results must still be byte-exact.
+        let mut ins = Vec::new();
+        for i in 1..=3000_i64 {
+            // x is unique per row; a repeats over a small domain.
+            ins.push(format!(
+                "INSERT INTO t VALUES ({i}, {i}, {}, {});",
+                i % 6,
+                i % 3
+            ));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+            ],
+            &ins,
+        )
+        .await;
+        assert!(has_op(&f, "SELECT id FROM t WHERE a = 2", "SeekGT").await);
+        for a in [0, 2, 4, 5, 100] {
+            cmp(&f, &r, &format!("SELECT x, a FROM t WHERE a = {a}")).await;
+            cmp(&f, &r, &format!("SELECT id FROM t WHERE a = {a}")).await;
+        }
+    });
+}
+
+#[test]
+fn skip_scan_text_and_dup_runs_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // TEXT second column + long duplicate (x, const) runs (many rows share the exact (x, s) tuple).
+        let mut ins = Vec::new();
+        for i in 1..=2500_i64 {
+            let x = i % 20;
+            let s = if i % 41 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("'s{}'", i % 5)
+            };
+            ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {s}, {});", i % 4));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, s TEXT, c INTEGER);",
+                "CREATE INDEX idx_xs ON t(x, s);",
+            ],
+            &ins,
+        )
+        .await;
+        assert!(has_op(&f, "SELECT x, s FROM t WHERE s = 's2'", "SeekGT").await);
+        for s in ["s0", "s2", "s4", "nope"] {
+            cmp(&f, &r, &format!("SELECT x, s FROM t WHERE s = '{s}'")).await;
+            cmp(&f, &r, &format!("SELECT id, c FROM t WHERE s = '{s}'")).await;
+        }
+    });
+}
+
+#[test]
+fn skip_scan_edge_cases_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // Empty table, all-same-leading, all-NULL-target, single row.
+        for (label, ddl, rows) in [
+            (
+                "empty",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER);",
+                vec![],
+            ),
+            (
+                "all-same-x",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER);",
+                (1..=100)
+                    .map(|i| format!("INSERT INTO t VALUES ({i}, 7, {});", i % 5))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "all-null-a",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER);",
+                (1..=100)
+                    .map(|i| format!("INSERT INTO t VALUES ({i}, {}, NULL);", i % 10))
+                    .collect(),
+            ),
+            (
+                "single",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER);",
+                vec!["INSERT INTO t VALUES (1, 3, 9);".to_owned()],
+            ),
+        ] {
+            let (f, r) = both(&[ddl, "CREATE INDEX idx_xa ON t(x, a);"], &rows).await;
+            for a in [3, 9, 0] {
+                cmp(&f, &r, &format!("SELECT x, a FROM t WHERE a = {a}")).await;
+            }
+            let _ = label;
+        }
+    });
+}
+
+#[test]
+fn skip_scan_three_column_index_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // `WHERE a = <const>` where `a` is the SECOND term of a THREE-column index `idx(x, a, c)`: `x` is
+        // the unconstrained leading term, `c` is an unconstrained TRAILING term. The seek must fill `c` and
+        // the rowid with the MIN sentinel so it lands on the first `(x, a, *)`, and the run emits every
+        // matching row across all `c`. Low- and high-cardinality leading `x`, NULLs in `x`, `a`, and `c`.
+        let mut ins = Vec::new();
+        for i in 1..=4000_i64 {
+            let x = if i % 53 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 15).to_string()
+            };
+            let a = if i % 37 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 8).to_string()
+            };
+            let c = if i % 29 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 6).to_string()
+            };
+            ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {c});"));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xac ON t(x, a, c);",
+            ],
+            &ins,
+        )
+        .await;
+        // Skip scan fires over the 3-col index (SeekGT advance between distinct leading values), and a
+        // covering query (x, a, c all in the index) never opens the base table.
+        assert!(
+            has_op(&f, "SELECT x, a, c FROM t WHERE a = 5", "SeekGT").await,
+            "skip scan should serve WHERE a = 5 over idx_xac(x, a, c)"
+        );
+        for a in [0, 3, 5, 7, 999] {
+            cmp(&f, &r, &format!("SELECT x, a, c FROM t WHERE a = {a}")).await; // covering (all 3 key cols)
+            cmp(&f, &r, &format!("SELECT id FROM t WHERE a = {a}")).await; // non-covering
+            cmp(&f, &r, &format!("SELECT x, c FROM t WHERE a = {a}")).await; // covering subset
+        }
+    });
+}
+
+#[test]
+fn skip_scan_range_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // `WHERE a <range>` (inclusive lower) where `a` is the SECOND term of `idx(x, a)` with `x`
+        // unconstrained: the range skip scan seeks `(x, lo)` per distinct leading value. Covers `>=`,
+        // `BETWEEN`, and inclusive-lower/exclusive-upper, low- and high-cardinality leading `x`, NULLs.
+        let mut ins = Vec::new();
+        for i in 1..=4000_i64 {
+            let x = if i % 53 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 12).to_string()
+            };
+            let a = if i % 37 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 20).to_string()
+            };
+            ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {});", i % 4));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+            ],
+            &ins,
+        )
+        .await;
+        assert!(
+            has_op(&f, "SELECT x, a FROM t WHERE a >= 5", "SeekGT").await,
+            "range skip scan should serve WHERE a >= 5 over idx_xa(x, a)"
+        );
+        assert!(
+            has_op(&f, "SELECT x, a FROM t WHERE a > 5", "SeekGT").await,
+            "range skip scan should serve exclusive-lower WHERE a > 5"
+        );
+        assert!(
+            has_op(&f, "SELECT x, a FROM t WHERE a < 15", "SeekGT").await,
+            "range skip scan should serve no-lower WHERE a < 15"
+        );
+        for sql in [
+            "SELECT x, a FROM t WHERE a >= 5", // inclusive lower, no upper (covering)
+            "SELECT id, c FROM t WHERE a >= 5", // non-covering
+            "SELECT x, a FROM t WHERE a > 5",  // EXCLUSIVE lower, no upper
+            "SELECT id, c FROM t WHERE a > 5", // exclusive lower, non-covering
+            "SELECT x, a FROM t WHERE a BETWEEN 5 AND 12", // inclusive both
+            "SELECT id FROM t WHERE a BETWEEN 5 AND 12", // non-covering
+            "SELECT x, a FROM t WHERE a >= 5 AND a < 12", // inclusive lower, exclusive upper
+            "SELECT x, a FROM t WHERE a > 5 AND a <= 12", // exclusive lower, inclusive upper
+            "SELECT x, a FROM t WHERE a > 5 AND a < 12", // exclusive both
+            "SELECT x, a FROM t WHERE a < 15", // NO lower, exclusive upper (covering)
+            "SELECT id, c FROM t WHERE a < 15", // no lower, non-covering
+            "SELECT x, a FROM t WHERE a <= 15", // no lower, inclusive upper
+            "SELECT x, a FROM t WHERE a < 0",  // no lower, empty (below all non-null)
+            "SELECT x, a FROM t WHERE a >= 0 AND a <= 19", // whole domain
+            "SELECT x, a FROM t WHERE a >= 100", // empty (above all)
+            "SELECT x, a FROM t WHERE a > 100", // empty (exclusive, above all)
+            "SELECT x, a FROM t WHERE a BETWEEN 8 AND 3", // empty (lo > hi)
+            "SELECT x, a FROM t WHERE a > 19", // empty (exclusive, at max)
+        ] {
+            cmp(&f, &r, sql).await;
+        }
+    });
+}
+
+#[test]
+fn skip_scan_range_high_cardinality_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // Near-unique leading `x` -> the adaptive walk dominates (never worse than a covering scan).
+        let mut ins = Vec::new();
+        for i in 1..=3000_i64 {
+            ins.push(format!(
+                "INSERT INTO t VALUES ({i}, {i}, {}, {});",
+                i % 25,
+                i % 3
+            ));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+            ],
+            &ins,
+        )
+        .await;
+        assert!(has_op(&f, "SELECT id FROM t WHERE a >= 10", "SeekGT").await);
+        for sql in [
+            "SELECT x, a FROM t WHERE a >= 10",
+            "SELECT id FROM t WHERE a BETWEEN 5 AND 15",
+            "SELECT x, a FROM t WHERE a >= 20 AND a < 24",
+        ] {
+            cmp(&f, &r, sql).await;
+        }
+    });
+}
+
+#[test]
+fn skip_scan_range_declines_when_unsafe() {
+    asupersync::test_utils::run_test(|| async {
+        // A single-column index on the target, or a residual on a non-key column, must NOT skip-scan.
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+            ],
+            &(1..=800)
+                .map(|i| {
+                    format!(
+                        "INSERT INTO t VALUES ({i}, {}, {}, {});",
+                        i % 10,
+                        i % 20,
+                        i % 3
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        // Residual on a non-key column: must decline (else `c = 1` is silently dropped).
+        assert!(
+            !has_op(&f, "SELECT x, a FROM t WHERE a >= 5 AND c = 1", "SeekGT").await,
+            "range skip scan must decline when a non-key residual is present"
+        );
+        cmp(&f, &r, "SELECT x, a, c FROM t WHERE a >= 5 AND c = 1").await;
+        // A residual on the range column itself referencing another shape must still stay correct.
+        cmp(
+            &f,
+            &r,
+            "SELECT x, a FROM t WHERE a >= 5 AND a <= 8 AND c = 2",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn skip_scan_order_by_streams_without_sorter() {
+    asupersync::test_utils::run_test(|| async {
+        // The skip scan emits `leading ASC (NULLs first), second ASC, rowid ASC`, so an ORDER BY matching
+        // that prefix + rowid tiebreaker is served WITHOUT a sorter and must be byte-identical WITH order.
+        let mut ins = Vec::new();
+        for i in 1..=4000_i64 {
+            let x = if i % 53 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 12).to_string()
+            };
+            let a = if i % 37 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 20).to_string()
+            };
+            ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {});", i % 4));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+            ],
+            &ins,
+        )
+        .await;
+        // Equality: `ORDER BY x, id` matches (x ASC NULLs-first, rowid ASC) → skip scan + no sorter.
+        assert!(
+            has_op(
+                &f,
+                "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id",
+                "SeekGT"
+            )
+            .await
+        );
+        assert!(
+            !has_op(
+                &f,
+                "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id",
+                "SorterOpen"
+            )
+            .await,
+            "equality ORDER BY x, id must elide the sorter"
+        );
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id").await;
+        cmp_ordered(&f, &r, "SELECT id, c FROM t WHERE a = 5 ORDER BY x, id").await; // non-covering
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY x, a, id").await; // constant a harmless
+        // Range: `ORDER BY x, a, id` matches (x, a, rowid) → skip scan + no sorter.
+        assert!(
+            !has_op(
+                &f,
+                "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, a, id",
+                "SorterOpen"
+            )
+            .await,
+            "range ORDER BY x, a, id must elide the sorter"
+        );
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, a, id").await;
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a > 5 ORDER BY x, a, id").await;
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT x, a FROM t WHERE a BETWEEN 5 AND 12 ORDER BY x, a, id",
+        )
+        .await;
+        cmp_ordered(&f, &r, "SELECT id FROM t WHERE a < 8 ORDER BY x, a, id").await;
+        // A non-matching ORDER BY must DECLINE the stream (sorter runs) but stay correct.
+        assert!(
+            has_op(
+                &f,
+                "SELECT x, a FROM t WHERE a = 5 ORDER BY x DESC, id",
+                "SorterOpen"
+            )
+            .await,
+            "descending ORDER BY must fall to the sorter"
+        );
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY x DESC, id").await;
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY a, x, id").await;
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, id").await; // range needs `a` in ORDER BY
+
+        // LIMIT / OFFSET stream a deterministic top-N off the ordered emission — no sorter, byte-exact.
+        assert!(
+            !has_op(
+                &f,
+                "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id LIMIT 10",
+                "SorterOpen"
+            )
+            .await,
+            "ORDER BY + LIMIT must stream without a sorter"
+        );
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id LIMIT 10",
+        )
+        .await;
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id LIMIT 10 OFFSET 7",
+        )
+        .await;
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT id, c FROM t WHERE a = 5 ORDER BY x, id LIMIT 25 OFFSET 3",
+        )
+        .await;
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, a, id LIMIT 15",
+        )
+        .await;
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT x, a FROM t WHERE a BETWEEN 5 AND 12 ORDER BY x, a, id LIMIT 8 OFFSET 4",
+        )
+        .await;
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT x, a FROM t WHERE a < 8 ORDER BY x, a, id LIMIT 20",
+        )
+        .await;
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id LIMIT 0",
+        )
+        .await; // empty
+        // A bare LIMIT with no ORDER BY is non-deterministic (which rows) — must decline the skip scan.
+        assert!(
+            !has_op(&f, "SELECT x, a FROM t WHERE a = 5 LIMIT 10", "SeekGT").await,
+            "bare LIMIT without ORDER BY must decline the skip scan"
+        );
+    });
+}
+
+#[test]
+fn skip_scan_is_null_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // `WHERE a IS NULL` where `a` is the SECOND term of idx(x, a) with x unconstrained: the (x, NULL)
+        // run is at each leading block's start, so the scan emits it and advances. NULLs in both columns.
+        let mut ins = Vec::new();
+        for i in 1..=4000_i64 {
+            let x = if i % 53 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 12).to_string()
+            };
+            let a = if i % 7 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 20).to_string()
+            };
+            ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {});", i % 4));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+            ],
+            &ins,
+        )
+        .await;
+        assert!(
+            has_op(&f, "SELECT x, a FROM t WHERE a IS NULL", "SeekGT").await,
+            "IS NULL skip scan should serve WHERE a IS NULL over idx_xa(x, a)"
+        );
+        cmp(&f, &r, "SELECT x, a FROM t WHERE a IS NULL").await; // covering
+        cmp(&f, &r, "SELECT id, c FROM t WHERE a IS NULL").await; // non-covering
+        // ORDER BY x, id streams with no sorter (the NULL 2nd key is constant within the run).
+        assert!(
+            !has_op(
+                &f,
+                "SELECT x, a FROM t WHERE a IS NULL ORDER BY x, id",
+                "SorterOpen"
+            )
+            .await,
+            "IS NULL + ORDER BY x, id must elide the sorter"
+        );
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a IS NULL ORDER BY x, id").await;
+        cmp_ordered(
+            &f,
+            &r,
+            "SELECT id, c FROM t WHERE a IS NULL ORDER BY x, id LIMIT 12 OFFSET 5",
+        )
+        .await;
+        // `IS NOT NULL` must NOT use this path (declines; still correct).
+        cmp(&f, &r, "SELECT x, a FROM t WHERE a IS NOT NULL").await;
+    });
+}
+
+#[test]
+fn skip_scan_is_null_edge_cases_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        for (label, rows) in [
+            (
+                "no-null-a",
+                (1..=200)
+                    .map(|i| format!("INSERT INTO t VALUES ({i}, {}, {}, 0);", i % 8, i % 5))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "all-null-a",
+                (1..=200)
+                    .map(|i| format!("INSERT INTO t VALUES ({i}, {}, NULL, 0);", i % 8))
+                    .collect(),
+            ),
+            (
+                "null-leading-too",
+                (1..=200)
+                    .map(|i| {
+                        let x = if i % 9 == 0 {
+                            "NULL".to_owned()
+                        } else {
+                            (i % 8).to_string()
+                        };
+                        let a = if i % 3 == 0 {
+                            "NULL".to_owned()
+                        } else {
+                            (i % 5).to_string()
+                        };
+                        format!("INSERT INTO t VALUES ({i}, {x}, {a}, 0);")
+                    })
+                    .collect(),
+            ),
+        ] {
+            let (f, r) = both(
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                    "CREATE INDEX idx_xa ON t(x, a);",
+                ],
+                &rows,
+            )
+            .await;
+            cmp(&f, &r, "SELECT x, a FROM t WHERE a IS NULL").await;
+            cmp(&f, &r, "SELECT id FROM t WHERE a IS NULL").await;
+            cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a IS NULL ORDER BY x, id").await;
+            let _ = label;
+        }
+    });
+}
+
+#[test]
+fn skip_scan_declines_when_avoidable() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+                "CREATE INDEX idx_a ON t(a);", // single-column index on the target -> equality seek wins
+            ],
+            &(1..=500)
+                .map(|i| format!("INSERT INTO t VALUES ({i}, {}, {});", i % 10, i % 7))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        // A single-column index on `a` exists: the equality seek serves it; the skip scan must decline.
+        assert!(
+            !has_op(&f, "SELECT x, a FROM t WHERE a = 3", "SeekGT").await,
+            "skip scan must decline when a single-column index on the target column exists"
+        );
+        cmp(&f, &r, "SELECT x, a FROM t WHERE a = 3").await;
+        // A constraint on the LEADING term is a normal composite equality/prefix seek, not a skip scan.
+        cmp(&f, &r, "SELECT x, a FROM t WHERE x = 4").await;
+        cmp(&f, &r, "SELECT x, a FROM t WHERE x = 4 AND a = 3").await;
+    });
+}

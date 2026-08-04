@@ -7,9 +7,10 @@
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
-fn count_f(c: &Connection, sql: &str) -> i64 {
+async fn count_f(c: &Connection, sql: &str) -> i64 {
     let rows = c
         .query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
     match rows.first().and_then(|r| r.values().first()) {
         Some(SqliteValue::Integer(n)) => *n,
@@ -21,66 +22,74 @@ fn count_r(c: &rusqlite::Connection, sql: &str) -> i64 {
     c.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap()
 }
 
-fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
+async fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
     c.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with(prefix)))
 }
 
-fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
     match no_rewind {
         Some(true) => assert!(
-            !has_op(f, sql, "Rewind"),
+            !has_op(f, sql, "Rewind").await,
             "rowid-eq COUNT must not full-scan (Rewind): `{sql}`"
         ),
         Some(false) => assert!(
-            has_op(f, sql, "Rewind"),
+            has_op(f, sql, "Rewind").await,
             "control COUNT should full-scan (Rewind): `{sql}`"
         ),
         None => {}
     }
-    assert_eq!(count_f(f, sql), count_r(r, sql), "count diverged: `{sql}`");
+    assert_eq!(
+        count_f(f, sql).await,
+        count_r(r, sql),
+        "count diverged: `{sql}`"
+    );
 }
 
 #[test]
 fn count_rowid_eq_matches_sqlite() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, y INTEGER, z REAL);",
-        "CREATE INDEX idx_y ON t(y);",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    for i in 1..=300_i64 {
-        let s = format!("INSERT INTO t VALUES ({i}, {}, {}.5);", i % 20, i % 10);
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, y INTEGER, z REAL);",
+            "CREATE INDEX idx_y ON t(y);",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        for i in 1..=300_i64 {
+            let s = format!("INSERT INTO t VALUES ({i}, {}, {}.5);", i % 20, i % 10);
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
 
-    // rowid = <int literal>: single SeekRowid, no Rewind, count matches (0 or 1).
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 5", Some(true)); // present -> 1
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 150", Some(true)); // present -> 1
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id = 99999",
-        Some(true),
-    ); // absent -> 0
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 1", Some(true)); // first -> 1
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 300", Some(true)); // last -> 1
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE 5 = id", Some(true)); // reversed operand order -> 1
+        // rowid = <int literal>: single SeekRowid, no Rewind, count matches (0 or 1).
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 5", Some(true)).await; // present -> 1
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 150", Some(true)).await; // present -> 1
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id = 99999",
+            Some(true),
+        )
+        .await; // absent -> 0
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 1", Some(true)).await; // first -> 1
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 300", Some(true)).await; // last -> 1
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE 5 = id", Some(true)).await; // reversed operand order -> 1
 
-    // A REAL rowid literal uses the coerced seek: MustBeInt rejects 2.5 rather than truncating it to 2.
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 2.5", Some(true));
-    // A placeholder also routes through MustBeInt at runtime; plan asserted only (no bind needed).
-    assert!(
-        !has_op(&f, "SELECT COUNT(*) FROM t WHERE id = ?", "Rewind"),
-        "param rowid-eq COUNT must use the coerced seek"
-    );
-    // Control: a non-rowid indexed column is served by the aggregate seek (bd-2dgf5), NOT this lever —
-    // only assert the count. A non-indexed usage would full-scan; z has no index.
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE z = 3.5", Some(false)); // non-indexed REAL -> full scan
+        // A REAL rowid literal uses the coerced seek: MustBeInt rejects 2.5 rather than truncating it to 2.
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 2.5", Some(true)).await;
+        // A placeholder also routes through MustBeInt at runtime; plan asserted only (no bind needed).
+        assert!(
+            !has_op(&f, "SELECT COUNT(*) FROM t WHERE id = ?", "Rewind").await,
+            "param rowid-eq COUNT must use the coerced seek"
+        );
+        // Control: a non-rowid indexed column is served by the aggregate seek (bd-2dgf5), NOT this lever —
+        // only assert the count. A non-indexed usage would full-scan; z has no index.
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE z = 3.5", Some(false)).await; // non-indexed REAL -> full scan
+    });
 }

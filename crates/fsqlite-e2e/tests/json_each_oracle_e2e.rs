@@ -6,6 +6,7 @@
 //! row shapes (array index keys, object field keys, value storage class, the
 //! `type` label), the path argument, aggregation over the produced rows, and a
 //! json_tree recursive walk. Compared against rusqlite (bundled SQLite ~3.46).
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -23,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,12 +57,12 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -85,59 +86,74 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn json_each_over_array() {
-    assert_scalar(
-        &[
-            "SELECT key, value, type FROM json_each('[10,20,30]') ORDER BY key",
-            "SELECT count(*) FROM json_each('[1,2,3,4,5]')", // 5
-            "SELECT sum(value) FROM json_each('[1,2,3,4]')", // 10
-        ],
-        "json_each_over_array",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT key, value, type FROM json_each('[10,20,30]') ORDER BY key",
+                "SELECT count(*) FROM json_each('[1,2,3,4,5]')", // 5
+                "SELECT sum(value) FROM json_each('[1,2,3,4]')", // 10
+            ],
+            "json_each_over_array",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_each_over_object() {
-    assert_scalar(
-        &[
-            "SELECT key, value, type FROM json_each('{\"a\":1,\"b\":\"x\",\"c\":2.5}') ORDER BY key",
-            "SELECT key FROM json_each('{\"z\":1,\"a\":2,\"m\":3}') ORDER BY key", // a,m,z
-        ],
-        "json_each_over_object",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT key, value, type FROM json_each('{\"a\":1,\"b\":\"x\",\"c\":2.5}') ORDER BY key",
+                "SELECT key FROM json_each('{\"z\":1,\"a\":2,\"m\":3}') ORDER BY key", // a,m,z
+            ],
+            "json_each_over_object",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_each_with_path() {
-    assert_scalar(
-        &[
-            "SELECT value FROM json_each('{\"items\":[5,6,7]}', '$.items') ORDER BY value", // 5,6,7
-            "SELECT sum(value) FROM json_each('{\"nums\":[10,20,30]}', '$.nums')",          // 60
-        ],
-        "json_each_with_path",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT value FROM json_each('{\"items\":[5,6,7]}', '$.items') ORDER BY value", // 5,6,7
+                "SELECT sum(value) FROM json_each('{\"nums\":[10,20,30]}', '$.nums')", // 60
+            ],
+            "json_each_with_path",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_each_value_types() {
-    assert_scalar(
-        &[
-            // Mixed element types -> the `type` label per element.
-            "SELECT type FROM json_each('[1, 2.5, \"s\", true, false, null]') ORDER BY key",
-            "SELECT value FROM json_each('[1, 2.5, \"s\", null]') ORDER BY key",
-        ],
-        "json_each_value_types",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                // Mixed element types -> the `type` label per element.
+                "SELECT type FROM json_each('[1, 2.5, \"s\", true, false, null]') ORDER BY key",
+                "SELECT value FROM json_each('[1, 2.5, \"s\", null]') ORDER BY key",
+            ],
+            "json_each_value_types",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_tree_recursive_walk() {
-    assert_scalar(
-        &[
-            // json_tree walks nested structure; count all nodes.
-            "SELECT count(*) FROM json_tree('{\"a\":1,\"b\":[2,3]}')",
-            // Sum of the integer leaves via json_tree.
-            "SELECT sum(value) FROM json_tree('{\"a\":1,\"b\":[2,3]}') WHERE type = 'integer'", // 6
-        ],
-        "json_tree_recursive_walk",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                // json_tree walks nested structure; count all nodes.
+                "SELECT count(*) FROM json_tree('{\"a\":1,\"b\":[2,3]}')",
+                // Sum of the integer leaves via json_tree.
+                "SELECT sum(value) FROM json_tree('{\"a\":1,\"b\":[2,3]}') WHERE type = 'integer'", // 6
+            ],
+            "json_tree_recursive_walk",
+        )
+        .await;
+    });
 }

@@ -1,19 +1,40 @@
+// bd-h9o9r: integration tests are separate crates, so fsqlite-pager's
+// crate-level rationale applies here too — the pager's futures are
+// deliberately not `Send` (thread-local runtime design).
+#![allow(clippy::future_not_send)]
+
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use asupersync::runtime::RuntimeBuilder;
-use fsqlite_error::Result;
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::traits::{
     CheckpointPageWriter, CheckpointResult, JournalMode, MvccPager, TransactionHandle,
     TransactionMode, WalBackend, WalFuture,
 };
 use fsqlite_pager::{CheckpointMode, SimplePager};
-use fsqlite_types::PageSize;
 use fsqlite_types::cx::Cx;
+use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vfs::MemoryVfs;
+use fsqlite_wal::{ParallelWalCommitCertificate, ParallelWalFramePayloadDigestBuilder};
 
-type SharedFrames = Arc<Mutex<Vec<(u32, Vec<u8>, u32)>>>;
+type WalFrame = (u32, Vec<u8>, u32);
+
+#[derive(Clone)]
+struct PendingParallelWalCommit {
+    certificate: ParallelWalCommitCertificate,
+    wal_frame_start: u64,
+    wal_frame_end: u64,
+}
+
+#[derive(Default)]
+struct SharedWalState {
+    frames: Vec<WalFrame>,
+    pending_commit: Option<PendingParallelWalCommit>,
+}
+
+type SharedWalStateRef = Arc<Mutex<SharedWalState>>;
 
 fn block_on_test<F: Future>(future: F) -> F::Output {
     RuntimeBuilder::current_thread()
@@ -74,13 +95,19 @@ impl WalBackend for NoopWalBackend {
     }
 }
 
+/// Ready-only, process-local WAL fixture for the pager visibility scenarios.
+///
+/// Certificate persistence and batch append contain no suspension point and
+/// share one state lock. The pending proof is therefore consumed in the same
+/// poll that admits its exact frame batch. Crash recovery and durable sidecar
+/// reconciliation belong to the production adapter tests, not this fixture.
 struct SharedWalBackend {
-    frames: SharedFrames,
+    state: SharedWalStateRef,
 }
 
 impl SharedWalBackend {
-    fn with_shared_frames(frames: SharedFrames) -> Self {
-        Self { frames }
+    fn with_shared_state(state: SharedWalStateRef) -> Self {
+        Self { state }
     }
 }
 
@@ -93,9 +120,17 @@ impl WalBackend for SharedWalBackend {
         db_size_if_commit: u32,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            self.frames
+            let mut state = self
+                .state
                 .lock()
-                .expect("shared wal frames lock should not poison")
+                .expect("shared WAL state lock should not poison");
+            if state.pending_commit.is_some() {
+                return Err(FrankenError::internal(
+                    "test WAL backend requires certified commits to use one exact frame batch",
+                ));
+            }
+            state
+                .frames
                 .push((page_number, page_data.to_vec(), db_size_if_commit));
             Ok(())
         })
@@ -107,17 +142,131 @@ impl WalBackend for SharedWalBackend {
         frames: &'a [fsqlite_pager::traits::WalFrameRef<'a>],
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            let mut written = self
-                .frames
+            let mut state = self
+                .state
                 .lock()
-                .expect("shared wal frames lock should not poison");
+                .expect("shared WAL state lock should not poison");
+            let pending = state.pending_commit.as_ref().ok_or_else(|| {
+                FrankenError::internal(
+                    "test WAL backend received a frame batch without a pending certificate",
+                )
+            })?;
+            let expected_start = u64::try_from(state.frames.len())
+                .map_err(|_| FrankenError::internal("synthetic WAL frame count exceeds u64"))?
+                .checked_add(1)
+                .ok_or_else(|| FrankenError::internal("synthetic WAL frame count overflow"))?;
+            if pending.wal_frame_start != expected_start {
+                return Err(FrankenError::internal(
+                    "test WAL backend certificate does not begin after the current frame prefix",
+                ));
+            }
+            let expected_end = expected_start
+                .checked_add(
+                    u64::try_from(frames.len())
+                        .map_err(|_| FrankenError::internal("frame batch length exceeds u64"))?
+                        .saturating_sub(1),
+                )
+                .ok_or_else(|| FrankenError::internal("synthetic WAL frame interval overflow"))?;
+            if pending.wal_frame_end != expected_end
+                || frames.len()
+                    != usize::try_from(pending.certificate.page_set_size)
+                        .map_err(|_| FrankenError::internal("certificate page set exceeds usize"))?
+            {
+                return Err(FrankenError::internal(
+                    "test WAL backend frame batch does not match its pending certificate interval",
+                ));
+            }
+            let final_frame = frames.last().ok_or_else(|| {
+                FrankenError::internal("test WAL backend rejected an empty certified frame batch")
+            })?;
+            if final_frame.db_size_if_commit == 0
+                || final_frame.db_size_if_commit != pending.certificate.db_size_pages
+            {
+                return Err(FrankenError::internal(
+                    "test WAL backend frame batch lacks the certified commit marker",
+                ));
+            }
+            let mut digest = ParallelWalFramePayloadDigestBuilder::new();
             for frame in frames {
-                written.push((
+                digest.update(
+                    PageNumber::new(frame.page_number).ok_or_else(|| {
+                        FrankenError::internal("test WAL frame batch contains page zero")
+                    })?,
+                    frame.db_size_if_commit,
+                    frame.page_data,
+                );
+            }
+            if digest.finalize() != pending.certificate.wal_frame_payload_digest {
+                return Err(FrankenError::internal(
+                    "test WAL backend frame batch does not match the certificate payload digest",
+                ));
+            }
+
+            for frame in frames {
+                state.frames.push((
                     frame.page_number,
                     frame.page_data.to_vec(),
                     frame.db_size_if_commit,
                 ));
             }
+            state.pending_commit = None;
+            Ok(())
+        })
+    }
+
+    fn persist_parallel_wal_commit_certificate<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        certificate: &'a ParallelWalCommitCertificate,
+        wal_frame_start: u64,
+        wal_frame_end: u64,
+        _sync: bool,
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            if !certificate.checksum_is_valid() {
+                return Err(FrankenError::internal(
+                    "test WAL backend rejected a damaged parallel-WAL certificate",
+                ));
+            }
+            let covered_frame_count = wal_frame_end
+                .checked_sub(wal_frame_start)
+                .and_then(|distance| distance.checked_add(1))
+                .ok_or_else(|| {
+                    FrankenError::internal(
+                        "test WAL backend rejected an invalid certificate frame interval",
+                    )
+                })?;
+            if covered_frame_count != u64::from(certificate.page_set_size) {
+                return Err(FrankenError::internal(
+                    "test WAL backend certificate frame interval does not match its page set",
+                ));
+            }
+            let expected_committed_prefix = wal_frame_start.checked_sub(1).ok_or_else(|| {
+                FrankenError::internal(
+                    "test WAL backend certificate interval must use one-based frame indexes",
+                )
+            })?;
+            let mut state = self
+                .state
+                .lock()
+                .expect("shared WAL state lock should not poison");
+            let current_frame_count = u64::try_from(state.frames.len())
+                .map_err(|_| FrankenError::internal("synthetic WAL frame count exceeds u64"))?;
+            if current_frame_count != expected_committed_prefix {
+                return Err(FrankenError::internal(
+                    "test WAL backend certificate does not start after the committed WAL prefix",
+                ));
+            }
+            if state.pending_commit.is_some() {
+                return Err(FrankenError::internal(
+                    "test WAL backend already has an unconsumed commit certificate",
+                ));
+            }
+            state.pending_commit = Some(PendingParallelWalCommit {
+                certificate: certificate.clone(),
+                wal_frame_start,
+                wal_frame_end,
+            });
             Ok(())
         })
     }
@@ -128,11 +277,12 @@ impl WalBackend for SharedWalBackend {
         page_number: u32,
     ) -> WalFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
-            let frames = self
-                .frames
+            let state = self
+                .state
                 .lock()
-                .expect("shared wal frames lock should not poison");
-            Ok(frames
+                .expect("shared WAL state lock should not poison");
+            Ok(state
+                .frames
                 .iter()
                 .rev()
                 .find(|(pn, _, _)| *pn == page_number)
@@ -146,13 +296,17 @@ impl WalBackend for SharedWalBackend {
         page_number: u32,
     ) -> WalFuture<'a, u64> {
         Box::pin(async move {
-            let frames = self
-                .frames
+            let state = self
+                .state
                 .lock()
-                .expect("shared wal frames lock should not poison");
-            let last_page_frame = frames.iter().rposition(|(pn, _, _)| *pn == page_number);
+                .expect("shared WAL state lock should not poison");
+            let last_page_frame = state
+                .frames
+                .iter()
+                .rposition(|(pn, _, _)| *pn == page_number);
             let Some(last_page_frame) = last_page_frame else {
-                return Ok(frames
+                return Ok(state
+                    .frames
                     .iter()
                     .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
                     .count() as u64);
@@ -160,7 +314,7 @@ impl WalBackend for SharedWalBackend {
 
             let mut page_commit_seen = false;
             let mut committed_txns_after_page = 0_u64;
-            for (frame_index, (_, _, db_size_if_commit)) in frames.iter().enumerate() {
+            for (frame_index, (_, _, db_size_if_commit)) in state.frames.iter().enumerate() {
                 if *db_size_if_commit == 0 {
                     continue;
                 }
@@ -178,11 +332,12 @@ impl WalBackend for SharedWalBackend {
 
     fn committed_txn_count<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, u64> {
         Box::pin(async move {
-            let frames = self
-                .frames
+            let state = self
+                .state
                 .lock()
-                .expect("shared wal frames lock should not poison");
-            Ok(frames
+                .expect("shared WAL state lock should not poison");
+            Ok(state
+                .frames
                 .iter()
                 .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
                 .count() as u64)
@@ -194,9 +349,10 @@ impl WalBackend for SharedWalBackend {
     }
 
     fn frame_count(&self) -> usize {
-        self.frames
+        self.state
             .lock()
-            .expect("shared wal frames lock should not poison")
+            .expect("shared WAL state lock should not poison")
+            .frames
             .len()
     }
 
@@ -222,25 +378,44 @@ impl WalBackend for SharedWalBackend {
     }
 }
 
-async fn wal_pager_pair() -> (Cx, SimplePager<MemoryVfs>, SimplePager<MemoryVfs>) {
+fn assert_no_pending_certificate(state: &SharedWalStateRef) {
+    assert!(
+        state
+            .lock()
+            .expect("shared WAL state lock should not poison")
+            .pending_commit
+            .is_none(),
+        "every successful test commit must consume its exact certificate"
+    );
+}
+
+async fn wal_pager_pair(
+    path: &Path,
+) -> (
+    Cx,
+    SimplePager<MemoryVfs>,
+    SimplePager<MemoryVfs>,
+    SharedWalStateRef,
+) {
     let cx = Cx::new();
     let vfs = MemoryVfs::new();
-    let path = PathBuf::from("/self_alloc_extension_peer_interleave.db");
-    let pager_a = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+    let pager_a = SimplePager::open_with_cx(&cx, vfs.clone(), path, PageSize::DEFAULT)
         .await
         .expect("pager A open");
-    let pager_b = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
+    let pager_b = SimplePager::open_with_cx(&cx, vfs, path, PageSize::DEFAULT)
         .await
         .expect("pager B open");
 
-    let frames: SharedFrames = Arc::new(Mutex::new(Vec::new()));
+    let state = Arc::new(Mutex::new(SharedWalState::default()));
     pager_a
-        .set_wal_backend(Box::new(SharedWalBackend::with_shared_frames(Arc::clone(
-            &frames,
+        .set_wal_backend(Box::new(SharedWalBackend::with_shared_state(Arc::clone(
+            &state,
         ))))
         .expect("pager A WAL backend should install");
     pager_b
-        .set_wal_backend(Box::new(SharedWalBackend::with_shared_frames(frames)))
+        .set_wal_backend(Box::new(SharedWalBackend::with_shared_state(Arc::clone(
+            &state,
+        ))))
         .expect("pager B WAL backend should install");
     pager_a
         .set_journal_mode(&cx, JournalMode::Wal)
@@ -251,7 +426,7 @@ async fn wal_pager_pair() -> (Cx, SimplePager<MemoryVfs>, SimplePager<MemoryVfs>
         .await
         .expect("pager B WAL mode should be available");
 
-    (cx, pager_a, pager_b)
+    (cx, pager_a, pager_b, state)
 }
 
 #[test]
@@ -313,7 +488,8 @@ fn self_allocated_eof_page_stays_out_of_conflict_surface() {
 #[test]
 fn self_allocated_extension_page_survives_peer_writer_interleaving() {
     block_on_test(async {
-        let (cx, pager_a, pager_b) = wal_pager_pair().await;
+        let (cx, pager_a, pager_b, state) =
+            wal_pager_pair(Path::new("/self_alloc_extension_peer_interleave.db")).await;
         let page_size = PageSize::DEFAULT.as_usize();
 
         {
@@ -374,13 +550,32 @@ fn self_allocated_extension_page_survives_peer_writer_interleaving() {
             0xA5,
             "pager A must still read back its own staged extension-page contents after peer commit"
         );
+        txn_a
+            .commit(&cx)
+            .await
+            .expect("pager A extension-page commit should survive peer interleaving");
+        let peer_reader = pager_b
+            .begin(&cx, TransactionMode::ReadOnly)
+            .await
+            .expect("peer reader should begin after pager A commit");
+        let peer_read_back = peer_reader
+            .get_page(&cx, extension_page)
+            .await
+            .expect("peer reader should see pager A's committed extension page");
+        assert_eq!(
+            peer_read_back.as_ref()[0],
+            0xA5,
+            "pager A's extension-page contents must become peer-visible after commit"
+        );
+        assert_no_pending_certificate(&state);
     });
 }
 
 #[test]
 fn peer_growth_commit_refreshes_reader_snapshot_boundary() {
     block_on_test(async {
-        let (cx, pager_a, pager_b) = wal_pager_pair().await;
+        let (cx, pager_a, pager_b, state) =
+            wal_pager_pair(Path::new("/self_alloc_extension_peer_growth.db")).await;
         let page_size = PageSize::DEFAULT.as_usize();
 
         {
@@ -432,5 +627,6 @@ fn peer_growth_commit_refreshes_reader_snapshot_boundary() {
             0x33,
             "peer reader must see the committed contents of the grown page"
         );
+        assert_no_pending_certificate(&state);
     });
 }

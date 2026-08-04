@@ -163,13 +163,13 @@ fn validate_open_flags(flags: OpenFlags) -> Result<(), FrankenError> {
     Ok(())
 }
 
-fn open_read_only_connection(path: &str) -> Result<Connection, FrankenError> {
+async fn open_read_only_connection(path: &str) -> Result<Connection, FrankenError> {
     if path == ":memory:" {
         return Err(FrankenError::NotImplemented(
             "read-only :memory: connections are not supported".to_owned(),
         ));
     }
-    Connection::open_schema_only(path)
+    Connection::open_schema_only(path).await
 }
 
 impl std::ops::BitOr for OpenFlags {
@@ -196,17 +196,17 @@ impl std::ops::BitOr for OpenFlags {
 ///
 /// let conn = open_with_flags("my.db", OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 /// ```
-pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
+pub async fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
     match classify_access_mode(flags)? {
-        OpenDisposition::ReadOnly => open_read_only_connection(path),
+        OpenDisposition::ReadOnly => open_read_only_connection(path).await,
         OpenDisposition::WriteExisting => {
             if path == ":memory:" {
-                Connection::open(path)
+                Connection::open(path).await
             } else {
-                Connection::open_existing(path)
+                Connection::open_existing(path).await
             }
         }
-        OpenDisposition::WriteCreate => Connection::open(path),
+        OpenDisposition::WriteCreate => Connection::open(path).await,
     }
 }
 
@@ -230,8 +230,12 @@ mod tests {
 
     #[test]
     fn open_with_flags_in_memory() {
-        let conn = open_with_flags(":memory:", OpenFlags::default_flags()).unwrap();
-        assert_eq!(conn.path(), ":memory:");
+        asupersync::test_utils::run_test(|| async {
+            let conn = open_with_flags(":memory:", OpenFlags::default_flags())
+                .await
+                .unwrap();
+            assert_eq!(conn.path(), ":memory:");
+        });
     }
 
     #[test]
@@ -261,12 +265,15 @@ mod tests {
 
     #[test]
     fn open_with_flags_read_write_without_create_missing_db_fails() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("missing.db");
-        let error = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .expect_err("READ_WRITE without CREATE should not create a missing database");
-        assert!(matches!(error, FrankenError::CannotOpen { .. }));
-        assert!(!path.exists());
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("missing.db");
+            let error = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .await
+                .expect_err("READ_WRITE without CREATE should not create a missing database");
+            assert!(matches!(error, FrankenError::CannotOpen { .. }));
+            assert!(!path.exists());
+        });
     }
 
     #[test]
@@ -323,26 +330,32 @@ mod tests {
 
     #[test]
     fn open_with_flags_read_only_in_memory_is_rejected() {
-        let error = open_with_flags(":memory:", OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect_err("compat open must not return a writable connection for READ_ONLY");
-        assert!(matches!(error, FrankenError::NotImplemented(_)));
+        asupersync::test_utils::run_test(|| async {
+            let error = open_with_flags(":memory:", OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .await
+                .expect_err("compat open must not return a writable connection for READ_ONLY");
+            assert!(matches!(error, FrankenError::NotImplemented(_)));
+        });
     }
 
     #[test]
     fn open_with_flags_accepts_common_sqlite_ancillary_flags() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("ancillary_flags.db");
-        let conn = open_with_flags(
-            path.to_str().unwrap(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
-                | OpenFlags::SQLITE_OPEN_EXRESCODE,
-        )
-        .expect("ancillary sqlite3_open_v2 flags should be accepted by the compat layer");
-        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
-        assert!(path.exists());
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("ancillary_flags.db");
+            let conn = open_with_flags(
+                path.to_str().unwrap(),
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+                    | OpenFlags::SQLITE_OPEN_EXRESCODE,
+            )
+            .await
+            .expect("ancillary sqlite3_open_v2 flags should be accepted by the compat layer");
+            conn.execute("CREATE TABLE t(x INTEGER)").await.unwrap();
+            assert!(path.exists());
+        });
     }
 }

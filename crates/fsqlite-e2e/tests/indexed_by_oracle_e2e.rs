@@ -7,6 +7,7 @@
 //! UPDATE/DELETE. Each scenario asserts per-statement agreement with rusqlite,
 //! then compares query results; the "forced index that cannot satisfy the query"
 //! case is isolated because its error behaviour is the subtlest.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,11 +58,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -71,7 +72,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -101,28 +102,34 @@ const T: [&str; 3] = [
 
 #[test]
 fn indexed_by_equality_and_range() {
-    scenario(
-        &T,
-        &[
-            "SELECT id FROM t INDEXED BY idx_a WHERE a = 20 ORDER BY id", // 2,3
-            "SELECT id FROM t INDEXED BY idx_a WHERE a > 15 ORDER BY id", // 2,3,4
-            "SELECT count(*) FROM t INDEXED BY idx_a WHERE a <= 20",      // 3
-        ],
-        "indexed_by_equality_and_range",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &T,
+            &[
+                "SELECT id FROM t INDEXED BY idx_a WHERE a = 20 ORDER BY id", // 2,3
+                "SELECT id FROM t INDEXED BY idx_a WHERE a > 15 ORDER BY id", // 2,3,4
+                "SELECT count(*) FROM t INDEXED BY idx_a WHERE a <= 20",      // 3
+            ],
+            "indexed_by_equality_and_range",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn not_indexed_forces_scan_same_results() {
-    scenario(
-        &T,
-        &[
-            "SELECT id FROM t NOT INDEXED WHERE a = 20 ORDER BY id", // 2,3 (scan)
-            "SELECT id FROM t NOT INDEXED WHERE id = 1",             // 1
-            "SELECT id FROM t NOT INDEXED WHERE a > 15 ORDER BY id", // 2,3,4
-        ],
-        "not_indexed_forces_scan_same_results",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &T,
+            &[
+                "SELECT id FROM t NOT INDEXED WHERE a = 20 ORDER BY id", // 2,3 (scan)
+                "SELECT id FROM t NOT INDEXED WHERE id = 1",             // 1
+                "SELECT id FROM t NOT INDEXED WHERE a > 15 ORDER BY id", // 2,3,4
+            ],
+            "not_indexed_forces_scan_same_results",
+        )
+        .await;
+    });
 }
 
 /// bd-pw68x: SQLite rejects `INDEXED BY <unknown index>` with "no such index",
@@ -130,29 +137,51 @@ fn not_indexed_forces_scan_same_results() {
 /// forced-index name is not validated against the schema.
 #[test]
 fn indexed_by_nonexistent_index_errors() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &T,
+            &[
+                // Naming an index that does not exist errors on both engines.
+                "SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
+            ],
+            "indexed_by_nonexistent_index_errors",
+        )
+        .await;
+    });
+}
+
+/// hfdt-3b8zl: both engines refuse `EXPLAIN [QUERY PLAN]` when the inner
+/// SELECT names a missing `INDEXED BY` index — C SQLite fails at prepare
+/// time, so the plan surfaces must not silently describe a hint-ignoring
+/// plan.
+#[test]
+fn explain_query_plan_missing_indexed_by_errors() {
     scenario(
         &T,
         &[
-            // Naming an index that does not exist errors on both engines.
-            "SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
+            "EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
+            "EXPLAIN SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
         ],
-        "indexed_by_nonexistent_index_errors",
+        "explain_query_plan_missing_indexed_by_errors",
     );
 }
 
 #[test]
 fn indexed_by_in_update_and_delete() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
-            "CREATE INDEX idx_a ON t(a)",
-            "INSERT INTO t VALUES (1,10,'x'),(2,20,'y'),(3,20,'z'),(4,30,'w')",
-            "UPDATE t INDEXED BY idx_a SET b = 'Z' WHERE a = 30",
-            "DELETE FROM t INDEXED BY idx_a WHERE a = 10",
-        ],
-        &["SELECT id, a, b FROM t ORDER BY id"], // (2,20,y),(3,20,z),(4,30,Z)
-        "indexed_by_in_update_and_delete",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+                "CREATE INDEX idx_a ON t(a)",
+                "INSERT INTO t VALUES (1,10,'x'),(2,20,'y'),(3,20,'z'),(4,30,'w')",
+                "UPDATE t INDEXED BY idx_a SET b = 'Z' WHERE a = 30",
+                "DELETE FROM t INDEXED BY idx_a WHERE a = 10",
+            ],
+            &["SELECT id, a, b FROM t ORDER BY id"], // (2,20,y),(3,20,z),(4,30,Z)
+            "indexed_by_in_update_and_delete",
+        )
+        .await;
+    });
 }
 
 /// A forced index whose column is not constrained by the WHERE: both engines
@@ -160,12 +189,15 @@ fn indexed_by_in_update_and_delete() {
 /// query returns id=1 on both.
 #[test]
 fn indexed_by_unconstrained_column_full_scan() {
-    scenario(
-        &T,
-        &[
-            // idx_a is on (a) but the only constraint is on id; both allow it.
-            "SELECT id FROM t INDEXED BY idx_a WHERE id = 1",
-        ],
-        "indexed_by_unconstrained_column_full_scan",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &T,
+            &[
+                // idx_a is on (a) but the only constraint is on id; both allow it.
+                "SELECT id FROM t INDEXED BY idx_a WHERE id = 1",
+            ],
+            "indexed_by_unconstrained_column_full_scan",
+        )
+        .await;
+    });
 }

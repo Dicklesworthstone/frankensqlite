@@ -1194,35 +1194,40 @@ fn build_execute_stage_not_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute not benchmark program should build")
 }
 
-async fn prepare_commit_stage_fixture(dirty_pages: usize) -> (Cx, SimpleTransaction<MemoryVfs>) {
-    let cx = Cx::new();
-    let pager = SimplePager::open_with_cx(
-        &cx,
-        MemoryVfs::new(),
-        Path::new("/:memory:"),
-        PageSize::DEFAULT,
-    )
-    .await
-    .expect("pipeline commit benchmark should open pager");
-    let mut txn = pager
-        .begin(&cx, TransactionMode::Immediate)
+fn prepare_commit_stage_fixture(
+    runtime: &Runtime,
+    dirty_pages: usize,
+) -> (Cx, SimpleTransaction<MemoryVfs>) {
+    runtime.block_on(async {
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx(
+            &cx,
+            MemoryVfs::new(),
+            Path::new("/:memory:"),
+            PageSize::DEFAULT,
+        )
         .await
-        .expect("pipeline commit benchmark should begin transaction");
-    let page_bytes = PageSize::DEFAULT.as_usize();
-    txn.write_page(&cx, PageNumber::ONE, &vec![0xA5; page_bytes])
-        .await
-        .expect("pipeline commit benchmark should dirty page one");
-    for page_idx in 1..dirty_pages {
-        let page_no = txn
-            .allocate_page(&cx)
+        .expect("pipeline commit benchmark should open pager");
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Immediate)
             .await
-            .expect("pipeline commit benchmark should allocate page");
-        let fill = u8::try_from((page_idx % 251) + 1).unwrap();
-        txn.write_page(&cx, page_no, &vec![fill; page_bytes])
+            .expect("pipeline commit benchmark should begin transaction");
+        let page_bytes = PageSize::DEFAULT.as_usize();
+        txn.write_page(&cx, PageNumber::ONE, &vec![0xA5; page_bytes])
             .await
-            .expect("pipeline commit benchmark should dirty page");
-    }
-    (cx, txn)
+            .expect("pipeline commit benchmark should dirty page one");
+        for page_idx in 1..dirty_pages {
+            let page_no = txn
+                .allocate_page(&cx)
+                .await
+                .expect("pipeline commit benchmark should allocate page");
+            let fill = u8::try_from((page_idx % 251) + 1).unwrap();
+            txn.write_page(&cx, page_no, &vec![fill; page_bytes])
+                .await
+                .expect("pipeline commit benchmark should dirty page");
+        }
+        (cx, txn)
+    })
 }
 
 fn bench_vdbe_decode_stage(c: &mut Criterion) {
@@ -2927,7 +2932,7 @@ fn bench_vdbe_commit_stage(c: &mut Criterion) {
             &dirty_pages,
             |b, &dirty_pages| {
                 b.iter_batched(
-                    || runtime.block_on(prepare_commit_stage_fixture(dirty_pages)),
+                    || prepare_commit_stage_fixture(&runtime, dirty_pages),
                     |(cx, mut txn)| {
                         profile_vdbe_commit_stage(|| {
                             runtime

@@ -20,6 +20,7 @@ use fsqlite_ast::{
     JoinConstraint, JoinKind, LikeOp, Literal, NullsOrder, OrderingTerm, ResultColumn, SelectBody,
     SelectCore, SortDirection, Span, TableOrSubquery,
 };
+use fsqlite_types::{SqliteValue, sync_primitives::Instant};
 use lru::LruCache;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -1632,10 +1633,12 @@ pub fn best_access_path_with_rowid_alias_hints(
         table,
         indexes,
         where_terms,
+        where_terms,
         needed_columns,
         None,
         None,
         rowid_alias_hints,
+        true,
     )
 }
 
@@ -1659,10 +1662,12 @@ pub fn best_access_path_with_hints(
         table,
         indexes,
         where_terms,
+        where_terms,
         needed_columns,
         index_hint,
         adaptive_preferred_index.as_deref(),
         &[],
+        true,
     );
 
     if let Some(store) = cracking_hints {
@@ -1679,22 +1684,49 @@ fn best_access_path_internal(
     table: &TableStats,
     indexes: &[IndexInfo],
     where_terms: &[WhereTerm<'_>],
+    partial_index_terms: &[WhereTerm<'_>],
     needed_columns: Option<&[String]>,
     index_hint: Option<&IndexHint>,
     adaptive_preferred_index: Option<&str>,
     rowid_alias_hints: &[RowidAliasHint],
+    unqualified_terms_are_table_local: bool,
 ) -> AccessPath {
     // Only pay the clock read when an INFO subscriber will consume the
     // `selection_elapsed_us` diagnostic below. The cost-estimation path is
     // otherwise allocation- and syscall-free on the per-compile hot loop.
-    let started = tracing::enabled!(tracing::Level::INFO).then(std::time::Instant::now);
+    let started = tracing::enabled!(tracing::Level::INFO).then(Instant::now);
+    let locally_evaluable_terms;
+    let access_terms = if unqualified_terms_are_table_local
+        && where_terms.iter().any(|term| {
+            !table_local_access_path_probe_is_evaluable(term, &table.name, rowid_alias_hints)
+        }) {
+        // A table-local comparison such as `a = b` is a valid residual
+        // predicate, but `b` cannot be evaluated until after reading the same
+        // row. It must not become an index/rowid seek target. Keep it in
+        // `partial_index_terms` for implication, while restricting access-path
+        // selection and executable probe extraction to operands available
+        // before this table scan starts.
+        locally_evaluable_terms = where_terms
+            .iter()
+            .filter(|term| {
+                table_local_access_path_probe_is_evaluable(term, &table.name, rowid_alias_hints)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        &locally_evaluable_terms
+    } else {
+        // Multi-table callers have already applied order-aware binding in
+        // `join_access_path`; an ordinary table-local term set reaches this
+        // branch without allocating when every probe is already evaluable.
+        where_terms
+    };
     let explicit_indexed_by = match index_hint {
         Some(IndexHint::IndexedBy(index_name)) => Some(index_name.as_str()),
         _ => None,
     };
     let not_indexed = matches!(index_hint, Some(IndexHint::NotIndexed));
     let rowid_equality_candidate =
-        find_rowid_equality_term(&table.name, where_terms, rowid_alias_hints).is_some();
+        find_rowid_equality_term(&table.name, access_terms, rowid_alias_hints).is_some();
     // The range branch below is only reached when the equality branch did not
     // match, so the range candidate is dead work in the common point-lookup
     // case — short-circuit it. When it is needed, probe with the
@@ -1703,7 +1735,7 @@ fn best_access_path_internal(
     // `where_term_matches_rowid_range` already requires a present column, so
     // `.any(..)` is equivalent to the previous `.is_some()`.
     let rowid_range_candidate = !rowid_equality_candidate
-        && where_terms
+        && access_terms
             .iter()
             .any(|term| where_term_matches_rowid_range(&table.name, term, rowid_alias_hints));
 
@@ -1782,20 +1814,27 @@ fn best_access_path_internal(
             explicit_hint_missing = false;
         }
 
-        // Partial index gate: skip unless the query's WHERE implies the
-        // index's WHERE predicate. We use a conservative structural check:
-        // the index predicate must appear as a conjunct in the query WHERE.
+        // Partial index gate: skip unless the query's WHERE conservatively
+        // implies every conjunct in the index predicate. The proof accepts a
+        // small explicit lattice of same-bound comparisons and non-NULL
+        // guarantees; unknown affinity, collation, or function semantics fail
+        // closed.
         if let Some(ref partial_pred) = idx.partial_where {
-            if !where_terms_imply_predicate(where_terms, partial_pred) {
+            if !where_terms_imply_predicate(
+                partial_index_terms,
+                partial_pred,
+                &idx.table,
+                unqualified_terms_are_table_local,
+            ) {
                 partial_indexes_pruned += 1;
                 continue;
             }
         }
 
         let mut skip_scan_candidate = None;
-        let usability = match analyze_index_usability(idx, where_terms) {
+        let usability = match analyze_index_usability(idx, access_terms) {
             IndexUsability::NotUsable => {
-                if let Some(candidate) = analyze_skip_scan_candidate(table, idx, where_terms) {
+                if let Some(candidate) = analyze_skip_scan_candidate(table, idx, access_terms) {
                     skip_scan_candidates += 1;
                     skip_scan_candidate = Some(candidate);
                     IndexUsability::Range {
@@ -1996,7 +2035,7 @@ fn best_access_path_internal(
     best.probe = extract_access_path_probe_with_rowid_aliases(
         &best,
         indexes,
-        where_terms,
+        access_terms,
         rowid_alias_hints,
     );
 
@@ -2077,31 +2116,67 @@ fn best_access_path_internal(
 ///
 /// This is intentionally stronger than plain structural equality for common
 /// partial-index predicates. It accepts exact conjunct matches, commuted
-/// equality/range comparisons, stronger range bounds on the same column, and
-/// non-NULL comparisons implying `IS NOT NULL`.
-fn where_terms_imply_predicate(terms: &[WhereTerm<'_>], predicate: &Expr) -> bool {
+/// comparisons with the same literal, same-bound operator implications, and
+/// non-NULL comparisons implying `IS NOT NULL`. Distinct literal bounds are
+/// deliberately not ordered here: without proven column affinity and collation,
+/// their Rust ordering does not establish SQLite comparison implication.
+fn where_terms_imply_predicate(
+    terms: &[WhereTerm<'_>],
+    predicate: &Expr,
+    index_table: &str,
+    unqualified_terms_are_table_local: bool,
+) -> bool {
     let pred_conjuncts = decompose_where(predicate);
     pred_conjuncts.iter().all(|predicate_conjunct| {
-        terms
-            .iter()
-            .any(|term| expr_implies_partial_predicate(term.expr, predicate_conjunct))
+        terms.iter().any(|term| {
+            expr_implies_partial_predicate(
+                term.expr,
+                predicate_conjunct,
+                index_table,
+                unqualified_terms_are_table_local,
+            )
+        })
     })
 }
 
-fn expr_implies_partial_predicate(query_expr: &Expr, predicate: &Expr) -> bool {
-    if query_expr == predicate {
+fn expr_implies_partial_predicate(
+    query_expr: &Expr,
+    predicate: &Expr,
+    index_table: &str,
+    unqualified_terms_are_table_local: bool,
+) -> bool {
+    // Exact arbitrary predicates are a binding proof only after normalizing
+    // columns within a proven table scope. Single-table callers have already
+    // resolved bare columns to `index_table`; multi-table callers must spell
+    // every column with that table's visible qualifier. The normalizer strips
+    // only that qualifier, folds identifier case, and rejects nested scopes or
+    // any foreign table before structural comparison.
+    let query_is_bound_to_index_table = unqualified_terms_are_table_local
+        || expr_uses_only_explicit_table_columns(query_expr, index_table);
+    if query_is_bound_to_index_table
+        && expression_matches_index_key(query_expr, predicate, index_table)
+    {
         return true;
     }
 
     if let Some(predicate_column) = normalize_is_not_null_predicate(predicate) {
-        return expr_guarantees_non_null(query_expr, &predicate_column);
+        return expr_guarantees_non_null(
+            query_expr,
+            &predicate_column,
+            index_table,
+            unqualified_terms_are_table_local,
+        );
     }
 
     match (
         normalize_column_literal_comparison(query_expr),
         normalize_column_literal_comparison(predicate),
     ) {
-        (Some(query_cmp), Some(predicate_cmp)) => query_cmp.implies(&predicate_cmp),
+        (Some(query_cmp), Some(predicate_cmp)) => query_cmp.implies(
+            &predicate_cmp,
+            index_table,
+            unqualified_terms_are_table_local,
+        ),
         _ => false,
     }
 }
@@ -2114,96 +2189,200 @@ struct NormalizedColumnComparison {
 }
 
 impl NormalizedColumnComparison {
-    fn implies(&self, predicate: &Self) -> bool {
-        if !where_columns_compatible(&self.column, &predicate.column) {
+    fn implies(
+        &self,
+        predicate: &Self,
+        index_table: &str,
+        unqualified_terms_are_table_local: bool,
+    ) -> bool {
+        if !where_columns_match_partial_index(
+            &self.column,
+            &predicate.column,
+            index_table,
+            unqualified_terms_are_table_local,
+        ) || self.literal != predicate.literal
+        {
             return false;
         }
 
-        let Some(ordering) = compare_partial_index_literals(&self.literal, &predicate.literal)
-        else {
-            return false;
-        };
-
         match self.op {
-            AstBinaryOp::Eq => literal_satisfies_predicate_literal(ordering, predicate.op),
+            AstBinaryOp::Eq => matches!(
+                predicate.op,
+                AstBinaryOp::Eq | AstBinaryOp::Ge | AstBinaryOp::Le
+            ),
             AstBinaryOp::Gt => {
                 matches!(predicate.op, AstBinaryOp::Gt | AstBinaryOp::Ge)
-                    && matches!(
-                        ordering,
-                        std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
-                    )
             }
-            AstBinaryOp::Ge => match predicate.op {
-                AstBinaryOp::Gt => matches!(ordering, std::cmp::Ordering::Greater),
-                AstBinaryOp::Ge => matches!(
-                    ordering,
-                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
-                ),
-                _ => false,
-            },
+            AstBinaryOp::Ge => predicate.op == AstBinaryOp::Ge,
             AstBinaryOp::Lt => {
                 matches!(predicate.op, AstBinaryOp::Lt | AstBinaryOp::Le)
-                    && matches!(
-                        ordering,
-                        std::cmp::Ordering::Less | std::cmp::Ordering::Equal
-                    )
             }
-            AstBinaryOp::Le => match predicate.op {
-                AstBinaryOp::Lt => matches!(ordering, std::cmp::Ordering::Less),
-                AstBinaryOp::Le => matches!(
-                    ordering,
-                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
-                ),
-                _ => false,
-            },
+            AstBinaryOp::Le => predicate.op == AstBinaryOp::Le,
             _ => false,
         }
     }
 }
 
-fn literal_satisfies_predicate_literal(
-    ordering: std::cmp::Ordering,
-    predicate_op: AstBinaryOp,
+fn expr_guarantees_non_null(
+    expr: &Expr,
+    predicate_column: &WhereColumn,
+    index_table: &str,
+    unqualified_terms_are_table_local: bool,
 ) -> bool {
-    match predicate_op {
-        AstBinaryOp::Eq => matches!(ordering, std::cmp::Ordering::Equal),
-        AstBinaryOp::Gt => matches!(ordering, std::cmp::Ordering::Greater),
-        AstBinaryOp::Ge => matches!(
-            ordering,
-            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
-        ),
-        AstBinaryOp::Lt => matches!(ordering, std::cmp::Ordering::Less),
-        AstBinaryOp::Le => matches!(
-            ordering,
-            std::cmp::Ordering::Less | std::cmp::Ordering::Equal
-        ),
-        _ => false,
-    }
-}
-
-fn expr_guarantees_non_null(expr: &Expr, predicate_column: &WhereColumn) -> bool {
-    if let Some(query_cmp) = normalize_column_literal_comparison(expr) {
-        return where_columns_compatible(&query_cmp.column, predicate_column)
-            && !matches!(query_cmp.literal, Literal::Null);
+    if direct_comparison_guarantees_non_null(
+        expr,
+        predicate_column,
+        index_table,
+        unqualified_terms_are_table_local,
+    ) {
+        return true;
     }
 
     if let Some((column, _)) = classify_or_disjunction_as_in_list(expr) {
-        return where_columns_compatible(&column, predicate_column);
+        return where_columns_match_partial_index(
+            &column,
+            predicate_column,
+            index_table,
+            unqualified_terms_are_table_local,
+        );
     }
 
     match expr {
-        Expr::Between { expr: inner, .. }
-        | Expr::In { expr: inner, .. }
-        | Expr::Like { expr: inner, .. } => extract_where_column(inner)
-            .is_some_and(|column| where_columns_compatible(&column, predicate_column)),
+        Expr::Between { expr: inner, .. } => extract_where_column(inner).is_some_and(|column| {
+            where_columns_match_partial_index(
+                &column,
+                predicate_column,
+                index_table,
+                unqualified_terms_are_table_local,
+            )
+        }),
+        Expr::In {
+            expr: inner,
+            set,
+            not,
+            ..
+        } => {
+            // SQLite makes `NULL NOT IN` true when the RHS is empty. A
+            // subquery/table may be empty at execution, and an explicit empty
+            // list is empty by construction, so those negative forms do not
+            // prove the left operand non-NULL. A non-empty literal list does:
+            // with a NULL left operand its result is NULL, never true.
+            let proves_non_null = !*not || matches!(set, InSet::List(items) if !items.is_empty());
+            proves_non_null
+                && extract_where_column(inner).is_some_and(|column| {
+                    where_columns_match_partial_index(
+                        &column,
+                        predicate_column,
+                        index_table,
+                        unqualified_terms_are_table_local,
+                    )
+                })
+        }
         Expr::IsNull {
             expr: inner,
             not: true,
             ..
-        } => extract_where_column(inner)
-            .is_some_and(|column| where_columns_compatible(&column, predicate_column)),
+        } => extract_where_column(inner).is_some_and(|column| {
+            where_columns_match_partial_index(
+                &column,
+                predicate_column,
+                index_table,
+                unqualified_terms_are_table_local,
+            )
+        }),
         _ => false,
     }
+}
+
+fn direct_comparison_guarantees_non_null(
+    expr: &Expr,
+    predicate_column: &WhereColumn,
+    index_table: &str,
+    unqualified_terms_are_table_local: bool,
+) -> bool {
+    let Expr::BinaryOp {
+        left, op, right, ..
+    } = expr
+    else {
+        return false;
+    };
+    let column_matches = |candidate: &Expr| {
+        extract_where_column(candidate).is_some_and(|column| {
+            where_columns_match_partial_index(
+                &column,
+                predicate_column,
+                index_table,
+                unqualified_terms_are_table_local,
+            )
+        })
+    };
+    let is_explicit_null = |candidate: &Expr| {
+        let mut candidate = candidate;
+        loop {
+            match candidate {
+                Expr::Literal(Literal::Null, _)
+                | Expr::BoundOuterValue {
+                    value: SqliteValue::Null,
+                    ..
+                } => break true,
+                Expr::UnaryOp { expr: inner, .. }
+                | Expr::Cast { expr: inner, .. }
+                | Expr::Collate { expr: inner, .. } => candidate = inner,
+                _ => break false,
+            }
+        }
+    };
+
+    match op {
+        // SQL's ordinary comparisons are NULL-propagating. Regardless of the
+        // opposite operand's shape or runtime value, a TRUE result proves that
+        // every directly referenced comparison column is non-NULL. Keep an
+        // explicit NULL operand fail-closed: that predicate can never be TRUE,
+        // so selecting a partial index provides no useful probe while making
+        // the implication proof depend on vacuous truth.
+        AstBinaryOp::Eq
+        | AstBinaryOp::Ne
+        | AstBinaryOp::Lt
+        | AstBinaryOp::Le
+        | AstBinaryOp::Gt
+        | AstBinaryOp::Ge => {
+            (column_matches(left) && !is_explicit_null(right))
+                || (column_matches(right) && !is_explicit_null(left))
+        }
+        // Unlike ordinary comparisons, `NULL IS NULL` is TRUE. Only admit an
+        // IS proof when the opposite side is a source-level non-NULL literal;
+        // a placeholder may bind NULL and must remain fail-closed.
+        AstBinaryOp::Is => {
+            let is_non_null_literal = |candidate: &Expr| matches!(candidate, Expr::Literal(literal, _) if !matches!(literal, Literal::Null));
+            (column_matches(left) && is_non_null_literal(right))
+                || (column_matches(right) && is_non_null_literal(left))
+        }
+        _ => false,
+    }
+}
+
+fn where_columns_match_partial_index(
+    query: &WhereColumn,
+    predicate: &WhereColumn,
+    index_table: &str,
+    unqualified_terms_are_table_local: bool,
+) -> bool {
+    query.column.eq_ignore_ascii_case(&predicate.column)
+        && match (&query.table, &predicate.table) {
+            (None, None) => unqualified_terms_are_table_local,
+            // Partial-index predicates are table-local. A query qualifier that
+            // names the indexed table therefore binds the otherwise bare
+            // predicate column without treating arbitrary qualifiers as
+            // wildcards.
+            (Some(query_table), None) => query_table.eq_ignore_ascii_case(index_table),
+            // The reverse direction needs name-resolution evidence for the
+            // unqualified query column, which this planner seam does not carry.
+            (None, Some(_)) => false,
+            (Some(query_table), Some(predicate_table)) => {
+                query_table.eq_ignore_ascii_case(predicate_table)
+                    && query_table.eq_ignore_ascii_case(index_table)
+            }
+        }
 }
 
 fn normalize_is_not_null_predicate(expr: &Expr) -> Option<WhereColumn> {
@@ -2265,25 +2444,6 @@ fn reverse_comparison_op(op: AstBinaryOp) -> Option<AstBinaryOp> {
         AstBinaryOp::Ge => Some(AstBinaryOp::Le),
         _ => None,
     }
-}
-
-fn compare_partial_index_literals(left: &Literal, right: &Literal) -> Option<std::cmp::Ordering> {
-    match (left, right) {
-        (Literal::Integer(lhs), Literal::Integer(rhs)) => Some(lhs.cmp(rhs)),
-        (Literal::Float(lhs), Literal::Float(rhs)) => lhs.partial_cmp(rhs),
-        (Literal::Integer(lhs), Literal::Float(rhs)) => (*lhs as f64).partial_cmp(rhs),
-        (Literal::Float(lhs), Literal::Integer(rhs)) => lhs.partial_cmp(&(*rhs as f64)),
-        (Literal::String(lhs), Literal::String(rhs)) => Some(lhs.cmp(rhs)),
-        _ => None,
-    }
-}
-
-fn where_columns_compatible(left: &WhereColumn, right: &WhereColumn) -> bool {
-    left.column.eq_ignore_ascii_case(&right.column)
-        && match (&left.table, &right.table) {
-            (Some(lhs), Some(rhs)) => lhs.eq_ignore_ascii_case(rhs),
-            _ => true,
-        }
 }
 
 // ---------------------------------------------------------------------------
@@ -2391,32 +2551,40 @@ pub fn decompose_where(expr: &Expr) -> Vec<&Expr> {
 }
 
 fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
-    if let Expr::BinaryOp {
-        left,
-        op: AstBinaryOp::And,
-        right,
-        ..
-    } = expr
-    {
-        collect_conjuncts(left, out);
-        collect_conjuncts(right, out);
-    } else {
-        out.push(expr);
+    let mut pending = FoldStack::<_, 16>::new();
+    pending.push(expr);
+    while let Some(term) = pending.pop() {
+        if let Expr::BinaryOp {
+            left,
+            op: AstBinaryOp::And,
+            right,
+            ..
+        } = term
+        {
+            pending.push(right);
+            pending.push(left);
+        } else {
+            out.push(term);
+        }
     }
 }
 
 fn collect_disjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
-    if let Expr::BinaryOp {
-        left,
-        op: AstBinaryOp::Or,
-        right,
-        ..
-    } = expr
-    {
-        collect_disjuncts(left, out);
-        collect_disjuncts(right, out);
-    } else {
-        out.push(expr);
+    let mut pending = FoldStack::<_, 16>::new();
+    pending.push(expr);
+    while let Some(term) = pending.pop() {
+        if let Expr::BinaryOp {
+            left,
+            op: AstBinaryOp::Or,
+            right,
+            ..
+        } = term
+        {
+            pending.push(right);
+            pending.push(left);
+        } else {
+            out.push(term);
+        }
     }
 }
 
@@ -2436,7 +2604,7 @@ fn classify_or_disjunction_as_in_list(expr: &Expr) -> Option<(WhereColumn, usize
         return None;
     }
 
-    let mut shared_column: Option<WhereColumn> = None;
+    let mut shared_candidates: Option<Vec<WhereColumn>> = None;
 
     for disjunct in disjuncts.iter().copied() {
         let Expr::BinaryOp {
@@ -2449,25 +2617,47 @@ fn classify_or_disjunction_as_in_list(expr: &Expr) -> Option<(WhereColumn, usize
             return None;
         };
 
-        let column = match (extract_where_column(left), extract_where_column(right)) {
-            (Some(column), None) | (None, Some(column)) => column,
-            _ => return None,
-        };
-
-        if is_rowid_column(&column) {
+        let mut candidates = [extract_where_column(left), extract_where_column(right)]
+            .into_iter()
+            .flatten()
+            .filter(|column| !is_rowid_column(column))
+            .collect::<Vec<_>>();
+        candidates.dedup_by(|left, right| where_columns_equivalent(left, right));
+        if candidates.is_empty() {
             return None;
         }
 
-        if let Some(ref existing) = shared_column {
-            if !where_columns_equivalent(existing, &column) {
+        if let Some(existing) = &mut shared_candidates {
+            existing.retain(|candidate| {
+                candidates
+                    .iter()
+                    .any(|column| where_columns_equivalent(candidate, column))
+            });
+            if existing.is_empty() {
                 return None;
             }
         } else {
-            shared_column = Some(column);
+            shared_candidates = Some(candidates);
         }
     }
 
-    shared_column.map(|column| (column, disjuncts.len()))
+    let mut shared_candidates = shared_candidates?;
+    if shared_candidates.len() != 1 {
+        // More than one shared column makes probe orientation ambiguous, as
+        // with `(t1.a = t2.a) OR (t1.a = t2.a)`.
+        return None;
+    }
+    let column = shared_candidates.pop()?;
+    let table_name = column.table.as_deref().unwrap_or("");
+    if !disjuncts.iter().all(|disjunct| {
+        comparison_operand_for_column(disjunct, table_name, &column.column).is_some()
+    }) {
+        // The shared column must occur on exactly one side of every equality.
+        // A tautology such as `t1.a = t1.a` has no probe operand and therefore
+        // cannot be represented as an executable IN-list rewrite.
+        return None;
+    }
+    Some((column, disjuncts.len()))
 }
 
 /// Classify a single WHERE expression into a [`WhereTerm`].
@@ -2513,9 +2703,7 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
             right,
             ..
         } => {
-            if matches!(left.as_ref(), Expr::Literal(Literal::Null, _))
-                || matches!(right.as_ref(), Expr::Literal(Literal::Null, _))
-            {
+            if expr_is_null_constant(left) || expr_is_null_constant(right) {
                 return WhereTerm {
                     expr,
                     column: None,
@@ -2685,6 +2873,17 @@ fn extract_where_column(expr: &Expr) -> Option<WhereColumn> {
     }
 }
 
+fn expr_is_null_constant(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(Literal::Null, _)
+            | Expr::BoundOuterValue {
+                value: SqliteValue::Null,
+                ..
+            }
+    )
+}
+
 /// Check if a `WhereColumn` is a rowid alias.
 fn is_rowid_column(wc: &WhereColumn) -> bool {
     is_rowid_alias_name(&wc.column)
@@ -2743,18 +2942,59 @@ fn find_rowid_range_column<'a>(
     })
 }
 
-/// Extract the non-column side of a binary comparison expression.
-fn extract_comparison_operand(expr: &Expr) -> Option<Expr> {
+/// Extract the side opposite one specific table column from a binary
+/// comparison expression.
+fn comparison_operand_for_column<'expr>(
+    expr: &'expr Expr,
+    table_name: &str,
+    column_name: &str,
+) -> Option<&'expr Expr> {
     let Expr::BinaryOp { left, right, .. } = expr else {
         return None;
     };
-    if extract_where_column(left).is_some() {
-        Some(right.as_ref().clone())
-    } else if extract_where_column(right).is_some() {
-        Some(left.as_ref().clone())
-    } else {
-        None
+    let matches_target = |expr: &Expr| {
+        extract_where_column(expr).is_some_and(|column| {
+            identifier_eq(&column.column, column_name)
+                && column
+                    .table
+                    .as_deref()
+                    .is_none_or(|qualifier| identifier_eq(qualifier, table_name))
+        })
+    };
+    match (matches_target(left), matches_target(right)) {
+        (true, false) => Some(right),
+        (false, true) => Some(left),
+        (true, true) | (false, false) => None,
     }
+}
+
+/// Extract the opposite operand of a comparison against one fully identified
+/// WHERE column.  Unlike [`comparison_operand_for_column`], this preserves a
+/// query alias qualifier, which is required for schema-provided rowid aliases.
+fn comparison_operand_for_where_column<'expr>(
+    expr: &'expr Expr,
+    target_column: &WhereColumn,
+) -> Option<&'expr Expr> {
+    let Expr::BinaryOp { left, right, .. } = expr else {
+        return None;
+    };
+    let matches_target = |expr: &Expr| {
+        extract_where_column(expr)
+            .is_some_and(|column| where_columns_equivalent(&column, target_column))
+    };
+    match (matches_target(left), matches_target(right)) {
+        (true, false) => Some(right),
+        (false, true) => Some(left),
+        (true, true) | (false, false) => None,
+    }
+}
+
+fn extract_comparison_operand_for_column(
+    expr: &Expr,
+    table_name: &str,
+    column_name: &str,
+) -> Option<Expr> {
+    comparison_operand_for_column(expr, table_name, column_name).cloned()
 }
 
 /// Given a finalized [`AccessPath`] and the WHERE terms that produced it,
@@ -2770,7 +3010,8 @@ fn extract_access_path_probe_with_rowid_aliases(
         AccessPathKind::FullTableScan => None,
         AccessPathKind::RowidLookup => {
             let term = find_rowid_equality_term(&best.table, where_terms, rowid_alias_hints)?;
-            let target = extract_comparison_operand(term.expr)?;
+            let column = term.column.as_ref()?;
+            let target = comparison_operand_for_where_column(term.expr, column)?.clone();
             Some(AccessPathProbe::RowidEquality {
                 target: Box::new(target),
             })
@@ -2787,7 +3028,8 @@ fn extract_access_path_probe_with_rowid_aliases(
                         .as_ref()
                         .is_some_and(|c| identifier_eq(&c.column, leading_col))
             }) {
-                let target = extract_comparison_operand(term.expr)?;
+                let target =
+                    extract_comparison_operand_for_column(term.expr, &best.table, leading_col)?;
                 return Some(AccessPathProbe::Equality {
                     column: leading_col.clone(),
                     target: Box::new(target),
@@ -2799,7 +3041,7 @@ fn extract_access_path_probe_with_rowid_aliases(
                         .as_ref()
                         .is_some_and(|c| identifier_eq(&c.column, leading_col))
             }) {
-                return extract_in_list_probe(term.expr, leading_col);
+                return extract_in_list_probe(term.expr, &best.table, leading_col);
             }
             None
         }
@@ -2807,20 +3049,21 @@ fn extract_access_path_probe_with_rowid_aliases(
             if best.index.is_none() {
                 let leading_col =
                     find_rowid_range_column(&best.table, where_terms, rowid_alias_hints)?;
-                return extract_range_probe_for_column(where_terms, leading_col);
+                return extract_range_probe_for_column(where_terms, &best.table, leading_col);
             }
             let index_name = best.index.as_deref()?;
             let idx = indexes
                 .iter()
                 .find(|i| identifier_eq(&i.name, index_name))?;
             let leading_col = idx.columns.first()?;
-            extract_range_probe_for_column(where_terms, leading_col)
+            extract_range_probe_for_column(where_terms, &best.table, leading_col)
         }
     }
 }
 
 fn extract_range_probe_for_column(
     where_terms: &[WhereTerm<'_>],
+    table_name: &str,
     leading_col: &str,
 ) -> Option<AccessPathProbe> {
     let mut lower: Option<(Box<Expr>, bool)> = None;
@@ -2831,7 +3074,7 @@ fn extract_range_probe_for_column(
             _ => continue,
         };
         if matches!(term.kind, WhereTermKind::Equality) {
-            let target = extract_comparison_operand(term.expr)?;
+            let target = extract_comparison_operand_for_column(term.expr, table_name, leading_col)?;
             return Some(AccessPathProbe::Equality {
                 column: col.column.clone(),
                 target: Box::new(target),
@@ -2874,7 +3117,19 @@ fn extract_range_probe_for_column(
             left, op, right, ..
         } = term.expr
         {
-            let col_on_left = extract_where_column(left).is_some();
+            let side_matches = |expr: &Expr| {
+                extract_where_column(expr).is_some_and(|column| {
+                    identifier_eq(&column.column, leading_col)
+                        && column
+                            .table
+                            .as_deref()
+                            .is_none_or(|qualifier| identifier_eq(qualifier, table_name))
+                })
+            };
+            let (col_on_left, col_on_right) = (side_matches(left), side_matches(right));
+            if col_on_left == col_on_right {
+                continue;
+            }
             match op {
                 AstBinaryOp::Gt => {
                     let val = if col_on_left { right } else { left };
@@ -2923,7 +3178,7 @@ fn extract_range_probe_for_column(
     }
 }
 
-fn extract_in_list_probe(expr: &Expr, column: &str) -> Option<AccessPathProbe> {
+fn extract_in_list_probe(expr: &Expr, table_name: &str, column: &str) -> Option<AccessPathProbe> {
     if let Expr::In {
         set: InSet::List(items),
         not: false,
@@ -2934,6 +3189,29 @@ fn extract_in_list_probe(expr: &Expr, column: &str) -> Option<AccessPathProbe> {
         if values.is_empty() {
             return None;
         }
+        return Some(AccessPathProbe::InList {
+            column: column.to_owned(),
+            values,
+        });
+    }
+    if matches!(
+        expr,
+        Expr::BinaryOp {
+            op: AstBinaryOp::Or,
+            ..
+        }
+    ) {
+        let mut disjuncts = Vec::new();
+        collect_disjuncts(expr, &mut disjuncts);
+        if disjuncts.len() < 2 {
+            return None;
+        }
+        let values = disjuncts
+            .into_iter()
+            .map(|disjunct| {
+                extract_comparison_operand_for_column(disjunct, table_name, column).map(Box::new)
+            })
+            .collect::<Option<Vec<_>>>()?;
         return Some(AccessPathProbe::InList {
             column: column.to_owned(),
             values,
@@ -3262,12 +3540,14 @@ fn analyze_expression_index_usability(
             // cannot drive an index seek (SQL semantics), so skip the
             // `x = NULL` / `NULL = x` degenerate forms exactly like
             // classify_where_term does for plain columns.
-            let left_is_null = matches!(left.as_ref(), Expr::Literal(Literal::Null, _));
-            let right_is_null = matches!(right.as_ref(), Expr::Literal(Literal::Null, _));
+            let left_is_null = expr_is_null_constant(left);
+            let right_is_null = expr_is_null_constant(right);
             if left_is_null || right_is_null {
                 continue;
             }
-            if **left == *first_expr || **right == *first_expr {
+            if expression_matches_index_key(left, first_expr, &index.table)
+                || expression_matches_index_key(right, first_expr, &index.table)
+            {
                 return IndexUsability::Equality;
             }
         }
@@ -3282,7 +3562,9 @@ fn analyze_expression_index_usability(
             ..
         } = term.expr
         {
-            if **left == *first_expr || **right == *first_expr {
+            if expression_matches_index_key(left, first_expr, &index.table)
+                || expression_matches_index_key(right, first_expr, &index.table)
+            {
                 return IndexUsability::Range {
                     selectivity: DEFAULT_RANGE_SELECTIVITY,
                 };
@@ -3292,7 +3574,7 @@ fn analyze_expression_index_usability(
             expr: inner, not, ..
         } = term.expr
         {
-            if !*not && **inner == *first_expr {
+            if !*not && expression_matches_index_key(inner, first_expr, &index.table) {
                 return IndexUsability::Range {
                     selectivity: DEFAULT_RANGE_SELECTIVITY,
                 };
@@ -3301,6 +3583,139 @@ fn analyze_expression_index_usability(
     }
 
     IndexUsability::NotUsable
+}
+
+fn expression_matches_index_key(query: &Expr, key: &Expr, index_table: &str) -> bool {
+    let mut normalized_query = query.clone();
+    let mut normalized_key = key.clone();
+    normalize_expression_index_columns(&mut normalized_query, index_table)
+        && normalize_expression_index_columns(&mut normalized_key, index_table)
+        && normalized_query == normalized_key
+}
+
+/// Canonicalize columns for expression-index structural matching.
+///
+/// Index definitions are parsed outside the query and therefore normally
+/// store bare columns, while a query may qualify the same column with the
+/// table's visible name or alias. Strip only that proven-local qualifier and
+/// fold the column name to SQLite's case-insensitive identifier form. A
+/// foreign qualifier or a nested scope fails closed.
+fn normalize_expression_index_columns(expr: &mut Expr, index_table: &str) -> bool {
+    match expr {
+        Expr::Literal(..) | Expr::Placeholder(..) => true,
+        Expr::Column(column, _) => {
+            if column
+                .table
+                .as_deref()
+                .is_some_and(|qualifier| !identifier_eq(qualifier, index_table))
+            {
+                return false;
+            }
+            column.table = None;
+            column.column = column.column.to_ascii_lowercase().into();
+            true
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            normalize_expression_index_columns(left, index_table)
+                && normalize_expression_index_columns(right, index_table)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Collate { expr, .. } | Expr::IsNull { expr, .. } => {
+            normalize_expression_index_columns(expr, index_table)
+        }
+        Expr::Cast {
+            expr, type_name, ..
+        } => {
+            type_name.name.make_ascii_lowercase();
+            if let Some(arg) = &mut type_name.arg1 {
+                arg.make_ascii_lowercase();
+            }
+            if let Some(arg) = &mut type_name.arg2 {
+                arg.make_ascii_lowercase();
+            }
+            normalize_expression_index_columns(expr, index_table)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            normalize_expression_index_columns(expr, index_table)
+                && normalize_expression_index_columns(low, index_table)
+                && normalize_expression_index_columns(high, index_table)
+        }
+        Expr::In { expr, set, .. } => {
+            normalize_expression_index_columns(expr, index_table)
+                && match set {
+                    InSet::List(items) => items
+                        .iter_mut()
+                        .all(|item| normalize_expression_index_columns(item, index_table)),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            normalize_expression_index_columns(expr, index_table)
+                && normalize_expression_index_columns(pattern, index_table)
+                && escape
+                    .as_deref_mut()
+                    .is_none_or(|escape| normalize_expression_index_columns(escape, index_table))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref_mut()
+                .is_none_or(|operand| normalize_expression_index_columns(operand, index_table))
+                && whens.iter_mut().all(|(when, then)| {
+                    normalize_expression_index_columns(when, index_table)
+                        && normalize_expression_index_columns(then, index_table)
+                })
+                && else_expr.as_deref_mut().is_none_or(|else_expr| {
+                    normalize_expression_index_columns(else_expr, index_table)
+                })
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let args_local = match args {
+                fsqlite_ast::FunctionArgs::Star => false,
+                fsqlite_ast::FunctionArgs::List(args) => args
+                    .iter_mut()
+                    .all(|arg| normalize_expression_index_columns(arg, index_table)),
+            };
+            args_local
+                && order_by
+                    .iter_mut()
+                    .all(|term| normalize_expression_index_columns(&mut term.expr, index_table))
+                && filter
+                    .as_deref_mut()
+                    .is_none_or(|filter| normalize_expression_index_columns(filter, index_table))
+                && over.is_none()
+        }
+        Expr::RowValue(items, _) => items
+            .iter_mut()
+            .all(|item| normalize_expression_index_columns(item, index_table)),
+        // Bound values are runtime-only nodes, while subqueries and RAISE
+        // expressions cannot be part of a local expression-index key.
+        Expr::BoundOuterValue { .. }
+        | Expr::Exists { .. }
+        | Expr::Subquery(..)
+        | Expr::Raise { .. } => false,
+    }
 }
 
 /// Default selectivity for range constraints when no ANALYZE data is available.
@@ -4110,25 +4525,528 @@ pub fn order_joins(
     )
 }
 
+#[derive(Clone, Copy)]
+struct JoinAccessPathContext<'a> {
+    table_index_hints: Option<&'a BTreeMap<String, IndexHint>>,
+    cracking_hints: Option<&'a CrackingHintStore>,
+    available_outer_tables: &'a [String],
+    unqualified_terms_are_table_local: bool,
+}
+
 fn join_access_path(
     table: &TableStats,
     indexes: &[IndexInfo],
     where_terms: &[WhereTerm<'_>],
     needed_columns: Option<&[String]>,
-    table_index_hints: Option<&BTreeMap<String, IndexHint>>,
-    cracking_hints: Option<&CrackingHintStore>,
+    context: JoinAccessPathContext<'_>,
 ) -> AccessPath {
-    let explicit_hint = lookup_table_index_hint(&table.name, table_index_hints);
-    let adaptive_hint = cracking_hints.and_then(|store| store.preferred_index(&table.name));
+    let explicit_hint = lookup_table_index_hint(&table.name, context.table_index_hints);
+    let forced_index = match explicit_hint {
+        Some(IndexHint::IndexedBy(index_name)) => indexes.iter().find(|index| {
+            identifier_eq(&index.table, &table.name) && identifier_eq(&index.name, index_name)
+        }),
+        Some(IndexHint::NotIndexed) | None => None,
+    };
+    let adaptive_hint = context
+        .cracking_hints
+        .and_then(|store| store.preferred_index(&table.name));
+    let bound_terms;
+    let access_terms = if context.unqualified_terms_are_table_local {
+        where_terms
+    } else {
+        // `order_joins` receives one global WHERE-term set. Without completed
+        // name-resolution metadata, a bare constrained column cannot safely
+        // drive an ordinary index, rowid lookup, skip-scan, or extracted probe
+        // for every table that happens to expose the same name. Keep explicitly
+        // qualified constrained columns. A join comparison is usable only when
+        // every column in its opposite probe operand belongs to an outer table
+        // that is already present in this candidate join prefix. The complete
+        // term set is still passed separately for fail-closed partial-index
+        // implication, because a same-row residual may prove an index predicate
+        // without being executable as a pre-scan probe.
+        bound_terms = where_terms
+            .iter()
+            .filter_map(|term| {
+                bind_where_term_to_table(term, &table.name, context.available_outer_tables).or_else(
+                    || {
+                        forced_index
+                            .filter(|index| {
+                                bare_term_is_forced_index_probe(term, &table.name, index)
+                            })
+                            .map(|_| term.clone())
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        &bound_terms
+    };
     best_access_path_internal(
         table,
         indexes,
+        access_terms,
         where_terms,
         needed_columns,
         explicit_hint,
         adaptive_hint,
         &[],
+        context.unqualified_terms_are_table_local,
     )
+}
+
+/// A join planner has no schema-level owner for an unqualified column.  An
+/// explicit `INDEXED BY` requirement makes one ordinary index mandatory,
+/// though, so a scalar equality on that index's leftmost bare column can be
+/// bound to the required table without admitting unrelated predicates.
+fn bare_term_is_forced_index_probe(
+    term: &WhereTerm<'_>,
+    table_name: &str,
+    index: &IndexInfo,
+) -> bool {
+    matches!(term.kind, WhereTermKind::Equality)
+        && index.expression_columns.is_empty()
+        && term.column.as_ref().is_some_and(|column| {
+            column.table.is_none()
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|leading| identifier_eq(leading, &column.column))
+        })
+        && table_local_index_probe_is_evaluable(term, table_name)
+}
+
+fn bind_where_term_to_table<'expr>(
+    term: &WhereTerm<'expr>,
+    table_name: &str,
+    available_outer_tables: &[String],
+) -> Option<WhereTerm<'expr>> {
+    let qualifier_matches = |column: &WhereColumn| {
+        column
+            .table
+            .as_deref()
+            .is_some_and(|qualifier| identifier_eq(qualifier, table_name))
+    };
+    let (column, probe_operand) = match term.kind {
+        WhereTermKind::Equality | WhereTermKind::RowidEquality | WhereTermKind::Range => {
+            let (column, operand) = qualified_comparison_probe_operand(term.expr, table_name)?;
+            (Some(column), operand)
+        }
+        WhereTermKind::Other => {
+            let column = term
+                .column
+                .clone()
+                .filter(|column| qualifier_matches(column));
+            let mut qualifiers = HashSet::new();
+            collect_table_refs(term.expr, &mut qualifiers);
+            let references_target = qualifiers
+                .iter()
+                .any(|qualifier| identifier_eq(qualifier, table_name));
+            if !references_target
+                || !expr_uses_only_qualified_table_columns(term.expr, table_name)
+                || !table_local_index_probe_is_evaluable(term, table_name)
+            {
+                return None;
+            }
+            (column, term.expr)
+        }
+        WhereTermKind::Between
+        | WhereTermKind::InList { .. }
+        | WhereTermKind::LikePrefix { .. } => (
+            Some(
+                term.column
+                    .clone()
+                    .filter(|column| qualifier_matches(column))?,
+            ),
+            term.expr,
+        ),
+    };
+    if matches!(
+        term.kind,
+        WhereTermKind::Equality | WhereTermKind::RowidEquality | WhereTermKind::Range
+    ) && !probe_operand_uses_only_available_columns(probe_operand, available_outer_tables)
+    {
+        return None;
+    }
+    let remaining_probe_operands_available = match (&term.kind, term.expr) {
+        (WhereTermKind::Between, Expr::Between { low, high, .. }) => {
+            probe_operand_uses_only_available_columns(low, available_outer_tables)
+                && probe_operand_uses_only_available_columns(high, available_outer_tables)
+        }
+        (WhereTermKind::InList { .. }, Expr::In { set, .. }) => match set {
+            InSet::List(items) => {
+                !items.is_empty()
+                    && items.iter().all(|item| {
+                        probe_operand_uses_only_available_columns(item, available_outer_tables)
+                    })
+            }
+            InSet::Subquery(_) | InSet::Table(_) => false,
+        },
+        (
+            WhereTermKind::InList { .. },
+            Expr::BinaryOp {
+                op: AstBinaryOp::Or,
+                ..
+            },
+        ) => {
+            let mut disjuncts = Vec::new();
+            collect_disjuncts(term.expr, &mut disjuncts);
+            disjuncts.iter().all(|disjunct| {
+                qualified_comparison_probe_operand(disjunct, table_name).is_some_and(
+                    |(_, operand)| {
+                        probe_operand_uses_only_available_columns(operand, available_outer_tables)
+                    },
+                )
+            })
+        }
+        (
+            WhereTermKind::LikePrefix { .. },
+            Expr::Like {
+                pattern, escape, ..
+            },
+        ) => {
+            probe_operand_uses_only_available_columns(pattern, available_outer_tables)
+                && escape.as_deref().is_none_or(|escape| {
+                    probe_operand_uses_only_available_columns(escape, available_outer_tables)
+                })
+        }
+        (
+            WhereTermKind::Between
+            | WhereTermKind::InList { .. }
+            | WhereTermKind::LikePrefix { .. },
+            _,
+        ) => false,
+        _ => true,
+    };
+    if !remaining_probe_operands_available {
+        return None;
+    }
+    let kind = match term.kind {
+        WhereTermKind::Equality | WhereTermKind::RowidEquality => {
+            if column.as_ref().is_some_and(is_rowid_column) {
+                WhereTermKind::RowidEquality
+            } else {
+                WhereTermKind::Equality
+            }
+        }
+        ref kind => kind.clone(),
+    };
+    Some(WhereTerm {
+        expr: term.expr,
+        column,
+        kind,
+    })
+}
+
+fn qualified_comparison_probe_operand<'expr>(
+    expr: &'expr Expr,
+    table_name: &str,
+) -> Option<(WhereColumn, &'expr Expr)> {
+    let Expr::BinaryOp { left, right, .. } = expr else {
+        return None;
+    };
+    let qualifier_matches = |column: &WhereColumn| {
+        column
+            .table
+            .as_deref()
+            .is_some_and(|qualifier| identifier_eq(qualifier, table_name))
+    };
+    let left_column = extract_where_column(left);
+    let right_column = extract_where_column(right);
+    let left_matches = left_column.as_ref().is_some_and(&qualifier_matches);
+    let right_matches = right_column.as_ref().is_some_and(&qualifier_matches);
+    if left_matches && !right_matches {
+        Some((left_column?, right.as_ref()))
+    } else if right_matches && !left_matches {
+        Some((right_column?, left.as_ref()))
+    } else {
+        // A same-table column-vs-column predicate cannot be probed before
+        // reading that table, and two matching sides have no unambiguous outer
+        // lookup operand.
+        None
+    }
+}
+
+/// Return whether a prospective index-probe operand is independent of the
+/// candidate table and references only columns from tables already admitted to
+/// the outer join prefix.
+///
+/// Subqueries and `RAISE` expressions fail closed: their binding scopes cannot
+/// be proven from the planner's flat table-name list. Other expression forms
+/// recurse through every operand so a nested bare or not-yet-available column
+/// cannot masquerade as a constant probe.
+fn probe_operand_uses_only_available_columns(
+    expr: &Expr,
+    available_outer_tables: &[String],
+) -> bool {
+    let column_available = |column: &ColumnRef| {
+        column.table.as_deref().is_some_and(|qualifier| {
+            available_outer_tables
+                .iter()
+                .any(|table| identifier_eq(table, qualifier))
+        })
+    };
+    expr_columns_satisfy(expr, &column_available)
+}
+
+fn expr_uses_only_qualified_table_columns(expr: &Expr, table_name: &str) -> bool {
+    expr_columns_satisfy(expr, &|column| {
+        column
+            .table
+            .as_deref()
+            .is_some_and(|qualifier| identifier_eq(qualifier, table_name))
+    })
+}
+
+fn expr_uses_only_explicit_table_columns(expr: &Expr, table_name: &str) -> bool {
+    let saw_column = std::cell::Cell::new(false);
+    let columns_are_explicitly_local = expr_columns_satisfy(expr, &|column| {
+        saw_column.set(true);
+        column
+            .table
+            .as_deref()
+            .is_some_and(|qualifier| identifier_eq(qualifier, table_name))
+    });
+    columns_are_explicitly_local && saw_column.get()
+}
+
+fn table_local_index_probe_is_evaluable(term: &WhereTerm<'_>, table_name: &str) -> bool {
+    let has_no_columns = |expr: &Expr| expr_columns_satisfy(expr, &|_| false);
+    let column_belongs_to_table = |column: &WhereColumn| {
+        column
+            .table
+            .as_deref()
+            .is_none_or(|qualifier| identifier_eq(qualifier, table_name))
+    };
+
+    match (&term.kind, term.expr) {
+        (WhereTermKind::Equality | WhereTermKind::RowidEquality | WhereTermKind::Range, _) => {
+            let Some(column) = term
+                .column
+                .as_ref()
+                .filter(|column| column_belongs_to_table(column))
+            else {
+                return false;
+            };
+            comparison_operand_for_column(term.expr, table_name, &column.column)
+                .is_some_and(&has_no_columns)
+        }
+        (WhereTermKind::Between, Expr::Between { low, high, .. }) => {
+            term.column.as_ref().is_some_and(column_belongs_to_table)
+                && has_no_columns(low)
+                && has_no_columns(high)
+        }
+        (WhereTermKind::InList { .. }, Expr::In { set, .. }) => {
+            term.column.as_ref().is_some_and(column_belongs_to_table)
+                && match set {
+                    InSet::List(items) => !items.is_empty() && items.iter().all(&has_no_columns),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        (
+            WhereTermKind::InList { .. },
+            Expr::BinaryOp {
+                op: AstBinaryOp::Or,
+                ..
+            },
+        ) => {
+            let Some(column) = term
+                .column
+                .as_ref()
+                .filter(|column| column_belongs_to_table(column))
+            else {
+                return false;
+            };
+            let mut disjuncts = Vec::new();
+            collect_disjuncts(term.expr, &mut disjuncts);
+            disjuncts.iter().all(|disjunct| {
+                comparison_operand_for_column(disjunct, table_name, &column.column)
+                    .is_some_and(&has_no_columns)
+            })
+        }
+        (
+            WhereTermKind::LikePrefix { .. },
+            Expr::Like {
+                pattern, escape, ..
+            },
+        ) => {
+            term.column.as_ref().is_some_and(column_belongs_to_table)
+                && has_no_columns(pattern)
+                && escape.as_deref().is_none_or(&has_no_columns)
+        }
+        (
+            WhereTermKind::Other,
+            Expr::BinaryOp {
+                left,
+                right,
+                op:
+                    AstBinaryOp::Eq
+                    | AstBinaryOp::Lt
+                    | AstBinaryOp::Le
+                    | AstBinaryOp::Gt
+                    | AstBinaryOp::Ge,
+                ..
+            },
+        ) => {
+            let left_is_key = expr_is_table_local_index_key(left, table_name);
+            let right_is_key = expr_is_table_local_index_key(right, table_name);
+            match (left_is_key, right_is_key) {
+                (true, false) => has_no_columns(right),
+                (false, true) => has_no_columns(left),
+                (true, true) => false,
+                // Constant expression-index keys are unusual but legal enough
+                // that this seam must also prove both sides pre-scan
+                // evaluable rather than assuming no table-local column means
+                // no possible key match.
+                (false, false) => has_no_columns(left) && has_no_columns(right),
+            }
+        }
+        (
+            WhereTermKind::Other,
+            Expr::Between {
+                expr,
+                low,
+                high,
+                not: false,
+                ..
+            },
+        ) => {
+            (expr_is_table_local_index_key(expr, table_name) || has_no_columns(expr))
+                && has_no_columns(low)
+                && has_no_columns(high)
+        }
+        (WhereTermKind::Other, _) => true,
+        _ => false,
+    }
+}
+
+/// Return whether `term` can drive an access path before scanning `table_name`.
+///
+/// Ordinary index probes may use the table name or no qualifier.  A rowid alias
+/// may instead be exposed through a query alias, so retain that equality only
+/// when its opposite operand is scalar and the alias hint matches exactly.
+fn table_local_access_path_probe_is_evaluable(
+    term: &WhereTerm<'_>,
+    table_name: &str,
+    rowid_alias_hints: &[RowidAliasHint],
+) -> bool {
+    if table_local_index_probe_is_evaluable(term, table_name) {
+        return true;
+    }
+
+    let has_no_columns = |expr: &Expr| expr_columns_satisfy(expr, &|_| false);
+    matches!(
+        term.kind,
+        WhereTermKind::Equality | WhereTermKind::RowidEquality
+    ) && term.column.as_ref().is_some_and(|column| {
+        rowid_alias_hints
+            .iter()
+            .any(|hint| hint.matches_column(table_name, column))
+            && comparison_operand_for_where_column(term.expr, column).is_some_and(&has_no_columns)
+    })
+}
+
+fn expr_is_table_local_index_key(expr: &Expr, table_name: &str) -> bool {
+    let saw_column = std::cell::Cell::new(false);
+    let columns_are_local = expr_columns_satisfy(expr, &|column| {
+        saw_column.set(true);
+        column
+            .table
+            .as_deref()
+            .is_none_or(|qualifier| identifier_eq(qualifier, table_name))
+    });
+    columns_are_local && saw_column.get()
+}
+
+fn expr_columns_satisfy(expr: &Expr, column_allowed: &impl Fn(&ColumnRef) -> bool) -> bool {
+    match expr {
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } | Expr::Placeholder(..) => true,
+        Expr::Column(column, _) => column_allowed(column),
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            expr_columns_satisfy(left, column_allowed)
+                && expr_columns_satisfy(right, column_allowed)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_columns_satisfy(expr, column_allowed),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_columns_satisfy(expr, column_allowed)
+                && expr_columns_satisfy(low, column_allowed)
+                && expr_columns_satisfy(high, column_allowed)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_columns_satisfy(expr, column_allowed)
+                && match set {
+                    InSet::List(items) => items
+                        .iter()
+                        .all(|item| expr_columns_satisfy(item, column_allowed)),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_columns_satisfy(expr, column_allowed)
+                && expr_columns_satisfy(pattern, column_allowed)
+                && escape
+                    .as_deref()
+                    .is_none_or(|escape| expr_columns_satisfy(escape, column_allowed))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(|operand| expr_columns_satisfy(operand, column_allowed))
+                && whens.iter().all(|(when, then)| {
+                    expr_columns_satisfy(when, column_allowed)
+                        && expr_columns_satisfy(then, column_allowed)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(|else_expr| expr_columns_satisfy(else_expr, column_allowed))
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let args_available = match args {
+                fsqlite_ast::FunctionArgs::Star => true,
+                fsqlite_ast::FunctionArgs::List(args) => args
+                    .iter()
+                    .all(|arg| expr_columns_satisfy(arg, column_allowed)),
+            };
+            args_available
+                && order_by.iter().all(|term| {
+                    expr_columns_satisfy(&term.expr, column_allowed)
+                })
+                && filter
+                    .as_deref()
+                    .is_none_or(|filter| expr_columns_satisfy(filter, column_allowed))
+                // Window functions are not legal in WHERE comparisons, and
+                // named/base-window scope cannot be resolved at this seam.
+                && over.is_none()
+        }
+        Expr::RowValue(items, _) => items
+            .iter()
+            .all(|item| expr_columns_satisfy(item, column_allowed)),
+        Expr::Exists { .. } | Expr::Subquery(..) | Expr::Raise { .. } => false,
+    }
 }
 
 /// Order tables using bounded beam search while honoring table-level
@@ -4188,8 +5106,12 @@ pub fn order_joins_with_hints_and_features(
             indexes,
             where_terms,
             needed_columns,
-            table_index_hints,
-            cracking_hints.as_deref(),
+            JoinAccessPathContext {
+                table_index_hints,
+                cracking_hints: cracking_hints.as_deref(),
+                available_outer_tables: &[],
+                unqualified_terms_are_table_local: true,
+            },
         );
         // Move the access path into the plan rather than cloning it (its cost
         // is a Copy f64, captured first), so the single owned AccessPath — which
@@ -4226,6 +5148,13 @@ pub fn order_joins_with_hints_and_features(
                 .iter()
                 .map(|idx| tables[*idx].name.clone())
                 .collect::<Vec<_>>();
+            // DPccp currently costs one order-independent access path per
+            // relation. Keep the emitted paths under that same contract:
+            // admitting an outer-column probe only after selecting the order
+            // would make `total_cost` describe different paths than the plan
+            // carries. The default beam search below performs order-aware
+            // join-probe costing; DPccp fails closed until its state model is
+            // extended to cost paths by `(outer_set, candidate)`.
             let access_paths = order_indices
                 .iter()
                 .map(|idx| {
@@ -4234,8 +5163,12 @@ pub fn order_joins_with_hints_and_features(
                         indexes,
                         where_terms,
                         needed_columns,
-                        table_index_hints,
-                        cracking_hints.as_deref(),
+                        JoinAccessPathContext {
+                            table_index_hints,
+                            cracking_hints: cracking_hints.as_deref(),
+                            available_outer_tables: &[],
+                            unqualified_terms_are_table_local: false,
+                        },
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4311,8 +5244,12 @@ pub fn order_joins_with_hints_and_features(
             indexes,
             where_terms,
             needed_columns,
-            table_index_hints,
-            cracking_hints.as_deref(),
+            JoinAccessPathContext {
+                table_index_hints,
+                cracking_hints: cracking_hints.as_deref(),
+                available_outer_tables: &[],
+                unqualified_terms_are_table_local: false,
+            },
         );
         let cumulative_rows = ap.estimated_rows;
         let cost = ap.estimated_cost;
@@ -4356,8 +5293,12 @@ pub fn order_joins_with_hints_and_features(
                     indexes,
                     where_terms,
                     needed_columns,
-                    table_index_hints,
-                    cracking_hints.as_deref(),
+                    JoinAccessPathContext {
+                        table_index_hints,
+                        cracking_hints: cracking_hints.as_deref(),
+                        available_outer_tables: &path.tables,
+                        unqualified_terms_are_table_local: false,
+                    },
                 );
                 // Scale inner table cost by the cumulative cardinality of
                 // all outer tables (nested loop model).  For a 3-table join
@@ -4408,8 +5349,12 @@ pub fn order_joins_with_hints_and_features(
                 indexes,
                 where_terms,
                 needed_columns,
-                table_index_hints,
-                cracking_hints.as_deref(),
+                JoinAccessPathContext {
+                    table_index_hints,
+                    cracking_hints: cracking_hints.as_deref(),
+                    available_outer_tables: &[],
+                    unqualified_terms_are_table_local: false,
+                },
             );
             let cost = ap.estimated_cost;
             let cumulative_rows = ap.estimated_rows;
@@ -4550,8 +5495,12 @@ fn dpccp_order_joins(
                 indexes,
                 where_terms,
                 needed_columns,
-                table_index_hints,
-                cracking_hints,
+                JoinAccessPathContext {
+                    table_index_hints,
+                    cracking_hints,
+                    available_outer_tables: &[],
+                    unqualified_terms_are_table_local: false,
+                },
             )
         })
         .collect::<Vec<_>>();
@@ -4817,8 +5766,11 @@ fn collect_table_refs(expr: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
-        // Literals, placeholders — no column refs to collect.
-        _ => {}
+        // Constant leaves and parser placeholders contain no column refs.
+        Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Placeholder(..)
+        | Expr::Raise { .. } => {}
     }
 }
 
@@ -4921,8 +5873,48 @@ pub fn pushdown_predicates<'a>(
 pub enum FoldResult {
     /// Expression was folded to a literal value.
     Literal(Literal),
-    /// Expression could not be folded (contains column references).
+    /// Expression is non-constant or cannot be folded safely.
     NotConstant,
+}
+
+struct FoldStack<T, const N: usize> {
+    inline: [Option<T>; N],
+    inline_len: usize,
+    spill: Vec<T>,
+}
+
+impl<T, const N: usize> FoldStack<T, N> {
+    fn new() -> Self {
+        Self {
+            inline: [const { None }; N],
+            inline_len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, value: T) {
+        if self.inline_len < N && self.spill.is_empty() {
+            self.inline[self.inline_len] = Some(value);
+            self.inline_len += 1;
+        } else {
+            self.spill.push(value);
+        }
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        if let Some(value) = self.spill.pop() {
+            return Some(value);
+        }
+        if self.inline_len == 0 {
+            return None;
+        }
+        self.inline_len -= 1;
+        self.inline[self.inline_len].take()
+    }
+
+    fn len(&self) -> usize {
+        self.inline_len.saturating_add(self.spill.len())
+    }
 }
 
 /// Attempt to constant-fold an expression.
@@ -4930,110 +5922,351 @@ pub enum FoldResult {
 /// Evaluates expressions that contain only literals and deterministic operators
 /// at plan time, avoiding repeated evaluation during execution.
 pub fn try_constant_fold(expr: &Expr) -> FoldResult {
-    match expr {
-        Expr::Literal(lit, _) => FoldResult::Literal(lit.clone()),
+    enum FoldTask<'a> {
+        Visit(&'a Expr),
+        ApplyUnary(fsqlite_ast::UnaryOp),
+        ApplyBinary(AstBinaryOp),
+    }
 
-        Expr::UnaryOp {
-            op, expr: inner, ..
-        } => {
-            let inner_val = try_constant_fold(inner);
-            match inner_val {
-                FoldResult::Literal(Literal::Integer(i)) => match op {
-                    fsqlite_ast::UnaryOp::Negate => {
-                        FoldResult::Literal(Literal::Integer(i.wrapping_neg()))
-                    }
-                    fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Integer(i)),
-                    fsqlite_ast::UnaryOp::BitNot => FoldResult::Literal(Literal::Integer(!i)),
-                    fsqlite_ast::UnaryOp::Not => FoldResult::Literal(if i == 0 {
-                        Literal::True
-                    } else {
-                        Literal::False
-                    }),
-                },
-                FoldResult::Literal(Literal::Float(f)) => match op {
-                    fsqlite_ast::UnaryOp::Negate => FoldResult::Literal(Literal::Float(-f)),
-                    fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Float(f)),
-                    _ => FoldResult::NotConstant,
-                },
-                // NULL propagation: any unary op on NULL yields NULL.
-                FoldResult::Literal(Literal::Null) => FoldResult::Literal(Literal::Null),
-                _ => FoldResult::NotConstant,
+    let mut tasks = FoldStack::<_, 16>::new();
+    tasks.push(FoldTask::Visit(expr));
+    let mut values = FoldStack::<_, 16>::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            FoldTask::Visit(Expr::Literal(literal, _)) => {
+                values.push(FoldResult::Literal(literal.clone()));
+            }
+            FoldTask::Visit(Expr::UnaryOp {
+                op, expr: inner, ..
+            }) => {
+                tasks.push(FoldTask::ApplyUnary(*op));
+                tasks.push(FoldTask::Visit(inner));
+            }
+            FoldTask::Visit(Expr::BinaryOp {
+                left, op, right, ..
+            }) => {
+                tasks.push(FoldTask::ApplyBinary(*op));
+                tasks.push(FoldTask::Visit(right));
+                tasks.push(FoldTask::Visit(left));
+            }
+            FoldTask::Visit(_) => values.push(FoldResult::NotConstant),
+            FoldTask::ApplyUnary(op) => {
+                let Some(value) = values.pop() else {
+                    return FoldResult::NotConstant;
+                };
+                values.push(fold_unary_literal(op, value));
+            }
+            FoldTask::ApplyBinary(op) => {
+                let Some(right) = values.pop() else {
+                    return FoldResult::NotConstant;
+                };
+                let Some(left) = values.pop() else {
+                    return FoldResult::NotConstant;
+                };
+                values.push(fold_binary_literals(op, left, right));
             }
         }
+    }
 
-        Expr::BinaryOp {
-            left, op, right, ..
-        } => {
-            let l = try_constant_fold(left);
-            let r = try_constant_fold(right);
-            match (l, r) {
-                (
-                    FoldResult::Literal(Literal::Integer(a)),
-                    FoldResult::Literal(Literal::Integer(b)),
-                ) => match op {
-                    fsqlite_ast::BinaryOp::Add => {
-                        FoldResult::Literal(Literal::Integer(a.wrapping_add(b)))
-                    }
-                    fsqlite_ast::BinaryOp::Subtract => {
-                        FoldResult::Literal(Literal::Integer(a.wrapping_sub(b)))
-                    }
-                    fsqlite_ast::BinaryOp::Multiply => {
-                        FoldResult::Literal(Literal::Integer(a.wrapping_mul(b)))
-                    }
-                    fsqlite_ast::BinaryOp::Divide => {
-                        if b == 0 {
-                            FoldResult::Literal(Literal::Null)
-                        } else {
-                            FoldResult::Literal(Literal::Integer(a.wrapping_div(b)))
-                        }
-                    }
-                    fsqlite_ast::BinaryOp::Modulo => {
-                        if b == 0 {
-                            FoldResult::Literal(Literal::Null)
-                        } else {
-                            FoldResult::Literal(Literal::Integer(a.wrapping_rem(b)))
-                        }
-                    }
-                    fsqlite_ast::BinaryOp::Eq => FoldResult::Literal(if a == b {
-                        Literal::True
-                    } else {
-                        Literal::False
-                    }),
-                    fsqlite_ast::BinaryOp::Ne => FoldResult::Literal(if a == b {
-                        Literal::False
-                    } else {
-                        Literal::True
-                    }),
-                    fsqlite_ast::BinaryOp::Lt => {
-                        FoldResult::Literal(if a < b { Literal::True } else { Literal::False })
-                    }
-                    fsqlite_ast::BinaryOp::Le => FoldResult::Literal(if a <= b {
-                        Literal::True
-                    } else {
-                        Literal::False
-                    }),
-                    fsqlite_ast::BinaryOp::Gt => {
-                        FoldResult::Literal(if a > b { Literal::True } else { Literal::False })
-                    }
-                    fsqlite_ast::BinaryOp::Ge => FoldResult::Literal(if a >= b {
-                        Literal::True
-                    } else {
-                        Literal::False
-                    }),
-                    _ => FoldResult::NotConstant,
-                },
-                // NULL propagation: any arithmetic or comparison with NULL
-                // yields NULL in SQL.
-                (FoldResult::Literal(Literal::Null), FoldResult::Literal(_))
-                | (FoldResult::Literal(_), FoldResult::Literal(Literal::Null)) => {
-                    FoldResult::Literal(Literal::Null)
-                }
-                _ => FoldResult::NotConstant,
-            }
+    if values.len() == 1 {
+        values.pop().unwrap_or(FoldResult::NotConstant)
+    } else {
+        FoldResult::NotConstant
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FoldNumeric {
+    Integer(i64),
+    Real(f64),
+}
+
+#[derive(Clone, Copy)]
+enum FoldTruth {
+    False,
+    True,
+    Null,
+}
+
+fn boolean_literal(value: bool) -> Literal {
+    if value { Literal::True } else { Literal::False }
+}
+
+fn normalized_float_literal(value: f64) -> Literal {
+    if value.is_nan() {
+        Literal::Null
+    } else {
+        Literal::Float(value)
+    }
+}
+
+fn fold_numeric(literal: &Literal) -> Option<FoldNumeric> {
+    match literal {
+        Literal::Integer(value) => Some(FoldNumeric::Integer(*value)),
+        Literal::Float(value) if !value.is_nan() => Some(FoldNumeric::Real(*value)),
+        Literal::True => Some(FoldNumeric::Integer(1)),
+        Literal::False => Some(FoldNumeric::Integer(0)),
+        _ => None,
+    }
+}
+
+fn fold_truth(literal: &Literal) -> Option<FoldTruth> {
+    match literal {
+        Literal::Null => Some(FoldTruth::Null),
+        Literal::Integer(value) => Some(if *value == 0 {
+            FoldTruth::False
+        } else {
+            FoldTruth::True
+        }),
+        Literal::Float(value) if value.is_nan() => Some(FoldTruth::Null),
+        Literal::Float(value) => Some(if *value == 0.0 {
+            FoldTruth::False
+        } else {
+            FoldTruth::True
+        }),
+        Literal::True => Some(FoldTruth::True),
+        Literal::False => Some(FoldTruth::False),
+        _ => None,
+    }
+}
+
+fn fold_unary_literal(op: fsqlite_ast::UnaryOp, value: FoldResult) -> FoldResult {
+    let FoldResult::Literal(literal) = value else {
+        return FoldResult::NotConstant;
+    };
+    if matches!(&literal, Literal::Null)
+        || matches!(&literal, Literal::Float(value) if value.is_nan())
+    {
+        return FoldResult::Literal(Literal::Null);
+    }
+
+    match (op, fold_numeric(&literal)) {
+        (fsqlite_ast::UnaryOp::Negate, Some(FoldNumeric::Integer(value))) => {
+            FoldResult::Literal(value.checked_neg().map_or_else(
+                || normalized_float_literal(-(value as f64)),
+                Literal::Integer,
+            ))
         }
-
-        // Any expression containing column references is not constant.
+        (fsqlite_ast::UnaryOp::Negate, Some(FoldNumeric::Real(value))) => {
+            FoldResult::Literal(normalized_float_literal(-value))
+        }
+        (fsqlite_ast::UnaryOp::Plus, Some(FoldNumeric::Integer(value))) => {
+            FoldResult::Literal(Literal::Integer(value))
+        }
+        (fsqlite_ast::UnaryOp::Plus, Some(FoldNumeric::Real(value))) => {
+            FoldResult::Literal(normalized_float_literal(value))
+        }
+        (fsqlite_ast::UnaryOp::BitNot, Some(FoldNumeric::Integer(value))) => {
+            FoldResult::Literal(Literal::Integer(!value))
+        }
+        (fsqlite_ast::UnaryOp::Not, _) => {
+            fold_truth(&literal).map_or(FoldResult::NotConstant, |truth| match truth {
+                FoldTruth::False => FoldResult::Literal(Literal::True),
+                FoldTruth::True => FoldResult::Literal(Literal::False),
+                FoldTruth::Null => FoldResult::Literal(Literal::Null),
+            })
+        }
         _ => FoldResult::NotConstant,
+    }
+}
+
+fn compare_integer_real(integer: i64, real: f64) -> Option<std::cmp::Ordering> {
+    if real.is_nan() {
+        return None;
+    }
+    const TWO_TO_63: f64 = 9_223_372_036_854_775_808.0;
+    if real >= TWO_TO_63 {
+        return Some(std::cmp::Ordering::Less);
+    }
+    if real < -TWO_TO_63 {
+        return Some(std::cmp::Ordering::Greater);
+    }
+
+    let truncated = real as i64;
+    match integer.cmp(&truncated) {
+        std::cmp::Ordering::Equal => (integer as f64).partial_cmp(&real),
+        ordering => Some(ordering),
+    }
+}
+
+fn compare_numeric(left: FoldNumeric, right: FoldNumeric) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (FoldNumeric::Integer(left), FoldNumeric::Integer(right)) => Some(left.cmp(&right)),
+        (FoldNumeric::Real(left), FoldNumeric::Real(right)) => left.partial_cmp(&right),
+        (FoldNumeric::Integer(left), FoldNumeric::Real(right)) => compare_integer_real(left, right),
+        (FoldNumeric::Real(left), FoldNumeric::Integer(right)) => {
+            compare_integer_real(right, left).map(std::cmp::Ordering::reverse)
+        }
+    }
+}
+
+fn sqlite_is_equal(left: &Literal, right: &Literal) -> Option<bool> {
+    let left_is_null =
+        matches!(left, Literal::Null) || matches!(left, Literal::Float(value) if value.is_nan());
+    let right_is_null =
+        matches!(right, Literal::Null) || matches!(right, Literal::Float(value) if value.is_nan());
+    if left_is_null || right_is_null {
+        return Some(left_is_null && right_is_null);
+    }
+
+    if let (Some(left), Some(right)) = (fold_numeric(left), fold_numeric(right)) {
+        return compare_numeric(left, right).map(std::cmp::Ordering::is_eq);
+    }
+
+    match (left, right) {
+        (Literal::String(left), Literal::String(right)) => Some(left == right),
+        (Literal::Blob(left), Literal::Blob(right)) => Some(left == right),
+        (Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp, _)
+        | (_, Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp) => None,
+        _ => Some(false),
+    }
+}
+
+fn sqlite_is_result(left: &Literal, right: &Literal) -> Option<bool> {
+    match right {
+        Literal::True => fold_truth(left).map(|truth| matches!(truth, FoldTruth::True)),
+        Literal::False => fold_truth(left).map(|truth| matches!(truth, FoldTruth::False)),
+        _ => sqlite_is_equal(left, right),
+    }
+}
+
+fn fold_logical(op: AstBinaryOp, left: &Literal, right: &Literal) -> FoldResult {
+    let (Some(left), Some(right)) = (fold_truth(left), fold_truth(right)) else {
+        return FoldResult::NotConstant;
+    };
+    let truth = match op {
+        AstBinaryOp::And => match (left, right) {
+            (FoldTruth::False, _) | (_, FoldTruth::False) => FoldTruth::False,
+            (FoldTruth::Null, _) | (_, FoldTruth::Null) => FoldTruth::Null,
+            (FoldTruth::True, FoldTruth::True) => FoldTruth::True,
+        },
+        AstBinaryOp::Or => match (left, right) {
+            (FoldTruth::True, _) | (_, FoldTruth::True) => FoldTruth::True,
+            (FoldTruth::Null, _) | (_, FoldTruth::Null) => FoldTruth::Null,
+            (FoldTruth::False, FoldTruth::False) => FoldTruth::False,
+        },
+        _ => return FoldResult::NotConstant,
+    };
+    FoldResult::Literal(match truth {
+        FoldTruth::False => Literal::False,
+        FoldTruth::True => Literal::True,
+        FoldTruth::Null => Literal::Null,
+    })
+}
+
+fn fold_numeric_binary(op: AstBinaryOp, left: FoldNumeric, right: FoldNumeric) -> FoldResult {
+    match (left, right) {
+        (FoldNumeric::Integer(left), FoldNumeric::Integer(right)) => match op {
+            AstBinaryOp::Add => FoldResult::Literal(left.checked_add(right).map_or_else(
+                || normalized_float_literal((left as f64) + (right as f64)),
+                Literal::Integer,
+            )),
+            AstBinaryOp::Subtract => FoldResult::Literal(left.checked_sub(right).map_or_else(
+                || normalized_float_literal((left as f64) - (right as f64)),
+                Literal::Integer,
+            )),
+            AstBinaryOp::Multiply => FoldResult::Literal(left.checked_mul(right).map_or_else(
+                || normalized_float_literal((left as f64) * (right as f64)),
+                Literal::Integer,
+            )),
+            AstBinaryOp::Divide | AstBinaryOp::Modulo if right == 0 => {
+                FoldResult::Literal(Literal::Null)
+            }
+            AstBinaryOp::Divide => FoldResult::Literal(left.checked_div(right).map_or_else(
+                || normalized_float_literal((left as f64) / (right as f64)),
+                Literal::Integer,
+            )),
+            AstBinaryOp::Modulo => {
+                FoldResult::Literal(Literal::Integer(left.checked_rem(right).unwrap_or(0)))
+            }
+            AstBinaryOp::Eq
+            | AstBinaryOp::Ne
+            | AstBinaryOp::Lt
+            | AstBinaryOp::Le
+            | AstBinaryOp::Gt
+            | AstBinaryOp::Ge => fold_ordering_comparison(op, Some(left.cmp(&right))),
+            _ => FoldResult::NotConstant,
+        },
+        (left, right) => match op {
+            AstBinaryOp::Add => {
+                FoldResult::Literal(normalized_float_literal(as_real(left) + as_real(right)))
+            }
+            AstBinaryOp::Subtract => {
+                FoldResult::Literal(normalized_float_literal(as_real(left) - as_real(right)))
+            }
+            AstBinaryOp::Multiply => {
+                FoldResult::Literal(normalized_float_literal(as_real(left) * as_real(right)))
+            }
+            AstBinaryOp::Divide if as_real(right) == 0.0 => FoldResult::Literal(Literal::Null),
+            AstBinaryOp::Divide => {
+                FoldResult::Literal(normalized_float_literal(as_real(left) / as_real(right)))
+            }
+            AstBinaryOp::Eq
+            | AstBinaryOp::Ne
+            | AstBinaryOp::Lt
+            | AstBinaryOp::Le
+            | AstBinaryOp::Gt
+            | AstBinaryOp::Ge => fold_ordering_comparison(op, compare_numeric(left, right)),
+            _ => FoldResult::NotConstant,
+        },
+    }
+}
+
+fn as_real(value: FoldNumeric) -> f64 {
+    match value {
+        FoldNumeric::Integer(value) => value as f64,
+        FoldNumeric::Real(value) => value,
+    }
+}
+
+fn fold_ordering_comparison(op: AstBinaryOp, ordering: Option<std::cmp::Ordering>) -> FoldResult {
+    let Some(ordering) = ordering else {
+        return FoldResult::Literal(Literal::Null);
+    };
+    let value = match op {
+        AstBinaryOp::Eq => ordering.is_eq(),
+        AstBinaryOp::Ne => !ordering.is_eq(),
+        AstBinaryOp::Lt => ordering.is_lt(),
+        AstBinaryOp::Le => ordering.is_le(),
+        AstBinaryOp::Gt => ordering.is_gt(),
+        AstBinaryOp::Ge => ordering.is_ge(),
+        _ => return FoldResult::NotConstant,
+    };
+    FoldResult::Literal(boolean_literal(value))
+}
+
+fn fold_binary_literals(op: AstBinaryOp, left: FoldResult, right: FoldResult) -> FoldResult {
+    let (FoldResult::Literal(left), FoldResult::Literal(right)) = (left, right) else {
+        return FoldResult::NotConstant;
+    };
+
+    match op {
+        AstBinaryOp::Is | AstBinaryOp::IsNot => {
+            let Some(equal) = sqlite_is_result(&left, &right) else {
+                return FoldResult::NotConstant;
+            };
+            return FoldResult::Literal(boolean_literal(if op == AstBinaryOp::Is {
+                equal
+            } else {
+                !equal
+            }));
+        }
+        AstBinaryOp::And | AstBinaryOp::Or => return fold_logical(op, &left, &right),
+        _ => {}
+    }
+
+    if matches!(&left, Literal::Null)
+        || matches!(&right, Literal::Null)
+        || matches!(&left, Literal::Float(value) if value.is_nan())
+        || matches!(&right, Literal::Float(value) if value.is_nan())
+    {
+        return FoldResult::Literal(Literal::Null);
+    }
+
+    if let (Some(left), Some(right)) = (fold_numeric(&left), fold_numeric(&right)) {
+        fold_numeric_binary(op, left, right)
+    } else {
+        FoldResult::NotConstant
     }
 }
 
@@ -5045,9 +6278,9 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
 mod tests {
     use super::*;
     use fsqlite_ast::{
-        ColumnRef, CompoundOp, Distinctness, Expr, FromClause, InSet, IndexHint, Literal,
-        OrderingTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
-        TableOrSubquery,
+        BoundCollation, ColumnRef, CompoundOp, Distinctness, Expr, FromClause, InSet, IndexHint,
+        Literal, OrderingTerm, QualifiedName, ResultColumn, SelectBody, SelectCore,
+        SelectStatement, SortDirection, Span, TableOrSubquery,
     };
     use std::{cell::Cell, path::PathBuf, time::Instant};
 
@@ -5316,21 +6549,24 @@ mod tests {
         );
 
         // VALUES: width comes from the first row; every column is unnamed.
-        let values = SelectCore::Values(vec![
+        let values = SelectCore::Values(
             vec![
-                Expr::Literal(Literal::Integer(1), Span::ZERO),
-                Expr::Literal(Literal::Integer(2), Span::ZERO),
-            ],
-            vec![
-                Expr::Literal(Literal::Integer(3), Span::ZERO),
-                Expr::Literal(Literal::Integer(4), Span::ZERO),
-            ],
-        ]);
+                vec![
+                    Expr::Literal(Literal::Integer(1), Span::ZERO),
+                    Expr::Literal(Literal::Integer(2), Span::ZERO),
+                ],
+                vec![
+                    Expr::Literal(Literal::Integer(3), Span::ZERO),
+                    Expr::Literal(Literal::Integer(4), Span::ZERO),
+                ],
+            ]
+            .into(),
+        );
         assert_eq!(count_output_columns(&values), 2);
         assert_eq!(extract_output_aliases(&values), vec![None, None]);
 
         // Empty VALUES -> zero columns.
-        let empty = SelectCore::Values(vec![]);
+        let empty = SelectCore::Values(vec![].into());
         assert_eq!(count_output_columns(&empty), 0);
         assert!(extract_output_aliases(&empty).is_empty());
     }
@@ -5534,10 +6770,13 @@ mod tests {
 
     #[test]
     fn test_extract_output_aliases_values() {
-        let core = SelectCore::Values(vec![vec![
-            Expr::Literal(Literal::Integer(1), Span::ZERO),
-            Expr::Literal(Literal::Integer(2), Span::ZERO),
-        ]]);
+        let core = SelectCore::Values(
+            vec![vec![
+                Expr::Literal(Literal::Integer(1), Span::ZERO),
+                Expr::Literal(Literal::Integer(2), Span::ZERO),
+            ]]
+            .into(),
+        );
         let aliases = extract_output_aliases(&core);
         assert_eq!(aliases, vec![None, None]);
     }
@@ -6480,11 +7719,16 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_comparison_operand_returns_other_side_of_column_comparison() {
-        // extract_comparison_operand returns the non-column side of a binary
-        // comparison: a column on the left yields the right operand and vice
-        // versa; with no column operand (or a non-BinaryOp) it yields None.
+    fn test_extract_comparison_operand_returns_other_side_of_target_column() {
+        // The extractor orients a comparison around one requested table
+        // column, including a commuted qualified join equality.
         let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let qualified = |table: &str, column: &str| {
+            Box::new(Expr::Column(
+                ColumnRef::qualified(table, column),
+                Span::ZERO,
+            ))
+        };
         let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
         let binop = |l: Box<Expr>, r: Box<Expr>| Expr::BinaryOp {
             left: l,
@@ -6495,19 +7739,33 @@ mod tests {
 
         // x = 5 -> the literal 5 (column on the left).
         assert!(matches!(
-            extract_comparison_operand(&binop(col("x"), lit(5))),
+            extract_comparison_operand_for_column(&binop(col("x"), lit(5)), "t", "x"),
             Some(Expr::Literal(Literal::Integer(5), _))
         ));
         // 5 = x -> the literal 5 (column on the right).
         assert!(matches!(
-            extract_comparison_operand(&binop(lit(5), col("x"))),
+            extract_comparison_operand_for_column(&binop(lit(5), col("x")), "t", "x"),
             Some(Expr::Literal(Literal::Integer(5), _))
         ));
+        assert!(matches!(
+            extract_comparison_operand_for_column(
+                &binop(qualified("outer", "x"), qualified("t", "x")),
+                "t",
+                "x",
+            ),
+            Some(Expr::Column(column, _))
+                if column.table.as_deref() == Some("outer") && column.column.as_ref() == "x"
+        ));
         // No column operand -> None.
-        assert!(extract_comparison_operand(&binop(lit(5), lit(6))).is_none());
+        assert!(extract_comparison_operand_for_column(&binop(lit(5), lit(6)), "t", "x").is_none());
         // Not a binary op -> None.
         assert!(
-            extract_comparison_operand(&Expr::Literal(Literal::Integer(1), Span::ZERO)).is_none()
+            extract_comparison_operand_for_column(
+                &Expr::Literal(Literal::Integer(1), Span::ZERO),
+                "t",
+                "x",
+            )
+            .is_none()
         );
     }
 
@@ -6644,18 +7902,18 @@ mod tests {
         // For the leading column, an equality term yields an Equality probe and
         // a range term (x > 5) yields a Range probe; terms on other columns (or
         // no terms) yield no probe.
-        match extract_range_probe_for_column(&[eq_term_value("x", 5)], "x") {
+        match extract_range_probe_for_column(&[eq_term_value("x", 5)], "t", "x") {
             Some(AccessPathProbe::Equality { column, .. }) => assert_eq!(column, "x"),
             _ => panic!("expected an Equality probe"),
         }
         assert!(matches!(
-            extract_range_probe_for_column(&[range_term("x")], "x"),
+            extract_range_probe_for_column(&[range_term("x")], "t", "x"),
             Some(AccessPathProbe::Range { .. })
         ));
         // A term on a different column yields nothing for the leading column.
-        assert!(extract_range_probe_for_column(&[eq_term_value("y", 5)], "x").is_none());
+        assert!(extract_range_probe_for_column(&[eq_term_value("y", 5)], "t", "x").is_none());
         // No terms -> no probe.
-        assert!(extract_range_probe_for_column(&[], "x").is_none());
+        assert!(extract_range_probe_for_column(&[], "t", "x").is_none());
     }
 
     #[test]
@@ -6671,7 +7929,7 @@ mod tests {
             span: Span::ZERO,
         };
 
-        match extract_in_list_probe(&in_expr(vec![lit(1), lit(2), lit(3)], false), "x") {
+        match extract_in_list_probe(&in_expr(vec![lit(1), lit(2), lit(3)], false), "t", "x") {
             Some(AccessPathProbe::InList { column, values }) => {
                 assert_eq!(column, "x");
                 assert_eq!(values.len(), 3);
@@ -6680,12 +7938,13 @@ mod tests {
         }
 
         // Empty list -> None.
-        assert!(extract_in_list_probe(&in_expr(vec![], false), "x").is_none());
+        assert!(extract_in_list_probe(&in_expr(vec![], false), "t", "x").is_none());
         // x NOT IN (1, 2) -> None.
-        assert!(extract_in_list_probe(&in_expr(vec![lit(1), lit(2)], true), "x").is_none());
+        assert!(extract_in_list_probe(&in_expr(vec![lit(1), lit(2)], true), "t", "x").is_none());
         // A non-IN expression -> None.
         assert!(
-            extract_in_list_probe(&Expr::Literal(Literal::Integer(1), Span::ZERO), "x").is_none()
+            extract_in_list_probe(&Expr::Literal(Literal::Integer(1), Span::ZERO), "t", "x",)
+                .is_none()
         );
     }
 
@@ -6763,34 +8022,53 @@ mod tests {
 
         // x = 5 implies x IS NOT NULL.
         let terms = [eq_term_value("x", 5)];
-        assert!(where_terms_imply_predicate(&terms, &is_not_null("x")));
+        assert!(where_terms_imply_predicate(
+            &terms,
+            &is_not_null("x"),
+            "t",
+            true
+        ));
 
         // x = 5 does not imply y IS NOT NULL (different column).
-        assert!(!where_terms_imply_predicate(&terms, &is_not_null("y")));
+        assert!(!where_terms_imply_predicate(
+            &terms,
+            &is_not_null("y"),
+            "t",
+            true
+        ));
 
         // Both terms together imply (x IS NOT NULL AND y IS NOT NULL).
         let both = [eq_term_value("x", 5), eq_term_value("y", 7)];
         assert!(where_terms_imply_predicate(
             &both,
-            &and(is_not_null("x"), is_not_null("y"))
+            &and(is_not_null("x"), is_not_null("y")),
+            "t",
+            true
         ));
 
         // Only the x term -> the y conjunct is unimplied -> overall false.
         assert!(!where_terms_imply_predicate(
             &terms,
-            &and(is_not_null("x"), is_not_null("y"))
+            &and(is_not_null("x"), is_not_null("y")),
+            "t",
+            true
         ));
 
         // No terms -> any() over empty is false -> no implication possible.
-        assert!(!where_terms_imply_predicate(&[], &is_not_null("x")));
+        assert!(!where_terms_imply_predicate(
+            &[],
+            &is_not_null("x"),
+            "t",
+            true
+        ));
     }
 
     #[test]
     fn test_expr_implies_partial_predicate() {
         // A query predicate implies a partial-index predicate when it is
         // structurally identical, when it guarantees the column non-null for an
-        // IS NOT NULL index predicate, or when its column-literal comparison
-        // logically implies the predicate's (x > 10 implies x > 5, not vice versa).
+        // IS NOT NULL index predicate, or when the same-bound comparison
+        // operator is logically stricter.
         let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
         let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
         let cmp = |c: &str, op: AstBinaryOp, n: i64| Expr::BinaryOp {
@@ -6803,17 +8081,39 @@ mod tests {
         // Structural identity implies trivially.
         assert!(expr_implies_partial_predicate(
             &cmp("x", AstBinaryOp::Eq, 5),
-            &cmp("x", AstBinaryOp::Eq, 5)
+            &cmp("x", AstBinaryOp::Eq, 5),
+            "t",
+            true
         ));
+        assert!(
+            !expr_implies_partial_predicate(
+                &cmp("x", AstBinaryOp::Eq, 5),
+                &cmp("x", AstBinaryOp::Eq, 5),
+                "t",
+                false
+            ),
+            "bare structural identity is not a table-binding proof in a join"
+        );
 
-        // x > 10 implies x > 5; the reverse does not.
-        assert!(expr_implies_partial_predicate(
+        // Distinct bounds are not ordered without affinity/collation proof.
+        assert!(!expr_implies_partial_predicate(
             &cmp("x", AstBinaryOp::Gt, 10),
-            &cmp("x", AstBinaryOp::Gt, 5)
+            &cmp("x", AstBinaryOp::Gt, 5),
+            "t",
+            true
+        ));
+        // At the same bound, `>` safely implies `>=`.
+        assert!(expr_implies_partial_predicate(
+            &cmp("x", AstBinaryOp::Gt, 5),
+            &cmp("x", AstBinaryOp::Ge, 5),
+            "t",
+            true
         ));
         assert!(!expr_implies_partial_predicate(
             &cmp("x", AstBinaryOp::Gt, 5),
-            &cmp("x", AstBinaryOp::Gt, 10)
+            &cmp("x", AstBinaryOp::Gt, 10),
+            "t",
+            true
         ));
 
         // x = 5 implies the partial-index predicate x IS NOT NULL.
@@ -6824,91 +8124,250 @@ mod tests {
         };
         assert!(expr_implies_partial_predicate(
             &cmp("x", AstBinaryOp::Eq, 5),
-            &is_not_null
+            &is_not_null,
+            "t",
+            true
         ));
 
         // Different columns do not imply.
         assert!(!expr_implies_partial_predicate(
             &cmp("x", AstBinaryOp::Eq, 5),
-            &cmp("y", AstBinaryOp::Eq, 3)
+            &cmp("y", AstBinaryOp::Eq, 3),
+            "t",
+            true
         ));
     }
 
     #[test]
-    fn test_literal_satisfies_predicate_literal() {
-        use AstBinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
-        use std::cmp::Ordering::{Equal, Greater, Less};
+    fn test_partial_index_is_not_null_accepts_direct_comparison_placeholders() {
+        let is_not_null = Expr::IsNull {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        };
+        for op in [
+            AstBinaryOp::Eq,
+            AstBinaryOp::Ne,
+            AstBinaryOp::Lt,
+            AstBinaryOp::Le,
+            AstBinaryOp::Gt,
+            AstBinaryOp::Ge,
+        ] {
+            let comparison = Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op,
+                right: Box::new(Expr::Placeholder(
+                    fsqlite_ast::PlaceholderType::Numbered(1),
+                    Span::ZERO,
+                )),
+                span: Span::ZERO,
+            };
+            assert!(
+                expr_implies_partial_predicate(&comparison, &is_not_null, "t", true),
+                "a TRUE {op:?} comparison proves its direct column is non-NULL"
+            );
+        }
 
-        // Eq is satisfied only by Equal.
-        assert!(literal_satisfies_predicate_literal(Equal, Eq));
-        assert!(!literal_satisfies_predicate_literal(Less, Eq));
-        assert!(!literal_satisfies_predicate_literal(Greater, Eq));
-        // Gt only by Greater; Ge by Greater or Equal.
-        assert!(literal_satisfies_predicate_literal(Greater, Gt));
-        assert!(!literal_satisfies_predicate_literal(Equal, Gt));
-        assert!(literal_satisfies_predicate_literal(Greater, Ge));
-        assert!(literal_satisfies_predicate_literal(Equal, Ge));
-        assert!(!literal_satisfies_predicate_literal(Less, Ge));
-        // Lt only by Less; Le by Less or Equal.
-        assert!(literal_satisfies_predicate_literal(Less, Lt));
-        assert!(!literal_satisfies_predicate_literal(Equal, Lt));
-        assert!(literal_satisfies_predicate_literal(Less, Le));
-        assert!(literal_satisfies_predicate_literal(Equal, Le));
-        assert!(!literal_satisfies_predicate_literal(Greater, Le));
-        // Unsupported ops (Ne) -> false.
-        assert!(!literal_satisfies_predicate_literal(Equal, Ne));
+        let reversed = Expr::BinaryOp {
+            left: Box::new(Expr::Placeholder(
+                fsqlite_ast::PlaceholderType::Numbered(1),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert!(expr_implies_partial_predicate(
+            &reversed,
+            &is_not_null,
+            "t",
+            true
+        ));
+
+        let is_non_null_literal = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Is,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert!(expr_implies_partial_predicate(
+            &is_non_null_literal,
+            &is_not_null,
+            "t",
+            true
+        ));
+
+        for nullable_rhs in [
+            Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(1), Span::ZERO),
+            Expr::Literal(Literal::Null, Span::ZERO),
+        ] {
+            let nullable_is = Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op: AstBinaryOp::Is,
+                right: Box::new(nullable_rhs),
+                span: Span::ZERO,
+            };
+            assert!(
+                !expr_implies_partial_predicate(&nullable_is, &is_not_null, "t", true),
+                "IS against a nullable operand cannot prove the column non-NULL"
+            );
+        }
     }
 
     #[test]
-    fn test_compare_partial_index_literals_handles_cross_type_numerics() {
-        use std::cmp::Ordering;
-        let int = Literal::Integer;
-        let flt = Literal::Float;
+    fn test_join_partial_index_is_not_null_accepts_qualified_placeholder_comparison() {
+        let table = table_stats("p", 100, 1_000);
+        let mut partial_idx = index_info("idx_p_a_not_null", "p", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::IsNull {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        });
+        let context = JoinAccessPathContext {
+            table_index_hints: None,
+            cracking_hints: None,
+            available_outer_tables: &[],
+            unqualified_terms_are_table_local: false,
+        };
 
-        // Same-type comparisons.
-        assert_eq!(
-            compare_partial_index_literals(&int(3), &int(5)),
-            Some(Ordering::Less)
+        let local_comparison = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("p", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Placeholder(
+                fsqlite_ast::PlaceholderType::Numbered(7),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        let local_terms = [classify_where_term(&local_comparison)];
+        let local_path = join_access_path(
+            &table,
+            std::slice::from_ref(&partial_idx),
+            &local_terms,
+            None,
+            context,
         );
-        assert_eq!(
-            compare_partial_index_literals(&flt(2.0), &flt(2.0)),
-            Some(Ordering::Equal)
-        );
-        assert_eq!(
-            compare_partial_index_literals(
-                &Literal::String("a".to_owned()),
-                &Literal::String("b".to_owned())
-            ),
-            Some(Ordering::Less)
-        );
+        assert_eq!(local_path.index.as_deref(), Some("idx_p_a_not_null"));
+        assert!(matches!(
+            local_path.probe,
+            Some(AccessPathProbe::Equality { target, .. })
+                if matches!(
+                    target.as_ref(),
+                    Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(7), _)
+                )
+        ));
 
-        // Integer and Float compare numerically across types.
-        assert_eq!(
-            compare_partial_index_literals(&int(5), &flt(5.0)),
-            Some(Ordering::Equal)
+        let foreign_comparison = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("other", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Placeholder(
+                fsqlite_ast::PlaceholderType::Numbered(7),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        let foreign_terms = [classify_where_term(&foreign_comparison)];
+        let foreign_path = join_access_path(&table, &[partial_idx], &foreign_terms, None, context);
+        assert!(
+            matches!(foreign_path.kind, AccessPathKind::FullTableScan),
+            "a foreign qualifier must not prove p.a IS NOT NULL"
         );
-        assert_eq!(
-            compare_partial_index_literals(&int(3), &flt(5.0)),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            compare_partial_index_literals(&flt(7.0), &int(2)),
-            Some(Ordering::Greater)
-        );
+    }
 
-        // Incompatible types, NULL, and NaN are unordered -> None.
-        assert_eq!(
-            compare_partial_index_literals(&int(1), &Literal::String("x".to_owned())),
-            None
-        );
-        assert_eq!(
-            compare_partial_index_literals(&Literal::Null, &int(1)),
-            None
-        );
-        assert_eq!(
-            compare_partial_index_literals(&flt(f64::NAN), &flt(1.0)),
-            None
-        );
+    #[test]
+    fn test_partial_index_implication_requires_same_literal_and_bound_column() {
+        let comparison =
+            |table: Option<&str>, op: AstBinaryOp, literal: Literal| NormalizedColumnComparison {
+                column: WhereColumn {
+                    table: table.map(str::to_owned),
+                    column: "x".to_owned(),
+                },
+                op,
+                literal,
+            };
+        let bare = |op, literal| comparison(None, op, literal);
+        let implies = |query: &NormalizedColumnComparison,
+                       predicate: &NormalizedColumnComparison| {
+            query.implies(predicate, "t", true)
+        };
+
+        let equal_five = bare(AstBinaryOp::Eq, Literal::Integer(5));
+        assert!(implies(
+            &equal_five,
+            &bare(AstBinaryOp::Eq, Literal::Integer(5))
+        ));
+        assert!(implies(
+            &equal_five,
+            &bare(AstBinaryOp::Ge, Literal::Integer(5))
+        ));
+        assert!(implies(
+            &equal_five,
+            &bare(AstBinaryOp::Le, Literal::Integer(5))
+        ));
+        assert!(!implies(
+            &equal_five,
+            &bare(AstBinaryOp::Gt, Literal::Integer(5))
+        ));
+
+        let greater_five = bare(AstBinaryOp::Gt, Literal::Integer(5));
+        assert!(implies(
+            &greater_five,
+            &bare(AstBinaryOp::Gt, Literal::Integer(5))
+        ));
+        assert!(implies(
+            &greater_five,
+            &bare(AstBinaryOp::Ge, Literal::Integer(5))
+        ));
+        assert!(!implies(
+            &bare(AstBinaryOp::Ge, Literal::Integer(5)),
+            &bare(AstBinaryOp::Gt, Literal::Integer(5))
+        ));
+
+        // Rust ordering between distinct literals does not prove SQLite
+        // implication without the column's affinity and collation. On a TEXT
+        // column, for example, `x > 10` can include the value `'2'` even though
+        // a partial index on `x > 2` excludes it.
+        assert!(!implies(
+            &bare(AstBinaryOp::Gt, Literal::Integer(10)),
+            &bare(AstBinaryOp::Gt, Literal::Integer(2))
+        ));
+        assert!(!implies(
+            &bare(AstBinaryOp::Gt, Literal::String("z".to_owned())),
+            &bare(AstBinaryOp::Gt, Literal::String("a".to_owned()))
+        ));
+
+        // Numerically equal INTEGER/REAL spellings also remain distinct until
+        // the planner carries proof of the comparison affinity.
+        let max_integer = bare(AstBinaryOp::Eq, Literal::Integer(i64::MAX));
+        let rounded_max_real = bare(AstBinaryOp::Eq, Literal::Float(i64::MAX as f64));
+        assert!(!implies(&max_integer, &rounded_max_real));
+        assert!(!implies(&rounded_max_real, &max_integer));
+        let min_integer = bare(AstBinaryOp::Eq, Literal::Integer(i64::MIN));
+        let exact_min_real = bare(AstBinaryOp::Eq, Literal::Float(i64::MIN as f64));
+        assert!(!implies(&min_integer, &exact_min_real));
+        assert!(!implies(&exact_min_real, &min_integer));
+
+        let qualified = comparison(Some("t"), AstBinaryOp::Eq, Literal::Integer(5));
+        assert!(implies(
+            &qualified,
+            &comparison(Some("T"), AstBinaryOp::Eq, Literal::Integer(5))
+        ));
+        assert!(!implies(
+            &qualified,
+            &comparison(Some("other"), AstBinaryOp::Eq, Literal::Integer(5))
+        ));
+        assert!(implies(
+            &qualified,
+            &bare(AstBinaryOp::Eq, Literal::Integer(5))
+        ));
+        assert!(!implies(
+            &bare(AstBinaryOp::Eq, Literal::Integer(5)),
+            &comparison(Some("t"), AstBinaryOp::Eq, Literal::Integer(5))
+        ));
+        assert!(!implies(
+            &comparison(Some("other"), AstBinaryOp::Eq, Literal::Integer(5)),
+            &bare(AstBinaryOp::Eq, Literal::Integer(5))
+        ));
     }
 
     #[test]
@@ -6956,12 +8415,7 @@ mod tests {
     }
 
     #[test]
-    fn test_where_columns_compatible_vs_equivalent() {
-        // _compatible: column names match (case-insens) AND tables either both
-        // match or at least one is None (treats None as a wildcard).
-        // _equivalent: stricter -- both tables must match OR both be None;
-        // mixed Some/None is NOT equivalent. The Some-vs-None case is the
-        // distinguishing input.
+    fn test_where_columns_equivalent_requires_matching_qualification() {
         let bare = |c: &str| WhereColumn {
             table: None,
             column: c.to_owned(),
@@ -6971,20 +8425,16 @@ mod tests {
             column: c.to_owned(),
         };
 
-        // Same column, both None -> both true.
-        assert!(where_columns_compatible(&bare("x"), &bare("X")));
+        // Same column, both unqualified.
         assert!(where_columns_equivalent(&bare("x"), &bare("X")));
-        // Same column, both same table (case-insens) -> both true.
-        assert!(where_columns_compatible(&qual("t", "x"), &qual("T", "X")));
+        // Same column, both qualified by the same table (case-insensitive).
         assert!(where_columns_equivalent(&qual("t", "x"), &qual("T", "X")));
-        // Same column, different tables -> both false.
-        assert!(!where_columns_compatible(&qual("t", "x"), &qual("u", "x")));
+        // Different table qualifiers do not identify the same bound column.
         assert!(!where_columns_equivalent(&qual("t", "x"), &qual("u", "x")));
-        // Mixed Some/None: compatible treats None as wildcard, equivalent doesn't.
-        assert!(where_columns_compatible(&qual("t", "x"), &bare("x")));
+        // A missing qualifier is not a wildcard: without name-resolution
+        // evidence, it cannot prove a partial-index predicate about `t.x`.
         assert!(!where_columns_equivalent(&qual("t", "x"), &bare("x")));
-        // Different columns -> both false (regardless of table).
-        assert!(!where_columns_compatible(&bare("x"), &bare("y")));
+        // Different columns never match.
         assert!(!where_columns_equivalent(&bare("x"), &bare("y")));
     }
 
@@ -7067,6 +8517,38 @@ mod tests {
     }
 
     #[test]
+    fn test_bound_outer_value_is_a_runtime_constant_leaf() {
+        let bound_null = Expr::BoundOuterValue {
+            value: SqliteValue::Null,
+            collation: BoundCollation::Named("NOCASE".to_owned()),
+            affinity: Some(fsqlite_types::TypeAffinity::Text),
+            span: Span::ZERO,
+        };
+
+        assert!(expr_columns_satisfy(&bound_null, &|_| false));
+        let mut table_refs = HashSet::new();
+        collect_table_refs(&bound_null, &mut table_refs);
+        assert!(table_refs.is_empty());
+
+        let mut index_definition_expr = bound_null.clone();
+        assert!(!normalize_expression_index_columns(
+            &mut index_definition_expr,
+            "t"
+        ));
+
+        let comparison = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(bound_null),
+            span: Span::ZERO,
+        };
+        assert!(matches!(
+            classify_where_term(&comparison).kind,
+            WhereTermKind::Other
+        ));
+    }
+
+    #[test]
     fn test_normalize_is_not_null_predicate() {
         // Only `<column> IS NOT NULL` normalizes to its column; IS NULL, a
         // non-column operand, and non-IsNull expressions yield None.
@@ -7106,11 +8588,12 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_guarantees_non_null_for_matching_column() {
-        // expr_guarantees_non_null reports whether a WHERE expression proves the
-        // given column is non-NULL: an explicit IS NOT NULL, or a comparison to a
-        // non-NULL literal, on the SAME column qualifies; IS NULL, a NULL
-        // literal, or a different column does not.
+    fn test_partial_index_expr_guarantees_non_null_for_matching_column() {
+        // expr_guarantees_non_null reports whether a WHERE expression can be
+        // true only when the target column is non-NULL. Explicit IS NOT NULL,
+        // comparisons, positive IN, and non-empty literal NOT IN can qualify;
+        // empty or runtime-sized NOT IN right-hand sides, function-backed
+        // pattern operators, IS NULL, and predicates on another column do not.
         let pcol = WhereColumn {
             table: None,
             column: "x".to_owned(),
@@ -7123,7 +8606,7 @@ mod tests {
             not: true,
             span: Span::ZERO,
         };
-        assert!(expr_guarantees_non_null(&is_not_null, &pcol));
+        assert!(expr_guarantees_non_null(&is_not_null, &pcol, "t", true));
 
         // x IS NULL does not.
         let is_null = Expr::IsNull {
@@ -7131,7 +8614,7 @@ mod tests {
             not: false,
             span: Span::ZERO,
         };
-        assert!(!expr_guarantees_non_null(&is_null, &pcol));
+        assert!(!expr_guarantees_non_null(&is_null, &pcol, "t", true));
 
         // x = 5 (non-null literal) guarantees non-null; x = NULL does not.
         let eq = |lit: Literal| Expr::BinaryOp {
@@ -7140,8 +8623,83 @@ mod tests {
             right: Box::new(Expr::Literal(lit, Span::ZERO)),
             span: Span::ZERO,
         };
-        assert!(expr_guarantees_non_null(&eq(Literal::Integer(5)), &pcol));
-        assert!(!expr_guarantees_non_null(&eq(Literal::Null), &pcol));
+        assert!(expr_guarantees_non_null(
+            &eq(Literal::Integer(5)),
+            &pcol,
+            "t",
+            true
+        ));
+        assert!(!expr_guarantees_non_null(
+            &eq(Literal::Null),
+            &pcol,
+            "t",
+            true
+        ));
+
+        let in_expr = |set: InSet, not: bool| Expr::In {
+            expr: col("x"),
+            set,
+            not,
+            span: Span::ZERO,
+        };
+        assert!(
+            !expr_guarantees_non_null(&in_expr(InSet::List(Vec::new()), true), &pcol, "t", true),
+            "NULL NOT IN () is true in SQLite"
+        );
+        assert!(
+            expr_guarantees_non_null(
+                &in_expr(
+                    InSet::List(vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]),
+                    true
+                ),
+                &pcol,
+                "t",
+                true
+            ),
+            "a non-empty literal NOT IN list cannot be true for a NULL left operand"
+        );
+        let empty_subquery = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: None,
+                    where_clause: Some(Box::new(Expr::Literal(Literal::False, Span::ZERO))),
+                    group_by: Vec::new(),
+                    having: None,
+                    windows: Vec::new(),
+                },
+                compounds: Vec::new(),
+            },
+            order_by: Vec::new(),
+            limit: None,
+        };
+        assert!(
+            !expr_guarantees_non_null(
+                &in_expr(InSet::Subquery(Box::new(empty_subquery)), true),
+                &pcol,
+                "t",
+                true
+            ),
+            "NULL NOT IN an empty subquery is true in SQLite"
+        );
+        assert!(
+            !expr_guarantees_non_null(
+                &in_expr(InSet::Table(QualifiedName::bare("rhs")), true),
+                &pcol,
+                "t",
+                true
+            ),
+            "a table-form NOT IN RHS may be empty at execution"
+        );
+        assert!(
+            expr_guarantees_non_null(&in_expr(InSet::List(Vec::new()), false), &pcol, "t", true),
+            "positive IN can only be true for a non-NULL left operand"
+        );
 
         // An IS NOT NULL on a DIFFERENT column does not help.
         let other = Expr::IsNull {
@@ -7149,7 +8707,7 @@ mod tests {
             not: true,
             span: Span::ZERO,
         };
-        assert!(!expr_guarantees_non_null(&other, &pcol));
+        assert!(!expr_guarantees_non_null(&other, &pcol, "t", true));
     }
 
     #[test]
@@ -8114,6 +9672,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_best_access_path_partial_index_expression_uses_probe_fallback() {
+        let lower_name = || Expr::FunctionCall {
+            name: "lower".to_owned(),
+            args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                ColumnRef::bare("name"),
+                Span::ZERO,
+            )]),
+            distinct: false,
+            order_by: Vec::new(),
+            filter: None,
+            over: None,
+            span: Span::ZERO,
+        };
+        let partial_predicate = || Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("active"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let expression_equality = Expr::BinaryOp {
+            left: Box::new(lower_name()),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(
+                Literal::String("alice".to_owned()),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        let query_partial_predicate = partial_predicate();
+        let terms = [
+            classify_where_term(&expression_equality),
+            classify_where_term(&query_partial_predicate),
+        ];
+        let index = IndexInfo {
+            name: "idx_active_lower_name".to_owned(),
+            table: "users".to_owned(),
+            columns: Vec::new(),
+            unique: false,
+            n_pages: 10,
+            source: StatsSource::Heuristic,
+            partial_where: Some(partial_predicate()),
+            expression_columns: vec![lower_name()],
+        };
+        let table = table_stats("users", 1_000, 100_000);
+
+        let path = best_access_path(&table, &[index], &terms, None);
+        assert_eq!(path.index.as_deref(), Some("idx_active_lower_name"));
+        assert!(matches!(path.kind, AccessPathKind::IndexScanEquality));
+        assert!(
+            path.probe.is_none(),
+            "expression-index targets are intentionally re-extracted by the core directive fallback"
+        );
+    }
+
     /// An index with neither `columns` nor `expression_columns` is degenerate
     /// and must still fall through to NotUsable.  Guards against the reorder
     /// accidentally exposing a new reachable code path.
@@ -8184,6 +9797,51 @@ mod tests {
         assert_eq!(terms.len(), 2);
     }
 
+    #[test]
+    fn test_associative_where_walkers_are_stack_safe_at_parser_height_boundary() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let equality = |value| Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+                    op: AstBinaryOp::Eq,
+                    right: Box::new(Expr::Literal(Literal::Integer(value), Span::ZERO)),
+                    span: Span::ZERO,
+                };
+
+                for height in [1_000_i64, 1_001] {
+                    let expected_count =
+                        usize::try_from(height).expect("positive test height fits usize");
+                    let mut conjunction = equality(0);
+                    let mut disjunction = equality(0);
+                    for value in 1..height {
+                        conjunction = Expr::BinaryOp {
+                            left: Box::new(conjunction),
+                            op: AstBinaryOp::And,
+                            right: Box::new(equality(value)),
+                            span: Span::ZERO,
+                        };
+                        disjunction = Expr::BinaryOp {
+                            left: Box::new(disjunction),
+                            op: AstBinaryOp::Or,
+                            right: Box::new(equality(value)),
+                            span: Span::ZERO,
+                        };
+                    }
+
+                    assert_eq!(decompose_where(&conjunction).len(), expected_count);
+                    let (column, count) = classify_or_disjunction_as_in_list(&disjunction)
+                        .expect("same-column equality disjunction must classify as an IN-list");
+                    assert_eq!(column.column, "x");
+                    assert_eq!(count, expected_count);
+                    drop((conjunction, disjunction));
+                }
+            })
+            .expect("one-MiB WHERE-walker test thread must spawn")
+            .join()
+            .expect("height-1000/1001 WHERE walkers must not overflow the native stack");
+    }
+
     // ===================================================================
     // §10.5 Join ordering tests
     // ===================================================================
@@ -8229,7 +9887,13 @@ mod tests {
     fn test_join_ordering_prefers_indexed() {
         let tables = [table_stats("t1", 10, 100), table_stats("t2", 1000, 50000)];
         let indexes = [index_info("idx_t2_fk", "t2", &["fk"], false, 50)];
-        let terms = [eq_term("fk")];
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("t2", "fk"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let terms = [classify_where_term(expr)];
         let plan = order_joins(&tables, &indexes, &terms, None, &[]);
         // t1 should still come first (small outer), t2 uses index.
         assert_eq!(plan.join_order[0], "t1");
@@ -8761,6 +10425,31 @@ mod tests {
     }
 
     #[test]
+    fn test_join_indexed_by_keeps_unrelated_bare_predicate_residual() {
+        let tables = [
+            table_stats("users", 2_000, 100_000),
+            table_stats("events", 5_000, 500_000),
+        ];
+        let index = index_info("idx_users_email", "users", &["email"], false, 100);
+        let terms = [eq_term("user_id")];
+        let hints = BTreeMap::from([(
+            canonical_table_key("users"),
+            IndexHint::IndexedBy("idx_users_email".to_owned()),
+        )]);
+
+        let plan = order_joins_with_hints(&tables, &[index], &terms, None, &[], Some(&hints), None);
+        let users_path = plan
+            .access_paths
+            .iter()
+            .find(|path| path.table.eq_ignore_ascii_case("users"))
+            .expect("users path should exist");
+
+        assert!(matches!(users_path.kind, AccessPathKind::FullTableScan));
+        assert!(users_path.index.is_none());
+        assert!(users_path.probe.is_none());
+    }
+
+    #[test]
     fn test_order_joins_with_hints_reuses_cracking_store() {
         let tables = [table_stats("t1", 1000, 50000)];
         let idx_a = index_info("idx_a", "t1", &["a"], false, 40);
@@ -9083,6 +10772,30 @@ mod tests {
         let qualified = [RowidAliasHint::qualified("b", "id")];
         let hit = best_access_path_with_rowid_alias_hints(&table, &[], &terms, None, &qualified);
         assert!(matches!(hit.kind, AccessPathKind::RowidLookup));
+        assert!(matches!(
+            &hit.probe,
+            Some(AccessPathProbe::RowidEquality { target })
+                if **target == Expr::Literal(Literal::Integer(7), Span::ZERO)
+        ));
+    }
+
+    #[test]
+    fn test_qualified_ipk_alias_column_comparison_stays_residual() {
+        let table = table_stats("bench", 128, 5000);
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("b", "id"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("b", "other"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let terms = [classify_where_term(expr)];
+        let qualified = [RowidAliasHint::qualified("b", "id")];
+
+        let path = best_access_path_with_rowid_alias_hints(&table, &[], &terms, None, &qualified);
+
+        assert!(matches!(path.kind, AccessPathKind::FullTableScan));
+        assert!(path.index.is_none());
+        assert!(path.probe.is_none());
     }
 
     #[test]
@@ -9185,16 +10898,19 @@ mod tests {
 
     #[test]
     fn test_count_output_columns_values() {
-        let core = SelectCore::Values(vec![vec![
-            Expr::Literal(Literal::Integer(1), Span::ZERO),
-            Expr::Literal(Literal::Integer(2), Span::ZERO),
-        ]]);
+        let core = SelectCore::Values(
+            vec![vec![
+                Expr::Literal(Literal::Integer(1), Span::ZERO),
+                Expr::Literal(Literal::Integer(2), Span::ZERO),
+            ]]
+            .into(),
+        );
         assert_eq!(count_output_columns(&core), 2);
     }
 
     #[test]
     fn test_count_output_columns_empty_values() {
-        let core = SelectCore::Values(vec![]);
+        let core = SelectCore::Values(vec![].into());
         assert_eq!(count_output_columns(&core), 0);
     }
 
@@ -9247,7 +10963,8 @@ mod tests {
 
     #[test]
     fn test_resolve_projection_values_core_error() {
-        let core = SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]]);
+        let core =
+            SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]].into());
         let err = resolve_single_table_result_columns(&core, &["a".to_owned()])
             .expect_err("VALUES should fail");
         assert_eq!(err, SingleTableProjectionError::NotSelectCore);
@@ -10286,13 +12003,822 @@ mod tests {
     }
 
     #[test]
-    fn test_best_access_path_partial_index_accepts_stronger_lower_bound() {
+    fn test_best_access_path_partial_index_rejects_unproven_cross_bound_ordering() {
         let table = table_stats("t1", 100, 1000);
         let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
         partial_idx.partial_where = Some(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
             op: AstBinaryOp::Gt,
             right: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+            span: Span::ZERO,
+        });
+
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let ap = best_access_path(&table, &[partial_idx], &[classify_where_term(expr)], None);
+        assert!(
+            matches!(ap.kind, AccessPathKind::FullTableScan),
+            "literal ordering is affinity-dependent and must not prove partial-index implication"
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_rejects_unproven_string_collation_ordering() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::String("a".to_owned()), Span::ZERO)),
+            span: Span::ZERO,
+        });
+
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::String("z".to_owned()), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let ap = best_access_path(&table, &[partial_idx], &[classify_where_term(expr)], None);
+        assert!(
+            matches!(ap.kind, AccessPathKind::FullTableScan),
+            "Rust string ordering must not stand in for an unknown SQLite collation"
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_rejects_unbound_qualifier_match() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        });
+
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("other", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let ap = best_access_path(
+            &table,
+            std::slice::from_ref(&partial_idx),
+            &[classify_where_term(expr)],
+            None,
+        );
+        assert!(
+            matches!(ap.kind, AccessPathKind::FullTableScan),
+            "an unqualified index predicate must not treat another table's qualifier as a wildcard"
+        );
+
+        let qualified_other_predicate = expr.clone();
+        partial_idx.partial_where = Some(qualified_other_predicate);
+        assert!(
+            !expr_implies_partial_predicate(
+                expr,
+                partial_idx
+                    .partial_where
+                    .as_ref()
+                    .expect("test predicate is present"),
+                "t1",
+                true,
+            ),
+            "the structural-identity shortcut must still validate qualifiers"
+        );
+        let ap = best_access_path(
+            &table,
+            std::slice::from_ref(&partial_idx),
+            &[classify_where_term(expr)],
+            None,
+        );
+        assert!(
+            matches!(ap.kind, AccessPathKind::FullTableScan),
+            "structurally identical predicates bound to another table must not bypass qualifier validation"
+        );
+
+        let target_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        });
+        let ap = best_access_path(
+            &table,
+            &[partial_idx],
+            &[classify_where_term(target_expr)],
+            None,
+        );
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_partial_index_arbitrary_predicate_normalizes_local_alias_and_case() {
+        let abs_gt_zero =
+            |table: Option<&str>, function_name: &str, column_name: &str| Expr::BinaryOp {
+                left: Box::new(Expr::FunctionCall {
+                    name: function_name.to_owned(),
+                    args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                        table.map_or_else(
+                            || ColumnRef::bare(column_name),
+                            |qualifier| ColumnRef::qualified(qualifier, column_name),
+                        ),
+                        Span::ZERO,
+                    )]),
+                    distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                    over: None,
+                    span: Span::ZERO,
+                }),
+                op: AstBinaryOp::Gt,
+                right: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+                span: Span::ZERO,
+            };
+        let qualified_a_eq_one: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("p", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let local_predicate: &'static Expr =
+            Box::leak(Box::new(abs_gt_zero(Some("p"), "ABS", "A")));
+        let foreign_predicate: &'static Expr =
+            Box::leak(Box::new(abs_gt_zero(Some("other"), "ABS", "A")));
+
+        let mut partial_idx = index_info("idx_p_partial_a", "p", &["a"], false, 20);
+        partial_idx.partial_where = Some(abs_gt_zero(None, "abs", "a"));
+        let table = table_stats("p", 100, 1_000);
+        let local_terms = [
+            classify_where_term(qualified_a_eq_one),
+            classify_where_term(local_predicate),
+        ];
+        let local_path = best_access_path(
+            &table,
+            std::slice::from_ref(&partial_idx),
+            &local_terms,
+            None,
+        );
+        assert_eq!(
+            local_path.index.as_deref(),
+            Some("idx_p_partial_a"),
+            "the visible alias and identifier case should normalize within a proven single-table scope"
+        );
+
+        let foreign_terms = [
+            classify_where_term(qualified_a_eq_one),
+            classify_where_term(foreign_predicate),
+        ];
+        let foreign_path = best_access_path(&table, &[partial_idx], &foreign_terms, None);
+        assert!(
+            matches!(foreign_path.kind, AccessPathKind::FullTableScan),
+            "a foreign qualifier must not prove the indexed table's arbitrary partial predicate"
+        );
+    }
+
+    #[test]
+    fn test_join_partial_index_proof_retains_same_row_residual_without_probing_it() {
+        let comparison =
+            |left_table: &str, left_column: &str, right: Expr, op: AstBinaryOp| -> &'static Expr {
+                Box::leak(Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(
+                        ColumnRef::qualified(left_table, left_column),
+                        Span::ZERO,
+                    )),
+                    op,
+                    right: Box::new(right),
+                    span: Span::ZERO,
+                }))
+            };
+        let access_expr = comparison(
+            "t1",
+            "a",
+            Expr::Literal(Literal::Integer(1), Span::ZERO),
+            AstBinaryOp::Eq,
+        );
+        let local_residual = comparison(
+            "t1",
+            "b",
+            Expr::Column(ColumnRef::qualified("t1", "c"), Span::ZERO),
+            AstBinaryOp::Eq,
+        );
+        let foreign_residual = comparison(
+            "t2",
+            "b",
+            Expr::Column(ColumnRef::qualified("t2", "c"), Span::ZERO),
+            AstBinaryOp::Eq,
+        );
+        let access_term = classify_where_term(access_expr);
+        let local_residual_term = classify_where_term(local_residual);
+        assert!(
+            bind_where_term_to_table(&local_residual_term, "t1", &[]).is_none(),
+            "a same-row column comparison is a residual, not a pre-scan index probe"
+        );
+
+        let mut partial_idx = index_info("idx_t1_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::bare("c"), Span::ZERO)),
+            span: Span::ZERO,
+        });
+        let table = table_stats("t1", 100, 1_000);
+        let context = JoinAccessPathContext {
+            table_index_hints: None,
+            cracking_hints: None,
+            available_outer_tables: &[],
+            unqualified_terms_are_table_local: false,
+        };
+        let local_terms = [access_term.clone(), local_residual_term];
+        let local_path = join_access_path(
+            &table,
+            std::slice::from_ref(&partial_idx),
+            &local_terms,
+            None,
+            context,
+        );
+        assert_eq!(local_path.index.as_deref(), Some("idx_t1_partial_a"));
+        assert!(
+            matches!(
+                local_path.probe,
+                Some(AccessPathProbe::Equality {
+                    target,
+                    ..
+                }) if matches!(target.as_ref(), Expr::Literal(Literal::Integer(1), _))
+            ),
+            "only the executable a=1 term should become the index probe"
+        );
+
+        let foreign_terms = [access_term, classify_where_term(foreign_residual)];
+        let foreign_path = join_access_path(&table, &[partial_idx], &foreign_terms, None, context);
+        assert!(
+            matches!(foreign_path.kind, AccessPathKind::FullTableScan),
+            "another table's same-row residual must not prove t1's partial predicate"
+        );
+    }
+
+    #[test]
+    fn test_join_planning_rejects_bare_partial_predicate_identity() {
+        let tables = [table_stats("t1", 100, 1000), table_stats("t2", 100, 1000)];
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        });
+
+        // `order_joins` receives one global WHERE-term set. Without completed
+        // name-resolution metadata, bare `a = 1` cannot be attributed to `t1`
+        // merely because it is structurally identical to t1's partial predicate.
+        let plan = order_joins(&tables, &[partial_idx], &[eq_term_value("a", 1)], None, &[]);
+        let t1_path = plan
+            .access_paths
+            .iter()
+            .find(|path| path.table.eq_ignore_ascii_case("t1"))
+            .expect("join plan must include t1");
+        assert!(
+            matches!(t1_path.kind, AccessPathKind::FullTableScan),
+            "ambiguous bare term selected partial index: {t1_path:?}"
+        );
+    }
+
+    #[test]
+    fn test_join_planning_rejects_bare_terms_for_all_access_paths() {
+        let tables = [table_stats("t1", 100, 1000), table_stats("t2", 100, 1000)];
+        let index = index_info("idx_t1_a", "t1", &["a"], false, 20);
+
+        let plan = order_joins(
+            &tables,
+            std::slice::from_ref(&index),
+            &[eq_term_value("a", 1)],
+            None,
+            &[],
+        );
+        let t1_path = plan
+            .access_paths
+            .iter()
+            .find(|path| path.table.eq_ignore_ascii_case("t1"))
+            .expect("join plan must include t1");
+        assert!(
+            matches!(t1_path.kind, AccessPathKind::FullTableScan),
+            "ambiguous bare term selected an ordinary index: {t1_path:?}"
+        );
+
+        let bare_rowid_plan = order_joins(&tables, &[], &[eq_term_value("rowid", 1)], None, &[]);
+        assert!(
+            bare_rowid_plan
+                .access_paths
+                .iter()
+                .all(|path| matches!(path.kind, AccessPathKind::FullTableScan)),
+            "ambiguous bare rowid selected a table-specific lookup: {bare_rowid_plan:?}"
+        );
+
+        let qualified_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let qualified_plan = order_joins(
+            &tables,
+            &[index.clone()],
+            &[classify_where_term(qualified_expr)],
+            None,
+            &[],
+        );
+        let qualified_t1_path = qualified_plan
+            .access_paths
+            .iter()
+            .find(|path| path.table.eq_ignore_ascii_case("t1"))
+            .expect("join plan must include t1");
+        assert!(
+            matches!(
+                qualified_t1_path.kind,
+                AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
+            ),
+            "qualified t1 term should remain indexable: {qualified_t1_path:?}"
+        );
+        assert!(
+            matches!(
+                qualified_t1_path.probe,
+                Some(AccessPathProbe::Equality { .. })
+            ),
+            "qualified index selection must retain its executable probe"
+        );
+
+        let commuted_join_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("t2", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let commuted_term = classify_where_term(commuted_join_expr);
+        assert!(
+            bind_where_term_to_table(&commuted_term, "t1", &[]).is_none(),
+            "a join probe must not reference a table absent from the outer prefix"
+        );
+        let available_t2 = vec!["t2".to_owned()];
+        assert!(
+            bind_where_term_to_table(&commuted_term, "t1", &available_t2).is_some(),
+            "a commuted join equality should become indexable after its probe table is outer"
+        );
+        let commuted_tables = [
+            table_stats("t1", 100, 1000),
+            // Make t2 the unambiguously cheaper outer table. The t1 index may
+            // then use t2.a as a probe without referencing a future table.
+            table_stats("t2", 1, 10),
+        ];
+        let commuted_plan = order_joins(&commuted_tables, &[index], &[commuted_term], None, &[]);
+        assert_eq!(
+            commuted_plan.join_order.first().map(String::as_str),
+            Some("t2")
+        );
+        let commuted_t1_path = commuted_plan
+            .access_paths
+            .iter()
+            .find(|path| path.table.eq_ignore_ascii_case("t1"))
+            .expect("join plan must include t1");
+        assert!(matches!(
+            commuted_t1_path.kind,
+            AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
+        ));
+        assert!(matches!(
+            commuted_t1_path.probe,
+            Some(AccessPathProbe::Equality {
+                target: ref probe,
+                ..
+            }) if matches!(
+                probe.as_ref(),
+                Expr::Column(column, _) if column.table.as_deref() == Some("t2")
+            )
+        ));
+
+        let nested_bare_probe_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("t2", "a"), Span::ZERO)),
+                op: AstBinaryOp::Add,
+                right: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        }));
+        assert!(
+            bind_where_term_to_table(
+                &classify_where_term(nested_bare_probe_expr),
+                "t1",
+                &available_t2,
+            )
+            .is_none(),
+            "a nested ambiguous bare column must not masquerade as an available probe"
+        );
+
+        let between_join_expr: &'static Expr = Box::leak(Box::new(Expr::Between {
+            expr: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            low: Box::new(Expr::Column(ColumnRef::qualified("t2", "a"), Span::ZERO)),
+            high: Box::new(Expr::Literal(Literal::Integer(9), Span::ZERO)),
+            not: false,
+            span: Span::ZERO,
+        }));
+        let between_term = classify_where_term(between_join_expr);
+        assert!(bind_where_term_to_table(&between_term, "t1", &[]).is_none());
+        assert!(bind_where_term_to_table(&between_term, "t1", &available_t2).is_some());
+
+        let or_join_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Column(ColumnRef::qualified("t2", "a"), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Or,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(Literal::Integer(7), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        }));
+        let or_term = classify_where_term(or_join_expr);
+        assert!(matches!(or_term.kind, WhereTermKind::InList { count: 2 }));
+        assert!(bind_where_term_to_table(&or_term, "t1", &[]).is_none());
+        assert!(bind_where_term_to_table(&or_term, "t1", &available_t2).is_some());
+        assert!(matches!(
+            extract_in_list_probe(or_join_expr, "t1", "a"),
+            Some(AccessPathProbe::InList { values, .. })
+                if values.len() == 2
+                    && matches!(
+                        values[0].as_ref(),
+                        Expr::Column(column, _)
+                            if column.table.as_deref() == Some("t2")
+                    )
+        ));
+
+        let ambiguous_or_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new((*commuted_join_expr).clone()),
+            op: AstBinaryOp::Or,
+            right: Box::new((*commuted_join_expr).clone()),
+            span: Span::ZERO,
+        }));
+        assert!(
+            matches!(
+                classify_where_term(ambiguous_or_expr).kind,
+                WhereTermKind::Other
+            ),
+            "an OR with two equally shared columns has no unambiguous IN-list target"
+        );
+
+        let tautological_disjunct = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let tautological_or_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(tautological_disjunct),
+            op: AstBinaryOp::Or,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(Literal::Integer(7), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        }));
+        assert!(
+            matches!(
+                classify_where_term(tautological_or_expr).kind,
+                WhereTermKind::Other
+            ),
+            "an equality with the shared column on both sides has no executable IN-list probe"
+        );
+    }
+
+    #[test]
+    fn test_join_binding_retains_only_fully_qualified_single_table_expressions() {
+        let qualified_is_not_null: &'static Expr = Box::leak(Box::new(Expr::IsNull {
+            expr: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        }));
+        let qualified_is_not_null_term = classify_where_term(qualified_is_not_null);
+        assert!(matches!(
+            qualified_is_not_null_term.kind,
+            WhereTermKind::Other
+        ));
+        assert!(
+            bind_where_term_to_table(&qualified_is_not_null_term, "t1", &[]).is_some(),
+            "a qualified single-table partial-index predicate must survive join binding"
+        );
+        assert!(
+            bind_where_term_to_table(&qualified_is_not_null_term, "t2", &[]).is_none(),
+            "a predicate qualified for t1 must not bind to t2"
+        );
+
+        let qualified_expression_eq: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::FunctionCall {
+                name: "lower".to_owned(),
+                args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                    ColumnRef::qualified("t1", "a"),
+                    Span::ZERO,
+                )]),
+                distinct: false,
+                order_by: vec![],
+                filter: None,
+                over: None,
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::String("x".to_owned()), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let qualified_expression_term = classify_where_term(qualified_expression_eq);
+        assert!(matches!(
+            qualified_expression_term.kind,
+            WhereTermKind::Other
+        ));
+        let bound_expression = bind_where_term_to_table(&qualified_expression_term, "t1", &[])
+            .expect("qualified t1 expression-index term must survive binding");
+        assert!(
+            bound_expression.column.is_none(),
+            "expression-index terms intentionally retain their raw AST instead of inventing a column"
+        );
+        let qualified_expression_index = IndexInfo {
+            name: "idx_t1_lower_a".to_owned(),
+            table: "t1".to_owned(),
+            columns: vec![],
+            unique: false,
+            n_pages: 20,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![Expr::FunctionCall {
+                name: "LOWER".to_owned(),
+                args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                    ColumnRef::bare("A"),
+                    Span::ZERO,
+                )]),
+                distinct: false,
+                order_by: vec![],
+                filter: None,
+                over: None,
+                span: Span::ZERO,
+            }],
+        };
+        let qualified_expression_path = join_access_path(
+            &table_stats("t1", 100, 1_000),
+            &[qualified_expression_index],
+            std::slice::from_ref(&qualified_expression_term),
+            None,
+            JoinAccessPathContext {
+                table_index_hints: None,
+                cracking_hints: None,
+                available_outer_tables: &[],
+                unqualified_terms_are_table_local: false,
+            },
+        );
+        assert_eq!(
+            qualified_expression_path.index.as_deref(),
+            Some("idx_t1_lower_a"),
+            "qualified query expressions must match bare, case-insensitive expression-index keys"
+        );
+        let qualified_cast = Expr::Cast {
+            expr: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            type_name: fsqlite_ast::TypeName {
+                name: "text".to_owned(),
+                arg1: None,
+                arg2: None,
+            },
+            span: Span::ZERO,
+        };
+        let indexed_cast = Expr::Cast {
+            expr: Box::new(Expr::Column(ColumnRef::bare("A"), Span::ZERO)),
+            type_name: fsqlite_ast::TypeName {
+                name: "TEXT".to_owned(),
+                arg1: None,
+                arg2: None,
+            },
+            span: Span::ZERO,
+        };
+        assert!(
+            expression_matches_index_key(&qualified_cast, &indexed_cast, "t1"),
+            "type names and columns in expression-index keys are SQL identifiers, not case-sensitive data"
+        );
+
+        let bare_expression_eq: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::FunctionCall {
+                name: "lower".to_owned(),
+                args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                    ColumnRef::bare("a"),
+                    Span::ZERO,
+                )]),
+                distinct: false,
+                order_by: vec![],
+                filter: None,
+                over: None,
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::String("x".to_owned()), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        assert!(
+            bind_where_term_to_table(&classify_where_term(bare_expression_eq), "t1", &[]).is_none(),
+            "a bare expression-index term is ambiguous in a multi-table query"
+        );
+
+        let cross_table_expression_eq: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::FunctionCall {
+                name: "lower".to_owned(),
+                args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                    ColumnRef::qualified("t1", "a"),
+                    Span::ZERO,
+                )]),
+                distinct: false,
+                order_by: vec![],
+                filter: None,
+                over: None,
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("t2", "a"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        assert!(
+            bind_where_term_to_table(
+                &classify_where_term(cross_table_expression_eq),
+                "t1",
+                &["t2".to_owned()],
+            )
+            .is_none(),
+            "expression-index probes are not executable for cross-table operands yet and must fail closed"
+        );
+
+        let same_row_expression_eq: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::FunctionCall {
+                name: "lower".to_owned(),
+                args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                    ColumnRef::qualified("t1", "a"),
+                    Span::ZERO,
+                )]),
+                distinct: false,
+                order_by: vec![],
+                filter: None,
+                over: None,
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("t1", "b"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        assert!(
+            bind_where_term_to_table(&classify_where_term(same_row_expression_eq), "t1", &[],)
+                .is_none(),
+            "an expression-index probe cannot depend on another column from the same unread row"
+        );
+    }
+
+    #[test]
+    fn test_table_local_access_paths_reject_row_dependent_probes() {
+        let table = table_stats("t1", 100, 1000);
+        let index = index_info("idx_t1_a", "t1", &["a"], false, 20);
+
+        let column_comparison: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let column_comparison_path = best_access_path(
+            &table,
+            std::slice::from_ref(&index),
+            &[classify_where_term(column_comparison)],
+            None,
+        );
+        assert!(
+            matches!(column_comparison_path.kind, AccessPathKind::FullTableScan),
+            "a same-row column cannot be evaluated as a pre-scan index probe: \
+             {column_comparison_path:?}"
+        );
+
+        let rowid_comparison: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let rowid_comparison_path =
+            best_access_path(&table, &[], &[classify_where_term(rowid_comparison)], None);
+        assert!(
+            matches!(rowid_comparison_path.kind, AccessPathKind::FullTableScan),
+            "a same-row column cannot be evaluated as a pre-scan rowid probe: \
+             {rowid_comparison_path:?}"
+        );
+
+        let or_comparison: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new((*column_comparison).clone()),
+            op: AstBinaryOp::Or,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(Literal::Integer(7), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        }));
+        let or_term = classify_where_term(or_comparison);
+        assert!(matches!(or_term.kind, WhereTermKind::InList { count: 2 }));
+        let or_comparison_path = best_access_path(&table, &[index], &[or_term], None);
+        assert!(
+            matches!(or_comparison_path.kind, AccessPathKind::FullTableScan),
+            "one row-dependent OR arm makes the whole IN expansion unavailable: \
+             {or_comparison_path:?}"
+        );
+
+        let empty_in: &'static Expr = Box::leak(Box::new(Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            set: InSet::List(vec![]),
+            not: false,
+            span: Span::ZERO,
+        }));
+        let empty_in_path = best_access_path(
+            &table,
+            &[index_info("idx_t1_a", "t1", &["a"], false, 20)],
+            &[classify_where_term(empty_in)],
+            None,
+        );
+        assert!(
+            matches!(empty_in_path.kind, AccessPathKind::FullTableScan),
+            "an empty IN list has no executable seek probe and must remain a residual: \
+             {empty_in_path:?}"
+        );
+    }
+
+    #[test]
+    fn test_table_local_probe_filter_preserves_expression_index_terms() {
+        let table = table_stats("t1", 100, 1000);
+        let key_expr = Expr::FunctionCall {
+            name: "lower".to_owned(),
+            args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                ColumnRef::bare("a"),
+                Span::ZERO,
+            )]),
+            distinct: false,
+            order_by: vec![],
+            filter: None,
+            over: None,
+            span: Span::ZERO,
+        };
+        let where_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(key_expr.clone()),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::String("x".to_owned()), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let index = IndexInfo {
+            name: "idx_t1_lower_a".to_owned(),
+            table: "t1".to_owned(),
+            columns: vec![],
+            unique: false,
+            n_pages: 20,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![key_expr],
+        };
+
+        let path = best_access_path(&table, &[index], &[classify_where_term(where_expr)], None);
+        assert_eq!(
+            path.index.as_deref(),
+            Some("idx_t1_lower_a"),
+            "filtering row-dependent probes must retain evaluable expression-index terms"
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_accepts_same_bound_stricter_operator() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Ge,
+            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
             span: Span::ZERO,
         });
 
@@ -10367,37 +12893,37 @@ mod tests {
     }
 
     #[test]
-    fn test_best_access_path_partial_index_accepts_is_not_null_from_like_prefix() {
+    fn test_best_access_path_partial_index_rejects_is_not_null_from_function_backed_patterns() {
         let table = table_stats("t1", 100, 1000);
-        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
-        partial_idx.partial_where = Some(Expr::IsNull {
-            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
-            not: true,
-            span: Span::ZERO,
-        });
 
-        let ap = best_access_path(&table, &[partial_idx], &[like_term("a", "123%")], None);
-        assert!(matches!(
-            ap.kind,
-            AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
-        ));
-    }
+        for op in [LikeOp::Like, LikeOp::Glob, LikeOp::Match, LikeOp::Regexp] {
+            let mut partial_idx = index_info("idx_partial_b", "t1", &["b"], false, 20);
+            partial_idx.partial_where = Some(Expr::IsNull {
+                expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                not: true,
+                span: Span::ZERO,
+            });
+            let pattern_expr: &'static Expr = Box::leak(Box::new(Expr::Like {
+                expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                pattern: Box::new(Expr::Literal(
+                    Literal::String("needle".to_owned()),
+                    Span::ZERO,
+                )),
+                escape: None,
+                op,
+                not: false,
+                span: Span::ZERO,
+            }));
+            let terms = [eq_term_value("b", 7), classify_where_term(pattern_expr)];
 
-    #[test]
-    fn test_best_access_path_partial_index_accepts_is_not_null_from_glob_prefix() {
-        let table = table_stats("t1", 100, 1000);
-        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
-        partial_idx.partial_where = Some(Expr::IsNull {
-            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
-            not: true,
-            span: Span::ZERO,
-        });
-
-        let ap = best_access_path(&table, &[partial_idx], &[glob_term("a", "abc*")], None);
-        assert!(matches!(
-            ap.kind,
-            AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
-        ));
+            let ap = best_access_path(&table, &[partial_idx], &terms, None);
+            assert!(
+                matches!(ap.kind, AccessPathKind::FullTableScan),
+                "{op:?} can be backed by an overridden scalar function and cannot prove that its \
+                 left operand is non-NULL"
+            );
+            assert!(ap.index.is_none());
+        }
     }
 
     #[test]
@@ -10607,6 +13133,13 @@ mod tests {
             .find(|path| path.table.eq_ignore_ascii_case("users"))
             .expect("bead_id={BEAD_ID} users path should exist");
         assert_eq!(users_path.index.as_deref(), Some("idx_users_email"));
+        assert!(matches!(users_path.kind, AccessPathKind::IndexScanEquality));
+        assert!(matches!(
+            &users_path.probe,
+            Some(AccessPathProbe::Equality { column, target })
+                if column == "email"
+                    && **target == Expr::Literal(Literal::Integer(1), Span::ZERO)
+        ));
         let events_path = first_plan
             .access_paths
             .iter()
@@ -11558,6 +14091,48 @@ mod tests {
 
     // ── Constant folding tests (bd-1as.3) ──
 
+    fn fold_literal(literal: Literal) -> Expr {
+        Expr::Literal(literal, Span::ZERO)
+    }
+
+    fn fold_binary(left: Expr, op: AstBinaryOp, right: Expr) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+            span: Span::ZERO,
+        }
+    }
+
+    fn fold_unary(op: fsqlite_ast::UnaryOp, expr: Expr) -> Expr {
+        Expr::UnaryOp {
+            op,
+            expr: Box::new(expr),
+            span: Span::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_fold_stack_avoids_spill_allocation_until_inline_capacity() {
+        let mut stack = FoldStack::<u8, 2>::new();
+        assert_eq!(stack.spill.capacity(), 0);
+
+        stack.push(1);
+        stack.push(2);
+        assert_eq!(
+            stack.spill.capacity(),
+            0,
+            "the shallow fold path must stay allocation-free"
+        );
+
+        stack.push(3);
+        assert!(stack.spill.capacity() > 0);
+        assert_eq!(stack.pop(), Some(3));
+        assert_eq!(stack.pop(), Some(2));
+        assert_eq!(stack.pop(), Some(1));
+        assert_eq!(stack.pop(), None);
+    }
+
     #[test]
     fn test_fold_literal() {
         let expr = Expr::Literal(Literal::Integer(42), Span::ZERO);
@@ -11640,6 +14215,214 @@ mod tests {
             try_constant_fold(&expr),
             FoldResult::Literal(Literal::Integer(42))
         );
+    }
+
+    #[test]
+    fn test_fold_integer_overflow_promotes_to_real_like_sqlite() {
+        for (expr, expected) in [
+            (
+                fold_binary(
+                    fold_literal(Literal::Integer(i64::MAX)),
+                    AstBinaryOp::Add,
+                    fold_literal(Literal::Integer(1)),
+                ),
+                (i64::MAX as f64) + 1.0,
+            ),
+            (
+                fold_binary(
+                    fold_literal(Literal::Integer(i64::MIN)),
+                    AstBinaryOp::Subtract,
+                    fold_literal(Literal::Integer(1)),
+                ),
+                (i64::MIN as f64) - 1.0,
+            ),
+            (
+                fold_binary(
+                    fold_literal(Literal::Integer(3_037_000_500)),
+                    AstBinaryOp::Multiply,
+                    fold_literal(Literal::Integer(3_037_000_500)),
+                ),
+                3_037_000_500_f64 * 3_037_000_500_f64,
+            ),
+            (
+                fold_binary(
+                    fold_literal(Literal::Integer(i64::MIN)),
+                    AstBinaryOp::Divide,
+                    fold_literal(Literal::Integer(-1)),
+                ),
+                -(i64::MIN as f64),
+            ),
+            (
+                fold_unary(
+                    fsqlite_ast::UnaryOp::Negate,
+                    fold_literal(Literal::Integer(i64::MIN)),
+                ),
+                -(i64::MIN as f64),
+            ),
+        ] {
+            assert_eq!(
+                try_constant_fold(&expr),
+                FoldResult::Literal(Literal::Float(expected))
+            );
+        }
+
+        let modulo_overflow = fold_binary(
+            fold_literal(Literal::Integer(i64::MIN)),
+            AstBinaryOp::Modulo,
+            fold_literal(Literal::Integer(-1)),
+        );
+        assert_eq!(
+            try_constant_fold(&modulo_overflow),
+            FoldResult::Literal(Literal::Integer(0))
+        );
+    }
+
+    #[test]
+    fn test_fold_is_and_is_not_never_propagate_null() {
+        for (left, op, right, expected) in [
+            (Literal::Null, AstBinaryOp::Is, Literal::Null, Literal::True),
+            (
+                Literal::Null,
+                AstBinaryOp::IsNot,
+                Literal::Null,
+                Literal::False,
+            ),
+            (
+                Literal::Null,
+                AstBinaryOp::Is,
+                Literal::Integer(1),
+                Literal::False,
+            ),
+            (
+                Literal::Null,
+                AstBinaryOp::IsNot,
+                Literal::Integer(1),
+                Literal::True,
+            ),
+            (
+                Literal::Integer(1),
+                AstBinaryOp::Is,
+                Literal::Float(1.0),
+                Literal::True,
+            ),
+            (
+                Literal::String("1".to_owned()),
+                AstBinaryOp::Is,
+                Literal::Integer(1),
+                Literal::False,
+            ),
+            (
+                Literal::Integer(2),
+                AstBinaryOp::Is,
+                Literal::True,
+                Literal::True,
+            ),
+            (
+                Literal::True,
+                AstBinaryOp::Is,
+                Literal::Integer(2),
+                Literal::False,
+            ),
+            (
+                Literal::Integer(0),
+                AstBinaryOp::Is,
+                Literal::False,
+                Literal::True,
+            ),
+            (
+                Literal::Integer(i64::MAX),
+                AstBinaryOp::Is,
+                Literal::Float(i64::MAX as f64),
+                Literal::False,
+            ),
+            (
+                Literal::Integer(i64::MIN),
+                AstBinaryOp::Is,
+                Literal::Float(i64::MIN as f64),
+                Literal::True,
+            ),
+        ] {
+            let expr = fold_binary(fold_literal(left), op, fold_literal(right));
+            assert_eq!(try_constant_fold(&expr), FoldResult::Literal(expected));
+        }
+
+        let ordinary_equality = fold_binary(
+            fold_literal(Literal::Null),
+            AstBinaryOp::Eq,
+            fold_literal(Literal::Null),
+        );
+        assert_eq!(
+            try_constant_fold(&ordinary_equality),
+            FoldResult::Literal(Literal::Null)
+        );
+    }
+
+    #[test]
+    fn test_fold_and_or_use_sql_three_valued_logic() {
+        for (left, op, right, expected) in [
+            (
+                Literal::Integer(0),
+                AstBinaryOp::And,
+                Literal::Null,
+                Literal::False,
+            ),
+            (
+                Literal::Null,
+                AstBinaryOp::And,
+                Literal::Integer(0),
+                Literal::False,
+            ),
+            (
+                Literal::Integer(1),
+                AstBinaryOp::And,
+                Literal::Null,
+                Literal::Null,
+            ),
+            (
+                Literal::Null,
+                AstBinaryOp::Or,
+                Literal::Integer(1),
+                Literal::True,
+            ),
+            (
+                Literal::Integer(1),
+                AstBinaryOp::Or,
+                Literal::Null,
+                Literal::True,
+            ),
+            (
+                Literal::Integer(0),
+                AstBinaryOp::Or,
+                Literal::Null,
+                Literal::Null,
+            ),
+        ] {
+            let expr = fold_binary(fold_literal(left), op, fold_literal(right));
+            assert_eq!(try_constant_fold(&expr), FoldResult::Literal(expected));
+        }
+    }
+
+    #[test]
+    fn test_fold_height_1000_and_1001_is_stack_safe_on_one_mib_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                for height in [1_000_i64, 1_001] {
+                    let mut expr = fold_literal(Literal::Integer(1));
+                    for _ in 1..height {
+                        expr =
+                            fold_binary(fold_literal(Literal::Integer(1)), AstBinaryOp::Add, expr);
+                    }
+                    assert_eq!(
+                        try_constant_fold(&expr),
+                        FoldResult::Literal(Literal::Integer(height))
+                    );
+                    drop(expr);
+                }
+            })
+            .expect("one-MiB constant-fold test thread must spawn")
+            .join()
+            .expect("height-1000/1001 constant folding must not overflow the native stack");
     }
 
     #[test]

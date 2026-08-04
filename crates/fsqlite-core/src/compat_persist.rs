@@ -433,11 +433,22 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
 
             // Populate the index B-tree from table rows.
             {
-                let mut idx_cursor = fsqlite_btree::BtCursor::new(
+                // bd-vacuum-desc-index-self-reject-y2aog: the insert cursor
+                // MUST carry the index's declared sort directions — a bare
+                // cursor positions every entry ASC/binary, so a DESC term
+                // yields a physically mis-ordered leaf that the (schema-
+                // driven, correct) integrity checker then rejects. All-ASC
+                // binary indexes only worked by coincidence.
+                let mut idx_cursor = fsqlite_btree::BtCursor::new_with_index_desc(
                     TransactionPageIo::new(&mut txn),
                     idx_root,
                     usable_size,
                     true,
+                    index
+                        .key_sort_directions
+                        .iter()
+                        .map(|direction| matches!(direction, SortDirection::Desc))
+                        .collect(),
                 );
                 configure_btree_cursor_page_size(&mut idx_cursor, usable_size, full_page_size);
                 if let Some(mem_table) = db.get_table(table.root_page) {

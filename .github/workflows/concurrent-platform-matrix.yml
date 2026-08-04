@@ -11,6 +11,7 @@ on:
     paths:
       - ".github/workflows/concurrent-platform-matrix.yml"
       - "crates/fsqlite-e2e/**"
+      - "crates/fsqlite-btree/**"
       - "crates/fsqlite-mvcc/**"
       - "crates/fsqlite-wal/**"
       - "crates/fsqlite-pager/**"
@@ -135,80 +136,135 @@ jobs:
       - name: Build concurrency test crates
         shell: bash
         run: |
+          set -o pipefail
           cargo test -p fsqlite-e2e --no-run 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/build.log
 
       - name: Run concurrent writer tests
         shell: bash
         run: |
           set +e
+          set -o pipefail
           cargo test -p fsqlite-e2e \
             --test correctness_concurrent_writes \
             --test mvcc_concurrent_writers \
             -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_writers.log
-          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_writers.exit
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_writers.exit
 
       - name: Run concurrent mode defaults
         shell: bash
         run: |
           set +e
+          set -o pipefail
           cargo test -p fsqlite-e2e \
             --test bd_2yqp6_6_5_concurrent_mode_defaults \
             -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_defaults.log
-          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_defaults.exit
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_defaults.exit
 
       - name: Run SSI serialization anomaly tests
         shell: bash
         run: |
           set +e
+          set -o pipefail
           cargo test -p fsqlite-e2e \
             --test bd_2yqp6_6_1_ssi_serialization_anomaly_differential \
             -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/ssi_anomaly.log
-          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/ssi_anomaly.exit
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/ssi_anomaly.exit
 
       - name: Run busy retry error semantics
         shell: bash
         run: |
           set +e
+          set -o pipefail
           cargo test -p fsqlite-e2e \
             --test bd_2yqp6_6_2_busy_retry_error_semantics_matrix \
             -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/busy_retry.log
-          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/busy_retry.exit
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/busy_retry.exit
 
       - name: Run crash recovery corruption matrix
         shell: bash
         run: |
           set +e
+          set -o pipefail
           cargo test -p fsqlite-e2e \
             --test bd_2yqp6_6_3_crash_recovery_corruption_matrix \
             -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/crash_recovery.log
-          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/crash_recovery.exit
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/crash_recovery.exit
 
       - name: Run integrity check tests
         shell: bash
         run: |
           set +e
+          set -o pipefail
           cargo test -p fsqlite-e2e \
             --test bd_aiica_integrity_check \
             -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/integrity_check.log
-          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/integrity_check.exit
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/integrity_check.exit
 
       - name: Run Connection !Send/!Sync audit
         shell: bash
         run: |
           set +e
+          set -o pipefail
           cargo test -p fsqlite-e2e \
             --test bd_3v5ci_connection_not_sync \
             -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/connection_sync.log
-          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/connection_sync.exit
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/connection_sync.exit
 
       - name: Run swarm harness smoke test
         shell: bash
         run: |
           set +e
+          set -o pipefail
           cargo test -p fsqlite-e2e \
             --test bd_073kf_swarm_harness \
             -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/swarm_harness.log
-          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/swarm_harness.exit
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/swarm_harness.exit
+
+      - name: Run persisted seek-cache corruption oracle
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cargo test --locked -p fsqlite-e2e \
+            --test bd_105ga_replace_conflict_guard \
+            -- --exact replace_conflict_churn_leaves_a_stock_valid_database --nocapture \
+            2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/replace_conflict_guard.log
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/replace_conflict_guard.exit
+
+      # Deliberately named a smoke test, not a corruption guard. Its own header
+      # says so: the captured stream is an open-only capture that replays clean
+      # even against the v0.1.18 tree it was supposed to corrupt, so a green run
+      # here is NOT evidence that bd-105ga is absent -- that is
+      # replace_conflict_guard's job, above. What this does buy: ~5k real
+      # statements (1,024 REPLACE INTO upserts inside one BEGIN IMMEDIATE ...
+      # ROLLBACK) against an 18 MB real-world database, checked by both our
+      # integrity_check and C SQLite's. Nothing else in CI exercises a
+      # bulk-upsert-then-rollback workload on a non-toy file.
+      #
+      # COST: measured at 265 s locally (2026-07-29), and this job is a
+      # per-platform matrix, so budget that per platform. If the matrix gets
+      # tight, this is the most defensible step to move to a nightly job --
+      # it is a smoke test, not a correctness gate.
+      - name: Bulk-upsert rollback smoke test on a real 18 MB database
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cargo test --locked -p fsqlite-e2e \
+            --test bd_105ga_replay_regression \
+            -- --exact bd105ga_stream_replays_without_error_or_integrity_loss --nocapture \
+            2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/replay_smoke.log
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/replay_smoke.exit
 
       - name: Cross-engine integrity check on artifacts (Linux only)
         if: runner.os == 'Linux'
@@ -248,7 +304,7 @@ jobs:
             for f in artifacts/concurrent-${{ matrix.platform_tag }}/*.exit; do
               if [ -f "$f" ]; then
                 suite=$(basename "$f" .exit)
-                code=$(cat "$f" | grep -o '[0-9]*$' || echo "?")
+                code=$(grep -o '[0-9]*$' "$f" || echo "?")
                 status="PASS"
                 [ "$code" != "0" ] && status="**FAIL**"
                 echo "| $suite | $code ($status) |"
@@ -275,6 +331,51 @@ jobs:
           name: concurrent-${{ matrix.platform_tag }}
           path: artifacts/concurrent-${{ matrix.platform_tag }}/
           retention-days: 21
+
+      - name: Enforce recorded test outcomes
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          failed=0
+          expected_suites=(
+            concurrent_writers
+            concurrent_defaults
+            ssi_anomaly
+            busy_retry
+            crash_recovery
+            integrity_check
+            connection_sync
+            swarm_harness
+            replace_conflict_guard
+            replay_smoke
+          )
+          shopt -s nullglob
+          actual_receipts=(artifacts/concurrent-${{ matrix.platform_tag }}/*.exit)
+          if [ "${#actual_receipts[@]}" -ne "${#expected_suites[@]}" ]; then
+            echo "::error::Expected ${#expected_suites[@]} exact test receipts, found ${#actual_receipts[@]}"
+            failed=1
+          fi
+          for suite in "${expected_suites[@]}"; do
+            receipt="artifacts/concurrent-${{ matrix.platform_tag }}/${suite}.exit"
+            if [ ! -f "$receipt" ]; then
+              echo "::error file=${receipt}::Required test receipt is missing"
+              failed=1
+              continue
+            fi
+            receipt_value=$(<"$receipt")
+            if ! [[ "$receipt_value" =~ ^exit_code=([0-9]+)$ ]]; then
+              echo "::error file=${receipt}::Malformed or missing exit-code receipt"
+              failed=1
+              continue
+            fi
+            code=${BASH_REMATCH[1]}
+            if [ "$code" -ne 0 ]; then
+              echo "::error file=${receipt}::Test command failed with exit code ${code}"
+              failed=1
+            fi
+          done
+          exit "$failed"
 
   platform-summary:
     needs: platform-concurrency
@@ -303,7 +404,7 @@ jobs:
                 failed=0
                 for f in "$dir"*.exit; do
                   if [ -f "$f" ]; then
-                    code=$(cat "$f" | grep -o '[0-9]*$' || echo 1)
+                    code=$(grep -o '[0-9]*$' "$f" || echo 1)
                     if [ "$code" = "0" ]; then
                       passed=$((passed + 1))
                     else

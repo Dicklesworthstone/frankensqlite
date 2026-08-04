@@ -165,7 +165,21 @@ impl CollationRegistry {
         &mut self,
         collation: C,
     ) -> Option<Arc<dyn CollationFunction>> {
-        let name = collation.name().to_ascii_uppercase();
+        let name = collation.name().to_owned();
+        self.register_captured(&name, collation)
+    }
+
+    /// Register a custom collation using a caller-captured name.
+    ///
+    /// This variant never invokes user code. Callers that publish into a
+    /// shared registry can capture `CollationFunction::name` before taking
+    /// their lock, preventing a reentrant metadata callback from deadlocking.
+    pub fn register_captured<C: CollationFunction + 'static>(
+        &mut self,
+        name: &str,
+        collation: C,
+    ) -> Option<Arc<dyn CollationFunction>> {
+        let name = name.to_ascii_uppercase();
         info!(collation_name = %name, deterministic = true, "custom collation registration");
         self.custom_collations
             .insert(name.clone(), Arc::new(collation))
@@ -196,6 +210,19 @@ impl CollationRegistry {
     pub fn contains(&self, name: &str) -> bool {
         let canon = name.to_ascii_uppercase();
         self.custom_collations.contains_key(&canon) || builtin_collation(&canon).is_some()
+    }
+
+    /// Whether `name` currently resolves to FrankenSQLite's built-in
+    /// implementation rather than an application override.
+    ///
+    /// Fast paths that replace comparator calls with canonical byte keys must
+    /// use this stronger predicate: checking the name alone is unsound because
+    /// applications may replace even `BINARY`, `NOCASE`, or `RTRIM`.
+    #[must_use]
+    pub fn uses_builtin_implementation(&self, name: &str) -> bool {
+        let canon = name.to_ascii_uppercase();
+        matches!(canon.as_str(), "BINARY" | "NOCASE" | "RTRIM")
+            && !self.custom_collations.contains_key(&canon)
     }
 
     /// Return registered collation names in stable display order.
@@ -467,9 +494,11 @@ mod tests {
     #[test]
     fn test_registry_overwrite_builtin() {
         let mut reg = CollationRegistry::new();
+        assert!(reg.uses_builtin_implementation("binary"));
 
         let prev = reg.register(AlwaysEqualCollation);
         assert!(prev.is_some(), "should return previous BINARY collation");
+        assert!(!reg.uses_builtin_implementation("BINARY"));
 
         let coll = reg.find("BINARY").unwrap();
         assert_eq!(

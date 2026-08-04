@@ -125,7 +125,10 @@ OPTIONS:
   -h, --help                  Show this help
 
 Exit 0 means the candidate was not found in the no-retry registry.
-Exit 2 means a rejected or non-candidate duplicate was found; do not mutate source first.
+Exit 2 means either a sound rejected/non-candidate duplicate was found or a
+matched REJECT lacks a recorded same-invocation A/A null control. In the latter
+case, re-run the exact candidate under the corrected harness before proposing a
+new source mutation.
 "
     );
 }
@@ -153,16 +156,20 @@ fn run() -> Result<ExitCode, String> {
         println!("{}", report.summary);
         for record in &report.matched_records {
             println!(
-                "match decision={} date={} ledger={} retry_condition={}",
-                record.decision, record.date, record.ledger_entry, record.retry_condition
+                "match decision={} date={} ledger={} null_control_recorded={} retry_condition={}",
+                record.decision,
+                record.date,
+                record.ledger_entry,
+                record.null_control_recorded,
+                record.retry_condition
             );
         }
     }
 
-    if report.verdict == CandidatePreflightVerdict::Blocked {
-        Ok(ExitCode::from(2))
-    } else {
+    if report.verdict == CandidatePreflightVerdict::Allowed {
         Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(2))
     }
 }
 

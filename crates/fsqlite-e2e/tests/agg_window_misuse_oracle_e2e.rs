@@ -8,6 +8,7 @@
 //! valid-aggregate / valid-window controls confirming the legitimate forms still
 //! work. The shared comparison treats (Err,Err) as agreement and flags an
 //! engine that diverges (one errors, the other succeeds).
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -25,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,10 +59,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -83,14 +84,14 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn data() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn data() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, g TEXT)",
         "INSERT INTO t VALUES (1,10,'a'),(2,20,'a'),(3,30,'b'),(4,5,'b')",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -99,75 +100,90 @@ fn data() -> (Connection, rusqlite::Connection) {
 /// bd-fuxgg: frank runs an aggregate placed in WHERE instead of rejecting it.
 #[test]
 fn aggregate_in_where_is_rejected() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT * FROM t WHERE sum(x) > 5", // misuse of aggregate -> error both
-            "SELECT * FROM t WHERE count(*) > 1", // error both
-            "SELECT * FROM t WHERE max(x) = x", // error both
-        ],
-        "aggregate_in_where_is_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT * FROM t WHERE sum(x) > 5", // misuse of aggregate -> error both
+                "SELECT * FROM t WHERE count(*) > 1", // error both
+                "SELECT * FROM t WHERE max(x) = x", // error both
+            ],
+            "aggregate_in_where_is_rejected",
+        )
+        .await;
+    });
 }
 
 /// bd-fuxgg: frank runs a nested aggregate (returns NULL) instead of rejecting.
 #[test]
 fn nested_aggregate_is_rejected() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT sum(count(*)) FROM t", // nested aggregate -> error both
-            "SELECT max(avg(x)) FROM t GROUP BY g", // error both
-        ],
-        "nested_aggregate_is_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT sum(count(*)) FROM t", // nested aggregate -> error both
+                "SELECT max(avg(x)) FROM t GROUP BY g", // error both
+            ],
+            "nested_aggregate_is_rejected",
+        )
+        .await;
+    });
 }
 
 /// frank correctly rejects a window function in WHERE (matches SQLite).
 #[test]
 fn window_function_in_where_is_rejected() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &["SELECT x FROM t WHERE row_number() OVER () = 1"],
-        "window_function_in_where_is_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &["SELECT x FROM t WHERE row_number() OVER () = 1"],
+            "window_function_in_where_is_rejected",
+        )
+        .await;
+    });
 }
 
 /// bd-fuxgg: frank accepts a window function in HAVING / GROUP BY (SQLite rejects
 /// it; window functions are only allowed in SELECT and ORDER BY).
 #[test]
 fn window_function_in_having_or_group_by_is_rejected() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT g FROM t GROUP BY g HAVING row_number() OVER () > 0",
-            "SELECT x FROM t GROUP BY row_number() OVER ()",
-        ],
-        "window_function_in_having_or_group_by_is_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT g FROM t GROUP BY g HAVING row_number() OVER () > 0",
+                "SELECT x FROM t GROUP BY row_number() OVER ()",
+            ],
+            "window_function_in_having_or_group_by_is_rejected",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn valid_aggregate_and_window_controls() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // The legitimate forms must still succeed and match.
-            "SELECT sum(x), count(*), max(x) FROM t",
-            "SELECT g, sum(x) FROM t GROUP BY g HAVING sum(x) > 25 ORDER BY g",
-            "SELECT id, row_number() OVER (ORDER BY x) FROM t ORDER BY id",
-            "SELECT id, x FROM t ORDER BY count(*) OVER () , id", // window in ORDER BY is allowed
-        ],
-        "valid_aggregate_and_window_controls",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // The legitimate forms must still succeed and match.
+                "SELECT sum(x), count(*), max(x) FROM t",
+                "SELECT g, sum(x) FROM t GROUP BY g HAVING sum(x) > 25 ORDER BY g",
+                "SELECT id, row_number() OVER (ORDER BY x) FROM t ORDER BY id",
+                "SELECT id, x FROM t ORDER BY count(*) OVER () , id", // window in ORDER BY is allowed
+            ],
+            "valid_aggregate_and_window_controls",
+        )
+        .await;
+    });
 }

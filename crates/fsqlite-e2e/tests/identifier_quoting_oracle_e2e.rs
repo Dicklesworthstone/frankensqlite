@@ -5,6 +5,7 @@
 //! used as quoted identifiers, and the (mis)feature where a double-quoted token
 //! that matches no identifier is treated as a string literal. Each scenario
 //! asserts per-statement agreement with rusqlite, then compares query results.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -22,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -55,11 +56,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -69,7 +70,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -93,110 +94,153 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn quoting_double_quoted_identifiers() {
-    scenario(
-        &[
-            "CREATE TABLE \"my tbl\" (\"col a\" INTEGER, \"col b\" TEXT)",
-            "INSERT INTO \"my tbl\" (\"col a\", \"col b\") VALUES (1, 'x'), (2, 'y')",
-        ],
-        &[
-            "SELECT \"col a\", \"col b\" FROM \"my tbl\" ORDER BY \"col a\"",
-            "SELECT \"col b\" FROM \"my tbl\" WHERE \"col a\" = 2",
-        ],
-        "quoting_double_quoted_identifiers",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE \"my tbl\" (\"col a\" INTEGER, \"col b\" TEXT)",
+                "INSERT INTO \"my tbl\" (\"col a\", \"col b\") VALUES (1, 'x'), (2, 'y')",
+            ],
+            &[
+                "SELECT \"col a\", \"col b\" FROM \"my tbl\" ORDER BY \"col a\"",
+                "SELECT \"col b\" FROM \"my tbl\" WHERE \"col a\" = 2",
+            ],
+            "quoting_double_quoted_identifiers",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn quoting_bracket_identifiers() {
-    scenario(
-        &[
-            "CREATE TABLE [b tbl] ([x col] INTEGER, [y] TEXT)",
-            "INSERT INTO [b tbl] ([x col], [y]) VALUES (10, 'a'), (20, 'b')",
-        ],
-        &[
-            "SELECT [x col], [y] FROM [b tbl] ORDER BY [x col]",
-            "SELECT [y] FROM [b tbl] WHERE [x col] > 15",
-        ],
-        "quoting_bracket_identifiers",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE [b tbl] ([x col] INTEGER, [y] TEXT)",
+                "INSERT INTO [b tbl] ([x col], [y]) VALUES (10, 'a'), (20, 'b')",
+            ],
+            &[
+                "SELECT [x col], [y] FROM [b tbl] ORDER BY [x col]",
+                "SELECT [y] FROM [b tbl] WHERE [x col] > 15",
+            ],
+            "quoting_bracket_identifiers",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn quoting_backtick_identifiers() {
-    scenario(
-        &[
-            "CREATE TABLE `bt` (`a b` INTEGER, `c` TEXT)",
-            "INSERT INTO `bt` (`a b`, `c`) VALUES (5, 'p'), (6, 'q')",
-        ],
-        &[
-            "SELECT `a b`, `c` FROM `bt` ORDER BY `a b`",
-            "SELECT `c` FROM `bt` WHERE `a b` = 6",
-        ],
-        "quoting_backtick_identifiers",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE `bt` (`a b` INTEGER, `c` TEXT)",
+                "INSERT INTO `bt` (`a b`, `c`) VALUES (5, 'p'), (6, 'q')",
+            ],
+            &[
+                "SELECT `a b`, `c` FROM `bt` ORDER BY `a b`",
+                "SELECT `c` FROM `bt` WHERE `a b` = 6",
+            ],
+            "quoting_backtick_identifiers",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn quoting_keywords_as_identifiers() {
-    scenario(
-        &[
-            // Reserved keywords usable as quoted identifiers.
-            "CREATE TABLE \"select\" (\"from\" INTEGER, \"where\" TEXT, \"order\" INTEGER)",
-            "INSERT INTO \"select\" (\"from\", \"where\", \"order\") VALUES (1,'a',3),(2,'b',1)",
-        ],
-        &[
-            "SELECT \"from\", \"where\" FROM \"select\" ORDER BY \"order\"",
-            "SELECT \"where\" FROM \"select\" WHERE \"from\" = 1",
-        ],
-        "quoting_keywords_as_identifiers",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                // Reserved keywords usable as quoted identifiers.
+                "CREATE TABLE \"select\" (\"from\" INTEGER, \"where\" TEXT, \"order\" INTEGER)",
+                "INSERT INTO \"select\" (\"from\", \"where\", \"order\") VALUES (1,'a',3),(2,'b',1)",
+            ],
+            &[
+                "SELECT \"from\", \"where\" FROM \"select\" ORDER BY \"order\"",
+                "SELECT \"where\" FROM \"select\" WHERE \"from\" = 1",
+            ],
+            "quoting_keywords_as_identifiers",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn quoting_case_insensitive_identifiers_and_keywords() {
-    scenario(
-        &[
-            "CREATE TABLE Tbl (Col INTEGER, Name TEXT)",
-            "InSeRt INTO tBL (cOl, nAmE) VaLuEs (1,'a'),(2,'b')",
-        ],
-        &[
-            // Identifiers and keywords are case-insensitive.
-            "select COL, name FROM tbl ORDER BY Col",
-            "SELECT name FROM TBL WHERE col = 2",
-        ],
-        "quoting_case_insensitive_identifiers_and_keywords",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE Tbl (Col INTEGER, Name TEXT)",
+                "InSeRt INTO tBL (cOl, nAmE) VaLuEs (1,'a'),(2,'b')",
+            ],
+            &[
+                // Identifiers and keywords are case-insensitive.
+                "select COL, name FROM tbl ORDER BY Col",
+                "SELECT name FROM TBL WHERE col = 2",
+            ],
+            "quoting_case_insensitive_identifiers_and_keywords",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn quoting_double_quoted_column_reference() {
-    scenario(
-        &[
-            "CREATE TABLE t (a INTEGER, b TEXT)",
-            "INSERT INTO t VALUES (1,'x'),(2,'y')",
-        ],
-        &[
-            // "b" IS a column -> column reference (works).
-            "SELECT \"b\" FROM t ORDER BY a",
-            // bare single-quoted string literal for contrast.
-            "SELECT 'literal' FROM t LIMIT 1",
-        ],
-        "quoting_double_quoted_column_reference",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (a INTEGER, b TEXT)",
+                "INSERT INTO t VALUES (1,'x'),(2,'y')",
+            ],
+            &[
+                // "b" IS a column -> column reference (works).
+                "SELECT \"b\" FROM t ORDER BY a",
+                // bare single-quoted string literal for contrast.
+                "SELECT 'literal' FROM t LIMIT 1",
+            ],
+            "quoting_double_quoted_column_reference",
+        )
+        .await;
+    });
 }
 
-/// SQLite's DQS (mis)feature: a double-quoted token matching no identifier is
-/// treated as a string literal. frank is stricter and errors. Tracked in
-/// bd-hrz7y (low priority — frank's behavior is arguably preferable).
+/// v0.2 deliberately rejects SQLite's legacy DQS fallback: a double-quoted
+/// token matching no identifier is not reinterpreted as a string literal.
+/// Ordinary double-quoted identifiers remain valid. See GH #148.
 #[test]
-#[ignore = "bd-hrz7y: double-quoted-string fallback (DQS) not supported; frank errors instead"]
 fn quoting_double_quoted_string_fallback() {
-    scenario(
-        &[
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("open frank");
+        let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        for statement in [
             "CREATE TABLE t (a INTEGER, b TEXT)",
             "INSERT INTO t VALUES (1,'x'),(2,'y')",
-        ],
-        &["SELECT \"no_such\" FROM t"],
-        "quoting_double_quoted_string_fallback",
-    );
+        ] {
+            f.execute(statement).await.expect("set up frank");
+            r.execute_batch(statement).expect("set up rusqlite");
+        }
+
+        let legacy_sql = "SELECT \"no_such\" FROM t ORDER BY a";
+        assert_eq!(
+            sqlite_rows(&r, legacy_sql).expect("legacy SQLite DQS fallback"),
+            vec![vec!["'no_such'".to_owned()], vec!["'no_such'".to_owned()]],
+            "stock SQLite must retain its legacy DQS fallback for this policy contrast"
+        );
+        let frank_error = frank_rows(&f, legacy_sql)
+            .await
+            .expect_err("FrankenSQLite must reject an unresolved quoted identifier");
+        assert!(
+            frank_error.contains("no_such"),
+            "rejection must identify the unresolved quoted token: {frank_error}"
+        );
+
+        let identifier_sql = "SELECT \"b\" FROM t ORDER BY a";
+        assert_eq!(
+            frank_rows(&f, identifier_sql)
+                .await
+                .expect("FrankenSQLite quoted identifier"),
+            sqlite_rows(&r, identifier_sql).expect("SQLite quoted identifier"),
+            "ordinary double-quoted identifiers remain supported"
+        );
+    });
 }

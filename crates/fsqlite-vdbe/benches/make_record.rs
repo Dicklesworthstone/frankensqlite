@@ -1,6 +1,7 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
+use asupersync::runtime::RuntimeBuilder;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{
@@ -62,6 +63,10 @@ fn build_make_record_program(column_count: usize, p4: P4) -> fsqlite_vdbe::VdbeP
 
 fn bench_make_record_fixed_schema(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("make-record benchmark runtime should build");
     let mut group = c.benchmark_group("make_record_fixed_schema");
 
     for column_count in [4_usize, 8, 16, 32] {
@@ -85,8 +90,8 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
+                    let outcome = runtime
+                        .block_on(async { engine.execute(program).await })
                         .expect("generic MakeRecord benchmark should execute");
                     black_box(outcome);
                 });
@@ -104,8 +109,8 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
+                    let outcome = runtime
+                        .block_on(async { engine.execute(program).await })
                         .expect("precomputed MakeRecord benchmark should execute");
                     black_box(outcome);
                 });

@@ -25,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,10 +58,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -84,14 +84,14 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 }
 
 // Ties in x make peer groups observable: groups {10,10},{20,20,20},{30}.
-fn data() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn data() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)",
         "INSERT INTO t VALUES (1,10),(2,10),(3,20),(4,20),(5,20),(6,30)",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -99,8 +99,9 @@ fn data() -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn window_rows_frame_sliding() {
-    let (f, r) = data();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
         &f,
         &r,
         &[
@@ -114,13 +115,16 @@ fn window_rows_frame_sliding() {
             "SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM t ORDER BY id",
         ],
         "window_rows_frame_sliding",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn window_groups_frame() {
-    let (f, r) = data();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
         &f,
         &r,
         &[
@@ -130,13 +134,16 @@ fn window_groups_frame() {
             "SELECT id, x, sum(x) OVER (ORDER BY x GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
         ],
         "window_groups_frame",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn window_exclude_clause() {
-    let (f, r) = data();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
         &f,
         &r,
         &[
@@ -150,5 +157,7 @@ fn window_exclude_clause() {
             "SELECT id, x, sum(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS) FROM t ORDER BY id",
         ],
         "window_exclude_clause",
-    );
+    )
+    .await;
+    });
 }

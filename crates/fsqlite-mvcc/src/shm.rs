@@ -18,7 +18,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use fsqlite_types::{CommitSeq, PageSize, SchemaEpoch, TxnId};
+use fsqlite_types::{CommitSeq, PageSize, SchemaEpoch, TxnId, sync_primitives::SystemTime};
 use fsqlite_vfs::ShmRegion;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -128,6 +128,7 @@ const LAYOUT_VERSION: u32 = 1;
 const DEFAULT_MAX_TXN_SLOTS: u32 = 128;
 
 /// High bit identifying a `/proc/<pid>/stat` start-time birth marker.
+#[cfg(unix)]
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 
 /// High bit identifying an owner token whose birth marker is not published yet.
@@ -178,8 +179,8 @@ fn current_process_birth_marker() -> u64 {
     }
 
     *FALLBACK_BIRTH.get_or_init(|| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(1, |duration| duration.as_nanos() as u64);
         now.max(1)
     })

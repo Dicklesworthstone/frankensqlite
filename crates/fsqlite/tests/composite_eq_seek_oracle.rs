@@ -13,8 +13,9 @@ fn render(v: &SqliteValue) -> String {
         SqliteValue::Blob(_) => "blob".into(),
     }
 }
-fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
+async fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
     c.query(s)
+        .await
         .unwrap_or_else(|e| panic!("frank `{s}`: {e}"))
         .iter()
         .map(|r| r.values().iter().map(render).collect())
@@ -40,66 +41,68 @@ fn sq(c: &rusqlite::Connection, s: &str) -> Vec<Vec<String>> {
     .map(Result::unwrap)
     .collect()
 }
-fn has_op(c: &Connection, s: &str, w: &str) -> bool {
+async fn has_op(c: &Connection, s: &str, w: &str) -> bool {
     c.query(&format!("EXPLAIN {s}"))
+        .await
         .unwrap()
         .iter()
         .any(|r| matches!(r.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == w))
 }
 #[test]
 fn composite_eq_seek_matches_sqlite() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, w TEXT, x INTEGER, z INTEGER);",
-        "CREATE INDEX idx_ab ON t(a, b);",
-        "CREATE INDEX idx_aw ON t(a, w);",
-        "CREATE INDEX idx_abz ON t(a, b, z);",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    for i in 1..=800_i64 {
-        // multiple rows per (a,b): a in 0..9, b in 0..9 -> ~8 rows each
-        let s = format!(
-            "INSERT INTO t VALUES ({i}, {}, {}, 'w{}', {i}, {});",
-            i % 10,
-            i % 9,
-            i % 9,
-            i % 3
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, w TEXT, x INTEGER, z INTEGER);",
+            "CREATE INDEX idx_ab ON t(a, b);",
+            "CREATE INDEX idx_aw ON t(a, w);",
+            "CREATE INDEX idx_abz ON t(a, b, z);",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        for i in 1..=800_i64 {
+            // multiple rows per (a,b): a in 0..9, b in 0..9 -> ~8 rows each
+            let s = format!(
+                "INSERT INTO t VALUES ({i}, {}, {}, 'w{}', {i}, {});",
+                i % 10,
+                i % 9,
+                i % 9,
+                i % 3
+            );
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
+        for s in [
+            // Multi-row matches (natural order, no ORDER BY) + LIMIT.
+            "SELECT id FROM t WHERE a = 5 AND b = 3",
+            "SELECT id, x FROM t WHERE a = 5 AND b = 3 LIMIT 3",
+            "SELECT id FROM t WHERE a = 5 AND b = 3 ORDER BY id",
+            // Reversed conjunct order.
+            "SELECT id FROM t WHERE b = 3 AND a = 5",
+            // Absent -> empty.
+            "SELECT id FROM t WHERE a = 5 AND b = 999",
+            "SELECT id FROM t WHERE a = 999 AND b = 3",
+            // Text second column.
+            "SELECT id FROM t WHERE a = 5 AND w = 'w3'",
+            "SELECT id FROM t WHERE a = 5 AND w = 'nope'",
+            // 3-term full equality on (a,b,z).
+            "SELECT id FROM t WHERE a = 5 AND b = 3 AND z = 1",
+            // Regression: real range after the prefix still works.
+            "SELECT id FROM t WHERE a = 5 AND b > 3 ORDER BY id",
+            "SELECT id FROM t WHERE a = 5 AND b >= 3 AND b <= 6 ORDER BY id",
+        ] {
+            assert_eq!(fr(&f, s).await, sq(&r, s), "diverged: `{s}`");
+        }
+        // Opcode gate: composite eq seeks (SeekGE / SeekGT), not a plain scan.
+        assert!(
+            has_op(&f, "SELECT id FROM t WHERE a = 5 AND b = 3", "SeekGE").await,
+            "a=? AND b=? must seek the composite index (SeekGE)"
         );
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
-    let cmp = |s: &str| assert_eq!(fr(&f, s), sq(&r, s), "diverged: `{s}`");
-    for s in [
-        // Multi-row matches (natural order, no ORDER BY) + LIMIT.
-        "SELECT id FROM t WHERE a = 5 AND b = 3",
-        "SELECT id, x FROM t WHERE a = 5 AND b = 3 LIMIT 3",
-        "SELECT id FROM t WHERE a = 5 AND b = 3 ORDER BY id",
-        // Reversed conjunct order.
-        "SELECT id FROM t WHERE b = 3 AND a = 5",
-        // Absent -> empty.
-        "SELECT id FROM t WHERE a = 5 AND b = 999",
-        "SELECT id FROM t WHERE a = 999 AND b = 3",
-        // Text second column.
-        "SELECT id FROM t WHERE a = 5 AND w = 'w3'",
-        "SELECT id FROM t WHERE a = 5 AND w = 'nope'",
-        // 3-term full equality on (a,b,z).
-        "SELECT id FROM t WHERE a = 5 AND b = 3 AND z = 1",
-        // Regression: real range after the prefix still works.
-        "SELECT id FROM t WHERE a = 5 AND b > 3 ORDER BY id",
-        "SELECT id FROM t WHERE a = 5 AND b >= 3 AND b <= 6 ORDER BY id",
-    ] {
-        cmp(s);
-    }
-    // Opcode gate: composite eq seeks (SeekGE / SeekGT), not a plain scan.
-    assert!(
-        has_op(&f, "SELECT id FROM t WHERE a = 5 AND b = 3", "SeekGE"),
-        "a=? AND b=? must seek the composite index (SeekGE)"
-    );
-    assert!(
-        has_op(&f, "SELECT id FROM t WHERE a = 5 AND w = 'w3'", "SeekGE"),
-        "a=? AND w=? (text) must seek the composite index"
-    );
+        assert!(
+            has_op(&f, "SELECT id FROM t WHERE a = 5 AND w = 'w3'", "SeekGE").await,
+            "a=? AND w=? (text) must seek the composite index"
+        );
+    });
 }

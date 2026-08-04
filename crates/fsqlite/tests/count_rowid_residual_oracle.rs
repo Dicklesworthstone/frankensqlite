@@ -9,9 +9,10 @@
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
-fn count_f(c: &Connection, sql: &str) -> i64 {
+async fn count_f(c: &Connection, sql: &str) -> i64 {
     let rows = c
         .query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
     match rows.first().and_then(|r| r.values().first()) {
         Some(SqliteValue::Integer(n)) => *n,
@@ -23,138 +24,158 @@ fn count_r(c: &rusqlite::Connection, sql: &str) -> i64 {
     c.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap()
 }
 
-fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
+async fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
     c.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with(prefix)))
 }
 
-fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
     match no_rewind {
         Some(true) => assert!(
-            !has_op(f, sql, "Rewind"),
+            !has_op(f, sql, "Rewind").await,
             "rowid-residual COUNT must not full-scan (Rewind): `{sql}`"
         ),
         Some(false) => assert!(
-            has_op(f, sql, "Rewind"),
+            has_op(f, sql, "Rewind").await,
             "control COUNT should full-scan (Rewind): `{sql}`"
         ),
         None => {}
     }
-    assert_eq!(count_f(f, sql), count_r(r, sql), "count diverged: `{sql}`");
+    assert_eq!(
+        count_f(f, sql).await,
+        count_r(r, sql),
+        "count diverged: `{sql}`"
+    );
 }
 
 #[test]
 fn count_rowid_residual_matches_sqlite() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, y INTEGER, c INTEGER);", // y non-indexed, c indexed
-        "CREATE INDEX idx_c ON t(c);",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    for i in 1..=300_i64 {
-        let s = format!("INSERT INTO t VALUES ({i}, {}, {});", i % 20, i % 10);
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, y INTEGER, c INTEGER);", // y non-indexed, c indexed
+            "CREATE INDEX idx_c ON t(c);",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        for i in 1..=300_i64 {
+            let s = format!("INSERT INTO t VALUES ({i}, {}, {});", i % 20, i % 10);
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
 
-    // Bare cases still seek (regression: the shared emitter's residual path must be off / byte-identical).
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 5", Some(true));
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id IN (5, 25, 45)",
-        Some(true),
-    );
-
-    // rowid = <int> AND <non-indexed residual>: reaches count_star (no diverter) -> seek, no Rewind.
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id = 5 AND y = 5",
-        Some(true),
-    ); // y[5]=5 -> 1
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id = 5 AND y = 7",
-        Some(true),
-    ); // y[5]=5 != 7 -> 0
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id = 99999 AND y = 5",
-        Some(true),
-    ); // absent rowid -> 0
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id = 5 AND y > 0 AND y < 10",
-        Some(true),
-    ); // multi-conjunct -> 1
-
-    // rowid IN (<ints>) AND <non-indexed residual>: SeekRowid per value + residual, no Rewind.
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id IN (5, 25, 45) AND y = 5",
-        Some(true),
-    ); // all y=5 -> 3
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id IN (5, 26, 47) AND y = 5",
-        Some(true),
-    ); // only id=5 -> 1
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id IN (5, 25, 45) AND y = 6",
-        Some(true),
-    ); // none -> 0
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id IN (5, 99999) AND y = 5",
-        Some(true),
-    ); // one absent -> 1
-
-    // Placeholder residual routes to the seek too (plan asserted on the unbound `?`).
-    assert!(
-        !has_op(
+        // Bare cases still seek (regression: the shared emitter's residual path must be off / byte-identical).
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 5", Some(true)).await;
+        cmp(
             &f,
-            "SELECT COUNT(*) FROM t WHERE id = 5 AND y = ?",
-            "Rewind"
-        ),
-        "param eq-residual COUNT should seek (no Rewind)"
-    );
-    assert!(
-        !has_op(
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id IN (5, 25, 45)",
+            Some(true),
+        )
+        .await;
+
+        // rowid = <int> AND <non-indexed residual>: reaches count_star (no diverter) -> seek, no Rewind.
+        cmp(
             &f,
-            "SELECT COUNT(*) FROM t WHERE id IN (5, 25) AND y = ?",
-            "Rewind"
-        ),
-        "param in-residual COUNT should seek (no Rewind)"
-    );
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id = 5 AND y = 5",
+            Some(true),
+        )
+        .await; // y[5]=5 -> 1
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id = 5 AND y = 7",
+            Some(true),
+        )
+        .await; // y[5]=5 != 7 -> 0
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id = 99999 AND y = 5",
+            Some(true),
+        )
+        .await; // absent rowid -> 0
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id = 5 AND y > 0 AND y < 10",
+            Some(true),
+        )
+        .await; // multi-conjunct -> 1
 
-    // Indexed residual may route to the aggregate seek (bd-2dgf5) instead of count_star — count parity only.
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id = 5 AND c = 5",
-        None,
-    ); // c[5]=5 -> 1
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(*) FROM t WHERE id IN (5, 25, 45) AND c = 5",
-        None,
-    );
+        // rowid IN (<ints>) AND <non-indexed residual>: SeekRowid per value + residual, no Rewind.
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id IN (5, 25, 45) AND y = 5",
+            Some(true),
+        )
+        .await; // all y=5 -> 3
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id IN (5, 26, 47) AND y = 5",
+            Some(true),
+        )
+        .await; // only id=5 -> 1
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id IN (5, 25, 45) AND y = 6",
+            Some(true),
+        )
+        .await; // none -> 0
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id IN (5, 99999) AND y = 5",
+            Some(true),
+        )
+        .await; // one absent -> 1
 
-    // Control: a bare non-rowid, non-indexed predicate still full-scans.
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE y = 5", Some(false));
+        // Placeholder residual routes to the seek too (plan asserted on the unbound `?`).
+        assert!(
+            !has_op(
+                &f,
+                "SELECT COUNT(*) FROM t WHERE id = 5 AND y = ?",
+                "Rewind"
+            )
+            .await,
+            "param eq-residual COUNT should seek (no Rewind)"
+        );
+        assert!(
+            !has_op(
+                &f,
+                "SELECT COUNT(*) FROM t WHERE id IN (5, 25) AND y = ?",
+                "Rewind"
+            )
+            .await,
+            "param in-residual COUNT should seek (no Rewind)"
+        );
+
+        // Indexed residual may route to the aggregate seek (bd-2dgf5) instead of count_star — count parity only.
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id = 5 AND c = 5",
+            None,
+        )
+        .await; // c[5]=5 -> 1
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(*) FROM t WHERE id IN (5, 25, 45) AND c = 5",
+            None,
+        )
+        .await;
+
+        // Control: a bare non-rowid, non-indexed predicate still full-scans.
+        cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE y = 5", Some(false)).await;
+    });
 }

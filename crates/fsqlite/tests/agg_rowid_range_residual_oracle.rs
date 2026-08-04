@@ -19,8 +19,9 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -48,89 +49,96 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
-fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
-    conn.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(
-        |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
-    )
+async fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
+        )
 }
 
 #[test]
 fn agg_rowid_range_residual_matches_sqlite() {
-    let f = Connection::open(":memory:").expect("frank");
-    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
-    let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);";
-    f.execute(ddl).unwrap();
-    r.execute_batch(ddl).unwrap();
-    for i in 1..=1000_i64 {
-        let stmt = format!("INSERT INTO t VALUES ({i}, {}, {});", i % 10, i % 3);
-        f.execute(&stmt).unwrap();
-        r.execute_batch(&stmt).unwrap();
-    }
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("frank");
+        let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+        let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);";
+        f.execute(ddl).await.unwrap();
+        r.execute_batch(ddl).unwrap();
+        for i in 1..=1000_i64 {
+            let stmt = format!("INSERT INTO t VALUES ({i}, {}, {});", i % 10, i % 3);
+            f.execute(&stmt).await.unwrap();
+            r.execute_batch(&stmt).unwrap();
+        }
 
-    let cmp = |sql: &str| {
-        assert_eq!(
-            frank_rows(&f, sql),
-            sqlite_rows(&r, sql),
-            "diverged: `{sql}`"
-        );
-    };
-    for sql in [
-        // Rowid range + residual, both aggregates.
-        "SELECT COUNT(*) FROM t WHERE id > 500 AND x = 5",
-        "SELECT SUM(x) FROM t WHERE id > 500 AND x = 5",
-        "SELECT COUNT(*) FROM t WHERE id BETWEEN 100 AND 400 AND x > 3",
-        "SELECT SUM(x) FROM t WHERE id >= 100 AND id <= 300 AND x <> 5",
-        "SELECT COUNT(*) FROM t WHERE id < 200 AND x IN (2, 5, 8)",
-        "SELECT COUNT(*) FROM t WHERE id > 100 AND id < 900 AND y = 1",
-        // Multiple residuals.
-        "SELECT COUNT(*) FROM t WHERE id > 100 AND x = 5 AND y = 2",
-        // Absent range -> COUNT=0 / SUM=NULL, and COALESCE.
-        "SELECT COUNT(*) FROM t WHERE id > 100000 AND x = 5",
-        "SELECT SUM(x) FROM t WHERE id < 0 AND x = 5",
-        "SELECT COALESCE(SUM(x), -1) FROM t WHERE id < 0 AND x = 5",
-        // MIN/MAX riding the same seek.
-        "SELECT MIN(x), MAX(x) FROM t WHERE id BETWEEN 100 AND 400 AND x > 1",
-        // Residual-free rowid range still works (regression).
-        "SELECT COUNT(*) FROM t WHERE id > 500",
-        "SELECT SUM(x) FROM t WHERE id BETWEEN 100 AND 400",
-    ] {
-        cmp(sql);
-    }
-
-    // Opcode gate: the rowid range seeks the table (SeekGT for `id > c`), residual enforced by filter.
-    assert!(
-        has_op(
-            &f,
+        for sql in [
+            // Rowid range + residual, both aggregates.
             "SELECT COUNT(*) FROM t WHERE id > 500 AND x = 5",
-            "SeekGT"
-        ),
-        "COUNT(*) rowid range + residual must seek the range (SeekGT)"
-    );
-    assert!(
-        has_op(
-            &f,
             "SELECT SUM(x) FROM t WHERE id > 500 AND x = 5",
-            "SeekGT"
-        ),
-        "SUM rowid range + residual must seek the range (SeekGT)"
-    );
-    // A bound parameter in the RESIDUAL is fine (literal rowid bound -> probe emits no placeholders, so
-    // the residual filter numbers `?` exactly as the scan path). The seek fires.
-    assert!(
-        has_op(
-            &f,
-            "SELECT COUNT(*) FROM t WHERE id > 500 AND x = ?",
-            "SeekGT"
-        ),
-        "rowid range (literal bound) + parameterized residual must still seek the range"
-    );
-    // A parameterized rowid BOUND declines (the probe must be a literal).
-    assert!(
-        !has_op(
-            &f,
-            "SELECT COUNT(*) FROM t WHERE id > ? AND x = 5",
-            "SeekGT"
-        ),
-        "a parameterized rowid bound must decline (probe must be a literal)"
-    );
+            "SELECT COUNT(*) FROM t WHERE id BETWEEN 100 AND 400 AND x > 3",
+            "SELECT SUM(x) FROM t WHERE id >= 100 AND id <= 300 AND x <> 5",
+            "SELECT COUNT(*) FROM t WHERE id < 200 AND x IN (2, 5, 8)",
+            "SELECT COUNT(*) FROM t WHERE id > 100 AND id < 900 AND y = 1",
+            // Multiple residuals.
+            "SELECT COUNT(*) FROM t WHERE id > 100 AND x = 5 AND y = 2",
+            // Absent range -> COUNT=0 / SUM=NULL, and COALESCE.
+            "SELECT COUNT(*) FROM t WHERE id > 100000 AND x = 5",
+            "SELECT SUM(x) FROM t WHERE id < 0 AND x = 5",
+            "SELECT COALESCE(SUM(x), -1) FROM t WHERE id < 0 AND x = 5",
+            // MIN/MAX riding the same seek.
+            "SELECT MIN(x), MAX(x) FROM t WHERE id BETWEEN 100 AND 400 AND x > 1",
+            // Residual-free rowid range still works (regression).
+            "SELECT COUNT(*) FROM t WHERE id > 500",
+            "SELECT SUM(x) FROM t WHERE id BETWEEN 100 AND 400",
+        ] {
+            assert_eq!(
+                frank_rows(&f, sql).await,
+                sqlite_rows(&r, sql),
+                "diverged: `{sql}`"
+            );
+        }
+
+        // Opcode gate: the rowid range seeks the table (SeekGT for `id > c`), residual enforced by filter.
+        assert!(
+            has_op(
+                &f,
+                "SELECT COUNT(*) FROM t WHERE id > 500 AND x = 5",
+                "SeekGT"
+            )
+            .await,
+            "COUNT(*) rowid range + residual must seek the range (SeekGT)"
+        );
+        assert!(
+            has_op(
+                &f,
+                "SELECT SUM(x) FROM t WHERE id > 500 AND x = 5",
+                "SeekGT"
+            )
+            .await,
+            "SUM rowid range + residual must seek the range (SeekGT)"
+        );
+        // A bound parameter in the RESIDUAL is fine (literal rowid bound -> probe emits no placeholders, so
+        // the residual filter numbers `?` exactly as the scan path). The seek fires.
+        assert!(
+            has_op(
+                &f,
+                "SELECT COUNT(*) FROM t WHERE id > 500 AND x = ?",
+                "SeekGT"
+            )
+            .await,
+            "rowid range (literal bound) + parameterized residual must still seek the range"
+        );
+        // A parameterized rowid BOUND declines (the probe must be a literal).
+        assert!(
+            !has_op(
+                &f,
+                "SELECT COUNT(*) FROM t WHERE id > ? AND x = 5",
+                "SeekGT"
+            )
+            .await,
+            "a parameterized rowid bound must decline (probe must be a literal)"
+        );
+    });
 }

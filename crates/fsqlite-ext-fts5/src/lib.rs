@@ -85,6 +85,17 @@ const FTS5_CONFIG_VERSION: i64 = 4;
 const FTS5_CONFIG_VERSION_SECURE_DELETE: i64 = 5;
 const FTS5_DEFAULT_PAGE_SIZE: i64 = 4050;
 const FTS5_MAX_PAGE_SIZE: i64 = 64 * 1024;
+/// cass#369: a single segment leaf stores its term/rowid/footer offsets in u16
+/// fields, so a leaf must encode to <= 65535 bytes. When one flush's combined
+/// terms + doclists would exceed that (a large batch on a big corpus — the
+/// "segment leaf term offset exceeds u16" failure), the writer partitions the
+/// terms across MULTIPLE leaves at term boundaries, each kept under this
+/// conservative bound. The headroom below 65535 absorbs the footer offset array
+/// plus the per-term size estimate's slack, so a leaf accepted by the estimate
+/// always actually encodes within the u16 ceiling.
+const FTS5_SAFE_LEAF_BYTES: usize = 60_000;
+/// Fixed 4-byte segment-leaf header (first_rowid_offset u16 + footer_offset u16).
+const FTS5_LEAF_HEADER_BYTES: usize = 4;
 const FTS5_DEFAULT_AUTOMERGE: i64 = 4;
 const FTS5_DEFAULT_USERMERGE: i64 = 4;
 const FTS5_DEFAULT_CRISISMERGE: i64 = 16;
@@ -1418,10 +1429,34 @@ impl Fts5PendingHash {
         if self.is_empty() {
             return Err(fts5_data_error("cannot flush an empty pending hash"));
         }
-        let leaf = Fts5SegmentLeaf::decode(&self.to_segment_leaf().encode()?)?;
-        let data_row = leaf.to_data_row(segid, 1)?;
+        // cass#369: partition into one-or-more leaves so a batch whose terms +
+        // doclists exceed the u16 leaf-offset ceiling is written as a multi-leaf
+        // segment (pgno 1..=N) instead of failing `encode()`. The reader
+        // (`lazy_segment_exact_postings`) linear-scans pgno_first..=pgno_last, so
+        // a single segment spanning N leaves needs no idx rows and keeps origin
+        // tracking clean (one segment, entry_count = row_count).
+        let leaves = self.to_segment_leaves();
+        if leaves.is_empty() {
+            return Err(fts5_data_error(
+                "pending hash produced no encodable segment leaves",
+            ));
+        }
+        let pgno_last = u32::try_from(leaves.len())
+            .map_err(|_| fts5_data_error("segment leaf count exceeds u32"))?;
+        let mut data_rows = Vec::with_capacity(leaves.len() + 1);
+        let mut decoded_leaves = Vec::with_capacity(leaves.len());
+        for (index, leaf) in leaves.iter().enumerate() {
+            let pgno = u32::try_from(index + 1)
+                .map_err(|_| fts5_data_error("segment leaf pgno exceeds u32"))?;
+            // Round-trip through encode/decode (as the prior single-leaf path
+            // did) so the stored leaf is normalized, then key its `_data` row by
+            // (segid, pgno).
+            let decoded = Fts5SegmentLeaf::decode(&leaf.encode()?)?;
+            data_rows.push(decoded.to_data_row(segid, pgno)?);
+            decoded_leaves.push(decoded);
+        }
         let segment = if structure.uses_origin_tracking() {
-            Fts5StructureSegment::new(segid, 1, 1).with_origin_tracking(
+            Fts5StructureSegment::new(segid, 1, pgno_last).with_origin_tracking(
                 structure.origin_counter,
                 structure.origin_counter,
                 0,
@@ -1429,7 +1464,7 @@ impl Fts5PendingHash {
                 u64::try_from(self.row_count).unwrap_or(u64::MAX),
             )
         } else {
-            Fts5StructureSegment::new(segid, 1, 1)
+            Fts5StructureSegment::new(segid, 1, pgno_last)
         };
 
         if structure.levels.is_empty() {
@@ -1445,39 +1480,87 @@ impl Fts5PendingHash {
         }
 
         let structure_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode());
+        data_rows.push(structure_row);
         Ok(Fts5PendingFlush {
-            data_rows: vec![data_row, structure_row],
+            data_rows,
             idx_rows: Vec::new(),
-            leaf,
+            leaves: decoded_leaves,
             structure,
             pending_bytes: self.pending_bytes,
         })
     }
 
-    fn to_segment_leaf(&self) -> Fts5SegmentLeaf {
-        Fts5SegmentLeaf::new(
-            self.terms
-                .iter()
-                .map(|(term, docs)| {
-                    Fts5SegmentTerm::new(
-                        term.as_bytes().to_vec(),
-                        Fts5Doclist::new(
-                            docs.iter()
-                                .map(|(rowid, doc)| Fts5DoclistEntry::new(*rowid, doc.to_poslist()))
-                                .collect(),
-                        ),
-                    )
-                })
-                .collect(),
-        )
+    /// cass#369: build the segment's terms (already globally sorted, since
+    /// `self.terms` is a `BTreeMap`) into one-or-more leaves, each kept under
+    /// [`FTS5_SAFE_LEAF_BYTES`]. Each leaf holds a contiguous increasing term
+    /// range and the ranges are globally ordered, exactly what the multi-leaf
+    /// reader expects. A single term whose own entry exceeds the leaf ceiling
+    /// (a pathological huge doclist) cannot fit any leaf and is skipped with a
+    /// warning — unqueryable in the SQLite shadow but still present in the
+    /// authoritative Tantivy index — mirroring the gh362 overlong-term skip
+    /// rather than failing the whole segment write.
+    fn to_segment_leaves(&self) -> Vec<Fts5SegmentLeaf> {
+        let mut leaves = Vec::new();
+        let mut current: Vec<Fts5SegmentTerm> = Vec::new();
+        let mut current_bytes = FTS5_LEAF_HEADER_BYTES;
+        for (term, docs) in &self.terms {
+            let seg_term = Fts5SegmentTerm::new(
+                term.as_bytes().to_vec(),
+                Fts5Doclist::new(
+                    docs.iter()
+                        .map(|(rowid, doc)| Fts5DoclistEntry::new(*rowid, doc.to_poslist()))
+                        .collect(),
+                ),
+            );
+            let estimate = estimate_leaf_term_bytes(&seg_term);
+            if estimate > FTS5_SAFE_LEAF_BYTES {
+                tracing::warn!(
+                    term_bytes = seg_term.term.len(),
+                    estimated_entry_bytes = estimate,
+                    safe_leaf_bytes = FTS5_SAFE_LEAF_BYTES,
+                    "fts5: skipping a term whose doclist alone exceeds the segment-leaf u16 offset space (cass#369); it stays searchable via the authoritative Tantivy index"
+                );
+                continue;
+            }
+            if !current.is_empty() && current_bytes + estimate > FTS5_SAFE_LEAF_BYTES {
+                leaves.push(Fts5SegmentLeaf::new(std::mem::take(&mut current)));
+                current_bytes = FTS5_LEAF_HEADER_BYTES;
+            }
+            current_bytes += estimate;
+            current.push(seg_term);
+        }
+        if !current.is_empty() {
+            leaves.push(Fts5SegmentLeaf::new(current));
+        }
+        leaves
     }
+}
+
+/// Upper bound on a term's contribution to an encoded leaf (cass#369): the
+/// term-length varint (<= 9 bytes) + the term bytes + the encoded doclist + a
+/// footer offset varint (<= 3 bytes for an offset <= 65535). Ignores prefix
+/// compression, which only shrinks the real size, so a leaf kept under
+/// [`FTS5_SAFE_LEAF_BYTES`] by this estimate always encodes within the u16
+/// ceiling. A doclist that fails to encode is treated as oversized.
+fn estimate_leaf_term_bytes(term: &Fts5SegmentTerm) -> usize {
+    let doclist_bytes = term
+        .doclist
+        .encode()
+        .map_or(usize::MAX, |bytes| bytes.len());
+    9usize
+        .saturating_add(term.term.len())
+        .saturating_add(doclist_bytes)
+        .saturating_add(3)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fts5PendingFlush {
     pub data_rows: Vec<Fts5DataRow>,
     pub idx_rows: Vec<Fts5IdxRow>,
-    pub leaf: Fts5SegmentLeaf,
+    /// cass#369: the segment's leaves, in page order (pgno_first..=pgno_last).
+    /// Usually one; more when the flush was partitioned to stay under the u16
+    /// leaf-offset ceiling.
+    pub leaves: Vec<Fts5SegmentLeaf>,
     pub structure: Fts5StructureRecord,
     pub pending_bytes: usize,
 }
@@ -1494,10 +1577,13 @@ impl Fts5PendingFlush {
 /// inverted index. See [`Fts5Table::encode_incremental_insert_flush`] (bd-sf8dx).
 #[derive(Debug, Clone)]
 pub struct Fts5IncrementalInsertFlush {
-    /// The new segment's leaf `_data` row, to be appended. `None` when the
-    /// inserted rows produced no indexable tokens (e.g. empty/all-unindexed
-    /// content): no segment is created, but averages/docsize still advance.
-    pub leaf_data_row: Option<Fts5DataRow>,
+    /// The new segment's leaf `_data` rows, to be appended (one per leaf page,
+    /// pgno 1..=N). Empty when the inserted rows produced no indexable tokens
+    /// (e.g. empty/all-unindexed content): no segment is created, but
+    /// averages/docsize still advance. Usually one row; more (cass#369) when the
+    /// flush was partitioned across multiple leaves to stay under the u16
+    /// leaf-offset ceiling.
+    pub leaf_data_rows: Vec<Fts5DataRow>,
     /// The updated structure `_data` row (rowid [`FTS5_STRUCTURE_ROWID`]),
     /// replacing the prior structure (now with the appended segment).
     pub structure_data_row: Fts5DataRow,
@@ -2112,8 +2198,7 @@ impl Fts5ScoreSnapshot {
         &self,
         queries: &[&str],
     ) -> std::result::Result<Vec<String>, Fts5QueryError> {
-        let tokenizer = create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+        let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
         query_terms_for_query_strings(&self.columns, queries, tokenizer.as_ref(), self.detail)
     }
 
@@ -2126,8 +2211,7 @@ impl Fts5ScoreSnapshot {
         match &self.source {
             Fts5ScoreSource::InMemory(index) => Ok(bm25_score(index, rowid, query_terms, weights)),
             Fts5ScoreSource::Shadow(rows) => {
-                let tokenizer = create_tokenizer(&self.tokenizer_name)
-                    .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+                let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)?
                     .bm25_score(rowid, query_terms, weights)
             }
@@ -3339,6 +3423,89 @@ pub trait Fts5Tokenizer: Send + Sync {
     }
 }
 
+/// Upper bound on a single indexed term in bytes (cass#362).
+///
+/// The segment-leaf codec addresses term starts with u16 offsets, so a term
+/// larger than one leaf can never be represented; before this cap a single
+/// >64 KiB whitespace-delimited token (a minified JS bundle or base64 blob
+/// pasted into a coding-agent transcript — normal data in that domain) made
+/// `Fts5SegmentLeaf::encode` fail the entire INSERT, and every rebuild after
+/// it, unrecoverably. C SQLite FTS5 does not error here either way: it writes
+/// the oversized term with a silently wrapped `szLeaf` header
+/// (`fts5_index.c` `fts5WriteFlushLeaf`'s unchecked u16 cast), leaving the
+/// term unqueryable. Skipping matches that observable outcome — the term is
+/// not findable — while keeping the write path total, and matches the
+/// mainstream-engine convention (Lucene rejects >32 KiB terms outright,
+/// Elasticsearch `ignore_above` drops them). Divergences from C are
+/// documented rather than hidden: one position slot is lost per skipped
+/// token, so phrase and NEAR windows spanning a pathological token shift by
+/// one; a MATCH query that itself contains an overlong term drops it during
+/// query tokenization (C parses the term and finds nothing, returning zero
+/// rows, where our AND/NEAR/phrase behaves as if the term were absent —
+/// strictly broader results); and a `prefix*` query can never reach a
+/// skipped term even when the prefix itself is under the cap.
+pub const FTS5_MAX_TERM_BYTES: usize = 1024;
+
+/// Decorator applied by [`Fts5Table::create_tokenizer_instance`] so every
+/// tokenizer (unicode61/ascii/porter/trigram) and every consumer — the
+/// pending-hash segment writer, the live in-memory index, the incremental
+/// delta index, and MATCH query parsing — sees the same bounded term stream.
+/// Query-time symmetry means a query containing an overlong term drops it
+/// exactly as indexing did.
+struct MaxTokenLenTokenizer {
+    inner: Box<dyn Fts5Tokenizer>,
+    /// First skip per tokenizer instance logs at `warn!`; the rest drop to
+    /// `debug!`. A single minified bundle can hold thousands of overlong
+    /// blobs, and hydration/rebuild re-tokenizes the whole corpus — per-token
+    /// warns would flood logs with an identical, already-actioned message.
+    warned_overlong: std::sync::atomic::AtomicBool,
+}
+
+impl Fts5Tokenizer for MaxTokenLenTokenizer {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        self.inner
+            .visit_tokens(text, &mut |term, start, end, colocated| {
+                if term.len() > FTS5_MAX_TERM_BYTES {
+                    if self
+                        .warned_overlong
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::debug!(
+                            term_bytes = term.len(),
+                            max_term_bytes = FTS5_MAX_TERM_BYTES,
+                            "fts5: skipping overlong term instead of failing the segment write (cass#362)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            term_bytes = term.len(),
+                            max_term_bytes = FTS5_MAX_TERM_BYTES,
+                            "fts5: skipping overlong term instead of failing the segment write (cass#362); further skips log at debug level"
+                        );
+                    }
+                    return;
+                }
+                sink(term, start, end, colocated);
+            });
+    }
+}
+
+/// Shared capped construction for every tokenizer the table, hydration,
+/// query, and scoring paths use (cass#362). The bare [`create_tokenizer`]
+/// factory stays uncapped for spec validation and direct API use; every
+/// indexing and MATCH consumer must come through this guard so the live
+/// index, the persisted segments, and query normalization all see the same
+/// bounded term stream.
+fn create_capped_tokenizer(name: &str) -> Box<dyn Fts5Tokenizer> {
+    Box::new(MaxTokenLenTokenizer {
+        inner: create_tokenizer(name).unwrap_or_else(|| Box::new(Unicode61Tokenizer::new())),
+        warned_overlong: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
 /// Unicode61 tokenizer: splits on non-alphanumeric characters, lowercases.
 #[derive(Debug)]
 pub struct Unicode61Tokenizer {
@@ -3533,6 +3700,13 @@ impl PorterTokenizer {
     }
 }
 
+/// C parity: `fts5_tokenize.c` (`FTS5_PORTER_MAX_TOKEN = 64`) passes tokens
+/// longer than 64 bytes through unstemmed. Mirroring it keeps term identity
+/// aligned with stock FTS5 for long tokens and avoids `porter_stem`'s
+/// per-suffix `String` reallocation storm on pathological inputs (a 91 KiB
+/// minified-JS token would otherwise be "stemmed"; cass#362).
+const FTS5_PORTER_MAX_TOKEN: usize = 64;
+
 impl Fts5Tokenizer for PorterTokenizer {
     fn name(&self) -> &'static str {
         "porter"
@@ -3541,6 +3715,10 @@ impl Fts5Tokenizer for PorterTokenizer {
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         self.inner
             .visit_tokens(text, &mut |term, start, end, colocated| {
+                if term.len() > FTS5_PORTER_MAX_TOKEN {
+                    sink(term, start, end, colocated);
+                    return;
+                }
                 let stemmed = porter_stem(term);
                 sink(stemmed.as_str(), start, end, colocated);
             });
@@ -7499,8 +7677,7 @@ impl Fts5Table {
     }
 
     pub fn create_tokenizer_instance(&self) -> Box<dyn Fts5Tokenizer> {
-        create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()))
+        create_capped_tokenizer(&self.tokenizer_name)
     }
 
     pub fn open_shadow_rows(
@@ -7746,8 +7923,12 @@ impl Fts5Table {
         self.clear_lazy_on_disk();
         self.row_locales.clear();
         self.next_rowid = 1;
-        let tokenizer = create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+        // cass#362: hydration must use the same capped tokenizer as inserts,
+        // or a reopened content table's live in-memory index would carry
+        // overlong terms the persisted segments (and fresh sessions) skip —
+        // and a later contentless-style flush of that index would re-hit the
+        // u16 leaf-offset failure this cap exists to prevent.
+        let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
         for (rowid, columns) in rows {
             self.index_document_with_tokenizer(rowid, &columns, tokenizer.as_ref());
             self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
@@ -8132,8 +8313,13 @@ impl Fts5Table {
         }
     }
 
-    #[must_use]
-    pub fn encode_data_rows(&self) -> Vec<Fts5DataRow> {
+    /// Encode the full `%_data` shadow contents from the in-memory index.
+    ///
+    /// A pending-hash build or segment flush failure is propagated (cass#362):
+    /// the previous `if let Ok(..)` fall-through silently emitted an *empty*
+    /// structure row on failure, so a full re-encode of a populated table
+    /// could "succeed" while discarding the entire inverted index.
+    pub fn encode_data_rows(&self) -> Result<Vec<Fts5DataRow>> {
         let docsize_rows = self.encode_docsize_rows();
         let averages = Fts5AveragesRecord::from_docsize_rows(
             u64::try_from(self.row_count()).unwrap_or(u64::MAX),
@@ -8148,20 +8334,18 @@ impl Fts5Table {
 
         let mut rows = vec![Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode())];
         let pending = if self.config.content_mode == ContentMode::Contentless {
-            self.index.build_pending_hash(&self.prefix_lengths)
+            self.index.build_pending_hash(&self.prefix_lengths)?
         } else {
-            self.build_pending_hash()
+            self.build_pending_hash()?
         };
-        if let Ok(pending) = pending
-            && !pending.is_empty()
-            && let Ok(flush) = pending.flush_to_segment(1, structure.clone())
-        {
+        if !pending.is_empty() {
+            let flush = pending.flush_to_segment(1, structure.clone())?;
             rows.extend(flush.data_rows);
-            return rows;
+            return Ok(rows);
         }
 
         rows.push(Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()));
-        rows
+        Ok(rows)
     }
 
     pub fn decode_data_rows(&self, rows: &[Fts5DataRow]) -> Result<Fts5DataMetadata> {
@@ -8205,7 +8389,7 @@ impl Fts5Table {
     /// wedge (bd-sf8dx).
     ///
     /// The caller passes a fresh `next_segid` (one past the current max) and,
-    /// on success, appends `leaf_data_row`, replaces `structure_data_row` and
+    /// on success, appends `leaf_data_rows`, replaces `structure_data_row` and
     /// `averages_data_row`, and appends `docsize_rows` to `_docsize`. Live
     /// MATCH keeps reading the in-memory `self.index`; reopen rehydrates from
     /// the multi-segment structure via
@@ -8278,7 +8462,7 @@ impl Fts5Table {
         let pending = delta.build_pending_hash(&self.prefix_lengths)?;
         if pending.is_empty() {
             return Ok(Some(Fts5IncrementalInsertFlush {
-                leaf_data_row: None,
+                leaf_data_rows: Vec::new(),
                 structure_data_row: Fts5DataRow::new(
                     FTS5_STRUCTURE_ROWID,
                     existing_structure.encode(),
@@ -8289,27 +8473,29 @@ impl Fts5Table {
         }
         let flush = pending.flush_to_segment(next_segid, existing_structure.clone())?;
         let structure_data_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, flush.structure.encode());
-        let leaf_data_row = flush
+        // cass#369: a partitioned flush yields one leaf `_data` row per leaf
+        // page (pgno 1..=N); append them all.
+        let leaf_data_rows = flush
             .data_rows
             .into_iter()
-            .find(|row| row.id != FTS5_STRUCTURE_ROWID);
+            .filter(|row| row.id != FTS5_STRUCTURE_ROWID)
+            .collect();
         Ok(Some(Fts5IncrementalInsertFlush {
-            leaf_data_row,
+            leaf_data_rows,
             structure_data_row,
             averages_data_row,
             docsize_rows,
         }))
     }
 
-    #[must_use]
-    pub fn encode_shadow_rows(&self) -> Fts5ShadowRows {
-        Fts5ShadowRows {
-            data: self.encode_data_rows(),
+    pub fn encode_shadow_rows(&self) -> Result<Fts5ShadowRows> {
+        Ok(Fts5ShadowRows {
+            data: self.encode_data_rows()?,
             idx: Vec::new(),
             config: self.encode_config_rows(),
             content: self.encode_content_rows(),
             docsize: self.encode_docsize_rows(),
-        }
+        })
     }
 
     pub fn apply_shadow_rows(&mut self, rows: &Fts5ShadowRows) -> Result<Fts5ConfigMetadata> {
@@ -8984,8 +9170,7 @@ impl VirtualTableCursor for Fts5Cursor {
                 let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
                 let queries: Vec<String> = args.iter().map(SqliteValue::to_text).collect();
                 let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-                let tokenizer = create_tokenizer(&self.tokenizer_name)
-                    .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+                let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 self.results = if let Some(rows) = self.shadow_rows.as_ref() {
                     Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)
                         .and_then(|query| query.search_queries_with_weights(&query_refs, &weights))
@@ -10530,7 +10715,7 @@ mod tests {
             &["rust index".to_owned(), "shadow table rows".to_owned()],
         );
 
-        let data = table.encode_data_rows();
+        let data = table.encode_data_rows().unwrap();
         let metadata = table.decode_data_rows(&data).unwrap();
         let snapshot = Fts5DataRowsStructure {
             data_blocks: data.iter().map(|row| (row.id, row.block.clone())).collect(),
@@ -10946,38 +11131,50 @@ mod tests {
         idx: Vec<Fts5IdxRow>,
     }
 
+    // The trait contract is async (real readers do I/O); this in-memory
+    // test reader answers synchronously. `clippy::unused_async` ignores
+    // allow attributes on async-trait impl methods, so the impls use the
+    // desugared RPITIT form with eagerly computed `ready` futures instead
+    // of `async fn`.
     impl Fts5OnDiskReader for SliceOnDiskReader {
-        async fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
-            Ok(self
+        fn read_data_block(
+            &mut self,
+            id: i64,
+        ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> {
+            std::future::ready(Ok(self
                 .data
                 .iter()
                 .find(|row| row.id == id)
-                .map(|row| row.block.clone()))
+                .map(|row| row.block.clone())))
         }
 
-        async fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
-            Ok(self
+        fn idx_candidate_page(
+            &mut self,
+            segid: u32,
+            term: &[u8],
+        ) -> impl std::future::Future<Output = Result<Option<u32>>> {
+            std::future::ready(Ok(self
                 .idx
                 .iter()
                 .filter(|row| row.segid == segid && row.term.as_slice() <= term)
                 .max_by(|left, right| left.term.cmp(&right.term))
-                .map(|row| row.btree_page))
+                .map(|row| row.btree_page)))
         }
 
-        async fn read_docsize(
+        fn read_docsize(
             &mut self,
             _rowid: i64,
             _column_count: usize,
-        ) -> Result<Option<Fts5DocsizeRow>> {
-            Ok(None)
+        ) -> impl std::future::Future<Output = Result<Option<Fts5DocsizeRow>>> {
+            std::future::ready(Ok(None))
         }
 
-        async fn read_content(
+        fn read_content(
             &mut self,
             _rowid: i64,
             _column_count: usize,
-        ) -> Result<Option<Vec<String>>> {
-            Ok(None)
+        ) -> impl std::future::Future<Output = Result<Option<Vec<String>>>> {
+            std::future::ready(Ok(None))
         }
     }
 
@@ -11389,12 +11586,93 @@ mod tests {
             Fts5DataRowid::SegmentLeaf { segid: 4, pgno: 1 }
         );
         assert_eq!(flush.data_rows[1].id, FTS5_STRUCTURE_ROWID);
+        assert_eq!(flush.leaves.len(), 1);
         assert_eq!(
             Fts5SegmentLeaf::decode(&flush.data_rows[0].block).unwrap(),
-            flush.leaf
+            flush.leaves[0]
         );
         assert_eq!(flush.structure.levels[0].segments[0].segid, 4);
         assert_eq!(flush.structure.write_counter, 1);
+    }
+
+    /// cass#369: a flush whose combined terms exceed the u16 leaf-offset ceiling
+    /// is partitioned into MULTIPLE leaves forming one segment (pgno 1..=N),
+    /// every leaf encodes within u16, terms stay globally sorted, and no term is
+    /// dropped.
+    #[test]
+    fn test_cass369_oversized_flush_partitions_into_multiple_leaves() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+        // One document with enough distinct in-cap tokens that the combined
+        // single leaf would exceed 65,535 bytes, forcing a multi-leaf segment.
+        let body = (0..15_000usize)
+            .map(|i| format!("tok{i:06}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        table.insert_document(1, &[body]);
+        let pending = table.build_pending_hash().unwrap();
+        let term_count = pending.term_count();
+        assert!(
+            term_count >= 15_000,
+            "expected >=15000 distinct terms, got {term_count}"
+        );
+
+        let flush = pending
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap();
+
+        assert!(
+            flush.leaves.len() > 1,
+            "an oversized flush must partition into multiple leaves, got {}",
+            flush.leaves.len()
+        );
+        let segment = &flush.structure.levels[0].segments[0];
+        assert_eq!(segment.pgno_first, 1);
+        assert_eq!(
+            u32::try_from(flush.leaves.len()).unwrap(),
+            segment.pgno_last,
+            "the segment page range must cover every leaf"
+        );
+
+        // Every leaf encodes within the u16 ceiling; terms are globally strictly
+        // increasing across leaves; no term is dropped.
+        let mut all_terms = 0usize;
+        let mut previous: Vec<u8> = Vec::new();
+        for leaf in &flush.leaves {
+            let encoded = leaf.encode().expect("each partitioned leaf must encode");
+            assert!(
+                encoded.len() <= 65_535,
+                "partitioned leaf still exceeds the u16 ceiling: {} bytes",
+                encoded.len()
+            );
+            for term in &leaf.terms {
+                assert!(
+                    term.term > previous,
+                    "terms must be globally strictly increasing across leaves"
+                );
+                previous = term.term.clone();
+                all_terms += 1;
+            }
+        }
+        assert_eq!(
+            all_terms, term_count,
+            "partitioning must preserve every term (none dropped)"
+        );
+
+        // Each non-structure `_data` row is a distinct leaf page keyed 1..=N.
+        let leaf_rows: Vec<_> = flush
+            .data_rows
+            .iter()
+            .filter(|row| row.id != FTS5_STRUCTURE_ROWID)
+            .collect();
+        assert_eq!(leaf_rows.len(), flush.leaves.len());
+        for (index, row) in leaf_rows.iter().enumerate() {
+            let pgno = u32::try_from(index + 1).unwrap();
+            assert_eq!(
+                Fts5DataRowid::decode(row.id).unwrap(),
+                Fts5DataRowid::SegmentLeaf { segid: 4, pgno }
+            );
+        }
     }
 
     #[test]
@@ -11568,9 +11846,9 @@ mod tests {
                 .map(|row| (row.id, Fts5DataRowid::decode(row.id).unwrap()))
                 .collect(),
             terms: flush
-                .leaf
-                .terms
+                .leaves
                 .iter()
+                .flat_map(|leaf| leaf.terms.iter())
                 .map(|term| term.term.clone())
                 .collect(),
             structure: flush.structure,
@@ -11971,7 +12249,7 @@ mod tests {
         );
         table.insert_document(9, &["sqlite notes".to_owned(), "rust fts".to_owned()]);
 
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         assert_eq!(
             rows.content,
             vec![
@@ -12028,7 +12306,7 @@ mod tests {
         );
         assert_eq!(table.lookup_content_row(3), None);
 
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         let opened = Fts5Table::open_shadow_rows(
             &cx,
             &["fts5", "main", "docs", "body", "content=''"],
@@ -12249,7 +12527,7 @@ mod tests {
         let cx = Cx::new();
         let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
         let rows = Fts5ShadowRows {
-            data: base.encode_data_rows(),
+            data: base.encode_data_rows().unwrap(),
             idx: Vec::new(),
             config: base.encode_config_rows(),
             content: vec![Fts5ContentRow::new(1, vec!["only one column".to_owned()])],
@@ -12284,7 +12562,7 @@ mod tests {
             11,
             &["rust index".to_owned(), "shadow table rows".to_owned()],
         );
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         let snapshot = Fts5ShadowRowsStructure {
             data: rows
                 .data
@@ -14205,7 +14483,7 @@ mod tests {
     ///   (a per-term docid index) tracked outside this fix.
     ///
     /// Ignored by default (timing-sensitive). Run with:
-    ///   cargo test -p fsqlite-ext-fts5 --release -- --ignored --nocapture \
+    ///   cargo test -p fsqlite-ext-fts5 --profile release-perf -- --ignored --nocapture \
     ///       bench_remove_document_upsert_scaling
     #[test]
     #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]

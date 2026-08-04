@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
-    WAL_TOTAL_LOCKS,
+    WAL_CKPT_LOCK, WAL_TOTAL_LOCKS, WAL_WRITE_LOCK,
 };
 use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion};
 use fsqlite_error::{FrankenError, Result};
@@ -430,6 +431,8 @@ impl Vfs for MemoryVfs {
             path: resolved_path,
             storage,
             lock_level: LockLevel::None,
+            external_shared_snapshot_prior_level: None,
+            external_maintenance_attempt: None,
             // SQLite temp opens pass a null path and expect delete-on-close semantics.
             delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE) || is_anonymous_temp,
             vfs: Arc::clone(&self.inner),
@@ -483,10 +486,19 @@ impl Vfs for MemoryVfs {
     }
 
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
-        if path.is_absolute() {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Browser WASM has no ambient current directory. MemoryVfs paths
+            // are opaque, deterministic virtual keys, so preserve them exactly.
             Ok(path.to_path_buf())
-        } else {
-            Ok(env::current_dir()?.join(path))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if path.is_absolute() {
+                Ok(path.to_path_buf())
+            } else {
+                Ok(env::current_dir()?.join(path))
+            }
         }
     }
 
@@ -498,11 +510,59 @@ impl Vfs for MemoryVfs {
 /// A file handle in the memory VFS.
 ///
 /// Reads and writes operate on a shared `Vec<u8>` protected by a mutex.
+#[derive(Debug, Clone, Copy)]
+struct MemoryExternalMaintenanceAttempt {
+    prior_lock_level: LockLevel,
+    wal_mode: bool,
+    acquired_wal_write: bool,
+    acquired_wal_checkpoint: bool,
+}
+
+impl MemoryExternalMaintenanceAttempt {
+    const fn new(prior_lock_level: LockLevel, wal_mode: bool) -> Self {
+        Self {
+            prior_lock_level,
+            wal_mode,
+            acquired_wal_write: false,
+            acquired_wal_checkpoint: false,
+        }
+    }
+
+    fn acquired_slot(self, slot: u32) -> Result<bool> {
+        match slot {
+            WAL_WRITE_LOCK => Ok(self.acquired_wal_write),
+            WAL_CKPT_LOCK => Ok(self.acquired_wal_checkpoint),
+            _ => Err(FrankenError::internal(format!(
+                "invalid MemoryVfs maintenance WAL slot {slot}"
+            ))),
+        }
+    }
+
+    fn set_acquired_slot(&mut self, slot: u32, acquired: bool) -> Result<()> {
+        match slot {
+            WAL_WRITE_LOCK => self.acquired_wal_write = acquired,
+            WAL_CKPT_LOCK => self.acquired_wal_checkpoint = acquired,
+            _ => {
+                return Err(FrankenError::internal(format!(
+                    "invalid MemoryVfs maintenance WAL slot {slot}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    const fn has_acquired_wal_slot(self) -> bool {
+        self.acquired_wal_write || self.acquired_wal_checkpoint
+    }
+}
+
 #[derive(Debug)]
 pub struct MemoryFile {
     path: PathBuf,
     storage: Arc<Mutex<FileStorage>>,
     lock_level: LockLevel,
+    external_shared_snapshot_prior_level: Option<LockLevel>,
+    external_maintenance_attempt: Option<MemoryExternalMaintenanceAttempt>,
     delete_on_close: bool,
     vfs: Arc<Mutex<MemoryVfsInner>>,
     shm_owner_id: u64,
@@ -590,7 +650,7 @@ impl MemoryFile {
     }
 
     fn release_shm_owner_state(&mut self, delete: bool) -> Result<()> {
-        let Some(info_arc) = self.shm_info.take() else {
+        let Some(info_arc) = self.shm_info.as_ref().map(Arc::clone) else {
             return Ok(());
         };
 
@@ -635,6 +695,11 @@ impl MemoryFile {
             debug_assert!(inner.shm.contains_key(&self.shm_path));
         }
 
+        // Publish terminal cleanup only after every fallible lock acquisition
+        // and all owner/accounting updates succeed. A failed attempt retains
+        // the exact SHM generation so a caller that retains the handle can
+        // retry.
+        self.shm_info = None;
         Ok(())
     }
 
@@ -785,6 +850,62 @@ impl MemoryFile {
         slot_state.exclusive_owner = None;
         Ok(())
     }
+
+    fn restore_external_lock_level(&mut self, cx: &Cx, prior_level: LockLevel) -> Result<()> {
+        match self.lock_level.cmp(&prior_level) {
+            std::cmp::Ordering::Greater => self.unlock(cx, prior_level),
+            std::cmp::Ordering::Less => self.lock(cx, prior_level),
+            std::cmp::Ordering::Equal => Ok(()),
+        }
+    }
+
+    fn acquire_external_maintenance_wal_slot(&mut self, cx: &Cx, slot: u32) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info.lock().map_err(|_| lock_err())?;
+        let slot_idx = usize::try_from(slot).map_err(|_| FrankenError::LockFailed {
+            detail: format!("invalid SHM slot {slot}"),
+        })?;
+        let already_owned = info
+            .slots
+            .get(slot_idx)
+            .ok_or_else(|| FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            })?
+            .exclusive_owner
+            == Some(self.shm_owner_id);
+
+        if !already_owned {
+            self.external_maintenance_attempt
+                .as_mut()
+                .ok_or_else(|| {
+                    FrankenError::internal(
+                        "MemoryVfs maintenance WAL acquisition has no attempt marker",
+                    )
+                })?
+                .set_acquired_slot(slot, true)?;
+        }
+
+        let result = self.acquire_shm_exclusive_slot(&mut info, slot);
+        if result.is_err() && !already_owned {
+            self.external_maintenance_attempt
+                .as_mut()
+                .ok_or_else(|| {
+                    FrankenError::internal(
+                        "MemoryVfs maintenance WAL acquisition lost its attempt marker",
+                    )
+                })?
+                .set_acquired_slot(slot, false)?;
+        }
+        result
+    }
+
+    fn release_external_maintenance_wal_slot(&mut self, cx: &Cx, slot: u32) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info.lock().map_err(|_| lock_err())?;
+        self.release_shm_exclusive_slot(&mut info, slot)
+    }
 }
 
 impl Drop for MemoryFile {
@@ -806,6 +927,8 @@ impl VfsFile for MemoryFile {
         self.unlock(cx, LockLevel::None)?;
 
         self.release_shm_owner_state(self.delete_on_close)?;
+        self.external_shared_snapshot_prior_level = None;
+        self.external_maintenance_attempt = None;
         self.remove_delete_on_close_storage()?;
         Ok(())
     }
@@ -821,153 +944,137 @@ impl VfsFile for MemoryFile {
         Ok(Some(FileIdentity::from_memory_parts(namespace, object)))
     }
 
-    fn read<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a mut [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-        async move {
-            checkpoint_or_abort(cx)?;
-            let storage = self.storage.lock().map_err(|_| lock_err())?;
+    // The in-memory backend completes synchronously, but `VfsFile` requires a
+    // lazy future; the `async` with no awaits is deliberate.
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        checkpoint_or_abort(cx)?;
+        let storage = self.storage.lock().map_err(|_| lock_err())?;
 
-            let (offset, _) = checked_memory_io_range(offset, buf.len(), "read offset")?;
-            let file_len = storage.data.len();
+        let (offset, _) = checked_memory_io_range(offset, buf.len(), "read offset")?;
+        let file_len = storage.data.len();
 
-            if offset >= file_len {
-                drop(storage);
-                buf.fill(0);
-                return Ok(0);
-            }
-
-            let available = file_len - offset;
-            let to_read = buf.len().min(available);
-            buf[..to_read].copy_from_slice(&storage.data[offset..offset + to_read]);
+        if offset >= file_len {
             drop(storage);
-
-            // Zero-fill the rest if short read.
-            if to_read < buf.len() {
-                buf[to_read..].fill(0);
-            }
-
-            Ok(to_read)
+            buf.fill(0);
+            return Ok(0);
         }
+
+        let available = file_len - offset;
+        let to_read = buf.len().min(available);
+        buf[..to_read].copy_from_slice(&storage.data[offset..offset + to_read]);
+        drop(storage);
+
+        // Zero-fill the rest if short read.
+        if to_read < buf.len() {
+            buf[to_read..].fill(0);
+        }
+
+        Ok(to_read)
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    fn write<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
+    #[allow(clippy::unused_async_trait_impl)] // lazy future required by the trait; body is synchronous
+    async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+        Self::write_into_storage(&mut inner, &mut storage, buf, offset)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::unused_async_trait_impl)] // lazy future required by the trait; body is synchronous
+    async fn write_tracked(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
         offset: u64,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        let result = (|| {
             checkpoint_or_abort(cx)?;
             let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
             let mut storage = self.storage.lock().map_err(|_| lock_err())?;
             Self::write_into_storage(&mut inner, &mut storage, buf, offset)
+        })();
+        if result.is_ok() {
+            completion.complete_success();
+        } else {
+            completion.complete_error();
         }
+        result
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    fn write_tracked<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
-        offset: u64,
-        completion: VfsWriteCompletion,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            let result = (|| {
-                checkpoint_or_abort(cx)?;
-                let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-                let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-                Self::write_into_storage(&mut inner, &mut storage, buf, offset)
-            })();
-            if result.is_ok() {
-                completion.complete_success();
-            } else {
-                completion.complete_error();
-            }
-            result
+    #[allow(clippy::unused_async_trait_impl)] // lazy future required by the trait; body is synchronous
+    async fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        if writes.is_empty() {
+            return Ok(());
         }
-    }
+        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
 
-    #[allow(clippy::significant_drop_tightening)]
-    fn write_page_batch<'a>(
-        &'a self,
-        cx: &'a Cx,
-        writes: &'a [(u64, &'a [u8])],
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            checkpoint_or_abort(cx)?;
-            if writes.is_empty() {
-                return Ok(());
-            }
-            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+        if writes.len() == 1 {
+            let (offset, data) = writes[0];
+            return Self::write_into_storage(&mut inner, &mut storage, data, offset);
+        }
 
-            if writes.len() == 1 {
-                let (offset, data) = writes[0];
-                return Self::write_into_storage(&mut inner, &mut storage, data, offset);
+        let mut normalized_writes = Vec::with_capacity(writes.len());
+        let mut required_len = storage.data.len();
+        for &(offset, data) in writes {
+            if data.is_empty() {
+                continue;
             }
+            let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
+            required_len = required_len.max(end);
+            normalized_writes.push((offset, data));
+        }
 
-            let mut normalized_writes = Vec::with_capacity(writes.len());
-            let mut required_len = storage.data.len();
-            for &(offset, data) in writes {
-                if data.is_empty() {
-                    continue;
-                }
-                let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
-                required_len = required_len.max(end);
-                normalized_writes.push((offset, data));
-            }
+        if normalized_writes.is_empty() {
+            return Ok(());
+        }
 
-            if normalized_writes.is_empty() {
-                return Ok(());
-            }
-
-            let old_len = storage.data.len();
-            let old_reserved = storage.data.capacity();
-            if required_len > old_reserved {
-                let proposed_reserved = next_growth_target(
-                    old_reserved,
-                    required_len,
-                    inner.config.initial_reserve_bytes,
-                    inner.config.growth_chunk_bytes,
-                );
-                ensure_total_reserved_within_limit(
-                    &inner.usage,
-                    old_reserved,
-                    proposed_reserved,
-                    inner.config.max_bytes,
-                )?;
-                storage
-                    .data
-                    .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
-                    .map_err(|_| FrankenError::OutOfMemory)?;
-            }
-
-            if required_len > storage.data.len() {
-                storage.data.resize(required_len, 0);
-            }
-
-            for (offset, data) in normalized_writes {
-                let end = offset + data.len();
-                if end == storage.data.len() && offset == storage.data.len() - data.len() {
-                    storage.data[offset..].copy_from_slice(data);
-                } else {
-                    storage.data[offset..end].copy_from_slice(data);
-                }
-            }
-            inner.usage.apply_file_change(
-                old_len,
+        let old_len = storage.data.len();
+        let old_reserved = storage.data.capacity();
+        if required_len > old_reserved {
+            let proposed_reserved = next_growth_target(
                 old_reserved,
-                storage.data.len(),
-                storage.data.capacity(),
+                required_len,
+                inner.config.initial_reserve_bytes,
+                inner.config.growth_chunk_bytes,
             );
-            Ok(())
+            ensure_total_reserved_within_limit(
+                &inner.usage,
+                old_reserved,
+                proposed_reserved,
+                inner.config.max_bytes,
+            )?;
+            storage
+                .data
+                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
+                .map_err(|_| FrankenError::OutOfMemory)?;
         }
+
+        if required_len > storage.data.len() {
+            storage.data.resize(required_len, 0);
+        }
+
+        for (offset, data) in normalized_writes {
+            let end = offset + data.len();
+            if end == storage.data.len() && offset == storage.data.len() - data.len() {
+                storage.data[offset..].copy_from_slice(data);
+            } else {
+                storage.data[offset..end].copy_from_slice(data);
+            }
+        }
+        inner.usage.apply_file_change(
+            old_len,
+            old_reserved,
+            storage.data.len(),
+            storage.data.capacity(),
+        );
+        Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -1019,6 +1126,129 @@ impl VfsFile for MemoryFile {
             self.lock_level = level;
         }
         Ok(())
+    }
+
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        if self.external_shared_snapshot_prior_level.is_some() {
+            return Err(FrankenError::internal(
+                "MemoryVfs external shared-snapshot attempt is already active",
+            ));
+        }
+        if self.external_maintenance_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire a MemoryVfs shared snapshot during external maintenance",
+            ));
+        }
+
+        // Publish the exact baseline before changing the raw lock state. If a
+        // future backend implementation makes `lock` fallible after a partial
+        // side effect, the attempt remains retry-restorable.
+        self.external_shared_snapshot_prior_level = Some(self.lock_level);
+        self.lock(cx, LockLevel::Shared)
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        let Some(prior_level) = self.external_shared_snapshot_prior_level else {
+            return Ok(());
+        };
+
+        // Raw state first, bookkeeping second: an error retains the baseline
+        // for a later retry.
+        self.restore_external_lock_level(cx, prior_level)?;
+        self.external_shared_snapshot_prior_level = None;
+        Ok(())
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        if self.external_shared_snapshot_prior_level.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire MemoryVfs external maintenance during a shared snapshot",
+            ));
+        }
+        if self.external_maintenance_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "MemoryVfs external maintenance attempt is already active",
+            ));
+        }
+
+        // The marker must exist before either WAL slot or the main-file state
+        // changes. Slot bits are intents while their raw acquisition runs and
+        // become exact ownership records only when that acquisition succeeds.
+        self.external_maintenance_attempt = Some(MemoryExternalMaintenanceAttempt::new(
+            self.lock_level,
+            wal_mode,
+        ));
+
+        if wal_mode {
+            self.acquire_external_maintenance_wal_slot(cx, WAL_WRITE_LOCK)?;
+            self.acquire_external_maintenance_wal_slot(cx, WAL_CKPT_LOCK)?;
+        }
+        self.lock(cx, LockLevel::Exclusive)
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        let Some(attempt) = self.external_maintenance_attempt else {
+            return Ok(());
+        };
+
+        let mut failures = Vec::new();
+
+        // Reverse acquisition order: main file, checkpoint slot, write slot.
+        // Every surface is attempted even after an earlier error. A successful
+        // raw WAL unlock clears only its own bit; failures remain retryable.
+        if let Err(error) = self.restore_external_lock_level(cx, attempt.prior_lock_level) {
+            failures.push(format!("main file: {error}"));
+        }
+
+        if attempt.wal_mode {
+            for (slot, label) in [
+                (WAL_CKPT_LOCK, "WAL checkpoint slot"),
+                (WAL_WRITE_LOCK, "WAL write slot"),
+            ] {
+                let acquired = self
+                    .external_maintenance_attempt
+                    .as_ref()
+                    .ok_or_else(|| {
+                        FrankenError::internal(
+                            "MemoryVfs maintenance restore lost its attempt marker",
+                        )
+                    })?
+                    .acquired_slot(slot)?;
+                if !acquired {
+                    continue;
+                }
+
+                match self.release_external_maintenance_wal_slot(cx, slot) {
+                    Ok(()) => {
+                        self.external_maintenance_attempt
+                            .as_mut()
+                            .ok_or_else(|| {
+                                FrankenError::internal(
+                                    "MemoryVfs maintenance restore lost its attempt marker",
+                                )
+                            })?
+                            .set_acquired_slot(slot, false)?;
+                    }
+                    Err(error) => failures.push(format!("{label}: {error}")),
+                }
+            }
+        }
+
+        let remaining_wal_lock = self
+            .external_maintenance_attempt
+            .is_some_and(MemoryExternalMaintenanceAttempt::has_acquired_wal_slot);
+        if failures.is_empty() && !remaining_wal_lock {
+            self.external_maintenance_attempt = None;
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(FrankenError::internal(format!(
+                "MemoryVfs external maintenance restore was incomplete: {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
@@ -1805,6 +2035,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_shm_owner_cleanup_retains_exact_generation_for_retry() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("shm_cleanup_retry.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        let _region = file.shm_map(&cx, 0, 64, true).unwrap();
+        let shm_generation = Arc::clone(
+            file.shm_info
+                .as_ref()
+                .expect("mapping SHM must retain its exact generation"),
+        );
+        let generation_to_poison = Arc::clone(&shm_generation);
+        let poisoned = std::panic::catch_unwind(move || {
+            let _guard = generation_to_poison
+                .lock()
+                .expect("SHM generation starts unpoisoned");
+            panic!("poison SHM generation for retry test");
+        });
+        assert!(poisoned.is_err());
+
+        assert!(
+            file.release_shm_owner_state(false).is_err(),
+            "a poisoned generation must make cleanup fail"
+        );
+        assert!(
+            file.shm_info
+                .as_ref()
+                .is_some_and(|retained| Arc::ptr_eq(retained, &shm_generation)),
+            "failed cleanup must retain the exact generation for a later retry"
+        );
+
+        shm_generation.clear_poison();
+        file.release_shm_owner_state(false)
+            .expect("cleanup must succeed after the transient failure clears");
+        assert!(
+            file.shm_info.is_none(),
+            "terminal cleanup must forget the released SHM generation"
+        );
+    }
+
+    #[test]
     fn dropping_detached_old_handle_does_not_remove_recreated_shm_generation() {
         let cx = Cx::new();
         let vfs = make_vfs();
@@ -2217,6 +2490,240 @@ mod tests {
         assert_eq!(f1.lock_level, LockLevel::None);
         f2.unlock(&cx, LockLevel::Shared).unwrap();
         assert_eq!(f2.lock_level, LockLevel::Shared);
+    }
+
+    #[test]
+    fn external_snapshot_attempt_restores_exact_prior_level_idempotently() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("snapshot_attempt.db")), flags)
+            .unwrap();
+
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+        assert_eq!(
+            file.external_shared_snapshot_prior_level,
+            Some(LockLevel::Reserved)
+        );
+
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+        assert_eq!(file.external_shared_snapshot_prior_level, None);
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+
+        file.unlock(&cx, LockLevel::None).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::None);
+    }
+
+    #[test]
+    fn external_maintenance_partial_wal_acquisition_is_retry_restorable() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("maintenance_partial.db");
+        let (mut attempt, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut checkpoint_blocker, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut probe, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        checkpoint_blocker
+            .shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            attempt.lock_external_maintenance(&cx, true),
+            Err(FrankenError::Busy)
+        ));
+        let marker = attempt
+            .external_maintenance_attempt
+            .expect("failed acquisition retains its exact attempt marker");
+        assert!(marker.acquired_wal_write);
+        assert!(!marker.acquired_wal_checkpoint);
+        assert_eq!(attempt.lock_level, LockLevel::None);
+
+        attempt.restore_external_maintenance_attempt(&cx).unwrap();
+        assert!(attempt.external_maintenance_attempt.is_none());
+        probe
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+        probe
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+        checkpoint_blocker
+            .shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn external_maintenance_restore_uses_backend_recorded_wal_mode() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("maintenance_recorded_mode.db");
+        let (mut owner, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut probe, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        owner.lock_external_maintenance(&cx, true).unwrap();
+        assert!(
+            owner
+                .external_maintenance_attempt
+                .is_some_and(|attempt| attempt.wal_mode),
+            "the backend must record whether the attempt acquired WAL surfaces"
+        );
+
+        owner.restore_external_maintenance_attempt(&cx).unwrap();
+        assert!(owner.external_maintenance_attempt.is_none());
+        for slot in [WAL_WRITE_LOCK, WAL_CKPT_LOCK] {
+            probe
+                .shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                .unwrap();
+            probe
+                .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+                .unwrap();
+        }
+
+        owner.restore_external_maintenance_attempt(&cx).unwrap();
+    }
+
+    #[test]
+    fn external_maintenance_preserves_preexisting_same_owner_wal_slot() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("maintenance_same_owner.db");
+        let (mut owner, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut probe, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        owner
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+        owner.lock(&cx, LockLevel::Reserved).unwrap();
+        owner.lock_external_maintenance(&cx, true).unwrap();
+
+        let marker = owner
+            .external_maintenance_attempt
+            .expect("successful maintenance retains a restore marker");
+        assert!(!marker.acquired_wal_write);
+        assert!(marker.acquired_wal_checkpoint);
+        assert_eq!(owner.lock_level, LockLevel::Exclusive);
+
+        owner.restore_external_maintenance_attempt(&cx).unwrap();
+        assert_eq!(owner.lock_level, LockLevel::Reserved);
+        assert!(owner.external_maintenance_attempt.is_none());
+
+        assert!(matches!(
+            probe.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            ),
+            Err(FrankenError::Busy)
+        ));
+        probe
+            .shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+        probe
+            .shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+        owner
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn external_maintenance_restore_retries_failed_wal_surfaces_independently() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("maintenance_cancelled_restore.db")),
+                flags,
+            )
+            .unwrap();
+
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        file.restore_external_maintenance_attempt(&cx).unwrap();
+        file.lock_external_maintenance(&cx, true).unwrap();
+
+        let cancelled_cx = Cx::new();
+        cancelled_cx.cancel();
+        let error = file
+            .restore_external_maintenance_attempt(&cancelled_cx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("WAL checkpoint slot"),
+            "checkpoint failure must be retained: {error}"
+        );
+        assert!(
+            error.contains("WAL write slot"),
+            "write-slot cleanup must still be attempted: {error}"
+        );
+        assert_eq!(
+            file.lock_level,
+            LockLevel::Reserved,
+            "main lock restoration must not depend on WAL cleanup success"
+        );
+        let marker = file
+            .external_maintenance_attempt
+            .expect("failed raw unlocks retain their exact ownership bits");
+        assert!(marker.acquired_wal_checkpoint);
+        assert!(marker.acquired_wal_write);
+
+        file.restore_external_maintenance_attempt(&cx).unwrap();
+        assert!(file.external_maintenance_attempt.is_none());
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+        file.restore_external_maintenance_attempt(&cx).unwrap();
     }
 
     #[test]

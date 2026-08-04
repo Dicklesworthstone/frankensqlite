@@ -268,9 +268,9 @@ fn splitmix64(mut x: u64) -> u64 {
 }
 
 fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use fsqlite_types::sync_primitives::SystemTime;
     SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |dur| {
             let secs = dur.as_secs();
             let nanos = u64::from(dur.subsec_nanos());

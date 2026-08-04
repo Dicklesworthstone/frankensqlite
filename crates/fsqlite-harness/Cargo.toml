@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-harness"
-version = "0.1.19"
+version = "0.2.0"
 publish = false
 description = "Conformance test runner and golden file comparison"
 edition.workspace = true
@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 asupersync.workspace = true
+blake3.workspace = true
 fsqlite = { workspace = true }
 fsqlite-ast = { workspace = true }
 fsqlite-error = { workspace = true }
@@ -26,9 +27,13 @@ rusqlite = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
-blake3 = { workspace = true }
+# Inline `#[cfg(test)]` modules and the integration tests drive the async engine
+# API through `asupersync::test_utils::run_test`, which lives behind
+# `test-internals`. The non-dev dependency above stays feature-clean.
+asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
 serde_json = { workspace = true }
+syn.workspace = true
 tempfile = { workspace = true }
 trybuild = "1.0"
 fsqlite-btree = { workspace = true }

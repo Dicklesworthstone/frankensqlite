@@ -1,12 +1,17 @@
+#![allow(clippy::future_not_send)]
+// wasm-bindgen drives these futures on the browser's single-threaded local
+// executor. Requiring `Send` would reject the core connection's intentional
+// `Rc`/`RefCell` state even though no future crosses a thread boundary.
+
 //! WebAssembly bindings for FrankenSQLite.
 //!
 //! This crate exposes a small browser-facing surface backed by
 //! `fsqlite-core`'s wasm-compatible in-memory engine, while continuing to
 //! re-export the parser/planner crates for lower-level integration.
 //!
-//! All OS-specific functionality (VFS, pager, WAL, MVCC, io_uring) is
-//! excluded — those require the `native` feature on `fsqlite-types` and
-//! OS-level primitives not available in `wasm32-unknown-unknown`.
+//! The browser build retains FrankenSQLite's portable in-memory VFS, pager,
+//! WAL, and MVCC stack. Only native OS backends and facilities such as
+//! `io_uring` are excluded from `wasm32-unknown-unknown`.
 //!
 //! JavaScript conversion semantics currently follow the WASM 2.6 bead:
 //! - `null` / `undefined` <-> `SqliteValue::Null`
@@ -19,9 +24,7 @@
 //! - `Date` inputs are stored as ISO 8601 `TEXT` when the `date-params`
 //!   feature is enabled
 
-#[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Once;
 
@@ -29,8 +32,6 @@ use std::sync::Once;
 use fsqlite_core::connection::ConnectionEnv;
 #[cfg(feature = "diagnostics")]
 use fsqlite_core::connection::ConnectionMemoryStats;
-#[cfg(feature = "prepared-statements")]
-use fsqlite_core::connection::PreparedStatement as CorePreparedStatement;
 use fsqlite_core::connection::{Connection as CoreConnection, Row as CoreRow};
 use fsqlite_error::FrankenError;
 #[cfg(feature = "date-params")]
@@ -40,9 +41,10 @@ use fsqlite_types::SqliteValue;
 use js_sys::Date;
 #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 use js_sys::Function;
-use js_sys::{Array, BigInt, Number, Object, Reflect, Uint8Array};
+use js_sys::{Array, BigInt, Number, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
 
 pub use fsqlite_ast as ast;
 pub use fsqlite_error as error;
@@ -127,7 +129,8 @@ pub struct FrankenDb {
 struct FrankenDbState {
     #[cfg(feature = "diagnostics")]
     path: String,
-    inner: RefCell<Option<CoreConnection>>,
+    inner: RefCell<Option<Rc<CoreConnection>>>,
+    operation_active: Cell<bool>,
     #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     memory_warning_threshold_bytes: Cell<Option<usize>>,
     #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
@@ -136,6 +139,35 @@ struct FrankenDbState {
     memory_warning_above_threshold: Cell<bool>,
     #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     memory_warning_callback: RefCell<Option<Function>>,
+}
+
+struct ConnectionOperationGuard {
+    state: Rc<FrankenDbState>,
+    conn: Rc<CoreConnection>,
+}
+
+impl ConnectionOperationGuard {
+    async fn finish<T>(
+        self,
+        operation: impl std::ops::AsyncFnOnce(&CoreConnection) -> Result<T, FrankenError>,
+    ) -> Result<T, JsValue> {
+        match operation(self.conn.as_ref()).await {
+            Ok(value) => {
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+                // Keep the admission guard live through the callback so
+                // callback-triggered re-entry follows the same `Busy` contract.
+                self.state.observe_memory_warning();
+                Ok(value)
+            }
+            Err(error) => Err(self.state.connection_error_to_js(self.conn.as_ref(), error)),
+        }
+    }
+}
+
+impl Drop for ConnectionOperationGuard {
+    fn drop(&mut self) {
+        self.state.operation_active.set(false);
+    }
 }
 
 #[cfg(all(feature = "diagnostics", feature = "prepared-statements"))]
@@ -238,13 +270,25 @@ pub struct FrankenPreparedStatement {
     column_names: Vec<String>,
 }
 
+// `wasm_bindgen`'s Promise adapter already owns each exported async future on
+// the browser's heap. Boxing nested core futures here would add allocations and
+// pointer indirection without reducing the JavaScript boundary's stack use.
+#[allow(clippy::large_futures)]
 #[wasm_bindgen(js_class = FrankenDB)]
 impl FrankenDb {
-    #[wasm_bindgen(constructor)]
-    pub fn new(name: Option<String>) -> Result<Self, JsValue> {
+    /// Open a database.
+    ///
+    /// NOTE: opening is `async` now that the storage stack is async, and
+    /// `wasm_bindgen` cannot export an `async` constructor. This is therefore a
+    /// static factory returning a `Promise` rather than a JS `new` constructor:
+    /// `await FrankenDB.create(name)`.
+    #[wasm_bindgen(js_name = create)]
+    pub async fn new(name: Option<String>) -> Result<Self, JsValue> {
         install_wasm_runtime();
         let path = name.unwrap_or_else(|| ":memory:".to_owned());
-        let conn = open_core_connection(&path).map_err(franken_error_to_js)?;
+        let conn = open_core_connection(&path)
+            .await
+            .map_err(franken_error_to_js)?;
         #[cfg(feature = "memory-options")]
         {
             Self::from_parts(path, conn, WasmDatabaseOptions::default())
@@ -257,29 +301,32 @@ impl FrankenDb {
 
     #[cfg(feature = "api-extras")]
     #[wasm_bindgen(js_name = open)]
-    pub fn open(name: Option<String>) -> Result<Self, JsValue> {
-        Self::new(name)
+    pub async fn open(name: Option<String>) -> Result<Self, JsValue> {
+        Self::new(name).await
     }
 
     #[cfg(feature = "memory-options")]
     #[wasm_bindgen(js_name = openWithOptions)]
-    pub fn open_with_options(
+    pub async fn open_with_options(
         name: Option<String>,
         options: Option<JsValue>,
     ) -> Result<Self, JsValue> {
         install_wasm_runtime();
         let path = name.unwrap_or_else(|| ":memory:".to_owned());
         let options = parse_database_options(options)?;
-        let conn =
-            open_core_connection_with_options(&path, &options).map_err(franken_error_to_js)?;
+        let conn = open_core_connection_with_options(&path, &options)
+            .await
+            .map_err(franken_error_to_js)?;
         Self::from_parts(path, conn, options)
     }
 
     #[cfg(feature = "backup")]
     #[wasm_bindgen(js_name = import)]
-    pub fn import(data: Uint8Array) -> Result<Self, JsValue> {
+    pub async fn import(data: Uint8Array) -> Result<Self, JsValue> {
         install_wasm_runtime();
-        let conn = import_core_connection(&data.to_vec()).map_err(franken_error_to_js)?;
+        let conn = import_core_connection(&data.to_vec())
+            .await
+            .map_err(franken_error_to_js)?;
         #[cfg(feature = "memory-options")]
         {
             Self::from_parts(":memory:".to_owned(), conn, WasmDatabaseOptions::default())
@@ -292,13 +339,14 @@ impl FrankenDb {
 
     #[cfg(all(feature = "backup", feature = "memory-options"))]
     #[wasm_bindgen(js_name = importWithOptions)]
-    pub fn import_with_options(
+    pub async fn import_with_options(
         data: Uint8Array,
         options: Option<JsValue>,
     ) -> Result<Self, JsValue> {
         install_wasm_runtime();
         let options = parse_database_options(options)?;
         let conn = import_core_connection_with_options(&data.to_vec(), &options)
+            .await
             .map_err(franken_error_to_js)?;
         Self::from_parts(":memory:".to_owned(), conn, options)
     }
@@ -309,91 +357,142 @@ impl FrankenDb {
         self.state.path.clone()
     }
 
+    /// Close this JavaScript handle.
+    ///
+    /// An operation whose `Promise` was already admitted retains the core
+    /// connection and is allowed to finish. Operations admitted after `close`
+    /// fail with a closed-handle error. Calls that overlap another operation
+    /// on the same handle fail fast instead of concurrently driving the
+    /// single-connection state machine.
     pub fn close(&self) {
         let _ = self.state.inner.borrow_mut().take();
     }
 
-    pub fn execute(&self, sql: &str) -> Result<usize, JsValue> {
-        self.with_connection(|conn| conn.execute(sql))
+    #[wasm_bindgen(js_name = execute)]
+    pub fn execute_js(&self, sql: &str) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = sql.to_owned();
+        future_to_promise(async move {
+            FrankenDb::execute_admitted(guard, sql)
+                .await
+                .map(|changes| JsValue::from_f64(changes as f64))
+        })
     }
 
     #[cfg(feature = "batch-execution")]
     #[wasm_bindgen(js_name = executeBatch)]
-    pub fn execute_batch(&self, sql: &str) -> Result<(), JsValue> {
-        self.with_connection(|conn| conn.execute_batch(sql))
-    }
-
-    #[wasm_bindgen(js_name = executeWithParams)]
-    pub fn execute_with_params(&self, sql: &str, params: JsValue) -> Result<usize, JsValue> {
-        let params = parse_js_params(params)?;
-        self.with_connection(|conn| conn.execute_with_params(sql, &params))
-    }
-
-    pub fn query(&self, sql: &str) -> Result<JsValue, JsValue> {
-        self.with_connection(|conn| {
-            let stmt = conn.prepare(sql)?;
-            let rows = stmt.query()?;
-            query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+    pub fn execute_batch_js(&self, sql: &str) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = sql.to_owned();
+        future_to_promise(async move {
+            FrankenDb::execute_batch_admitted(guard, sql)
+                .await
+                .map(|()| JsValue::UNDEFINED)
         })
     }
 
+    #[wasm_bindgen(js_name = executeWithParams)]
+    pub fn execute_with_params_js(&self, sql: &str, params: JsValue) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = sql.to_owned();
+        future_to_promise(async move {
+            // Admission deliberately precedes JavaScript parameter conversion:
+            // overlapping calls deterministically observe `SQLITE_BUSY`
+            // without invoking getters or coercions. Conversion also runs
+            // after this exported method returns, so a getter may safely free
+            // its wasm-bindgen wrapper.
+            let params = parse_js_params(params)?;
+            FrankenDb::execute_with_params_admitted(guard, sql, params)
+                .await
+                .map(|changes| JsValue::from_f64(changes as f64))
+        })
+    }
+
+    #[wasm_bindgen(js_name = query)]
+    pub fn query_js(&self, sql: &str) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = sql.to_owned();
+        future_to_promise(FrankenDb::query_admitted(guard, sql))
+    }
+
     #[wasm_bindgen(js_name = queryWithParams)]
-    pub fn query_with_params(&self, sql: &str, params: JsValue) -> Result<JsValue, JsValue> {
-        let params = parse_js_params(params)?;
-        self.with_connection(|conn| {
-            let stmt = conn.prepare(sql)?;
-            let rows = stmt.query_with_params(&params)?;
-            query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+    pub fn query_with_params_js(&self, sql: &str, params: JsValue) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = sql.to_owned();
+        future_to_promise(async move {
+            let params = parse_js_params(params)?;
+            FrankenDb::query_with_params_admitted(guard, sql, params).await
         })
     }
 
     #[cfg(feature = "api-extras")]
-    pub fn pragma(&self, pragma: &str) -> Result<JsValue, JsValue> {
+    #[wasm_bindgen(js_name = pragma)]
+    pub fn pragma_js(&self, pragma: &str) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
         let sql = format!("PRAGMA {pragma}");
-        self.with_connection(|conn| {
-            let stmt = conn.prepare(&sql)?;
-            let rows = stmt.query()?;
-            query_result_to_js(rows, stmt.column_names(), stmt.column_count())
-        })
+        future_to_promise(FrankenDb::query_admitted(guard, sql))
     }
 
     #[cfg(feature = "prepared-statements")]
-    pub fn prepare(&self, sql: &str) -> Result<FrankenPreparedStatement, JsValue> {
-        #[cfg(feature = "diagnostics")]
-        let metadata = self.with_connection(|conn| {
-            let stmt = conn.prepare(sql)?;
-            Ok(PreparedMetadata {
-                column_count: stmt.column_count(),
-                column_names: stmt.column_names().to_vec(),
-            })
-        })?;
-        #[cfg(not(feature = "diagnostics"))]
-        self.with_connection(|conn| {
-            let _stmt = conn.prepare(sql)?;
-            Ok(())
-        })?;
-        Ok(FrankenPreparedStatement {
-            state: Rc::clone(&self.state),
-            sql: sql.to_owned(),
-            #[cfg(feature = "diagnostics")]
-            column_count: metadata.column_count,
-            #[cfg(feature = "diagnostics")]
-            column_names: metadata.column_names,
+    #[wasm_bindgen(js_name = prepare)]
+    pub fn prepare_js(&self, sql: &str) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = sql.to_owned();
+        future_to_promise(async move {
+            FrankenDb::prepare_admitted(guard, sql)
+                .await
+                .map(JsValue::from)
         })
     }
 
     #[cfg(feature = "diagnostics")]
-    pub fn explain(&self, sql: &str) -> Result<String, JsValue> {
-        self.with_connection(|conn| {
-            let stmt = conn.prepare(sql)?;
-            Ok(stmt.explain())
+    #[wasm_bindgen(js_name = explain)]
+    pub fn explain_js(&self, sql: &str) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = sql.to_owned();
+        future_to_promise(async move {
+            FrankenDb::explain_admitted(guard, sql)
+                .await
+                .map(|explanation| JsValue::from_str(&explanation))
         })
     }
 
     #[cfg(feature = "backup")]
-    pub fn export(&self) -> Result<Uint8Array, JsValue> {
-        let bytes = self.with_connection(|conn| conn.export_bytes())?;
-        Ok(Uint8Array::from(bytes.as_slice()))
+    #[wasm_bindgen(js_name = export)]
+    pub fn export_js(&self) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        future_to_promise(async move {
+            FrankenDb::export_admitted(guard)
+                .await
+                .map(|bytes| Uint8Array::from(bytes.as_slice()).into())
+        })
     }
 
     #[cfg(feature = "diagnostics")]
@@ -403,81 +502,51 @@ impl FrankenDb {
     }
 }
 
-impl FrankenDb {
-    #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unnecessary_wraps))]
-    fn from_parts(
-        path: String,
-        conn: CoreConnection,
-        #[cfg(feature = "memory-options")] options: WasmDatabaseOptions,
-    ) -> Result<Self, JsValue> {
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = &path;
-        #[cfg(all(feature = "memory-options", not(feature = "diagnostics")))]
-        let _ = &options;
-        let db = Self {
-            state: Rc::new(FrankenDbState {
-                #[cfg(feature = "diagnostics")]
-                path,
-                inner: RefCell::new(Some(conn)),
-                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-                memory_warning_threshold_bytes: Cell::new(
-                    options
-                        .effective_warning_threshold_bytes()
-                        .map_err(franken_error_to_js)?,
-                ),
-                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-                memory_warning_threshold_percent: Cell::new(options.warning_threshold_percent),
-                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-                memory_warning_above_threshold: Cell::new(false),
-                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-                memory_warning_callback: RefCell::new(options.warning_callback),
-            }),
-        };
-        #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-        db.state.observe_memory_warning();
-        Ok(db)
-    }
-
-    fn with_connection<T>(
-        &self,
-        f: impl FnOnce(&CoreConnection) -> Result<T, FrankenError>,
-    ) -> Result<T, JsValue> {
-        self.state.with_connection(f)
-    }
-}
-
 impl FrankenDbState {
-    fn with_connection<T>(
-        &self,
-        f: impl FnOnce(&CoreConnection) -> Result<T, FrankenError>,
+    fn connection_snapshot(&self) -> Result<Rc<CoreConnection>, FrankenError> {
+        self.inner
+            .borrow()
+            .clone()
+            .ok_or_else(|| FrankenError::internal("database handle is closed"))
+    }
+
+    fn admit_connection_operation(
+        self: &Rc<Self>,
+    ) -> Result<ConnectionOperationGuard, FrankenError> {
+        let conn = self.connection_snapshot()?;
+        if self.operation_active.replace(true) {
+            return Err(FrankenError::Busy);
+        }
+        Ok(ConnectionOperationGuard {
+            state: Rc::clone(self),
+            conn,
+        })
+    }
+
+    #[cfg(test)]
+    async fn with_connection<T>(
+        self: &Rc<Self>,
+        f: impl std::ops::AsyncFnOnce(&CoreConnection) -> Result<T, FrankenError>,
     ) -> Result<T, JsValue> {
         install_wasm_runtime();
-        let borrow = self.inner.borrow();
-        let conn = borrow.as_ref().ok_or_else(|| {
-            franken_error_to_js(FrankenError::internal("database handle is closed"))
-        })?;
-        match f(conn) {
-            Ok(value) => {
-                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-                self.observe_memory_warning();
-                Ok(value)
-            }
-            Err(error) => Err(self.connection_error_to_js(conn, error)),
-        }
+        let operation_guard = self
+            .admit_connection_operation()
+            .map_err(franken_error_to_js)?;
+        operation_guard.finish(f).await
     }
 
     #[cfg(feature = "diagnostics")]
     fn memory_stats_js(&self) -> Result<JsValue, JsValue> {
         install_wasm_runtime();
-        let borrow = self.inner.borrow();
-        let conn = borrow.as_ref().ok_or_else(|| {
-            franken_error_to_js(FrankenError::internal("database handle is closed"))
-        })?;
+        if self.operation_active.get() {
+            return Err(franken_error_to_js(FrankenError::Busy));
+        }
+        let conn = self.connection_snapshot().map_err(franken_error_to_js)?;
         let stats = conn
             .memory_stats()
-            .map_err(|error| self.connection_error_to_js(conn, error))?;
+            .map_err(|error| self.connection_error_to_js(conn.as_ref(), error))?;
         connection_memory_stats_to_js(
-            conn,
+            conn.as_ref(),
             stats,
             #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
             self.memory_warning_threshold_bytes.get(),
@@ -498,8 +567,7 @@ impl FrankenDbState {
         let Some(callback) = self.memory_warning_callback.borrow().clone() else {
             return;
         };
-        let borrow = self.inner.borrow();
-        let Some(conn) = borrow.as_ref() else {
+        let Some(conn) = self.inner.borrow().as_ref().cloned() else {
             return;
         };
         let Ok(stats) = conn.memory_stats() else {
@@ -513,7 +581,7 @@ impl FrankenDbState {
         self.memory_warning_above_threshold.set(above_threshold);
         if crossed_threshold
             && let Ok(payload) = connection_memory_stats_to_js(
-                conn,
+                conn.as_ref(),
                 stats,
                 self.memory_warning_threshold_bytes.get(),
                 self.memory_warning_threshold_percent.get(),
@@ -559,30 +627,237 @@ impl FrankenDbState {
 }
 
 #[cfg(feature = "memory-options")]
-fn open_core_connection_with_options(
+async fn open_core_connection_with_options(
     path: &str,
     options: &WasmDatabaseOptions,
 ) -> Result<CoreConnection, FrankenError> {
     let env = connection_env_from_options(options)?;
-    CoreConnection::open_with_env(path, env)
+    CoreConnection::open_with_env(path, env).await
 }
 
 #[cfg(feature = "backup")]
-fn import_core_connection(bytes: &[u8]) -> Result<CoreConnection, FrankenError> {
-    CoreConnection::import_bytes(bytes)
+async fn import_core_connection(bytes: &[u8]) -> Result<CoreConnection, FrankenError> {
+    CoreConnection::import_bytes(bytes).await
 }
 
 #[cfg(all(feature = "backup", feature = "memory-options"))]
-fn import_core_connection_with_options(
+async fn import_core_connection_with_options(
     bytes: &[u8],
     options: &WasmDatabaseOptions,
 ) -> Result<CoreConnection, FrankenError> {
     let env = connection_env_from_options(options)?;
-    CoreConnection::import_bytes_with_env(bytes, env)
+    CoreConnection::import_bytes_with_env(bytes, env).await
 }
 
-fn open_core_connection(path: &str) -> Result<CoreConnection, FrankenError> {
-    CoreConnection::open(path)
+impl FrankenDb {
+    #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unnecessary_wraps))]
+    fn from_parts(
+        path: String,
+        conn: CoreConnection,
+        #[cfg(feature = "memory-options")] options: WasmDatabaseOptions,
+    ) -> Result<Self, JsValue> {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = &path;
+        #[cfg(all(feature = "memory-options", not(feature = "diagnostics")))]
+        let _ = &options;
+        let db = Self {
+            state: Rc::new(FrankenDbState {
+                #[cfg(feature = "diagnostics")]
+                path,
+                inner: RefCell::new(Some(Rc::new(conn))),
+                operation_active: Cell::new(false),
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+                memory_warning_threshold_bytes: Cell::new(
+                    options
+                        .effective_warning_threshold_bytes()
+                        .map_err(franken_error_to_js)?,
+                ),
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+                memory_warning_threshold_percent: Cell::new(options.warning_threshold_percent),
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+                memory_warning_above_threshold: Cell::new(false),
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+                memory_warning_callback: RefCell::new(options.warning_callback),
+            }),
+        };
+        #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+        db.state.observe_memory_warning();
+        Ok(db)
+    }
+
+    fn admit_operation(&self) -> Result<ConnectionOperationGuard, JsValue> {
+        install_wasm_runtime();
+        self.state
+            .admit_connection_operation()
+            .map_err(franken_error_to_js)
+    }
+
+    async fn execute_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+    ) -> Result<usize, JsValue> {
+        guard.finish(async |conn| conn.execute(&sql).await).await
+    }
+
+    #[cfg(feature = "batch-execution")]
+    async fn execute_batch_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+    ) -> Result<(), JsValue> {
+        guard
+            .finish(async |conn| conn.execute_batch(&sql).await)
+            .await
+    }
+
+    async fn execute_with_params_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+        params: Vec<SqliteValue>,
+    ) -> Result<usize, JsValue> {
+        guard
+            .finish(async |conn| conn.execute_with_params(&sql, &params).await)
+            .await
+    }
+
+    async fn query_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+    ) -> Result<JsValue, JsValue> {
+        guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                let rows = stmt.query().await?;
+                query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+            })
+            .await
+    }
+
+    async fn query_with_params_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+        params: Vec<SqliteValue>,
+    ) -> Result<JsValue, JsValue> {
+        guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                let rows = stmt.query_with_params(&params).await?;
+                query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+            })
+            .await
+    }
+
+    #[cfg(feature = "prepared-statements")]
+    async fn prepare_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+    ) -> Result<FrankenPreparedStatement, JsValue> {
+        let state = Rc::clone(&guard.state);
+        #[cfg(feature = "diagnostics")]
+        let metadata = guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                Ok(PreparedMetadata {
+                    column_count: stmt.column_count(),
+                    column_names: stmt.column_names().to_vec(),
+                })
+            })
+            .await?;
+        #[cfg(not(feature = "diagnostics"))]
+        guard
+            .finish(async |conn| {
+                let _stmt = conn.prepare(&sql).await?;
+                Ok(())
+            })
+            .await?;
+        Ok(FrankenPreparedStatement {
+            state,
+            sql,
+            #[cfg(feature = "diagnostics")]
+            column_count: metadata.column_count,
+            #[cfg(feature = "diagnostics")]
+            column_names: metadata.column_names,
+        })
+    }
+
+    #[cfg(feature = "diagnostics")]
+    async fn explain_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+    ) -> Result<String, JsValue> {
+        guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                Ok(stmt.explain())
+            })
+            .await
+    }
+
+    #[cfg(feature = "backup")]
+    async fn export_admitted(guard: ConnectionOperationGuard) -> Result<Vec<u8>, JsValue> {
+        guard.finish(async |conn| conn.export_bytes().await).await
+    }
+
+    #[cfg(test)]
+    async fn with_connection<T>(
+        &self,
+        f: impl std::ops::AsyncFnOnce(&CoreConnection) -> Result<T, FrankenError>,
+    ) -> Result<T, JsValue> {
+        self.state.with_connection(f).await
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl FrankenDb {
+    async fn execute(&self, sql: &str) -> Result<usize, JsValue> {
+        Self::execute_admitted(self.admit_operation()?, sql.to_owned()).await
+    }
+
+    #[cfg(feature = "batch-execution")]
+    async fn execute_batch(&self, sql: &str) -> Result<(), JsValue> {
+        Self::execute_batch_admitted(self.admit_operation()?, sql.to_owned()).await
+    }
+
+    async fn execute_with_params(&self, sql: &str, params: JsValue) -> Result<usize, JsValue> {
+        let guard = self.admit_operation()?;
+        let params = parse_js_params(params)?;
+        Self::execute_with_params_admitted(guard, sql.to_owned(), params).await
+    }
+
+    async fn query(&self, sql: &str) -> Result<JsValue, JsValue> {
+        Self::query_admitted(self.admit_operation()?, sql.to_owned()).await
+    }
+
+    async fn query_with_params(&self, sql: &str, params: JsValue) -> Result<JsValue, JsValue> {
+        let guard = self.admit_operation()?;
+        let params = parse_js_params(params)?;
+        Self::query_with_params_admitted(guard, sql.to_owned(), params).await
+    }
+
+    #[cfg(feature = "api-extras")]
+    async fn pragma(&self, pragma: &str) -> Result<JsValue, JsValue> {
+        Self::query_admitted(self.admit_operation()?, format!("PRAGMA {pragma}")).await
+    }
+
+    #[cfg(feature = "prepared-statements")]
+    async fn prepare(&self, sql: &str) -> Result<FrankenPreparedStatement, JsValue> {
+        Self::prepare_admitted(self.admit_operation()?, sql.to_owned()).await
+    }
+
+    #[cfg(feature = "diagnostics")]
+    async fn explain(&self, sql: &str) -> Result<String, JsValue> {
+        Self::explain_admitted(self.admit_operation()?, sql.to_owned()).await
+    }
+
+    #[cfg(feature = "backup")]
+    async fn export(&self) -> Result<Uint8Array, JsValue> {
+        let bytes = Self::export_admitted(self.admit_operation()?).await?;
+        Ok(Uint8Array::from(bytes.as_slice()))
+    }
+}
+
+async fn open_core_connection(path: &str) -> Result<CoreConnection, FrankenError> {
+    CoreConnection::open(path).await
 }
 
 #[cfg(feature = "memory-options")]
@@ -600,6 +875,9 @@ fn connection_env_from_options(
 }
 
 #[cfg(feature = "prepared-statements")]
+// As above, the exported Promise owns this future; nested boxing would only add
+// per-operation allocation overhead.
+#[allow(clippy::large_futures)]
 #[wasm_bindgen(js_class = FrankenPreparedStatement)]
 impl FrankenPreparedStatement {
     #[cfg(feature = "diagnostics")]
@@ -624,48 +902,179 @@ impl FrankenPreparedStatement {
         names.into()
     }
 
-    pub fn execute(&self) -> Result<usize, JsValue> {
-        self.with_prepared_statement(|stmt| stmt.execute())
-    }
-
-    #[wasm_bindgen(js_name = executeWithParams)]
-    pub fn execute_with_params(&self, params: JsValue) -> Result<usize, JsValue> {
-        let params = parse_js_params(params)?;
-        self.with_prepared_statement(|stmt| stmt.execute_with_params(&params))
-    }
-
-    pub fn query(&self) -> Result<JsValue, JsValue> {
-        self.with_prepared_statement(|stmt| {
-            let rows = stmt.query()?;
-            query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+    #[wasm_bindgen(js_name = execute)]
+    pub fn execute_js(&self) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = self.sql.clone();
+        future_to_promise(async move {
+            FrankenPreparedStatement::execute_admitted(guard, sql)
+                .await
+                .map(|changes| JsValue::from_f64(changes as f64))
         })
     }
 
+    #[wasm_bindgen(js_name = executeWithParams)]
+    pub fn execute_with_params_js(&self, params: JsValue) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        // Detach every future input from the wasm-bindgen wrapper before
+        // parameter getters can re-enter JavaScript and free that wrapper.
+        let sql = self.sql.clone();
+        future_to_promise(async move {
+            let params = parse_js_params(params)?;
+            FrankenPreparedStatement::execute_with_params_admitted(guard, sql, params)
+                .await
+                .map(|changes| JsValue::from_f64(changes as f64))
+        })
+    }
+
+    #[wasm_bindgen(js_name = query)]
+    pub fn query_js(&self) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = self.sql.clone();
+        future_to_promise(FrankenPreparedStatement::query_admitted(guard, sql))
+    }
+
     #[wasm_bindgen(js_name = queryWithParams)]
-    pub fn query_with_params(&self, params: JsValue) -> Result<JsValue, JsValue> {
-        let params = parse_js_params(params)?;
-        self.with_prepared_statement(|stmt| {
-            let rows = stmt.query_with_params(&params)?;
-            query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+    pub fn query_with_params_js(&self, params: JsValue) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        // See `execute_with_params_js`: JS conversion may run arbitrary
+        // getters, including `stmt.free()`.
+        let sql = self.sql.clone();
+        future_to_promise(async move {
+            let params = parse_js_params(params)?;
+            FrankenPreparedStatement::query_with_params_admitted(guard, sql, params).await
         })
     }
 
     #[cfg(feature = "diagnostics")]
-    pub fn explain(&self) -> Result<String, JsValue> {
-        self.with_prepared_statement(|stmt| Ok(stmt.explain()))
+    #[wasm_bindgen(js_name = explain)]
+    pub fn explain_js(&self) -> Promise {
+        let guard = match self.admit_operation() {
+            Ok(guard) => guard,
+            Err(error) => return Promise::reject(&error),
+        };
+        let sql = self.sql.clone();
+        future_to_promise(async move {
+            FrankenPreparedStatement::explain_admitted(guard, sql)
+                .await
+                .map(|explanation| JsValue::from_str(&explanation))
+        })
     }
 }
 
 #[cfg(feature = "prepared-statements")]
 impl FrankenPreparedStatement {
-    fn with_prepared_statement<T>(
-        &self,
-        f: impl FnOnce(&CorePreparedStatement<'_>) -> Result<T, FrankenError>,
-    ) -> Result<T, JsValue> {
-        self.state.with_connection(|conn| {
-            let stmt = conn.prepare(&self.sql)?;
-            f(&stmt)
-        })
+    fn admit_operation(&self) -> Result<ConnectionOperationGuard, JsValue> {
+        install_wasm_runtime();
+        self.state
+            .admit_connection_operation()
+            .map_err(franken_error_to_js)
+    }
+
+    async fn execute_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+    ) -> Result<usize, JsValue> {
+        guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                stmt.execute().await
+            })
+            .await
+    }
+
+    async fn execute_with_params_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+        params: Vec<SqliteValue>,
+    ) -> Result<usize, JsValue> {
+        guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                stmt.execute_with_params(&params).await
+            })
+            .await
+    }
+
+    async fn query_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+    ) -> Result<JsValue, JsValue> {
+        guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                let rows = stmt.query().await?;
+                query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+            })
+            .await
+    }
+
+    async fn query_with_params_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+        params: Vec<SqliteValue>,
+    ) -> Result<JsValue, JsValue> {
+        guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                let rows = stmt.query_with_params(&params).await?;
+                query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+            })
+            .await
+    }
+
+    #[cfg(feature = "diagnostics")]
+    async fn explain_admitted(
+        guard: ConnectionOperationGuard,
+        sql: String,
+    ) -> Result<String, JsValue> {
+        guard
+            .finish(async |conn| {
+                let stmt = conn.prepare(&sql).await?;
+                Ok(stmt.explain())
+            })
+            .await
+    }
+}
+
+#[cfg(all(test, feature = "prepared-statements"))]
+#[allow(dead_code)]
+impl FrankenPreparedStatement {
+    async fn execute(&self) -> Result<usize, JsValue> {
+        Self::execute_admitted(self.admit_operation()?, self.sql.clone()).await
+    }
+
+    async fn execute_with_params(&self, params: JsValue) -> Result<usize, JsValue> {
+        let guard = self.admit_operation()?;
+        let params = parse_js_params(params)?;
+        Self::execute_with_params_admitted(guard, self.sql.clone(), params).await
+    }
+
+    async fn query(&self) -> Result<JsValue, JsValue> {
+        Self::query_admitted(self.admit_operation()?, self.sql.clone()).await
+    }
+
+    async fn query_with_params(&self, params: JsValue) -> Result<JsValue, JsValue> {
+        let guard = self.admit_operation()?;
+        let params = parse_js_params(params)?;
+        Self::query_with_params_admitted(guard, self.sql.clone(), params).await
+    }
+
+    #[cfg(feature = "diagnostics")]
+    async fn explain(&self) -> Result<String, JsValue> {
+        Self::explain_admitted(self.admit_operation()?, self.sql.clone()).await
     }
 }
 
@@ -1674,10 +2083,15 @@ fn wasm_linear_memory_bytes() -> Option<usize> {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+// The standard mutex deliberately serializes whole host-side LabRuntime tests;
+// it is never acquired by production async code. Direct core futures are also
+// large here, but these tests keep them inline to exercise their exact API.
+#[allow(clippy::await_holding_lock, clippy::large_futures)]
 mod tests {
     use super::*;
     #[cfg(feature = "diagnostics")]
     use fsqlite_pager::PageCacheMetricsSnapshot;
+    use std::future::Future as _;
     use std::sync::{Mutex, OnceLock};
 
     fn host_connection_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1685,34 +2099,6 @@ mod tests {
         HOST_CONNECTION_TEST_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap()
-    }
-
-    #[cfg(feature = "memory-options")]
-    fn set_js_number_property(object: &Object, key: &str, value: usize) {
-        set_property(object, key, &JsValue::from_f64(value as f64)).unwrap();
-    }
-
-    #[cfg(feature = "diagnostics")]
-    fn js_object_property_usize(object: &Object, key: &str) -> Option<usize> {
-        Reflect::get(object, &JsValue::from_str(key))
-            .unwrap()
-            .as_f64()
-            .map(|value| value as usize)
-    }
-
-    #[cfg(feature = "diagnostics")]
-    fn js_object_property_string(object: &Object, key: &str) -> Option<String> {
-        Reflect::get(object, &JsValue::from_str(key))
-            .unwrap()
-            .as_string()
-    }
-
-    #[cfg(feature = "memory-options")]
-    fn js_error_message_field(error: &JsValue) -> String {
-        Reflect::get(error, &JsValue::from_str("message"))
-            .unwrap()
-            .as_string()
             .unwrap()
     }
 
@@ -1737,211 +2123,157 @@ mod tests {
     }
 
     #[test]
+    fn parse_sql_reports_missing_statement_separator() {
+        let (stmts, errors) = parse_sql("SELECT 1 SELECT 2");
+        assert_eq!(
+            stmts.len(),
+            2,
+            "recovery should retain both independently valid statements"
+        );
+        assert_eq!(errors.len(), 1, "the missing separator must be reported");
+        assert!(
+            errors[0].message.contains("expected ';' separator"),
+            "unexpected diagnostic: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
     fn core_connection_roundtrip_for_wasm_wrapper() {
-        let _guard = host_connection_test_guard();
-        let conn = open_core_connection(":memory:").expect("in-memory connection should open");
-        conn.execute("CREATE TABLE wasm_rt (id INTEGER PRIMARY KEY, name TEXT)")
-            .expect("schema create should succeed");
-        conn.execute("INSERT INTO wasm_rt (id, name) VALUES (1, 'alpha'), (2, 'beta')")
-            .expect("seed rows should insert");
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let conn = open_core_connection(":memory:")
+                .await
+                .expect("in-memory connection should open");
+            conn.execute("CREATE TABLE wasm_rt (id INTEGER PRIMARY KEY, name TEXT)")
+                .await
+                .expect("schema create should succeed");
+            conn.execute("INSERT INTO wasm_rt (id, name) VALUES (1, 'alpha'), (2, 'beta')")
+                .await
+                .expect("seed rows should insert");
 
-        let stmt = conn
-            .prepare("SELECT id, name FROM wasm_rt ORDER BY id")
-            .expect("statement should prepare");
-        assert_eq!(stmt.column_count(), 2);
+            let stmt = conn
+                .prepare("SELECT id, name FROM wasm_rt ORDER BY id")
+                .await
+                .expect("statement should prepare");
+            assert_eq!(stmt.column_count(), 2);
 
-        let rows = stmt.query().expect("query should succeed");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+            let rows = stmt.query().await.expect("query should succeed");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+            assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+        });
+    }
+
+    #[test]
+    fn admitted_operation_survives_close_without_holding_state_borrow() {
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let db = FrankenDb::new(None).await.expect("db should open");
+            let yielded_once = Cell::new(false);
+            let mut operation = Box::pin(db.with_connection(async |conn| {
+                std::future::poll_fn(|cx| {
+                    if yielded_once.replace(true) {
+                        std::task::Poll::Ready(())
+                    } else {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                conn.execute("SELECT 1").await
+            }));
+
+            std::future::poll_fn(|cx| {
+                assert!(
+                    operation.as_mut().poll(cx).is_pending(),
+                    "the operation must suspend after admission"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            assert!(db.state.operation_active.get());
+            assert!(
+                matches!(
+                    db.state.admit_connection_operation(),
+                    Err(FrankenError::Busy)
+                ),
+                "a second operation on the same connection must use SQLITE_BUSY"
+            );
+
+            db.close();
+            assert!(
+                db.state.connection_snapshot().is_err(),
+                "close must reject operations admitted after it returns"
+            );
+
+            assert_eq!(
+                operation
+                    .await
+                    .expect("the already-admitted operation should retain the connection"),
+                1
+            );
+            assert!(!db.state.operation_active.get());
+        });
     }
 
     #[test]
     fn core_prepared_statement_exposes_inferred_column_names() {
-        let _guard = host_connection_test_guard();
-        let conn = open_core_connection(":memory:").expect("in-memory connection should open");
-        conn.execute("CREATE TABLE wasm_cols (id INTEGER PRIMARY KEY, name TEXT)")
-            .expect("schema create should succeed");
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let conn = open_core_connection(":memory:")
+                .await
+                .expect("in-memory connection should open");
+            conn.execute("CREATE TABLE wasm_cols (id INTEGER PRIMARY KEY, name TEXT)")
+                .await
+                .expect("schema create should succeed");
 
-        let stmt = conn
-            .prepare("SELECT id AS user_id, name, 1 + 2 FROM wasm_cols")
-            .expect("statement should prepare");
+            let stmt = conn
+                .prepare("SELECT id AS user_id, name, 1 + 2 FROM wasm_cols")
+                .await
+                .expect("statement should prepare");
 
-        assert_eq!(stmt.column_count(), 3);
-        assert_eq!(stmt.column_names(), &["user_id", "name", "_c2"]);
+            assert_eq!(stmt.column_count(), 3);
+            assert_eq!(stmt.column_names(), &["user_id", "name", "_c2"]);
+        });
     }
 
     #[cfg(feature = "memory-options")]
     #[test]
     fn core_connection_memory_stats_follow_wasm_memory_options() {
-        let _guard = host_connection_test_guard();
-        let options = WasmDatabaseOptions {
-            page_buffer_max: Some(8),
-            initial_reserve_bytes: Some(64 * 1024),
-            growth_chunk_bytes: Some(16 * 1024),
-            max_bytes: Some(128 * 1024),
-            #[cfg(feature = "diagnostics")]
-            warning_threshold_bytes: None,
-            #[cfg(feature = "diagnostics")]
-            warning_threshold_percent: None,
-            #[cfg(feature = "diagnostics")]
-            warning_callback: None,
-        };
-        let conn = open_core_connection_with_options(":memory:", &options)
-            .expect("in-memory connection with explicit memory policy should open");
-        let stats = conn
-            .memory_stats()
-            .expect("memory stats should be available");
-        let memory_vfs = stats
-            .memory_vfs
-            .expect("memory backend should expose MemoryVfs usage");
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let options = WasmDatabaseOptions {
+                page_buffer_max: Some(8),
+                initial_reserve_bytes: Some(64 * 1024),
+                growth_chunk_bytes: Some(16 * 1024),
+                max_bytes: Some(128 * 1024),
+                #[cfg(feature = "diagnostics")]
+                warning_threshold_bytes: None,
+                #[cfg(feature = "diagnostics")]
+                warning_threshold_percent: None,
+                #[cfg(feature = "diagnostics")]
+                warning_callback: None,
+            };
+            let conn = open_core_connection_with_options(":memory:", &options)
+                .await
+                .expect("in-memory connection with explicit memory policy should open");
+            let stats = conn
+                .memory_stats()
+                .expect("memory stats should be available");
+            let memory_vfs = stats
+                .memory_vfs
+                .expect("memory backend should expose MemoryVfs usage");
 
-        assert_eq!(stats.page_cache.pool_capacity, 8);
-        assert_eq!(memory_vfs.initial_reserve_bytes, 64 * 1024);
-        assert_eq!(memory_vfs.growth_chunk_bytes, 16 * 1024);
-        assert_eq!(memory_vfs.max_bytes, Some(128 * 1024));
-        assert_eq!(memory_vfs.file_reserved_bytes, 64 * 1024);
-    }
-
-    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-    #[test]
-    fn parse_database_options_accepts_page_aliases_and_warn_at_percent() {
-        let options = Object::new();
-        set_js_number_property(&options, "pageBufferMax", 16);
-        let memory = Object::new();
-        set_js_number_property(&memory, "initialPages", 2);
-        set_js_number_property(&memory, "growthChunkPages", 1);
-        set_js_number_property(&memory, "maxPages", 8);
-        set_js_number_property(&memory, "warnAtPercent", 75);
-        set_property(&options, "memory", &memory.into()).unwrap();
-
-        let parsed = parse_database_options(Some(options.into())).expect("options should parse");
-        assert_eq!(parsed.page_buffer_max, Some(16));
-        assert_eq!(
-            parsed.initial_reserve_bytes,
-            Some(2 * WASM_LINEAR_MEMORY_PAGE_BYTES)
-        );
-        assert_eq!(
-            parsed.growth_chunk_bytes,
-            Some(WASM_LINEAR_MEMORY_PAGE_BYTES)
-        );
-        assert_eq!(parsed.max_bytes, Some(8 * WASM_LINEAR_MEMORY_PAGE_BYTES));
-        assert_eq!(parsed.warning_threshold_percent, Some(75));
-        assert_eq!(
-            parsed.effective_warning_threshold_bytes().unwrap(),
-            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
-        );
-    }
-
-    #[cfg(all(feature = "memory-options", not(feature = "diagnostics")))]
-    #[test]
-    fn parse_database_options_rejects_memory_warning_options_without_diagnostics() {
-        let options = Object::new();
-        let memory = Object::new();
-        set_js_number_property(&memory, "maxPages", 8);
-        set_js_number_property(&memory, "warnAtPercent", 75);
-        set_property(&options, "memory", &memory.into()).unwrap();
-
-        let error = parse_database_options(Some(options.into()))
-            .err()
-            .expect("default build should reject diagnostics-only memory warnings");
-        let message = js_error_message_field(&error);
-        assert!(message.contains("enable fsqlite-wasm diagnostics"));
-        assert!(message.contains("memory.warnAtPercent"));
-    }
-
-    #[cfg(feature = "memory-options")]
-    #[test]
-    fn parse_database_options_rejects_conflicting_page_and_byte_aliases() {
-        let options = Object::new();
-        let memory = Object::new();
-        set_js_number_property(
-            &memory,
-            "initialReserveBytes",
-            WASM_LINEAR_MEMORY_PAGE_BYTES,
-        );
-        set_js_number_property(&memory, "initialPages", 2);
-        set_property(&options, "memory", &memory.into()).unwrap();
-
-        let error = parse_database_options(Some(options.into()))
-            .err()
-            .expect("conflicting aliases should fail");
-        let message = js_error_message_field(&error);
-        assert!(message.contains("memory.initialReserveBytes"));
-        assert!(message.contains("memory.initialPages"));
-    }
-
-    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-    #[test]
-    fn parse_database_options_requires_tracked_cap_for_warn_at_percent() {
-        let options = Object::new();
-        let memory = Object::new();
-        set_js_number_property(&memory, "warnAtPercent", 80);
-        set_property(&options, "memory", &memory.into()).unwrap();
-
-        let error = parse_database_options(Some(options.into()))
-            .err()
-            .expect("warnAtPercent without cap");
-        assert!(js_error_message_field(&error).contains("memory.maxBytes or memory.maxPages"));
-    }
-
-    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
-    #[test]
-    fn connection_memory_stats_surface_page_aliases_and_warning_percent() {
-        let _guard = host_connection_test_guard();
-        let options = WasmDatabaseOptions {
-            page_buffer_max: Some(8),
-            initial_reserve_bytes: Some(2 * WASM_LINEAR_MEMORY_PAGE_BYTES),
-            growth_chunk_bytes: Some(WASM_LINEAR_MEMORY_PAGE_BYTES),
-            max_bytes: Some(8 * WASM_LINEAR_MEMORY_PAGE_BYTES),
-            warning_threshold_bytes: None,
-            warning_threshold_percent: Some(75),
-            warning_callback: None,
-        };
-        let conn = open_core_connection_with_options(":memory:", &options)
-            .expect("memory-configured connection should open");
-        let stats = conn
-            .memory_stats()
-            .expect("memory stats should be available");
-        let js = connection_memory_stats_to_js(
-            &conn,
-            stats,
-            options.effective_warning_threshold_bytes().unwrap(),
-            options.warning_threshold_percent,
-        )
-        .expect("memory stats js should build");
-        let object = js.unchecked_into::<Object>();
-
-        assert_eq!(
-            js_object_property_usize(&object, "initialReservePages"),
-            Some(2)
-        );
-        assert_eq!(
-            js_object_property_usize(&object, "growthChunkPages"),
-            Some(1)
-        );
-        assert_eq!(
-            js_object_property_usize(&object, "trackedMaxPages"),
-            Some(8)
-        );
-        assert_eq!(
-            js_object_property_usize(&object, "warningThresholdPercent"),
-            Some(75)
-        );
-        assert_eq!(
-            js_object_property_usize(&object, "warningThresholdBytes"),
-            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
-        );
-        assert_eq!(
-            js_object_property_string(&object, "pageCachePressureLevel").as_deref(),
-            Some("normal")
-        );
-        assert_eq!(
-            js_object_property_usize(&object, "pageCachePressureBudgetBytes"),
-            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
-        );
+            assert_eq!(stats.page_cache.pool_capacity, 8);
+            assert_eq!(memory_vfs.initial_reserve_bytes, 64 * 1024);
+            assert_eq!(memory_vfs.growth_chunk_bytes, 16 * 1024);
+            assert_eq!(memory_vfs.max_bytes, Some(128 * 1024));
+            assert_eq!(memory_vfs.file_reserved_bytes, 64 * 1024);
+        });
     }
 
     #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
@@ -2088,56 +2420,81 @@ mod tests {
     #[cfg(all(feature = "backup", feature = "memory-options"))]
     #[test]
     fn import_with_wasm_memory_cap_returns_out_of_memory() {
-        let _guard = host_connection_test_guard();
-        let seed = open_core_connection(":memory:").expect("seed connection should open");
-        seed.execute("CREATE TABLE wasm_seed (id INTEGER PRIMARY KEY, name TEXT)")
-            .expect("seed schema create should succeed");
-        seed.execute("INSERT INTO wasm_seed (id, name) VALUES (1, 'alpha')")
-            .expect("seed insert should succeed");
-        let image = seed.export_bytes().expect("seed export should succeed");
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let seed = open_core_connection(":memory:")
+                .await
+                .expect("seed connection should open");
+            seed.execute("CREATE TABLE wasm_seed (id INTEGER PRIMARY KEY, name TEXT)")
+                .await
+                .expect("seed schema create should succeed");
+            seed.execute("INSERT INTO wasm_seed (id, name) VALUES (1, 'alpha')")
+                .await
+                .expect("seed insert should succeed");
+            let image = seed
+                .export_bytes()
+                .await
+                .expect("seed export should succeed");
 
-        let options = WasmDatabaseOptions {
-            max_bytes: Some(1024),
-            ..WasmDatabaseOptions::default()
-        };
-        let error = import_core_connection_with_options(&image, &options)
-            .expect_err("tight memory cap should reject import");
-        assert!(matches!(error, FrankenError::OutOfMemory));
+            let options = WasmDatabaseOptions {
+                max_bytes: Some(1024),
+                ..WasmDatabaseOptions::default()
+            };
+            let error = import_core_connection_with_options(&image, &options)
+                .await
+                .expect_err("tight memory cap should reject import");
+            assert!(matches!(error, FrankenError::OutOfMemory));
+        });
     }
 
     #[cfg(all(feature = "batch-execution", feature = "prepared-statements"))]
     #[test]
     fn franken_db_prepare_and_execute_batch_work_on_host() {
-        let _guard = host_connection_test_guard();
-        let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch(
-            "CREATE TABLE wasm_batch (id INTEGER PRIMARY KEY, name TEXT);\
-             INSERT INTO wasm_batch (id, name) VALUES (1, 'alpha');\
-             INSERT INTO wasm_batch (id, name) VALUES (2, 'beta');",
-        )
-        .expect("batch execution should succeed");
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let db = FrankenDb::new(None).await.expect("db should open");
+            db.execute_batch(
+                "CREATE TABLE wasm_batch (id INTEGER PRIMARY KEY, name TEXT);\
+                 INSERT INTO wasm_batch (id, name) VALUES (1, 'alpha');\
+                 INSERT INTO wasm_batch (id, name) VALUES (2, 'beta');",
+            )
+            .await
+            .expect("batch execution should succeed");
 
-        let stmt = db
-            .prepare("SELECT id AS user_id, name FROM wasm_batch ORDER BY id")
-            .expect("select should prepare");
-        #[cfg(feature = "diagnostics")]
-        assert_eq!(stmt.column_count(), 2);
-        assert_eq!(stmt.execute().expect("select execute should count rows"), 2);
+            let stmt = db
+                .prepare("SELECT id AS user_id, name FROM wasm_batch ORDER BY id")
+                .await
+                .expect("select should prepare");
+            #[cfg(feature = "diagnostics")]
+            assert_eq!(stmt.column_count(), 2);
+            assert_eq!(
+                stmt.execute()
+                    .await
+                    .expect("select execute should count rows"),
+                2
+            );
+        });
     }
 
     #[cfg(feature = "batch-execution")]
     #[test]
     fn franken_db_execute_batch_allows_empty_and_comment_only_input_on_host() {
-        let _guard = host_connection_test_guard();
-        let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch("").expect("empty batch should be a no-op");
-        db.execute_batch("  -- nothing here\n/* still empty */ ; ")
-            .expect("comment-only batch should be a no-op");
-        assert_eq!(
-            db.execute("SELECT 1")
-                .expect("database should remain usable after no-op batches"),
-            1
-        );
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let db = FrankenDb::new(None).await.expect("db should open");
+            db.execute_batch("")
+                .await
+                .expect("empty batch should be a no-op");
+            db.execute_batch("  -- nothing here\n/* still empty */ ; ")
+                .await
+                .expect("comment-only batch should be a no-op");
+            assert_eq!(
+                db.execute("SELECT 1")
+                    .await
+                    .expect("database should remain usable after no-op batches"),
+                1
+            );
+        });
     }
 
     #[test]
@@ -2216,11 +2573,215 @@ mod tests {
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
+#[wasm_bindgen(inline_js = r#"
+export async function boundaryExecuteThenClose(db) {
+    const admitted = db.execute(
+        "CREATE TABLE boundary_close (id INTEGER PRIMARY KEY)"
+    );
+    db.close();
+    const changes = await admitted;
+    let postCloseError;
+    try {
+        await db.query("SELECT 1");
+    } catch (error) {
+        postCloseError = error;
+    }
+    return {
+        changes,
+        postCloseCode: postCloseError?.code,
+        postCloseMessage: postCloseError?.message,
+    };
+}
+
+export async function boundaryExecuteThenCloseAndFree(db) {
+    const admitted = db.execute(
+        "CREATE TABLE boundary_close_free (id INTEGER PRIMARY KEY)"
+    );
+    db.close();
+    db.free();
+    return { changes: await admitted };
+}
+
+export async function boundaryOverlapIsBusy(db) {
+    const admitted = db.execute(
+        "CREATE TABLE boundary_busy (id INTEGER PRIMARY KEY)"
+    );
+    let overlapError;
+    try {
+        await db.query("SELECT 1");
+    } catch (error) {
+        overlapError = error;
+    }
+    await admitted;
+    const after = await db.query("SELECT 1 AS value");
+    return {
+        overlapCode: overlapError?.code,
+        overlapMessage: overlapError?.message,
+        afterRows: after.rows.length,
+    };
+}
+
+export async function boundaryParamAdmissionOrdering(db) {
+    let conversionTouches = 0;
+    const untouchedWhileBusy = [];
+    Object.defineProperty(untouchedWhileBusy, 0, {
+        configurable: true,
+        enumerable: true,
+        get() {
+            conversionTouches += 1;
+            return { invalid: true };
+        },
+    });
+
+    const admitted = db.execute(
+        "CREATE TABLE boundary_params (id INTEGER PRIMARY KEY)"
+    );
+    let busyError;
+    try {
+        await db.executeWithParams("SELECT ?", untouchedWhileBusy);
+    } catch (error) {
+        busyError = error;
+    }
+    const touchesWhileBusy = conversionTouches;
+    await admitted;
+
+    let reentrantPromise;
+    const reentrantParams = [];
+    Object.defineProperty(reentrantParams, 0, {
+        configurable: true,
+        enumerable: true,
+        get() {
+            conversionTouches += 1;
+            reentrantPromise = db.query("SELECT 1");
+            return { invalid: true };
+        },
+    });
+
+    let conversionError;
+    try {
+        await db.executeWithParams("SELECT ?", reentrantParams);
+    } catch (error) {
+        conversionError = error;
+    }
+    let reentrantError;
+    try {
+        await reentrantPromise;
+    } catch (error) {
+        reentrantError = error;
+    }
+
+    const after = await db.query("SELECT 1 AS value");
+    return {
+        busyCode: busyError?.code,
+        touchesWhileBusy,
+        conversionCode: conversionError?.code,
+        reentrantCode: reentrantError?.code,
+        finalTouches: conversionTouches,
+        afterRows: after.rows.length,
+    };
+}
+
+export async function boundaryPreparedQueryThenFree(db) {
+    await db.execute(
+        "CREATE TABLE boundary_prepared (id INTEGER PRIMARY KEY, value TEXT)"
+    );
+    await db.execute(
+        "INSERT INTO boundary_prepared VALUES (1, 'kept alive')"
+    );
+    const stmt = await db.prepare(
+        "SELECT id, value FROM boundary_prepared ORDER BY id"
+    );
+    const admitted = stmt.query();
+    stmt.free();
+    const result = await admitted;
+    const after = await db.query("SELECT count(*) AS total FROM boundary_prepared");
+    return {
+        admittedRows: result.rows.length,
+        afterRows: after.rows.length,
+    };
+}
+
+export async function boundaryPreparedGetterFreesWrapper(db) {
+    const stmt = await db.prepare("SELECT ? AS value");
+    const params = [];
+    Object.defineProperty(params, 0, {
+        configurable: true,
+        enumerable: true,
+        get() {
+            stmt.free();
+            return 7;
+        },
+    });
+    const prepared = await stmt.queryWithParams(params);
+    const after = await db.query("SELECT 1 AS value");
+    return {
+        preparedRows: prepared.rows.length,
+        preparedValue: prepared.rows[0].value,
+        afterRows: after.rows.length,
+    };
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(js_name = boundaryExecuteThenClose)]
+    fn boundary_execute_then_close(db: &JsValue) -> Promise;
+
+    #[wasm_bindgen(js_name = boundaryExecuteThenCloseAndFree)]
+    fn boundary_execute_then_close_and_free(db: &JsValue) -> Promise;
+
+    #[wasm_bindgen(js_name = boundaryOverlapIsBusy)]
+    fn boundary_overlap_is_busy(db: &JsValue) -> Promise;
+
+    #[wasm_bindgen(js_name = boundaryParamAdmissionOrdering)]
+    fn boundary_param_admission_ordering(db: &JsValue) -> Promise;
+
+    #[cfg(feature = "prepared-statements")]
+    #[wasm_bindgen(js_name = boundaryPreparedQueryThenFree)]
+    fn boundary_prepared_query_then_free(db: &JsValue) -> Promise;
+
+    #[cfg(feature = "prepared-statements")]
+    #[wasm_bindgen(js_name = boundaryPreparedGetterFreesWrapper)]
+    fn boundary_prepared_getter_frees_wrapper(db: &JsValue) -> Promise;
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use wasm_bindgen_futures::JsFuture;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn wasm_memory_vfs_paths_and_open_are_host_independent() {
+        use std::path::Path;
+
+        use fsqlite_pager::SimplePager;
+        use fsqlite_types::PageSize;
+        use fsqlite_types::cx::Cx;
+        use fsqlite_vfs::{MemoryVfs, Vfs};
+
+        let path = Path::new("/:memory:");
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let resolved = vfs
+            .full_pathname(&cx, path)
+            .expect("MemoryVfs virtual path resolution should not access the host");
+        assert_eq!(resolved, path);
+        let relative = Path::new("relative.db");
+        assert_eq!(
+            vfs.full_pathname(&cx, relative)
+                .expect("relative virtual keys should not access the host"),
+            relative
+        );
+
+        SimplePager::open_with_cx(&cx, vfs, &resolved, PageSize::DEFAULT)
+            .await
+            .expect("MemoryVfs SimplePager bootstrap should open in the browser");
+
+        CoreConnection::open(":memory:")
+            .await
+            .expect("CoreConnection memory bootstrap should open in the browser");
+    }
 
     fn rows(result: &JsValue) -> Array {
         Reflect::get(result, &JsValue::from_str("rows"))
@@ -2232,6 +2793,56 @@ mod wasm_tests {
         Reflect::get(row, &JsValue::from_str(key)).expect("row field should exist")
     }
 
+    fn string_property(value: &JsValue, key: &str) -> Option<String> {
+        Reflect::get(value, &JsValue::from_str(key))
+            .expect("string property lookup should succeed")
+            .as_string()
+    }
+
+    fn number_property(value: &JsValue, key: &str) -> Option<f64> {
+        Reflect::get(value, &JsValue::from_str(key))
+            .expect("number property lookup should succeed")
+            .as_f64()
+    }
+
+    struct HotPathProfileGuard {
+        hot_path: bool,
+        btree_copy: bool,
+        btree_metrics: bool,
+        record: bool,
+        vdbe: bool,
+        pager_commit: bool,
+    }
+
+    impl HotPathProfileGuard {
+        fn enabled() -> Self {
+            let previous = Self {
+                hot_path: fsqlite_core::connection::hot_path_profile_enabled(),
+                btree_copy: fsqlite_btree::btree_copy_profile_enabled(),
+                btree_metrics: fsqlite_btree::btree_metrics_enabled(),
+                record: fsqlite_types::record::record_profile_enabled(),
+                vdbe: fsqlite_vdbe::engine::vdbe_metrics_enabled(),
+                pager_commit: fsqlite_pager::pager_commit_profile_enabled(),
+            };
+            fsqlite_core::connection::set_hot_path_profile_enabled(true);
+            previous
+        }
+    }
+
+    impl Drop for HotPathProfileGuard {
+        fn drop(&mut self) {
+            // The aggregate setter mutates every subordinate gate in
+            // non-test dependency builds, so restore it first and then put
+            // each independently configurable gate back exactly as found.
+            fsqlite_core::connection::set_hot_path_profile_enabled(self.hot_path);
+            fsqlite_btree::set_btree_copy_profile_enabled(self.btree_copy);
+            fsqlite_btree::set_btree_metrics_enabled(self.btree_metrics);
+            fsqlite_types::record::set_record_profile_enabled(self.record);
+            fsqlite_vdbe::engine::set_vdbe_metrics_enabled(self.vdbe);
+            fsqlite_pager::set_pager_commit_profile_enabled(self.pager_commit);
+        }
+    }
+
     #[cfg(feature = "row-arrays")]
     fn row_arrays(result: &JsValue) -> Array {
         Reflect::get(result, &JsValue::from_str("rowArrays"))
@@ -2239,9 +2850,11 @@ mod wasm_tests {
             .unchecked_into::<Array>()
     }
 
-    fn execute_seed_statements(db: &FrankenDb, statements: &[&str]) {
+    async fn execute_seed_statements(db: &FrankenDb, statements: &[&str]) {
         for sql in statements {
-            db.execute(sql).expect("seed statement should succeed");
+            db.execute(sql)
+                .await
+                .expect("seed statement should succeed");
         }
     }
 
@@ -2250,6 +2863,264 @@ mod wasm_tests {
             .expect("message field should exist")
             .as_string()
             .expect("message should be a string")
+    }
+
+    #[wasm_bindgen_test]
+    async fn generated_js_execute_then_close_keeps_admitted_operation_alive() {
+        let db = FrankenDb::new(None).await.expect("db should open");
+        let db_js = JsValue::from(db);
+        let result = JsFuture::from(boundary_execute_then_close(&db_js))
+            .await
+            .expect("generated JS lifecycle probe should resolve");
+
+        assert_eq!(number_property(&result, "changes"), Some(0.0));
+        assert_eq!(
+            string_property(&result, "postCloseCode").as_deref(),
+            Some("SQLITE_INTERNAL")
+        );
+        assert!(
+            string_property(&result, "postCloseMessage")
+                .expect("closed error should include a message")
+                .contains("closed")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn generated_js_execute_survives_immediate_close_and_free() {
+        let db = FrankenDb::new(None).await.expect("db should open");
+        let db_js = JsValue::from(db);
+        let result = JsFuture::from(boundary_execute_then_close_and_free(&db_js))
+            .await
+            .expect("generated JS close-and-free probe should resolve");
+
+        assert_eq!(number_property(&result, "changes"), Some(0.0));
+    }
+
+    #[wasm_bindgen_test]
+    async fn generated_js_overlapping_operation_is_deterministically_busy() {
+        let db = FrankenDb::new(None).await.expect("db should open");
+        let db_js = JsValue::from(db);
+        let result = JsFuture::from(boundary_overlap_is_busy(&db_js))
+            .await
+            .expect("generated JS overlap probe should resolve");
+
+        assert_eq!(
+            string_property(&result, "overlapCode").as_deref(),
+            Some("SQLITE_BUSY")
+        );
+        assert!(
+            string_property(&result, "overlapMessage")
+                .expect("busy error should include a message")
+                .contains("busy")
+        );
+        assert_eq!(number_property(&result, "afterRows"), Some(1.0));
+    }
+
+    #[wasm_bindgen_test]
+    async fn generated_js_parameter_admission_precedes_conversion_and_reentry() {
+        let db = FrankenDb::new(None).await.expect("db should open");
+        let db_js = JsValue::from(db);
+        let result = JsFuture::from(boundary_param_admission_ordering(&db_js))
+            .await
+            .expect("generated JS parameter-ordering probe should resolve");
+
+        assert_eq!(
+            string_property(&result, "busyCode").as_deref(),
+            Some("SQLITE_BUSY")
+        );
+        assert_eq!(number_property(&result, "touchesWhileBusy"), Some(0.0));
+        assert_eq!(
+            string_property(&result, "conversionCode").as_deref(),
+            Some("SQLITE_MISMATCH")
+        );
+        assert_eq!(
+            string_property(&result, "reentrantCode").as_deref(),
+            Some("SQLITE_BUSY")
+        );
+        assert_eq!(number_property(&result, "finalTouches"), Some(1.0));
+        assert_eq!(
+            number_property(&result, "afterRows"),
+            Some(1.0),
+            "synchronous conversion rejection must release the operation guard"
+        );
+    }
+
+    #[cfg(feature = "prepared-statements")]
+    #[wasm_bindgen_test]
+    async fn generated_js_prepared_query_survives_immediate_free() {
+        let db = FrankenDb::new(None).await.expect("db should open");
+        let db_js = JsValue::from(db);
+        let result = JsFuture::from(boundary_prepared_query_then_free(&db_js))
+            .await
+            .expect("generated JS prepared lifecycle probe should resolve");
+
+        assert_eq!(number_property(&result, "admittedRows"), Some(1.0));
+        assert_eq!(number_property(&result, "afterRows"), Some(1.0));
+    }
+
+    #[cfg(feature = "prepared-statements")]
+    #[wasm_bindgen_test]
+    async fn generated_js_prepared_param_getter_can_free_wrapper_safely() {
+        let db = FrankenDb::new(None).await.expect("db should open");
+        let db_js = JsValue::from(db);
+        let result = JsFuture::from(boundary_prepared_getter_frees_wrapper(&db_js))
+            .await
+            .expect("generated JS getter/free probe should resolve");
+
+        assert_eq!(number_property(&result, "preparedRows"), Some(1.0));
+        assert_eq!(number_property(&result, "preparedValue"), Some(7.0));
+        assert_eq!(number_property(&result, "afterRows"), Some(1.0));
+    }
+
+    #[cfg(feature = "memory-options")]
+    fn set_js_number_property(object: &Object, key: &str, value: usize) {
+        set_property(object, key, &JsValue::from_f64(value as f64))
+            .expect("numeric option property should be set");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn js_object_property_usize(object: &Object, key: &str) -> Option<usize> {
+        Reflect::get(object, &JsValue::from_str(key))
+            .expect("numeric property lookup should succeed")
+            .as_f64()
+            .map(|value| value as usize)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn js_object_property_string(object: &Object, key: &str) -> Option<String> {
+        Reflect::get(object, &JsValue::from_str(key))
+            .expect("string property lookup should succeed")
+            .as_string()
+    }
+
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+    #[wasm_bindgen_test]
+    fn wasm_parse_database_options_accepts_page_aliases_and_warn_at_percent() {
+        let options = Object::new();
+        set_js_number_property(&options, "pageBufferMax", 16);
+        let memory = Object::new();
+        set_js_number_property(&memory, "initialPages", 2);
+        set_js_number_property(&memory, "growthChunkPages", 1);
+        set_js_number_property(&memory, "maxPages", 8);
+        set_js_number_property(&memory, "warnAtPercent", 75);
+        set_property(&options, "memory", &memory.into()).expect("memory options should be set");
+
+        let parsed = parse_database_options(Some(options.into())).expect("options should parse");
+        assert_eq!(parsed.page_buffer_max, Some(16));
+        assert_eq!(
+            parsed.initial_reserve_bytes,
+            Some(2 * WASM_LINEAR_MEMORY_PAGE_BYTES)
+        );
+        assert_eq!(
+            parsed.growth_chunk_bytes,
+            Some(WASM_LINEAR_MEMORY_PAGE_BYTES)
+        );
+        assert_eq!(parsed.max_bytes, Some(8 * WASM_LINEAR_MEMORY_PAGE_BYTES));
+        assert_eq!(parsed.warning_threshold_percent, Some(75));
+        assert_eq!(
+            parsed.effective_warning_threshold_bytes().unwrap(),
+            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
+        );
+    }
+
+    #[cfg(all(feature = "memory-options", not(feature = "diagnostics")))]
+    #[wasm_bindgen_test]
+    fn wasm_parse_database_options_rejects_warning_options_without_diagnostics() {
+        let options = Object::new();
+        let memory = Object::new();
+        set_js_number_property(&memory, "maxPages", 8);
+        set_js_number_property(&memory, "warnAtPercent", 75);
+        set_property(&options, "memory", &memory.into()).expect("memory options should be set");
+
+        let error = parse_database_options(Some(options.into()))
+            .err()
+            .expect("default build should reject diagnostics-only memory warnings");
+        let message = error_message(&error);
+        assert!(message.contains("enable fsqlite-wasm diagnostics"));
+        assert!(message.contains("memory.warnAtPercent"));
+    }
+
+    #[cfg(feature = "memory-options")]
+    #[wasm_bindgen_test]
+    fn wasm_parse_database_options_rejects_conflicting_page_and_byte_aliases() {
+        let options = Object::new();
+        let memory = Object::new();
+        set_js_number_property(
+            &memory,
+            "initialReserveBytes",
+            WASM_LINEAR_MEMORY_PAGE_BYTES,
+        );
+        set_js_number_property(&memory, "initialPages", 2);
+        set_property(&options, "memory", &memory.into()).expect("memory options should be set");
+
+        let error = parse_database_options(Some(options.into()))
+            .err()
+            .expect("conflicting aliases should fail");
+        let message = error_message(&error);
+        assert!(message.contains("memory.initialReserveBytes"));
+        assert!(message.contains("memory.initialPages"));
+    }
+
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+    #[wasm_bindgen_test]
+    fn wasm_parse_database_options_requires_tracked_cap_for_warn_at_percent() {
+        let options = Object::new();
+        let memory = Object::new();
+        set_js_number_property(&memory, "warnAtPercent", 80);
+        set_property(&options, "memory", &memory.into()).expect("memory options should be set");
+
+        let error = parse_database_options(Some(options.into()))
+            .err()
+            .expect("warnAtPercent without cap should fail");
+        assert!(error_message(&error).contains("memory.maxBytes or memory.maxPages"));
+    }
+
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
+    #[wasm_bindgen_test]
+    async fn wasm_open_with_options_surfaces_page_aliases_and_warning_percent() {
+        let options = Object::new();
+        set_js_number_property(&options, "pageBufferMax", 8);
+        let memory = Object::new();
+        set_js_number_property(&memory, "initialPages", 2);
+        set_js_number_property(&memory, "growthChunkPages", 1);
+        set_js_number_property(&memory, "maxPages", 8);
+        set_js_number_property(&memory, "warnAtPercent", 75);
+        set_property(&options, "memory", &memory.into()).expect("memory options should be set");
+
+        let db = FrankenDb::open_with_options(None, Some(options.into()))
+            .await
+            .expect("memory-configured connection should open");
+        let stats = db.memory_stats().expect("memory stats should be available");
+        let object = stats.unchecked_into::<Object>();
+
+        assert_eq!(
+            js_object_property_usize(&object, "initialReservePages"),
+            Some(2)
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "growthChunkPages"),
+            Some(1)
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "trackedMaxPages"),
+            Some(8)
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "warningThresholdPercent"),
+            Some(75)
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "warningThresholdBytes"),
+            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
+        );
+        assert_eq!(
+            js_object_property_string(&object, "pageCachePressureLevel").as_deref(),
+            Some("normal")
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "pageCachePressureBudgetBytes"),
+            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
+        );
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2271,15 +3142,18 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_db_roundtrip() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_db_roundtrip() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         db.execute("CREATE TABLE wasm_t (id INTEGER PRIMARY KEY, name TEXT)")
+            .await
             .expect("table create should succeed");
         db.execute("INSERT INTO wasm_t (id, name) VALUES (1, 'alpha'), (2, 'beta')")
+            .await
             .expect("seed insert should succeed");
 
         let result = db
             .query("SELECT id, name FROM wasm_t ORDER BY id")
+            .await
             .expect("query should succeed");
         let rows = Reflect::get(&result, &JsValue::from_str("rows"))
             .expect("rows field should exist")
@@ -2289,10 +3163,11 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_wall_clock_sql_and_snapshot_capture_use_browser_time() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_wall_clock_sql_and_snapshot_capture_use_browser_time() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         let result = db
             .query("SELECT CURRENT_TIMESTAMP AS observed_at")
+            .await
             .expect("browser wall-clock query should succeed");
         let rows = Reflect::get(&result, &JsValue::from_str("rows"))
             .expect("rows field should exist")
@@ -2304,14 +3179,45 @@ mod wasm_tests {
         assert_eq!(observed_at.len(), 19);
 
         db.execute("CREATE TABLE wasm_clock (id INTEGER PRIMARY KEY)")
+            .await
             .expect("table create should capture a time-travel snapshot");
         db.execute("INSERT INTO wasm_clock VALUES (1)")
+            .await
             .expect("insert should capture a time-travel snapshot");
     }
 
     #[wasm_bindgen_test]
-    fn wasm_open_and_close_is_idempotent() {
-        let db = FrankenDb::new(None).expect("db should open via constructor");
+    async fn wasm_hot_path_profiles_use_browser_clock() {
+        let _profile_guard = HotPathProfileGuard::enabled();
+        let db = FrankenDb::new(None).await.expect("db should open");
+        db.execute("CREATE TABLE wasm_profile (id INTEGER PRIMARY KEY, value TEXT)")
+            .await
+            .expect("profiled table create should succeed");
+        db.execute("INSERT INTO wasm_profile (id, value) VALUES (1, 'alpha'), (2, 'beta')")
+            .await
+            .expect("profiled insert should succeed");
+
+        let result = db
+            .query("SELECT id, value FROM wasm_profile ORDER BY id")
+            .await
+            .expect("profiled query should succeed");
+        assert_eq!(rows(&result).length(), 2);
+
+        db.execute("DELETE FROM wasm_profile WHERE id = 1")
+            .await
+            .expect("profiled delete should succeed");
+        let result = db
+            .query("SELECT id FROM wasm_profile ORDER BY id")
+            .await
+            .expect("post-delete profile query should succeed");
+        assert_eq!(rows(&result).length(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    async fn wasm_open_and_close_is_idempotent() {
+        let db = FrankenDb::new(None)
+            .await
+            .expect("db should open via constructor");
         #[cfg(feature = "diagnostics")]
         assert_eq!(db.path(), ":memory:");
 
@@ -2320,16 +3226,20 @@ mod wasm_tests {
 
         let error = db
             .query("SELECT 1")
+            .await
             .expect_err("queries after close should produce a JS error");
         assert!(error_message(&error).contains("closed"));
     }
 
     #[cfg(feature = "api-extras")]
     #[wasm_bindgen_test]
-    fn wasm_static_open_constructor_creates_database() {
-        let db = FrankenDb::open(None).expect("db should open via static constructor");
+    async fn wasm_static_open_constructor_creates_database() {
+        let db = FrankenDb::open(None)
+            .await
+            .expect("db should open via static constructor");
         assert_eq!(
             db.execute("CREATE TABLE wasm_static_open (id INTEGER PRIMARY KEY)")
+                .await
                 .expect("table create should succeed"),
             0
         );
@@ -2337,7 +3247,7 @@ mod wasm_tests {
 
     #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     #[wasm_bindgen_test]
-    fn wasm_memory_warning_callback_receives_stats_payload_once_while_above_threshold() {
+    async fn wasm_memory_warning_callback_receives_stats_payload_once_while_above_threshold() {
         use wasm_bindgen::closure::Closure;
 
         let warning_count = Rc::new(Cell::new(0));
@@ -2367,26 +3277,30 @@ mod wasm_tests {
         set_property(&options, "memory", &memory.into()).unwrap();
 
         let db = FrankenDb::open_with_options(None, Some(options.into()))
+            .await
             .expect("diagnostic memory options should open");
         assert_eq!(warning_count.get(), 1);
         assert!(saw_exceeded_payload.get());
 
         db.execute("CREATE TABLE wasm_memory_warning (id INTEGER PRIMARY KEY)")
+            .await
             .expect("table create should succeed");
         assert_eq!(warning_count.get(), 1);
     }
 
     #[cfg(feature = "batch-execution")]
     #[wasm_bindgen_test]
-    fn wasm_execute_reports_changes_and_batch_runs_multiple_statements() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_execute_reports_changes_and_batch_runs_multiple_statements() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         assert_eq!(
             db.execute("CREATE TABLE wasm_counts (id INTEGER PRIMARY KEY, name TEXT)")
+                .await
                 .expect("table create should succeed"),
             0
         );
         assert_eq!(
             db.execute("INSERT INTO wasm_counts (id, name) VALUES (1, 'alpha')")
+                .await
                 .expect("single insert should report one change"),
             1
         );
@@ -2395,10 +3309,12 @@ mod wasm_tests {
              INSERT INTO wasm_counts (id, name) VALUES (3, 'gamma');\
              UPDATE wasm_counts SET name = 'delta' WHERE id = 2;",
         )
+        .await
         .expect("batch execution should succeed");
 
         let rows = rows(
             &db.query("SELECT id, name FROM wasm_counts ORDER BY id")
+                .await
                 .expect("query should succeed"),
         );
         assert_eq!(rows.length(), 3);
@@ -2411,13 +3327,17 @@ mod wasm_tests {
 
     #[cfg(feature = "batch-execution")]
     #[wasm_bindgen_test]
-    fn wasm_execute_batch_allows_empty_and_comment_only_input() {
-        let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch("").expect("empty batch should be a no-op");
+    async fn wasm_execute_batch_allows_empty_and_comment_only_input() {
+        let db = FrankenDb::new(None).await.expect("db should open");
+        db.execute_batch("")
+            .await
+            .expect("empty batch should be a no-op");
         db.execute_batch("  -- nothing here\n/* still empty */ ; ")
+            .await
             .expect("comment-only batch should be a no-op");
         assert_eq!(
             db.execute("SELECT 1")
+                .await
                 .expect("database should remain usable after no-op batches"),
             1
         );
@@ -2425,8 +3345,8 @@ mod wasm_tests {
 
     #[cfg(feature = "backup")]
     #[wasm_bindgen_test]
-    fn wasm_export_import_roundtrips_sqlite_image() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_export_import_roundtrips_sqlite_image() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         execute_seed_statements(
             &db,
             &[
@@ -2434,27 +3354,31 @@ mod wasm_tests {
                 "INSERT INTO wasm_export VALUES (1, 'alpha', X'DEADBEEF')",
                 "INSERT INTO wasm_export VALUES (2, 'beta', X'010203')",
             ],
-        );
+        )
+        .await;
 
-        let exported = db.export().expect("export should succeed");
+        let exported = db.export().await.expect("export should succeed");
         let exported_bytes = exported.to_vec();
         assert!(
             exported_bytes.starts_with(b"SQLite format 3\0"),
             "export should produce a standard SQLite image header"
         );
 
-        let imported = FrankenDb::import(exported).expect("import should succeed");
+        let imported = FrankenDb::import(exported)
+            .await
+            .expect("import should succeed");
         #[cfg(feature = "diagnostics")]
         assert_eq!(imported.path(), ":memory:");
 
-        let rows = rows(
+        let result_rows = rows(
             &imported
                 .query("SELECT id, name, payload FROM wasm_export ORDER BY id")
+                .await
                 .expect("query should succeed after import"),
         );
-        assert_eq!(rows.length(), 2);
+        assert_eq!(result_rows.length(), 2);
 
-        let first_row = rows.get(0).unchecked_into::<Object>();
+        let first_row = result_rows.get(0).unchecked_into::<Object>();
         assert_eq!(row_property(&first_row, "id").as_f64(), Some(1.0));
         assert_eq!(
             row_property(&first_row, "name").as_string().as_deref(),
@@ -2465,7 +3389,7 @@ mod wasm_tests {
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
 
-        let second_row = rows.get(1).unchecked_into::<Object>();
+        let second_row = result_rows.get(1).unchecked_into::<Object>();
         assert_eq!(row_property(&second_row, "id").as_f64(), Some(2.0));
         assert_eq!(
             row_property(&second_row, "name").as_string().as_deref(),
@@ -2475,12 +3399,33 @@ mod wasm_tests {
             Uint8Array::new(&row_property(&second_row, "payload")).to_vec(),
             vec![1, 2, 3]
         );
+
+        #[cfg(feature = "memory-options")]
+        {
+            let options = Object::new();
+            set_js_number_property(&options, "pageBufferMax", 8);
+            let imported_with_options = FrankenDb::import_with_options(
+                Uint8Array::from(exported_bytes.as_slice()),
+                Some(options.into()),
+            )
+            .await
+            .expect("importWithOptions should import the exported image");
+            let result = imported_with_options
+                .query("SELECT count(*) AS row_count FROM wasm_export")
+                .await
+                .expect("query should succeed after importWithOptions");
+            let imported_rows = rows(&result);
+            assert_eq!(imported_rows.length(), 1);
+            let row = imported_rows.get(0).unchecked_into::<Object>();
+            assert_eq!(row_property(&row, "row_count").as_f64(), Some(2.0));
+        }
     }
 
     #[cfg(feature = "backup")]
     #[wasm_bindgen_test]
-    fn wasm_import_rejects_empty_database_image() {
+    async fn wasm_import_rejects_empty_database_image() {
         let error = FrankenDb::import(Uint8Array::new_with_length(0))
+            .await
             .err()
             .expect("empty image should be rejected");
         assert!(error_message(&error).contains("empty"));
@@ -2504,8 +3449,8 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_value_conversion_round_trips_with_type_fidelity() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_value_conversion_round_trips_with_type_fidelity() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         db.execute(
             "CREATE TABLE wasm_types (
                 safe_i INTEGER,
@@ -2516,6 +3461,7 @@ mod wasm_tests {
                 null_v
             )",
         )
+        .await
         .expect("table create should succeed");
 
         let params = Array::new();
@@ -2531,10 +3477,12 @@ mod wasm_tests {
             "INSERT INTO wasm_types VALUES (?, ?, ?, ?, ?, ?)",
             params.into(),
         )
+        .await
         .expect("parameterized insert should succeed");
 
         let result = db
             .query("SELECT safe_i, big_i, real_v, text_v, blob_v, null_v FROM wasm_types")
+            .await
             .expect("query should succeed");
         let rows = rows(&result);
         assert_eq!(rows.length(), 1);
@@ -2572,9 +3520,10 @@ mod wasm_tests {
 
     #[cfg(feature = "date-params")]
     #[wasm_bindgen_test]
-    fn wasm_date_parameter_converts_to_iso_text() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_date_parameter_converts_to_iso_text() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         db.execute("CREATE TABLE wasm_dates (date_v TEXT)")
+            .await
             .expect("table create should succeed");
 
         let input_date = Date::new(&JsValue::from_str("2026-03-11T12:34:56.000Z"));
@@ -2583,10 +3532,12 @@ mod wasm_tests {
         params.push(&input_date.into());
 
         db.execute_with_params("INSERT INTO wasm_dates VALUES (?)", params.into())
+            .await
             .expect("Date parameter insert should succeed");
 
         let result = db
             .query("SELECT date_v FROM wasm_dates")
+            .await
             .expect("query should succeed");
         let rows = rows(&result);
         let row = rows.get(0).unchecked_into::<Object>();
@@ -2597,13 +3548,14 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_value_conversion_reports_overflow_and_unsupported_types() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_value_conversion_reports_overflow_and_unsupported_types() {
+        let db = FrankenDb::new(None).await.expect("db should open");
 
         let overflow_params = Array::new();
         overflow_params.push(&JsValue::bigint_from_str("9223372036854775808"));
         let overflow_error = db
             .query_with_params("SELECT ?", overflow_params.into())
+            .await
             .expect_err("overflowing BigInt should be rejected");
         let overflow_message = Reflect::get(&overflow_error, &JsValue::from_str("message"))
             .expect("message field should exist")
@@ -2615,6 +3567,7 @@ mod wasm_tests {
         unsupported_params.push(&Object::new().into());
         let unsupported_error = db
             .query_with_params("SELECT ?", unsupported_params.into())
+            .await
             .expect_err("plain objects should be rejected");
         let unsupported_message = Reflect::get(&unsupported_error, &JsValue::from_str("message"))
             .expect("message field should exist")
@@ -2629,8 +3582,8 @@ mod wasm_tests {
 
     #[cfg(all(feature = "diagnostics", feature = "prepared-statements"))]
     #[wasm_bindgen_test]
-    fn wasm_prepare_roundtrip_uses_core_column_names() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_prepare_roundtrip_uses_core_column_names() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         execute_seed_statements(
             &db,
             &[
@@ -2638,10 +3591,12 @@ mod wasm_tests {
                 "INSERT INTO wasm_prepared (id, name) VALUES (1, 'alpha')",
                 "INSERT INTO wasm_prepared (id, name) VALUES (2, 'beta')",
             ],
-        );
+        )
+        .await;
 
         let stmt = db
             .prepare("SELECT id AS user_id, name FROM wasm_prepared WHERE id = ?")
+            .await
             .expect("statement should prepare");
         assert_eq!(
             stmt.sql(),
@@ -2660,6 +3615,7 @@ mod wasm_tests {
         params.push(&JsValue::from_f64(2.0));
         let result = stmt
             .query_with_params(params.into())
+            .await
             .expect("prepared query should succeed");
 
         let columns = Reflect::get(&result, &JsValue::from_str("columns"))
@@ -2698,8 +3654,8 @@ mod wasm_tests {
 
     #[cfg(feature = "prepared-statements")]
     #[wasm_bindgen_test]
-    fn wasm_prepare_supports_sql_query_execute_without_params() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_prepare_supports_sql_query_execute_without_params() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         execute_seed_statements(
             &db,
             &[
@@ -2707,18 +3663,21 @@ mod wasm_tests {
                 "INSERT INTO wasm_stmt_surface (id, name) VALUES (1, 'alpha')",
                 "INSERT INTO wasm_stmt_surface (id, name) VALUES (2, 'beta')",
             ],
-        );
+        )
+        .await;
 
         let stmt = db
             .prepare("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
+            .await
             .expect("statement should prepare");
         assert_eq!(
             stmt.execute()
+                .await
                 .expect("execute should report visible row count"),
             2
         );
 
-        let rows = rows(&stmt.query().expect("prepared query should succeed"));
+        let rows = rows(&stmt.query().await.expect("prepared query should succeed"));
         assert_eq!(rows.length(), 2);
         let first_row = rows.get(0).unchecked_into::<Object>();
         assert_eq!(row_property(&first_row, "id").as_f64(), Some(1.0));
@@ -2730,20 +3689,25 @@ mod wasm_tests {
 
     #[cfg(all(feature = "diagnostics", feature = "prepared-statements"))]
     #[wasm_bindgen_test]
-    fn wasm_diagnostics_explain_methods_return_program_text() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_diagnostics_explain_methods_return_program_text() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         execute_seed_statements(
             &db,
             &[
                 "CREATE TABLE wasm_stmt_surface (id INTEGER PRIMARY KEY, name TEXT)",
                 "INSERT INTO wasm_stmt_surface (id, name) VALUES (1, 'alpha')",
             ],
-        );
+        )
+        .await;
 
         let stmt = db
             .prepare("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
+            .await
             .expect("statement should prepare");
-        let stmt_explain = stmt.explain().expect("statement explain should succeed");
+        let stmt_explain = stmt
+            .explain()
+            .await
+            .expect("statement explain should succeed");
         assert!(
             !stmt_explain.trim().is_empty(),
             "statement explain output should not be empty"
@@ -2751,6 +3715,7 @@ mod wasm_tests {
 
         let db_explain = db
             .explain("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
+            .await
             .expect("db explain should succeed");
         assert!(
             !db_explain.trim().is_empty(),
@@ -2760,25 +3725,29 @@ mod wasm_tests {
 
     #[cfg(feature = "prepared-statements")]
     #[wasm_bindgen_test]
-    fn wasm_prepared_execute_with_params_inserts_rows() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_prepared_execute_with_params_inserts_rows() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         db.execute("CREATE TABLE wasm_stmt_insert (id INTEGER PRIMARY KEY, name TEXT)")
+            .await
             .expect("table create should succeed");
 
         let stmt = db
             .prepare("INSERT INTO wasm_stmt_insert (id, name) VALUES (?, ?)")
+            .await
             .expect("insert statement should prepare");
         let params = Array::new();
         params.push(&JsValue::from_f64(1.0));
         params.push(&JsValue::from_str("alpha"));
         assert_eq!(
             stmt.execute_with_params(params.into())
+                .await
                 .expect("prepared insert should report one change"),
             1
         );
 
         let rows = rows(
             &db.query("SELECT id, name FROM wasm_stmt_insert")
+                .await
                 .expect("query should succeed"),
         );
         assert_eq!(rows.length(), 1);
@@ -2791,14 +3760,15 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_value_conversion_keeps_representable_fractional_numbers_real() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_value_conversion_keeps_representable_fractional_numbers_real() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         let number = ((1_i64 << 51) as f64) + 0.5;
 
         let params = Array::new();
         params.push(&JsValue::from_f64(number));
         let result = db
             .query_with_params("SELECT ? AS value", params.into())
+            .await
             .expect("representable fractional JS numbers should stay REAL");
         let rows = rows(&result);
         let row = rows.get(0).unchecked_into::<Object>();
@@ -2806,14 +3776,15 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_value_conversion_rejects_large_fraction_after_js_rounding() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_value_conversion_rejects_large_fraction_after_js_rounding() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         let rounded = (MAX_SAFE_INTEGER as f64) + 0.5;
 
         let params = Array::new();
         params.push(&JsValue::from_f64(rounded));
         let error = db
             .query_with_params("SELECT ?", params.into())
+            .await
             .expect_err("rounded large JS numbers should require BigInt");
         let message = Reflect::get(&error, &JsValue::from_str("message"))
             .expect("message field should exist")
@@ -2823,8 +3794,8 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_query_exposes_column_metadata() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_query_exposes_column_metadata() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         execute_seed_statements(
             &db,
             &[
@@ -2832,10 +3803,12 @@ mod wasm_tests {
                 "INSERT INTO wasm_meta (id, name) VALUES (1, 'alpha')",
                 "INSERT INTO wasm_meta (id, name) VALUES (2, 'beta')",
             ],
-        );
+        )
+        .await;
 
         let result = db
             .query("SELECT id AS user_id, name FROM wasm_meta ORDER BY id")
+            .await
             .expect("query should succeed");
 
         let columns = Reflect::get(&result, &JsValue::from_str("columns"))
@@ -2885,18 +3858,20 @@ mod wasm_tests {
 
     #[cfg(feature = "row-arrays")]
     #[wasm_bindgen_test]
-    fn wasm_row_arrays_feature_exposes_positional_rows() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_row_arrays_feature_exposes_positional_rows() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         execute_seed_statements(
             &db,
             &[
                 "CREATE TABLE wasm_row_arrays (id INTEGER PRIMARY KEY, name TEXT)",
                 "INSERT INTO wasm_row_arrays (id, name) VALUES (1, 'alpha')",
             ],
-        );
+        )
+        .await;
 
         let result = db
             .query("SELECT id, name FROM wasm_row_arrays")
+            .await
             .expect("query should succeed");
         let row_arrays = row_arrays(&result);
         assert_eq!(row_arrays.length(), 1);
@@ -2907,8 +3882,8 @@ mod wasm_tests {
 
     #[cfg(feature = "prepared-statements")]
     #[wasm_bindgen_test]
-    fn wasm_prepared_statement_reuses_sql_with_different_params() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_prepared_statement_reuses_sql_with_different_params() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         execute_seed_statements(
             &db,
             &[
@@ -2916,16 +3891,19 @@ mod wasm_tests {
                 "INSERT INTO wasm_reuse (id, name) VALUES (1, 'alpha')",
                 "INSERT INTO wasm_reuse (id, name) VALUES (2, 'beta')",
             ],
-        );
+        )
+        .await;
 
         let stmt = db
             .prepare("SELECT name FROM wasm_reuse WHERE id = ?")
+            .await
             .expect("statement should prepare");
 
         let first_params = Array::new();
         first_params.push(&JsValue::from_f64(1.0));
         let first_result = stmt
             .query_with_params(first_params.into())
+            .await
             .expect("first prepared query should succeed");
         let first_rows = Reflect::get(&first_result, &JsValue::from_str("rows"))
             .expect("rows field should exist")
@@ -2944,6 +3922,7 @@ mod wasm_tests {
         second_params.push(&JsValue::from_f64(2.0));
         let second_result = stmt
             .query_with_params(second_params.into())
+            .await
             .expect("second prepared query should succeed");
         let second_rows = Reflect::get(&second_result, &JsValue::from_str("rows"))
             .expect("rows field should exist")
@@ -2961,9 +3940,12 @@ mod wasm_tests {
 
     #[cfg(feature = "api-extras")]
     #[wasm_bindgen_test]
-    fn wasm_pragma_surface_returns_query_result_shape() {
-        let db = FrankenDb::new(None).expect("db should open");
-        let result = db.pragma("user_version").expect("pragma should succeed");
+    async fn wasm_pragma_surface_returns_query_result_shape() {
+        let db = FrankenDb::new(None).await.expect("db should open");
+        let result = db
+            .pragma("user_version")
+            .await
+            .expect("pragma should succeed");
 
         let columns = Reflect::get(&result, &JsValue::from_str("columns"))
             .expect("columns field should exist")
@@ -2985,10 +3967,11 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_errors_include_core_sqlite_metadata() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_errors_include_core_sqlite_metadata() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         let error = db
             .execute("NOT VALID SQL {{{{")
+            .await
             .expect_err("invalid SQL should produce a JS error");
 
         let code = Reflect::get(&error, &JsValue::from_str("code"))
@@ -3018,10 +4001,11 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_out_of_memory_errors_are_structured_for_js() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_out_of_memory_errors_are_structured_for_js() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         let error = db
-            .with_connection(|_conn| Err::<(), FrankenError>(FrankenError::OutOfMemory))
+            .with_connection(async |_conn| Err::<(), FrankenError>(FrankenError::OutOfMemory))
+            .await
             .expect_err("out-of-memory should produce a JS error");
 
         let message = Reflect::get(&error, &JsValue::from_str("message"))
@@ -3041,10 +4025,11 @@ mod wasm_tests {
 
     #[cfg(feature = "diagnostics")]
     #[wasm_bindgen_test]
-    fn wasm_diagnostic_errors_include_recovery_metadata() {
-        let db = FrankenDb::new(None).expect("db should open");
+    async fn wasm_diagnostic_errors_include_recovery_metadata() {
+        let db = FrankenDb::new(None).await.expect("db should open");
         let error = db
             .execute("NOT VALID SQL {{{{")
+            .await
             .expect_err("invalid SQL should produce a JS error");
 
         let transient = Reflect::get(&error, &JsValue::from_str("transient"))

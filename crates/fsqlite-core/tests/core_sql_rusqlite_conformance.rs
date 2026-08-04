@@ -19,12 +19,15 @@ struct CoreSqlConformanceHarness {
 }
 
 impl CoreSqlConformanceHarness {
-    fn new(setup_sql: &str) -> Self {
-        let franken = Connection::open(":memory:").expect("open FrankenSQLite in-memory database");
+    async fn new(setup_sql: &str) -> Self {
+        let franken = Connection::open(":memory:")
+            .await
+            .expect("open FrankenSQLite in-memory database");
         let sqlite =
             rusqlite::Connection::open_in_memory().expect("open rusqlite in-memory database");
         franken
             .execute_batch(setup_sql)
+            .await
             .expect("execute FrankenSQLite setup SQL");
         sqlite
             .execute_batch(setup_sql)
@@ -32,10 +35,10 @@ impl CoreSqlConformanceHarness {
         Self { franken, sqlite }
     }
 
-    fn assert_queries_match(&self, family: &str, cases: &[QueryCase]) {
+    async fn assert_queries_match(&self, family: &str, cases: &[QueryCase]) {
         for case in cases {
             assert_eq!(
-                self.franken_query_rows(case.sql),
+                self.franken_query_rows(case.sql).await,
                 self.sqlite_query_rows(case.sql),
                 "{family} conformance case failed: {} ({})",
                 case.name,
@@ -44,9 +47,9 @@ impl CoreSqlConformanceHarness {
         }
     }
 
-    fn assert_statement_errors_match(&self, family: &str, cases: &[StatementCase]) {
+    async fn assert_statement_errors_match(&self, family: &str, cases: &[StatementCase]) {
         for case in cases {
-            let franken_error = self.franken.execute_batch(case.sql).is_err();
+            let franken_error = self.franken.execute_batch(case.sql).await.is_err();
             let sqlite_error = self.sqlite.execute_batch(case.sql).is_err();
             assert!(
                 sqlite_error,
@@ -61,18 +64,20 @@ impl CoreSqlConformanceHarness {
         }
     }
 
-    fn execute_script(&self, sql: &str) {
+    async fn execute_script(&self, sql: &str) {
         self.franken
             .execute_batch(sql)
+            .await
             .expect("execute FrankenSQLite SQL script");
         self.sqlite
             .execute_batch(sql)
             .expect("execute rusqlite SQL script");
     }
 
-    fn franken_query_rows(&self, sql: &str) -> Vec<Vec<String>> {
+    async fn franken_query_rows(&self, sql: &str) -> Vec<Vec<String>> {
         self.franken
             .query(sql)
+            .await
             .unwrap_or_else(|error| panic!("query FrankenSQLite `{sql}`: {error}"))
             .iter()
             .map(|row| row.values().iter().map(format_franken_value).collect())
@@ -291,6 +296,10 @@ const AGGREGATE_EDGE_CASES: &[QueryCase] = &[
     QueryCase {
         name: "empty input aggregate identities",
         sql: "SELECT COUNT(*), COUNT(qty), SUM(qty), AVG(qty), MIN(qty), MAX(qty) FROM sales WHERE qty > 1000",
+    },
+    QueryCase {
+        name: "empty input keeps row-independent aggregate projections",
+        sql: "SELECT 'lit', 1 + 1, qty, COUNT(*) FROM sales WHERE qty > 1000",
     },
     QueryCase {
         name: "left join aggregate null skipping",
@@ -2934,507 +2943,795 @@ const REGEXP_ERROR_CASES: &[StatementCase] = &[
 
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
-    harness.assert_queries_match(
-        "SELECT/JOIN/GROUP BY/aggregate",
-        SELECT_JOIN_GROUP_AGGREGATE_CASES,
-    );
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SALES_SETUP).await;
+        harness
+            .assert_queries_match(
+                "SELECT/JOIN/GROUP BY/aggregate",
+                SELECT_JOIN_GROUP_AGGREGATE_CASES,
+            )
+            .await;
+    });
 }
 
 #[test]
 fn left_join_predicate_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
-    harness.assert_queries_match("LEFT JOIN predicate edge", LEFT_JOIN_PREDICATE_EDGE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SALES_SETUP).await;
+        harness
+            .assert_queries_match("LEFT JOIN predicate edge", LEFT_JOIN_PREDICATE_EDGE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn join_alias_and_self_join_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
-    harness.assert_queries_match("JOIN alias/self edge", JOIN_ALIAS_SELF_EDGE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SALES_SETUP).await;
+        harness
+            .assert_queries_match("JOIN alias/self edge", JOIN_ALIAS_SELF_EDGE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn join_using_and_natural_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(JOIN_USING_NATURAL_SETUP);
-    harness.assert_queries_match("JOIN USING/NATURAL edge", JOIN_USING_NATURAL_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(JOIN_USING_NATURAL_SETUP).await;
+        harness
+            .assert_queries_match("JOIN USING/NATURAL edge", JOIN_USING_NATURAL_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn aggregate_edge_cases_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
-    harness.assert_queries_match("aggregate edge", AGGREGATE_EDGE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SALES_SETUP).await;
+        harness
+            .assert_queries_match("aggregate edge", AGGREGATE_EDGE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn group_concat_separator_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(GROUP_CONCAT_SETUP);
-    harness.assert_queries_match("group_concat separator edge", GROUP_CONCAT_SEPARATOR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(GROUP_CONCAT_SETUP).await;
+        harness
+            .assert_queries_match("group_concat separator edge", GROUP_CONCAT_SEPARATOR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn having_and_aggregate_ordering_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
-    harness.assert_queries_match(
-        "HAVING/aggregate ordering edge",
-        HAVING_AGGREGATE_ORDER_CASES,
-    );
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SALES_SETUP).await;
+        harness
+            .assert_queries_match(
+                "HAVING/aggregate ordering edge",
+                HAVING_AGGREGATE_ORDER_CASES,
+            )
+            .await;
+    });
 }
 
 #[test]
 fn upsert_conflict_handling_matches_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(UPSERT_SETUP);
-    harness.execute_script(UPSERT_SCRIPT);
-    harness.assert_queries_match("UPSERT", UPSERT_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(UPSERT_SETUP).await;
+        harness.execute_script(UPSERT_SCRIPT).await;
+        harness.assert_queries_match("UPSERT", UPSERT_CASES).await;
+    });
 }
 
 #[test]
 fn with_upsert_returning_matches_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(WITH_UPSERT_RETURNING_SETUP);
-    harness.assert_queries_match("WITH/UPSERT/RETURNING", WITH_UPSERT_RETURNING_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(WITH_UPSERT_RETURNING_SETUP).await;
+        harness
+            .assert_queries_match("WITH/UPSERT/RETURNING", WITH_UPSERT_RETURNING_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn conflict_resolution_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CONFLICT_RESOLUTION_SETUP);
-    harness.execute_script(CONFLICT_RESOLUTION_SCRIPT);
-    harness.assert_queries_match("conflict resolution edge", CONFLICT_RESOLUTION_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CONFLICT_RESOLUTION_SETUP).await;
+        harness.execute_script(CONFLICT_RESOLUTION_SCRIPT).await;
+        harness
+            .assert_queries_match("conflict resolution edge", CONFLICT_RESOLUTION_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn cte_queries_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CTE_SETUP);
-    harness.assert_queries_match("CTE", CTE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CTE_SETUP).await;
+        harness.assert_queries_match("CTE", CTE_CASES).await;
+    });
 }
 
 #[test]
 fn values_clause_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP);
-    harness.assert_queries_match("VALUES clause edge", VALUES_CLAUSE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP).await;
+        harness
+            .assert_queries_match("VALUES clause edge", VALUES_CLAUSE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn window_functions_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(WINDOW_SETUP);
-    harness.assert_queries_match("window", WINDOW_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(WINDOW_SETUP).await;
+        harness.assert_queries_match("window", WINDOW_CASES).await;
+    });
 }
 
 #[test]
 fn cast_and_collation_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP);
-    harness.assert_queries_match("CAST/collation", CAST_COLLATION_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP).await;
+        harness
+            .assert_queries_match("CAST/collation", CAST_COLLATION_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn collation_expression_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP);
-    harness.assert_queries_match("collation expression", COLLATION_EXPRESSION_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP).await;
+        harness
+            .assert_queries_match("collation expression", COLLATION_EXPRESSION_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn dml_insert_update_delete_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(DML_SETUP);
-    harness.execute_script(DML_SCRIPT);
-    harness.assert_queries_match("DML", DML_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(DML_SETUP).await;
+        harness.execute_script(DML_SCRIPT).await;
+        harness.assert_queries_match("DML", DML_CASES).await;
+    });
 }
 
 #[test]
 fn change_tracking_function_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CHANGE_TRACKING_SETUP);
-    harness.assert_queries_match(
-        "change tracking initial state",
-        &[QueryCase {
-            name: "initial state",
-            sql: CHANGE_TRACKING_STATE_QUERY,
-        }],
-    );
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CHANGE_TRACKING_SETUP).await;
+        harness
+            .assert_queries_match(
+                "change tracking initial state",
+                &[QueryCase {
+                    name: "initial state",
+                    sql: CHANGE_TRACKING_STATE_QUERY,
+                }],
+            )
+            .await;
 
-    for (name, script) in [
-        (
-            "auto rowid insert",
-            "INSERT INTO change_tracking(label) VALUES ('alpha')",
-        ),
-        (
-            "explicit rowid insert",
-            "INSERT INTO change_tracking(id, label) VALUES (10, 'beta')",
-        ),
-        (
-            "multi row update",
-            "UPDATE change_tracking SET label = label || '-x' WHERE id IN (1, 10)",
-        ),
-        (
-            "no-op update",
-            "UPDATE change_tracking SET label = 'none' WHERE id = 99",
-        ),
-        ("matched delete", "DELETE FROM change_tracking WHERE id = 1"),
-        ("no-op delete", "DELETE FROM change_tracking WHERE id = 99"),
-    ] {
-        harness.execute_script(script);
-        harness.assert_queries_match(
-            "change tracking statement state",
-            &[QueryCase {
-                name,
-                sql: CHANGE_TRACKING_STATE_QUERY,
-            }],
+        for (name, script) in [
+            (
+                "auto rowid insert",
+                "INSERT INTO change_tracking(label) VALUES ('alpha')",
+            ),
+            (
+                "explicit rowid insert",
+                "INSERT INTO change_tracking(id, label) VALUES (10, 'beta')",
+            ),
+            (
+                "multi row update",
+                "UPDATE change_tracking SET label = label || '-x' WHERE id IN (1, 10)",
+            ),
+            (
+                "no-op update",
+                "UPDATE change_tracking SET label = 'none' WHERE id = 99",
+            ),
+            ("matched delete", "DELETE FROM change_tracking WHERE id = 1"),
+            ("no-op delete", "DELETE FROM change_tracking WHERE id = 99"),
+        ] {
+            harness.execute_script(script).await;
+            harness
+                .assert_queries_match(
+                    "change tracking statement state",
+                    &[QueryCase {
+                        name,
+                        sql: CHANGE_TRACKING_STATE_QUERY,
+                    }],
+                )
+                .await;
+        }
+
+        let duplicate_insert = "INSERT INTO change_tracking(id, label) VALUES (12, 'beta-x')";
+        let franken_error = harness
+            .franken
+            .execute_batch(duplicate_insert)
+            .await
+            .is_err();
+        let sqlite_error = harness.sqlite.execute_batch(duplicate_insert).is_err();
+        assert!(
+            sqlite_error,
+            "change tracking conformance expected rusqlite duplicate insert error"
         );
-    }
-
-    let duplicate_insert = "INSERT INTO change_tracking(id, label) VALUES (12, 'beta-x')";
-    let franken_error = harness.franken.execute_batch(duplicate_insert).is_err();
-    let sqlite_error = harness.sqlite.execute_batch(duplicate_insert).is_err();
-    assert!(
-        sqlite_error,
-        "change tracking conformance expected rusqlite duplicate insert error"
-    );
-    assert_eq!(
-        franken_error, sqlite_error,
-        "change tracking conformance failed after duplicate insert ({duplicate_insert})"
-    );
-    harness.assert_queries_match(
-        "change tracking failed statement state",
-        &[QueryCase {
-            name: "failed duplicate insert preserves counters",
-            sql: CHANGE_TRACKING_STATE_QUERY,
-        }],
-    );
+        assert_eq!(
+            franken_error, sqlite_error,
+            "change tracking conformance failed after duplicate insert ({duplicate_insert})"
+        );
+        harness
+            .assert_queries_match(
+                "change tracking failed statement state",
+                &[QueryCase {
+                    name: "failed duplicate insert preserves counters",
+                    sql: CHANGE_TRACKING_STATE_QUERY,
+                }],
+            )
+            .await;
+    });
 }
 
 #[test]
 fn dml_returning_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(DML_RETURNING_SETUP);
-    harness.assert_queries_match("DML RETURNING edge", DML_RETURNING_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(DML_RETURNING_SETUP).await;
+        harness
+            .assert_queries_match("DML RETURNING edge", DML_RETURNING_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn attached_update_delegation_matches_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(ATTACHED_UPDATE_SETUP);
-    harness.assert_queries_match("attached UPDATE", ATTACHED_UPDATE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(ATTACHED_UPDATE_SETUP).await;
+        harness
+            .assert_queries_match("attached UPDATE", ATTACHED_UPDATE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn attached_insert_select_delegation_matches_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(ATTACHED_INSERT_SELECT_SETUP);
-    harness.assert_queries_match("attached INSERT SELECT", ATTACHED_INSERT_SELECT_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(ATTACHED_INSERT_SELECT_SETUP).await;
+        harness
+            .assert_queries_match("attached INSERT SELECT", ATTACHED_INSERT_SELECT_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn attached_drop_delegation_matches_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(ATTACHED_DROP_SETUP);
-    harness.execute_script(ATTACHED_DROP_SCRIPT);
-    harness.assert_queries_match("attached DROP", ATTACHED_DROP_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(ATTACHED_DROP_SETUP).await;
+        harness.execute_script(ATTACHED_DROP_SCRIPT).await;
+        harness
+            .assert_queries_match("attached DROP", ATTACHED_DROP_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn attached_create_view_delegation_matches_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(ATTACHED_CREATE_VIEW_SETUP);
-    harness.assert_queries_match("attached CREATE VIEW", ATTACHED_CREATE_VIEW_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(ATTACHED_CREATE_VIEW_SETUP).await;
+        harness
+            .assert_queries_match("attached CREATE VIEW", ATTACHED_CREATE_VIEW_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn attached_vacuum_delegation_matches_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(ATTACHED_VACUUM_SETUP);
-    harness.assert_queries_match("attached VACUUM", ATTACHED_VACUUM_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(ATTACHED_VACUUM_SETUP).await;
+        harness
+            .assert_queries_match("attached VACUUM", ATTACHED_VACUUM_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn error_paths_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(ERROR_PATH_SETUP);
-    harness.assert_statement_errors_match("error path", ERROR_PATH_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(ERROR_PATH_SETUP).await;
+        harness
+            .assert_statement_errors_match("error path", ERROR_PATH_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn check_constraint_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CHECK_CONSTRAINT_SETUP);
-    harness.execute_script(CHECK_CONSTRAINT_SCRIPT);
-    harness.assert_queries_match("CHECK constraint edge", CHECK_CONSTRAINT_CASES);
-    harness.assert_statement_errors_match("CHECK constraint edge", CHECK_CONSTRAINT_ERROR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CHECK_CONSTRAINT_SETUP).await;
+        harness.execute_script(CHECK_CONSTRAINT_SCRIPT).await;
+        harness
+            .assert_queries_match("CHECK constraint edge", CHECK_CONSTRAINT_CASES)
+            .await;
+        harness
+            .assert_statement_errors_match("CHECK constraint edge", CHECK_CONSTRAINT_ERROR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn foreign_key_action_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(FOREIGN_KEY_ACTION_SETUP);
-    harness.execute_script(FOREIGN_KEY_ACTION_SCRIPT);
-    harness.assert_queries_match("FOREIGN KEY action edge", FOREIGN_KEY_ACTION_CASES);
-    harness
-        .assert_statement_errors_match("FOREIGN KEY action edge", FOREIGN_KEY_ACTION_ERROR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(FOREIGN_KEY_ACTION_SETUP).await;
+        harness.execute_script(FOREIGN_KEY_ACTION_SCRIPT).await;
+        harness
+            .assert_queries_match("FOREIGN KEY action edge", FOREIGN_KEY_ACTION_CASES)
+            .await;
+        harness
+            .assert_statement_errors_match(
+                "FOREIGN KEY action edge",
+                FOREIGN_KEY_ACTION_ERROR_CASES,
+            )
+            .await;
+    });
 }
 
 #[test]
 fn ddl_defaults_and_views_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(DDL_SETUP);
-    harness.assert_queries_match("DDL/default/view", DDL_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(DDL_SETUP).await;
+        harness
+            .assert_queries_match("DDL/default/view", DDL_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn create_table_as_select_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CTAS_SETUP);
-    harness.execute_script(CTAS_SCRIPT);
-    harness.assert_queries_match("CREATE TABLE AS SELECT edge", CTAS_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CTAS_SETUP).await;
+        harness.execute_script(CTAS_SCRIPT).await;
+        harness
+            .assert_queries_match("CREATE TABLE AS SELECT edge", CTAS_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn default_values_and_column_defaults_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(DEFAULT_VALUE_SETUP);
-    harness.execute_script(DEFAULT_VALUE_SCRIPT);
-    harness.assert_queries_match("DEFAULT VALUES/default column", DEFAULT_VALUE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(DEFAULT_VALUE_SETUP).await;
+        harness.execute_script(DEFAULT_VALUE_SCRIPT).await;
+        harness
+            .assert_queries_match("DEFAULT VALUES/default column", DEFAULT_VALUE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn rowid_and_quoted_identifier_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(ROWID_IDENTIFIER_SETUP);
-    harness.assert_queries_match("rowid/quoted identifier edge", ROWID_IDENTIFIER_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(ROWID_IDENTIFIER_SETUP).await;
+        harness
+            .assert_queries_match("rowid/quoted identifier edge", ROWID_IDENTIFIER_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn transactions_and_savepoints_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(TRANSACTION_SETUP);
-    harness.execute_script(TRANSACTION_SCRIPT);
-    harness.assert_queries_match("transaction/savepoint", TRANSACTION_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(TRANSACTION_SETUP).await;
+        harness.execute_script(TRANSACTION_SCRIPT).await;
+        harness
+            .assert_queries_match("transaction/savepoint", TRANSACTION_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn compound_selects_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(COMPOUND_SETUP);
-    harness.assert_queries_match("compound SELECT", COMPOUND_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(COMPOUND_SETUP).await;
+        harness
+            .assert_queries_match("compound SELECT", COMPOUND_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn compound_select_edge_cases_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(COMPOUND_SETUP);
-    harness.assert_queries_match("compound SELECT edge", COMPOUND_EDGE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(COMPOUND_SETUP).await;
+        harness
+            .assert_queries_match("compound SELECT edge", COMPOUND_EDGE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn case_and_null_logic_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("CASE/null logic", CASE_NULL_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("CASE/null logic", CASE_NULL_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn scalar_null_comparison_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("scalar NULL/comparison edge", SCALAR_NULL_COMPARISON_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("scalar NULL/comparison edge", SCALAR_NULL_COMPARISON_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn is_distinct_from_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("IS DISTINCT FROM edge", IS_DISTINCT_FROM_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("IS DISTINCT FROM edge", IS_DISTINCT_FROM_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn typeof_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(TYPEOF_SCALAR_SETUP);
-    harness.assert_queries_match("typeof scalar edge", TYPEOF_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(TYPEOF_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("typeof scalar edge", TYPEOF_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn conditional_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CONDITIONAL_SCALAR_SETUP);
-    harness.assert_queries_match("conditional scalar edge", CONDITIONAL_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CONDITIONAL_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("conditional scalar edge", CONDITIONAL_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn between_and_in_predicate_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(BETWEEN_IN_PREDICATE_SETUP);
-    harness.assert_queries_match("BETWEEN/IN predicate edge", BETWEEN_IN_PREDICATE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(BETWEEN_IN_PREDICATE_SETUP).await;
+        harness
+            .assert_queries_match("BETWEEN/IN predicate edge", BETWEEN_IN_PREDICATE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn boolean_logic_precedence_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match(
-        "boolean logic precedence edge",
-        BOOLEAN_LOGIC_PRECEDENCE_CASES,
-    );
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match(
+                "boolean logic precedence edge",
+                BOOLEAN_LOGIC_PRECEDENCE_CASES,
+            )
+            .await;
+    });
 }
 
 #[test]
 fn numeric_coercion_expression_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("numeric coercion edge", NUMERIC_COERCION_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("numeric coercion edge", NUMERIC_COERCION_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn group_by_expression_and_alias_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match(
-        "GROUP BY expression/alias edge",
-        GROUP_BY_EXPRESSION_ALIAS_CASES,
-    );
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match(
+                "GROUP BY expression/alias edge",
+                GROUP_BY_EXPRESSION_ALIAS_CASES,
+            )
+            .await;
+    });
 }
 
 #[test]
 fn order_by_expression_and_case_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("ORDER BY expression/CASE edge", ORDER_BY_EXPRESSION_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("ORDER BY expression/CASE edge", ORDER_BY_EXPRESSION_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn distinct_order_limit_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("DISTINCT/ORDER/LIMIT edge", DISTINCT_ORDER_LIMIT_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("DISTINCT/ORDER/LIMIT edge", DISTINCT_ORDER_LIMIT_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn limit_offset_expression_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("LIMIT/OFFSET expression edge", LIMIT_OFFSET_EDGE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("LIMIT/OFFSET expression edge", LIMIT_OFFSET_EDGE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn order_by_nulls_placement_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("ORDER BY NULLS placement edge", ORDER_BY_NULLS_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("ORDER BY NULLS placement edge", ORDER_BY_NULLS_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn subqueries_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP);
-    harness.assert_queries_match("subquery", SUBQUERY_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP).await;
+        harness
+            .assert_queries_match("subquery", SUBQUERY_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn scalar_subquery_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP);
-    harness.assert_queries_match("scalar subquery edge", SCALAR_SUBQUERY_EDGE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP).await;
+        harness
+            .assert_queries_match("scalar subquery edge", SCALAR_SUBQUERY_EDGE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn pragmas_and_schema_introspection_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(PRAGMA_SETUP);
-    harness.assert_queries_match("PRAGMA/schema introspection", PRAGMA_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(PRAGMA_SETUP).await;
+        harness
+            .assert_queries_match("PRAGMA/schema introspection", PRAGMA_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn triggers_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(TRIGGER_SETUP);
-    harness.execute_script(TRIGGER_SCRIPT);
-    harness.assert_queries_match("trigger", TRIGGER_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(TRIGGER_SETUP).await;
+        harness.execute_script(TRIGGER_SCRIPT).await;
+        harness.assert_queries_match("trigger", TRIGGER_CASES).await;
+    });
 }
 
 #[test]
 fn date_time_functions_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new("");
-    harness.assert_queries_match("date/time", DATE_TIME_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new("").await;
+        harness
+            .assert_queries_match("date/time", DATE_TIME_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn date_time_modifier_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new("");
-    harness.assert_queries_match("date/time modifier edge", DATE_TIME_EDGE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new("").await;
+        harness
+            .assert_queries_match("date/time modifier edge", DATE_TIME_EDGE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn json1_functions_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new("");
-    harness.assert_queries_match("JSON1", JSON1_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new("").await;
+        harness.assert_queries_match("JSON1", JSON1_CASES).await;
+    });
 }
 
 #[test]
 fn string_functions_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new("");
-    harness.assert_queries_match("string functions", STRING_FUNCTION_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new("").await;
+        harness
+            .assert_queries_match("string functions", STRING_FUNCTION_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn replace_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(REPLACE_SCALAR_SETUP);
-    harness.assert_queries_match("replace scalar edge", REPLACE_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(REPLACE_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("replace scalar edge", REPLACE_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn substr_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SUBSTR_SCALAR_SETUP);
-    harness.assert_queries_match("substr scalar edge", SUBSTR_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SUBSTR_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("substr scalar edge", SUBSTR_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn string_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
-    harness.assert_queries_match("string scalar edge", STRING_SCALAR_EDGE_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP).await;
+        harness
+            .assert_queries_match("string scalar edge", STRING_SCALAR_EDGE_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn trim_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(TRIM_SCALAR_SETUP);
-    harness.assert_queries_match("trim scalar edge", TRIM_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(TRIM_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("trim scalar edge", TRIM_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn length_instr_nul_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(LENGTH_INSTR_NUL_SETUP);
-    harness.assert_queries_match("length/instr NUL edge", LENGTH_INSTR_NUL_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(LENGTH_INSTR_NUL_SETUP).await;
+        harness
+            .assert_queries_match("length/instr NUL edge", LENGTH_INSTR_NUL_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn concat_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CONCAT_SCALAR_SETUP);
-    harness.assert_queries_match("concat scalar edge", CONCAT_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CONCAT_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("concat scalar edge", CONCAT_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn soundex_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SOUNDEX_SCALAR_SETUP);
-    harness.assert_queries_match("soundex scalar edge", SOUNDEX_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SOUNDEX_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("soundex scalar edge", SOUNDEX_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn char_unicode_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(CHAR_UNICODE_SETUP);
-    harness.assert_queries_match("char unicode scalar edge", CHAR_UNICODE_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(CHAR_UNICODE_SETUP).await;
+        harness
+            .assert_queries_match("char unicode scalar edge", CHAR_UNICODE_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn scalar_min_max_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SCALAR_MIN_MAX_SETUP);
-    harness.assert_queries_match("scalar min max edge", SCALAR_MIN_MAX_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SCALAR_MIN_MAX_SETUP).await;
+        harness
+            .assert_queries_match("scalar min max edge", SCALAR_MIN_MAX_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn misc_scalar_function_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(MISC_SCALAR_SETUP);
-    harness.assert_queries_match("misc scalar function edge", MISC_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(MISC_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("misc scalar function edge", MISC_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn format_quote_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(FORMAT_QUOTE_SETUP);
-    harness.assert_queries_match("format quote scalar edge", FORMAT_QUOTE_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(FORMAT_QUOTE_SETUP).await;
+        harness
+            .assert_queries_match("format quote scalar edge", FORMAT_QUOTE_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn unhex_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(UNHEX_SCALAR_SETUP);
-    harness.assert_queries_match("unhex scalar edge", UNHEX_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(UNHEX_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("unhex scalar edge", UNHEX_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn math_functions_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new("");
-    harness.assert_queries_match("math functions", MATH_FUNCTION_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new("").await;
+        harness
+            .assert_queries_match("math functions", MATH_FUNCTION_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn round_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(ROUND_SCALAR_SETUP);
-    harness.assert_queries_match("round scalar edge", ROUND_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(ROUND_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("round scalar edge", ROUND_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn sign_scalar_edges_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(SIGN_SCALAR_SETUP);
-    harness.assert_queries_match("sign scalar edge", SIGN_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SIGN_SCALAR_SETUP).await;
+        harness
+            .assert_queries_match("sign scalar edge", SIGN_SCALAR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn pattern_matching_functions_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(PATTERN_SETUP);
-    harness.assert_queries_match("LIKE/GLOB", PATTERN_CASES);
-    harness.assert_statement_errors_match("REGEXP", REGEXP_ERROR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(PATTERN_SETUP).await;
+        harness
+            .assert_queries_match("LIKE/GLOB", PATTERN_CASES)
+            .await;
+        harness
+            .assert_statement_errors_match("REGEXP", REGEXP_ERROR_CASES)
+            .await;
+    });
 }
 
 #[test]
 fn pattern_scalar_functions_match_rusqlite() {
-    let harness = CoreSqlConformanceHarness::new(PATTERN_SETUP);
-    harness.assert_queries_match("LIKE/GLOB scalar function", PATTERN_SCALAR_CASES);
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(PATTERN_SETUP).await;
+        harness
+            .assert_queries_match("LIKE/GLOB scalar function", PATTERN_SCALAR_CASES)
+            .await;
+    });
 }

@@ -1,0 +1,752 @@
+  [2m2026-07-28T04:13:49.486732Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at root@178.104.77.29 (4 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:1918 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:13:49.917488Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankensqlite (hash: 8241eb3b713a27bb)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:278 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:13:49.917591Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 28 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:300 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:33.285022Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:364 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:33.285168Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 5 pattern(s) from .rchignore (total: 49)[0m
+    [2;3mat[0m rch/src/transfer.rs:1160 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:33.285179Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite -> /data/projects/frankensqlite on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:36.830125Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 3544ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:36.830319Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite -> /data/projects/frankensqlite/crates/fsqlite on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:38.948337Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2117ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:38.948556Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ast -> /data/projects/frankensqlite/crates/fsqlite-ast on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:40.986448Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2037ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:40.986614Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-btree -> /data/projects/frankensqlite/crates/fsqlite-btree on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:43.022625Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2035ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:43.022793Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-c-api -> /data/projects/frankensqlite/crates/fsqlite-c-api on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:45.147298Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2124ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:45.147467Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-cli -> /data/projects/frankensqlite/crates/fsqlite-cli on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:47.221021Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2073ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:47.221191Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-core -> /data/projects/frankensqlite/crates/fsqlite-core on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:49.345490Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2124ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:49.345660Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-e2e -> /data/projects/frankensqlite/crates/fsqlite-e2e on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:51.465190Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2119ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:51.465370Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-error -> /data/projects/frankensqlite/crates/fsqlite-error on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:54.060915Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2595ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:54.061077Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts3 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts3 on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:56.144552Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2083ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:56.144723Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts5 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts5 on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:58.246298Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2101ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:14:58.246496Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-icu -> /data/projects/frankensqlite/crates/fsqlite-ext-icu on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:00.326153Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2079ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:00.326318Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-json -> /data/projects/frankensqlite/crates/fsqlite-ext-json on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:02.387845Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2061ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:02.388016Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-misc -> /data/projects/frankensqlite/crates/fsqlite-ext-misc on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:04.493464Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2105ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:04.493628Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-rtree -> /data/projects/frankensqlite/crates/fsqlite-ext-rtree on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:06.537101Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2043ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:06.537302Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-session -> /data/projects/frankensqlite/crates/fsqlite-ext-session on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:08.568451Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2031ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:08.568612Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-func -> /data/projects/frankensqlite/crates/fsqlite-func on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:10.640533Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2071ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:10.640678Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-harness -> /data/projects/frankensqlite/crates/fsqlite-harness on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:12.727879Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2087ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:12.728040Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-mvcc -> /data/projects/frankensqlite/crates/fsqlite-mvcc on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:14.813666Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2085ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:14.813815Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-observability -> /data/projects/frankensqlite/crates/fsqlite-observability on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:16.896430Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2082ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:16.896598Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-pager -> /data/projects/frankensqlite/crates/fsqlite-pager on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:18.973234Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2076ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:18.973419Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-parser -> /data/projects/frankensqlite/crates/fsqlite-parser on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:21.059643Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2086ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:21.059818Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-planner -> /data/projects/frankensqlite/crates/fsqlite-planner on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:23.174963Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2115ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:23.175121Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-types -> /data/projects/frankensqlite/crates/fsqlite-types on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:25.231763Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2056ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:25.231929Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vdbe -> /data/projects/frankensqlite/crates/fsqlite-vdbe on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:27.276017Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2044ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:27.276150Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vfs -> /data/projects/frankensqlite/crates/fsqlite-vfs on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:29.382126Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2105ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:29.382314Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wal -> /data/projects/frankensqlite/crates/fsqlite-wal on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:31.514974Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2132ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:31.515186Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wasm -> /data/projects/frankensqlite/crates/fsqlite-wasm on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1983 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:33.596603Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2081ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2047 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:33.596667Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 8333 files, 329387 bytes in 60291ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:564 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:55.024645Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick --filter subquery[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:607 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:15:55.024714Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/cargo-target -> /data/projects/frankensqlite/.rch-target-hz2-pool-acb5c41f52e8f4ec20e1ed3b0eb0a959[0m
+    [2;3mat[0m rch/src/transfer.rs:1028 [2;3mon[0m ThreadId(1)
+
+warning: crates/fsqlite/Cargo.toml: file `/data/projects/frankensqlite/crates/fsqlite/tests/minmax_prefix_profile.rs` found to be present in multiple build targets:
+  * `integration-test` target `minmax_prefix_profile`
+  * `bench` target `minmax_prefix_contract_bench`
+warning: `fsqlite` (manifest) generated 1 warning
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded advisory-lock v0.3.0
+  Downloaded scopeguard v1.2.0
+  Downloaded serde_spanned v1.1.1
+  Downloaded rustversion v1.0.22
+  Downloaded sha1 v0.11.0
+  Downloaded signature v2.2.0
+  Downloaded block-buffer v0.10.4
+  Downloaded block-buffer v0.12.0
+  Downloaded cfg_aliases v0.2.1
+  Downloaded semver v1.0.28
+  Downloaded sha2 v0.10.9
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded simdutf8 v0.1.5
+  Downloaded slab v0.4.12
+  Downloaded spki v0.7.3
+  Downloaded subtle v2.6.1
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded tracing-serde v0.2.0
+  Downloaded universal-hash v0.5.1
+  Downloaded universal-hash v0.6.1
+  Downloaded unty-next v0.1.2
+  Downloaded version_check v0.9.5
+  Downloaded visibility v0.1.1
+  Downloaded xattr v1.6.1
+  Downloaded zeroize_derive v1.4.3
+  Downloaded aead v0.5.2
+  Downloaded arrayref v0.3.9
+  Downloaded autocfg v1.5.0
+  Downloaded cfg-if v1.0.4
+  Downloaded cipher v0.4.4
+  Downloaded cipher v0.5.2
+  Downloaded cmov v0.5.3
+  Downloaded constant_time_eq v0.4.2
+  Downloaded cpufeatures v0.2.17
+  Downloaded cpufeatures v0.3.0
+  Downloaded crossbeam-queue v0.3.12
+  Downloaded dashmap v6.2.1
+  Downloaded data-encoding v2.10.0
+  Downloaded digest v0.11.2
+  Downloaded serde_derive v1.0.228
+  Downloaded shlex v1.3.0
+  Downloaded signal-hook v0.4.4
+  Downloaded smallvec v1.15.2
+  Downloaded thiserror v2.0.18
+  Downloaded thiserror-impl v2.0.18
+  Downloaded thread_local v1.1.9
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded toml_parser v1.1.2+spec-1.1.0
+  Downloaded toml_writer v1.1.1+spec-1.1.0
+  Downloaded tracing-log v0.2.0
+  Downloaded xxhash-rust v0.8.15
+  Downloaded zeroize v1.8.2
+  Downloaded zmij v1.0.21
+  Downloaded aead v0.6.1
+  Downloaded argon2 v0.5.3
+  Downloaded arrayvec v0.7.6
+  Downloaded base64ct v1.8.3
+  Downloaded bincode_derive-next v3.1.1
+  Downloaded chacha20 v0.9.1
+  Downloaded crc32c v0.6.8
+  Downloaded sha2 v0.11.0
+  Downloaded tracing-attributes v0.1.31
+  Downloaded serde_core v1.0.228
+  Downloaded socket2 v0.6.3
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded const-oid v0.9.6
+  Downloaded der v0.7.10
+  Downloaded digest v0.10.7
+  Downloaded hashlink v0.12.0
+  Downloaded virtue-next v0.1.3
+  Downloaded anyhow v1.0.103
+  Downloaded tempfile v3.27.0
+  Downloaded blake2 v0.10.6
+  Downloaded tinyvec v1.12.0
+  Downloaded toml v1.1.2+spec-1.1.0
+  Downloaded chacha20 v0.10.0
+  Downloaded crc32fast v1.5.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded serde v1.0.228
+  Downloaded ghash v0.5.1
+  Downloaded hex v0.4.3
+  Downloaded lazy_static v1.5.0
+  Downloaded unicode-ident v1.0.24
+  Downloaded bitflags v2.13.0
+  Downloaded ucd-trie v0.1.7
+  Downloaded sharded-slab v0.1.7
+  Downloaded tracing-core v0.1.36
+  Downloaded allocator-api2 v0.2.21
+  Downloaded equivalent v1.0.2
+  Downloaded hashbrown v0.17.1
+  Downloaded inout v0.1.4
+  Downloaded inout v0.2.2
+  Downloaded itoa v1.0.18
+  Downloaded matchers v0.2.0
+  Downloaded memoffset v0.9.1
+  Downloaded chacha20poly1305 v0.10.1
+  Downloaded const-oid v0.10.2
+  Downloaded fallible-streaming-iterator v0.1.9
+  Downloaded opaque-debug v0.3.1
+  Downloaded rustc_version v0.4.1
+  Downloaded base64 v0.22.1
+  Downloaded bytes v1.11.1
+  Downloaded cc v1.2.60
+  Downloaded chacha20poly1305 v0.11.0
+  Downloaded crossbeam-epoch v0.9.20
+  Downloaded errno v0.3.14
+  Downloaded franken-kernel v0.3.9
+  Downloaded futures-io v0.3.32
+  Downloaded generic-array v0.14.7
+  Downloaded typenum v1.20.0
+  Downloaded bumpalo v3.20.3
+  Downloaded fastrand v2.4.1
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded futures-core v0.3.32
+  Downloaded parking v2.2.1
+  Downloaded signatory v0.27.1
+  Downloaded crypto-common v0.1.7
+  Downloaded curve25519-dalek-derive v0.1.1
+  Downloaded unicode-normalization v0.1.25
+  Downloaded rand_chacha v0.3.1
+  Downloaded serde_json v1.0.150
+  Downloaded aes v0.8.4
+  Downloaded franken-decision v0.3.9
+  Downloaded nkeys v0.4.5
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded polyval v0.6.2
+  Downloaded quote v1.0.45
+  Downloaded aes-gcm v0.10.3
+  Downloaded crypto-common v0.2.2
+  Downloaded either v1.15.0
+  Downloaded ed25519 v2.2.3
+  Downloaded lru v0.18.0
+  Downloaded pastey v0.2.3
+  Downloaded pem-rfc7468 v0.7.0
+  Downloaded pin-project-lite v0.2.17
+  Downloaded pkg-config v0.3.33
+  Downloaded poly1305 v0.8.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded prost-derive v0.14.3
+  Downloaded ctr v0.9.2
+  Downloaded ctutils v0.4.2
+  Downloaded foldhash v0.2.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded password-hash v0.5.0
+  Downloaded pin-project-internal v1.1.11
+  Downloaded pkcs8 v0.10.2
+  Downloaded rand_core v0.6.4
+  Downloaded winnow v1.0.2
+  Downloaded getrandom v0.2.17
+  Downloaded hmac v0.13.0
+  Downloaded hybrid-array v0.4.10
+  Downloaded once_cell v1.21.4
+  Downloaded parking_lot v0.12.5
+  Downloaded parking_lot_core v0.9.12
+  Downloaded poly1305 v0.9.1
+  Downloaded rmp-serde v1.3.1
+  Downloaded blake3 v1.8.5
+  Downloaded fallible-iterator v0.3.0
+  Downloaded tracing-subscriber v0.3.23
+  Downloaded iana-time-zone v0.1.65
+  Downloaded lock_api v0.4.14
+  Downloaded num-traits v0.2.19
+  Downloaded polling v3.11.0
+  Downloaded prost v0.14.3
+  Downloaded rand_core v0.10.1
+  Downloaded rmp v0.8.15
+  Downloaded sysinfo v0.39.5
+  Downloaded vcpkg v0.2.15
+  Downloaded bincode-next v3.1.1
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded franken-evidence v0.3.9
+  Downloaded futures-lite v2.6.1
+  Downloaded pin-project v1.1.11
+  Downloaded proc-macro2 v1.0.106
+  Downloaded rapidhash v4.4.1
+  Downloaded chrono v0.4.44
+  Downloaded getrandom v0.4.3
+  Downloaded json5 v1.3.1
+  Downloaded log v0.4.29
+  Downloaded rand v0.8.6
+  Downloaded ed25519-dalek v2.2.0
+  Downloaded rand v0.10.1
+  Downloaded indexmap v2.14.0
+  Downloaded io-uring v0.7.12
+  Downloaded memchr v2.8.2
+  Downloaded syn v2.0.117
+  Downloaded zerocopy v0.8.48
+  Downloaded hashbrown v0.14.5
+  Downloaded itertools v0.13.0
+  Downloaded rusqlite v0.40.1
+  Downloaded hkdf v0.13.0
+  Downloaded rustix v1.1.4
+  Downloaded tracing v0.1.44
+  Downloaded curve25519-dalek v4.1.3
+  Downloaded nix v0.31.3
+  Downloaded regex-syntax v0.8.10
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.186
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded libsqlite3-sys v0.38.1
+  Downloaded asupersync v0.3.9
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling typenum v1.20.0
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling serde_core v1.0.228
+   Compiling version_check v0.9.5
+   Compiling subtle v2.6.1
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.10.1
+   Compiling cpufeatures v0.2.17
+   Compiling serde v1.0.228
+   Compiling autocfg v1.5.0
+   Compiling allocator-api2 v0.2.21
+   Compiling equivalent v1.0.2
+   Compiling semver v1.0.28
+   Compiling foldhash v0.2.0
+   Compiling cmov v0.5.3
+   Compiling base64ct v1.8.3
+   Compiling find-msvc-tools v0.1.9
+   Compiling once_cell v1.21.4
+   Compiling shlex v1.3.0
+   Compiling generic-array v0.14.7
+   Compiling cpufeatures v0.3.0
+   Compiling zerocopy v0.8.48
+   Compiling crossbeam-utils v0.8.21
+   Compiling rustc_version v0.4.1
+   Compiling ctutils v0.4.2
+   Compiling zmij v1.0.21
+   Compiling cc v1.2.60
+   Compiling pem-rfc7468 v0.7.0
+   Compiling num-traits v0.2.19
+   Compiling const-oid v0.9.6
+   Compiling const-oid v0.10.2
+   Compiling memchr v2.8.2
+   Compiling opaque-debug v0.3.1
+   Compiling rustix v1.1.4
+   Compiling serde_json v1.0.150
+   Compiling smallvec v1.15.2
+   Compiling curve25519-dalek v4.1.3
+   Compiling parking_lot_core v0.9.12
+   Compiling anyhow v1.0.103
+   Compiling rustversion v1.0.22
+   Compiling linux-raw-sys v0.12.1
+   Compiling itoa v1.0.18
+   Compiling hybrid-array v0.4.10
+   Compiling syn v2.0.117
+   Compiling memoffset v0.9.1
+   Compiling tracing-core v0.1.36
+   Compiling pin-project-lite v0.2.17
+   Compiling either v1.15.0
+   Compiling log v0.4.29
+   Compiling crossbeam-epoch v0.9.20
+   Compiling scopeguard v1.2.0
+   Compiling cfg_aliases v0.2.1
+   Compiling thiserror v2.0.18
+   Compiling nix v0.31.3
+   Compiling lock_api v0.4.14
+   Compiling itertools v0.13.0
+   Compiling block-buffer v0.10.4
+   Compiling block-buffer v0.12.0
+   Compiling inout v0.1.4
+   Compiling fastrand v2.4.1
+   Compiling signal-hook v0.4.4
+   Compiling bincode-next v3.1.1
+   Compiling tinyvec_macros v0.1.1
+   Compiling crc32fast v1.5.0
+   Compiling virtue-next v0.1.3
+   Compiling tinyvec v1.12.0
+   Compiling rmp v0.8.15
+   Compiling futures-io v0.3.32
+   Compiling blake3 v1.8.5
+   Compiling bytes v1.11.1
+   Compiling data-encoding v2.10.0
+   Compiling unty-next v0.1.2
+   Compiling futures-core v0.3.32
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling rapidhash v4.4.1
+   Compiling parking v2.2.1
+   Compiling pastey v0.2.3
+   Compiling rand_core v0.6.4
+   Compiling crypto-common v0.2.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling futures-lite v2.6.1
+   Compiling crossbeam-deque v0.8.6
+   Compiling parking_lot v0.12.5
+   Compiling bincode_derive-next v3.1.1
+   Compiling crypto-common v0.1.7
+   Compiling unicode-normalization v0.1.25
+   Compiling digest v0.10.7
+   Compiling universal-hash v0.5.1
+   Compiling aead v0.5.2
+   Compiling socket2 v0.6.3
+   Compiling hashbrown v0.17.1
+   Compiling bitflags v2.13.0
+   Compiling signature v2.2.0
+   Compiling polyval v0.6.2
+   Compiling sha2 v0.10.9
+   Compiling poly1305 v0.8.0
+   Compiling ed25519 v2.2.3
+   Compiling sysinfo v0.39.5
+   Compiling digest v0.11.2
+   Compiling ghash v0.5.1
+   Compiling hmac v0.13.0
+   Compiling sha2 v0.11.0
+   Compiling sha1 v0.11.0
+   Compiling crossbeam-queue v0.3.12
+   Compiling hex v0.4.3
+   Compiling arrayref v0.3.9
+   Compiling hkdf v0.13.0
+   Compiling constant_time_eq v0.4.2
+   Compiling base64 v0.22.1
+   Compiling slab v0.4.12
+   Compiling arrayvec v0.7.6
+   Compiling simdutf8 v0.1.5
+   Compiling indexmap v2.14.0
+   Compiling xxhash-rust v0.8.15
+   Compiling inout v0.2.2
+   Compiling iana-time-zone v0.1.65
+   Compiling io-uring v0.7.12
+   Compiling crc32c v0.6.8
+   Compiling universal-hash v0.6.1
+   Compiling cipher v0.5.2
+   Compiling chrono v0.4.44
+   Compiling advisory-lock v0.3.0
+   Compiling poly1305 v0.9.1
+   Compiling aead v0.6.1
+   Compiling blake2 v0.10.6
+   Compiling password-hash v0.5.0
+   Compiling chacha20 v0.10.0
+   Compiling hashbrown v0.14.5
+   Compiling bumpalo v3.20.3
+   Compiling ppv-lite86 v0.2.21
+   Compiling argon2 v0.5.3
+   Compiling rand v0.10.1
+   Compiling chacha20poly1305 v0.11.0
+   Compiling lazy_static v1.5.0
+   Compiling ucd-trie v0.1.7
+   Compiling pkg-config v0.3.33
+   Compiling vcpkg v0.2.15
+   Compiling lru v0.18.0
+   Compiling dashmap v6.2.1
+   Compiling rand_chacha v0.3.1
+   Compiling winnow v1.0.2
+   Compiling regex-syntax v0.8.10
+   Compiling hashlink v0.12.0
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling serde_spanned v1.1.1
+   Compiling rand v0.8.6
+   Compiling toml_writer v1.1.1+spec-1.1.0
+   Compiling libsqlite3-sys v0.38.1
+   Compiling toml_parser v1.1.2+spec-1.1.0
+   Compiling fallible-iterator v0.3.0
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling nu-ansi-term v0.50.3
+   Compiling fsqlite-e2e v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-e2e)
+   Compiling toml v1.1.2+spec-1.1.0
+   Compiling zeroize_derive v1.4.3
+   Compiling serde_derive v1.0.228
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling thiserror-impl v2.0.18
+   Compiling pin-project-internal v1.1.11
+   Compiling tracing-attributes v0.1.31
+   Compiling prost-derive v0.14.3
+   Compiling zeroize v1.8.2
+   Compiling polling v3.11.0
+   Compiling xattr v1.6.1
+   Compiling tempfile v3.27.0
+   Compiling cipher v0.4.4
+   Compiling der v0.7.10
+   Compiling aes v0.8.4
+   Compiling chacha20 v0.9.1
+   Compiling ctr v0.9.2
+   Compiling pin-project v1.1.11
+   Compiling regex-automata v0.4.14
+   Compiling chacha20poly1305 v0.10.1
+   Compiling fsqlite-error v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-error)
+   Compiling aes-gcm v0.10.3
+   Compiling ed25519-dalek v2.2.0
+   Compiling tracing v0.1.44
+   Compiling prost v0.14.3
+   Compiling spki v0.7.3
+   Compiling pkcs8 v0.10.2
+   Compiling signatory v0.27.1
+   Compiling nkeys v0.4.5
+   Compiling franken-evidence v0.3.9
+   Compiling franken-kernel v0.3.9
+   Compiling rmp-serde v1.3.1
+   Compiling json5 v1.3.1
+   Compiling tracing-serde v0.2.0
+   Compiling franken-decision v0.3.9
+   Compiling matchers v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling asupersync v0.3.9
+   Compiling rusqlite v0.40.1
+   Compiling fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types)
+   Compiling fsqlite-func v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-func)
+   Compiling fsqlite-observability v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-observability)
+   Compiling fsqlite-ast v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ast)
+   Compiling fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs)
+   Compiling fsqlite-parser v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-parser)
+   Compiling fsqlite-ext-fts5 v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-fts5)
+   Compiling fsqlite-ext-icu v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-icu)
+   Compiling fsqlite-ext-rtree v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-rtree)
+   Compiling fsqlite-ext-misc v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-misc)
+   Compiling fsqlite-ext-json v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-json)
+   Compiling fsqlite-planner v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-planner)
+   Compiling fsqlite-wal v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-wal)
+   Compiling fsqlite-pager v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-pager)
+   Compiling fsqlite-btree v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-btree)
+   Compiling fsqlite-mvcc v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-mvcc)
+   Compiling fsqlite-vdbe v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vdbe)
+   Compiling fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core)
+   Compiling fsqlite v0.1.19 (/data/projects/frankensqlite/crates/fsqlite)
+   Compiling fsqlite-harness v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-harness)
+    Finished `release-perf` profile [optimized] target(s) in 8m 23s
+warning: the following packages contain code that will be rejected by a future version of Rust: nix v0.31.3
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `.rch-target-hz2-pool-acb5c41f52e8f4ec20e1ed3b0eb0a959/release-perf/comprehensive-bench --quick --filter subquery`
+
+================================================================================
+  Comprehensive FrankenSQLite vs C SQLite Benchmark
+  !!! NON-CITABLE DIAGNOSTIC — NUMBERS ARE NOT RELEASE EVIDENCE !!!
+  provenance: build Git SHA is absent or malformed
+  provenance: benchmark binary was built from a dirty or unknown tree
+  provenance: build script could not watch every tracked workspace input
+  provenance: build profile label missing; set FSQLITE_BENCH_PROFILE_NAME while building
+  provenance: declared profile `unspecified` does not match Cargo output profile `release-perf`
+  provenance: build environment does not exactly force the canonical `release-perf` profile: expected {"CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER": "", "CARGO_BUILD_RUSTC_WRAPPER": "", "CARGO_BUILD_RUSTFLAGS": "", "CARGO_PROFILE_RELEASE_PERF_CODEGEN_UNITS": "1", "CARGO_PROFILE_RELEASE_PERF_DEBUG": "false", "CARGO_PROFILE_RELEASE_PERF_DEBUG_ASSERTIONS": "false", "CARGO_PROFILE_RELEASE_PERF_INCREMENTAL": "false", "CARGO_PROFILE_RELEASE_PERF_LTO": "true", "CARGO_PROFILE_RELEASE_PERF_OPT_LEVEL": "3", "CARGO_PROFILE_RELEASE_PERF_OVERFLOW_CHECKS": "false", "CARGO_PROFILE_RELEASE_PERF_PANIC": "abort", "CARGO_PROFILE_RELEASE_PERF_RPATH": "false", "CARGO_PROFILE_RELEASE_PERF_SPLIT_DEBUGINFO": "off", "CARGO_PROFILE_RELEASE_PERF_STRIP": "true", "RUSTC_WORKSPACE_WRAPPER": "", "RUSTC_WRAPPER": ""}, observed {}
+  provenance: citable builds require a 64-character lowercase hexadecimal build nonce, got `unknown`
+  provenance: citable builds require an absolute, nonempty, SHA-bound cargo -vv log whose explicit-target rustc invocations prove the nonce plus the required opt-level, codegen-units, debug-assertions, overflow-checks, LTO partition, and final panic/strip settings for the required Rust hot-path crate set and final benchmark binary; compiler identity and all other rustc flags remain outside this receipt's proof scope; observed (None, None, None, false)
+  provenance: generic comprehensive measurements are diagnostic-only: engines run in unpaired C-first/FrankenSQLite-second adaptive blocks, scored rows lack complete work oracles, and host/topology state is not release-gated
+  provenance: generic C-reference measurements do not receipt-bind sqlite_source_id(), compile_options, the SQLite amalgamation/library hash, or the resolved native C compiler path/version/hash
+  provenance: verification checkout SHA does not match the binary build SHA
+  provenance: verification checkout is dirty or unavailable
+================================================================================
+  OS: Ubuntu 26.04 LTS
+  Arch: x86_64
+  Kernel: 7.0.0-15-generic
+  CPU: AMD EPYC-Genoa Processor (16 cores)
+  RAM: 30.6 GB
+  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
+  Rust: rustc 1.99.0-nightly (09ee43b2d 2026-07-27)
+  Cargo: cargo 1.99.0-nightly (3efb1f477 2026-07-17)
+  Git: detached-or-unknown @ unknown
+  Binary modified: 2026-07-28 04:24:19 UTC
+  Build profile: unspecified
+  Mode: quick
+  Row counts: [100, 1000, 10000]
+  Measurement: 2 warmup, 3-10 iters, target 5s
+  Filter: subquery
+================================================================================
+
+
+[1/10] Subquery & CTE performance
+  Setting up subquery tables (100 rows)... done.
+    Scalar subquery in SELECT...     [cs_scalar_sub_100] warmup 1/2...    [cs_scalar_sub_100] warmup 2/2...    [cs_scalar_sub_100] iter 1/10 (total: 0.0s)        [cs_scalar_sub_100] iter 2/10 (total: 0.0s)        [cs_scalar_sub_100] iter 3/10 (total: 0.0s)        [cs_scalar_sub_100] iter 4/10 (total: 0.0s)        [cs_scalar_sub_100] iter 5/10 (total: 0.0s)        [cs_scalar_sub_100] iter 6/10 (total: 0.0s)        [cs_scalar_sub_100] iter 7/10 (total: 0.0s)        [cs_scalar_sub_100] iter 8/10 (total: 0.0s)        [cs_scalar_sub_100] iter 9/10 (total: 0.0s)        [cs_scalar_sub_100] iter 10/10 (total: 0.0s)                                                                                        [fs_scalar_sub_100] warmup 1/2...    [fs_scalar_sub_100] warmup 2/2...    [fs_scalar_sub_100] iter 1/10 (total: 0.0s)        [fs_scalar_sub_100] iter 2/10 (total: 0.0s)        [fs_scalar_sub_100] iter 3/10 (total: 0.0s)        [fs_scalar_sub_100] iter 4/10 (total: 0.0s)        [fs_scalar_sub_100] iter 5/10 (total: 0.0s)        [fs_scalar_sub_100] iter 6/10 (total: 0.0s)        [fs_scalar_sub_100] iter 7/10 (total: 0.0s)        [fs_scalar_sub_100] iter 8/10 (total: 0.0s)        [fs_scalar_sub_100] iter 9/10 (total: 0.0s)        [fs_scalar_sub_100] iter 10/10 (total: 0.0s)                                                                                    C=76.0 us F=11.0 us
+    EXISTS subquery (parameter-varying)...     [cs_exists_100] warmup 1/2...    [cs_exists_100] warmup 2/2...    [cs_exists_100] iter 1/10 (total: 0.0s)        [cs_exists_100] iter 2/10 (total: 0.0s)        [cs_exists_100] iter 3/10 (total: 0.0s)        [cs_exists_100] iter 4/10 (total: 0.0s)        [cs_exists_100] iter 5/10 (total: 0.0s)        [cs_exists_100] iter 6/10 (total: 0.0s)        [cs_exists_100] iter 7/10 (total: 0.0s)        [cs_exists_100] iter 8/10 (total: 0.0s)        [cs_exists_100] iter 9/10 (total: 0.0s)        [cs_exists_100] iter 10/10 (total: 0.0s)                                                                                        [fs_exists_100] warmup 1/2...    [fs_exists_100] warmup 2/2...    [fs_exists_100] iter 1/10 (total: 0.0s)        [fs_exists_100] iter 2/10 (total: 0.0s)        [fs_exists_100] iter 3/10 (total: 0.0s)        [fs_exists_100] iter 4/10 (total: 0.0s)        [fs_exists_100] iter 5/10 (total: 0.0s)        [fs_exists_100] iter 6/10 (total: 0.0s)        [fs_exists_100] iter 7/10 (total: 0.0s)        [fs_exists_100] iter 8/10 (total: 0.0s)        [fs_exists_100] iter 9/10 (total: 0.0s)        [fs_exists_100] iter 10/10 (total: 0.0s)                                                                                    C=4.7 us F=60.7 us
+    IN subquery (parameter-varying)...     [cs_in_sub_100] warmup 1/2...    [cs_in_sub_100] warmup 2/2...    [cs_in_sub_100] iter 1/10 (total: 0.0s)        [cs_in_sub_100] iter 2/10 (total: 0.0s)        [cs_in_sub_100] iter 3/10 (total: 0.0s)        [cs_in_sub_100] iter 4/10 (total: 0.0s)        [cs_in_sub_100] iter 5/10 (total: 0.0s)        [cs_in_sub_100] iter 6/10 (total: 0.0s)        [cs_in_sub_100] iter 7/10 (total: 0.0s)        [cs_in_sub_100] iter 8/10 (total: 0.0s)        [cs_in_sub_100] iter 9/10 (total: 0.0s)        [cs_in_sub_100] iter 10/10 (total: 0.0s)                                                                                        [fs_in_sub_100] warmup 1/2...    [fs_in_sub_100] warmup 2/2...    [fs_in_sub_100] iter 1/10 (total: 0.0s)        [fs_in_sub_100] iter 2/10 (total: 0.0s)        [fs_in_sub_100] iter 3/10 (total: 0.0s)        [fs_in_sub_100] iter 4/10 (total: 0.0s)        [fs_in_sub_100] iter 5/10 (total: 0.0s)        [fs_in_sub_100] iter 6/10 (total: 0.0s)        [fs_in_sub_100] iter 7/10 (total: 0.0s)        [fs_in_sub_100] iter 8/10 (total: 0.0s)        [fs_in_sub_100] iter 9/10 (total: 0.0s)        [fs_in_sub_100] iter 10/10 (total: 0.0s)                                                                                    C=4.2 us F=58.3 us
+    CTE (non-recursive)...     [cs_cte_100] warmup 1/2...    [cs_cte_100] warmup 2/2...    [cs_cte_100] iter 1/10 (total: 0.0s)        [cs_cte_100] iter 2/10 (total: 0.0s)        [cs_cte_100] iter 3/10 (total: 0.0s)        [cs_cte_100] iter 4/10 (total: 0.0s)        [cs_cte_100] iter 5/10 (total: 0.0s)        [cs_cte_100] iter 6/10 (total: 0.0s)        [cs_cte_100] iter 7/10 (total: 0.0s)        [cs_cte_100] iter 8/10 (total: 0.0s)        [cs_cte_100] iter 9/10 (total: 0.0s)        [cs_cte_100] iter 10/10 (total: 0.0s)                                                                                        [fs_cte_100] warmup 1/2...    [fs_cte_100] warmup 2/2...    [fs_cte_100] iter 1/10 (total: 0.0s)        [fs_cte_100] iter 2/10 (total: 0.0s)        [fs_cte_100] iter 3/10 (total: 0.0s)        [fs_cte_100] iter 4/10 (total: 0.0s)        [fs_cte_100] iter 5/10 (total: 0.0s)        [fs_cte_100] iter 6/10 (total: 0.0s)        [fs_cte_100] iter 7/10 (total: 0.0s)        [fs_cte_100] iter 8/10 (total: 0.0s)        [fs_cte_100] iter 9/10 (total: 0.0s)        [fs_cte_100] iter 10/10 (total: 0.0s)                                                                                    C=90.7 us F=10.1 us
+  Setting up subquery tables (1000 rows)... done.
+    Scalar subquery in SELECT...     [cs_scalar_sub_1000] warmup 1/2...    [cs_scalar_sub_1000] warmup 2/2...    [cs_scalar_sub_1000] iter 1/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 2/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 3/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 4/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 5/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 6/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 7/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 8/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 9/10 (total: 0.0s)        [cs_scalar_sub_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_scalar_sub_1000] warmup 1/2...    [fs_scalar_sub_1000] warmup 2/2...    [fs_scalar_sub_1000] iter 1/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 2/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 3/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 4/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 5/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 6/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 7/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 8/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 9/10 (total: 0.0s)        [fs_scalar_sub_1000] iter 10/10 (total: 0.0s)                                                                                    C=35.5 us F=5.8 us
+    EXISTS subquery (parameter-varying)...     [cs_exists_1000] warmup 1/2...    [cs_exists_1000] warmup 2/2...    [cs_exists_1000] iter 1/10 (total: 0.0s)        [cs_exists_1000] iter 2/10 (total: 0.0s)        [cs_exists_1000] iter 3/10 (total: 0.0s)        [cs_exists_1000] iter 4/10 (total: 0.0s)        [cs_exists_1000] iter 5/10 (total: 0.0s)        [cs_exists_1000] iter 6/10 (total: 0.0s)        [cs_exists_1000] iter 7/10 (total: 0.0s)        [cs_exists_1000] iter 8/10 (total: 0.0s)        [cs_exists_1000] iter 9/10 (total: 0.0s)        [cs_exists_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_exists_1000] warmup 1/2...    [fs_exists_1000] warmup 2/2...    [fs_exists_1000] iter 1/10 (total: 0.0s)        [fs_exists_1000] iter 2/10 (total: 0.0s)        [fs_exists_1000] iter 3/10 (total: 0.0s)        [fs_exists_1000] iter 4/10 (total: 0.0s)        [fs_exists_1000] iter 5/10 (total: 0.0s)        [fs_exists_1000] iter 6/10 (total: 0.0s)        [fs_exists_1000] iter 7/10 (total: 0.0s)        [fs_exists_1000] iter 8/10 (total: 0.0s)        [fs_exists_1000] iter 9/10 (total: 0.0s)        [fs_exists_1000] iter 10/10 (total: 0.0s)                                                                                    C=24.0 us F=65.8 us
+    IN subquery (parameter-varying)...     [cs_in_sub_1000] warmup 1/2...    [cs_in_sub_1000] warmup 2/2...    [cs_in_sub_1000] iter 1/10 (total: 0.0s)        [cs_in_sub_1000] iter 2/10 (total: 0.0s)        [cs_in_sub_1000] iter 3/10 (total: 0.0s)        [cs_in_sub_1000] iter 4/10 (total: 0.0s)        [cs_in_sub_1000] iter 5/10 (total: 0.0s)        [cs_in_sub_1000] iter 6/10 (total: 0.0s)        [cs_in_sub_1000] iter 7/10 (total: 0.0s)        [cs_in_sub_1000] iter 8/10 (total: 0.0s)        [cs_in_sub_1000] iter 9/10 (total: 0.0s)        [cs_in_sub_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_in_sub_1000] warmup 1/2...    [fs_in_sub_1000] warmup 2/2...    [fs_in_sub_1000] iter 1/10 (total: 0.0s)        [fs_in_sub_1000] iter 2/10 (total: 0.0s)        [fs_in_sub_1000] iter 3/10 (total: 0.0s)        [fs_in_sub_1000] iter 4/10 (total: 0.0s)        [fs_in_sub_1000] iter 5/10 (total: 0.0s)        [fs_in_sub_1000] iter 6/10 (total: 0.0s)        [fs_in_sub_1000] iter 7/10 (total: 0.0s)        [fs_in_sub_1000] iter 8/10 (total: 0.0s)        [fs_in_sub_1000] iter 9/10 (total: 0.0s)        [fs_in_sub_1000] iter 10/10 (total: 0.0s)                                                                                    C=6.6 us F=71.9 us
+    CTE (non-recursive)...     [cs_cte_1000] warmup 1/2...    [cs_cte_1000] warmup 2/2...    [cs_cte_1000] iter 1/10 (total: 0.0s)        [cs_cte_1000] iter 2/10 (total: 0.0s)        [cs_cte_1000] iter 3/10 (total: 0.0s)        [cs_cte_1000] iter 4/10 (total: 0.0s)        [cs_cte_1000] iter 5/10 (total: 0.0s)        [cs_cte_1000] iter 6/10 (total: 0.0s)        [cs_cte_1000] iter 7/10 (total: 0.0s)        [cs_cte_1000] iter 8/10 (total: 0.0s)        [cs_cte_1000] iter 9/10 (total: 0.0s)        [cs_cte_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_cte_1000] warmup 1/2...    [fs_cte_1000] warmup 2/2...    [fs_cte_1000] iter 1/10 (total: 0.0s)        [fs_cte_1000] iter 2/10 (total: 0.0s)        [fs_cte_1000] iter 3/10 (total: 0.0s)        [fs_cte_1000] iter 4/10 (total: 0.0s)        [fs_cte_1000] iter 5/10 (total: 0.0s)        [fs_cte_1000] iter 6/10 (total: 0.0s)        [fs_cte_1000] iter 7/10 (total: 0.0s)        [fs_cte_1000] iter 8/10 (total: 0.0s)        [fs_cte_1000] iter 9/10 (total: 0.0s)        [fs_cte_1000] iter 10/10 (total: 0.0s)                                                                                    C=215.0 us F=15.7 us
+  Setting up subquery tables (10000 rows)... done.
+    Scalar subquery in SELECT...     [cs_scalar_sub_10000] warmup 1/2...    [cs_scalar_sub_10000] warmup 2/2...    [cs_scalar_sub_10000] iter 1/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 2/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 3/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 4/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 5/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 6/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 7/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 8/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 9/10 (total: 0.0s)        [cs_scalar_sub_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_scalar_sub_10000] warmup 1/2...    [fs_scalar_sub_10000] warmup 2/2...    [fs_scalar_sub_10000] iter 1/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 2/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 3/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 4/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 5/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 6/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 7/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 8/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 9/10 (total: 0.0s)        [fs_scalar_sub_10000] iter 10/10 (total: 0.0s)                                                                                    C=70.4 us F=8.0 us
+    EXISTS subquery (parameter-varying)...     [cs_exists_10000] warmup 1/2...    [cs_exists_10000] warmup 2/2...    [cs_exists_10000] iter 1/10 (total: 0.0s)        [cs_exists_10000] iter 2/10 (total: 0.0s)        [cs_exists_10000] iter 3/10 (total: 0.0s)        [cs_exists_10000] iter 4/10 (total: 0.0s)        [cs_exists_10000] iter 5/10 (total: 0.0s)        [cs_exists_10000] iter 6/10 (total: 0.0s)        [cs_exists_10000] iter 7/10 (total: 0.0s)        [cs_exists_10000] iter 8/10 (total: 0.0s)        [cs_exists_10000] iter 9/10 (total: 0.0s)        [cs_exists_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_exists_10000] warmup 1/2...    [fs_exists_10000] warmup 2/2...    [fs_exists_10000] iter 1/10 (total: 0.0s)        [fs_exists_10000] iter 2/10 (total: 0.0s)        [fs_exists_10000] iter 3/10 (total: 0.0s)        [fs_exists_10000] iter 4/10 (total: 0.0s)        [fs_exists_10000] iter 5/10 (total: 0.0s)        [fs_exists_10000] iter 6/10 (total: 0.0s)        [fs_exists_10000] iter 7/10 (total: 0.0s)        [fs_exists_10000] iter 8/10 (total: 0.0s)        [fs_exists_10000] iter 9/10 (total: 0.0s)        [fs_exists_10000] iter 10/10 (total: 0.0s)                                                                                    C=12.7 us F=94.9 us
+    IN subquery (parameter-varying)...     [cs_in_sub_10000] warmup 1/2...    [cs_in_sub_10000] warmup 2/2...    [cs_in_sub_10000] iter 1/10 (total: 0.0s)        [cs_in_sub_10000] iter 2/10 (total: 0.0s)        [cs_in_sub_10000] iter 3/10 (total: 0.0s)        [cs_in_sub_10000] iter 4/10 (total: 0.0s)        [cs_in_sub_10000] iter 5/10 (total: 0.0s)        [cs_in_sub_10000] iter 6/10 (total: 0.0s)        [cs_in_sub_10000] iter 7/10 (total: 0.0s)        [cs_in_sub_10000] iter 8/10 (total: 0.0s)        [cs_in_sub_10000] iter 9/10 (total: 0.0s)        [cs_in_sub_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_in_sub_10000] warmup 1/2...    [fs_in_sub_10000] warmup 2/2...    [fs_in_sub_10000] iter 1/10 (total: 0.0s)        [fs_in_sub_10000] iter 2/10 (total: 0.0s)        [fs_in_sub_10000] iter 3/10 (total: 0.0s)        [fs_in_sub_10000] iter 4/10 (total: 0.0s)        [fs_in_sub_10000] iter 5/10 (total: 0.0s)        [fs_in_sub_10000] iter 6/10 (total: 0.0s)        [fs_in_sub_10000] iter 7/10 (total: 0.0s)        [fs_in_sub_10000] iter 8/10 (total: 0.0s)        [fs_in_sub_10000] iter 9/10 (total: 0.0s)        [fs_in_sub_10000] iter 10/10 (total: 0.0s)                                                                                    C=8.4 us F=72.4 us
+    CTE (non-recursive)...     [cs_cte_10000] warmup 1/2...    [cs_cte_10000] warmup 2/2...    [cs_cte_10000] iter 1/10 (total: 0.0s)        [cs_cte_10000] iter 2/10 (total: 0.0s)        [cs_cte_10000] iter 3/10 (total: 0.0s)        [cs_cte_10000] iter 4/10 (total: 0.0s)        [cs_cte_10000] iter 5/10 (total: 0.0s)        [cs_cte_10000] iter 6/10 (total: 0.0s)        [cs_cte_10000] iter 7/10 (total: 0.0s)        [cs_cte_10000] iter 8/10 (total: 0.0s)        [cs_cte_10000] iter 9/10 (total: 0.0s)        [cs_cte_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_cte_10000] warmup 1/2...    [fs_cte_10000] warmup 2/2...    [fs_cte_10000] iter 1/10 (total: 0.0s)        [fs_cte_10000] iter 2/10 (total: 0.0s)        [fs_cte_10000] iter 3/10 (total: 0.0s)        [fs_cte_10000] iter 4/10 (total: 0.0s)        [fs_cte_10000] iter 5/10 (total: 0.0s)        [fs_cte_10000] iter 6/10 (total: 0.0s)        [fs_cte_10000] iter 7/10 (total: 0.0s)        [fs_cte_10000] iter 8/10 (total: 0.0s)        [fs_cte_10000] iter 9/10 (total: 0.0s)        [fs_cte_10000] iter 10/10 (total: 0.0s)                                                                                    C=2.11 ms F=124.0 us
+    Recursive CTE specialized integer-series SUM...     [cs_recursive_cte] warmup 1/2...    [cs_recursive_cte] warmup 2/2...    [cs_recursive_cte] iter 1/10 (total: 0.0s)        [cs_recursive_cte] iter 2/10 (total: 0.0s)        [cs_recursive_cte] iter 3/10 (total: 0.0s)        [cs_recursive_cte] iter 4/10 (total: 0.0s)        [cs_recursive_cte] iter 5/10 (total: 0.0s)        [cs_recursive_cte] iter 6/10 (total: 0.0s)        [cs_recursive_cte] iter 7/10 (total: 0.0s)        [cs_recursive_cte] iter 8/10 (total: 0.0s)        [cs_recursive_cte] iter 9/10 (total: 0.0s)        [cs_recursive_cte] iter 10/10 (total: 0.0s)                                                                                        [fs_recursive_cte] warmup 1/2...    [fs_recursive_cte] warmup 2/2...    [fs_recursive_cte] iter 1/10 (total: 0.0s)        [fs_recursive_cte] iter 2/10 (total: 0.0s)        [fs_recursive_cte] iter 3/10 (total: 0.0s)        [fs_recursive_cte] iter 4/10 (total: 0.0s)        [fs_recursive_cte] iter 5/10 (total: 0.0s)        [fs_recursive_cte] iter 6/10 (total: 0.0s)        [fs_recursive_cte] iter 7/10 (total: 0.0s)        [fs_recursive_cte] iter 8/10 (total: 0.0s)        [fs_recursive_cte] iter 9/10 (total: 0.0s)        [fs_recursive_cte] iter 10/10 (total: 0.0s)                                                                                    C=171.1 us F=22.8 us
+
+============================================================================================================================================
+  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite
+  2026-07-28 04:24:24 UTC
+  OS: Ubuntu 26.04 LTS
+  Arch: x86_64
+  Kernel: 7.0.0-15-generic
+  CPU: AMD EPYC-Genoa Processor (16 cores)
+  RAM: 30.6 GB
+  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
+  Rust: rustc 1.99.0-nightly (09ee43b2d 2026-07-27)
+  Cargo: cargo 1.99.0-nightly (3efb1f477 2026-07-17)
+    Recursive CTE general COUNT...     [cs_recursive_cte_general] warmup 1/2...    [cs_recursive_cte_general] warmup 2/2...    [cs_recursive_cte_general] iter 1/10 (total: 0.0s)        [cs_recursive_cte_general] iter 2/10 (total: 0.0s)        [cs_recursive_cte_general] iter 3/10 (total: 0.0s)        [cs_recursive_cte_general] iter 4/10 (total: 0.0s)        [cs_recursive_cte_general] iter 5/10 (total: 0.0s)        [cs_recursive_cte_general] iter 6/10 (total: 0.0s)        [cs_recursive_cte_general] iter 7/10 (total: 0.0s)        [cs_recursive_cte_general] iter 8/10 (total: 0.0s)        [cs_recursive_cte_general] iter 9/10 (total: 0.0s)        [cs_recursive_cte_general] iter 10/10 (total: 0.0s)                                                                                        [fs_recursive_cte_general] warmup 1/2...    [fs_recursive_cte_general] warmup 2/2...    [fs_recursive_cte_general] iter 1/10 (total: 0.0s)        [fs_recursive_cte_general] iter 2/10 (total: 0.0s)        [fs_recursive_cte_general] iter 3/10 (total: 0.0s)        [fs_recursive_cte_general] iter 4/10 (total: 0.0s)        [fs_recursive_cte_general] iter 5/10 (total: 0.0s)        [fs_recursive_cte_general] iter 6/10 (total: 0.0s)        [fs_recursive_cte_general] iter 7/10 (total: 0.0s)        [fs_recursive_cte_general] iter 8/10 (total: 0.0s)        [fs_recursive_cte_general] iter 9/10 (total: 0.0s)        [fs_recursive_cte_general] iter 10/10 (total: 0.0s)                                                                                    C=335.4 us F=2.46 ms
+
+Benchmark complete in 0.8s. Generating reports...
+  Git: detached-or-unknown @ unknown
+  Binary modified: 2026-07-28 04:24:19 UTC
+  Build profile: unspecified
+  Total benchmark time: 0.8s
+============================================================================================================================================
+
+
+## Subquery & CTE Performance
+   Measures scalar subqueries, EXISTS, IN subqueries, and recursive CTEs.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows / scalar subquery (LIMIT 100)          76.0 us      11.0 us      1.32M/s      9.09M/s 6.91x [32mfaster[0m     5.1%    30.2%
+  100 rows / EXISTS subquery (parameter-varying)       4.7 us      60.7 us     212.9K/s      16.5K/s 12.92x [31mslower[0m    41.5%    20.0%
+  100 rows / IN subquery (parameter-varying)       4.2 us      58.3 us     238.8K/s      17.1K/s 13.93x [31mslower[0m    22.2%    10.8%
+  100 rows / CTE + JOIN                           90.7 us      10.1 us      1.10M/s      9.94M/s 9.01x [32mfaster[0m    47.7%     5.2%
+  1000 rows / scalar subquery (LIMIT 100)         35.5 us       5.8 us      2.82M/s     17.13M/s 6.08x [32mfaster[0m    17.4%   141.3%
+  1000 rows / EXISTS subquery (parameter-varying)      24.0 us      65.8 us      41.7K/s      15.2K/s 2.74x [31mslower[0m    74.3%    14.9%
+  1000 rows / IN subquery (parameter-varying)       6.6 us      71.9 us     151.1K/s      13.9K/s 10.87x [31mslower[0m    18.9%    13.6%
+  1000 rows / CTE + JOIN                         215.0 us      15.7 us      4.65M/s     63.52M/s 13.65x [32mfaster[0m    12.7%    14.5%
+  10000 rows / scalar subquery (LIMIT 100)        70.4 us       8.0 us      1.42M/s     12.43M/s 8.75x [32mfaster[0m    54.5%    22.3%
+  10000 rows / EXISTS subquery (parameter-varying)      12.7 us      94.9 us      78.4K/s      10.5K/s 7.44x [31mslower[0m    43.3%    83.3%
+  10000 rows / IN subquery (parameter-varying)       8.4 us      72.4 us     119.7K/s      13.8K/s 8.67x [31mslower[0m    25.6%     8.4%
+  10000 rows / CTE + JOIN                         2.11 ms     124.0 us      4.74M/s     80.61M/s 17.00x [32mfaster[0m    45.6%    17.3%
+  Recursive CTE specialized integer-series SUM (1..1000)     171.1 us      22.8 us      5.85M/s     43.95M/s 7.52x [32mfaster[0m    20.2%    73.2%
+  Recursive CTE general COUNT (1..1000)          335.4 us      2.46 ms      2.98M/s     407.0K/s 7.33x [31mslower[0m     6.0%    35.2%
+
+========================================================================================================================
+  SUMMARY STATISTICS
+========================================================================================================================
+
+  Total scenarios: 14  |  FrankenSQLite faster: 7  |  Comparable: 0  |  C SQLite faster: 7
+  Average time ratio (FrankenSQLite / C SQLite): 4.62x
+
+  [2m2026-07-28T04:24:24.837285Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 509812ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:731 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:24:24.837646Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:780 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:24:24.837659Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:2701 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:24:24.837705Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 5 retrieval exclude pattern(s) from .rchignore (total: 10)[0m
+    [2;3mat[0m rch/src/transfer.rs:1270 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:24:27.422322Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2584ms (1 files, 9384 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2756 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:24:27.422367Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 9384 bytes in 2584ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:813 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:24:27.422492Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite/.rch-target-hz2-pool-acb5c41f52e8f4ec20e1ed3b0eb0a959 on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:2701 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:24:29.605242Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2182ms (5 files, 531 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2756 [2;3mon[0m ThreadId(1)
+
+  [2m2026-07-28T04:24:29.605277Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 5 files, 531 bytes in 2182ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:937 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 (640.1s)

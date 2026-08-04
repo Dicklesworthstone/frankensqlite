@@ -3,6 +3,7 @@
 //! Validates that the verify_with_c_sqlite infrastructure produces correct
 //! results for clean and corrupt databases, and that the reporting format
 //! matches the expected schema.
+#![recursion_limit = "512"]
 
 use tempfile::TempDir;
 
@@ -106,82 +107,106 @@ fn t4_corrupt_header_detected() {
 
 #[test]
 fn t5_fsqlite_created_db_passes_csqlite_check() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("fsqlite.db");
-    let path_str = db_path.to_string_lossy().into_owned();
+    asupersync::test_utils::run_test(|| async {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fsqlite.db");
+        let path_str = db_path.to_string_lossy().into_owned();
 
-    let conn = fsqlite::Connection::open(path_str).unwrap();
-    let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-        .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'from_fsqlite')")
-        .unwrap();
-    drop(conn);
+        let conn = fsqlite::Connection::open(path_str).await.unwrap();
+        drop(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'from_fsqlite')")
+            .await
+            .unwrap();
+        drop(conn);
 
-    assert_eq!(integrity_check(&db_path), "ok");
+        assert_eq!(integrity_check(&db_path), "ok");
+    });
 }
 
 #[test]
 fn t6_fsqlite_multithread_db_passes_csqlite_check() {
-    let dir = TempDir::new().unwrap();
-    let (database_file, connection_target) = temp_db_target(&dir, "mt.db");
+    asupersync::test_utils::run_test(|| async {
+        let dir = TempDir::new().unwrap();
+        let (database_file, connection_target) = temp_db_target(&dir, "mt.db");
 
-    {
-        let conn = fsqlite::Connection::open(connection_target.clone()).unwrap();
-        let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-            .unwrap();
-    }
+        {
+            let conn = fsqlite::Connection::open(connection_target.clone())
+                .await
+                .unwrap();
+            drop(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await);
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
+                .unwrap();
+        }
 
-    let connection_target = std::sync::Arc::new(connection_target);
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
-    let mut handles = Vec::new();
+        let connection_target = std::sync::Arc::new(connection_target);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
 
-    for tid in 0..4u32 {
-        let connection_target = std::sync::Arc::clone(&connection_target);
-        let barrier = std::sync::Arc::clone(&barrier);
-        handles.push(std::thread::spawn(move || {
-            let conn = fsqlite::Connection::open(connection_target.as_str().to_owned()).unwrap();
-            let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-            let _ = conn.execute("PRAGMA busy_timeout=5000;");
-            barrier.wait();
+        for tid in 0..4u32 {
+            let connection_target = std::sync::Arc::clone(&connection_target);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                asupersync::test_utils::run_test(|| async {
+                    let conn = fsqlite::Connection::open(connection_target.as_str().to_owned())
+                        .await
+                        .unwrap();
+                    drop(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await);
+                    drop(conn.execute("PRAGMA busy_timeout=5000;").await);
+                    barrier.wait();
 
-            let base = i64::from(tid) * 100;
-            let value = format!("thread_{tid}");
-            for i in 0..10i64 {
-                let _ = conn.execute_with_params(
-                    "INSERT INTO t VALUES (?1, ?2)",
-                    &[
-                        fsqlite::SqliteValue::Integer(base + i),
-                        fsqlite::SqliteValue::Text(value.clone().into()),
-                    ],
-                );
-            }
-        }));
-    }
+                    let base = i64::from(tid) * 100;
+                    let value = format!("thread_{tid}");
+                    for i in 0..10i64 {
+                        drop(
+                            conn.execute_with_params(
+                                "INSERT INTO t VALUES (?1, ?2)",
+                                &[
+                                    fsqlite::SqliteValue::Integer(base + i),
+                                    fsqlite::SqliteValue::Text(value.clone().into()),
+                                ],
+                            )
+                            .await,
+                        );
+                    }
+                });
+            }));
+        }
 
-    for h in handles {
-        h.join().unwrap();
-    }
+        for h in handles {
+            h.join().unwrap();
+        }
 
-    assert_eq!(integrity_check(&database_file), "ok");
+        assert_eq!(integrity_check(&database_file), "ok");
+    });
 }
 
 #[test]
 fn t7_verify_with_c_sqlite_clean() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("verify_clean.db");
-    let path_str = db_path.to_string_lossy().into_owned();
+    let mut outcome: Result<(), Box<dyn std::error::Error>> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = (async || -> Result<(), Box<dyn std::error::Error>> {
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("verify_clean.db");
+            let path_str = db_path.to_string_lossy().into_owned();
 
-    let conn = fsqlite::Connection::open(path_str).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-        .unwrap();
-    conn.execute("INSERT INTO t VALUES (1)").unwrap();
-    drop(conn);
+            let conn = fsqlite::Connection::open(path_str).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            drop(conn);
 
-    let report = fsqlite_e2e::verify_csqlite::verify_with_c_sqlite(&db_path)?;
-    assert!(report.ok, "clean DB should verify ok");
-    Ok(())
+            let report = fsqlite_e2e::verify_csqlite::verify_with_c_sqlite(&db_path)?;
+            assert!(report.ok, "clean DB should verify ok");
+            Ok(())
+        })()
+        .await;
+    });
+    outcome
 }
 
 #[test]

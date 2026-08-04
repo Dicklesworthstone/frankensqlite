@@ -24,6 +24,7 @@
 //!    produced a consistent committed file. `persisted_indexes_stay_consistent`
 //!    keeps that guard in place but remains `#[ignore]`d: it has never fired, so
 //!    it is documentation of the unreproduced claim rather than a known failure.
+#![recursion_limit = "512"]
 
 use std::path::Path;
 
@@ -34,21 +35,23 @@ const ROWS: i64 = 8000;
 const CYCLES: usize = 12;
 const BATCH: i64 = 5600; // ~70% churn per cycle
 
-fn insert_row(conn: &fsqlite::Connection, id: i64, ctx: &str) {
+async fn insert_row(conn: &fsqlite::Connection, id: i64, ctx: &str) {
     conn.execute(&format!(
         "INSERT INTO t(id, j, k, payload) VALUES ({id}, {j}, {k}, 'p{id:07}')",
         j = id,
         k = id % 8,
     ))
+    .await
     .unwrap_or_else(|e| panic!("{ctx}: insert {id}: {e}"));
 }
 
 /// The text of every row returned by `PRAGMA integrity_check`. A healthy
 /// database returns exactly `["ok"]`; corruption returns one or more
 /// human-readable problem descriptions.
-fn integrity_check_texts(conn: &fsqlite::Connection, ctx: &str) -> Vec<String> {
+async fn integrity_check_texts(conn: &fsqlite::Connection, ctx: &str) -> Vec<String> {
     let rows = conn
         .query("PRAGMA integrity_check")
+        .await
         .unwrap_or_else(|e| panic!("{ctx}: integrity_check returned an error: {e}"));
     rows.iter()
         .map(|r| match r.values().first() {
@@ -63,73 +66,82 @@ fn integrity_check_texts(conn: &fsqlite::Connection, ctx: &str) -> Vec<String> {
 /// reported `database disk image is malformed` (stale freelist/size metadata).
 #[test]
 fn in_txn_integrity_check_stays_consistent() {
-    // A few cycles are enough to exercise the alloc-from-committed-freelist and
-    // in-transaction db-growth windows that tripped the stale-metadata walk.
-    const CYCLES_FAST: usize = 4;
+    asupersync::test_utils::run_test(|| async {
+        // A few cycles are enough to exercise the alloc-from-committed-freelist and
+        // in-transaction db-growth windows that tripped the stale-metadata walk.
+        const CYCLES_FAST: usize = 4;
 
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("issue113_intxn.db");
-    let conn =
-        fsqlite::Connection::open(db_path.to_string_lossy().into_owned()).expect("open fsqlite");
-    conn.execute("PRAGMA foreign_keys=off").unwrap();
-    conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")
-        .unwrap();
-    conn.execute_batch(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, j INTEGER, k INTEGER, payload TEXT);
-         CREATE INDEX idx_j ON t(j);
-         CREATE INDEX idx_k ON t(k);
-         CREATE INDEX idx_kj ON t(k, j);",
-    )
-    .expect("create schema");
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("issue113_intxn.db");
+        let conn = fsqlite::Connection::open(db_path.to_string_lossy().into_owned())
+            .await
+            .expect("open fsqlite");
+        conn.execute("PRAGMA foreign_keys=off").await.unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")
+            .await
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, j INTEGER, k INTEGER, payload TEXT);
+             CREATE INDEX idx_j ON t(j);
+             CREATE INDEX idx_k ON t(k);
+             CREATE INDEX idx_kj ON t(k, j);",
+        )
+        .await
+        .expect("create schema");
 
-    // Bulk-load in its own committed transaction.
-    conn.execute("BEGIN IMMEDIATE").unwrap();
-    for id in 1..=ROWS {
-        insert_row(&conn, id, "load");
-    }
-    conn.execute("COMMIT").unwrap();
+        // Bulk-load in its own committed transaction.
+        conn.execute("BEGIN IMMEDIATE").await.unwrap();
+        for id in 1..=ROWS {
+            insert_row(&conn, id, "load").await;
+        }
+        conn.execute("COMMIT").await.unwrap();
 
-    let mut next_id = ROWS + 1;
-    let mut lo = 1i64;
-    for cycle in 0..CYCLES_FAST {
-        conn.execute("BEGIN IMMEDIATE").unwrap();
+        let mut next_id = ROWS + 1;
+        let mut lo = 1i64;
+        for cycle in 0..CYCLES_FAST {
+            conn.execute("BEGIN IMMEDIATE").await.unwrap();
 
-        let hi = lo + BATCH - 1;
-        conn.execute(&format!("DELETE FROM t WHERE id BETWEEN {lo} AND {hi}"))
-            .unwrap_or_else(|e| panic!("cycle {cycle}: delete: {e}"));
-        lo = hi + 1;
+            let hi = lo + BATCH - 1;
+            conn.execute(&format!("DELETE FROM t WHERE id BETWEEN {lo} AND {hi}"))
+                .await
+                .unwrap_or_else(|e| panic!("cycle {cycle}: delete: {e}"));
+            lo = hi + 1;
 
-        for _ in 0..BATCH {
-            insert_row(&conn, next_id, &format!("cycle {cycle}"));
-            next_id += 1;
+            for _ in 0..BATCH {
+                insert_row(&conn, next_id, &format!("cycle {cycle}")).await;
+                next_id += 1;
+            }
+
+            // The in-transaction integrity check — the GH#113 trigger.
+            let texts = integrity_check_texts(&conn, &format!("cycle {cycle}")).await;
+            assert_eq!(
+                texts,
+                vec!["ok".to_string()],
+                "cycle {cycle}: in-transaction PRAGMA integrity_check reported corruption (GH#113); \
+                 engine state is consistent, this is the stale-metadata walk false positive: {texts:?}"
+            );
+
+            conn.execute("COMMIT").await.unwrap();
         }
 
-        // The in-transaction integrity check — the GH#113 trigger.
-        let texts = integrity_check_texts(&conn, &format!("cycle {cycle}"));
+        // After COMMIT the committed file must also be clean.
+        let texts = integrity_check_texts(&conn, "post-commit").await;
         assert_eq!(
             texts,
             vec!["ok".to_string()],
-            "cycle {cycle}: in-transaction PRAGMA integrity_check reported corruption (GH#113); \
-             engine state is consistent, this is the stale-metadata walk false positive: {texts:?}"
+            "post-commit integrity_check: {texts:?}"
         );
-
-        conn.execute("COMMIT").unwrap();
-    }
-
-    // After COMMIT the committed file must also be clean.
-    let texts = integrity_check_texts(&conn, "post-commit");
-    assert_eq!(
-        texts,
-        vec!["ok".to_string()],
-        "post-commit integrity_check: {texts:?}"
-    );
+    });
 }
 
 /// Run the churn workload through a single fsqlite connection at `path`,
 /// committing each cycle (used by the persisted-corruption guard below).
-fn run_committed_churn(path: &str) {
-    let conn = fsqlite::Connection::open(path.to_owned()).expect("open fsqlite");
+async fn run_committed_churn(path: &str) {
+    let conn = fsqlite::Connection::open(path.to_owned())
+        .await
+        .expect("open fsqlite");
     conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")
+        .await
         .expect("concurrent_mode off");
     conn.execute_batch(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, j INTEGER, k INTEGER, payload TEXT);
@@ -137,30 +149,34 @@ fn run_committed_churn(path: &str) {
          CREATE INDEX idx_k ON t(k);
          CREATE INDEX idx_kj ON t(k, j);",
     )
+    .await
     .expect("create schema");
 
-    conn.execute("BEGIN IMMEDIATE").expect("begin load");
+    conn.execute("BEGIN IMMEDIATE").await.expect("begin load");
     for id in 1..=ROWS {
-        insert_row(&conn, id, "load");
+        insert_row(&conn, id, "load").await;
     }
-    conn.execute("COMMIT").expect("commit load");
+    conn.execute("COMMIT").await.expect("commit load");
 
     let mut next_id = ROWS + 1;
     let mut lo = 1i64;
     for cycle in 0..CYCLES {
         conn.execute("BEGIN IMMEDIATE")
+            .await
             .unwrap_or_else(|e| panic!("begin cycle {cycle}: {e}"));
         let hi = lo + BATCH - 1;
         conn.execute(&format!("DELETE FROM t WHERE id BETWEEN {lo} AND {hi}"))
+            .await
             .unwrap_or_else(|e| panic!("delete cycle {cycle}: {e}"));
         lo = hi + 1;
         for _ in 0..BATCH {
-            insert_row(&conn, next_id, &format!("cycle {cycle}"));
+            insert_row(&conn, next_id, &format!("cycle {cycle}")).await;
             next_id += 1;
         }
         // Interleaved in-transaction integrity walk (a full btree scan).
-        let _ = integrity_check_texts(&conn, &format!("cycle {cycle}"));
+        drop(integrity_check_texts(&conn, &format!("cycle {cycle}")).await);
         conn.execute("COMMIT")
+            .await
             .unwrap_or_else(|e| panic!("commit cycle {cycle}: {e}"));
     }
     drop(conn);
@@ -205,15 +221,17 @@ fn canonical_index_agrees_with_scan(path: &Path) -> Result<(), String> {
 #[test]
 #[ignore = "issue #113: persisted secondary-index corruption was never reproduced; committed file is consistent"]
 fn persisted_indexes_stay_consistent() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("issue113.db");
-    run_committed_churn(&db_path.to_string_lossy());
+    asupersync::test_utils::run_test(|| async {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("issue113.db");
+        run_committed_churn(&db_path.to_string_lossy()).await;
 
-    let ic = canonical_integrity_check(&db_path);
-    let agree = canonical_index_agrees_with_scan(&db_path);
-    assert_eq!(
-        ic, "ok",
-        "canonical integrity_check on fsqlite output: {ic}"
-    );
-    assert!(agree.is_ok(), "index/scan disagreement: {:?}", agree.err());
+        let ic = canonical_integrity_check(&db_path);
+        let agree = canonical_index_agrees_with_scan(&db_path);
+        assert_eq!(
+            ic, "ok",
+            "canonical integrity_check on fsqlite output: {ic}"
+        );
+        assert!(agree.is_ok(), "index/scan disagreement: {:?}", agree.err());
+    });
 }

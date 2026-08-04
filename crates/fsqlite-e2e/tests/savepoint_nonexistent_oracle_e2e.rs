@@ -7,18 +7,18 @@
 
 use fsqlite::Connection;
 
-fn stmts_agreement(stmts: &[&str], label: &str) -> Option<String> {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn stmts_agreement(stmts: &[&str], label: &str) -> Option<String> {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in &stmts[..stmts.len() - 1] {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         if let (Err(_), Ok(())) | (Ok(_), Err(_)) = (&fe, &re) {
             return Some(format!("{label} setup: disagreement on `{s}`"));
         }
     }
     let last = stmts[stmts.len() - 1];
-    let fe = f.execute(last);
+    let fe = f.execute(last).await;
     let re = r.execute_batch(last);
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => None,
@@ -29,11 +29,13 @@ fn stmts_agreement(stmts: &[&str], label: &str) -> Option<String> {
     }
 }
 
-fn check(cases: &[(&[&str], &str)], label: &str) {
-    let mismatches: Vec<String> = cases
-        .iter()
-        .filter_map(|(stmts, l)| stmts_agreement(stmts, l))
-        .collect();
+async fn check(cases: &[(&[&str], &str)], label: &str) {
+    let mut mismatches: Vec<String> = Vec::new();
+    for (stmts, l) in cases.iter() {
+        if let Some(m) = stmts_agreement(stmts, l).await {
+            mismatches.push(m);
+        }
+    }
     assert!(
         mismatches.is_empty(),
         "{label}: {} mismatch(es)\n{}",
@@ -44,35 +46,41 @@ fn check(cases: &[(&[&str], &str)], label: &str) {
 
 #[test]
 fn savepoint_valid_ok() {
-    check(
-        &[
-            (&["BEGIN", "SAVEPOINT sp1", "RELEASE sp1"], "sp1 release"),
-            (
-                &["BEGIN", "SAVEPOINT sp1", "ROLLBACK TO sp1"],
-                "sp1 rollback-to",
-            ),
-        ],
-        "savepoint_valid_ok",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            &[
+                (&["BEGIN", "SAVEPOINT sp1", "RELEASE sp1"], "sp1 release"),
+                (
+                    &["BEGIN", "SAVEPOINT sp1", "ROLLBACK TO sp1"],
+                    "sp1 rollback-to",
+                ),
+            ],
+            "savepoint_valid_ok",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn release_or_rollback_to_nonexistent_rejected() {
-    check(
-        &[
-            // RELEASE a name that was never declared
-            (&["BEGIN", "SAVEPOINT sp1", "RELEASE nope"], "RELEASE nope"),
-            // ROLLBACK TO a name that was never declared
-            (
-                &["BEGIN", "SAVEPOINT sp1", "ROLLBACK TO nope"],
-                "ROLLBACK TO nope",
-            ),
-            // After RELEASE, the savepoint is gone -- using it again errors
-            (
-                &["BEGIN", "SAVEPOINT sp1", "RELEASE sp1", "RELEASE sp1"],
-                "RELEASE after release",
-            ),
-        ],
-        "release_or_rollback_to_nonexistent_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            &[
+                // RELEASE a name that was never declared
+                (&["BEGIN", "SAVEPOINT sp1", "RELEASE nope"], "RELEASE nope"),
+                // ROLLBACK TO a name that was never declared
+                (
+                    &["BEGIN", "SAVEPOINT sp1", "ROLLBACK TO nope"],
+                    "ROLLBACK TO nope",
+                ),
+                // After RELEASE, the savepoint is gone -- using it again errors
+                (
+                    &["BEGIN", "SAVEPOINT sp1", "RELEASE sp1", "RELEASE sp1"],
+                    "RELEASE after release",
+                ),
+            ],
+            "release_or_rollback_to_nonexistent_rejected",
+        )
+        .await;
+    });
 }

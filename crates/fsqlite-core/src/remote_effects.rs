@@ -7,16 +7,16 @@
 //! - lease-backed liveness checks with deterministic escalation,
 //! - a cancellation-safe remote eviction saga skeleton.
 
+#[cfg(not(feature = "native"))]
+use fsqlite_types::sync_primitives::Instant;
+#[cfg(feature = "native")]
+use fsqlite_types::sync_primitives::SystemTime;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 #[cfg(not(feature = "native"))]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
-#[cfg(not(feature = "native"))]
-use std::time::Instant;
-#[cfg(feature = "native")]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "native")]
 use asupersync::combinator::bulkhead::{
@@ -347,7 +347,7 @@ pub struct AdmissionSnapshot {
 #[must_use]
 fn admission_now() -> AdmissionTime {
     let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let millis = u64::try_from(millis).unwrap_or(u64::MAX);

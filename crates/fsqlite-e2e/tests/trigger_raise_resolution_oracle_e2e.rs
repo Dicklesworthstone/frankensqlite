@@ -31,8 +31,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -68,11 +68,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
 /// compare the result of each query. A statement that errors on BOTH engines
 /// (e.g. the RAISE-triggering INSERT) counts as agreement — the point of the test
 /// is the surviving table state, captured by the queries.
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -82,7 +82,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -106,63 +106,75 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn raise_abort_rolls_back_statement() {
-    // ABORT on row 3 -> the whole multi-row INSERT is undone, table stays empty.
-    scenario(
-        &[
-            "CREATE TABLE t (x INTEGER)",
-            "CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.x = 3 \
-             BEGIN SELECT RAISE(ABORT, 'no 3'); END",
-            "INSERT INTO t VALUES (1),(2),(3),(4)", // errors on both
-        ],
-        &["SELECT x FROM t ORDER BY x"], // [] (ABORT undid rows 1,2)
-        "raise_abort_rolls_back_statement",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // ABORT on row 3 -> the whole multi-row INSERT is undone, table stays empty.
+        scenario(
+            &[
+                "CREATE TABLE t (x INTEGER)",
+                "CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.x = 3 \
+                 BEGIN SELECT RAISE(ABORT, 'no 3'); END",
+                "INSERT INTO t VALUES (1),(2),(3),(4)", // errors on both
+            ],
+            &["SELECT x FROM t ORDER BY x"], // [] (ABORT undid rows 1,2)
+            "raise_abort_rolls_back_statement",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn raise_fail_keeps_prior_rows() {
-    // FAIL on row 3 -> rows inserted before it (1,2) are KEPT; 3,4 are not.
-    scenario(
-        &[
-            "CREATE TABLE t (x INTEGER)",
-            "CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.x = 3 \
-             BEGIN SELECT RAISE(FAIL, 'fail 3'); END",
-            "INSERT INTO t VALUES (1),(2),(3),(4)", // errors on both
-        ],
-        &["SELECT x FROM t ORDER BY x"], // [1,2] (FAIL kept prior rows)
-        "raise_fail_keeps_prior_rows",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // FAIL on row 3 -> rows inserted before it (1,2) are KEPT; 3,4 are not.
+        scenario(
+            &[
+                "CREATE TABLE t (x INTEGER)",
+                "CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.x = 3 \
+                 BEGIN SELECT RAISE(FAIL, 'fail 3'); END",
+                "INSERT INTO t VALUES (1),(2),(3),(4)", // errors on both
+            ],
+            &["SELECT x FROM t ORDER BY x"], // [1,2] (FAIL kept prior rows)
+            "raise_fail_keeps_prior_rows",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn raise_rollback_undoes_whole_transaction() {
-    // ROLLBACK undoes the entire transaction, including the (10) row inserted
-    // before the failing statement.
-    scenario(
-        &[
-            "CREATE TABLE t (x INTEGER)",
-            "CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.x = 99 \
-             BEGIN SELECT RAISE(ROLLBACK, 'rb'); END",
-            "BEGIN",
-            "INSERT INTO t VALUES (10)", // a prior change in the txn
-            "INSERT INTO t VALUES (99)", // triggers ROLLBACK -> errors on both
-        ],
-        &["SELECT x FROM t ORDER BY x"], // [] (whole txn rolled back, even the 10)
-        "raise_rollback_undoes_whole_transaction",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // ROLLBACK undoes the entire transaction, including the (10) row inserted
+        // before the failing statement.
+        scenario(
+            &[
+                "CREATE TABLE t (x INTEGER)",
+                "CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.x = 99 \
+                 BEGIN SELECT RAISE(ROLLBACK, 'rb'); END",
+                "BEGIN",
+                "INSERT INTO t VALUES (10)", // a prior change in the txn
+                "INSERT INTO t VALUES (99)", // triggers ROLLBACK -> errors on both
+            ],
+            &["SELECT x FROM t ORDER BY x"], // [] (whole txn rolled back, even the 10)
+            "raise_rollback_undoes_whole_transaction",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn raise_ignore_skips_row_no_error() {
-    // IGNORE silently drops row 3 and continues -> 1,2,4 inserted, no error.
-    scenario(
-        &[
-            "CREATE TABLE t (x INTEGER)",
-            "CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.x = 3 \
-             BEGIN SELECT RAISE(IGNORE); END",
-            "INSERT INTO t VALUES (1),(2),(3),(4)", // succeeds on both (no error)
-        ],
-        &["SELECT x FROM t ORDER BY x"], // [1,2,4] (3 ignored)
-        "raise_ignore_skips_row_no_error",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // IGNORE silently drops row 3 and continues -> 1,2,4 inserted, no error.
+        scenario(
+            &[
+                "CREATE TABLE t (x INTEGER)",
+                "CREATE TRIGGER tr BEFORE INSERT ON t WHEN NEW.x = 3 \
+                 BEGIN SELECT RAISE(IGNORE); END",
+                "INSERT INTO t VALUES (1),(2),(3),(4)", // succeeds on both (no error)
+            ],
+            &["SELECT x FROM t ORDER BY x"], // [1,2,4] (3 ignored)
+            "raise_ignore_skips_row_no_error",
+        )
+        .await;
+    });
 }

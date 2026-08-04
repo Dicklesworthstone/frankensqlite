@@ -1,7 +1,22 @@
+// The `#[cfg(test)]` module drives deeply nested engine futures through
+// `run_test`; the default 128 is not enough for the trait-solver queries those
+// generate. Harmless for the binary itself (the limit is a compiler budget).
+#![recursion_limit = "512"]
+// bd-h9o9r: the CLI drives fsqlite-core's deliberately non-`Send`, deeply
+// nested engine futures (the same nesting behind the recursion_limit
+// above); `future_not_send` and `large_futures` contradict that design —
+// see fsqlite-core/src/lib.rs for the full rationale, including why boxing
+// was rejected by the perf ledger. Pre-existing cache-masked redness (68
+// findings on untouched main), same family as the rest of the chain.
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
+
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::{self, BufRead, ErrorKind, IsTerminal, Write};
 use std::path::Path;
+use std::pin::Pin;
 
 use fsqlite::{Connection, Row, SqliteValue};
 use fsqlite_core::decode_proofs::{
@@ -171,13 +186,23 @@ fn main() {
         fail_on_error: !interactive_input,
     };
 
-    let exit_code = run_with_shell_options(
+    // The CLI is the top-level consumer, so it owns the async runtime and hands
+    // the resulting `Cx` down into the engine. FrankenSQLite itself never builds
+    // a runtime (AGENTS.md).
+    let runtime = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(stderr, "error: failed to start async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    let exit_code = runtime.block_on(run_with_shell_options(
         std::env::args_os(),
         &mut input,
         &mut stdout,
         &mut stderr,
         shell_options,
-    );
+    ));
     drop(input);
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -185,17 +210,17 @@ fn main() {
 }
 
 #[cfg(test)]
-fn run<I, R, W, E>(args: I, input: &mut R, out: &mut W, err: &mut E) -> i32
+async fn run<I, R, W, E>(args: I, input: &mut R, out: &mut W, err: &mut E) -> i32
 where
     I: IntoIterator<Item = OsString>,
     R: BufRead,
     W: Write,
     E: Write,
 {
-    run_with_shell_options(args, input, out, err, ShellOptions::interactive())
+    run_with_shell_options(args, input, out, err, ShellOptions::interactive()).await
 }
 
-fn run_with_shell_options<I, R, W, E>(
+async fn run_with_shell_options<I, R, W, E>(
     args: I,
     input: &mut R,
     out: &mut W,
@@ -247,13 +272,23 @@ where
         shell_options
     };
     let mut current_db_path = options.db_path.clone();
-    let mut connection = match Connection::open(&options.db_path) {
-        Ok(connection) => connection,
-        Err(error) => {
-            let _ = writeln!(err, "error: {error}");
-            return 1;
-        }
-    };
+    // bd-fo6xw: the CLI owns the process runtime (built in main and alive
+    // for the whole session), so a RuntimeContext constructed HERE — inside
+    // that runtime — captures its strong handle, giving every operation an
+    // io_uring driver spawner that outlives the connection. The default
+    // process-global env deliberately has no runtime handle, so plain
+    // Connection::open keeps the Unix fallback; this is the opt-in surface.
+    let cli_runtime_env = fsqlite::ConnectionEnv::new(std::sync::Arc::new(
+        fsqlite::RuntimeContext::new(fsqlite::RuntimeConfig::default()),
+    ));
+    let mut connection =
+        match Connection::open_with_env(&options.db_path, cli_runtime_env.clone()).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                let _ = writeln!(err, "error: {error}");
+                return 1;
+            }
+        };
     let mut output_options = OutputOptions::default();
 
     if let Some(path) = options.init_path.as_deref() {
@@ -265,7 +300,9 @@ where
             out,
             err,
             shell_options.nested_script(),
-        ) else {
+        )
+        .await
+        else {
             return 1;
         };
         if shell_options.fail_on_error && outcome.had_error {
@@ -284,7 +321,8 @@ where
             &command,
             out,
             err,
-        );
+        )
+        .await;
     }
 
     run_repl(
@@ -296,6 +334,7 @@ where
         err,
         shell_options,
     )
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -590,7 +629,7 @@ where
     }
 }
 
-fn run_command<W, E>(
+async fn run_command<W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
     output_options: &mut OutputOptions,
@@ -617,13 +656,15 @@ where
         out,
         err,
         ShellOptions::batch(),
-    ) {
+    )
+    .await
+    {
         Some(outcome) if !outcome.had_error => 0,
         Some(_) | None => 1,
     }
 }
 
-fn run_repl<R, W, E>(
+async fn run_repl<R, W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
     output_options: &mut OutputOptions,
@@ -645,45 +686,53 @@ where
         out,
         err,
         shell_options,
-    ) {
+    )
+    .await
+    {
         Some(outcome) if !(shell_options.fail_on_error && outcome.had_error) => 0,
         Some(_) | None => 1,
     }
 }
 
-fn execute_script_file<W, E>(
-    path: &str,
-    connection: &mut Connection,
-    current_db_path: &mut String,
-    output_options: &mut OutputOptions,
-    out: &mut W,
-    err: &mut E,
+// `.read FILE` can execute a script that itself contains `.read`, so this sits
+// in a cycle with `run_shell`/`try_execute_dot_command`. Boxing this one future
+// breaks the otherwise-infinite future type.
+fn execute_script_file<'a, W, E>(
+    path: &'a str,
+    connection: &'a mut Connection,
+    current_db_path: &'a mut String,
+    output_options: &'a mut OutputOptions,
+    out: &'a mut W,
+    err: &'a mut E,
     shell_options: ShellOptions,
-) -> Option<ShellOutcome>
+) -> Pin<Box<dyn Future<Output = Option<ShellOutcome>> + 'a>>
 where
     W: Write,
     E: Write,
 {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) => {
-            let _ = writeln!(err, "error: {error}");
-            return None;
-        }
-    };
-    let mut nested = io::Cursor::new(contents.into_bytes());
-    run_shell(
-        connection,
-        current_db_path,
-        output_options,
-        &mut nested,
-        out,
-        err,
-        shell_options,
-    )
+    Box::pin(async move {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                let _ = writeln!(err, "error: {error}");
+                return None;
+            }
+        };
+        let mut nested = io::Cursor::new(contents.into_bytes());
+        run_shell(
+            connection,
+            current_db_path,
+            output_options,
+            &mut nested,
+            out,
+            err,
+            shell_options,
+        )
+        .await
+    })
 }
 
-fn run_shell<R, W, E>(
+async fn run_shell<R, W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
     output_options: &mut OutputOptions,
@@ -727,7 +776,7 @@ where
         if bytes_read == 0 {
             if !pending_sql.trim().is_empty() {
                 had_error |=
-                    !execute_sql(connection, pending_sql.trim(), *output_options, out, err);
+                    !execute_sql(connection, pending_sql.trim(), *output_options, out, err).await;
             }
             return Some(ShellOutcome {
                 flow: ShellFlow::Continue,
@@ -762,7 +811,9 @@ where
                 err,
                 shell_options,
                 &mut had_error,
-            ) {
+            )
+            .await
+            {
                 DotCommandResult::NotHandled => {}
                 DotCommandResult::Continue => continue,
                 DotCommandResult::Exit => {
@@ -784,7 +835,8 @@ where
         pending_sql.push_str(line);
 
         if statement_complete(&pending_sql) {
-            had_error |= !execute_sql(connection, pending_sql.trim(), *output_options, out, err);
+            had_error |=
+                !execute_sql(connection, pending_sql.trim(), *output_options, out, err).await;
             pending_sql.clear();
         }
     }
@@ -840,7 +892,7 @@ fn prompt_db_label(current_db_path: &str) -> String {
         .to_owned()
 }
 
-fn execute_sql<W, E>(
+async fn execute_sql<W, E>(
     connection: &Connection,
     sql: &str,
     output_options: OutputOptions,
@@ -851,8 +903,8 @@ where
     W: Write,
     E: Write,
 {
-    let column_names = infer_result_column_names(connection, sql);
-    match connection.query(sql) {
+    let column_names = infer_result_column_names(connection, sql).await;
+    match connection.query(sql).await {
         Ok(rows) => {
             if write_rows(&rows, column_names.as_deref(), output_options, out).is_err() {
                 let _ = writeln!(err, "error: failed writing query results");
@@ -1091,9 +1143,9 @@ fn render_csv_field(value: &str) -> String {
     }
 }
 
-fn infer_result_column_names(connection: &Connection, sql: &str) -> Option<Vec<String>> {
+async fn infer_result_column_names(connection: &Connection, sql: &str) -> Option<Vec<String>> {
     let statement = last_sql_statement(sql)?;
-    let prepared = connection.prepare(statement).ok()?;
+    let prepared = connection.prepare(statement).await.ok()?;
     let column_names = prepared.column_names();
     (!column_names.is_empty()).then(|| column_names.to_vec())
 }
@@ -1484,7 +1536,7 @@ fn is_sql_keyword(token: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_execute_dot_command<W, E>(
+async fn try_execute_dot_command<W, E>(
     trimmed: &str,
     connection: &mut Connection,
     current_db_path: &mut String,
@@ -1513,7 +1565,9 @@ where
             out,
             err,
             shell_options.nested_script(),
-        ) {
+        )
+        .await
+        {
             Some(outcome) => {
                 *had_error |= outcome.had_error;
                 if outcome.flow == ShellFlow::Exit {
@@ -1534,7 +1588,7 @@ where
             return DotCommandResult::Continue;
         };
 
-        match Connection::open(&path) {
+        match Connection::open(&path).await {
             Ok(new_connection) => {
                 *connection = new_connection;
                 *current_db_path = path;
@@ -1554,7 +1608,9 @@ where
             filter.as_deref(),
             shell_options.colorize_prompts,
             out,
-        ) {
+        )
+        .await
+        {
             let _ = writeln!(err, "error: {error}");
             *had_error = true;
         }
@@ -1568,7 +1624,9 @@ where
             filter.as_deref(),
             shell_options.colorize_prompts,
             out,
-        ) {
+        )
+        .await
+        {
             let _ = writeln!(err, "error: {error}");
             *had_error = true;
         }
@@ -1577,7 +1635,7 @@ where
 
     if let Some(arg) = dot_command_arg(trimmed, ".tables") {
         let filter = parse_optional_quoted_arg(arg);
-        if let Err(error) = write_tables(connection, filter.as_deref(), out) {
+        if let Err(error) = write_tables(connection, filter.as_deref(), out).await {
             let _ = writeln!(err, "error: {error}");
             *had_error = true;
         }
@@ -1668,7 +1726,11 @@ fn parse_on_off(raw: &str) -> Option<bool> {
     }
 }
 
-fn write_tables<W>(connection: &Connection, filter: Option<&str>, out: &mut W) -> Result<(), String>
+async fn write_tables<W>(
+    connection: &Connection,
+    filter: Option<&str>,
+    out: &mut W,
+) -> Result<(), String>
 where
     W: Write,
 {
@@ -1688,9 +1750,11 @@ where
 
     let rows = match filter {
         Some(filter) => {
-            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+            connection
+                .query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
         }
-        None => connection.query(sql),
+        None => connection.query(sql).await,
     }
     .map_err(|error| error.to_string())?;
 
@@ -1705,7 +1769,7 @@ where
     Ok(())
 }
 
-fn write_schema<W>(
+async fn write_schema<W>(
     connection: &Connection,
     filter: Option<&str>,
     colorize_sql: bool,
@@ -1744,9 +1808,11 @@ where
 
     let rows = match filter {
         Some(filter) => {
-            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+            connection
+                .query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
         }
-        None => connection.query(sql),
+        None => connection.query(sql).await,
     }
     .map_err(|error| error.to_string())?;
 
@@ -1760,7 +1826,7 @@ where
     Ok(())
 }
 
-fn write_dump<W>(
+async fn write_dump<W>(
     connection: &Connection,
     filter: Option<&str>,
     colorize_sql: bool,
@@ -1811,9 +1877,12 @@ where
         END, name";
 
     let table_rows = match filter {
-        Some(filter) => connection
-            .query_with_params(filtered_table_sql, &[SqliteValue::from(filter.to_owned())]),
-        None => connection.query(table_sql),
+        Some(filter) => {
+            connection
+                .query_with_params(filtered_table_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
+        }
+        None => connection.query(table_sql).await,
     }
     .map_err(|error| error.to_string())?;
 
@@ -1838,6 +1907,7 @@ where
         let quoted_table = quote_identifier(table_name);
         let rows = connection
             .query(&format!("SELECT * FROM {quoted_table};"))
+            .await
             .map_err(|error| error.to_string())?;
         for row in rows {
             writeln!(
@@ -1853,12 +1923,15 @@ where
         }
     }
 
-    write_sqlite_sequence_dump(connection, filter, colorize_sql, out)?;
+    write_sqlite_sequence_dump(connection, filter, colorize_sql, out).await?;
 
     let object_rows = match filter {
-        Some(filter) => connection
-            .query_with_params(filtered_object_sql, &[SqliteValue::from(filter.to_owned())]),
-        None => connection.query(object_sql),
+        Some(filter) => {
+            connection
+                .query_with_params(filtered_object_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
+        }
+        None => connection.query(object_sql).await,
     }
     .map_err(|error| error.to_string())?;
 
@@ -1873,7 +1946,7 @@ where
     Ok(())
 }
 
-fn write_sqlite_sequence_dump<W>(
+async fn write_sqlite_sequence_dump<W>(
     connection: &Connection,
     filter: Option<&str>,
     colorize_sql: bool,
@@ -1887,6 +1960,7 @@ where
             "SELECT name FROM sqlite_schema \
              WHERE type = 'table' AND name = 'sqlite_sequence'",
         )
+        .await
         .map_err(|error| error.to_string())?;
     if exists.is_empty() {
         return Ok(());
@@ -1900,9 +1974,11 @@ where
         ORDER BY name";
     let rows = match filter {
         Some(filter) => {
-            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+            connection
+                .query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
         }
-        None => connection.query(sql),
+        None => connection.query(sql).await,
     }
     .map_err(|error| error.to_string())?;
     if rows.is_empty() {
@@ -2473,8 +2549,9 @@ mod tests {
 
     #[test]
     fn test_repl_accepts_multi_line_trigger() {
-        let mut input = Cursor::new(
-            b"CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);\n\
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b"CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);\n\
 CREATE TABLE audit(item_id INTEGER, v TEXT);\n\
 CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN\n\
   INSERT INTO audit VALUES(NEW.id, NEW.v);\n\
@@ -2482,53 +2559,56 @@ END;\n\
 INSERT INTO items(v) VALUES('hello');\n\
 SELECT item_id, v FROM audit;\n\
 .quit\n"
-                .to_vec(),
-        );
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
 
-        let stderr = String::from_utf8_lossy(&err);
-        assert_eq!(exit_code, 0, "stderr: {stderr}");
-        assert!(err.is_empty(), "unexpected stderr: {stderr}");
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(
-            stdout.contains("hello"),
-            "trigger should have fired and audit row should be selected, got: {stdout}"
-        );
+            let stderr = String::from_utf8_lossy(&err);
+            assert_eq!(exit_code, 0, "stderr: {stderr}");
+            assert!(err.is_empty(), "unexpected stderr: {stderr}");
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(
+                stdout.contains("hello"),
+                "trigger should have fired and audit row should be selected, got: {stdout}"
+            );
+        });
     }
 
     #[test]
     fn test_dump_emits_foreign_keys_off_and_nonfinite_reals() {
-        let mut input = Cursor::new(
-            b"CREATE TABLE r(x REAL);\n\
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b"CREATE TABLE r(x REAL);\n\
 INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
 .dump\n\
 .quit\n"
-                .to_vec(),
-        );
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
 
-        assert_eq!(exit_code, 0);
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(
-            stdout.contains("PRAGMA foreign_keys=OFF;"),
-            "dump must disable FK enforcement for reload, got: {stdout}"
-        );
-        assert!(
-            stdout.contains("9.0e+999"),
-            "infinite REAL must dump as a parseable literal, got: {stdout}"
-        );
-        assert!(
-            !stdout.contains("Inf"),
-            "raw Inf is not a valid SQL literal, got: {stdout}"
-        );
+            assert_eq!(exit_code, 0);
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(
+                stdout.contains("PRAGMA foreign_keys=OFF;"),
+                "dump must disable FK enforcement for reload, got: {stdout}"
+            );
+            assert!(
+                stdout.contains("9.0e+999"),
+                "infinite REAL must dump as a parseable literal, got: {stdout}"
+            );
+            assert!(
+                !stdout.contains("Inf"),
+                "raw Inf is not a valid SQL literal, got: {stdout}"
+            );
+        });
     }
 
     #[test]
@@ -2540,587 +2620,643 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
 
     #[test]
     fn test_format_row_joins_with_pipes() {
-        let mut input = Cursor::new(Vec::<u8>::new());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![
-            OsString::from("fsqlite"),
-            OsString::from("-c"),
-            OsString::from("SELECT 1, 'x';"),
-        ];
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        assert_eq!(exit_code, 0);
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![
+                OsString::from("fsqlite"),
+                OsString::from("-c"),
+                OsString::from("SELECT 1, 'x';"),
+            ];
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            assert_eq!(exit_code, 0);
 
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(
-            stdout.contains("1 | 'x'"),
-            "expected rendered row in output, got: {stdout}",
-        );
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(
+                stdout.contains("1 | 'x'"),
+                "expected rendered row in output, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_version_flag_prints_binary_version_without_opening_database() {
-        let mut input = Cursor::new(Vec::<u8>::new());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite"), OsString::from("--version")];
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite"), OsString::from("--version")];
 
-        let exit_code =
-            run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch());
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let exit_code =
+                run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch())
+                    .await;
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
-        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
-        assert_eq!(
-            stdout.trim(),
-            format!("fsqlite {}", env!("CARGO_PKG_VERSION"))
-        );
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert_eq!(
+                stdout.trim(),
+                format!("fsqlite {}", env!("CARGO_PKG_VERSION"))
+            );
+        });
     }
 
     #[test]
     fn test_repl_quit_command_exits_cleanly() {
-        let mut input = Cursor::new(b".quit\n".to_vec());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(b".quit\n".to_vec());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+        });
     }
 
     #[test]
     fn test_repl_executes_statement_then_quits() {
-        let mut input = Cursor::new(b"SELECT 7;\n.quit\n".to_vec());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(b"SELECT 7;\n.quit\n".to_vec());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(stdout.contains('7'), "expected query result in output");
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(stdout.contains('7'), "expected query result in output");
+        });
     }
 
     #[test]
     fn test_batch_mode_suppresses_prompts() {
-        let mut input = Cursor::new(b"SELECT 7;\n".to_vec());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(b"SELECT 7;\n".to_vec());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code =
-            run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch());
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let exit_code =
+                run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch())
+                    .await;
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(stdout.contains('7'), "expected query result in output");
-        assert!(
-            !stdout.contains("fsqlite> ") && !stdout.contains("   ...> "),
-            "batch mode should not render prompts, got: {stdout}",
-        );
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(stdout.contains('7'), "expected query result in output");
+            assert!(
+                !stdout.contains("fsqlite> ") && !stdout.contains("   ...> "),
+                "batch mode should not render prompts, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_command_mode_sql_error_returns_failure_exit_code() {
-        let mut input = Cursor::new(Vec::<u8>::new());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![
-            OsString::from("fsqlite"),
-            OsString::from("-c"),
-            OsString::from("SELECT * FROM missing_table;"),
-        ];
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![
+                OsString::from("fsqlite"),
+                OsString::from("-c"),
+                OsString::from("SELECT * FROM missing_table;"),
+            ];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        assert_eq!(exit_code, 1);
-        let stderr = String::from_utf8(err).expect("stderr should be utf-8");
-        assert!(
-            stderr.contains("missing_table") || stderr.contains("no such table"),
-            "expected SQL failure in stderr, got: {stderr}",
-        );
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            assert_eq!(exit_code, 1);
+            let stderr = String::from_utf8(err).expect("stderr should be utf-8");
+            assert!(
+                stderr.contains("missing_table") || stderr.contains("no such table"),
+                "expected SQL failure in stderr, got: {stderr}",
+            );
+        });
     }
 
     #[test]
     fn test_batch_mode_read_error_returns_failure_exit_code() {
-        let mut input = Cursor::new(b".read /definitely/missing/path.sql\n".to_vec());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(b".read /definitely/missing/path.sql\n".to_vec());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code =
-            run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch());
-        assert_eq!(exit_code, 1);
-        let stderr = String::from_utf8(err).expect("stderr should be utf-8");
-        assert!(
-            stderr.contains("error:"),
-            "expected .read failure in stderr, got: {stderr}",
-        );
+            let exit_code =
+                run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch())
+                    .await;
+            assert_eq!(exit_code, 1);
+            let stderr = String::from_utf8(err).expect("stderr should be utf-8");
+            assert!(
+                stderr.contains("error:"),
+                "expected .read failure in stderr, got: {stderr}",
+            );
+        });
     }
 
     #[test]
     fn test_repl_read_line_interrupted_keeps_shell_running() {
-        let mut input = InterruptOnceBufRead::new(b".quit\n".to_vec());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+        asupersync::test_utils::run_test(|| async {
+            let mut input = InterruptOnceBufRead::new(b".quit\n".to_vec());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+        });
     }
 
     #[test]
     fn test_repl_read_command_executes_sql_from_file() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after UNIX_EPOCH");
-        let file_name = format!(
-            "fsqlite_cli_read_{}_{}.sql",
-            std::process::id(),
-            now.as_nanos()
-        );
-        let path = std::env::temp_dir().join(file_name);
+        asupersync::test_utils::run_test(|| async {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after UNIX_EPOCH");
+            let file_name = format!(
+                "fsqlite_cli_read_{}_{}.sql",
+                std::process::id(),
+                now.as_nanos()
+            );
+            let path = std::env::temp_dir().join(file_name);
 
-        fs::write(&path, "SELECT 42;\n").expect("temp SQL file should be writable");
+            fs::write(&path, "SELECT 42;\n").expect("temp SQL file should be writable");
 
-        let input_script = format!(".read {}\n.quit\n", path.display());
-        let mut input = Cursor::new(input_script.into_bytes());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+            let input_script = format!(".read {}\n.quit\n", path.display());
+            let mut input = Cursor::new(input_script.into_bytes());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        let _ = fs::remove_file(&path);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            let _ = fs::remove_file(&path);
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(
-            stdout.contains("42"),
-            "expected .read query output in stdout"
-        );
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(
+                stdout.contains("42"),
+                "expected .read query output in stdout"
+            );
+        });
     }
 
     #[test]
     fn test_repl_read_command_requires_path() {
-        let mut input = Cursor::new(b".read\n.quit\n".to_vec());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(b".read\n.quit\n".to_vec());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        assert_eq!(exit_code, 0);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            assert_eq!(exit_code, 0);
 
-        let stderr = String::from_utf8(err).expect("stderr should be utf-8");
-        assert!(
-            stderr.contains(".read requires a file path"),
-            "expected .read path error in stderr",
-        );
+            let stderr = String::from_utf8(err).expect("stderr should be utf-8");
+            assert!(
+                stderr.contains(".read requires a file path"),
+                "expected .read path error in stderr",
+            );
+        });
     }
 
     #[test]
     fn test_init_file_executes_before_command_mode() {
-        let path = unique_temp_path("fsqlite_cli_init", "sql");
-        fs::write(
-            &path,
-            "CREATE TABLE seeded(id INTEGER PRIMARY KEY);\nINSERT INTO seeded VALUES(1);\n",
-        )
-        .expect("startup SQL file should be writable");
+        asupersync::test_utils::run_test(|| async {
+            let path = unique_temp_path("fsqlite_cli_init", "sql");
+            fs::write(
+                &path,
+                "CREATE TABLE seeded(id INTEGER PRIMARY KEY);\nINSERT INTO seeded VALUES(1);\n",
+            )
+            .expect("startup SQL file should be writable");
 
-        let mut input = Cursor::new(Vec::<u8>::new());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![
-            OsString::from("fsqlite"),
-            OsString::from("--init"),
-            path.as_os_str().to_os_string(),
-            OsString::from("-c"),
-            OsString::from("SELECT COUNT(*) AS n FROM seeded;"),
-        ];
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![
+                OsString::from("fsqlite"),
+                OsString::from("--init"),
+                path.as_os_str().to_os_string(),
+                OsString::from("-c"),
+                OsString::from("SELECT COUNT(*) AS n FROM seeded;"),
+            ];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        let _ = fs::remove_file(&path);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            let _ = fs::remove_file(&path);
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
-        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
-        assert!(
-            stdout.contains('1'),
-            "expected startup script side effects in command mode, got: {stdout}",
-        );
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains('1'),
+                "expected startup script side effects in command mode, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_repl_open_command_switches_database() {
-        let path = unique_temp_path("fsqlite_cli_open", "db");
-        let input_script = format!(
-            "CREATE TABLE before_open(id INTEGER);\n.open {}\nSELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'before_open';\n.quit\n",
-            path.display()
-        );
-        let mut input = Cursor::new(input_script.into_bytes());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+        asupersync::test_utils::run_test(|| async {
+            let path = unique_temp_path("fsqlite_cli_open", "db");
+            let input_script = format!(
+                "CREATE TABLE before_open(id INTEGER);\n.open {}\nSELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'before_open';\n.quit\n",
+                path.display()
+            );
+            let mut input = Cursor::new(input_script.into_bytes());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        let _ = fs::remove_file(&path);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            let _ = fs::remove_file(&path);
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(
-            stdout.contains('0'),
-            "expected .open to switch to a fresh database, got: {stdout}",
-        );
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(
+                stdout.contains('0'),
+                "expected .open to switch to a fresh database, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_tables_command_lists_tables_and_views() {
-        let mut input = Cursor::new(
-            b"CREATE TABLE widgets(id INTEGER PRIMARY KEY);\n\
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b"CREATE TABLE widgets(id INTEGER PRIMARY KEY);\n\
 CREATE VIEW widget_names AS SELECT id FROM widgets;\n\
 .tables\n\
 .quit\n"
-                .to_vec(),
-        );
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
-        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
-        assert!(
-            stdout.contains("widget_names") && stdout.contains("widgets"),
-            "expected .tables output to include tables and views, got: {stdout}",
-        );
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains("widget_names") && stdout.contains("widgets"),
+                "expected .tables output to include tables and views, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_mode_and_header_commands_affect_query_rendering() {
-        let mut input = Cursor::new(
-            b".mode column\n\
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b".mode column\n\
 .header on\n\
 SELECT 1 AS one, 'x' AS two;\n\
 .quit\n"
-                .to_vec(),
-        );
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
-        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
-        assert!(
-            stdout.contains("one") && stdout.contains("two"),
-            "expected headers in column mode output, got: {stdout}",
-        );
-        assert!(
-            stdout.contains("1") && stdout.contains("'x'"),
-            "expected row data in column mode output, got: {stdout}",
-        );
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains("one") && stdout.contains("two"),
+                "expected headers in column mode output, got: {stdout}",
+            );
+            assert!(
+                stdout.contains("1") && stdout.contains("'x'"),
+                "expected row data in column mode output, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_mode_csv_uses_raw_text_and_header_row() {
-        let mut input = Cursor::new(
-            b".mode csv\n\
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b".mode csv\n\
 .header on\n\
 SELECT 1 AS one, 'two,three' AS two;\n\
 .quit\n"
-                .to_vec(),
-        );
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
-        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
-        assert!(
-            stdout.contains("one,two"),
-            "expected CSV header row, got: {stdout}",
-        );
-        assert!(
-            stdout.contains("1,\"two,three\""),
-            "expected CSV value escaping without SQL quotes, got: {stdout}",
-        );
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains("one,two"),
+                "expected CSV header row, got: {stdout}",
+            );
+            assert!(
+                stdout.contains("1,\"two,three\""),
+                "expected CSV value escaping without SQL quotes, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_headers_alias_toggles_header_output() {
-        let mut input = Cursor::new(
-            b".mode column\n\
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b".mode column\n\
 .headers on\n\
 SELECT 1 AS one, 'x' AS two;\n\
 .quit\n"
-                .to_vec(),
-        );
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
-        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
-        assert!(
-            stdout.contains("one") && stdout.contains("two"),
-            "expected .headers alias to enable column headers, got: {stdout}",
-        );
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains("one") && stdout.contains("two"),
+                "expected .headers alias to enable column headers, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_command_mode_dot_schema_supports_filtering() {
-        let path = unique_temp_path("fsqlite_cli_schema", "db");
-        let path_text = path.to_string_lossy().into_owned();
-        let conn = fsqlite::Connection::open(path_text.clone()).expect("connection should open");
-        conn.query("CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT);")
-            .expect("create widgets table");
-        conn.query("CREATE TABLE gadgets(id INTEGER PRIMARY KEY, name TEXT);")
-            .expect("create gadgets table");
-        drop(conn);
+        asupersync::test_utils::run_test(|| async {
+            let path = unique_temp_path("fsqlite_cli_schema", "db");
+            let path_text = path.to_string_lossy().into_owned();
+            let conn = fsqlite::Connection::open(path_text.clone())
+                .await
+                .expect("connection should open");
+            conn.query("CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT);")
+                .await
+                .expect("create widgets table");
+            conn.query("CREATE TABLE gadgets(id INTEGER PRIMARY KEY, name TEXT);")
+                .await
+                .expect("create gadgets table");
+            drop(conn);
 
-        let mut input = Cursor::new(Vec::<u8>::new());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![
-            OsString::from("fsqlite"),
-            OsString::from(path_text),
-            OsString::from("-c"),
-            OsString::from(".schema widgets"),
-        ];
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![
+                OsString::from("fsqlite"),
+                OsString::from(path_text),
+                OsString::from("-c"),
+                OsString::from(".schema widgets"),
+            ];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        let _ = fs::remove_file(&path);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            let _ = fs::remove_file(&path);
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(
-            stdout.contains("CREATE TABLE widgets"),
-            "expected widgets schema in output, got: {stdout}",
-        );
-        assert!(
-            !stdout.contains("CREATE TABLE gadgets"),
-            "unexpected gadgets schema in filtered output: {stdout}",
-        );
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(
+                stdout.contains("CREATE TABLE widgets"),
+                "expected widgets schema in output, got: {stdout}",
+            );
+            assert!(
+                !stdout.contains("CREATE TABLE gadgets"),
+                "unexpected gadgets schema in filtered output: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_repl_dump_command_emits_schema_and_escaped_values() {
-        let mut input = Cursor::new(
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
             b"CREATE TABLE notes(id INTEGER PRIMARY KEY, name TEXT, payload BLOB, note TEXT);\n\
 INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
 .dump\n\
 .quit\n"
                 .to_vec(),
         );
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let exit_code = run(args, &mut input, &mut out, &mut err);
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
 
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
-        let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(
-            stdout.contains("BEGIN TRANSACTION;"),
-            "expected transaction header in dump, got: {stdout}",
-        );
-        assert!(
-            stdout.contains("CREATE TABLE notes"),
-            "expected table DDL in dump, got: {stdout}",
-        );
-        assert!(
-            stdout.contains("INSERT INTO \"notes\" VALUES(1, 'O''Malley', X'0102', NULL);"),
-            "expected escaped INSERT in dump, got: {stdout}",
-        );
-        assert!(
-            stdout.contains("COMMIT;"),
-            "expected transaction trailer in dump, got: {stdout}",
-        );
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(
+                stdout.contains("BEGIN TRANSACTION;"),
+                "expected transaction header in dump, got: {stdout}",
+            );
+            assert!(
+                stdout.contains("CREATE TABLE notes"),
+                "expected table DDL in dump, got: {stdout}",
+            );
+            assert!(
+                stdout.contains("INSERT INTO \"notes\" VALUES(1, 'O''Malley', X'0102', NULL);"),
+                "expected escaped INSERT in dump, got: {stdout}",
+            );
+            assert!(
+                stdout.contains("COMMIT;"),
+                "expected transaction trailer in dump, got: {stdout}",
+            );
+        });
     }
 
     #[test]
     fn test_dump_preserves_autoincrement_sequence_for_restore() {
-        let mut dump_input = Cursor::new(
-            b"CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
+        asupersync::test_utils::run_test(|| async {
+            let mut dump_input = Cursor::new(
+                b"CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
 INSERT INTO ai(name) VALUES('a');\n\
 INSERT INTO ai(name) VALUES('b');\n\
 DELETE FROM ai WHERE id = 2;\n\
 .dump\n"
-                .to_vec(),
-        );
-        let mut dump_out = Vec::new();
-        let mut dump_err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+                    .to_vec(),
+            );
+            let mut dump_out = Vec::new();
+            let mut dump_err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let dump_exit = run_with_shell_options(
-            args,
-            &mut dump_input,
-            &mut dump_out,
-            &mut dump_err,
-            ShellOptions::batch(),
-        );
-        assert_eq!(dump_exit, 0);
-        assert!(
-            dump_err.is_empty(),
-            "unexpected dump stderr: {:?}",
-            dump_err
-        );
+            let dump_exit = run_with_shell_options(
+                args,
+                &mut dump_input,
+                &mut dump_out,
+                &mut dump_err,
+                ShellOptions::batch(),
+            )
+            .await;
+            assert_eq!(dump_exit, 0);
+            assert!(
+                dump_err.is_empty(),
+                "unexpected dump stderr: {:?}",
+                dump_err
+            );
 
-        let dump = String::from_utf8(dump_out).expect("dump output should be utf-8");
-        assert!(
-            dump.contains("DELETE FROM sqlite_sequence;"),
-            "expected dump to reset sqlite_sequence before restoring AUTOINCREMENT state: {dump}",
-        );
-        assert!(
-            dump.contains("INSERT INTO \"sqlite_sequence\" VALUES('ai', 2);"),
-            "expected dump to preserve AUTOINCREMENT high-water mark: {dump}",
-        );
+            let dump = String::from_utf8(dump_out).expect("dump output should be utf-8");
+            assert!(
+                dump.contains("DELETE FROM sqlite_sequence;"),
+                "expected dump to reset sqlite_sequence before restoring AUTOINCREMENT state: {dump}",
+            );
+            assert!(
+                dump.contains("INSERT INTO \"sqlite_sequence\" VALUES('ai', 2);"),
+                "expected dump to preserve AUTOINCREMENT high-water mark: {dump}",
+            );
 
-        let restore_script = format!(
-            "{dump}\n\
+            let restore_script = format!(
+                "{dump}\n\
 INSERT INTO ai(name) VALUES('c');\n\
 SELECT id FROM ai WHERE name = 'c';\n"
-        );
-        let mut restore_input = Cursor::new(restore_script.into_bytes());
-        let mut restore_out = Vec::new();
-        let mut restore_err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+            );
+            let mut restore_input = Cursor::new(restore_script.into_bytes());
+            let mut restore_out = Vec::new();
+            let mut restore_err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let restore_exit = run_with_shell_options(
-            args,
-            &mut restore_input,
-            &mut restore_out,
-            &mut restore_err,
-            ShellOptions::batch(),
-        );
-        assert_eq!(restore_exit, 0);
-        assert!(
-            restore_err.is_empty(),
-            "unexpected restore stderr: {:?}",
-            restore_err
-        );
+            let restore_exit = run_with_shell_options(
+                args,
+                &mut restore_input,
+                &mut restore_out,
+                &mut restore_err,
+                ShellOptions::batch(),
+            )
+            .await;
+            assert_eq!(restore_exit, 0);
+            assert!(
+                restore_err.is_empty(),
+                "unexpected restore stderr: {:?}",
+                restore_err
+            );
 
-        let restored = String::from_utf8(restore_out).expect("restore output should be utf-8");
-        assert!(
-            restored.lines().any(|line| line.trim() == "3"),
-            "restored AUTOINCREMENT table should continue at id=3, got: {restored}",
-        );
+            let restored = String::from_utf8(restore_out).expect("restore output should be utf-8");
+            assert!(
+                restored.lines().any(|line| line.trim() == "3"),
+                "restored AUTOINCREMENT table should continue at id=3, got: {restored}",
+            );
+        });
     }
 
     #[test]
     fn test_filtered_dump_does_not_reset_unrelated_autoincrement_sequence() {
-        let mut dump_input = Cursor::new(
-            b"CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
+        asupersync::test_utils::run_test(|| async {
+            let mut dump_input = Cursor::new(
+                b"CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
 INSERT INTO ai(name) VALUES('a');\n\
 INSERT INTO ai(name) VALUES('b');\n\
 DELETE FROM ai WHERE id = 2;\n\
 .dump ai\n"
-                .to_vec(),
-        );
-        let mut dump_out = Vec::new();
-        let mut dump_err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+                    .to_vec(),
+            );
+            let mut dump_out = Vec::new();
+            let mut dump_err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let dump_exit = run_with_shell_options(
-            args,
-            &mut dump_input,
-            &mut dump_out,
-            &mut dump_err,
-            ShellOptions::batch(),
-        );
-        assert_eq!(dump_exit, 0);
-        assert!(
-            dump_err.is_empty(),
-            "unexpected dump stderr: {:?}",
-            dump_err
-        );
+            let dump_exit = run_with_shell_options(
+                args,
+                &mut dump_input,
+                &mut dump_out,
+                &mut dump_err,
+                ShellOptions::batch(),
+            )
+            .await;
+            assert_eq!(dump_exit, 0);
+            assert!(
+                dump_err.is_empty(),
+                "unexpected dump stderr: {:?}",
+                dump_err
+            );
 
-        let dump = String::from_utf8(dump_out).expect("dump output should be utf-8");
-        assert!(
-            !dump.contains("DELETE FROM sqlite_sequence;"),
-            "filtered dump must not clear unrelated sqlite_sequence rows: {dump}",
-        );
-        assert!(
-            dump.contains("DELETE FROM sqlite_sequence WHERE name = 'ai';"),
-            "filtered dump should reset only the dumped table sequence row: {dump}",
-        );
+            let dump = String::from_utf8(dump_out).expect("dump output should be utf-8");
+            assert!(
+                !dump.contains("DELETE FROM sqlite_sequence;"),
+                "filtered dump must not clear unrelated sqlite_sequence rows: {dump}",
+            );
+            assert!(
+                dump.contains("DELETE FROM sqlite_sequence WHERE name = 'ai';"),
+                "filtered dump should reset only the dumped table sequence row: {dump}",
+            );
 
-        let restore_script = format!(
-            "CREATE TABLE keep(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
+            let restore_script = format!(
+                "CREATE TABLE keep(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
 INSERT INTO keep(name) VALUES('k1');\n\
 INSERT INTO keep(name) VALUES('k2');\n\
 DELETE FROM keep WHERE id = 2;\n\
 {dump}\n\
 INSERT INTO keep(name) VALUES('k3');\n\
 SELECT id FROM keep WHERE name = 'k3';\n"
-        );
-        let mut restore_input = Cursor::new(restore_script.into_bytes());
-        let mut restore_out = Vec::new();
-        let mut restore_err = Vec::new();
-        let args = vec![OsString::from("fsqlite")];
+            );
+            let mut restore_input = Cursor::new(restore_script.into_bytes());
+            let mut restore_out = Vec::new();
+            let mut restore_err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
 
-        let restore_exit = run_with_shell_options(
-            args,
-            &mut restore_input,
-            &mut restore_out,
-            &mut restore_err,
-            ShellOptions::batch(),
-        );
-        assert_eq!(restore_exit, 0);
-        assert!(
-            restore_err.is_empty(),
-            "unexpected restore stderr: {:?}",
-            restore_err
-        );
+            let restore_exit = run_with_shell_options(
+                args,
+                &mut restore_input,
+                &mut restore_out,
+                &mut restore_err,
+                ShellOptions::batch(),
+            )
+            .await;
+            assert_eq!(restore_exit, 0);
+            assert!(
+                restore_err.is_empty(),
+                "unexpected restore stderr: {:?}",
+                restore_err
+            );
 
-        let restored = String::from_utf8(restore_out).expect("restore output should be utf-8");
-        assert!(
-            restored.lines().any(|line| line.trim() == "3"),
-            "filtered restore should preserve unrelated AUTOINCREMENT sequence state, got: {restored}",
-        );
+            let restored = String::from_utf8(restore_out).expect("restore output should be utf-8");
+            assert!(
+                restored.lines().any(|line| line.trim() == "3"),
+                "filtered restore should preserve unrelated AUTOINCREMENT sequence state, got: {restored}",
+            );
+        });
     }
 
     #[test]
     fn test_format_row_helper_with_connection_row() {
-        let mut input = Cursor::new(Vec::<u8>::new());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![
-            OsString::from("fsqlite"),
-            OsString::from("-c"),
-            OsString::from("SELECT NULL;"),
-        ];
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        assert_eq!(exit_code, 0);
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![
+                OsString::from("fsqlite"),
+                OsString::from("-c"),
+                OsString::from("SELECT NULL;"),
+            ];
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            assert_eq!(exit_code, 0);
 
-        // Also directly exercise `format_row` on a real row.
-        let conn = fsqlite::Connection::open(":memory:").expect("connection should open");
-        let row = conn
-            .query_row("SELECT 10, 'abc', NULL;")
-            .expect("query_row should succeed");
-        let rendered = format_row(&row);
-        assert_eq!(rendered, "10 | 'abc' | NULL");
+            // Also directly exercise `format_row` on a real row.
+            let conn = fsqlite::Connection::open(":memory:")
+                .await
+                .expect("connection should open");
+            let row = conn
+                .query_row("SELECT 10, 'abc', NULL;")
+                .await
+                .expect("query_row should succeed");
+            let rendered = format_row(&row);
+            assert_eq!(rendered, "10 | 'abc' | NULL");
+        });
     }
 
     #[test]
@@ -3176,113 +3312,119 @@ SELECT id FROM keep WHERE name = 'k3';\n"
 
     #[test]
     fn test_verify_proof_cli_success() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after UNIX_EPOCH");
-        let file_name = format!(
-            "fsqlite_cli_verify_proof_ok_{}_{}.json",
-            std::process::id(),
-            now.as_nanos()
-        );
-        let path = std::env::temp_dir().join(file_name);
+        asupersync::test_utils::run_test(|| async {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after UNIX_EPOCH");
+            let file_name = format!(
+                "fsqlite_cli_verify_proof_ok_{}_{}.json",
+                std::process::id(),
+                now.as_nanos()
+            );
+            let path = std::env::temp_dir().join(file_name);
 
-        let oid = ObjectId::derive_from_canonical_bytes(b"cli-proof-ok");
-        let symbol_digests = vec![
-            SymbolDigest {
-                esi: 0,
-                digest_xxh3: 101,
-            },
-            SymbolDigest {
-                esi: 1,
-                digest_xxh3: 202,
-            },
-        ];
-        let rejected = vec![RejectedSymbol {
-            esi: 9,
-            reason: SymbolRejectionReason::HashMismatch,
-        }];
-        let proof = EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3, 4, 5], true, Some(4), 1, 42)
-            .with_symbol_digests(symbol_digests.clone())
-            .with_rejected_symbols(rejected.clone());
-        let payload = json!({
-            "proof": proof,
-            "symbol_digests": symbol_digests,
-            "rejected_symbols": rejected
+            let oid = ObjectId::derive_from_canonical_bytes(b"cli-proof-ok");
+            let symbol_digests = vec![
+                SymbolDigest {
+                    esi: 0,
+                    digest_xxh3: 101,
+                },
+                SymbolDigest {
+                    esi: 1,
+                    digest_xxh3: 202,
+                },
+            ];
+            let rejected = vec![RejectedSymbol {
+                esi: 9,
+                reason: SymbolRejectionReason::HashMismatch,
+            }];
+            let proof =
+                EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3, 4, 5], true, Some(4), 1, 42)
+                    .with_symbol_digests(symbol_digests.clone())
+                    .with_rejected_symbols(rejected.clone());
+            let payload = json!({
+                "proof": proof,
+                "symbol_digests": symbol_digests,
+                "rejected_symbols": rejected
+            });
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&payload).expect("serialize proof payload"),
+            )
+            .expect("write verify-proof payload");
+
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![
+                OsString::from("fsqlite"),
+                OsString::from("--verify-proof"),
+                path.as_os_str().to_os_string(),
+            ];
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            let _ = fs::remove_file(&path);
+
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains("\"ok\": true"),
+                "expected successful verification report, got: {stdout}",
+            );
         });
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&payload).expect("serialize proof payload"),
-        )
-        .expect("write verify-proof payload");
-
-        let mut input = Cursor::new(Vec::<u8>::new());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![
-            OsString::from("fsqlite"),
-            OsString::from("--verify-proof"),
-            path.as_os_str().to_os_string(),
-        ];
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(exit_code, 0);
-        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
-        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
-        assert!(
-            stdout.contains("\"ok\": true"),
-            "expected successful verification report, got: {stdout}",
-        );
     }
 
     #[test]
     fn test_verify_proof_cli_failure_on_policy_mismatch() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after UNIX_EPOCH");
-        let file_name = format!(
-            "fsqlite_cli_verify_proof_fail_{}_{}.json",
-            std::process::id(),
-            now.as_nanos()
-        );
-        let path = std::env::temp_dir().join(file_name);
+        asupersync::test_utils::run_test(|| async {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after UNIX_EPOCH");
+            let file_name = format!(
+                "fsqlite_cli_verify_proof_fail_{}_{}.json",
+                std::process::id(),
+                now.as_nanos()
+            );
+            let path = std::env::temp_dir().join(file_name);
 
-        let oid = ObjectId::derive_from_canonical_bytes(b"cli-proof-fail");
-        let proof = EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3, 4, 5], true, Some(4), 1, 42);
-        let payload = json!({
-            "proof": proof,
-            "symbol_digests": [],
-            "rejected_symbols": []
+            let oid = ObjectId::derive_from_canonical_bytes(b"cli-proof-fail");
+            let proof =
+                EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3, 4, 5], true, Some(4), 1, 42);
+            let payload = json!({
+                "proof": proof,
+                "symbol_digests": [],
+                "rejected_symbols": []
+            });
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&payload).expect("serialize proof payload"),
+            )
+            .expect("write verify-proof payload");
+
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![
+                OsString::from("fsqlite"),
+                OsString::from("--verify-proof"),
+                path.as_os_str().to_os_string(),
+                OsString::from("--verify-policy-id"),
+                OsString::from("999"),
+            ];
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+            let _ = fs::remove_file(&path);
+
+            assert_eq!(exit_code, 1);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains("policy_id_mismatch"),
+                "expected policy mismatch in report, got: {stdout}",
+            );
+            let stderr = String::from_utf8(err).expect("stderr should be utf-8");
+            assert!(
+                stderr.contains("proof verification failed"),
+                "expected failure summary in stderr, got: {stderr}",
+            );
         });
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&payload).expect("serialize proof payload"),
-        )
-        .expect("write verify-proof payload");
-
-        let mut input = Cursor::new(Vec::<u8>::new());
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let args = vec![
-            OsString::from("fsqlite"),
-            OsString::from("--verify-proof"),
-            path.as_os_str().to_os_string(),
-            OsString::from("--verify-policy-id"),
-            OsString::from("999"),
-        ];
-        let exit_code = run(args, &mut input, &mut out, &mut err);
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(exit_code, 1);
-        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
-        assert!(
-            stdout.contains("policy_id_mismatch"),
-            "expected policy mismatch in report, got: {stdout}",
-        );
-        let stderr = String::from_utf8(err).expect("stderr should be utf-8");
-        assert!(
-            stderr.contains("proof verification failed"),
-            "expected failure summary in stderr, got: {stderr}",
-        );
     }
 }

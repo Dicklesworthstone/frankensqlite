@@ -13,8 +13,9 @@
 //! - Maximum load factor: 0.70 (Knuth Vol. 3 analysis for linear probing)
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use fsqlite_types::sync_primitives::{Instant, SystemTime};
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -738,7 +739,7 @@ impl SharedPageLockTable {
             }
 
             let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs());
             let pid = std::process::id();
             let pid_birth = current_process_birth_token(now_secs);
@@ -764,7 +765,7 @@ impl SharedPageLockTable {
         }
 
         let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let pid = std::process::id();
         let pid_birth = current_process_birth_token(now_secs);
@@ -1698,7 +1699,7 @@ mod tests {
     fn test_process_alive_os_rejects_tagged_birth_mismatch() {
         let pid = std::process::id();
         let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let birth = current_process_birth_token(now_secs);
         if birth & PID_BIRTH_PROCFS_TAG == 0 {
@@ -1801,7 +1802,7 @@ mod tests {
         // Hold a live rebuild lease so try_acquire cannot rotate tables.
         let process_id = std::process::id();
         let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let pid_birth = current_process_birth_token(now_secs);
         assert!(

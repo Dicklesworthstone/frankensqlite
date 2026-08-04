@@ -6,6 +6,7 @@
 //! BLOBs the function works in byte space and returns the 1-based byte position;
 //! mixed text/blob arguments are coerced to text; NULL on either side propagates
 //! to NULL; numeric arguments are coerced to their text form. This pins those.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -23,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,12 +57,12 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -85,35 +86,41 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn instr_blob_in_blob() {
-    assert_scalar(
-        &[
-            // X'48656C6C6F' is 'Hello'; X'6C' is 'l' -> byte position 3.
-            "SELECT instr(X'48656C6C6F', X'6C')",
-            // not found -> 0
-            "SELECT instr(X'48656C6C6F', X'7A')",
-            // empty needle -> 1
-            "SELECT instr(X'48656C6C6F', X'')",
-            // empty haystack -> 0
-            "SELECT instr(X'', X'00')",
-            "SELECT typeof(instr(X'4142', X'42'))", // integer
-        ],
-        "instr_blob_in_blob",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                // X'48656C6C6F' is 'Hello'; X'6C' is 'l' -> byte position 3.
+                "SELECT instr(X'48656C6C6F', X'6C')",
+                // not found -> 0
+                "SELECT instr(X'48656C6C6F', X'7A')",
+                // empty needle -> 1
+                "SELECT instr(X'48656C6C6F', X'')",
+                // empty haystack -> 0
+                "SELECT instr(X'', X'00')",
+                "SELECT typeof(instr(X'4142', X'42'))", // integer
+            ],
+            "instr_blob_in_blob",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn instr_null_and_numeric() {
-    assert_scalar(
-        &[
-            "SELECT instr(NULL, 'x')",   // NULL propagation
-            "SELECT instr('abc', NULL)", // NULL propagation
-            "SELECT instr(NULL, NULL)",  // NULL
-            // numeric argument coerced to its text form
-            "SELECT instr(12345, '23')", // '12345' contains '23' at 2 -> 2
-            "SELECT instr(12345, 9)",    // '12345' / '9' -> 0
-            // mixed blob+text: both interpreted as text -> X'4142' = 'AB', find 'B' at 2
-            "SELECT instr(X'4142', 'B')",
-        ],
-        "instr_null_and_numeric",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT instr(NULL, 'x')",   // NULL propagation
+                "SELECT instr('abc', NULL)", // NULL propagation
+                "SELECT instr(NULL, NULL)",  // NULL
+                // numeric argument coerced to its text form
+                "SELECT instr(12345, '23')", // '12345' contains '23' at 2 -> 2
+                "SELECT instr(12345, 9)",    // '12345' / '9' -> 0
+                // mixed blob+text: both interpreted as text -> X'4142' = 'AB', find 'B' at 2
+                "SELECT instr(X'4142', 'B')",
+            ],
+            "instr_null_and_numeric",
+        )
+        .await;
+    });
 }

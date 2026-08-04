@@ -4,7 +4,7 @@
 //! cycle. Invoke with:
 //!
 //! ```text
-//! cargo test -p fsqlite-btree --release --lib quotient_filter_bench -- --ignored --nocapture
+//! cargo test -p fsqlite-btree --profile release-perf --lib quotient_filter_bench -- --ignored --nocapture
 //! ```
 //!
 //! The benchmark models the "10K-row table, 10K DELETE-by-absent-rowid"

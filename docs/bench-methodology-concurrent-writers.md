@@ -3,14 +3,23 @@
 ## TL;DR
 
 `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs::bench_concurrent_writers`
-now runs FrankenSQLite and C SQLite with the same shape: N OS threads, one
-connection per thread, one shared file-backed WAL database, and disjoint rowid
-ranges. Current full-matrix concurrent rows are therefore valid multi-writer
-MVCC measurements.
+runs FrankenSQLite and C SQLite with the same shape: N OS threads, one
+connection per thread, one shared file-backed WAL database, disjoint rowid
+ranges, and — since 2026-07-25 — the same `synchronous=NORMAL` durability on
+both engines' writer connections.
 
-Use `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` (IMPL-4a) when you want the
-standalone scale harness: 1/2/4/8/16-thread reports, separate-table mode,
-startup diagnostics, and pass-over-pass history gates.
+**Do not cite its rows for concurrent-writer speed claims.** Even with the shape
+and durability matched, the section is file-WAL disk-noise-bound: on a shared
+host the C-side 2-writer median has been observed spreading 95-138 ms (CV up to
+104 % at 8 writers), which is larger than the effects being compared. Use
+`crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` (IMPL-4a) for every published
+concurrent-writer number: 1/2/4/8/16-thread reports, separate-table mode,
+startup diagnostics, higher iteration counts, executable self-identification,
+same-invocation C/C null controls, and bootstrap median-CI decisions.
+Pass-over-pass history, CV, and MAD are diagnostics only; none can veto or
+create a verdict.
+See `docs/progress/perf-negative-results.md` (2026-07-23 / 2026-07-25, bd-x5gzk)
+for the full evidence and the retry predicate.
 
 ## Background
 
@@ -62,12 +71,25 @@ against a matched rusqlite WAL-mode workload.
 The numbers it reports are directly comparable because both sides run
 the same count of OS threads performing the same count of transactions.
 
+Since 2026-07-26, one thread-count measurement consists of four independent
+fresh-database arms per paired round: C null A, C null B, C baseline, and
+FrankenSQLite candidate. Odd rounds reverse the execution order. The report
+bootstraps the median of the per-round ratios 10,000 times and calls a result
+only when the claim interval clears twice the measured C/C null radius, with a
+minimum 1% effect. A high CV is printed as provenance and is never a gate.
+
+The benchmark program's first stdout line reports the SHA-256, byte length, and
+path of the executable that is actually running. The next identity line reports
+the benchmark source SHA-256. Record both with every published row; a Cargo
+target path or Git HEAD inferred by the launching shell is not a substitute for
+the running ELF's identity.
+
 ## When to use which bench
 
 | Use case | Use |
 |---|---|
 | Single-connection latency | `comprehensive_bench::bench_*` (all but concurrent_writers) |
-| Full-matrix concurrent row | `comprehensive_bench::bench_concurrent_writers` |
+| Full-matrix concurrent row (smoke only — do not cite) | `comprehensive_bench::bench_concurrent_writers` |
 | Real multi-thread MVCC throughput | `mt_mvcc_bench` (IMPL-4a) |
 | Cross-process conflict | `swarm_multiprocess` / `swarm_peer_visibility` |
 
@@ -78,6 +100,39 @@ file-backed database for shared-table mode, disjoint rowid ranges, prepared
 statements on both engines, and transaction-level retry for transient MVCC
 errors. If you change its workload shape, update this document and the README
 performance artifact citations in the same commit.
+
+**Matched durability is an invariant, not a detail.** `synchronous` is a
+*per-connection* pragma — the setup connection's setting does NOT carry to the
+worker connections. A C SQLite connection that never sets it inherits the
+compiled default `SQLITE_DEFAULT_SYNCHRONOUS=2` (`FULL`), i.e. a real WAL fsync
+on every commit, while FrankenSQLite's `NORMAL` maps to
+`WalCommitSyncPolicy::Deferred` and does no per-commit fsync at all. That
+asymmetry silently flattered FrankenSQLite for the life of the section until it
+was found in 2026-07-23 (bd-x5gzk). Both writer arms now set
+`synchronous=NORMAL` explicitly. `FSQLITE_BENCH_CONCURRENT_SYNC=normal|full`
+forces both engines to the named level together; it must never be used to change
+only one side.
+
+## Current reference invocation
+
+The 2026-07-26 Lane-M reference run used:
+
+```bash
+RCH_WORKER=vmi1149989 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
+  rch exec -- cargo run --profile release-perf -j7 -p fsqlite-e2e \
+  --bin mt-mvcc-bench -- --rows-per-thread=1000 \
+  --threads=1,2,4,8 --iters=21
+
+RCH_WORKER=vmi1149989 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
+  rch exec -- cargo run --profile release-perf -j7 -p fsqlite-e2e \
+  --bin mt-mvcc-bench -- --rows-per-thread=1000 \
+  --threads=1,2,4,8 --iters=21 --separate-tables
+```
+
+The complete null and claim intervals, exact ELF identities, verdicts, and
+retry predicates are recorded in
+`docs/progress/perf-negative-results.md` under the 2026-07-26 matched-sync
+entry. The README reproduces only the compact result tables.
 
 ## Related
 

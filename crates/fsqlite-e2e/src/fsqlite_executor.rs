@@ -917,7 +917,8 @@ fn open_connection(db_path: &Path) -> E2eResult<Connection> {
             .ok_or_else(|| E2eError::Io(std::io::Error::other("path is not valid UTF-8")))?
             .to_owned()
     };
-    Connection::open(&path_str).map_err(|e| E2eError::Fsqlite(format!("open: {e}")))
+    crate::block_on(Connection::open(&path_str))
+        .map_err(|e| E2eError::Fsqlite(format!("open: {e}")))
 }
 
 const FILE_BACKED_DEFAULT_PARITY_PRAGMAS: [&str; 2] = [
@@ -942,8 +943,7 @@ fn config_has_explicit_parity_override(config: &FsqliteExecConfig) -> bool {
 }
 
 fn query_pragma_text(conn: &Connection, pragma: &str) -> E2eResult<String> {
-    let rows = conn
-        .query(pragma)
+    let rows = crate::block_on(conn.query(pragma))
         .map_err(|e| E2eError::Fsqlite(format!("query `{pragma}`: {e}")))?;
     let Some(value) = rows.first().and_then(|row| row.values().first()) else {
         return Err(E2eError::Fsqlite(format!(
@@ -960,14 +960,13 @@ fn query_pragma_text(conn: &Connection, pragma: &str) -> E2eResult<String> {
 }
 
 fn reset_conflict_stats(conn: &Connection) -> E2eResult<()> {
-    conn.query("PRAGMA fsqlite.conflict_reset;")
+    crate::block_on(conn.query("PRAGMA fsqlite.conflict_reset;"))
         .map(|_| ())
         .map_err(|e| E2eError::Fsqlite(format!("query `PRAGMA fsqlite.conflict_reset;`: {e}")))
 }
 
 fn query_conflict_stats_note(conn: &Connection) -> E2eResult<Option<String>> {
-    let rows = conn
-        .query("PRAGMA fsqlite.conflict_stats;")
+    let rows = crate::block_on(conn.query("PRAGMA fsqlite.conflict_stats;"))
         .map_err(|e| E2eError::Fsqlite(format!("query `PRAGMA fsqlite.conflict_stats;`: {e}")))?;
 
     let mut page_contentions = 0_u64;
@@ -1047,7 +1046,7 @@ fn configure_connection(
     {
         let mut attempt = 0;
         loop {
-            match conn.execute(pragma) {
+            match crate::block_on(conn.execute(pragma)) {
                 Ok(_) => break,
                 Err(e) if is_retryable_busy(&e) => {
                     attempt += 1;
@@ -1490,7 +1489,17 @@ impl OpError {
     }
 }
 
-fn execute_batch_with_executor(
+/// Execute one transaction batch entirely inside a single runtime entry.
+///
+/// bd-zavyn: this function is `async` and its caller enters the harness
+/// runtime exactly once per batch attempt (`crate::block_on` in
+/// [`run_records_with_retry`]). The previous shape bridged sync→async once
+/// per operation, which put one ~333 ns `block_on` entry inside the timed
+/// window for every op and made `ops_per_sec` (and the per-phase ns
+/// receipts) measure the bridge instead of the engine. The `Instant` timers
+/// below now run inside the already-entered runtime, so the per-phase
+/// receipts bracket engine awaits, not runtime entries.
+async fn execute_batch_with_executor(
     executor: &mut PreparedOpExecutor<'_>,
     records: &[OpRecord],
     batch: BatchRange,
@@ -1501,13 +1510,14 @@ fn execute_batch_with_executor(
     executor
         .conn
         .begin_transaction()
+        .await
         .map_err(|err| classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Begin))?;
     timing.begin_boundary = duration_to_u64_ns(begin_started.elapsed());
 
     let mut ok: u64 = 0;
     for op in batch.ops(records) {
         let op_started = Instant::now();
-        match executor.execute_op(op) {
+        match executor.execute_op(op).await {
             Ok(()) => {
                 ok = ok.saturating_add(1);
                 timing.body_execution = timing
@@ -1519,11 +1529,13 @@ fn execute_batch_with_executor(
                     .body_execution
                     .saturating_add(duration_to_u64_ns(op_started.elapsed()));
                 let rollback_started = Instant::now();
-                rollback_active_batch(executor.conn).map_err(|rollback| BatchError::Fatal {
-                    message: format!("{}; rollback failed: {rollback}", err.message()),
-                    phase: BatchPhase::Rollback,
-                    timing,
-                })?;
+                rollback_active_batch(executor.conn)
+                    .await
+                    .map_err(|rollback| BatchError::Fatal {
+                        message: format!("{}; rollback failed: {rollback}", err.message()),
+                        phase: BatchPhase::Rollback,
+                        timing,
+                    })?;
                 timing.rollback = timing
                     .rollback
                     .saturating_add(duration_to_u64_ns(rollback_started.elapsed()));
@@ -1545,9 +1557,9 @@ fn execute_batch_with_executor(
 
     let finalize_started = Instant::now();
     let finalize_result = if batch.commit {
-        executor.conn.commit_transaction()
+        executor.conn.commit_transaction().await
     } else {
-        executor.conn.rollback_transaction()
+        executor.conn.rollback_transaction().await
     };
     match finalize_result {
         Ok(()) => {
@@ -1566,11 +1578,13 @@ fn execute_batch_with_executor(
                 timing.rollback = duration_to_u64_ns(finalize_started.elapsed());
             }
             let rollback_started = Instant::now();
-            rollback_active_batch(executor.conn).map_err(|rollback| BatchError::Fatal {
-                message: format!("{err}; rollback failed: {rollback}"),
-                phase: BatchPhase::Rollback,
-                timing,
-            })?;
+            rollback_active_batch(executor.conn)
+                .await
+                .map_err(|rollback| BatchError::Fatal {
+                    message: format!("{err}; rollback failed: {rollback}"),
+                    phase: BatchPhase::Rollback,
+                    timing,
+                })?;
             timing.rollback = timing
                 .rollback
                 .saturating_add(duration_to_u64_ns(rollback_started.elapsed()));
@@ -1614,7 +1628,10 @@ fn run_records_with_retry(
 
         let mut attempt: u32 = 0;
         loop {
-            match execute_batch_with_executor(&mut executor, records, batch) {
+            // bd-zavyn: exactly one runtime entry per batch attempt. The
+            // busy backoff below stays a sync `thread::sleep` outside the
+            // runtime so retries re-enter rather than parking a future.
+            match crate::block_on(execute_batch_with_executor(&mut executor, records, batch)) {
                 Ok(outcome) => {
                     stats.ops_ok += outcome.ok;
                     stats.ops_err += outcome.err;
@@ -1690,8 +1707,8 @@ fn run_records_with_retry(
     stats
 }
 
-fn rollback_active_batch(conn: &Connection) -> Result<(), String> {
-    match conn.rollback_transaction() {
+async fn rollback_active_batch(conn: &Connection) -> Result<(), String> {
+    match conn.rollback_transaction().await {
         Ok(()) | Err(FrankenError::NoActiveTransaction) => Ok(()),
         Err(err) => Err(err.to_string()),
     }
@@ -1718,31 +1735,36 @@ impl<'conn> PreparedOpExecutor<'conn> {
         }
     }
 
-    fn execute_op(&mut self, rec: &OpRecord) -> Result<(), OpError> {
+    async fn execute_op(&mut self, rec: &OpRecord) -> Result<(), OpError> {
         match &rec.kind {
-            OpKind::Sql { statement } => self.execute_sql(statement, rec.expected.as_ref()),
+            OpKind::Sql { statement } => self.execute_sql(statement, rec.expected.as_ref()).await,
             OpKind::Insert { table, key, values } => {
                 self.execute_insert(table, *key, values, rec.expected.as_ref())
+                    .await
             }
             OpKind::Update { table, key, values } => {
                 self.execute_update(table, *key, values, rec.expected.as_ref())
+                    .await
             }
             OpKind::Begin => self
                 .conn
                 .begin_transaction()
+                .await
                 .map_err(classify_fsqlite_error_as_op),
             OpKind::Commit => self
                 .conn
                 .commit_transaction()
+                .await
                 .map_err(classify_fsqlite_error_as_op),
             OpKind::Rollback => self
                 .conn
                 .rollback_transaction()
+                .await
                 .map_err(classify_fsqlite_error_as_op),
         }
     }
 
-    fn execute_sql(
+    async fn execute_sql(
         &mut self,
         statement: &str,
         expected: Option<&ExpectedResult>,
@@ -1758,12 +1780,12 @@ impl<'conn> PreparedOpExecutor<'conn> {
             &mut self.sql_scratch,
             &mut self.params_scratch,
         ) {
-            self.execute_prepared_sql_with_scratch(is_query)
+            self.execute_prepared_sql_with_scratch(is_query).await
         } else {
             let Some(is_query) = prepared_sql_mode(trimmed) else {
-                return execute_unprepared_sql(self.conn, trimmed, expected);
+                return execute_unprepared_sql(self.conn, trimmed, expected).await;
             };
-            self.execute_prepared_sql(trimmed, is_query)
+            self.execute_prepared_sql(trimmed, is_query).await
         };
 
         match execution {
@@ -1807,7 +1829,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
         Ok(())
     }
 
-    fn execute_insert(
+    async fn execute_insert(
         &mut self,
         table: &str,
         key: i64,
@@ -1823,7 +1845,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
         self.sql_scratch.clear();
         push_insert_sql(&mut self.sql_scratch, table, values);
 
-        match self.execute_prepared_dml_with_scratch() {
+        match self.execute_prepared_dml_with_scratch().await {
             Ok(affected) => {
                 if matches!(expected, Some(ExpectedResult::Error)) {
                     return Err(OpError::Fatal(format!(
@@ -1851,7 +1873,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
         Ok(())
     }
 
-    fn execute_update(
+    async fn execute_update(
         &mut self,
         table: &str,
         key: i64,
@@ -1867,7 +1889,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
         self.sql_scratch.clear();
         push_update_sql(&mut self.sql_scratch, table, values);
 
-        match self.execute_prepared_dml_with_scratch() {
+        match self.execute_prepared_dml_with_scratch().await {
             Ok(affected) => {
                 if matches!(expected, Some(ExpectedResult::Error)) {
                     return Err(OpError::Fatal(format!(
@@ -1895,8 +1917,8 @@ impl<'conn> PreparedOpExecutor<'conn> {
         Ok(())
     }
 
-    fn execute_prepared_dml_with_scratch(&mut self) -> Result<usize, FrankenError> {
-        self.ensure_prepared_dml_for_scratch()?;
+    async fn execute_prepared_dml_with_scratch(&mut self) -> Result<usize, FrankenError> {
+        self.ensure_prepared_dml_for_scratch().await?;
         for attempt in 0..=1 {
             let sql = self.sql_scratch.as_str();
             let params = self.params_scratch.as_slice();
@@ -1905,13 +1927,13 @@ impl<'conn> PreparedOpExecutor<'conn> {
                     .prepared_dml
                     .get(sql)
                     .expect("prepared DML cache must contain the current scratch SQL");
-                stmt.execute_with_params(params)
+                stmt.execute_with_params(params).await
             };
             match execute_result {
                 Ok(affected) => return Ok(affected),
                 Err(FrankenError::SchemaChanged) if attempt == 0 => {
                     self.prepared_dml.remove(sql);
-                    self.ensure_prepared_dml_for_scratch()?;
+                    self.ensure_prepared_dml_for_scratch().await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1919,20 +1941,20 @@ impl<'conn> PreparedOpExecutor<'conn> {
         unreachable!("schema change retry loop must return or error")
     }
 
-    fn ensure_prepared_dml_for_scratch(&mut self) -> Result<(), FrankenError> {
+    async fn ensure_prepared_dml_for_scratch(&mut self) -> Result<(), FrankenError> {
         if !self.prepared_dml.contains_key(self.sql_scratch.as_str()) {
             let sql = self.sql_scratch.clone();
-            let stmt = self.conn.prepare(&sql)?;
+            let stmt = self.conn.prepare(&sql).await?;
             self.prepared_dml.insert(sql, stmt);
         }
         Ok(())
     }
 
-    fn execute_prepared_sql_with_scratch(
+    async fn execute_prepared_sql_with_scratch(
         &mut self,
         is_query: bool,
     ) -> Result<RawSqlExecution, FrankenError> {
-        self.ensure_prepared_sql_for_scratch()?;
+        self.ensure_prepared_sql_for_scratch().await?;
         for attempt in 0..=1 {
             let sql = self.sql_scratch.as_str();
             let params = self.params_scratch.as_slice();
@@ -1942,9 +1964,12 @@ impl<'conn> PreparedOpExecutor<'conn> {
                     .get(sql)
                     .expect("prepared SQL cache must contain the current scratch SQL");
                 if is_query {
-                    stmt.query_with_params(params).map(RawSqlExecution::Rows)
+                    stmt.query_with_params(params)
+                        .await
+                        .map(RawSqlExecution::Rows)
                 } else {
                     stmt.execute_with_params(params)
+                        .await
                         .map(RawSqlExecution::Affected)
                 }
             };
@@ -1952,7 +1977,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
                 Ok(result) => return Ok(result),
                 Err(FrankenError::SchemaChanged) if attempt == 0 => {
                     self.prepared_sql.remove(sql);
-                    self.ensure_prepared_sql_for_scratch()?;
+                    self.ensure_prepared_sql_for_scratch().await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1960,21 +1985,21 @@ impl<'conn> PreparedOpExecutor<'conn> {
         unreachable!("schema change retry loop must return or error")
     }
 
-    fn ensure_prepared_sql_for_scratch(&mut self) -> Result<(), FrankenError> {
+    async fn ensure_prepared_sql_for_scratch(&mut self) -> Result<(), FrankenError> {
         if !self.prepared_sql.contains_key(self.sql_scratch.as_str()) {
             let sql = self.sql_scratch.clone();
-            let stmt = self.conn.prepare(&sql)?;
+            let stmt = self.conn.prepare(&sql).await?;
             self.prepared_sql.insert(sql, stmt);
         }
         Ok(())
     }
 
-    fn execute_prepared_sql(
+    async fn execute_prepared_sql(
         &mut self,
         sql: &str,
         is_query: bool,
     ) -> Result<RawSqlExecution, FrankenError> {
-        self.ensure_prepared_sql(sql)?;
+        self.ensure_prepared_sql(sql).await?;
         for attempt in 0..=1 {
             let execute_result = {
                 let stmt = self
@@ -1982,16 +2007,16 @@ impl<'conn> PreparedOpExecutor<'conn> {
                     .get(sql)
                     .expect("prepared SQL cache must contain the requested SQL");
                 if is_query {
-                    stmt.query().map(RawSqlExecution::Rows)
+                    stmt.query().await.map(RawSqlExecution::Rows)
                 } else {
-                    stmt.execute().map(RawSqlExecution::Affected)
+                    stmt.execute().await.map(RawSqlExecution::Affected)
                 }
             };
             match execute_result {
                 Ok(result) => return Ok(result),
                 Err(FrankenError::SchemaChanged) if attempt == 0 => {
                     self.prepared_sql.remove(sql);
-                    self.ensure_prepared_sql(sql)?;
+                    self.ensure_prepared_sql(sql).await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1999,9 +2024,9 @@ impl<'conn> PreparedOpExecutor<'conn> {
         unreachable!("schema change retry loop must return or error")
     }
 
-    fn ensure_prepared_sql(&mut self, sql: &str) -> Result<(), FrankenError> {
+    async fn ensure_prepared_sql(&mut self, sql: &str) -> Result<(), FrankenError> {
         if !self.prepared_sql.contains_key(sql) {
-            let stmt = self.conn.prepare(sql)?;
+            let stmt = self.conn.prepare(sql).await?;
             self.prepared_sql.insert(sql.to_owned(), stmt);
         }
         Ok(())
@@ -2013,8 +2038,12 @@ enum RawSqlExecution {
     Affected(usize),
 }
 
+/// One-shot sync wrapper for setup/teardown paths (outside all timed
+/// windows), so untimed callers keep a synchronous surface while the
+/// executor itself is async (bd-zavyn).
 fn execute_op(conn: &Connection, rec: &OpRecord) -> Result<(), OpError> {
-    PreparedOpExecutor::new(conn).execute_op(rec)
+    let mut executor = PreparedOpExecutor::new(conn);
+    crate::block_on(executor.execute_op(rec))
 }
 
 #[cfg(test)]
@@ -2023,7 +2052,8 @@ fn execute_sql(
     statement: &str,
     expected: Option<&ExpectedResult>,
 ) -> Result<(), OpError> {
-    PreparedOpExecutor::new(conn).execute_sql(statement, expected)
+    let mut executor = PreparedOpExecutor::new(conn);
+    crate::block_on(executor.execute_sql(statement, expected))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -2454,12 +2484,12 @@ fn prepared_sql_mode(sql: &str) -> Option<bool> {
     }
 }
 
-fn execute_unprepared_sql(
+async fn execute_unprepared_sql(
     conn: &Connection,
     trimmed: &str,
     expected: Option<&ExpectedResult>,
 ) -> Result<(), OpError> {
-    match conn.execute(trimmed) {
+    match conn.execute(trimmed).await {
         Ok(affected) => {
             if matches!(expected, Some(ExpectedResult::Error)) {
                 return Err(OpError::Fatal(format!(
@@ -3084,9 +3114,11 @@ mod tests {
 
     #[test]
     fn prepared_op_executor_reuses_insert_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT, num REAL);")
-            .unwrap();
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(
+            conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT, num REAL);"),
+        )
+        .unwrap();
 
         let mut executor = PreparedOpExecutor::new(&conn);
         let rows = [
@@ -3119,21 +3151,20 @@ mod tests {
         ];
 
         for row in &rows {
-            executor.execute_op(row).unwrap();
+            crate::block_on(executor.execute_op(row)).unwrap();
         }
 
         assert_eq!(executor.prepared_dml.len(), 1);
-        let count = conn.query_row("SELECT COUNT(*) FROM t0;").unwrap();
+        let count = crate::block_on(conn.query_row("SELECT COUNT(*) FROM t0;")).unwrap();
         assert_eq!(count.get(0), Some(&SqliteValue::Integer(2)));
     }
 
     #[test]
     fn prepared_op_executor_reuses_sql_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);"))
             .unwrap();
-        conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")
-            .unwrap();
+        crate::block_on(conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")).unwrap();
 
         let mut executor = PreparedOpExecutor::new(&conn);
         let reads = [
@@ -3156,7 +3187,7 @@ mod tests {
         ];
 
         for read in &reads {
-            executor.execute_op(read).unwrap();
+            crate::block_on(executor.execute_op(read)).unwrap();
         }
 
         assert_eq!(executor.prepared_sql.len(), 1);
@@ -3164,26 +3195,23 @@ mod tests {
 
     #[test]
     fn prepared_op_executor_normalizes_varying_point_selects_into_one_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);"))
             .unwrap();
-        conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")
-            .unwrap();
-        conn.execute("INSERT INTO t0(id, val) VALUES (2, 'beta');")
-            .unwrap();
+        crate::block_on(conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")).unwrap();
+        crate::block_on(conn.execute("INSERT INTO t0(id, val) VALUES (2, 'beta');")).unwrap();
 
         let mut executor = PreparedOpExecutor::new(&conn);
         for (op_id, id) in [(0_u64, 1_i64), (1, 2), (2, 1)] {
-            executor
-                .execute_op(&OpRecord {
-                    op_id,
-                    worker: 0,
-                    kind: OpKind::Sql {
-                        statement: format!("SELECT val FROM t0 WHERE id = {id};"),
-                    },
-                    expected: Some(ExpectedResult::RowCount(1)),
-                })
-                .unwrap();
+            crate::block_on(executor.execute_op(&OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!("SELECT val FROM t0 WHERE id = {id};"),
+                },
+                expected: Some(ExpectedResult::RowCount(1)),
+            }))
+            .unwrap();
         }
 
         assert_eq!(executor.prepared_sql.len(), 1);
@@ -3196,28 +3224,27 @@ mod tests {
 
     #[test]
     fn prepared_op_executor_normalizes_varying_point_deletes_into_one_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);"))
             .unwrap();
         for (id, value) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
-            conn.execute(&format!(
+            crate::block_on(conn.execute(&format!(
                 "INSERT INTO t0(id, val) VALUES ({id}, '{value}');"
-            ))
+            )))
             .unwrap();
         }
 
         let mut executor = PreparedOpExecutor::new(&conn);
         for (op_id, id) in [(0_u64, 1_i64), (1, 2), (2, 3)] {
-            executor
-                .execute_op(&OpRecord {
-                    op_id,
-                    worker: 0,
-                    kind: OpKind::Sql {
-                        statement: format!("DELETE FROM t0 WHERE id = {id};"),
-                    },
-                    expected: Some(ExpectedResult::AffectedRows(1)),
-                })
-                .unwrap();
+            crate::block_on(executor.execute_op(&OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!("DELETE FROM t0 WHERE id = {id};"),
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            }))
+            .unwrap();
         }
 
         assert_eq!(executor.prepared_sql.len(), 1);
@@ -3230,15 +3257,15 @@ mod tests {
 
     #[test]
     fn prepared_op_executor_normalizes_varying_point_updates_into_one_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute(
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute(
             "CREATE TABLE users(id INTEGER PRIMARY KEY, status TEXT, created_at INTEGER);",
-        )
+        ))
         .unwrap();
         for id in 1..=3 {
-            conn.execute(&format!(
+            crate::block_on(conn.execute(&format!(
                 "INSERT INTO users(id, status, created_at) VALUES ({id}, 'seed', 0);"
-            ))
+            )))
             .unwrap();
         }
 
@@ -3248,18 +3275,17 @@ mod tests {
             (1, 2, "inactive", 7200),
             (2, 3, "active", 10_800),
         ] {
-            executor
-                .execute_op(&OpRecord {
-                    op_id,
-                    worker: 0,
-                    kind: OpKind::Sql {
-                        statement: format!(
-                            "UPDATE users SET status = '{status}', created_at = {created_at} WHERE id = {id};"
-                        ),
-                    },
-                    expected: Some(ExpectedResult::AffectedRows(1)),
-                })
-                .unwrap();
+            crate::block_on(executor.execute_op(&OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!(
+                        "UPDATE users SET status = '{status}', created_at = {created_at} WHERE id = {id};"
+                    ),
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            }))
+            .unwrap();
         }
 
         assert_eq!(executor.prepared_sql.len(), 1);
@@ -3731,14 +3757,14 @@ mod tests {
 
         // Run through the executor (uses Connection internally).
         let path_str = ":memory:";
-        let conn = Connection::open(path_str).unwrap();
+        let conn = crate::block_on(Connection::open(path_str)).unwrap();
 
         // Manually replay the same oplog to verify final state.
         for rec in &oplog.records {
             let _ = execute_op(&conn, rec);
         }
 
-        let rows = conn.query("SELECT COUNT(*) FROM t0").unwrap();
+        let rows = crate::block_on(conn.query("SELECT COUNT(*) FROM t0")).unwrap();
         let count = rows[0].get(0).unwrap();
         assert_eq!(
             *count,
@@ -3780,7 +3806,7 @@ mod tests {
 
     #[test]
     fn execute_sql_expected_error_behavior() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
 
         let expected = ExpectedResult::Error;
         assert!(

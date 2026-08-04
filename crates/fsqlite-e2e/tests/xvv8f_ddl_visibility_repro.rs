@@ -42,11 +42,15 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis((1_u64 << shift).min(40))
 }
 
-fn with_retry<T>(label: &str, mut f: impl FnMut() -> Result<T, FrankenError>) -> Result<T, String> {
+async fn with_retry<T, Fut, F>(label: &str, mut f: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, FrankenError>>,
+{
     let deadline = Instant::now() + RETRY_BUDGET;
     let mut attempt = 0_u32;
     loop {
-        match f() {
+        match f().await {
             Ok(v) => return Ok(v),
             Err(err) if is_transient(&err) && Instant::now() < deadline => {
                 attempt = attempt.saturating_add(1);
@@ -57,14 +61,16 @@ fn with_retry<T>(label: &str, mut f: impl FnMut() -> Result<T, FrankenError>) ->
     }
 }
 
-fn open(path: &Path, wal: bool) -> Result<Connection, String> {
-    let conn =
-        Connection::open(path.to_string_lossy().to_string()).map_err(|e| format!("open: {e}"))?;
-    let _ = conn.execute("PRAGMA busy_timeout=10000;");
+async fn open(path: &Path, wal: bool) -> Result<Connection, String> {
+    let conn = Connection::open(path.to_string_lossy().to_string())
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    let _ = conn.execute("PRAGMA busy_timeout=10000;").await;
     if wal {
-        with_retry("journal_mode=WAL", || {
-            conn.execute("PRAGMA journal_mode=WAL;").map(|_| ())
-        })?;
+        with_retry("journal_mode=WAL", || async {
+            conn.execute("PRAGMA journal_mode=WAL;").await.map(|_| ())
+        })
+        .await?;
     }
     Ok(conn)
 }
@@ -73,24 +79,31 @@ fn open(path: &Path, wal: bool) -> Result<Connection, String> {
 /// on the SAME connection — the exact window where the bug fires. A
 /// "no such table" right after a successful CREATE on the same connection is a
 /// NON-transient failure and must never happen.
-fn writer_body(path: &Path, writer_id: usize, wal: bool, barrier: &Barrier) -> Result<(), String> {
-    let conn = open(path, wal)?;
+async fn writer_body(
+    path: &Path,
+    writer_id: usize,
+    wal: bool,
+    barrier: &Barrier,
+) -> Result<(), String> {
+    let conn = open(path, wal).await?;
     // Line all writers up so their CREATE/COMMIT calls interleave maximally.
     barrier.wait();
 
     for t in 0..TABLES_PER_WRITER {
         let table = format!("w{writer_id}_t{t}");
-        with_retry(&format!("create {table}"), || {
+        with_retry(&format!("create {table}"), || async {
             conn.execute(&format!(
                 "CREATE TABLE {table} (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);"
             ))
+            .await
             .map(|_| ())
-        })?;
+        })
+        .await?;
         // Immediately insert into the table this connection just created and
         // committed. This is where `no such table: {table}` is reported.
         for r in 0..ROWS_PER_TABLE {
             let payload = format!("w{writer_id}-t{t}-r{r}");
-            with_retry(&format!("insert {table} r{r}"), || {
+            with_retry(&format!("insert {table} r{r}"), || async {
                 conn.query_with_params(
                     &format!("INSERT INTO {table} (a, b) VALUES (?, ?);"),
                     &[
@@ -98,8 +111,10 @@ fn writer_body(path: &Path, writer_id: usize, wal: bool, barrier: &Barrier) -> R
                         SqliteValue::Integer((writer_id * 1000 + r) as i64),
                     ],
                 )
+                .await
                 .map(|_| ())
-            })?;
+            })
+            .await?;
         }
     }
     Ok(())
@@ -111,11 +126,22 @@ fn run_scenario(wal: bool) -> Result<(), String> {
 
     // Seed the file so all writers open an existing db.
     {
-        let conn = open(&db_path, wal)?;
-        with_retry("seed", || {
-            conn.execute("CREATE TABLE IF NOT EXISTS _seed (id INTEGER PRIMARY KEY);")
-                .map(|_| ())
-        })?;
+        let mut seed_outcome: Result<(), String> = Ok(());
+        asupersync::test_utils::run_test(|| async {
+            let r: Result<(), String> = async {
+                let conn = open(&db_path, wal).await?;
+                with_retry("seed", || async {
+                    conn.execute("CREATE TABLE IF NOT EXISTS _seed (id INTEGER PRIMARY KEY);")
+                        .await
+                        .map(|_| ())
+                })
+                .await?;
+                Ok(())
+            }
+            .await;
+            seed_outcome = r;
+        });
+        seed_outcome?;
     }
 
     let barrier = Arc::new(Barrier::new(WRITERS));
@@ -132,17 +158,19 @@ fn run_scenario(wal: bool) -> Result<(), String> {
             let other_errors = Arc::clone(&other_errors);
             let first_err = Arc::clone(&first_err);
             thread::spawn(move || {
-                if let Err(e) = writer_body(&path, w, wal, &barrier) {
-                    if e.contains("no such table") {
-                        no_such_table.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        other_errors.fetch_add(1, Ordering::Relaxed);
+                asupersync::test_utils::run_test(|| async {
+                    if let Err(e) = writer_body(&path, w, wal, &barrier).await {
+                        if e.contains("no such table") {
+                            no_such_table.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            other_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let mut slot = first_err.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
                     }
-                    let mut slot = first_err.lock().unwrap();
-                    if slot.is_none() {
-                        *slot = Some(e);
-                    }
-                }
+                });
             })
         })
         .collect();
@@ -192,40 +220,47 @@ fn xvv8f_ddl_visibility_rollback_journal() {
 /// sqlite_master. If that reload drops C1's own committed `foo`, the INSERT
 /// fails with "no such table: foo" — the exact bd-xvv8f symptom, reproduced
 /// without any thread race.
-fn run_deterministic(wal: bool) -> Result<(), String> {
+async fn run_deterministic(wal: bool) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let db_path = dir.path().join("xvv8f_det.db");
 
     // Seed so both connections open an existing db.
     {
-        let conn = open(&db_path, wal)?;
+        let conn = open(&db_path, wal).await?;
         conn.execute("CREATE TABLE IF NOT EXISTS _seed (id INTEGER PRIMARY KEY);")
+            .await
             .map_err(|e| format!("seed: {e}"))?;
     }
 
-    let c1 = open(&db_path, wal)?;
-    let c2 = open(&db_path, wal)?;
+    let c1 = open(&db_path, wal).await?;
+    let c2 = open(&db_path, wal).await?;
 
     // C1 creates its own table and commits (autocommit).
-    with_retry("c1 create foo", || {
+    with_retry("c1 create foo", || async {
         c1.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY, a TEXT);")
+            .await
             .map(|_| ())
-    })?;
+    })
+    .await?;
 
     // C2 commits an UNRELATED DDL — bumps the shared schema_cookie past C1's.
-    with_retry("c2 create bar", || {
+    with_retry("c2 create bar", || async {
         c2.execute("CREATE TABLE bar (id INTEGER PRIMARY KEY, a TEXT);")
+            .await
             .map(|_| ())
-    })?;
+    })
+    .await?;
 
     // C1 now inserts into the table it created. Must NOT see "no such table".
-    let res = with_retry("c1 insert foo", || {
+    let res = with_retry("c1 insert foo", || async {
         c1.query_with_params(
             "INSERT INTO foo (a) VALUES (?);",
             &[SqliteValue::Text("hello".into())],
         )
+        .await
         .map(|_| ())
-    });
+    })
+    .await;
 
     match res {
         Ok(()) => Ok(()),
@@ -235,16 +270,20 @@ fn run_deterministic(wal: bool) -> Result<(), String> {
 
 #[test]
 fn xvv8f_deterministic_wal() {
-    match run_deterministic(true) {
-        Ok(()) => eprintln!("[xvv8f det wal] clean"),
-        Err(e) => panic!("{e}"),
-    }
+    asupersync::test_utils::run_test(|| async {
+        match run_deterministic(true).await {
+            Ok(()) => eprintln!("[xvv8f det wal] clean"),
+            Err(e) => panic!("{e}"),
+        }
+    });
 }
 
 #[test]
 fn xvv8f_deterministic_rollback_journal() {
-    match run_deterministic(false) {
-        Ok(()) => eprintln!("[xvv8f det rollback] clean"),
-        Err(e) => panic!("{e}"),
-    }
+    asupersync::test_utils::run_test(|| async {
+        match run_deterministic(false).await {
+            Ok(()) => eprintln!("[xvv8f det rollback] clean"),
+            Err(e) => panic!("{e}"),
+        }
+    });
 }

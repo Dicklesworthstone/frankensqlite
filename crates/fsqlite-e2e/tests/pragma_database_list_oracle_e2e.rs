@@ -23,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,10 +56,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -83,39 +83,45 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 
 #[test]
 fn database_list_main_only() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    // Creating a table doesn't add a database row.
-    {
-        let s = "CREATE TABLE t (a INTEGER)";
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    check(
-        &f,
-        &r,
-        &[
-            "PRAGMA database_list", // (0,'main','')
-        ],
-        "database_list_main_only",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        // Creating a table doesn't add a database row.
+        {
+            let s = "CREATE TABLE t (a INTEGER)";
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        check(
+            &f,
+            &r,
+            &[
+                "PRAGMA database_list", // (0,'main','')
+            ],
+            "database_list_main_only",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn database_list_after_attach() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    {
-        let s = "ATTACH ':memory:' AS aux";
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    check(
-        &f,
-        &r,
-        &[
-            "PRAGMA database_list", // main (seq 0) + aux (next seq), both file ''
-        ],
-        "database_list_after_attach",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        {
+            let s = "ATTACH ':memory:' AS aux";
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        check(
+            &f,
+            &r,
+            &[
+                "PRAGMA database_list", // main (seq 0) + aux (next seq), both file ''
+            ],
+            "database_list_after_attach",
+        )
+        .await;
+    });
 }

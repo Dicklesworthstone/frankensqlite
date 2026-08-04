@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Benchmark: large transaction (100K row single-txn insert).
 //!
 //! Bead: bd-6d9v
@@ -10,6 +12,12 @@
 //! sampling) but is available as a standalone `#[test]` in the correctness
 //! suite.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
+use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -27,7 +35,7 @@ fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
          PRAGMA synchronous = NORMAL;\
          PRAGMA cache_size = -64000;",
     )
-    .ok();
+    .expect("failed to apply C SQLite benchmark pragmas");
 }
 
 fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
@@ -37,7 +45,9 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
         "PRAGMA synchronous = NORMAL;",
         "PRAGMA cache_size = -64000;",
     ] {
-        let _ = conn.execute(pragma);
+        fsqlite_e2e::block_on(conn.execute(pragma)).unwrap_or_else(|error| {
+            panic!("failed to apply FrankenSQLite benchmark pragma `{pragma}`: {error}")
+        });
     }
 }
 
@@ -77,12 +87,13 @@ fn bench_large_txn_10k(c: &mut Criterion) {
                     .unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..ROW_COUNT_10K as i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
                 conn.execute_batch("COMMIT").unwrap();
 
                 let mut count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
                 let count: i64 = count_stmt.query_row([], |r| r.get(0)).unwrap();
+                black_box(count);
                 #[allow(clippy::cast_possible_wrap)]
                 let expected = ROW_COUNT_10K as i64;
                 assert_eq!(count, expected);
@@ -94,32 +105,40 @@ fn bench_large_txn_10k(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN").unwrap();
-                let stmt = conn
-                    .prepare(
-                        "INSERT INTO bench VALUES (\
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN").await.unwrap();
+                    let stmt = conn
+                        .prepare(
+                            "INSERT INTO bench VALUES (\
                              ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
                              ('2026-01-' || ((?1 % 28) + 1))\
                          )",
-                    )
-                    .unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..ROW_COUNT_10K as i64 {
-                    conn.execute_prepared_with_params(&stmt, &[SqliteValue::Integer(i)])
+                        )
+                        .await
                         .unwrap();
-                }
-                conn.execute("COMMIT").unwrap();
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..ROW_COUNT_10K as i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT").await.unwrap();
 
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                let expected = ROW_COUNT_10K as i64;
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                    let rows = conn.query("SELECT COUNT(*) FROM bench").await.unwrap();
+                    black_box(&rows);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let expected = ROW_COUNT_10K as i64;
+                    assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                });
             },
             BatchSize::LargeInput,
         );
@@ -158,12 +177,13 @@ fn bench_large_txn_100k(c: &mut Criterion) {
                     .unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..ROW_COUNT_100K as i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
                 conn.execute_batch("COMMIT").unwrap();
 
                 let mut count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
                 let count: i64 = count_stmt.query_row([], |r| r.get(0)).unwrap();
+                black_box(count);
                 #[allow(clippy::cast_possible_wrap)]
                 let expected = ROW_COUNT_100K as i64;
                 assert_eq!(count, expected);
@@ -175,32 +195,40 @@ fn bench_large_txn_100k(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN").unwrap();
-                let stmt = conn
-                    .prepare(
-                        "INSERT INTO bench VALUES (\
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN").await.unwrap();
+                    let stmt = conn
+                        .prepare(
+                            "INSERT INTO bench VALUES (\
                              ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
                              ('2026-01-' || ((?1 % 28) + 1))\
                          )",
-                    )
-                    .unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..ROW_COUNT_100K as i64 {
-                    conn.execute_prepared_with_params(&stmt, &[SqliteValue::Integer(i)])
+                        )
+                        .await
                         .unwrap();
-                }
-                conn.execute("COMMIT").unwrap();
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..ROW_COUNT_100K as i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT").await.unwrap();
 
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                let expected = ROW_COUNT_100K as i64;
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                    let rows = conn.query("SELECT COUNT(*) FROM bench").await.unwrap();
+                    black_box(&rows);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let expected = ROW_COUNT_100K as i64;
+                    assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                });
             },
             BatchSize::LargeInput,
         );
@@ -240,12 +268,13 @@ fn bench_large_txn_100k_batched(c: &mut Criterion) {
                     conn.execute_batch("BEGIN").unwrap();
                     let base = batch * 10_000;
                     for i in base..base + 10_000 {
-                        stmt.execute(rusqlite::params![i]).unwrap();
+                        black_box(stmt.execute(rusqlite::params![i]).unwrap());
                     }
                     conn.execute_batch("COMMIT").unwrap();
                 }
                 let mut count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
                 let count: i64 = count_stmt.query_row([], |r| r.get(0)).unwrap();
+                black_box(count);
                 #[allow(clippy::cast_possible_wrap)]
                 let expected = ROW_COUNT_100K as i64;
                 assert_eq!(count, expected);
@@ -257,33 +286,41 @@ fn bench_large_txn_100k_batched(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
-                let stmt = conn
-                    .prepare(
-                        "INSERT INTO bench VALUES (\
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let stmt = conn
+                        .prepare(
+                            "INSERT INTO bench VALUES (\
                              ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
                              ('2026-01-' || ((?1 % 28) + 1))\
                          )",
-                    )
-                    .unwrap();
-                for batch in 0..10_i64 {
-                    conn.execute("BEGIN").unwrap();
-                    let base = batch * 10_000;
-                    for i in base..base + 10_000 {
-                        conn.execute_prepared_with_params(&stmt, &[SqliteValue::Integer(i)])
-                            .unwrap();
+                        )
+                        .await
+                        .unwrap();
+                    for batch in 0..10_i64 {
+                        conn.execute("BEGIN").await.unwrap();
+                        let base = batch * 10_000;
+                        for i in base..base + 10_000 {
+                            black_box(
+                                stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                    .await
+                                    .unwrap(),
+                            );
+                        }
+                        conn.execute("COMMIT").await.unwrap();
                     }
-                    conn.execute("COMMIT").unwrap();
-                }
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                let expected = ROW_COUNT_100K as i64;
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                    let rows = conn.query("SELECT COUNT(*) FROM bench").await.unwrap();
+                    black_box(&rows);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let expected = ROW_COUNT_100K as i64;
+                    assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                });
             },
             BatchSize::LargeInput,
         );

@@ -1,0 +1,102 @@
+bench_elf_sha256=9e3f7951a87098c4334a14e23a86e3876982d5d98b671f15302c3d77cda218ee (19322032 bytes) /data/tmp/cargo-target/release-perf/mt-mvcc-bench
+bench_source_sha256 /data/projects/frankensqlite/crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs:87500f71059d1e4c5d261bd2866ff7e4750270bf78c3bc92fbc91f3a08f10fc5:73934
+mt-mvcc-bench: rows_per_thread=1000 threads=[8, 32, 64, 128] paired_rounds=7 bootstrap_reps=10000 synchronous=NORMAL apples_to_apples=false separate_tables=false
+threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed
+registry_lock threads=8 holds=9 wait_ns_total=1834 wait_ns_max=321 hold_ns_total=13430614 hold_ns_max=2363036 mean_hold_us=1492.3 mean_wait_us=0.2
+registry_lock threads=8 holds=9 wait_ns_total=1546 wait_ns_max=251 hold_ns_total=11849063 hold_ns_max=1879416 mean_hold_us=1316.6 mean_wait_us=0.2
+registry_lock threads=8 holds=10 wait_ns_total=2404 wait_ns_max=321 hold_ns_total=9956161 hold_ns_max=1844812 mean_hold_us=995.6 mean_wait_us=0.2
+registry_lock threads=8 holds=11 wait_ns_total=2583 wait_ns_max=420 hold_ns_total=9994232 hold_ns_max=2015108 mean_hold_us=908.6 mean_wait_us=0.2
+registry_lock threads=8 holds=11 wait_ns_total=2924 wait_ns_max=621 hold_ns_total=9550267 hold_ns_max=1681768 mean_hold_us=868.2 mean_wait_us=0.3
+registry_lock threads=8 holds=11 wait_ns_total=2704 wait_ns_max=421 hold_ns_total=10206835 hold_ns_max=2279921 mean_hold_us=927.9 mean_wait_us=0.2
+registry_lock threads=8 holds=9 wait_ns_total=1964 wait_ns_max=331 hold_ns_total=4770975 hold_ns_max=654758 mean_hold_us=530.1 mean_wait_us=0.2
+      8 |      125830 |      55643 |             2.25x |          182363 |          198513 |          57130 |          57391 |          63.58 |          68.42 |          69.08 |        143.77 |        144.52 |        144.53 |       0.44x |              0 |             0
+case=shared_table threads=8 synchronous=NORMAL null_c_c ratio_median=0.982399 ci95=[0.979854,1.003466] cv_pct=14.542 mad=0.016603 cv_gate=never
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=2.247900 ci95=[2.167952,2.437550] cv_pct=20.419 mad=0.160714 fsqlite_p50_wps=125829.561 sqlite_p50_wps=55642.514 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=8 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.020146 claim_margin=61.942 min_decidable_gain=1.040293 max_decidable_regression=0.959707
+registry_lock threads=32 holds=202 wait_ns_total=48936 wait_ns_max=681 hold_ns_total=148466109 hold_ns_max=3790732 mean_hold_us=735.0 mean_wait_us=0.2
+registry_lock threads=32 holds=47 wait_ns_total=10323 wait_ns_max=341 hold_ns_total=62467689 hold_ns_max=2638578 mean_hold_us=1329.1 mean_wait_us=0.2
+registry_lock threads=32 holds=33 wait_ns_total=6926 wait_ns_max=330 hold_ns_total=67527969 hold_ns_max=4972931 mean_hold_us=2046.3 mean_wait_us=0.2
+registry_lock threads=32 holds=464 wait_ns_total=179890 wait_ns_max=33682 hold_ns_total=279115526 hold_ns_max=2516632 mean_hold_us=601.5 mean_wait_us=0.4
+registry_lock threads=32 holds=33 wait_ns_total=7767 wait_ns_max=391 hold_ns_total=64584477 hold_ns_max=3143097 mean_hold_us=1957.1 mean_wait_us=0.2
+registry_lock threads=32 holds=34 wait_ns_total=7354 wait_ns_max=341 hold_ns_total=68096861 hold_ns_max=3398462 mean_hold_us=2002.8 mean_wait_us=0.2
+registry_lock threads=32 holds=39 wait_ns_total=9103 wait_ns_max=671 hold_ns_total=60480440 hold_ns_max=2695124 mean_hold_us=1550.8 mean_wait_us=0.2
+     32 |      112141 |      13025 |             8.60x |          122665 |          123624 |          13566 |          13574 |         285.35 |        1618.49 |        1856.23 |       2456.76 |       2459.07 |       2459.55 |       0.12x |              0 |             0
+case=shared_table threads=32 synchronous=NORMAL null_c_c ratio_median=1.000440 ci95=[0.998667,1.066413] cv_pct=3.906 mad=0.038608 cv_gate=never
+case=shared_table threads=32 synchronous=NORMAL claim_f_over_c ratio_median=8.602579 ci95=[2.658826,9.080409] cv_pct=49.189 mad=0.477829 fsqlite_p50_wps=112141.360 sqlite_p50_wps=13025.281 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=32 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.066413 claim_margin=114.474 min_decidable_gain=1.132827 max_decidable_regression=0.867173
+registry_lock threads=64 holds=128 wait_ns_total=139650 wait_ns_max=81532 hold_ns_total=209765542 hold_ns_max=5711585 mean_hold_us=1638.8 mean_wait_us=1.1
+[fsqlite t16] COMMIT exhausted retry budget (17s wall clock, 159 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t21] COMMIT exhausted retry budget (17s wall clock, 155 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t12] COMMIT exhausted retry budget (17s wall clock, 169 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t32] COMMIT exhausted retry budget (17s wall clock, 148 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t23] COMMIT exhausted retry budget (17s wall clock, 167 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t30] COMMIT exhausted retry budget (17s wall clock, 175 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t20] COMMIT exhausted retry budget (17s wall clock, 171 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t28] COMMIT exhausted retry budget (17s wall clock, 163 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t14] COMMIT exhausted retry budget (17s wall clock, 161 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t10] COMMIT exhausted retry budget (17s wall clock, 168 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t22] COMMIT exhausted retry budget (17s wall clock, 153 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t19] COMMIT exhausted retry budget (17s wall clock, 154 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t18] COMMIT exhausted retry budget (17s wall clock, 147 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t33] COMMIT exhausted retry budget (17s wall clock, 142 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t17] COMMIT exhausted retry budget (17s wall clock, 155 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t13] COMMIT exhausted retry budget (17s wall clock, 145 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t29] COMMIT exhausted retry budget (17s wall clock, 158 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t35] COMMIT exhausted retry budget (17s wall clock, 154 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t34] COMMIT exhausted retry budget (17s wall clock, 157 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t15] COMMIT exhausted retry budget (17s wall clock, 158 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t27] COMMIT exhausted retry budget (17s wall clock, 168 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t24] COMMIT exhausted retry budget (17s wall clock, 165 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t31] COMMIT exhausted retry budget (17s wall clock, 156 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t25] COMMIT exhausted retry budget (17s wall clock, 133 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t11] COMMIT exhausted retry budget (17s wall clock, 160 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t26] COMMIT exhausted retry budget (17s wall clock, 146 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t6] COMMIT exhausted retry budget (17s wall clock, 47 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t42] INSERT 42000103 exhausted retry budget (17s wall clock, 2 attempts): database is busy — counting 1000 rows failed and continuing
+[fsqlite t3] COMMIT exhausted retry budget (17s wall clock, 40 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t1] COMMIT exhausted retry budget (17s wall clock, 42 attempts): database is busy (snapshot conflict on pages: ) — counting 1000 rows failed and continuing
+[fsqlite t59] INSERT 59000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t62] INSERT 62000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t39] INSERT 39000000 exhausted retry budget (17s wall clock, 3 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t40] INSERT 40000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t43] INSERT 43000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t37] INSERT 37000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t63] INSERT 63000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t55] INSERT 55000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t54] INSERT 54000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t47] INSERT 47000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t48] INSERT 48000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t46] INSERT 46000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t61] INSERT 61000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t58] INSERT 58000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t41] INSERT 41000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t56] INSERT 56000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t50] INSERT 50000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t0] INSERT 5 exhausted retry budget (17s wall clock, 43 attempts): database is busy (snapshot conflict on pages: 21) — counting 1000 rows failed and continuing
+[fsqlite t44] INSERT 44000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t45] INSERT 45000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t49] INSERT 49000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t38] INSERT 38000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t5] INSERT 5000004 exhausted retry budget (17s wall clock, 43 attempts): database is busy (snapshot conflict on pages: 21) — counting 1000 rows failed and continuing
+[fsqlite t2] INSERT 2000004 exhausted retry budget (17s wall clock, 40 attempts): database is busy (snapshot conflict on pages: 21) — counting 1000 rows failed and continuing
+[fsqlite t8] INSERT 8000004 exhausted retry budget (17s wall clock, 36 attempts): database is busy (snapshot conflict on pages: 21) — counting 1000 rows failed and continuing
+[fsqlite t52] INSERT 52000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t7] INSERT 7000004 exhausted retry budget (17s wall clock, 44 attempts): database is busy (snapshot conflict on pages: 21) — counting 1000 rows failed and continuing
+[fsqlite t4] INSERT 4000004 exhausted retry budget (17s wall clock, 41 attempts): database is busy (snapshot conflict on pages: 21) — counting 1000 rows failed and continuing
+[fsqlite t51] INSERT 51000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t60] INSERT 60000000 exhausted retry budget (17s wall clock, 4 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+[fsqlite t57] INSERT 57000000 exhausted retry budget (17s wall clock, 5 attempts): database is busy (snapshot conflict on pages: 18) — counting 1000 rows failed and continuing
+registry_lock threads=64 holds=4433 wait_ns_total=1476530 wait_ns_max=139119 hold_ns_total=2833534286 hold_ns_max=2237062 mean_hold_us=639.2 mean_wait_us=0.3
+registry_lock threads=64 holds=1316 wait_ns_total=383830 wait_ns_max=26809 hold_ns_total=1036206128 hold_ns_max=4744536 mean_hold_us=787.4 mean_wait_us=0.3
+registry_lock threads=64 holds=80 wait_ns_total=89418 wait_ns_max=72585 hold_ns_total=176269681 hold_ns_max=4590479 mean_hold_us=2203.4 mean_wait_us=1.1
+registry_lock threads=64 holds=621 wait_ns_total=228512 wait_ns_max=35787 hold_ns_total=490079918 hold_ns_max=3512524 mean_hold_us=789.2 mean_wait_us=0.4
+registry_lock threads=64 holds=1352 wait_ns_total=335958 wait_ns_max=33622 hold_ns_total=963920526 hold_ns_max=4067477 mean_hold_us=713.0 mean_wait_us=0.2
+registry_lock threads=64 holds=65 wait_ns_total=35025 wait_ns_max=19286 hold_ns_total=152105955 hold_ns_max=4197458 mean_hold_us=2340.1 mean_wait_us=0.5
+     64 |       22068 |      12531 |             1.76x |           92713 |           93508 |          14215 |          14762 |        2900.18 |       13691.19 |       16454.31 |       5107.40 |       5206.27 |       5229.90 |       0.57x |          61000 |             0
+case=shared_table threads=64 synchronous=NORMAL null_c_c ratio_median=0.995892 ci95=[0.927130,1.002663] cv_pct=4.004 mad=0.006771 cv_gate=never
+case=shared_table threads=64 synchronous=NORMAL claim_f_over_c ratio_median=1.761060 ci95=[0.762730,7.233603] cv_pct=93.740 mad=1.464110 fsqlite_p50_wps=22067.571 sqlite_p50_wps=12530.845 fsqlite_failed=61000 sqlite_failed=0
+case=shared_table threads=64 median_ci_gate=INVALID_FAILED_ROWS rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.072870 claim_margin=10.444 min_decidable_gain=1.145739 max_decidable_regression=0.854261
+registry_lock threads=128 holds=129 wait_ns_total=14587402 wait_ns_max=3342367 hold_ns_total=515901943 hold_ns_max=10157664 mean_hold_us=3999.2 mean_wait_us=113.1
+registry_lock threads=128 holds=291 wait_ns_total=19005441 wait_ns_max=4979903 hold_ns_total=903184483 hold_ns_max=31662135 mean_hold_us=3103.7 mean_wait_us=65.3
+registry_lock threads=128 holds=349 wait_ns_total=59037737 wait_ns_max=6553690 hold_ns_total=850134138 hold_ns_max=10437164 mean_hold_us=2435.9 mean_wait_us=169.2
+registry_lock threads=128 holds=135 wait_ns_total=146805593 wait_ns_max=9267659 hold_ns_total=938137366 hold_ns_max=60083089 mean_hold_us=6949.2 mean_wait_us=1087.4

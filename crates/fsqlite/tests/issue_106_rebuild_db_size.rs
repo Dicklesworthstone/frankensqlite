@@ -20,43 +20,52 @@ use fsqlite::Connection;
 /// repeated until the file must grow, then read back.
 #[test]
 fn rebuild_then_read_no_busy_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("issue106_rebuild_then_read.db");
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("issue106_rebuild_then_read.db");
 
-    let conn = Connection::open(path.to_str().unwrap()).unwrap();
+        let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
 
-    conn.execute("CREATE TABLE orig (id INTEGER PRIMARY KEY, payload TEXT)")
-        .unwrap();
-
-    // Seed enough rows that the rebuild touches several pages.
-    for i in 0..200 {
-        conn.execute(&format!(
-            "INSERT INTO orig (id, payload) VALUES ({i}, 'payload-value-number-{i}')"
-        ))
-        .unwrap();
-    }
-
-    // Run the rebuild pattern several times. Each rebuild allocates a fresh
-    // tmp table (growing the file) and frees the old `orig` pages, exercising
-    // the freelist-reuse / EOF-allocation paths that can drop the live page
-    // from the committed db_size.
-    for round in 0..6 {
-        conn.execute("BEGIN EXCLUSIVE").unwrap();
-        conn.execute("DROP TABLE IF EXISTS tmp").unwrap();
-        conn.execute("CREATE TABLE tmp (id INTEGER PRIMARY KEY, payload TEXT)")
+        conn.execute("CREATE TABLE orig (id INTEGER PRIMARY KEY, payload TEXT)")
+            .await
             .unwrap();
-        conn.execute("INSERT INTO tmp (id, payload) SELECT id, payload FROM orig")
-            .unwrap();
-        conn.execute("DROP TABLE orig").unwrap();
-        conn.execute("ALTER TABLE tmp RENAME TO orig").unwrap();
-        conn.execute("COMMIT").unwrap();
 
-        // The very next read must not spuriously fail with BusySnapshot.
-        let rows = conn
-            .query("SELECT id, payload FROM orig ORDER BY id")
-            .unwrap_or_else(|e| panic!("read after rebuild round {round} failed: {e:?}"));
-        assert_eq!(rows.len(), 200, "row count after rebuild round {round}");
-    }
+        // Seed enough rows that the rebuild touches several pages.
+        for i in 0..200 {
+            conn.execute(&format!(
+                "INSERT INTO orig (id, payload) VALUES ({i}, 'payload-value-number-{i}')"
+            ))
+            .await
+            .unwrap();
+        }
+
+        // Run the rebuild pattern several times. Each rebuild allocates a fresh
+        // tmp table (growing the file) and frees the old `orig` pages, exercising
+        // the freelist-reuse / EOF-allocation paths that can drop the live page
+        // from the committed db_size.
+        for round in 0..6 {
+            conn.execute("BEGIN EXCLUSIVE").await.unwrap();
+            conn.execute("DROP TABLE IF EXISTS tmp").await.unwrap();
+            conn.execute("CREATE TABLE tmp (id INTEGER PRIMARY KEY, payload TEXT)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO tmp (id, payload) SELECT id, payload FROM orig")
+                .await
+                .unwrap();
+            conn.execute("DROP TABLE orig").await.unwrap();
+            conn.execute("ALTER TABLE tmp RENAME TO orig")
+                .await
+                .unwrap();
+            conn.execute("COMMIT").await.unwrap();
+
+            // The very next read must not spuriously fail with BusySnapshot.
+            let rows = conn
+                .query("SELECT id, payload FROM orig ORDER BY id")
+                .await
+                .unwrap_or_else(|e| panic!("read after rebuild round {round} failed: {e:?}"));
+            assert_eq!(rows.len(), 200, "row count after rebuild round {round}");
+        }
+    });
 }
 
 /// Faithful mirror of beads_rust's `apply_schema` -> `run_pre_schema_migrations`
@@ -68,95 +77,118 @@ fn rebuild_then_read_no_busy_snapshot() {
 /// next read must not fail with BusySnapshot.
 #[test]
 fn beads_like_rebuild_then_index_burst() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("issue106_beads_like_rebuild.db");
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("issue106_beads_like_rebuild.db");
 
-    let conn = Connection::open(path.to_str().unwrap()).unwrap();
+        let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
 
-    // Legacy two-column table, like a database created by an old br version.
-    conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
-        .unwrap();
-    for i in 0..40 {
+        // Legacy two-column table, like a database created by an old br version.
+        conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
+            .await
+            .unwrap();
+        for i in 0..40 {
+            conn.execute(&format!(
+                "INSERT INTO issues (id, title) VALUES ('id-{i}', 'title number {i}')"
+            ))
+            .await
+            .unwrap();
+        }
+
+        // ---- rebuild_issues_table: BEGIN EXCLUSIVE ... COMMIT ----
+        conn.execute("PRAGMA foreign_keys = OFF").await.unwrap();
+        conn.execute("BEGIN EXCLUSIVE").await.unwrap();
+        conn.execute("DROP TABLE IF EXISTS issues_rebuild_tmp")
+            .await
+            .unwrap();
+        // Canonical wide table (mirrors the 38-column issues table).
+        let wide_cols: String = (0..36)
+            .map(|i| format!(", col{i} TEXT DEFAULT ''"))
+            .collect();
         conn.execute(&format!(
-            "INSERT INTO issues (id, title) VALUES ('id-{i}', 'title number {i}')"
+            "CREATE TABLE issues_rebuild_tmp (id TEXT PRIMARY KEY, title TEXT NOT NULL{wide_cols})"
         ))
+        .await
         .unwrap();
-    }
-
-    // ---- rebuild_issues_table: BEGIN EXCLUSIVE ... COMMIT ----
-    conn.execute("PRAGMA foreign_keys = OFF").unwrap();
-    conn.execute("BEGIN EXCLUSIVE").unwrap();
-    conn.execute("DROP TABLE IF EXISTS issues_rebuild_tmp")
-        .unwrap();
-    // Canonical wide table (mirrors the 38-column issues table).
-    let wide_cols: String = (0..36)
-        .map(|i| format!(", col{i} TEXT DEFAULT ''"))
-        .collect();
-    conn.execute(&format!(
-        "CREATE TABLE issues_rebuild_tmp (id TEXT PRIMARY KEY, title TEXT NOT NULL{wide_cols})"
-    ))
-    .unwrap();
-    conn.execute("INSERT INTO issues_rebuild_tmp (id, title) SELECT id, title FROM issues")
-        .unwrap();
-    conn.execute("DROP TABLE issues").unwrap();
-    conn.execute(&format!(
-        "CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL{wide_cols})"
-    ))
-    .unwrap();
-    conn.execute("INSERT INTO issues (id, title) SELECT id, title FROM issues_rebuild_tmp")
-        .unwrap();
-    conn.execute("DROP TABLE issues_rebuild_tmp").unwrap();
-    conn.execute("COMMIT").unwrap();
-    conn.execute("PRAGMA foreign_keys = ON").unwrap();
-
-    // ---- execute_batch(SCHEMA_SQL): index + table burst that grows the file ----
-    for i in 0..16 {
-        conn.execute(&format!("CREATE INDEX idx_issues_c{i} ON issues(col{i})"))
-            .unwrap_or_else(|e| panic!("create index {i} failed: {e:?}"));
-    }
-    for i in 0..6 {
+        conn.execute("INSERT INTO issues_rebuild_tmp (id, title) SELECT id, title FROM issues")
+            .await
+            .unwrap();
+        conn.execute("DROP TABLE issues").await.unwrap();
         conn.execute(&format!(
-            "CREATE TABLE aux{i} (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT)"
+            "CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL{wide_cols})"
         ))
-        .unwrap_or_else(|e| panic!("create aux table {i} failed: {e:?}"));
-    }
-
-    // ---- the next reads must not spuriously BusySnapshot ----
-    let info = conn.query("PRAGMA table_info(issues)").unwrap();
-    assert!(info.len() >= 38, "issues should have all columns");
-    let cnt = conn.query("SELECT COUNT(*) FROM issues").unwrap();
-    assert_eq!(cnt.len(), 1);
-    let rows = conn
-        .query("SELECT id, title FROM issues ORDER BY id")
+        .await
         .unwrap();
-    assert_eq!(rows.len(), 40);
+        conn.execute("INSERT INTO issues (id, title) SELECT id, title FROM issues_rebuild_tmp")
+            .await
+            .unwrap();
+        conn.execute("DROP TABLE issues_rebuild_tmp").await.unwrap();
+        conn.execute("COMMIT").await.unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").await.unwrap();
+
+        // ---- execute_batch(SCHEMA_SQL): index + table burst that grows the file ----
+        for i in 0..16 {
+            conn.execute(&format!("CREATE INDEX idx_issues_c{i} ON issues(col{i})"))
+                .await
+                .unwrap_or_else(|e| panic!("create index {i} failed: {e:?}"));
+        }
+        for i in 0..6 {
+            conn.execute(&format!(
+                "CREATE TABLE aux{i} (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT)"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create aux table {i} failed: {e:?}"));
+        }
+
+        // ---- the next reads must not spuriously BusySnapshot ----
+        let info = conn.query("PRAGMA table_info(issues)").await.unwrap();
+        assert!(info.len() >= 38, "issues should have all columns");
+        let cnt = conn.query("SELECT COUNT(*) FROM issues").await.unwrap();
+        assert_eq!(cnt.len(), 1);
+        let rows = conn
+            .query("SELECT id, title FROM issues ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 40);
+    });
 }
 
 /// Tighter variant: a single rebuild that grows the file from a small db_size,
 /// then immediately scans the rebuilt table.
 #[test]
 fn single_rebuild_grow_then_read() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("issue106_single_rebuild.db");
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("issue106_single_rebuild.db");
 
-    let conn = Connection::open(path.to_str().unwrap()).unwrap();
+        let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
 
-    conn.execute("CREATE TABLE orig (id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    for i in 0..50 {
-        conn.execute(&format!("INSERT INTO orig (id, v) VALUES ({i}, 'x{i}')"))
+        conn.execute("CREATE TABLE orig (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
             .unwrap();
-    }
+        for i in 0..50 {
+            conn.execute(&format!("INSERT INTO orig (id, v) VALUES ({i}, 'x{i}')"))
+                .await
+                .unwrap();
+        }
 
-    conn.execute("BEGIN EXCLUSIVE").unwrap();
-    conn.execute("CREATE TABLE tmp (id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    conn.execute("INSERT INTO tmp (id, v) SELECT id, v FROM orig")
-        .unwrap();
-    conn.execute("DROP TABLE orig").unwrap();
-    conn.execute("ALTER TABLE tmp RENAME TO orig").unwrap();
-    conn.execute("COMMIT").unwrap();
+        conn.execute("BEGIN EXCLUSIVE").await.unwrap();
+        conn.execute("CREATE TABLE tmp (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO tmp (id, v) SELECT id, v FROM orig")
+            .await
+            .unwrap();
+        conn.execute("DROP TABLE orig").await.unwrap();
+        conn.execute("ALTER TABLE tmp RENAME TO orig")
+            .await
+            .unwrap();
+        conn.execute("COMMIT").await.unwrap();
 
-    let rows = conn.query("SELECT id, v FROM orig ORDER BY id").unwrap();
-    assert_eq!(rows.len(), 50);
+        let rows = conn
+            .query("SELECT id, v FROM orig ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 50);
+    });
 }

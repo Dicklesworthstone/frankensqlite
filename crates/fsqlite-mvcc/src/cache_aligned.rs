@@ -89,6 +89,95 @@ impl<T: std::fmt::Debug> std::fmt::Debug for CacheAligned<T> {
 }
 
 // ---------------------------------------------------------------------------
+// VendorCachePadded<T> — vendor/ABI-aware padding (bd-db300.5.6.1 platform lane)
+// ---------------------------------------------------------------------------
+
+/// Cache-line size assumed by [`VendorCachePadded`] on this build target.
+///
+/// Apple silicon (M1–M5) uses 128-byte L1D/L2 lines; padding contended
+/// atomics to only 64 bytes there puts two logically-independent values on
+/// one line. `target_vendor = "apple"` deliberately covers BOTH
+/// `aarch64-apple-*` (native) and `x86_64-apple-*` (Rosetta 2 — translated
+/// x86 still executes on M-series silicon with 128-byte lines), closing the
+/// Rosetta gap a `target_arch` test would leave. Every other target —
+/// including non-Apple aarch64 such as Graviton, which uses 64-byte lines —
+/// keeps 64 to avoid unmeasured over-padding.
+pub const VENDOR_CACHE_LINE_BYTES: usize = if cfg!(target_vendor = "apple") {
+    128
+} else {
+    64
+};
+
+/// Vendor/ABI-aware cache-line padding wrapper.
+///
+/// Deliberately SEPARATE from [`CacheAligned`] (which stays at its historical
+/// 64-byte layout everywhere): no production type has been migrated to this
+/// wrapper yet. Migration of a contended type is a measured decision — an
+/// M-series contention A/B against the 64-byte layout with single-thread and
+/// RSS controls — not a blanket edit. Compile-time layout tests below pin
+/// the contract on every target so a migration cannot silently change
+/// cross-process or persisted layouts (those must never use this type).
+#[cfg_attr(target_vendor = "apple", repr(C, align(128)))]
+#[cfg_attr(not(target_vendor = "apple"), repr(C, align(64)))]
+pub struct VendorCachePadded<T> {
+    value: T,
+}
+
+impl<T> VendorCachePadded<T> {
+    /// Wrap `value` with vendor-aware cache-line alignment.
+    #[inline]
+    #[must_use]
+    pub const fn new(value: T) -> Self {
+        Self { value }
+    }
+
+    /// Unwrap, returning the inner value.
+    #[inline]
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+impl<T: Default> Default for VendorCachePadded<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T> std::ops::Deref for VendorCachePadded<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for VendorCachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for VendorCachePadded<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
+// Compile-time layout contract: alignment and size-rounding hold on every
+// target, and the wrapper can never be smaller than the line it pads to.
+const _: () = {
+    assert!(align_of::<VendorCachePadded<u8>>() == VENDOR_CACHE_LINE_BYTES);
+    assert!(size_of::<VendorCachePadded<u8>>() == VENDOR_CACHE_LINE_BYTES);
+    // `%` rather than `is_multiple_of`: the latter is not const-stable at
+    // the crate MSRV (1.85).
+    assert!(size_of::<VendorCachePadded<[u8; 200]>>() % VENDOR_CACHE_LINE_BYTES == 0);
+};
+
+// ---------------------------------------------------------------------------
 // TxnSlot Sentinel Encoding (§5.6.2, bd-22n.13)
 // ---------------------------------------------------------------------------
 
@@ -1008,6 +1097,34 @@ mod tests {
     fn test_cache_aligned_alignment() {
         assert_eq!(align_of::<CacheAligned<u8>>(), CACHE_LINE_BYTES);
         assert_eq!(align_of::<CacheAligned<AtomicU64>>(), CACHE_LINE_BYTES);
+    }
+
+    #[test]
+    fn test_vendor_cache_padded_layout_contract() {
+        // The vendor constant is 128 only on Apple targets (native arm64 AND
+        // Rosetta x86_64 — both execute on 128-byte-line silicon); everywhere
+        // else it matches the historical 64-byte layout.
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(VENDOR_CACHE_LINE_BYTES, 128);
+        } else {
+            assert_eq!(VENDOR_CACHE_LINE_BYTES, 64);
+        }
+        assert_eq!(align_of::<VendorCachePadded<u8>>(), VENDOR_CACHE_LINE_BYTES);
+        assert_eq!(size_of::<VendorCachePadded<u8>>(), VENDOR_CACHE_LINE_BYTES);
+        assert_eq!(
+            size_of::<VendorCachePadded<AtomicU64>>(),
+            VENDOR_CACHE_LINE_BYTES
+        );
+
+        // Adjacent array elements must land on distinct cache lines.
+        let arr: [VendorCachePadded<AtomicU64>; 4] =
+            std::array::from_fn(|_| VendorCachePadded::new(AtomicU64::new(0)));
+        for pair in arr.windows(2) {
+            let a = std::ptr::from_ref(&pair[0]) as usize;
+            let b = std::ptr::from_ref(&pair[1]) as usize;
+            assert_eq!(b - a, VENDOR_CACHE_LINE_BYTES);
+            assert_eq!(a % VENDOR_CACHE_LINE_BYTES, 0);
+        }
     }
 
     #[test]

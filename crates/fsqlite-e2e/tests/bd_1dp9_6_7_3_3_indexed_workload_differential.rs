@@ -44,6 +44,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::cast_precision_loss)]
+#![recursion_limit = "512"]
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -94,8 +95,8 @@ fn csqlite_query(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     .expect("collect")
 }
 
-fn fsqlite_query(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let rows = conn.query(sql).expect("fsqlite query");
+async fn fsqlite_query(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+    let rows = conn.query(sql).await.expect("fsqlite query");
     rows.iter()
         .map(|r| {
             r.values()
@@ -120,8 +121,8 @@ fn setup_csqlite() -> rusqlite::Connection {
     conn
 }
 
-fn setup_fsqlite() -> fsqlite::Connection {
-    let conn = fsqlite::Connection::open(":memory:").expect("open");
+async fn setup_fsqlite() -> fsqlite::Connection {
+    let conn = fsqlite::Connection::open(":memory:").await.expect("open");
     conn
 }
 
@@ -177,15 +178,16 @@ const SCHEMA: &str = "
     CREATE UNIQUE INDEX idx_name ON products(name);
 ";
 
-fn seed_data(exec: &dyn Fn(&str)) {
+async fn seed_data(exec: impl AsyncFn(String)) {
     let categories = ["electronics", "books", "clothing", "food", "toys"];
     for i in 0..200 {
         let cat = categories[i % categories.len()];
         let price = (i as f64).mul_add(1.5, 0.99);
         let stock = (i * 7 + 3) % 100;
-        exec(&format!(
+        exec(format!(
             "INSERT INTO products (id, category, name, price, stock) VALUES ({i}, '{cat}', 'product-{i:04}', {price}, {stock})"
-        ));
+        ))
+        .await;
     }
 }
 
@@ -193,456 +195,502 @@ fn seed_data(exec: &dyn Fn(&str)) {
 
 #[test]
 fn i1_equality_lookup() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let c = setup_csqlite();
-    c.execute_batch(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        c.execute(sql, []).unwrap();
+        let c = setup_csqlite();
+        c.execute_batch(SCHEMA).expect("schema");
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
+        })
+        .await;
+
+        let f = setup_fsqlite().await;
+        f.execute(SCHEMA).await.expect("schema");
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
+        })
+        .await;
+
+        let queries = [
+            "SELECT id, name, price FROM products WHERE category = 'electronics' ORDER BY id",
+            "SELECT id, name FROM products WHERE category = 'books' ORDER BY id",
+            "SELECT COUNT(*) FROM products WHERE category = 'food'",
+        ];
+
+        for q in &queries {
+            let start = Instant::now();
+            let c_rows = csqlite_query(&c, q);
+            let c_ns = start.elapsed().as_nanos() as u64;
+
+            let start = Instant::now();
+            let f_rows = fsqlite_query(&f, q).await;
+            let f_ns = start.elapsed().as_nanos() as u64;
+
+            emit_log(
+                "I1",
+                "result",
+                json!({
+                    "query": q,
+                    "csqlite_rows": c_rows.len(),
+                    "fsqlite_rows": f_rows.len(),
+                    "csqlite_ns": c_ns,
+                    "fsqlite_ns": f_ns,
+                }),
+            );
+            differential_check("I1", q, &c_rows, &f_rows);
+        }
     });
-
-    let f = setup_fsqlite();
-    f.execute(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        f.execute(sql).unwrap();
-    });
-
-    let queries = [
-        "SELECT id, name, price FROM products WHERE category = 'electronics' ORDER BY id",
-        "SELECT id, name FROM products WHERE category = 'books' ORDER BY id",
-        "SELECT COUNT(*) FROM products WHERE category = 'food'",
-    ];
-
-    for q in &queries {
-        let start = Instant::now();
-        let c_rows = csqlite_query(&c, q);
-        let c_ns = start.elapsed().as_nanos() as u64;
-
-        let start = Instant::now();
-        let f_rows = fsqlite_query(&f, q);
-        let f_ns = start.elapsed().as_nanos() as u64;
-
-        emit_log(
-            "I1",
-            "result",
-            json!({
-                "query": q,
-                "csqlite_rows": c_rows.len(),
-                "fsqlite_rows": f_rows.len(),
-                "csqlite_ns": c_ns,
-                "fsqlite_ns": f_ns,
-            }),
-        );
-        differential_check("I1", q, &c_rows, &f_rows);
-    }
 }
 
 // ─── I2: Range scan ──────────────────────────────────────────────────
 
 #[test]
 fn i2_range_scan() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let c = setup_csqlite();
-    c.execute_batch(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        c.execute(sql, []).unwrap();
+        let c = setup_csqlite();
+        c.execute_batch(SCHEMA).expect("schema");
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
+        })
+        .await;
+
+        let f = setup_fsqlite().await;
+        f.execute(SCHEMA).await.expect("schema");
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
+        })
+        .await;
+
+        let queries = [
+            "SELECT id, name, price FROM products WHERE price BETWEEN 10.0 AND 50.0 ORDER BY price, id",
+            "SELECT id, price FROM products WHERE price > 200.0 ORDER BY price",
+            "SELECT id, price FROM products WHERE price < 5.0 ORDER BY id",
+        ];
+
+        for q in &queries {
+            let c_rows = csqlite_query(&c, q);
+            let f_rows = fsqlite_query(&f, q).await;
+            emit_log(
+                "I2",
+                "result",
+                json!({"query": q, "csqlite_rows": c_rows.len(), "fsqlite_rows": f_rows.len()}),
+            );
+            differential_check("I2", q, &c_rows, &f_rows);
+        }
     });
-
-    let f = setup_fsqlite();
-    f.execute(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        f.execute(sql).unwrap();
-    });
-
-    let queries = [
-        "SELECT id, name, price FROM products WHERE price BETWEEN 10.0 AND 50.0 ORDER BY price, id",
-        "SELECT id, price FROM products WHERE price > 200.0 ORDER BY price",
-        "SELECT id, price FROM products WHERE price < 5.0 ORDER BY id",
-    ];
-
-    for q in &queries {
-        let c_rows = csqlite_query(&c, q);
-        let f_rows = fsqlite_query(&f, q);
-        emit_log(
-            "I2",
-            "result",
-            json!({"query": q, "csqlite_rows": c_rows.len(), "fsqlite_rows": f_rows.len()}),
-        );
-        differential_check("I2", q, &c_rows, &f_rows);
-    }
 }
 
 // ─── I3: Duplicate-heavy dataset ─────────────────────────────────────
 
 #[test]
 fn i3_duplicate_heavy() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let c = setup_csqlite();
-    c.execute_batch(
-        "CREATE TABLE dupes (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER);
+        let c = setup_csqlite();
+        c.execute_batch(
+            "CREATE TABLE dupes (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER);
          CREATE INDEX idx_grp ON dupes(grp);",
-    )
-    .expect("schema");
+        )
+        .expect("schema");
 
-    let f = setup_fsqlite();
-    f.execute(
-        "CREATE TABLE dupes (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER);
+        let f = setup_fsqlite().await;
+        f.execute(
+            "CREATE TABLE dupes (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER);
          CREATE INDEX idx_grp ON dupes(grp);",
-    )
-    .expect("schema");
+        )
+        .await
+        .expect("schema");
 
-    // Insert 500 rows with only 5 distinct group values
-    for i in 0..500 {
-        let grp = format!("group-{}", i % 5);
-        let sql = format!("INSERT INTO dupes VALUES ({i}, '{grp}', {i})");
-        c.execute(&sql, []).unwrap();
-        f.execute(&sql).unwrap();
-    }
+        // Insert 500 rows with only 5 distinct group values
+        for i in 0..500 {
+            let grp = format!("group-{}", i % 5);
+            let sql = format!("INSERT INTO dupes VALUES ({i}, '{grp}', {i})");
+            c.execute(&sql, []).unwrap();
+            f.execute(&sql).await.unwrap();
+        }
 
-    let queries = [
-        "SELECT COUNT(*) FROM dupes WHERE grp = 'group-0'",
-        "SELECT id, val FROM dupes WHERE grp = 'group-2' ORDER BY id",
-        "SELECT grp, COUNT(*), SUM(val) FROM dupes GROUP BY grp ORDER BY grp",
-    ];
+        let queries = [
+            "SELECT COUNT(*) FROM dupes WHERE grp = 'group-0'",
+            "SELECT id, val FROM dupes WHERE grp = 'group-2' ORDER BY id",
+            "SELECT grp, COUNT(*), SUM(val) FROM dupes GROUP BY grp ORDER BY grp",
+        ];
 
-    for q in &queries {
-        let c_rows = csqlite_query(&c, q);
-        let f_rows = fsqlite_query(&f, q);
-        emit_log(
-            "I3",
-            "result",
-            json!({"query": q, "rows_match": c_rows == f_rows, "row_count": c_rows.len()}),
-        );
-        differential_check("I3", q, &c_rows, &f_rows);
-    }
+        for q in &queries {
+            let c_rows = csqlite_query(&c, q);
+            let f_rows = fsqlite_query(&f, q).await;
+            emit_log(
+                "I3",
+                "result",
+                json!({"query": q, "rows_match": c_rows == f_rows, "row_count": c_rows.len()}),
+            );
+            differential_check("I3", q, &c_rows, &f_rows);
+        }
+    });
 }
 
 // ─── I4: Covering index ──────────────────────────────────────────────
 
 #[test]
 fn i4_covering_index() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let c = setup_csqlite();
-    c.execute_batch(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        c.execute(sql, []).unwrap();
+        let c = setup_csqlite();
+        c.execute_batch(SCHEMA).expect("schema");
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
+        })
+        .await;
+
+        let f = setup_fsqlite().await;
+        f.execute(SCHEMA).await.expect("schema");
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
+        })
+        .await;
+
+        // idx_cat_price covers (category, price) — query needs only those columns
+        let queries = [
+            "SELECT category, price FROM products WHERE category = 'electronics' ORDER BY price",
+            "SELECT category, COUNT(*) FROM products GROUP BY category ORDER BY category",
+        ];
+
+        for q in &queries {
+            let c_rows = csqlite_query(&c, q);
+            let f_rows = fsqlite_query(&f, q).await;
+            emit_log(
+                "I4",
+                "result",
+                json!({"query": q, "covering_index": "idx_cat_price", "rows_match": c_rows == f_rows}),
+            );
+            differential_check("I4", q, &c_rows, &f_rows);
+        }
     });
-
-    let f = setup_fsqlite();
-    f.execute(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        f.execute(sql).unwrap();
-    });
-
-    // idx_cat_price covers (category, price) — query needs only those columns
-    let queries = [
-        "SELECT category, price FROM products WHERE category = 'electronics' ORDER BY price",
-        "SELECT category, COUNT(*) FROM products GROUP BY category ORDER BY category",
-    ];
-
-    for q in &queries {
-        let c_rows = csqlite_query(&c, q);
-        let f_rows = fsqlite_query(&f, q);
-        emit_log(
-            "I4",
-            "result",
-            json!({"query": q, "covering_index": "idx_cat_price", "rows_match": c_rows == f_rows}),
-        );
-        differential_check("I4", q, &c_rows, &f_rows);
-    }
 }
 
 // ─── I5: Multi-column index ─────────────────────────────────────────
 
 #[test]
 fn i5_multi_column_index() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let c = setup_csqlite();
-    c.execute_batch(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        c.execute(sql, []).unwrap();
+        let c = setup_csqlite();
+        c.execute_batch(SCHEMA).expect("schema");
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
+        })
+        .await;
+
+        let f = setup_fsqlite().await;
+        f.execute(SCHEMA).await.expect("schema");
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
+        })
+        .await;
+
+        let queries = [
+            // Full composite key match
+            "SELECT id, name FROM products WHERE category = 'toys' AND price < 30.0 ORDER BY id",
+            // Prefix-only match (category only)
+            "SELECT id, name FROM products WHERE category = 'clothing' ORDER BY id",
+            // Non-prefix (price only) — cannot use idx_cat_price efficiently
+            "SELECT id, name FROM products WHERE price = 15.99 ORDER BY id",
+        ];
+
+        for q in &queries {
+            let c_rows = csqlite_query(&c, q);
+            let f_rows = fsqlite_query(&f, q).await;
+            emit_log(
+                "I5",
+                "result",
+                json!({"query": q, "rows_match": c_rows == f_rows, "row_count": c_rows.len()}),
+            );
+            differential_check("I5", q, &c_rows, &f_rows);
+        }
     });
-
-    let f = setup_fsqlite();
-    f.execute(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        f.execute(sql).unwrap();
-    });
-
-    let queries = [
-        // Full composite key match
-        "SELECT id, name FROM products WHERE category = 'toys' AND price < 30.0 ORDER BY id",
-        // Prefix-only match (category only)
-        "SELECT id, name FROM products WHERE category = 'clothing' ORDER BY id",
-        // Non-prefix (price only) — cannot use idx_cat_price efficiently
-        "SELECT id, name FROM products WHERE price = 15.99 ORDER BY id",
-    ];
-
-    for q in &queries {
-        let c_rows = csqlite_query(&c, q);
-        let f_rows = fsqlite_query(&f, q);
-        emit_log(
-            "I5",
-            "result",
-            json!({"query": q, "rows_match": c_rows == f_rows, "row_count": c_rows.len()}),
-        );
-        differential_check("I5", q, &c_rows, &f_rows);
-    }
 }
 
 // ─── I6: Unique constraint ──────────────────────────────────────────
 
 #[test]
 fn i6_unique_constraint() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let c = setup_csqlite();
-    c.execute_batch(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        c.execute(sql, []).unwrap();
+        let c = setup_csqlite();
+        c.execute_batch(SCHEMA).expect("schema");
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
+        })
+        .await;
+
+        let f = setup_fsqlite().await;
+        f.execute(SCHEMA).await.expect("schema");
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
+        })
+        .await;
+
+        // Unique lookup
+        let q = "SELECT id, category, price FROM products WHERE name = 'product-0042' ORDER BY id";
+        let c_rows = csqlite_query(&c, q);
+        let f_rows = fsqlite_query(&f, q).await;
+        differential_check("I6", q, &c_rows, &f_rows);
+
+        // Unique violation
+        let dup_sql = "INSERT INTO products (id, category, name, price) VALUES (9999, 'test', 'product-0042', 1.0)";
+        let c_err = c.execute(dup_sql, []).is_err();
+        let f_err = f.execute(dup_sql).await.is_err();
+
+        emit_log(
+            "I6",
+            "result",
+            json!({
+                "unique_lookup_match": c_rows == f_rows,
+                "csqlite_rejects_duplicate": c_err,
+                "fsqlite_rejects_duplicate": f_err,
+            }),
+        );
+
+        assert!(c_err, "[I6] C SQLite should reject duplicate name");
+        assert!(f_err, "[I6] FrankenSQLite should reject duplicate name");
     });
-
-    let f = setup_fsqlite();
-    f.execute(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        f.execute(sql).unwrap();
-    });
-
-    // Unique lookup
-    let q = "SELECT id, category, price FROM products WHERE name = 'product-0042' ORDER BY id";
-    let c_rows = csqlite_query(&c, q);
-    let f_rows = fsqlite_query(&f, q);
-    differential_check("I6", q, &c_rows, &f_rows);
-
-    // Unique violation
-    let dup_sql = "INSERT INTO products (id, category, name, price) VALUES (9999, 'test', 'product-0042', 1.0)";
-    let c_err = c.execute(dup_sql, []).is_err();
-    let f_err = f.execute(dup_sql).is_err();
-
-    emit_log(
-        "I6",
-        "result",
-        json!({
-            "unique_lookup_match": c_rows == f_rows,
-            "csqlite_rejects_duplicate": c_err,
-            "fsqlite_rejects_duplicate": f_err,
-        }),
-    );
-
-    assert!(c_err, "[I6] C SQLite should reject duplicate name");
-    assert!(f_err, "[I6] FrankenSQLite should reject duplicate name");
 }
 
 // ─── I7: ORDER BY indexed ────────────────────────────────────────────
 
 #[test]
 fn i7_order_by_indexed() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let c = setup_csqlite();
-    c.execute_batch(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        c.execute(sql, []).unwrap();
+        let c = setup_csqlite();
+        c.execute_batch(SCHEMA).expect("schema");
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
+        })
+        .await;
+
+        let f = setup_fsqlite().await;
+        f.execute(SCHEMA).await.expect("schema");
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
+        })
+        .await;
+
+        let queries = [
+            "SELECT id, price FROM products ORDER BY price LIMIT 20",
+            "SELECT id, category, price FROM products WHERE category = 'books' ORDER BY price DESC",
+            "SELECT id, name FROM products ORDER BY name LIMIT 10",
+        ];
+
+        for q in &queries {
+            let c_rows = csqlite_query(&c, q);
+            let f_rows = fsqlite_query(&f, q).await;
+            emit_log(
+                "I7",
+                "result",
+                json!({"query": q, "rows_match": c_rows == f_rows, "row_count": c_rows.len()}),
+            );
+            differential_check("I7", q, &c_rows, &f_rows);
+        }
     });
-
-    let f = setup_fsqlite();
-    f.execute(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        f.execute(sql).unwrap();
-    });
-
-    let queries = [
-        "SELECT id, price FROM products ORDER BY price LIMIT 20",
-        "SELECT id, category, price FROM products WHERE category = 'books' ORDER BY price DESC",
-        "SELECT id, name FROM products ORDER BY name LIMIT 10",
-    ];
-
-    for q in &queries {
-        let c_rows = csqlite_query(&c, q);
-        let f_rows = fsqlite_query(&f, q);
-        emit_log(
-            "I7",
-            "result",
-            json!({"query": q, "rows_match": c_rows == f_rows, "row_count": c_rows.len()}),
-        );
-        differential_check("I7", q, &c_rows, &f_rows);
-    }
 }
 
 // ─── I8: Mixed DML with index ────────────────────────────────────────
 
 #[test]
 fn i8_mixed_dml_with_index() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let c = setup_csqlite();
-    c.execute_batch(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        c.execute(sql, []).unwrap();
+        let c = setup_csqlite();
+        c.execute_batch(SCHEMA).expect("schema");
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
+        })
+        .await;
+
+        let f = setup_fsqlite().await;
+        f.execute(SCHEMA).await.expect("schema");
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
+        })
+        .await;
+
+        // UPDATE via indexed column
+        let update_sql = "UPDATE products SET stock = stock + 10 WHERE category = 'electronics'";
+        c.execute(update_sql, []).unwrap();
+        f.execute(update_sql).await.unwrap();
+
+        let q1 = "SELECT id, stock FROM products WHERE category = 'electronics' ORDER BY id";
+        differential_check(
+            "I8",
+            q1,
+            &csqlite_query(&c, q1),
+            &fsqlite_query(&f, q1).await,
+        );
+
+        // DELETE via indexed column
+        let delete_sql = "DELETE FROM products WHERE price > 250.0";
+        c.execute(delete_sql, []).unwrap();
+        f.execute(delete_sql).await.unwrap();
+
+        let q2 = "SELECT COUNT(*) FROM products";
+        differential_check(
+            "I8",
+            q2,
+            &csqlite_query(&c, q2),
+            &fsqlite_query(&f, q2).await,
+        );
+
+        // INSERT new rows, verify index updated
+        let insert_sql = "INSERT INTO products (id, category, name, price, stock) VALUES (9001, 'new', 'product-new-1', 999.99, 50)";
+        c.execute(insert_sql, []).unwrap();
+        f.execute(insert_sql).await.unwrap();
+
+        let q3 = "SELECT id, name, price FROM products WHERE name = 'product-new-1'";
+        let c_rows = csqlite_query(&c, q3);
+        let f_rows = fsqlite_query(&f, q3).await;
+        differential_check("I8", q3, &c_rows, &f_rows);
+
+        emit_log(
+            "I8",
+            "result",
+            json!({
+                "update_verified": true,
+                "delete_verified": true,
+                "insert_verified": true,
+            }),
+        );
     });
-
-    let f = setup_fsqlite();
-    f.execute(SCHEMA).expect("schema");
-    seed_data(&|sql| {
-        f.execute(sql).unwrap();
-    });
-
-    // UPDATE via indexed column
-    let update_sql = "UPDATE products SET stock = stock + 10 WHERE category = 'electronics'";
-    c.execute(update_sql, []).unwrap();
-    f.execute(update_sql).unwrap();
-
-    let q1 = "SELECT id, stock FROM products WHERE category = 'electronics' ORDER BY id";
-    differential_check("I8", q1, &csqlite_query(&c, q1), &fsqlite_query(&f, q1));
-
-    // DELETE via indexed column
-    let delete_sql = "DELETE FROM products WHERE price > 250.0";
-    c.execute(delete_sql, []).unwrap();
-    f.execute(delete_sql).unwrap();
-
-    let q2 = "SELECT COUNT(*) FROM products";
-    differential_check("I8", q2, &csqlite_query(&c, q2), &fsqlite_query(&f, q2));
-
-    // INSERT new rows, verify index updated
-    let insert_sql = "INSERT INTO products (id, category, name, price, stock) VALUES (9001, 'new', 'product-new-1', 999.99, 50)";
-    c.execute(insert_sql, []).unwrap();
-    f.execute(insert_sql).unwrap();
-
-    let q3 = "SELECT id, name, price FROM products WHERE name = 'product-new-1'";
-    let c_rows = csqlite_query(&c, q3);
-    let f_rows = fsqlite_query(&f, q3);
-    differential_check("I8", q3, &c_rows, &f_rows);
-
-    emit_log(
-        "I8",
-        "result",
-        json!({
-            "update_verified": true,
-            "delete_verified": true,
-            "insert_verified": true,
-        }),
-    );
 }
 
 // ─── I9: NULL handling in indexes ────────────────────────────────────
 
 #[test]
 fn i9_null_handling() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let schema = "
+        let schema = "
         CREATE TABLE nullable (id INTEGER PRIMARY KEY, key TEXT, val INTEGER);
         CREATE INDEX idx_key ON nullable(key);
     ";
 
-    let c = setup_csqlite();
-    c.execute_batch(schema).expect("schema");
+        let c = setup_csqlite();
+        c.execute_batch(schema).expect("schema");
 
-    let f = setup_fsqlite();
-    f.execute(schema).expect("schema");
+        let f = setup_fsqlite().await;
+        f.execute(schema).await.expect("schema");
 
-    let inserts = [
-        "INSERT INTO nullable VALUES (1, 'a', 10)",
-        "INSERT INTO nullable VALUES (2, NULL, 20)",
-        "INSERT INTO nullable VALUES (3, 'b', 30)",
-        "INSERT INTO nullable VALUES (4, NULL, 40)",
-        "INSERT INTO nullable VALUES (5, 'a', 50)",
-    ];
-    for sql in &inserts {
-        c.execute(sql, []).unwrap();
-        f.execute(sql).unwrap();
-    }
+        let inserts = [
+            "INSERT INTO nullable VALUES (1, 'a', 10)",
+            "INSERT INTO nullable VALUES (2, NULL, 20)",
+            "INSERT INTO nullable VALUES (3, 'b', 30)",
+            "INSERT INTO nullable VALUES (4, NULL, 40)",
+            "INSERT INTO nullable VALUES (5, 'a', 50)",
+        ];
+        for sql in &inserts {
+            c.execute(sql, []).unwrap();
+            f.execute(sql).await.unwrap();
+        }
 
-    let queries = [
-        "SELECT id, key, val FROM nullable WHERE key IS NULL ORDER BY id",
-        "SELECT id, key, val FROM nullable WHERE key IS NOT NULL ORDER BY id",
-        "SELECT id, key, val FROM nullable WHERE key = 'a' ORDER BY id",
-        "SELECT COUNT(*) FROM nullable WHERE key IS NULL",
-    ];
+        let queries = [
+            "SELECT id, key, val FROM nullable WHERE key IS NULL ORDER BY id",
+            "SELECT id, key, val FROM nullable WHERE key IS NOT NULL ORDER BY id",
+            "SELECT id, key, val FROM nullable WHERE key = 'a' ORDER BY id",
+            "SELECT COUNT(*) FROM nullable WHERE key IS NULL",
+        ];
 
-    for q in &queries {
-        let c_rows = csqlite_query(&c, q);
-        let f_rows = fsqlite_query(&f, q);
-        emit_log(
-            "I9",
-            "result",
-            json!({"query": q, "rows_match": c_rows == f_rows, "row_count": c_rows.len()}),
-        );
-        differential_check("I9", q, &c_rows, &f_rows);
-    }
+        for q in &queries {
+            let c_rows = csqlite_query(&c, q);
+            let f_rows = fsqlite_query(&f, q).await;
+            emit_log(
+                "I9",
+                "result",
+                json!({"query": q, "rows_match": c_rows == f_rows, "row_count": c_rows.len()}),
+            );
+            differential_check("I9", q, &c_rows, &f_rows);
+        }
+    });
 }
 
 // ─── I10: Large dataset differential ─────────────────────────────────
 
 #[test]
 fn i10_large_dataset() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let schema = "
+        let schema = "
         CREATE TABLE large (id INTEGER PRIMARY KEY, bucket INTEGER NOT NULL, payload TEXT);
         CREATE INDEX idx_bucket ON large(bucket);
     ";
 
-    let c = setup_csqlite();
-    c.execute_batch(schema).expect("schema");
+        let c = setup_csqlite();
+        c.execute_batch(schema).expect("schema");
 
-    let f = setup_fsqlite();
-    f.execute(schema).expect("schema");
+        let f = setup_fsqlite().await;
+        f.execute(schema).await.expect("schema");
 
-    let row_count = 10_000;
-    let start = Instant::now();
-    c.execute_batch("BEGIN;").unwrap();
-    for i in 0..row_count {
-        c.execute(
-            "INSERT INTO large VALUES (?1, ?2, ?3)",
-            rusqlite::params![i, i % 50, format!("data-{i:06}")],
-        )
-        .unwrap();
-    }
-    c.execute_batch("COMMIT;").unwrap();
-    let c_insert_ns = start.elapsed().as_nanos() as u64;
-
-    let start = Instant::now();
-    f.execute("BEGIN").unwrap();
-    for i in 0..row_count {
-        f.execute(&format!(
-            "INSERT INTO large VALUES ({i}, {}, 'data-{i:06}')",
-            i % 50
-        ))
-        .unwrap();
-    }
-    f.execute("COMMIT").unwrap();
-    let f_insert_ns = start.elapsed().as_nanos() as u64;
-
-    let queries = [
-        "SELECT COUNT(*) FROM large",
-        "SELECT COUNT(*) FROM large WHERE bucket = 7",
-        "SELECT id, payload FROM large WHERE bucket = 25 ORDER BY id LIMIT 10",
-        "SELECT bucket, COUNT(*), MIN(id), MAX(id) FROM large GROUP BY bucket ORDER BY bucket LIMIT 5",
-    ];
-
-    let mut all_match = true;
-    for q in &queries {
-        let c_rows = csqlite_query(&c, q);
-        let f_rows = fsqlite_query(&f, q);
-        if c_rows != f_rows {
-            all_match = false;
+        let row_count = 10_000;
+        let start = Instant::now();
+        c.execute_batch("BEGIN;").unwrap();
+        for i in 0..row_count {
+            c.execute(
+                "INSERT INTO large VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, i % 50, format!("data-{i:06}")],
+            )
+            .unwrap();
         }
-        differential_check("I10", q, &c_rows, &f_rows);
-    }
+        c.execute_batch("COMMIT;").unwrap();
+        let c_insert_ns = start.elapsed().as_nanos() as u64;
 
-    emit_log(
-        "I10",
-        "result",
-        json!({
-            "row_count": row_count,
-            "csqlite_insert_ns": c_insert_ns,
-            "fsqlite_insert_ns": f_insert_ns,
-            "all_queries_match": all_match,
-        }),
-    );
+        let start = Instant::now();
+        f.execute("BEGIN").await.unwrap();
+        for i in 0..row_count {
+            f.execute(&format!(
+                "INSERT INTO large VALUES ({i}, {}, 'data-{i:06}')",
+                i % 50
+            ))
+            .await
+            .unwrap();
+        }
+        f.execute("COMMIT").await.unwrap();
+        let f_insert_ns = start.elapsed().as_nanos() as u64;
+
+        let queries = [
+            "SELECT COUNT(*) FROM large",
+            "SELECT COUNT(*) FROM large WHERE bucket = 7",
+            "SELECT id, payload FROM large WHERE bucket = 25 ORDER BY id LIMIT 10",
+            "SELECT bucket, COUNT(*), MIN(id), MAX(id) FROM large GROUP BY bucket ORDER BY bucket LIMIT 5",
+        ];
+
+        let mut all_match = true;
+        for q in &queries {
+            let c_rows = csqlite_query(&c, q);
+            let f_rows = fsqlite_query(&f, q).await;
+            if c_rows != f_rows {
+                all_match = false;
+            }
+            differential_check("I10", q, &c_rows, &f_rows);
+        }
+
+        emit_log(
+            "I10",
+            "result",
+            json!({
+                "row_count": row_count,
+                "csqlite_insert_ns": c_insert_ns,
+                "fsqlite_insert_ns": f_insert_ns,
+                "all_queries_match": all_match,
+            }),
+        );
+    });
 }

@@ -134,7 +134,7 @@ fn coverage_flags_from_values(values: &[SqliteValue]) -> TestResult<CoverageFlag
     Ok(flags)
 }
 
-fn install_test_matrix_schema(conn: &Connection) -> TestResult {
+async fn install_test_matrix_schema(conn: &Connection) -> TestResult {
     conn.execute(
         "CREATE TABLE fsqlite_coordination_test_matrix_contract(
             invariant_id TEXT NOT NULL PRIMARY KEY,
@@ -153,7 +153,8 @@ fn install_test_matrix_schema(conn: &Connection) -> TestResult {
             heavy_rch_command TEXT NOT NULL,
             first_failure_diag TEXT NOT NULL
         );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE TABLE fsqlite_coordination_golden_rows_contract(
             golden_name TEXT NOT NULL PRIMARY KEY,
@@ -163,13 +164,14 @@ fn install_test_matrix_schema(conn: &Connection) -> TestResult {
             scrubbers TEXT NOT NULL,
             canonical_row_json TEXT NOT NULL
         );",
-    )?;
-    seed_matrix_rows(conn)?;
-    seed_golden_rows(conn)?;
+    )
+    .await?;
+    seed_matrix_rows(conn).await?;
+    seed_golden_rows(conn).await?;
     Ok(())
 }
 
-fn seed_matrix_rows(conn: &Connection) -> TestResult {
+async fn seed_matrix_rows(conn: &Connection) -> TestResult {
     let rows = [
         TestMatrixRow {
             invariant_id: "queue.unit.claim-release",
@@ -334,12 +336,12 @@ fn seed_matrix_rows(conn: &Connection) -> TestResult {
     ];
 
     for row in rows {
-        insert_matrix_row(conn, row)?;
+        insert_matrix_row(conn, row).await?;
     }
     Ok(())
 }
 
-fn seed_golden_rows(conn: &Connection) -> TestResult {
+async fn seed_golden_rows(conn: &Connection) -> TestResult {
     let rows = [
         GoldenRow {
             golden_name: "explain_concurrency_hot_page_row",
@@ -386,12 +388,12 @@ fn seed_golden_rows(conn: &Connection) -> TestResult {
     ];
 
     for row in rows {
-        insert_golden_row(conn, row)?;
+        insert_golden_row(conn, row).await?;
     }
     Ok(())
 }
 
-fn insert_matrix_row(conn: &Connection, row: TestMatrixRow<'_>) -> TestResult {
+async fn insert_matrix_row(conn: &Connection, row: TestMatrixRow<'_>) -> TestResult {
     conn.execute(&format!(
         "INSERT INTO fsqlite_coordination_test_matrix_contract(
             invariant_id,
@@ -441,11 +443,12 @@ fn insert_matrix_row(conn: &Connection, row: TestMatrixRow<'_>) -> TestResult {
         regression_name = sql_text(row.regression_name),
         heavy_rch_command = sql_text(row.heavy_rch_command),
         first_failure_diag = sql_text(row.first_failure_diag),
-    ))?;
+    ))
+    .await?;
     Ok(())
 }
 
-fn insert_golden_row(conn: &Connection, row: GoldenRow<'_>) -> TestResult {
+async fn insert_golden_row(conn: &Connection, row: GoldenRow<'_>) -> TestResult {
     conn.execute(&format!(
         "INSERT INTO fsqlite_coordination_golden_rows_contract(
             golden_name,
@@ -468,13 +471,15 @@ fn insert_golden_row(conn: &Connection, row: GoldenRow<'_>) -> TestResult {
         update_policy = sql_text(row.update_policy),
         scrubbers = sql_text(row.scrubbers),
         canonical_row_json = sql_text(row.canonical_row_json),
-    ))?;
+    ))
+    .await?;
     Ok(())
 }
 
-fn coverage_by_surface(conn: &Connection) -> TestResult<Vec<(String, SurfaceCoverage)>> {
-    let rows = conn.query(
-        "SELECT surface,
+async fn coverage_by_surface(conn: &Connection) -> TestResult<Vec<(String, SurfaceCoverage)>> {
+    let rows = conn
+        .query(
+            "SELECT surface,
                 test_layer,
                 covers_happy,
                 covers_empty,
@@ -483,7 +488,8 @@ fn coverage_by_surface(conn: &Connection) -> TestResult<Vec<(String, SurfaceCove
                 covers_error
            FROM fsqlite_coordination_test_matrix_contract
           ORDER BY surface, invariant_id;",
-    )?;
+        )
+        .await?;
 
     let mut coverage = Vec::<(String, SurfaceCoverage)>::new();
     for row in rows {
@@ -610,75 +616,84 @@ fn accepted_ranges(attempts: &[RangeAttempt]) -> Vec<RangeAttempt> {
 
 #[test]
 fn matrix_has_required_fast_layers_and_exact_rch_commands() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    install_test_matrix_schema(&conn)?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            install_test_matrix_schema(&conn).await?;
 
-    let coverage = coverage_by_surface(&conn)?;
-    assert_eq!(coverage.len(), 5);
+            let coverage = coverage_by_surface(&conn).await?;
+            assert_eq!(coverage.len(), 5);
 
-    for (surface, current) in coverage {
-        assert!(
-            has_layer(current.layers, LAYER_UNIT),
-            "{surface} must have unit contract coverage"
-        );
-        assert!(
-            current.coverage.contains(CoverageFlags::HAPPY),
-            "{surface} must cover happy paths"
-        );
-        assert!(
-            current.coverage.contains(CoverageFlags::EMPTY),
-            "{surface} must cover empty input"
-        );
-        assert!(
-            current.coverage.contains(CoverageFlags::BOUNDARY),
-            "{surface} must cover boundary cases"
-        );
-        assert!(
-            current.coverage.contains(CoverageFlags::ROLLBACK),
-            "{surface} must cover rollback semantics"
-        );
-        assert!(
-            current.coverage.contains(CoverageFlags::ERROR),
-            "{surface} must cover error conditions"
-        );
-        assert!(
-            has_layer(current.layers, LAYER_REGRESSION),
-            "{surface} must have a named regression guard"
-        );
-        if matches!(surface.as_str(), "queue" | "lease" | "range") {
-            assert!(
-                has_layer(current.layers, LAYER_PROPERTY),
-                "{surface} must have deterministic interleaving coverage"
-            );
-        }
-        if matches!(surface.as_str(), "explain" | "fallback") {
-            assert!(
-                has_layer(current.layers, LAYER_GOLDEN),
-                "{surface} must have canonical golden row coverage"
-            );
-        }
-    }
+            for (surface, current) in coverage {
+                assert!(
+                    has_layer(current.layers, LAYER_UNIT),
+                    "{surface} must have unit contract coverage"
+                );
+                assert!(
+                    current.coverage.contains(CoverageFlags::HAPPY),
+                    "{surface} must cover happy paths"
+                );
+                assert!(
+                    current.coverage.contains(CoverageFlags::EMPTY),
+                    "{surface} must cover empty input"
+                );
+                assert!(
+                    current.coverage.contains(CoverageFlags::BOUNDARY),
+                    "{surface} must cover boundary cases"
+                );
+                assert!(
+                    current.coverage.contains(CoverageFlags::ROLLBACK),
+                    "{surface} must cover rollback semantics"
+                );
+                assert!(
+                    current.coverage.contains(CoverageFlags::ERROR),
+                    "{surface} must cover error conditions"
+                );
+                assert!(
+                    has_layer(current.layers, LAYER_REGRESSION),
+                    "{surface} must have a named regression guard"
+                );
+                if matches!(surface.as_str(), "queue" | "lease" | "range") {
+                    assert!(
+                        has_layer(current.layers, LAYER_PROPERTY),
+                        "{surface} must have deterministic interleaving coverage"
+                    );
+                }
+                if matches!(surface.as_str(), "explain" | "fallback") {
+                    assert!(
+                        has_layer(current.layers, LAYER_GOLDEN),
+                        "{surface} must have canonical golden row coverage"
+                    );
+                }
+            }
 
-    let command_rows = conn.query(
-        "SELECT invariant_id, heavy_rch_command
+            let command_rows = conn
+                .query(
+                    "SELECT invariant_id, heavy_rch_command
            FROM fsqlite_coordination_test_matrix_contract
           ORDER BY invariant_id;",
-    )?;
-    for row in command_rows {
-        let values = row_values(&row);
-        let invariant_id = sqlite_text(&values[0])?;
-        let command = sqlite_text(&values[1])?;
-        assert!(
-            command.starts_with(HEAVY_GATE_PREFIX),
-            "{invariant_id} must use the repo's foreground rch command shape"
-        );
-        assert!(
-            !command.starts_with("cargo "),
-            "{invariant_id} must not document a local heavy cargo gate"
-        );
-    }
+                )
+                .await?;
+            for row in command_rows {
+                let values = row_values(&row);
+                let invariant_id = sqlite_text(&values[0])?;
+                let command = sqlite_text(&values[1])?;
+                assert!(
+                    command.starts_with(HEAVY_GATE_PREFIX),
+                    "{invariant_id} must use the repo's foreground rch command shape"
+                );
+                assert!(
+                    !command.starts_with("cargo "),
+                    "{invariant_id} must not document a local heavy cargo gate"
+                );
+            }
 
-    Ok(())
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
@@ -729,48 +744,53 @@ fn generated_interleavings_preserve_single_owner_properties() {
 
 #[test]
 fn canonical_golden_rows_are_exact_and_review_gated() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    install_test_matrix_schema(&conn)?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            install_test_matrix_schema(&conn).await?;
 
-    let rows = conn.query(
-        "SELECT golden_name,
+            let rows = conn
+                .query(
+                    "SELECT golden_name,
                 surface,
                 update_policy,
                 scrubbers,
                 canonical_row_json
            FROM fsqlite_coordination_golden_rows_contract
           ORDER BY golden_name;",
-    )?;
+                )
+                .await?;
 
-    assert_eq!(
-        rows_to_values(&rows),
-        vec![
-            vec![
-                SqliteValue::Text("explain_concurrency_hot_page_row".into()),
-                SqliteValue::Text("explain".into()),
-                SqliteValue::Text("intentional-change-only-review".into()),
-                SqliteValue::Text("none-required-static-contract-row".into()),
-                SqliteValue::Text(
-                    concat!(
-                        "{\"abort_count\":1,",
-                        "\"busy_family\":\"busy_snapshot\",",
-                        "\"conflict_reason\":\"hot_page_predicted\",",
-                        "\"coordination_strategy\":\"page_mvcc\",",
-                        "\"diagnostics_available\":true,",
-                        "\"external_wait\":null,",
-                        "\"fallback_reason\":null,",
-                        "\"hotspot_kind\":\"page\",",
-                        "\"page_number\":47,",
-                        "\"plan_id\":\"plan-update-leaf-47\",",
-                        "\"retry_count\":1,",
-                        "\"statement_fingerprint\":\"fp-hot-page-update\",",
-                        "\"suggested_next_inspection\":\"inspect_page_heat\",",
-                        "\"table_name\":\"jobs\"}"
-                    )
-                    .into()
-                ),
-            ],
-            vec![
+            assert_eq!(
+                rows_to_values(&rows),
+                vec![
+                    vec![
+                        SqliteValue::Text("explain_concurrency_hot_page_row".into()),
+                        SqliteValue::Text("explain".into()),
+                        SqliteValue::Text("intentional-change-only-review".into()),
+                        SqliteValue::Text("none-required-static-contract-row".into()),
+                        SqliteValue::Text(
+                            concat!(
+                                "{\"abort_count\":1,",
+                                "\"busy_family\":\"busy_snapshot\",",
+                                "\"conflict_reason\":\"hot_page_predicted\",",
+                                "\"coordination_strategy\":\"page_mvcc\",",
+                                "\"diagnostics_available\":true,",
+                                "\"external_wait\":null,",
+                                "\"fallback_reason\":null,",
+                                "\"hotspot_kind\":\"page\",",
+                                "\"page_number\":47,",
+                                "\"plan_id\":\"plan-update-leaf-47\",",
+                                "\"retry_count\":1,",
+                                "\"statement_fingerprint\":\"fp-hot-page-update\",",
+                                "\"suggested_next_inspection\":\"inspect_page_heat\",",
+                                "\"table_name\":\"jobs\"}"
+                            )
+                            .into()
+                        ),
+                    ],
+                    vec![
                 SqliteValue::Text("fallback_compatibility_row".into()),
                 SqliteValue::Text("fallback".into()),
                 SqliteValue::Text("intentional-change-only-review".into()),
@@ -791,89 +811,102 @@ fn canonical_golden_rows_are_exact_and_review_gated() -> TestResult {
                     .into()
                 ),
             ],
-        ]
-    );
+                ]
+            );
 
-    for row in rows {
-        let values = row_values(&row);
-        let golden_name = sqlite_text(&values[0])?;
-        let json = sqlite_text(&values[4])?;
-        assert!(
-            !json.contains("trace-") && !json.contains("run-"),
-            "{golden_name} must scrub dynamic trace/run identifiers"
-        );
-        assert!(
-            !json.contains("global_writer_lock"),
-            "{golden_name} must not bless serialized writer-lock diagnostics"
-        );
-    }
+            for row in rows {
+                let values = row_values(&row);
+                let golden_name = sqlite_text(&values[0])?;
+                let json = sqlite_text(&values[4])?;
+                assert!(
+                    !json.contains("trace-") && !json.contains("run-"),
+                    "{golden_name} must scrub dynamic trace/run identifiers"
+                );
+                assert!(
+                    !json.contains("global_writer_lock"),
+                    "{golden_name} must not bless serialized writer-lock diagnostics"
+                );
+            }
 
-    Ok(())
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn regression_names_cover_every_contract_surface() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    install_test_matrix_schema(&conn)?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            install_test_matrix_schema(&conn).await?;
 
-    let rows = conn.query(
-        "SELECT surface, regression_name, property_obligation, first_failure_diag
+            let rows = conn
+                .query(
+                    "SELECT surface, regression_name, property_obligation, first_failure_diag
            FROM fsqlite_coordination_test_matrix_contract
           ORDER BY surface, invariant_id;",
-    )?;
+                )
+                .await?;
 
-    let mut seen_surfaces = Vec::<String>::new();
-    let mut property_obligations = Vec::<String>::new();
-    for row in rows {
-        let values = row_values(&row);
-        let surface = sqlite_text(&values[0])?;
-        let regression_name = sqlite_text(&values[1])?;
-        let property_obligation = sqlite_text(&values[2])?;
-        let first_failure_diag = sqlite_text(&values[3])?;
+            let mut seen_surfaces = Vec::<String>::new();
+            let mut property_obligations = Vec::<String>::new();
+            for row in rows {
+                let values = row_values(&row);
+                let surface = sqlite_text(&values[0])?;
+                let regression_name = sqlite_text(&values[1])?;
+                let property_obligation = sqlite_text(&values[2])?;
+                let first_failure_diag = sqlite_text(&values[3])?;
 
-        assert!(
-            regression_name.starts_with(surface),
-            "{regression_name} must be scoped to {surface}"
-        );
-        assert!(
-            !first_failure_diag.is_empty() && first_failure_diag != "none",
-            "{regression_name} must have operator-facing failure context"
-        );
-        assert!(
-            !first_failure_diag.contains("global writer")
-                && !first_failure_diag.contains("global_writer_lock"),
-            "{regression_name} must not recommend serialized writer locking"
-        );
+                assert!(
+                    regression_name.starts_with(surface),
+                    "{regression_name} must be scoped to {surface}"
+                );
+                assert!(
+                    !first_failure_diag.is_empty() && first_failure_diag != "none",
+                    "{regression_name} must have operator-facing failure context"
+                );
+                assert!(
+                    !first_failure_diag.contains("global writer")
+                        && !first_failure_diag.contains("global_writer_lock"),
+                    "{regression_name} must not recommend serialized writer locking"
+                );
 
-        if !seen_surfaces.iter().any(|seen| seen == surface) {
-            seen_surfaces.push(surface.to_owned());
+                if !seen_surfaces.iter().any(|seen| seen == surface) {
+                    seen_surfaces.push(surface.to_owned());
+                }
+                if property_obligation != "none" {
+                    property_obligations.push(property_obligation.to_owned());
+                }
+            }
+
+            seen_surfaces.sort();
+            property_obligations.sort();
+
+            assert_eq!(
+                seen_surfaces,
+                vec![
+                    "explain".to_owned(),
+                    "fallback".to_owned(),
+                    "lease".to_owned(),
+                    "queue".to_owned(),
+                    "range".to_owned(),
+                ]
+            );
+            assert_eq!(
+                property_obligations,
+                vec![
+                    "no_double_claim".to_owned(),
+                    "no_double_lease".to_owned(),
+                    "no_overlapping_enforced_ranges".to_owned(),
+                ]
+            );
+
+            Ok::<(), Box<dyn std::error::Error>>(())
         }
-        if property_obligation != "none" {
-            property_obligations.push(property_obligation.to_owned());
-        }
-    }
-
-    seen_surfaces.sort();
-    property_obligations.sort();
-
-    assert_eq!(
-        seen_surfaces,
-        vec![
-            "explain".to_owned(),
-            "fallback".to_owned(),
-            "lease".to_owned(),
-            "queue".to_owned(),
-            "range".to_owned(),
-        ]
-    );
-    assert_eq!(
-        property_obligations,
-        vec![
-            "no_double_claim".to_owned(),
-            "no_double_lease".to_owned(),
-            "no_overlapping_enforced_ranges".to_owned(),
-        ]
-    );
-
-    Ok(())
+        .await;
+    });
+    outcome
 }

@@ -1,6 +1,7 @@
 //! Deterministic aggregate/window end-to-end parity checks for `bd-2wt.2`.
 
 #![allow(clippy::too_many_lines)]
+#![recursion_limit = "512"]
 
 use std::{
     env, fs,
@@ -184,8 +185,9 @@ fn csqlite_query_values(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<SqlVa
         .expect("csqlite collect rows")
 }
 
-fn fsqlite_query_values(conn: &FrankenConnection, sql: &str) -> Vec<Vec<SqlValue>> {
+async fn fsqlite_query_values(conn: &FrankenConnection, sql: &str) -> Vec<Vec<SqlValue>> {
     conn.query(sql)
+        .await
         .expect("fsqlite query")
         .into_iter()
         .map(|row| {
@@ -219,14 +221,14 @@ fn format_rows(rows: &[Vec<SqlValue>]) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn execute_setup(fconn: &FrankenConnection, cconn: &rusqlite::Connection) {
+async fn execute_setup(fconn: &FrankenConnection, cconn: &rusqlite::Connection) {
     for sql in SETUP_STATEMENTS {
         cconn.execute(sql, []).expect("csqlite setup");
-        fconn.execute(sql).expect("fsqlite setup");
+        fconn.execute(sql).await.expect("fsqlite setup");
     }
 }
 
-fn compare_query_case(
+async fn compare_query_case(
     pass: &'static str,
     case: &QueryCase,
     run_id: &str,
@@ -236,7 +238,7 @@ fn compare_query_case(
     cconn: &rusqlite::Connection,
 ) -> QuerySummary {
     let c_rows = csqlite_query_values(cconn, case.sql);
-    let f_rows = fsqlite_query_values(fconn, case.sql);
+    let f_rows = fsqlite_query_values(fconn, case.sql).await;
     assert_eq!(
         f_rows,
         c_rows,
@@ -258,7 +260,7 @@ scenario_id={scenario_id} pass={pass} query_name={} sql={} fsqlite_rows={:?} csq
     }
 }
 
-fn run_aggregate_window_scenario(
+async fn run_aggregate_window_scenario(
     run_id: &str,
     trace_id: &str,
     scenario_id: &str,
@@ -272,38 +274,48 @@ fn run_aggregate_window_scenario(
     let frank_path_str = frank_path.to_string_lossy().into_owned();
     let sqlite_path_str = sqlite_path.to_string_lossy().into_owned();
 
-    let fconn = FrankenConnection::open(&frank_path_str).expect("open fsqlite db");
+    let fconn = FrankenConnection::open(&frank_path_str)
+        .await
+        .expect("open fsqlite db");
     let cconn = rusqlite::Connection::open(&sqlite_path_str).expect("open csqlite db");
-    execute_setup(&fconn, &cconn);
+    execute_setup(&fconn, &cconn).await;
 
     let mut query_summaries = Vec::with_capacity(QUERY_CASES.len() * 2);
     for case in QUERY_CASES {
-        query_summaries.push(compare_query_case(
-            "initial",
-            case,
-            run_id,
-            trace_id,
-            scenario_id,
-            &fconn,
-            &cconn,
-        ));
+        query_summaries.push(
+            compare_query_case(
+                "initial",
+                case,
+                run_id,
+                trace_id,
+                scenario_id,
+                &fconn,
+                &cconn,
+            )
+            .await,
+        );
     }
 
     drop(fconn);
     drop(cconn);
 
-    let reopened_fconn = FrankenConnection::open(&frank_path_str).expect("reopen fsqlite db");
+    let reopened_fconn = FrankenConnection::open(&frank_path_str)
+        .await
+        .expect("reopen fsqlite db");
     let reopened_cconn = rusqlite::Connection::open(&sqlite_path_str).expect("reopen csqlite db");
     for case in QUERY_CASES {
-        query_summaries.push(compare_query_case(
-            "reopen",
-            case,
-            run_id,
-            trace_id,
-            scenario_id,
-            &reopened_fconn,
-            &reopened_cconn,
-        ));
+        query_summaries.push(
+            compare_query_case(
+                "reopen",
+                case,
+                run_id,
+                trace_id,
+                scenario_id,
+                &reopened_fconn,
+                &reopened_cconn,
+            )
+            .await,
+        );
     }
 
     let profile = hot_path_profile_snapshot();
@@ -377,41 +389,45 @@ seed={seed} artifact_path={} replay_command={REPLAY_COMMAND}",
 #[test]
 fn bd_2wt_2_aggregate_window_engine_file_backed_parity() {
     let _serial = aggregate_window_e2e_serializer();
-    let run_id = "bd-2wt.2-file-backed-parity";
-    let trace_id = "2204112001";
-    let scenario_id = "AGG-WINDOW-FILE-BACKED-PARITY";
+    asupersync::test_utils::run_test(|| async {
+        let run_id = "bd-2wt.2-file-backed-parity";
+        let trace_id = "2204112001";
+        let scenario_id = "AGG-WINDOW-FILE-BACKED-PARITY";
 
-    let outcome = run_aggregate_window_scenario(run_id, trace_id, scenario_id);
+        let outcome = run_aggregate_window_scenario(run_id, trace_id, scenario_id).await;
 
-    eprintln!(
-        "INFO bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} \
+        eprintln!(
+            "INFO bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} \
 seed={DEFAULT_SEED} elapsed_ms={} window_func_partitions_total={} query_count={} log_standard_ref={LOG_STANDARD_REF}",
-        outcome.elapsed_ms,
-        outcome.window_func_partitions_total,
-        outcome.query_summaries.len()
-    );
+            outcome.elapsed_ms,
+            outcome.window_func_partitions_total,
+            outcome.query_summaries.len()
+        );
+    });
 }
 
 #[test]
 fn bd_2wt_2_aggregate_window_engine_e2e_replay_emits_artifact() {
     let _serial = aggregate_window_e2e_serializer();
-    let seed = env::var("SEED")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SEED);
-    let trace_id = env::var("TRACE_ID").unwrap_or_else(|_| seed.to_string());
-    let run_id = env::var("RUN_ID").unwrap_or_else(|_| format!("{BEAD_ID}-seed-{seed}"));
-    let scenario_id =
-        env::var("SCENARIO_ID").unwrap_or_else(|_| "AGG-WINDOW-E2E-REPLAY".to_owned());
+    asupersync::test_utils::run_test(|| async {
+        let seed = env::var("SEED")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SEED);
+        let trace_id = env::var("TRACE_ID").unwrap_or_else(|_| seed.to_string());
+        let run_id = env::var("RUN_ID").unwrap_or_else(|_| format!("{BEAD_ID}-seed-{seed}"));
+        let scenario_id =
+            env::var("SCENARIO_ID").unwrap_or_else(|_| "AGG-WINDOW-E2E-REPLAY".to_owned());
 
-    let outcome = run_aggregate_window_scenario(&run_id, &trace_id, &scenario_id);
-    maybe_write_artifact(&run_id, &trace_id, &scenario_id, &outcome, seed);
+        let outcome = run_aggregate_window_scenario(&run_id, &trace_id, &scenario_id).await;
+        maybe_write_artifact(&run_id, &trace_id, &scenario_id, &outcome, seed);
 
-    eprintln!(
-        "INFO bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} \
+        eprintln!(
+            "INFO bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} \
 seed={seed} elapsed_ms={} window_func_partitions_total={} query_count={} log_standard_ref={LOG_STANDARD_REF}",
-        outcome.elapsed_ms,
-        outcome.window_func_partitions_total,
-        outcome.query_summaries.len()
-    );
+            outcome.elapsed_ms,
+            outcome.window_func_partitions_total,
+            outcome.query_summaries.len()
+        );
+    });
 }

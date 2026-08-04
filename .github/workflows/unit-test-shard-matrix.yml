@@ -421,3 +421,250 @@ jobs:
             artifacts/unit-coverage-drift-gate/
             artifacts/no-mock-critical-path-gate/
           retention-days: 21
+
+  # bd-ohk1x: `cargo test -p fsqlite-e2e --no-run` plus a hand-written
+  # allowlist compiled 96% of this crate's integration-test binaries without
+  # ever executing them. Enumerate the source-of-truth directory here, assign
+  # every target to one deterministic shard, and persist one exit receipt per
+  # target. The accounting job below fails on missing, duplicate, unexpected,
+  # mis-sharded, malformed, or non-zero receipts.
+  e2e-integration-shards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+      # Consumed by ci_e2e_test_discovery_gate.sh. This job enumerates every
+      # tracked integration-test target, executes each target exactly once,
+      # and emits receipts that the accounting job verifies below.
+      E2E_COVERAGE_MODE: all-tracked-targets
+      E2E_TEST_SOURCE_DIR: crates/fsqlite-e2e/tests
+      SHARD_COUNT: "16"
+      SHARD_INDEX: ${{ matrix.shard_index }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Cache deterministic E2E shard build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: e2e-integration-${{ matrix.shard_index }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            e2e-integration-${{ matrix.shard_index }}-
+
+      - name: Execute assigned E2E integration targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_root="artifacts/e2e-integration-shards/${SHARD_INDEX}"
+          log_dir="${artifact_root}/logs"
+          manifest="${artifact_root}/manifest.tsv"
+          summary="${artifact_root}/summary.md"
+          mkdir -p "${log_dir}"
+          : > "${manifest}"
+
+          mapfile -t targets < <(
+            git ls-files "${E2E_TEST_SOURCE_DIR}/*.rs" \
+              | xargs -r -n1 basename \
+              | sed -e 's/\.rs$//' \
+              | LC_ALL=C sort
+          )
+          if [[ "${#targets[@]}" -eq 0 ]]; then
+            echo "ERROR: no fsqlite-e2e integration targets were discovered" >&2
+            exit 1
+          fi
+
+          selected_count=0
+          failed_count=0
+          {
+            echo "# E2E integration shard ${SHARD_INDEX}/${SHARD_COUNT}"
+            echo
+            echo "- discovered_targets: ${#targets[@]}"
+            echo
+            echo "## Results"
+          } > "${summary}"
+
+          for ordinal in "${!targets[@]}"; do
+            if (( ordinal % SHARD_COUNT != SHARD_INDEX )); then
+              continue
+            fi
+
+            target="${targets[ordinal]}"
+            log_file="${log_dir}/${target}.log"
+            selected_count=$((selected_count + 1))
+            echo "Running fsqlite-e2e integration target ${target} (${ordinal}/${#targets[@]})..."
+
+            set +e
+            cargo test --locked -p fsqlite-e2e --test "${target}" -- --nocapture \
+              > "${log_file}" 2>&1
+            status=$?
+            set -e
+
+            printf '%s\t%s\t%s\t%s\n' \
+              "${SHARD_INDEX}" "${ordinal}" "${target}" "${status}" >> "${manifest}"
+            if [[ "${status}" -eq 0 ]]; then
+              echo "- PASS \`${target}\`" >> "${summary}"
+            else
+              failed_count=$((failed_count + 1))
+              echo "- FAIL \`${target}\` (exit ${status}) — see \`logs/${target}.log\`" \
+                >> "${summary}"
+            fi
+          done
+
+          {
+            echo
+            echo "## Totals"
+            echo "- selected_targets: ${selected_count}"
+            echo "- failed_targets: ${failed_count}"
+          } >> "${summary}"
+          {
+            echo "### E2E integration shard ${SHARD_INDEX}/${SHARD_COUNT}"
+            echo "- selected_targets: ${selected_count}"
+            echo "- failed_targets: ${failed_count}"
+            echo "- manifest: \`${manifest}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${selected_count}" -eq 0 ]]; then
+            echo "ERROR: shard ${SHARD_INDEX} was assigned no targets" >&2
+            exit 1
+          fi
+          exit "${failed_count}"
+
+      - name: Upload E2E integration shard receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-integration-shard-${{ matrix.shard_index }}
+          path: artifacts/e2e-integration-shards/${{ matrix.shard_index }}/
+          retention-days: 21
+
+  e2e-integration-accounting:
+    needs: e2e-integration-shards
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      E2E_TEST_SOURCE_DIR: crates/fsqlite-e2e/tests
+      SHARD_COUNT: "16"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download E2E integration shard receipts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/downloaded-e2e-integration-shards
+          pattern: e2e-integration-shard-*
+          merge-multiple: false
+
+      - name: Enforce exact E2E target accounting
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t expected_targets < <(
+            git ls-files "${E2E_TEST_SOURCE_DIR}/*.rs" \
+              | xargs -r -n1 basename \
+              | sed -e 's/\.rs$//' \
+              | LC_ALL=C sort
+          )
+          if [[ "${#expected_targets[@]}" -eq 0 ]]; then
+            echo "ERROR: no fsqlite-e2e integration targets were discovered" >&2
+            exit 1
+          fi
+
+          declare -A expected_ordinals=()
+          declare -A seen_counts=()
+          declare -A exit_codes=()
+          for ordinal in "${!expected_targets[@]}"; do
+            expected_ordinals["${expected_targets[ordinal]}"]="${ordinal}"
+          done
+
+          malformed=0
+          receipt_rows=0
+          mapfile -t manifests < <(
+            find artifacts/downloaded-e2e-integration-shards -type f -name manifest.tsv \
+              | LC_ALL=C sort
+          )
+          if [[ "${#manifests[@]}" -ne "${SHARD_COUNT}" ]]; then
+            echo "ERROR: expected ${SHARD_COUNT} shard manifests, found ${#manifests[@]}" >&2
+            malformed=1
+          fi
+
+          for manifest in "${manifests[@]}"; do
+            while IFS=$'\t' read -r shard ordinal target status extra; do
+              if [[ -z "${shard}" && -z "${ordinal}" && -z "${target}" && -z "${status}" ]]; then
+                continue
+              fi
+              receipt_rows=$((receipt_rows + 1))
+              if [[ -n "${extra:-}" \
+                    || ! "${shard}" =~ ^[0-9]+$ \
+                    || ! "${ordinal}" =~ ^[0-9]+$ \
+                    || ! "${status}" =~ ^[0-9]+$ \
+                    || -z "${target}" ]]; then
+                echo "ERROR: malformed receipt row in ${manifest}: ${shard}/${ordinal}/${target}/${status}" >&2
+                malformed=1
+                continue
+              fi
+              if [[ -z "${expected_ordinals[${target}]+present}" ]]; then
+                echo "ERROR: unexpected integration target receipt: ${target}" >&2
+                malformed=1
+                continue
+              fi
+
+              expected_ordinal="${expected_ordinals[${target}]}"
+              expected_shard=$((expected_ordinal % SHARD_COUNT))
+              if [[ "${ordinal}" -ne "${expected_ordinal}" || "${shard}" -ne "${expected_shard}" ]]; then
+                echo "ERROR: target ${target} reported shard/ordinal ${shard}/${ordinal}; expected ${expected_shard}/${expected_ordinal}" >&2
+                malformed=1
+              fi
+              seen_counts["${target}"]=$(( ${seen_counts["${target}"]:-0} + 1 ))
+              exit_codes["${target}"]="${status}"
+            done < "${manifest}"
+          done
+
+          failed=0
+          for target in "${expected_targets[@]}"; do
+            count="${seen_counts[${target}]:-0}"
+            if [[ "${count}" -ne 1 ]]; then
+              echo "ERROR: target ${target} has ${count} receipts; expected exactly one" >&2
+              failed=1
+              continue
+            fi
+            if [[ "${exit_codes[${target}]}" -ne 0 ]]; then
+              echo "ERROR: target ${target} failed with exit code ${exit_codes[${target}]}" >&2
+              failed=1
+            fi
+          done
+
+          {
+            echo "### E2E integration target accounting"
+            echo "- expected_targets: ${#expected_targets[@]}"
+            echo "- receipt_rows: ${receipt_rows}"
+            echo "- shard_manifests: ${#manifests[@]}/${SHARD_COUNT}"
+            echo "- malformed_or_misassigned: ${malformed}"
+            echo "- failed_or_missing: ${failed}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${receipt_rows}" -ne "${#expected_targets[@]}" ]]; then
+            echo "ERROR: receipt row count ${receipt_rows} does not match target count ${#expected_targets[@]}" >&2
+            failed=1
+          fi
+          if [[ "${malformed}" -ne 0 || "${failed}" -ne 0 ]]; then
+            exit 1
+          fi

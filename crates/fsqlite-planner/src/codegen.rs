@@ -10,6 +10,7 @@ use fsqlite_ast::{
     SelectCore, SelectStatement, Span, UnaryOp as AstUnaryOp, UpdateStatement,
 };
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
+use fsqlite_types::SqliteValue;
 use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
 
 // ---------------------------------------------------------------------------
@@ -1826,6 +1827,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
                 Ok(())
             }
         },
+        Expr::BoundOuterValue { value, .. } => emit_sqlite_value(b, value, reg),
 
         // Binary operations: arithmetic, comparison, logical, bitwise.
         Expr::BinaryOp {
@@ -1992,6 +1994,47 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
     }
 }
 
+/// Emit an already-materialized SQLite value without translating it through
+/// the SQL-literal AST, which would discard its exact storage class.
+fn emit_sqlite_value(
+    b: &mut ProgramBuilder,
+    value: &SqliteValue,
+    reg: i32,
+) -> Result<(), CodegenError> {
+    match value {
+        SqliteValue::Null => {
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        }
+        SqliteValue::Integer(value) => {
+            if let Ok(as_i32) = i32::try_from(*value) {
+                b.emit_op(Opcode::Integer, as_i32, reg, 0, P4::None, 0);
+            } else {
+                b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(*value), 0);
+            }
+        }
+        SqliteValue::Float(value) => {
+            b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(*value), 0);
+        }
+        SqliteValue::Text(value) => {
+            b.emit_op(
+                Opcode::String8,
+                0,
+                reg,
+                0,
+                P4::Str(value.as_str().to_owned()),
+                0,
+            );
+        }
+        SqliteValue::Blob(value) => {
+            let len = i32::try_from(value.len()).map_err(|_| {
+                CodegenError::Unsupported("bound BLOB value exceeds VDBE operand range".to_owned())
+            })?;
+            b.emit_op(Opcode::Blob, len, reg, 0, P4::Blob(value.to_vec()), 0);
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2000,10 +2043,10 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
 mod tests {
     use super::*;
     use fsqlite_ast::{
-        Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
-        Distinctness, Expr, FromClause, InsertSource, InsertStatement, Literal, PlaceholderType,
-        QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore, SelectStatement,
-        Span, TableOrSubquery, UpdateStatement,
+        Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, BoundCollation, ColumnRef,
+        DeleteStatement, Distinctness, Expr, FromClause, InsertSource, InsertStatement, Literal,
+        PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore,
+        SelectStatement, Span, TableOrSubquery, UpdateStatement,
     };
     use fsqlite_types::opcode::{Opcode, ProgramBuilder, VdbeProgram};
 
@@ -2806,7 +2849,7 @@ mod tests {
         let values = |rows: Vec<Vec<Expr>>| SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(rows),
+                select: SelectCore::Values(rows.into()),
                 compounds: vec![],
             },
             order_by: vec![],
@@ -3058,6 +3101,52 @@ mod tests {
         assert_eq!(ops[9].opcode, Opcode::String8);
         assert_eq!(ops[10].opcode, Opcode::PureFunc);
         assert_eq!(ops[10].p3, reg_current_timestamp);
+    }
+
+    #[test]
+    fn test_emit_expr_bound_outer_values_preserves_storage_class() {
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Float(3.25),
+            SqliteValue::Text("outer text".into()),
+            SqliteValue::Blob(vec![0, 1, 2, 255].into()),
+        ];
+        let mut b = ProgramBuilder::new();
+
+        for value in values {
+            let reg = b.alloc_reg();
+            emit_expr(
+                &mut b,
+                &Expr::BoundOuterValue {
+                    value,
+                    collation: BoundCollation::Unspecified,
+                    affinity: None,
+                    span: Span::ZERO,
+                },
+                reg,
+            )
+            .unwrap();
+        }
+
+        let program = b.finish().unwrap();
+        let ops = program.ops();
+        assert_eq!(ops.len(), 5);
+        assert_eq!((ops[0].opcode, &ops[0].p4), (Opcode::Null, &P4::None));
+        assert_eq!(
+            (ops[1].opcode, &ops[1].p4),
+            (Opcode::Int64, &P4::Int64(i64::MAX))
+        );
+        assert_eq!((ops[2].opcode, &ops[2].p4), (Opcode::Real, &P4::Real(3.25)));
+        assert_eq!(
+            (ops[3].opcode, &ops[3].p4),
+            (Opcode::String8, &P4::Str("outer text".to_owned()))
+        );
+        assert_eq!(ops[4].p1, 4);
+        assert_eq!(
+            (ops[4].opcode, &ops[4].p4),
+            (Opcode::Blob, &P4::Blob(vec![0, 1, 2, 255]))
+        );
     }
 
     #[test]
@@ -3477,16 +3566,19 @@ mod tests {
         let stmt = SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(vec![
+                select: SelectCore::Values(
                     vec![
-                        Expr::Literal(Literal::Integer(1), Span::ZERO),
-                        Expr::Literal(Literal::String("alpha".to_owned()), Span::ZERO),
-                    ],
-                    vec![
-                        Expr::Literal(Literal::Integer(2), Span::ZERO),
-                        Expr::Literal(Literal::String("beta".to_owned()), Span::ZERO),
-                    ],
-                ]),
+                        vec![
+                            Expr::Literal(Literal::Integer(1), Span::ZERO),
+                            Expr::Literal(Literal::String("alpha".to_owned()), Span::ZERO),
+                        ],
+                        vec![
+                            Expr::Literal(Literal::Integer(2), Span::ZERO),
+                            Expr::Literal(Literal::String("beta".to_owned()), Span::ZERO),
+                        ],
+                    ]
+                    .into(),
+                ),
                 compounds: vec![],
             },
             order_by: vec![],
@@ -3536,13 +3628,16 @@ mod tests {
         let stmt = SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(vec![
-                    vec![Expr::Literal(Literal::Integer(1), Span::ZERO)],
+                select: SelectCore::Values(
                     vec![
-                        Expr::Literal(Literal::Integer(2), Span::ZERO),
-                        Expr::Literal(Literal::Integer(3), Span::ZERO),
-                    ],
-                ]),
+                        vec![Expr::Literal(Literal::Integer(1), Span::ZERO)],
+                        vec![
+                            Expr::Literal(Literal::Integer(2), Span::ZERO),
+                            Expr::Literal(Literal::Integer(3), Span::ZERO),
+                        ],
+                    ]
+                    .into(),
+                ),
                 compounds: vec![],
             },
             order_by: vec![],
@@ -3794,7 +3889,7 @@ mod tests {
         let inner_values = SelectStatement {
             with: None,
             body: SelectBody {
-                select: SelectCore::Values(vec![vec![placeholder(1)]]),
+                select: SelectCore::Values(vec![vec![placeholder(1)]].into()),
                 compounds: vec![],
             },
             order_by: vec![],

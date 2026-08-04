@@ -18,6 +18,7 @@
 //! | H5   | F5: append_frames returns Busy | N committed | N frames (append rejected) | No partial frames, retry succeeds |
 //! | H9   | F9: crash between header rewrite and truncate | N committed, then reset | 0 frames (salt mismatch) | DB state = last checkpoint |
 
+use std::future::Future;
 use std::path::Path;
 
 use fsqlite_types::cx::Cx;
@@ -34,6 +35,18 @@ const BEAD_ID: &str = "bd-db300.7.2.3";
 /// Shared, panic-safe ownership guard for process-global fault hooks.
 static RECOVERY_TEST_LOCK: fault_hooks::FaultInjectionSessionLock =
     fault_hooks::FaultInjectionSessionLock::new();
+
+std::thread_local! {
+    static TEST_RUNTIME: asupersync::runtime::Runtime =
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("WAL recovery test runtime should build");
+}
+
+fn block_on_test<F: Future>(future: F) -> F::Output {
+    TEST_RUNTIME.with(|runtime| runtime.block_on(future))
+}
 
 fn test_cx() -> Cx {
     Cx::new()
@@ -65,7 +78,8 @@ fn create_wal_with_committed_frames(
     n: usize,
 ) -> (WalFile<<MemoryVfs as Vfs>::File>, u32) {
     let file = open_wal_file(vfs, cx);
-    let mut wal = WalFile::create(cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+    let mut wal =
+        block_on_test(WalFile::create(cx, file, PAGE_SIZE, 0, test_salts())).expect("create WAL");
 
     for i in 0..n {
         let page_no = u32::try_from(i + 1).unwrap();
@@ -74,12 +88,12 @@ fn create_wal_with_committed_frames(
         } else {
             0
         };
-        wal.append_frame(
+        block_on_test(wal.append_frame(
             cx,
             page_no,
             &sample_page(u8::try_from(i % 251).unwrap()),
             db_size,
-        )
+        ))
         .expect("append frame");
     }
     if n > 0 {
@@ -129,8 +143,7 @@ fn r1_crash_after_append_recovery_preserves_written_frames() {
         })
         .collect();
 
-    let err = wal
-        .append_frames(&cx, &new_frames)
+    let err = block_on_test(wal.append_frames(&cx, &new_frames))
         .expect_err("H1 hook should fire after append");
     assert!(err.to_string().contains("fault_inject:wal_after_append"));
 
@@ -144,7 +157,8 @@ fn r1_crash_after_append_recovery_preserves_written_frames() {
     // Phase 3: Close and re-open — recovery.
     wal.close(&cx).expect("close WAL");
     let recovered_file = open_wal_file(&vfs, &cx);
-    let recovered = WalFile::open(&cx, recovered_file).expect("reopen WAL for recovery");
+    let recovered =
+        block_on_test(WalFile::open(&cx, recovered_file)).expect("reopen WAL for recovery");
 
     // Recovery proof:
     // - MemoryVfs: data is always "durable", so all 8 frames survive.
@@ -159,8 +173,7 @@ fn r1_crash_after_append_recovery_preserves_written_frames() {
 
     // Verify checksum chain: read each frame and confirm header is valid.
     for i in 0..recovered_count {
-        let (header, _page) = recovered
-            .read_frame(&cx, i)
+        let (header, _page) = block_on_test(recovered.read_frame(&cx, i))
             .unwrap_or_else(|e| panic!("bead_id={BEAD_ID} invariant=R1 frame {i} unreadable: {e}"));
         assert!(
             header.page_number > 0,
@@ -221,7 +234,7 @@ fn r2_sync_failure_does_not_corrupt_written_frames() {
     // Recovery: re-open.
     wal.close(&cx).expect("close WAL");
     let recovered_file = open_wal_file(&vfs, &cx);
-    let recovered = WalFile::open(&cx, recovered_file).expect("reopen WAL");
+    let recovered = block_on_test(WalFile::open(&cx, recovered_file)).expect("reopen WAL");
 
     assert_eq!(
         recovered.frame_count(),
@@ -231,8 +244,7 @@ fn r2_sync_failure_does_not_corrupt_written_frames() {
 
     // Verify all frames readable.
     for i in 0..4 {
-        recovered
-            .read_frame(&cx, i)
+        block_on_test(recovered.read_frame(&cx, i))
             .unwrap_or_else(|e| panic!("bead_id={BEAD_ID} invariant=R2 frame {i}: {e}"));
     }
 
@@ -270,8 +282,7 @@ fn r3_append_busy_leaves_no_partial_frames_and_retry_succeeds() {
         db_size_if_commit: 4,
     }];
 
-    let err = wal
-        .append_frames(&cx, &frames)
+    let err = block_on_test(wal.append_frames(&cx, &frames))
         .expect_err("H5 countdown should fire on first append");
     assert!(matches!(err, fsqlite_error::FrankenError::Busy));
 
@@ -288,14 +299,13 @@ fn r3_append_busy_leaves_no_partial_frames_and_retry_succeeds() {
     );
 
     // Retry succeeds.
-    wal.append_frames(&cx, &frames)
-        .expect("retry after busy should succeed");
+    block_on_test(wal.append_frames(&cx, &frames)).expect("retry after busy should succeed");
     assert_eq!(wal.frame_count(), pre_fault_count + 1);
 
     // Recovery: re-open and verify.
     wal.close(&cx).expect("close");
     let recovered_file = open_wal_file(&vfs, &cx);
-    let recovered = WalFile::open(&cx, recovered_file).expect("reopen");
+    let recovered = block_on_test(WalFile::open(&cx, recovered_file)).expect("reopen");
     assert_eq!(
         recovered.frame_count(),
         pre_fault_count + 1,
@@ -336,9 +346,7 @@ fn r4_crash_between_header_and_truncate_recovers_to_zero_frames() {
         salt1: original_salts.salt1.wrapping_add(42),
         salt2: original_salts.salt2.wrapping_add(42),
     };
-    let err = wal
-        .reset(&cx, 1, new_salts, true)
-        .expect_err("H9 hook should fire");
+    let err = block_on_test(wal.reset(&cx, 1, new_salts, true)).expect_err("H9 hook should fire");
     assert!(
         err.to_string()
             .contains("fault_inject:wal_crash_header_truncate")
@@ -347,7 +355,7 @@ fn r4_crash_between_header_and_truncate_recovers_to_zero_frames() {
     // Close and recover.
     wal.close(&cx).expect("close corrupted WAL");
     let recovered_file = open_wal_file(&vfs, &cx);
-    let recovered = WalFile::open(&cx, recovered_file).expect("reopen WAL");
+    let recovered = block_on_test(WalFile::open(&cx, recovered_file)).expect("reopen WAL");
 
     // Key invariant: 0 frames because salt mismatch.
     assert_eq!(
@@ -394,12 +402,12 @@ fn r5_multi_fault_sequence_maintains_checksum_chain() {
         page_data: &page_a,
         db_size_if_commit: 4,
     }];
-    let _ = wal.append_frames(&cx, &frames_a); // Will error after writing
+    let _ = block_on_test(wal.append_frames(&cx, &frames_a)); // Will error after writing
 
     // Close and reopen (simulates restart after crash).
     wal.close(&cx).expect("close after fault 1");
     let file2 = open_wal_file(&vfs, &cx);
-    let mut wal2 = WalFile::open(&cx, file2).expect("reopen after fault 1");
+    let mut wal2 = block_on_test(WalFile::open(&cx, file2)).expect("reopen after fault 1");
     let count_after_recovery_1 = wal2.frame_count();
 
     // Fault 2: busy on next append.
@@ -414,19 +422,18 @@ fn r5_multi_fault_sequence_maintains_checksum_chain() {
         page_data: &page_b,
         db_size_if_commit: u32::try_from(count_after_recovery_1 + 1).unwrap(),
     }];
-    let busy_err = wal2.append_frames(&cx, &frames_b);
+    let busy_err = block_on_test(wal2.append_frames(&cx, &frames_b));
     assert!(busy_err.is_err());
 
     // Retry succeeds.
-    wal2.append_frames(&cx, &frames_b)
-        .expect("retry after busy");
+    block_on_test(wal2.append_frames(&cx, &frames_b)).expect("retry after busy");
     let final_count = wal2.frame_count();
     assert_eq!(final_count, count_after_recovery_1 + 1);
 
     // Final recovery.
     wal2.close(&cx).expect("close after fault 2");
     let file3 = open_wal_file(&vfs, &cx);
-    let final_wal = WalFile::open(&cx, file3).expect("final reopen");
+    let final_wal = block_on_test(WalFile::open(&cx, file3)).expect("final reopen");
     assert_eq!(
         final_wal.frame_count(),
         final_count,
@@ -435,8 +442,7 @@ fn r5_multi_fault_sequence_maintains_checksum_chain() {
 
     // Verify all frames readable.
     for i in 0..final_wal.frame_count() {
-        final_wal
-            .read_frame(&cx, i)
+        block_on_test(final_wal.read_frame(&cx, i))
             .unwrap_or_else(|e| panic!("bead_id={BEAD_ID} invariant=R5 frame {i}: {e}"));
     }
 

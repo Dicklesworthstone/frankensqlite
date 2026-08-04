@@ -24,6 +24,7 @@
 //! ```
 
 #![allow(clippy::cast_precision_loss)]
+#![recursion_limit = "512"]
 
 use fsqlite_pager::ShardedPageCache;
 use fsqlite_types::{PageNumber, PageSize};
@@ -443,223 +444,241 @@ fn q6_concurrent_reads() {
 
 #[test]
 fn q7_e2e_insert_10k_oracle() {
-    let tn = "q7_insert_10k_oracle";
-    let row_count = 10_000i64;
-    emit_log(tn, "start", json!({"rows": row_count}));
+    asupersync::test_utils::run_test(|| async {
+        let tn = "q7_insert_10k_oracle";
+        let row_count = 10_000i64;
+        emit_log(tn, "start", json!({"rows": row_count}));
 
-    let fconn = fsqlite::Connection::open(":memory:").unwrap();
-    let cconn = rusqlite::Connection::open_in_memory().unwrap();
+        let fconn = fsqlite::Connection::open(":memory:").await.unwrap();
+        let cconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    fconn
-        .execute("CREATE TABLE cache_test (id INTEGER PRIMARY KEY, val INTEGER, label TEXT)")
-        .unwrap();
-    cconn
-        .execute_batch("CREATE TABLE cache_test (id INTEGER PRIMARY KEY, val INTEGER, label TEXT);")
-        .unwrap();
-
-    let insert_start = Instant::now();
-    fconn.execute("BEGIN").unwrap();
-    cconn.execute_batch("BEGIN;").unwrap();
-    for i in 0..row_count {
-        let val = i * 13 + 7;
-        let label = format!("cache_{i:06}");
         fconn
-            .execute(&format!(
-                "INSERT INTO cache_test VALUES ({i}, {val}, '{label}')"
-            ))
+            .execute("CREATE TABLE cache_test (id INTEGER PRIMARY KEY, val INTEGER, label TEXT)")
+            .await
             .unwrap();
         cconn
-            .execute(
-                "INSERT INTO cache_test VALUES (?1, ?2, ?3)",
-                rusqlite::params![i, val, label],
+            .execute_batch(
+                "CREATE TABLE cache_test (id INTEGER PRIMARY KEY, val INTEGER, label TEXT);",
             )
             .unwrap();
-    }
-    fconn.execute("COMMIT").unwrap();
-    cconn.execute_batch("COMMIT;").unwrap();
-    let insert_ns = insert_start.elapsed().as_nanos() as u64;
 
-    // Full scan — exercises page cache read path
-    let scan_start = Instant::now();
-    let f_rows = fconn
-        .query("SELECT id, val, label FROM cache_test ORDER BY id")
-        .unwrap();
-    let scan_ns = scan_start.elapsed().as_nanos() as u64;
-
-    let c_rows: Vec<(i64, i64, String)> = {
-        let mut stmt = cconn
-            .prepare("SELECT id, val, label FROM cache_test ORDER BY id")
-            .unwrap();
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    };
-
-    assert_eq!(f_rows.len(), c_rows.len(), "[Q7] row count mismatch");
-
-    let mut mismatches = 0u64;
-    for (i, (f_row, c_row)) in f_rows.iter().zip(c_rows.iter()).enumerate() {
-        let f_vals = f_row.values();
-        let f_id = match &f_vals[0] {
-            fsqlite_types::value::SqliteValue::Integer(n) => *n,
-            other => panic!("row {i}: unexpected id: {other:?}"),
-        };
-        let f_val = match &f_vals[1] {
-            fsqlite_types::value::SqliteValue::Integer(n) => *n,
-            other => panic!("row {i}: unexpected val: {other:?}"),
-        };
-        let f_label = match &f_vals[2] {
-            fsqlite_types::value::SqliteValue::Text(s) => s.as_str().to_owned(),
-            other => panic!("row {i}: unexpected label: {other:?}"),
-        };
-
-        if f_id != c_row.0 || f_val != c_row.1 || f_label != c_row.2 {
-            mismatches += 1;
+        let insert_start = Instant::now();
+        fconn.execute("BEGIN").await.unwrap();
+        cconn.execute_batch("BEGIN;").unwrap();
+        for i in 0..row_count {
+            let val = i * 13 + 7;
+            let label = format!("cache_{i:06}");
+            fconn
+                .execute(&format!(
+                    "INSERT INTO cache_test VALUES ({i}, {val}, '{label}')"
+                ))
+                .await
+                .unwrap();
+            cconn
+                .execute(
+                    "INSERT INTO cache_test VALUES (?1, ?2, ?3)",
+                    rusqlite::params![i, val, label],
+                )
+                .unwrap();
         }
-    }
+        fconn.execute("COMMIT").await.unwrap();
+        cconn.execute_batch("COMMIT;").unwrap();
+        let insert_ns = insert_start.elapsed().as_nanos() as u64;
 
-    emit_log(
-        tn,
-        "result",
-        json!({
-            "rows": row_count,
-            "insert_ns": insert_ns,
-            "scan_ns": scan_ns,
-            "mismatches": mismatches,
-        }),
-    );
+        // Full scan — exercises page cache read path
+        let scan_start = Instant::now();
+        let f_rows = fconn
+            .query("SELECT id, val, label FROM cache_test ORDER BY id")
+            .await
+            .unwrap();
+        let scan_ns = scan_start.elapsed().as_nanos() as u64;
 
-    assert_eq!(mismatches, 0, "[Q7] {mismatches} mismatches in 10K oracle");
+        let c_rows: Vec<(i64, i64, String)> = {
+            let mut stmt = cconn
+                .prepare("SELECT id, val, label FROM cache_test ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+
+        assert_eq!(f_rows.len(), c_rows.len(), "[Q7] row count mismatch");
+
+        let mut mismatches = 0u64;
+        for (i, (f_row, c_row)) in f_rows.iter().zip(c_rows.iter()).enumerate() {
+            let f_vals = f_row.values();
+            let f_id = match &f_vals[0] {
+                fsqlite_types::value::SqliteValue::Integer(n) => *n,
+                other => panic!("row {i}: unexpected id: {other:?}"),
+            };
+            let f_val = match &f_vals[1] {
+                fsqlite_types::value::SqliteValue::Integer(n) => *n,
+                other => panic!("row {i}: unexpected val: {other:?}"),
+            };
+            let f_label = match &f_vals[2] {
+                fsqlite_types::value::SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("row {i}: unexpected label: {other:?}"),
+            };
+
+            if f_id != c_row.0 || f_val != c_row.1 || f_label != c_row.2 {
+                mismatches += 1;
+            }
+        }
+
+        emit_log(
+            tn,
+            "result",
+            json!({
+                "rows": row_count,
+                "insert_ns": insert_ns,
+                "scan_ns": scan_ns,
+                "mismatches": mismatches,
+            }),
+        );
+
+        assert_eq!(mismatches, 0, "[Q7] {mismatches} mismatches in 10K oracle");
+    });
 }
 
 // ─── Q8: 4 concurrent writers, no data loss ──────────────────────────
 
 #[test]
 fn q8_e2e_concurrent_writers() {
-    let tn = "q8_concurrent_writers";
-    let thread_count = 4usize;
-    let rows_per_thread = 500i64;
-    emit_log(
-        tn,
-        "start",
-        json!({"threads": thread_count, "rows_per_thread": rows_per_thread}),
-    );
+    asupersync::test_utils::run_test(|| async {
+        let tn = "q8_concurrent_writers";
+        let thread_count = 4usize;
+        let rows_per_thread = 500i64;
+        emit_log(
+            tn,
+            "start",
+            json!({"threads": thread_count, "rows_per_thread": rows_per_thread}),
+        );
 
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("q8.db");
-    let path_str = db_path.to_str().unwrap().to_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q8.db");
+        let path_str = db_path.to_str().unwrap().to_owned();
 
-    // Setup: create table on a fresh connection
-    {
-        let conn = fsqlite::Connection::open(&path_str).unwrap();
-        conn.execute(
-            "CREATE TABLE writers (tid INTEGER, seq INTEGER, val INTEGER, PRIMARY KEY (tid, seq))",
-        )
-        .unwrap();
-    }
+        // Setup: create table on a fresh connection
+        {
+            let conn = fsqlite::Connection::open(&path_str).await.unwrap();
+            conn.execute(
+                "CREATE TABLE writers (tid INTEGER, seq INTEGER, val INTEGER, PRIMARY KEY (tid, seq))",
+            )
+            .await
+            .unwrap();
+        }
 
-    let barrier = Arc::new(Barrier::new(thread_count));
-    let path_arc = Arc::new(path_str.clone());
+        let barrier = Arc::new(Barrier::new(thread_count));
+        let path_arc = Arc::new(path_str.clone());
 
-    let handles: Vec<_> = (0..thread_count)
-        .map(|tid| {
-            let barrier = Arc::clone(&barrier);
-            let path = Arc::clone(&path_arc);
-            std::thread::spawn(move || {
-                let conn = fsqlite::Connection::open(path.as_str()).unwrap();
-                barrier.wait();
+        let handles: Vec<_> = (0..thread_count)
+            .map(|tid| {
+                let barrier = Arc::clone(&barrier);
+                let path = Arc::clone(&path_arc);
+                std::thread::spawn(move || {
+                    let mut written = 0i64;
+                    asupersync::test_utils::run_test(|| async {
+                        let conn = fsqlite::Connection::open(path.as_str()).await.unwrap();
+                        barrier.wait();
 
-                let mut written = 0i64;
-                let batch = 50i64;
-                let mut seq = 0i64;
-                while seq < rows_per_thread {
-                    let end = (seq + batch).min(rows_per_thread);
-                    let max_retries = 50;
-                    let mut attempt = 0;
-                    loop {
-                        attempt += 1;
-                        conn.execute("BEGIN").unwrap();
-                        let mut batch_ok = true;
-                        for s in seq..end {
-                            let val = tid as i64 * 10000 + s;
-                            if conn
-                                .execute(&format!("INSERT INTO writers VALUES ({tid}, {s}, {val})"))
-                                .is_err()
-                            {
-                                batch_ok = false;
-                                break;
-                            }
-                        }
-                        if batch_ok {
-                            match conn.execute("COMMIT") {
-                                Ok(_) => {
-                                    written += end - seq;
-                                    break;
+                        let batch = 50i64;
+                        let mut seq = 0i64;
+                        while seq < rows_per_thread {
+                            let end = (seq + batch).min(rows_per_thread);
+                            let max_retries = 50;
+                            let mut attempt = 0;
+                            loop {
+                                attempt += 1;
+                                conn.execute("BEGIN").await.unwrap();
+                                let mut batch_ok = true;
+                                for s in seq..end {
+                                    let val = tid as i64 * 10000 + s;
+                                    if conn
+                                        .execute(&format!(
+                                            "INSERT INTO writers VALUES ({tid}, {s}, {val})"
+                                        ))
+                                        .await
+                                        .is_err()
+                                    {
+                                        batch_ok = false;
+                                        break;
+                                    }
                                 }
-                                Err(_) => {
-                                    let _ = conn.execute("ROLLBACK");
+                                if batch_ok {
+                                    match conn.execute("COMMIT").await {
+                                        Ok(_) => {
+                                            written += end - seq;
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            drop(conn.execute("ROLLBACK").await);
+                                        }
+                                    }
+                                } else {
+                                    drop(conn.execute("ROLLBACK").await);
                                 }
+                                assert!(
+                                    attempt < max_retries,
+                                    "thread {tid} exceeded {max_retries} retries at seq={seq}"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    1 + (attempt as u64 * tid as u64) % 5,
+                                ));
                             }
-                        } else {
-                            let _ = conn.execute("ROLLBACK");
+                            seq = end;
                         }
-                        assert!(
-                            attempt < max_retries,
-                            "thread {tid} exceeded {max_retries} retries at seq={seq}"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            1 + (attempt as u64 * tid as u64) % 5,
-                        ));
-                    }
-                    seq = end;
-                }
+                    });
 
-                written
+                    written
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    let mut total_written = 0i64;
-    for h in handles {
-        total_written += h.join().unwrap();
-    }
+        let mut total_written = 0i64;
+        for h in handles {
+            total_written += h.join().unwrap();
+        }
 
-    // Verify: open fresh connection, count rows, check no duplicates
-    let verify_conn = fsqlite::Connection::open(&path_str).unwrap();
-    let count_rows = verify_conn.query("SELECT COUNT(*) FROM writers").unwrap();
-    let actual_count = match &count_rows[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Integer(n) => *n,
-        other => panic!("unexpected count: {other:?}"),
-    };
+        // Verify: open fresh connection, count rows, check no duplicates
+        let verify_conn = fsqlite::Connection::open(&path_str).await.unwrap();
+        let count_rows = verify_conn
+            .query("SELECT COUNT(*) FROM writers")
+            .await
+            .unwrap();
+        let actual_count = match &count_rows[0].values()[0] {
+            fsqlite_types::value::SqliteValue::Integer(n) => *n,
+            other => panic!("unexpected count: {other:?}"),
+        };
 
-    let expected = thread_count as i64 * rows_per_thread;
+        let expected = thread_count as i64 * rows_per_thread;
 
-    // Also verify against csqlite
-    let cconn = rusqlite::Connection::open(db_path.to_str().unwrap()).unwrap();
-    let c_count: i64 = cconn
-        .query_row("SELECT COUNT(*) FROM writers", [], |r| r.get(0))
-        .unwrap();
+        // Also verify against csqlite
+        let cconn = rusqlite::Connection::open(db_path.to_str().unwrap()).unwrap();
+        let c_count: i64 = cconn
+            .query_row("SELECT COUNT(*) FROM writers", [], |r| r.get(0))
+            .unwrap();
 
-    emit_log(
-        tn,
-        "result",
-        json!({
-            "threads": thread_count,
-            "rows_per_thread": rows_per_thread,
-            "total_written": total_written,
-            "fsqlite_count": actual_count,
-            "csqlite_count": c_count,
-            "expected": expected,
-        }),
-    );
+        emit_log(
+            tn,
+            "result",
+            json!({
+                "threads": thread_count,
+                "rows_per_thread": rows_per_thread,
+                "total_written": total_written,
+                "fsqlite_count": actual_count,
+                "csqlite_count": c_count,
+                "expected": expected,
+            }),
+        );
 
-    assert_eq!(
-        actual_count, expected,
-        "[Q8] fsqlite row count: expected {expected}, got {actual_count}"
-    );
-    assert_eq!(
-        c_count, expected,
-        "[Q8] csqlite verification: expected {expected}, got {c_count}"
-    );
+        assert_eq!(
+            actual_count, expected,
+            "[Q8] fsqlite row count: expected {expected}, got {actual_count}"
+        );
+        assert_eq!(
+            c_count, expected,
+            "[Q8] csqlite verification: expected {expected}, got {c_count}"
+        );
+    });
 }

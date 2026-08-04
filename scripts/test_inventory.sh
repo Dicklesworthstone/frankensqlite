@@ -1,233 +1,153 @@
 #!/usr/bin/env bash
+# Canonical FrankenSQLite test-realism and Turso adaptation inventory.
 #
-# FrankenSQLite Test Realism Inventory
-# Analyzes test patterns to classify realism levels
-#
-# Usage:
-#   ./scripts/test_inventory.sh              # Full inventory
-#   ./scripts/test_inventory.sh summary      # Summary stats only
-#   ./scripts/test_inventory.sh crate NAME   # Single crate analysis
+# The default command is offline and validates the reviewed contract against
+# tracked HEAD. `audit` additionally fetches metadata for the pinned Turso Git
+# tree and proves every upstream top-level testing entry is classified.
 
 set -euo pipefail
 
-OUTPUT_DIR="${OUTPUT_DIR:-target/test-inventory}"
-mkdir -p "$OUTPUT_DIR"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE_ROOT}/target/test-inventory}"
+CONTRACT_PATH="${CONTRACT_PATH:-${WORKSPACE_ROOT}/docs/contracts/turso_test_adaptation_inventory.toml}"
+UPSTREAM_TREE_JSON="${TURSO_TREE_JSON:-${OUTPUT_DIR}/turso-tree.json}"
+REPORT_JSON="${OUTPUT_DIR}/test_inventory.json"
+REPORT_MARKDOWN="${OUTPUT_DIR}/summary.md"
+REPORT_CSV="${OUTPUT_DIR}/test_inventory.csv"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-print_status() {
-    echo -e "${1}${2}${NC}"
+contract_commit() {
+    awk '
+        /^\[source\]$/ { in_source = 1; next }
+        /^\[/ && in_source { exit }
+        in_source && /^commit = / {
+            value = $0
+            sub(/^commit = "/, "", value)
+            sub(/"$/, "", value)
+            print value
+            exit
+        }
+    ' "${CONTRACT_PATH}"
 }
 
-# Analyze a single file for test patterns
-analyze_file() {
-    local file="$1"
-    local crate
-    crate=$(echo "$file" | sed 's|crates/\([^/]*\)/.*|\1|')
-
-    # Count test functions
-    local test_count
-    test_count=$(rg -c '#\[test\]' "$file" 2>/dev/null || echo "0")
-
-    if [[ "$test_count" == "0" ]]; then
-        return
+fetch_upstream_tree() {
+    local commit
+    commit="$(contract_commit)"
+    if [[ ! "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "ERROR invalid pinned Turso commit in ${CONTRACT_PATH}: ${commit}" >&2
+        return 1
     fi
 
-    # Pattern detection
-    local uses_mock=false
-    local uses_memory_backend=false
-    local uses_file_backend=false
-    local is_e2e=false
-    local is_proptest=false
-    local uses_tempfile=false
+    mkdir -p "${OUTPUT_DIR}"
+    local -a curl_args=(
+        --fail
+        --silent
+        --show-error
+        --location
+        --retry 3
+        --header "Accept: application/vnd.github+json"
+        --header "X-GitHub-Api-Version: 2022-11-28"
+    )
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        curl_args+=(--header "Authorization: Bearer ${GITHUB_TOKEN}")
+    fi
+    curl "${curl_args[@]}" \
+        "https://api.github.com/repos/tursodatabase/turso/git/trees/${commit}?recursive=1" \
+        --output "${UPSTREAM_TREE_JSON}"
+    echo "INFO upstream_tree_fetched commit=${commit} artifact=${UPSTREAM_TREE_JSON}"
+}
 
-    # Check for mock/fake/stub patterns
-    if rg -q 'Mock|Fake|Stub|mock_|fake_|stub_' "$file" 2>/dev/null; then
-        uses_mock=true
+run_inventory() {
+    local require_upstream="$1"
+    shift
+    local -a args=(
+        --workspace-root "${WORKSPACE_ROOT}"
+        --contract "${CONTRACT_PATH}"
+        --output-json "${REPORT_JSON}"
+        --output-markdown "${REPORT_MARKDOWN}"
+        --output-csv "${REPORT_CSV}"
+        "$@"
+    )
+    if [[ "${require_upstream}" == "true" ]]; then
+        args+=(--upstream-tree "${UPSTREAM_TREE_JSON}" --require-upstream-tree)
     fi
 
-    # Check for in-memory backend
-    if rg -q 'MemDatabase|MemoryVfs|:memory:|InMemory' "$file" 2>/dev/null; then
-        uses_memory_backend=true
-    fi
-
-    # Check for tempfile usage (file-backed tests)
-    if rg -q 'tempfile|TempDir|temp_dir|NamedTempFile' "$file" 2>/dev/null; then
-        uses_tempfile=true
-        uses_file_backend=true
-    fi
-
-    # Check for E2E tests
-    if [[ "$file" == *"e2e"* ]] || rg -q 'test_e2e_|E2E|end.to.end' "$file" 2>/dev/null; then
-        is_e2e=true
-    fi
-
-    # Check for property-based tests
-    if rg -q 'proptest|prop_' "$file" 2>/dev/null; then
-        is_proptest=true
-    fi
-
-    # Determine realism tier
-    local tier="unknown"
-    if [[ "$is_e2e" == "true" ]]; then
-        tier="e2e"
-    elif [[ "$uses_file_backend" == "true" ]]; then
-        tier="file-backed"
-    elif [[ "$uses_memory_backend" == "true" ]]; then
-        tier="in-memory"
-    elif [[ "$uses_mock" == "true" ]]; then
-        tier="mocked"
+    mkdir -p "${OUTPUT_DIR}"
+    if [[ -n "${FSQLITE_TEST_INVENTORY_BIN:-}" ]]; then
+        "${FSQLITE_TEST_INVENTORY_BIN}" "${args[@]}"
     else
-        tier="unit"
+        cargo run --quiet -p fsqlite-harness --bin test_inventory -- "${args[@]}"
     fi
-
-    # Output as CSV line
-    echo "$crate,$file,$test_count,$tier,$uses_mock,$uses_memory_backend,$uses_file_backend,$is_proptest"
 }
 
-# Full inventory
 cmd_full() {
-    print_status "$GREEN" "Generating test inventory..."
-
-    local csv_file="$OUTPUT_DIR/test_inventory.csv"
-    echo "crate,file,test_count,realism_tier,uses_mock,uses_memory,uses_file,is_proptest" > "$csv_file"
-
-    # Find all test files
-    local test_files
-    test_files=$(find crates -name '*.rs' -type f | sort)
-
-    for file in $test_files; do
-        local result
-        result=$(analyze_file "$file" 2>/dev/null || true)
-        if [[ -n "$result" ]]; then
-            echo "$result" >> "$csv_file"
-        fi
-    done
-
-    print_status "$GREEN" "Inventory saved to: $csv_file"
-
-    # Generate summary
-    cmd_summary
+    run_inventory false "$@"
 }
 
-# Summary statistics
+cmd_audit() {
+    if [[ -z "${TURSO_TREE_JSON:-}" ]]; then
+        fetch_upstream_tree
+    elif [[ ! -f "${UPSTREAM_TREE_JSON}" ]]; then
+        echo "ERROR TURSO_TREE_JSON does not exist: ${UPSTREAM_TREE_JSON}" >&2
+        return 1
+    fi
+    run_inventory true "$@"
+}
+
 cmd_summary() {
-    local csv_file="$OUTPUT_DIR/test_inventory.csv"
-
-    if [[ ! -f "$csv_file" ]]; then
-        print_status "$RED" "No inventory found. Run '$0' first."
-        exit 1
+    if [[ ! -f "${REPORT_MARKDOWN}" ]]; then
+        echo "ERROR no report found; run '$0 full' or '$0 audit' first" >&2
+        return 1
     fi
-
-    print_status "$CYAN" ""
-    print_status "$CYAN" "=== Test Realism Inventory Summary ==="
-    print_status "$CYAN" ""
-
-    # Count by tier
-    print_status "$YELLOW" "By Realism Tier:"
-    awk -F, 'NR>1 {tier[$4]+=$3} END {for (t in tier) print "  " t ": " tier[t] " tests"}' "$csv_file" | sort
-
-    print_status "$CYAN" ""
-    print_status "$YELLOW" "By Crate (top 10):"
-    awk -F, 'NR>1 {crate[$1]+=$3} END {for (c in crate) print crate[c] " " c}' "$csv_file" | sort -rn | head -10 | while read count crate; do
-        echo "  $crate: $count tests"
-    done
-
-    print_status "$CYAN" ""
-    print_status "$YELLOW" "Mock/Fake Usage:"
-    local mock_count
-    mock_count=$(awk -F, 'NR>1 && $5=="true" {sum+=$3} END {print sum+0}' "$csv_file")
-    local total_count
-    total_count=$(awk -F, 'NR>1 {sum+=$3} END {print sum+0}' "$csv_file")
-    echo "  Tests using mocks: $mock_count / $total_count"
-
-    print_status "$CYAN" ""
-    print_status "$YELLOW" "Property-Based Tests:"
-    local prop_count
-    prop_count=$(awk -F, 'NR>1 && $8=="true" {sum+=$3} END {print sum+0}' "$csv_file")
-    echo "  Proptest tests: $prop_count"
-
-    # Save summary
-    {
-        echo "# Test Realism Summary"
-        echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo ""
-        echo "## By Tier"
-        awk -F, 'NR>1 {tier[$4]+=$3} END {for (t in tier) print "- " t ": " tier[t]}' "$csv_file" | sort
-        echo ""
-        echo "## Mock Usage"
-        echo "Tests using mocks: $mock_count / $total_count"
-        echo ""
-        echo "## Property-Based"
-        echo "Proptest tests: $prop_count"
-    } > "$OUTPUT_DIR/summary.md"
-
-    print_status "$GREEN" ""
-    print_status "$GREEN" "Summary saved to: $OUTPUT_DIR/summary.md"
+    printf '%s\n' "$(cat "${REPORT_MARKDOWN}")"
 }
 
-# Single crate analysis
 cmd_crate() {
-    local crate_name="$1"
-
-    if [[ -z "$crate_name" ]]; then
-        print_status "$RED" "Error: crate name required"
-        exit 2
+    local crate_name="${1:-}"
+    if [[ -z "${crate_name}" ]]; then
+        echo "ERROR crate name required" >&2
+        return 2
     fi
-
-    print_status "$GREEN" "Analyzing crate: $crate_name"
-
-    local crate_dir="crates/$crate_name"
-    if [[ ! -d "$crate_dir" ]]; then
-        print_status "$RED" "Crate directory not found: $crate_dir"
-        exit 2
+    if [[ ! -f "${REPORT_CSV}" ]]; then
+        cmd_full
     fi
-
-    echo "crate,file,test_count,realism_tier,uses_mock,uses_memory,uses_file,is_proptest"
-
-    find "$crate_dir" -name '*.rs' -type f | sort | while read -r file; do
-        local result
-        result=$(analyze_file "$file" 2>/dev/null || true)
-        if [[ -n "$result" ]]; then
-            echo "$result"
-        fi
-    done
+    awk -F, -v crate="${crate_name}" 'NR == 1 || $1 == crate' "${REPORT_CSV}"
 }
 
-# Main dispatch
-main() {
-    local cmd="${1:-full}"
-    shift || true
+print_help() {
+    cat <<'EOF'
+FrankenSQLite Test Realism and Turso Adaptation Inventory
 
-    case "$cmd" in
-        full)
-            cmd_full
-            ;;
-        summary)
-            cmd_summary
-            ;;
-        crate)
-            cmd_crate "$@"
-            ;;
-        help|--help|-h)
-            echo "FrankenSQLite Test Realism Inventory"
-            echo ""
-            echo "Usage: $0 <command> [args]"
-            echo ""
-            echo "Commands:"
-            echo "  full        Generate full inventory (default)"
-            echo "  summary     Show summary statistics"
-            echo "  crate NAME  Analyze single crate"
-            echo "  help        Show this help"
-            ;;
+Usage: scripts/test_inventory.sh <command> [runner options]
+
+Commands:
+  full        Validate tracked HEAD and generate JSON, Markdown, and CSV (default)
+  audit       Fetch and validate the pinned Turso Git-tree metadata, then generate reports
+  summary     Print the most recently generated human report
+  crate NAME  Print CSV rows for one crate (generates the offline report if absent)
+  help        Show this help
+
+Environment:
+  OUTPUT_DIR                  Output directory (default: target/test-inventory)
+  CONTRACT_PATH               Canonical intake contract path
+  TURSO_TREE_JSON             Use an existing pinned GitHub tree JSON instead of fetching
+  GITHUB_TOKEN                Optional GitHub API token
+  FSQLITE_TEST_INVENTORY_BIN  Prebuilt runner used instead of cargo run
+EOF
+}
+
+main() {
+    local command="${1:-full}"
+    shift || true
+    case "${command}" in
+        full) cmd_full "$@" ;;
+        audit) cmd_audit "$@" ;;
+        summary) cmd_summary ;;
+        crate) cmd_crate "$@" ;;
+        help|--help|-h) print_help ;;
         *)
-            print_status "$RED" "Unknown command: $cmd"
-            exit 2
+            echo "ERROR unknown command: ${command}" >&2
+            print_help >&2
+            return 2
             ;;
     esac
 }

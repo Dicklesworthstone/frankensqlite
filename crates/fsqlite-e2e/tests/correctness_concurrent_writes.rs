@@ -13,6 +13,7 @@
 //!
 //! For C SQLite, true multi-threaded concurrent writes are exercised
 //! (each thread opens its own connection to a shared WAL-mode file).
+#![recursion_limit = "512"]
 
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -91,9 +92,10 @@ fn query_sorted(conn: &rusqlite::Connection) -> Vec<(i64, String, i64)> {
 }
 
 /// Query all rows from the FrankenSQLite test table.
-fn frank_query_sorted(conn: &fsqlite::Connection) -> Vec<(i64, String, i64)> {
+async fn frank_query_sorted(conn: &fsqlite::Connection) -> Vec<(i64, String, i64)> {
     let rows = conn
         .query("SELECT id, name, val FROM concurrent_test ORDER BY id")
+        .await
         .unwrap();
     rows.iter()
         .map(|r| {
@@ -151,35 +153,44 @@ fn gen_thread_inserts(thread_id: usize, count: usize, range_size: usize) -> Vec<
 
 #[test]
 fn concurrent_writes_2_threads_disjoint_keys() {
-    concurrent_writes_n_threads(
-        "concurrent_writes_2_threads_disjoint_keys",
-        SEED_CONCURRENT_WRITES_2T,
-        2,
-        500,
-    );
+    asupersync::test_utils::run_test(|| async {
+        concurrent_writes_n_threads(
+            "concurrent_writes_2_threads_disjoint_keys",
+            SEED_CONCURRENT_WRITES_2T,
+            2,
+            500,
+        )
+        .await;
+    });
 }
 
 #[test]
 fn concurrent_writes_4_threads_disjoint_keys() {
-    concurrent_writes_n_threads(
-        "concurrent_writes_4_threads_disjoint_keys",
-        SEED_CONCURRENT_WRITES_4T,
-        4,
-        250,
-    );
+    asupersync::test_utils::run_test(|| async {
+        concurrent_writes_n_threads(
+            "concurrent_writes_4_threads_disjoint_keys",
+            SEED_CONCURRENT_WRITES_4T,
+            4,
+            250,
+        )
+        .await;
+    });
 }
 
 #[test]
 fn concurrent_writes_8_threads_disjoint_keys() {
-    concurrent_writes_n_threads(
-        "concurrent_writes_8_threads_disjoint_keys",
-        SEED_CONCURRENT_WRITES_8T,
-        8,
-        125,
-    );
+    asupersync::test_utils::run_test(|| async {
+        concurrent_writes_n_threads(
+            "concurrent_writes_8_threads_disjoint_keys",
+            SEED_CONCURRENT_WRITES_8T,
+            8,
+            125,
+        )
+        .await;
+    });
 }
 
-fn concurrent_writes_n_threads(
+async fn concurrent_writes_n_threads(
     test_name: &str,
     seed: u64,
     n_threads: usize,
@@ -228,23 +239,24 @@ fn concurrent_writes_n_threads(
 
     let csqlite_conn = rusqlite::Connection::open(&db_path).unwrap();
     let csqlite_rows = query_sorted(&csqlite_conn);
-    let frank = fsqlite::Connection::open(":memory:").unwrap();
+    let frank = fsqlite::Connection::open(":memory:").await.unwrap();
 
     // ── FrankenSQLite: sequential execution (same operations) ──
     frank
         .execute("CREATE TABLE concurrent_test (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)")
+        .await
         .unwrap();
 
     for tid in 0..n_threads {
         let stmts = gen_thread_inserts(tid, ops_per_thread, range_size);
-        frank.execute("BEGIN").unwrap();
+        frank.execute("BEGIN").await.unwrap();
         for sql in &stmts {
-            frank.execute(sql).unwrap();
+            frank.execute(sql).await.unwrap();
         }
-        frank.execute("COMMIT").unwrap();
+        frank.execute("COMMIT").await.unwrap();
     }
 
-    let frank_rows = frank_query_sorted(&frank);
+    let frank_rows = frank_query_sorted(&frank).await;
     let logically_equivalent = csqlite_rows == frank_rows;
 
     emit_scenario_completeness_log(

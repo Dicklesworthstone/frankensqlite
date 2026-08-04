@@ -4,6 +4,31 @@
 //! It is intentionally non-blocking: overflow is rejected with `SQLITE_BUSY`
 //! (`FrankenError::Busy`) instead of queue-and-wait semantics.
 
+// `connection.rs` composes deeply nested `async fn` futures (statement dispatch
+// → DML → triggers → nested statement execution), and each layer widens the
+// generated future type. The default limit overflows while type-checking that
+// chain.
+#![recursion_limit = "512"]
+// bd-h9o9r: the engine's futures are deliberately not `Send` — a Connection
+// executes strictly sequentially on a current-thread runtime with RefCell
+// state throughout (see docs/concurrency-contract.md: single-Connection
+// sharing across threads is unsupported). Requiring `Send` futures
+// contradicts that design, so the lint is noise here (same rationale as
+// fsqlite-pager and fsqlite-vdbe).
+#![allow(clippy::future_not_send)]
+// bd-h9o9r: the nested statement futures are inherently large (the same
+// nesting that needs `recursion_limit = 512` above). Boxing them to satisfy
+// `large_futures` is precisely the change the perf ledger rejected without
+// allocation/CPU profile evidence (2026-07-26 "boxed WAL futures are not yet
+// a measured root cause"); do not "fix" this lint blind.
+#![allow(clippy::large_futures)]
+// bd-h9o9r: connection.rs holds RefCell borrows across awaits at ~76 sites.
+// Execution is strictly sequential per connection, so re-entrant borrows are
+// structurally confined, but the audit (and any borrow-scope repair) belongs
+// to the Phase-C reconstruction — tracked in bd-h9o9r rather than tagged
+// per-site in the FK-slice's active file.
+#![allow(clippy::await_holding_refcell_ref)]
+
 pub mod attach;
 pub mod commit_marker;
 #[cfg(not(target_arch = "wasm32"))]

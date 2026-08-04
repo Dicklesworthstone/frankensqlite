@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-e2e"
-version = "0.1.19"
+version = "0.2.0"
 publish = false
 edition.workspace = true
 autobins = false
@@ -14,20 +14,31 @@ workspace = true
 
 [features]
 default = []
+bridge-experiment = ["fsqlite/async-api"]
 tui = ["dep:ftui"]
 pgo = []
 linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring", "fsqlite-core/linux-asupersync-uring", "fsqlite/linux-asupersync-uring"]
+bench-internals = [
+    "fsqlite-btree/bench-internals",
+    "fsqlite-core/bench-internals",
+    "fsqlite-types/bench-internals",
+]
 
 [dependencies]
 asupersync = { workspace = true }
-fsqlite = { path = "../fsqlite", version = "0.1.19", default-features = false, features = ["json", "fts5", "rtree"] }
+fsqlite = { path = "../fsqlite", version = "0.2.0", default-features = false, features = ["json", "fts5", "rtree"] }
 fsqlite-btree = { workspace = true }
-fsqlite-core = { path = "../fsqlite-core", version = "0.1.19", default-features = false }
+fsqlite-core = { path = "../fsqlite-core", version = "0.2.0", default-features = false }
+# Regular (not dev) dependency: mt-mvcc-bench reads the in-process registry
+# commit-lock counters (registry_commit_lock_metrics) after each writer arm.
+# Already in the dependency graph via fsqlite-core, so this adds visibility,
+# not build weight.
+fsqlite-mvcc = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-harness = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-vdbe = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.19", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.2.0", default-features = false }
 fsqlite-types = { workspace = true }
 fsqlite-wal = { workspace = true }
 ftui = { workspace = true, features = ["crossterm"], optional = true }
@@ -42,11 +53,19 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [dev-dependencies]
+# Test targets drive the async engine through `asupersync::test_utils::run_test`,
+# which lives behind `test-internals`. The non-dev dependency above stays
+# feature-clean: neither `src/` nor `benches/` uses `test_utils`.
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
-jsonschema = { version = "0.46.5", default-features = false }
+# Gunzip for the checksum-pinned bd-105ga corruption-regression corpus
+# (fixtures/bd105ga/); only tests/bd_105ga_replay_regression.rs uses it.
+flate2 = "1.1"
+jsonschema = { version = "0.48.5", default-features = false }
 fsqlite-ext-session = { workspace = true }
-fsqlite-mvcc = { workspace = true }
 fsqlite-pager = { workspace = true }
+# This unifies only for e2e test builds, not shipped binaries.
+fsqlite-mvcc = { workspace = true, features = ["commit-combiner-test-support", "ebr-reclaim-test-support"] }
 
 [[bin]]
 name = "realdb-e2e"
@@ -133,6 +152,10 @@ path = "src/bin/swarm_multiprocess.rs"
 [[bin]]
 name = "mt-mvcc-bench"
 path = "src/bin/mt_mvcc_bench.rs"
+
+[[bin]]
+name = "param-tax-controls"
+path = "src/bin/param_tax_controls.rs"
 
 [[bin]]
 name = "mt-oltp-bench"

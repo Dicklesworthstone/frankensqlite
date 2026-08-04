@@ -17,9 +17,10 @@ fn render(v: &SqliteValue) -> String {
         ),
     }
 }
-fn frank_state(c: &Connection) -> Vec<Vec<String>> {
+async fn frank_state(c: &Connection) -> Vec<Vec<String>> {
     let mut r: Vec<Vec<String>> = c
         .query("SELECT id, a, c, x FROM t")
+        .await
         .unwrap()
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -50,17 +51,17 @@ fn sqlite_state(c: &rusqlite::Connection) -> Vec<Vec<String>> {
     r.sort();
     r
 }
-fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
-    c.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with(prefix)))
+async fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
+    c.query(&format!("EXPLAIN {sql}")).await.unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with(prefix)))
 }
-fn fresh() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn fresh() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT);",
         "CREATE INDEX idx_c ON t(c);",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     for i in 1..=300_i64 {
@@ -70,54 +71,57 @@ fn fresh() -> (Connection, rusqlite::Connection) {
             i % 12,
             i % 7
         );
-        f.execute(&s).unwrap();
+        f.execute(&s).await.unwrap();
         r.execute_batch(&s).unwrap();
     }
     (f, r)
 }
-fn check(dml: &str, no_rewind: bool) {
-    let (f, r) = fresh();
+async fn check(dml: &str, no_rewind: bool) {
+    let (f, r) = fresh().await;
     if no_rewind {
         assert!(
-            !has_op(&f, dml, "Rewind"),
+            !has_op(&f, dml, "Rewind").await,
             "rowid-eq-residual DML must not full-scan (Rewind): `{dml}`"
         );
     } else {
         assert!(
-            has_op(&f, dml, "Rewind"),
+            has_op(&f, dml, "Rewind").await,
             "control DML should full-scan: `{dml}`"
         );
     }
-    f.execute(dml).unwrap();
+    f.execute(dml).await.unwrap();
     r.execute_batch(dml).unwrap();
     assert_eq!(
-        frank_state(&f),
+        frank_state(&f).await,
         sqlite_state(&r),
         "state diverged after `{dml}`"
     );
 }
 #[test]
 fn dml_rowid_eq_residual_matches_sqlite() {
-    // DELETE: single SeekRowid + residual, no Rewind, byte-exact resulting table.
-    check("DELETE FROM t WHERE id = 25 AND c = 1", true); // residual matches -> deletes
-    check("DELETE FROM t WHERE id = 25 AND c = 999", true); // residual fails -> deletes nothing
-    check("DELETE FROM t WHERE id = 99999 AND c = 5", true); // rowid miss -> deletes nothing
-    check("DELETE FROM t WHERE id = 40 AND c > 3", true); // range residual
-    check("DELETE FROM t WHERE id = 24 AND c != 5 AND x = 'v3'", true); // multi-conjunct residual
-    check("DELETE FROM t WHERE 13 = id AND c = 1", true); // rowid on the RHS
-    check("DELETE FROM t WHERE id = 17 AND a IS NULL", true); // 17 -> a = 17 (not null) -> no delete
-    // UPDATE: the optimistic-lock shape `WHERE id = ? AND version = ?`.
-    check("UPDATE t SET x = 'r' WHERE id = 25 AND c = 1", true); // matches -> updates
-    check("UPDATE t SET x = 'r' WHERE id = 25 AND c = 999", true); // residual fails -> no update
-    check("UPDATE t SET a = a + 1 WHERE id = 99999 AND c = 5", true); // rowid miss -> no update
-    check(
-        "UPDATE t SET c = c + 1 WHERE id = 50 AND c BETWEEN 2 AND 8",
-        true,
-    ); // range residual
-    check("UPDATE t SET id = id + 5000 WHERE id = 60 AND c = 0", true); // ROWID rewrite + residual
-    // Controls: predicates over two unindexed, non-rowid columns must still
-    // full-scan (Rewind), and stay correct. `c` is deliberately excluded here
-    // because it has an index and belongs to the indexed-equality DML lane.
-    check("DELETE FROM t WHERE a = 5 AND x = 'v1'", false);
-    check("UPDATE t SET x = 'c' WHERE a = 5 AND x = 'v1'", false);
+    asupersync::test_utils::run_test(|| async {
+        // DELETE: single SeekRowid + residual, no Rewind, byte-exact resulting table.
+        check("DELETE FROM t WHERE id = 25 AND c = 1", true).await; // residual matches -> deletes
+        check("DELETE FROM t WHERE id = 25 AND c = 999", true).await; // residual fails -> deletes nothing
+        check("DELETE FROM t WHERE id = 99999 AND c = 5", true).await; // rowid miss -> deletes nothing
+        check("DELETE FROM t WHERE id = 40 AND c > 3", true).await; // range residual
+        check("DELETE FROM t WHERE id = 24 AND c != 5 AND x = 'v3'", true).await; // multi-conjunct residual
+        check("DELETE FROM t WHERE 13 = id AND c = 1", true).await; // rowid on the RHS
+        check("DELETE FROM t WHERE id = 17 AND a IS NULL", true).await; // 17 -> a = 17 (not null) -> no delete
+        // UPDATE: the optimistic-lock shape `WHERE id = ? AND version = ?`.
+        check("UPDATE t SET x = 'r' WHERE id = 25 AND c = 1", true).await; // matches -> updates
+        check("UPDATE t SET x = 'r' WHERE id = 25 AND c = 999", true).await; // residual fails -> no update
+        check("UPDATE t SET a = a + 1 WHERE id = 99999 AND c = 5", true).await; // rowid miss -> no update
+        check(
+            "UPDATE t SET c = c + 1 WHERE id = 50 AND c BETWEEN 2 AND 8",
+            true,
+        )
+        .await; // range residual
+        check("UPDATE t SET id = id + 5000 WHERE id = 60 AND c = 0", true).await; // ROWID rewrite + residual
+        // Controls: predicates over two unindexed, non-rowid columns must still
+        // full-scan (Rewind), and stay correct. `c` is deliberately excluded here
+        // because it has an index and belongs to the indexed-equality DML lane.
+        check("DELETE FROM t WHERE a = 5 AND x = 'v1'", false).await;
+        check("UPDATE t SET x = 'c' WHERE a = 5 AND x = 'v1'", false).await;
+    });
 }

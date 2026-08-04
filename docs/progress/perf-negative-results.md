@@ -18,7 +18,9 @@ Before mutating SQL-pipeline/VDBE source for a T6.2 optimization candidate,
 run the machine-readable duplicate gate against this ledger. A blocked result
 means the candidate already has a rejected or non-candidate record and the agent
 must not start source edits until a broader retry condition from the matched
-entry is satisfied.
+entry is satisfied. A `requires-null-control` result means the matched REJECT
+does not record an A/A null control; rerun that exact candidate under the
+measurement contract below before proposing a new source mutation.
 
 Example:
 
@@ -31,10 +33,1158 @@ cargo run -p fsqlite-harness --bin sql_pipeline_candidate_preflight -- \
 ```
 
 Use `--json` for artifact capture. Exit code `0` means no matching no-retry
-record was found. Exit code `2` means the candidate is blocked. When adding a
-new kept, rejected, or non-candidate record, include the date, benchmark or
-artifact path, Beads comment or issue reference, touched source surface, and the
-retry condition so this preflight can emit actionable evidence.
+record was found. Exit code `2` means the candidate is either blocked or
+requires a corrected null-control rerun; inspect the emitted verdict. When
+adding a new kept, rejected, or non-candidate record, include the date,
+benchmark or artifact path, Beads comment or issue reference, touched source
+surface, A/A result, and the concrete retry condition so this preflight can
+emit actionable evidence.
+
+For new candidate measurements and ledger resurrections, the benchmark program
+must print its own executable SHA-256 (plus byte length and path) as its first
+stdout line. One invocation must then interleave independent A/A baseline
+fixtures and A/B baseline-candidate fixtures. Decide KEEP/REJECT only when the
+candidate median ratio clears the A/A median bootstrap-CI radius by at least
+2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
+are provenance only and must never gate the verdict.
+
+## 2026-08-03 - REJECTED DEFAULT: conflict-topology split policy uses process-global, cross-database state
+
+- Target workload: `mt-mvcc-bench` `shared_table`, 300 rows per thread, at 2,
+  4, and 8 threads. The candidate touched conflict-heat publication in
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` and split advice in
+  `crates/fsqlite-btree/src/instrumentation.rs` and `balance.rs`.
+- Historical evidence: commit `9ef87fdc` recorded three iterations per point in
+  `tests/artifacts/perf/bd-1dp9-6-7-13-2-conflict-topology-20260520T0030Z/`
+  (the artifact files were later untracked by `db922b5a` but remain readable
+  from the introducing commit). Enforced mode improved the isolated 2-thread
+  and 8-thread medians, but regressed the 4-thread FrankenSQLite median from
+  159,173 to 141,595 writes/s (about 11%). The runs were not interleaved, had
+  no A/A null control, reported `no_prior_report`, and their C SQLite control
+  medians also moved substantially, so they do not satisfy the current keep
+  gate.
+- Correctness and contention finding: non-baseline modes use one process-global
+  `Mutex<BTreeMap<PageNumber, ...>>`. Eligible local leaf splits and FCW/SSI
+  conflict recording from otherwise independent databases can serialize on
+  that mutex. Because the key omits database identity, heat and bounded
+  deflection credits for page N in one database can alter decisions for page N
+  in another database.
+- Result: reject `Enforced` as the shipped default and restore `Baseline`.
+  Explicit advisory/enforced overrides remain experimental; default operation
+  bypasses both the heat-update lock and the split-advice lock.
+- Retry only after the state is database-owned and lifecycle-bound, with a
+  non-vacuous two-database isolation keeper plus a counterbalanced A/A and A/B
+  release-perf matrix that exercises non-rightmost local leaf splits. Merely
+  sharding the process-global map or adding database identity under the same
+  global lock does not satisfy the retry condition.
+
+## 2026-08-02 - INVALIDATED ATTRIBUTION: small-row DML component counters are observer-dominated; scored F/C rows were never inflated (bd-he3ua)
+
+- Target workload: `comprehensive_bench` small-row INSERT profiling, especially
+  `tiny_1col` and `small_3col`, and the 2026-07-23 conclusion that the small-N
+  write gap had "no single fat component." The touched surface was the
+  env-gated INSERT profiler in `crates/fsqlite-core/src/connection.rs`.
+- History: `61dfef29` first claimed seven nested timers cost about 2.6x the
+  quantity reported; `b52a3236` revised that to six timers/about 2.1x.
+  Both mechanism claims were retracted by `dd84b4d7` after running the actual
+  benchmark end to end instead of extrapolating from code plus a timer
+  microbenchmark.
+- Corrected evidence: the profiler runs a separate pass on its own connection
+  after the scored `measure()` rows, so it cannot inflate published F/C wall
+  times. On one release-perf binary, `small_3col` 10K measured 9.65 ms with
+  profiling off versus 9.40 ms with deep profiling; the model had predicted
+  roughly 6 ms of inflation, which did not occur.
+- What remains invalid: the component attribution itself. One timed region cost
+  47.96-52.24 ns; `tiny_1col` reported `row_build_ns` of 48.7 ns/row at 100 rows
+  and 48.6 ns/row at 10,000 rows, while `small_3col` reported 674 ns/row against
+  about 600 ns/row of structural timer cost. Those counters cannot locate a hot
+  component at sub-microsecond row sizes. The "no single fat component"
+  conclusion may be true, but this instrument did not establish it.
+- Result: keep the `FSQLITE_DML_PROFILE_DEEP` gating because it improves
+  attribution fidelity, but assign it no benchmark-throughput benefit. Do not
+  use the affected component counters to select a small-row optimization.
+- Artifact caveat: commit `dd84b4d7` cites
+  `tests/artifacts/perf/dml-observer-3way-20260725T2205Z/`, but that directory is
+  absent from the current checkout. Treat the numbers as historical,
+  non-release-citable evidence backed by the commit and `bd-he3ua`.
+- Retry only with a committed artifact, one self-identifying binary, an
+  end-to-end off/default/deep comparison, and timer-overhead subtraction or
+  coarse regions whose measured work is comfortably larger than clock cost.
+
+## 2026-08-02 - BENCHMARK-INTEGRITY BLOCKER: an exit-zero RCH build is not proof that the requested performance binary was delivered (bd-8wumh)
+
+- Target: every performance measurement whose executable is built through RCH,
+  especially nonstandard Cargo profiles such as `release-perf` and custom or
+  out-of-tree `CARGO_TARGET_DIR` paths.
+- Evidence: `bd-8wumh` records four builds that reported remote success while
+  leaving a stale or byte-identical local executable, including one failure
+  after applying the in-repo-target workaround. A 2026-07-29 reproduction on
+  RCH 1.0.52 returned exit 0 after retrieving only metadata while the requested
+  `release-perf/comprehensive-bench` executable remained absent. Source review
+  recorded that retrieval patterns included `debug/**` and `release/**` but not
+  the resolved custom profile.
+- Result: invalidate every timing run whose launched process did not report an
+  expected ELF SHA-256/byte length/path and matching source identity. Successful
+  Cargo/RCH exit status, local file existence, or a previously validated target
+  directory is insufficient because a stale executable can satisfy those weaker
+  checks. This hazard motivated the landed self-reporting contract in
+  `24d33e0c`.
+- Current status (source-proven 2026-08-02): installed RCH is 1.0.53
+  (`bb6fe4c33881`; local executable SHA-256
+  `3cea0adf59bafaaacdcc7a014e3653fdcfe23bbf98c49ecd3cb8cc736af8ff95`).
+  The exact installed commit routes `CargoBuild` through
+  `default_rust_artifact_patterns`, whose only Cargo profile output globs are
+  `target/debug/**` and `target/release/**`; custom-target retrieval merely
+  strips the `target/` prefix and therefore still has no `release-perf/**`
+  include. This checkout exports `CARGO_TARGET_DIR=/data/tmp/cargo-target`, so
+  the configured build necessarily takes that custom-target path. RCH 1.0.53
+  therefore still cannot retrieve FrankenSQLite's requested `release-perf`
+  executable; another long build is not needed to establish the missing-pattern
+  mechanism.
+- Retry/closure condition: build an explicitly named `release-perf` binary into
+  a fresh target, require the expected artifact to be absent before the build,
+  verify it is delivered afterward, launch it, and match its self-reported ELF
+  and source hashes. Metadata-only retrieval must fail nonzero.
+
+## 2026-08-02 - RETRACTED TEST-FAILURE ATTRIBUTION: tracing suppresses the fused DML lane, but did not cause the nine pager-routing failures (bd-t56wv)
+
+- Target: nine `connection::pager_routing_tests` failures and the fused
+  prepared-DML fast-lane gate in `crates/fsqlite-core/src/connection.rs`.
+- Initial observation: `asupersync::test_utils::run_test` installs tracing and
+  the one-time warning from `12d6c590` proved that statement tracing suppressed
+  the fused lane. That observation was incorrectly promoted to the cause of the
+  nine failures.
+- Counterfactual: raising the relevant targets with `RUST_LOG=error` left the
+  exact result unchanged: 104 passed and the same nine failed. Retract the
+  test-failure attribution.
+- What survives: production DEBUG/INFO subscribers still select the slower
+  instrumented DML lane; `12d6c590` warns once but does not eliminate that
+  algorithmic deopt.
+- Retry the nine-test diagnosis only against clean HEAD with an A/B that changes
+  one suspected gate and demonstrates the assertions change. Do not use the
+  presence of the tracing warning as causal evidence.
+
+## 2026-07-28 - LANDED (be8e066d): bd-5zeai parameterized fast path (12.90us->1.01us, tax ELIMINATED to plumbing floor) + bd-gpi5i sync CTE frontier (1.59ms->1.01ms, residual documented)
+
+- bd-5zeai CLOSED: PreparedProbeRowidBound {None, LiteralExclusive,
+  Parameter} in SimpleCountIndexedRowidProbe; execute-time strict-Integer
+  resolution (Float/Text/Null -> general-path fallback = affinity-safe);
+  resolved-bound cache keys; both params branches of query_row_internal.
+  Receipt `param-fastpath-fix-20260728T2330Z-superserver`: control3
+  placeholder 12.90us -> 1.01us (20.1x -> 1.63x); residual 0.39us == the
+  independently measured params-plumbing floor (control2 0.40us) — the
+  fast-path-absence tax is GONE. rustc's field-type-change sweep found
+  exactly one dispatch site beyond the spec'd list (the deliberate
+  make-missed-sites-unrepresentable strategy worked).
+- bd-gpi5i PARTIAL (P1->P2): sync Direct-frontier lane (conservative node
+  set; async keeps Between/Case/Like/In/Cast/Collate/FunctionCall which are
+  affinity/collation/registry-aware). General COUNT 1.59ms -> 1.01ms
+  (6.4x -> 3.82x vs C; receipt
+  `cte-syncfrontier-fix-20260728T2255Z-superserver`). Residual ~750ns/iter
+  = frontier Vec/Row alloc traffic + final materialization + outer scan.
+  DO NOT retry via a COUNT closed-form specialization — it re-blinds the
+  bench row to the general path (bd-czzlp asymmetry is intentional); the
+  legitimate follow-up is allocation reduction in the general loop.
+- Landing discipline receipts: full lib suite 3432/24 with ALL 24
+  dispositioned via a stash/clean-HEAD rebuild (23 pre-existing in
+  RusticBasin's active correctness lane; 1 = pre-existing exact-counter
+  parallel flake, bd-zeqpr filed). En-route fix: eval_join_expr's
+  UnaryOp::Plus->NULL fallthrough NOT taken by the new sync evaluator
+  (copies the async arms; bd-g54oq still open for the join path itself).
+
+## 2026-07-28 - MEASURED(macOS): M4 Pro inversion decomposed — registry guard 1.4ms holds at 8 WRITERS (Linux-64w territory) drives conflict-backoff collapse; barrier hypothesis eliminated; padding flip suggestive-only, NOT landed
+
+- First real-Apple-silicon receipts (mac-mini-max M4 Pro; artifacts
+  `mseries-cacheline-ab-20260728T1935Z-mmmax`,
+  `macos-inversion-decomp-20260728T2145Z-mmmax`; beads bd-jyeus, bd-64uz9):
+  F is CI-gated SLOWER than C at 2-4 shared-table writers (0.24x/0.30x; 8w
+  0.66-0.85x INCONCLUSIVE), flat ~77-114k wps across 2-8w.
+- ELIMINATED by direct measurement (do not re-propose without new evidence):
+  (a) F_FULLFSYNC/checkpoint barriers — fs_usage counted ZERO F_FULLFSYNC and
+  112 total fsync-family lines over 3 paired rounds; synchronous=NORMAL is
+  correctly plumbed (apply_synchronous_to_pager -> Deferred); (b) blocking-
+  pool saturation — pool ~0.1% of thread-time, I/O leaves tiny.
+- MEASURED mechanism: worker round = ~30% condvar-blocked behind commit
+  serialization + ~28% engine work + ~23% retry-backoff SLEEP; registry
+  telemetry: holds ~9/round x mean 1,420us (max 4.5ms) at 8w. Root cause =
+  bd-i0tn6's guard-across-I/O, amplified on Darwin by spawn_blocking handoff
+  cost inside the guard + unpinned QoS (bd-y3dlq). bd-jyeus = macOS
+  acceptance harness for bd-i0tn6 S3.
+- PADDING (bd-64uz9): premise PROVEN on hardware (64B-spaced atomics
+  1.65-2.1x slower on M4, granule exactly 128B, x86 null control clean) but
+  the product-level flip (CommitSlot + striped counters to 128B) is
+  SUGGESTIVE-ONLY: interleaved A/B/A/B x3 won 3/3 pairs at mean +4.7%, cv
+  42-52%, sign-test p=0.125 -> NOT landed. RETRY: quiesced/QoS-pinned mini,
+  >=10 interleaved pairs, or Instruments HITM. Unpaired mac comparisons are
+  BANNED for receipts (C-arm drifted +33% run-to-run; interleave is a hard
+  requirement).
+- Infra: mac runs resolve their own dep graph (Cargo.lock drift on the mac
+  clone — note in provenance); `FSQLITE_BENCH_WAL_AUTOCHECKPOINT` knob
+  (e9fd9679) available for checkpoint-cadence isolation on other hosts.
+
+## 2026-07-28 - ATTRIBUTED: general recursive-CTE frontier gap (bd-gpi5i) = ~135ns/AST-node boxed-future evaluation (~53%) + ~720ns/iter async loop plumbing (~47%); fix spec'd, perf-tooling attempts all failed (recorded)
+
+- Target row: "Recursive CTE general COUNT (1..1000)" — four release-perf runs
+  on superserver: C=249-257us vs F=1.58-1.64ms (6.1-6.5x slower, CV<2.2%),
+  while the specialized SUM row is simultaneously 25-32x FASTER (closed
+  form). Artifact: `tests/artifacts/perf/cte-frontier-profile-20260728T1810Z-superserver/`.
+- MECHANISM (measured, not inferred): CLI node-count differential — same
+  Direct tier, 6-node vs 16-node arm expressions at depth 1000 → per
+  iteration T = ~720ns + ~135ns×AST-nodes; depth scaling linear (no O(n^2)).
+  135ns/node = the `Pin<Box<dyn Future>>`-per-node signature of
+  `eval_expr_with_subqueries` (connection.rs:56302), which the Direct-plan
+  matcher (:66898) makes pure waste (it admits NO subquery expressions; the
+  async evaluator's own simple-node fallthrough is `eval_join_expr`).
+- FIX: patch-ready hunk spec on bd-gpi5i (sync evaluator for a conservative
+  node set + fully-sync iteration loop when all arms qualify — H4(b) is what
+  removes the 47% fixed share). connection.rs leased → RusticBasin applies at
+  checkpoint. En route: bd-g54oq filed (eval_join_expr UnaryOp::Plus → NULL
+  latent bug); the existing recursive_cte_perf_repro.rs scaling test no
+  longer guards the general frontier (SUM specialization short-circuits it) —
+  COUNT twin required.
+- NEGATIVE RESULTS (perf tooling on a busy shared host; do not repeat):
+  (1) whole-run dwarf record at -F 999 → kernel-throttled to ~1K samples/2min,
+  zero window coverage; (2) trigger + `perf record -p PID` → ESRCH race;
+  (3) trigger + `-C cpus` system-wide → /proc-maps synthesis latency ate the
+  1.9s phase twice (even with --proc-map-timeout=50); (4) `--overwrite` ring
+  dump → unparseable perf.data on perf 6.17.13. RETRY CONDITION: none needed —
+  the CLI repetition differential (400 reps × /usr/bin/time, minimums) was
+  strictly better for phase-scoped attribution; prefer it for engine-internal
+  hot loops. If a flamegraph is ever truly required: dedicated quiet host +
+  record-from-birth + --quick + line-tables build.
+
+## 2026-07-28 - ATTRIBUTED: the high-writer decline decomposed — registry guard held 0.7-7ms per commit (~80% of the decline); leaf-boundary conflicts ~20%; merge ladder found production-dormant
+
+- Three-receipt attribution of why F declines 150k→52k wps from 8→128
+  writers (all diagnostic-host; within-run gates + the SHAPE are the
+  evidence):
+  1. **Separate-tables split** (`septables-split-20260728T1605Z`): with
+     page conflicts impossible, F still declines 202k→71k (8→64w) —
+     ~80% of the decline is registry-side; the shared-leaf class costs
+     the residual ~20% (and separate-table 32w hits **12.37x over C**).
+  2. **Registry hold/wait counters**
+     (`registry-hold-decomposition-20260728T1620Z`, RusticBasin's core
+     shim 57dffe1a + mvcc counters c53aaf93 + bench dump): mean guard
+     hold **713-2,340µs at 64w, 2.4-6.9ms at 128w** (max single hold
+     60ms) — milliseconds of global mutex per commit because pager I/O +
+     validation run inside the guard; waits stay µs-scale at 64w
+     (convoying shows up as txn latency, not lock spin).
+  3. **Page 45 identified** (job-tmp replica + dbstat): a stride-boundary
+     bench LEAF — numerically-disjoint 1M strides are ADJACENT in key
+     order, so one leaf spans every junction, and the rightmost leaf
+     absorbs every above-max writer on a young tree. Leaf-level false
+     sharing from distinct-key inserts — the merge ladder's designed case.
+- **Merge-ladder wiring audit** (bd-p4dcv): the ladder is
+  production-dormant IN FULL — only abort/retry executes; intent log never
+  populated; `write_merge` is an SSI-skip switch whose documented OFF
+  doesn't parse; two latent bugs in the dormant path; README corrected to
+  say so (Current-Implementation-Status convention). Statement-rebase
+  design at the audited begin_concurrent.rs:2826 hook = bd-3d5y3.
+- Fix ladder now numbers-backed and beaded: bd-i0tn6 (write outside the
+  lock — PRIMARY, design review requested from RusticBasin + DustyOrchid),
+  bd-6a8a5 (group commit), bd-15hxt (SSI history windowing), bd-3d5y3
+  (rebase, secondary ~20%). Non-behavioral platform groundwork landed:
+  VendorCachePadded + layout tests (Apple-vendor-scoped, no call-site
+  flips) and FC slot-full telemetry (bb705aad).
+
+## 2026-07-28 - MEASURED: COMPLETE 1-128 writer matrix (f1ab7663) — FSQLITE_FASTER at every gated arm incl. 64w 4.259x and 128w 4.082x, zero failed writes; hot page 45 identified; bd-5zeai controls confirm fast-path-presence 20.1x dominant
+
+- Follow-up to the truncated first attempt (below). With the bd-caa6u
+  envelope scaling (c53aaf93, floor deepened 10k→5k at f1ab7663), the full
+  matrix completed: 1w 2.111x / 8w 2.703x / 16w 6.556x FSQLITE_FASTER; 32w
+  7.333x median (CV-inconclusive); **64w 4.259x and 128w 4.082x
+  FSQLITE_FASTER with zero failed writes** — C pins to its ~12.5k wps
+  single-writer floor from 32w up while F stays 4-7x ahead through the
+  MAX_CONCURRENT_WRITERS cap. Artifact:
+  `tests/artifacts/perf/highwriter-full-20260728T0645Z-superserver/`
+  (diagnostic host; within-run CI gates are the evidence).
+- Extraction targets sharpened: the failed first 64-arm identified **hot
+  page 45 by number** ("snapshot conflict on pages: 45", 3-5 attempts) as
+  one starvation mode alongside busy-retry convoying (69-84 attempts); F's
+  own decline 150k→52k wps under contention is the registry-convoy cost —
+  RegistryCommitLockMetrics (mvcc side landed c53aaf93; core RAII shim
+  handed to RusticBasin) will quantify hold/wait vs writer count.
+- bd-5zeai control battery (same day, c53aaf93): Option gate 0.49µs,
+  params-on-fast-path 0.58µs, A/A 0.00µs, fast-path presence 20.1x
+  (0.64µs literal vs 12.90µs placeholder, same query) — parameter passing
+  is free; the placeholder fast-path gap is the whole mechanism.
+  Implementation awaiting RusticBasin ack. Cross-agent same-day flow:
+  bd-f8iph (silent-Null IN emitter) fixed by RusticBasin at 8f75946d,
+  verified downstream and closed; bd-3ua5h invariants locked at 2ef61094.
+
+## 2026-07-28 - MEASURED: first 1-128 writer scaling attempt — F/C grows 2.1x→7.3x through 32 writers; p95 latency convoying at 32 confirms the registry hypothesis; 64+ unmeasurable until the bench retry envelope scales
+
+- Post-revert tree a29e136d, mt-mvcc-bench ELF 4132d5a7…, shared table,
+  synchronous=NORMAL both arms, 7 paired rounds with same-invocation C/C
+  nulls, host superserver (64 logical CPUs, shared box — diagnostic-only).
+  Artifact: `tests/artifacts/perf/highwriter-baseline-20260728T0510Z-superserver/`.
+- Median-CI-gated: 1w 2.111x FASTER; 8w 2.703x FASTER; 16w 6.556x FASTER;
+  32w 7.333x median but INCONCLUSIVE (CV 70%). C collapses 65k→13k wps
+  under its single-writer lock while F holds 95-150k. Zero failed writes
+  through 32 writers on both engines.
+- ENGINE SIGNAL: F p95 per-txn latency 225ms@16 → 2,273ms@32 (10x for 2x
+  writers) with throughput nearly flat — convoying at a serialization
+  point, consistent with the concurrent_registry mutex held across
+  physical commit (the audit's named suspect). This is the instrumentation
+  target; fanout changes stay rejected until it is profiled.
+- HARNESS ENVELOPE: 64-writer arm aborts via the FIXED 5s wall-clock retry
+  budget (FSQLITE_RETRY_TIMEOUT, mt_mvcc_bench.rs:94) — queueing alone
+  exceeds it at 64×1000-row txns. bd-caa6u files the scaling fix; 64/128
+  rows are unmeasured, not bad.
+
+## 2026-07-28 - REVERTED same-hour: platform scaling slice (7b2c2c61 → reverted at b5074aa4) — reachability audit invalidated all three claims
+
+- Target: aarch64 128B padding, 64→128 contention-table fanout, macOS
+  barrier-fsync. Landed at 7b2c2c61 and reverted at b5074aa4 within the
+  hour after RusticBasin's independent immutable-checkout audit (agent-mail
+  msgs 4467/4468/4470/4471) showed every headline claim was
+  reachability-unsound:
+  1. **Barrier-fsync was dead code**: production has ZERO callers of
+     `durable_sync(DataOnly|DataAndMetadata)` — every production call is
+     FullDurable, and real WAL/pager syncs go through legacy
+     `.sync(SyncFlags)`. Also stale premise: pinned Rust maps Apple
+     `sync_all` AND `sync_data` to F_FULLFSYNC already. Barrier is ordering,
+     not persistence — never a substitute for commit/checkpoint fences.
+     Retry condition: map the production sync call graph first, add a
+     distinct ordering-intent API, prove reachability via fcntl tracing,
+     phase-order + power-loss tests (bd-64uz9 reworked to carry this).
+  2. **The three 64s are not a writer ceiling**: LOCK_TABLE_SHARDS hashes
+     only pages >65536 (ordinary pages take direct atomic fast arrays);
+     CHAIN_HEAD_SHARDS is CONNECTION-LOCAL (one per SQL writer — sizing it
+     from the global writer cap is category confusion); the page-lock FC is
+     default-off (`mvcc-flat-combining`) and its slots serve a rare fallback
+     shard. History I failed to mine before editing: 256→64 was an
+     INTENTIONAL reduction and several sharded variants were
+     benchmark-reverted. The likely real 64+ writer bottleneck is the
+     concurrent_registry mutex held across physical commit + active commit
+     sequence allocation. Retry condition: instrument (a) the
+     registry/commit critical section and (b) >65536-fallback frequency and
+     shard-wait BEFORE any fanout change; then SHA-stamped pinned-worker
+     1/8/16/32/64/128 ABBA runs.
+  3. **aarch64 padding was mis-scoped**: `cfg(target_arch = "aarch64")`
+     overpads Linux-ARM (Graviton = 64B lines), misses Rosetta, and the
+     audit found aarch64 layout tests that break deterministically. Retry
+     condition: Apple-vendor-scoped design, matrix {Intel Mac, native
+     M-series, Rosetta, Graviton}, origin-64 vs apple-128 vs runtime-stride
+     with contention AND single-thread/RSS controls.
+- Process lesson (why this entry exists): I changed contention constants
+  without mining the ledger/history for fanout-specific reversions — the
+  exact failure mode the ledger preamble warns about. The audit caught it
+  pre-merge-damage because reservations + agent-mail worked as designed.
+- Kept from the slice (re-landed separately, uncontested): the fsqlite-mvcc
+  `test-internals` dev-dep (standalone `cargo test -p fsqlite-mvcc` had been
+  compile-broken; sibling crates already carry it) and the AGENTS.md
+  host-tuned target-cpu documentation. Also durable: seqlock's two
+  throughput tests are load-flaky (solo-green receipts); bd-fmkbv's 6 pager
+  failures reproduced byte-identical on this tree (826/6/11).
+
+## 2026-07-28 - MEASURED: release-perf post-fix truth for the subquery section — fixes hold at full optimization; residual is a ~50-60µs FLAT parameterized-execution tax (bd-5zeai), not subquery logic
+
+- First release-perf (opt-level=3) run of the section post-fa85adfc/5d35b79e
+  (prior receipts raced debug F against rusqlite's always--O2 C). Artifact:
+  `tests/artifacts/perf/subq-releaseperf-20260728T0330Z-hz1/`.
+- The routing fixes hold: EXISTS F=60.7/65.8/94.9µs and IN F=58.3/71.9/72.4µs
+  at 100/1k/10k — flat across scale (was linear). In the SAME section F beats
+  C by 6-9x on scalar subqueries and 9-17x on CTE+JOIN.
+- KEY ATTRIBUTION: within the F column, parameterless prepared execution
+  (`stmt.query()`) costs 5.8-16µs while parameterized
+  (`query_row_with_params`) costs 58-95µs regardless of query shape or table
+  size — a ~50-60µs FLAT per-execution tax on the parameterized path (a
+  single-row indexed COUNT costs 6x more than materializing 100 rows). Filed
+  bd-5zeai with ordered hypotheses (params-gated fast-path bypasses at
+  :6952/:18422 are known instances; find the rest). The bridge entry
+  (~333ns, bd-zavyn) is NOT this.
+- Also confirmed at release: general recursive-CTE COUNT C=335.4µs vs
+  F=2.46ms (~7.3x) — bd-gpi5i's release-gate condition met; profiling now
+  warranted.
+- Fresh-eyes review of the fa85adfc/5d35b79e/1f0969b3 surface found no
+  defects in the landed code; two latent PRE-EXISTING correctness landmines
+  filed: bd-f8iph (compiled IN emitter silently yields NULL when probe
+  resolution and the complex emitter both fail, codegen.rs:27807 —
+  currently unreachable but the invariant is implicit across three files)
+  and bd-3ua5h (subquery-support routing never descends into nested
+  subquery bodies, so a nested broken-family correlated EXISTS reaches the
+  compiled path unchecked).
+
+## 2026-07-28 - LANDED: bd-2dgf5 closed at 5d35b79e — the parameterized IN-subquery had the same routing disease (~32x recovered at 10k, scaling inversion gone); original aggregate-seek scope verified already fixed
+
+- Target: the second of the two subquery routing pathologies. Same disease
+  as bd-8sfs3: `in_subquery_supported_by_vdbe`'s blanket kl17o placeholder
+  rejection banished `col IN (SELECT ... WHERE id <= ?1)` to the interpreted
+  outer full scan while `resolve_in_probe_source` consumes exactly this
+  shape natively (residual per execution, `Opcode::Variable` rebinds).
+- Fix: shape-scoped carve-out (structural mirror of the probe-source
+  acceptance, non-correlated only; correlated IN keeps bd-zvk68 routing).
+  Paired same-host receipt: IN row 252µs/423µs/4.40ms →
+  171µs/352µs/137µs at 100/1k/10k — flat scaling restored
+  (`tests/artifacts/perf/in-subquery-fix-20260728T0250Z-hz1/`).
+- Also verified: the bead's ORIGINAL "aggregates never use an index" scope
+  (incl. rowid-PK-seek-lost-under-COUNT) was already fixed by the
+  aggregate index-seek machinery at codegen.rs:1851-1884 — EXPLAIN on
+  current main shows SeekGE+AggStep / SeekRowid with the scan-fallback
+  safety valve. The bead's 2026-07-09 numbers are historical.
+- Pattern for future perf triage (two-for-two now): when a shape is
+  catastrophically slow ONLY when parameterized, suspect the dispatch
+  router before the executor — diff the literal twin's EXPLAIN first; the
+  compiled path frequently already handles the shape and placeholders.
+  Remaining subquery-family residual: general recursive CTE COUNT (~13x-33x
+  in the debug receipts) and the flat ~4-20x bridge/debug overhead on all
+  parameterized rows (bd-uzq54 class).
+
+## 2026-07-28 - LANDED: bd-8sfs3 fixed at fa85adfc — the ~26,000x correlated-EXISTS pathology was ROUTING, not execution (~2,250x recovered on the 10k shape)
+
+- Target: the correlated count-semijoin EXISTS shape with a placeholder
+  residual bound (`... WHERE EXISTS (SELECT 1 FROM c WHERE c.id =
+  p.category_id AND c.id <= ?1)`), the worst row in the honest subquery
+  matrix.
+- Root cause: two connection.rs router gates forced the per-outer-row
+  nested-statement fallback SOLELY because the subquery contained `?1` —
+  `exists_subquery_supported_by_vdbe`'s blanket kl17o placeholder rejection
+  (fires before its own semijoin-shape check), and
+  `select_correlated_exists_where_requires_fallback`, whose only escape
+  requires an integer-literal rowid bound. The fallback clones the subquery
+  AST, substitutes the outer value, and runs a FULL `execute_statement` per
+  outer row (~43µs × 10k ≈ 427ms/exec). The compiled `CountIndexEqRun`
+  semijoin already lowered placeholder bounds to `Opcode::Variable`
+  (rebound per execution, no prepare-time folding) — the literal variant of
+  the same query ran in µs all along; only the router differed.
+- Fix: shape-scoped carve-outs at both gates via the existing
+  `correlated_exists_matches_count_semijoin_shape` predicate (exactly one
+  correlated probe equality + ≤1 inner-only residual; the known-bad
+  multi-correlated-term family stays on the fallback; kl17o stands for all
+  other placeholder subqueries). Side effect: literal non-aggregate
+  correlated semijoins (previously Gate-B-forced to fallback) now compile
+  too, covered by a row-set parity test across rebinds.
+- Evidence: paired same-host (hz1) pre/post `--quick --filter subquery`
+  runs, both diagnostic-only debug profile — the paired delta and the
+  scaling-shape change are the evidence, not the absolutes. EXISTS rows:
+  14.76ms/155.68ms/~427ms-per-exec → 366.9µs/461.1µs/190.1µs at
+  100/1k/10k rows; pre-fix time scaled ~linearly in outer×inner, post-fix
+  flat. Artifacts (force-added past the perf gitignore so citations
+  resolve): `tests/artifacts/perf/subq-oracle-receipt-20260727T2345Z-hz1/`
+  and `tests/artifacts/perf/exists-semijoin-fix-20260728T0230Z-hz1/`.
+  Tests: new compiled-path + rebind-correctness test (aggregate and
+  non-aggregate), 242-test adjacency battery green (one solo-green
+  load-flake in an unrelated copy-profile counter test), clippy --lib -D
+  warnings green.
+- Still open in the same receipt: parameter-varying IN-subquery at 10k is
+  C=7.4µs / F=4.40ms (~600x) — bd-2dgf5's planner lane; general recursive
+  CTE COUNT is C=387µs / F=12.97ms (~33x). Neither is this mechanism.
+- Retry/regression condition: if the semijoin shape ever reroutes to
+  dispatch, `test_prepared_statement_exists_subquery_with_placeholder_uses_compiled_path`
+  fails on the deferred-statement assert before any perf regression is
+  visible.
+
+## 2026-07-27 - LANDED: bench-truth sweep — criterion suite had 30 per-op runtime-entry sites (bd-mnlk2 complete), subquery/CTE rows now cross-engine validated (bd-czzlp), dropped-pragma fix confirmed (bd-fd1ra)
+
+- Target: the remaining instrument-drift surface after bd-zavyn/bd-i8pt6.
+  Exhaustive audit of every criterion timed closure in
+  `crates/fsqlite-e2e/benches/` (110 sites across 9 files, three independent
+  auditors, every site dispositioned) plus the two bins bd-mnlk2 had left
+  (`perf_update_delete.rs`, `swarm_multiprocess.rs` — both turned out already
+  fixed in-tree with hoisted entries).
+- Finding: 30 live defect sites in 8 bench files — every FrankenSQLite timed
+  closure mirrored its rusqlite twin statement-for-statement, so each sync C
+  call was its own ~333ns runtime entry on the F side only. Extremes:
+  `large_txn_bench` 1M-row txn = 1,000,003 entries/sample (~0.33s pure bridge
+  tax per sample); `write_throughput_bench` 10k-row shapes ≈ 10,001-10,031;
+  `mixed_oltp_bench` 2000-op loop ≈ 2,007; `e2e_bench` 11 sites incl. the
+  concurrent-writes arm (per-row entries in every spawned thread);
+  `concurrent_write_persistent_bench` additionally constructed each writer's
+  thread-local runtime inside the timed region. `read_heavy_bench.rs` was the
+  only fully clean file. No thread::sleep-inside-runtime and no
+  future-re-poll instances anywhere in the audited set.
+- Fix (uniform, RusticBasin's Gate 0 shape): one
+  `fsqlite_e2e::block_on(async { .. })` per timed sample — per transaction
+  attempt with backoff outside the runtime for the contended persistent
+  bench, matching the landed mt_mvcc idiom. C arms byte-untouched. Also:
+  `mt_oltp_bench.rs` gained the crate-root
+  `future_not_send`/`large_futures` allows its siblings already carry
+  (the hoisted bodies await the 16-50KB statement futures of bd-uzq54;
+  Box::pin would put an allocation inside the timed window) — that bin had
+  been clippy-red at -D warnings since the 4/6-bin hoist landed, masked by
+  nobody running clippy on --bins (bd-h9o9r class).
+- bd-czzlp closeout: EXISTS/IN rows were already parameter-varying with
+  oracle asserts and the recursive CTE already split specialized-vs-general;
+  the remaining gap was the scalar-subquery and CTE+JOIN rows, which timed
+  fully-materialized results on both arms but never compared them. Added
+  `assert_result_set_oracle` (one-shot, outside timed loops, normalized
+  multiset compare). Verified `PreparedStatement::query()` returns fully
+  decoded `Vec<Row>` (work-symmetric with `collect_rusqlite_rows`) and that
+  the only retained caches (count/sum single-row, indexed-equality) cannot
+  serve these multi-row shapes, so no parameter variation is needed there.
+- bd-fd1ra confirmation: all sites from the bead (7 e2e criterion benches,
+  persistent bench, `prepared_cache_hot_paths.rs`) now await their pragmas
+  with panic-on-error; repo-wide sweep found no remaining unpolled
+  execute/query futures (`validation.rs` hits go through the sync
+  `SqlBackend` trait; `execute_batch` hits are rusqlite best-effort
+  rollbacks).
+- Consequence for published numbers: every pre-fix cross-engine ratio from
+  the 8 affected criterion benches UNDER-reports FrankenSQLite (bridge tax on
+  the F side only, up to ~0.33s/sample); any artifact citing them needs
+  re-derivation post-fix. Direction of published F-wins is safe; magnitudes
+  are not engine truth.
+- Evidence: audit tables + per-site old→new entry counts in bd-mnlk2
+  comments; fix commit referenced on the beads. Compile/clippy/fmt gates
+  green at landing (fsqlite-e2e bins+benches, -D warnings). Note the clippy
+  gate had to run LOCALLY with a session-scoped CARGO_TARGET_DIR: two rch
+  workers (vmi1264463, and vmi1149989 for artifact retrieval) served stale
+  or incomplete state during this slice, while hz1 stayed fresh — line-number
+  fingerprints in the diagnostics distinguish a stale worker tree from a real
+  failure (bd-8wumh comment has the details).
+- UNMASKED by the fix (first honest measurement of the shape): the
+  parameter-varying correlated-EXISTS row is catastrophically slow —
+  C=20.0µs/F=14.76ms at 100 rows, C=16.3µs/F=155.68ms at 1k,
+  C=16.1µs/F≈427ms-per-exec at 10k (~26,000x, debug profile, diagnostic
+  host hz1; magnitude is 5 orders, not noise). Scaling ~linear in
+  products×categories ⇒ per-outer-row re-execution of the inner subquery
+  with no early termination and no PK probe. Filed bd-8sfs3 (P0); sibling
+  IN-subquery planner gap is bd-2dgf5 (~89x, distinct mechanism). The old
+  constant-threshold row reported this shape as a ~70ns cache-hit "win".
+  Scalar-subquery and CTE+JOIN rows are genuinely F-faster in the same
+  section, so the pathology is subquery-execution-specific.
+
+## 2026-07-27 - LANDED: io_uring reachable for the first time (bd-fo6xw) + inline-I/O marker with default-off gate (bd-bjm5d) + write_page_batch production wiring
+
+- Target: the three I/O-side residual mechanisms. All landed on main the
+  same day: `a14b1629` (IoUringFile write_page_batch forward + journal-mode
+  commit batching — without the forward, the landed 4.9x batch could never
+  fire on Linux because the trait default loops per-page through the uring
+  fallback), `1b63c0c3` (bd-bjm5d `blocking_io_inline_safe` CxInner marker +
+  UnixFile inline gate <=64 KiB, default OFF everywhere, single set site on
+  the AsyncConnection dedicated worker thread — design approved with
+  constraints by the async-contract owner, agent-mail 4363), `dc56e76f`
+  (bd-fo6xw mint-and-exit native-Cx spawner on RuntimeContext, attached to
+  the CONNECTION root Cx only when the context carries a runtime handle;
+  CLI opts in).
+- Evidence, bd-fo6xw functional receipt: staged CLI (built from
+  byte-identical sources to the landed files, ELF prefix `b0a662b1…`,
+  345,057,328 bytes) on the bd-fo6xw cold-reader repro:
+  `read_samples_total` **0 -> 110**, `write_samples_total` **0 -> 4**,
+  `unix_fallbacks_total` 41 — the io_uring data path engages in production
+  for the FIRST time since the async migration — while the exact refuted-fix
+  failure repro (CREATE+INSERT+SELECT, reopen, cross-process counts) runs
+  clean. Root cause was deeper than recorded: `block_on`'s ambient request
+  Cx carries NO spawn gateway in asupersync 0.3.9, so the 2026-07-26
+  substitution failed deterministically; only
+  `RuntimeHandle::try_spawn_with_cx` mints a gateway-carrying Cx
+  (root-region task). Probe artifacts: session scratchpad `asup-probe/`
+  (six lifecycle probes incl. runtime-drop-with-saved-clone and
+  post-shutdown graceful spawn failure).
+- Constraints preserved: default `Connection::open` path bit-for-bit
+  unchanged (`new_process_global` never mints);
+  `test_global_runtime_context_does_not_capture_ambient_native_cx` green;
+  attach is on the connection root Cx, so Phase-C's staged
+  `is_detached_for_dedicated_worker` predicate is untouched; no new
+  RuntimeContexts (SharedMvccKey stable). The parked-task shape was
+  REPLACED by mint-and-exit after the structured-lifecycle objection
+  (agent-mail 4363) — no task survives the mint instant.
+- Result: the UnixFile fallback tax now has three landed reducers (batch
+  hop amortization on journal commits, inline lane awaiting its dedicated
+  thread consumer, uring engagement on runtime-bearing opens). NOT yet
+  measured as end-to-end throughput: the comprehensive bench drives raw
+  `Connection` on `:memory:`, which exercises none of these. The bd-bjm5d
+  optimization stays PROVISIONAL until its three-arm ABBA measurement;
+  uring-arm timing claims need a Gate 0 paired run on a file-backed shape.
+- Retry/next: file-backed paired A/B (unix-fallback vs uring-engaged CLI
+  arm, and AsyncConnection inline arm) under Gate 0 pairing; wire a
+  checkpoint copy-back batch caller (cross-crate trait change, mapped in
+  bd-bjm5d's session notes).
+
+## 2026-07-27 - ATTRIBUTED: the ~1.29x engine residual is per-statement async machinery (~700ns/row) + commit-path inflation, partially offset by a faster row-build pipeline; fast lanes are NOT disengaged
+
+- Target: mechanism attribution for the post-hoist ~1.29x write residual
+  (paired sub-phase profile, not a blind fix — per the standing rejection on
+  WAL boxing). Method: `FSQLITE_BENCH_PROFILE_INSERT=1` on both arms of the
+  same shape (`--quick --filter insert`, `release-perf`, `taskset -c 4-11`,
+  host csd): baseline `c967eaeb` (tightest buildable pre-async boundary,
+  worktree `/data/projects/frankensqlite-wt-crimson-base`, ELF prefix
+  `5de121c7dd86eee2…`) vs hoisted `19e35b81` (ELF prefix `4ea129dd…`).
+  Artifacts: `profile-base.out` / `profile-hoist.out` in the session
+  scratchpad; the paired table is reproduced in bd-dqdoe.
+- Findings, hoisted/baseline:
+  1. **Fast lanes are intact in BOTH arms** — every scenario reports
+     `direct_insert=10000 fast=10000 slow=0`. The residual is not lane
+     routing and not the TRACE/fast-lane test-fidelity issue.
+  2. **Narrow rows carry a fixed per-statement cost**: tiny_1col insert body
+     `7.21ms -> 14.38ms` and `7.54ms -> 14.32ms` per 10k rows (**+~700
+     ns/row, 1.9-2.0x**); small_3col `~1.10-1.13x`; the cost shrinks as row
+     width grows. These scenarios are `:memory:`, so this is engine-internal
+     per-`execute` async machinery (future construction/poll through
+     connection->VDBE->pager layers), not VFS I/O. Corroboration: the
+     bd-h9o9r clippy sweep measured the per-statement futures at
+     **16-50 KB each** (`large_futures`, connection.rs); materializing a
+     state machine that size per row is the right order of magnitude for
+     ~700 ns.
+  3. **Commit path inflated ~1.3-1.4x on page-heavy shapes**:
+     `pager_mem_flush_ns` 1.8-2.0x, `pager_c_metadata_ns` ~3x,
+     `pager_unlock_ns` ~4x, `pager_publish_ns` 1.4-3.9x,
+     `commit_roundtrip_ns` 1.9x (tiny shape); large_10col `btree_insert_ns`
+     4.0x inside a commit that is 1.4x overall.
+  4. **The same window contains a large engine WIN**: the preserialization
+     pipeline was removed (`preserialize_ns` 27.1ms -> 0 on large_10col;
+     `row_build_ns` 0.31x), making wide-row inserts 0.61-0.77x — FASTER
+     post-async. "The async migration made writes slower" is therefore
+     wrong as a uniform claim: it made narrow-row statement dispatch and
+     commit slower while making wide-row serialization much faster.
+- Result: the actionable residual mechanisms, in order of leverage on the
+  benchmark shape: (a) per-statement future materialization cost (~700
+  ns/row floor on every INSERT regardless of width) — the fix direction is
+  shrinking/splitting the hot statement future (boxing cold branches,
+  narrowing the always-constructed state machine), now evidence-backed
+  where the earlier WAL-boxing hypothesis was not; (b) commit-path
+  regressions concentrated in pager mem-flush/metadata/unlock/publish.
+  Filed as the follow-on engine bead (see bd-dqdoe comments 2026-07-27).
+- Caveats: single pass per arm, load ~4-8, directional; the sub-phase
+  profiler is env-gated eprintln instrumentation outside the scored rows.
+  Re-run under Gate 0 pairing for citable magnitudes.
+
+## 2026-07-27 - RESOLVED: comprehensive-bench block_on hoist lands; write_bulk 2.59x -> 1.13x (instrument), engine residual ~1.29x vs pre-async baseline
+
+- Target: the bd-zavyn instrument drift — every timed FrankenSQLite body in
+  `comprehensive_bench.rs` entered the harness runtime once per operation
+  since `a0ab400a`, so write-side rows measured ~333 ns of bridge per row on
+  the FrankenSQLite side only. Hoist landed at `19e35b81` (one runtime entry
+  per timed sample / transaction attempt; concurrent section attempt-scoped
+  with backoff outside the runtime; provenance design id
+  `scenario_scoped_thread_local_block_on` with the citable:false gate intact).
+  Executor and the other six bench bins were hoisted earlier
+  (`7547724b`, `5461fd2f`, `ee64b241`).
+- Evidence: same shape as the whole bd-zavyn chain (`--quick --filter insert`,
+  `release-perf`, `taskset -c 4-11`, same host csd). Hoisted binary ELF
+  SHA-256 `4ea129ddafa436379e1400dd1d74bd6615087771…` (21,683,408 bytes,
+  built 2026-07-27 14:16 from `19e35b81`); artifact
+  `tests/artifacts/perf/zavyn-hoist-directional-20260727T1817Z-csd/`
+  (`bench-hoist-rp.json` SHA-256 prefix `782e60fccdfa0561`). N-for-n:
+
+  | arm | write_bulk n=22 geomean | write_single n=3 geomean |
+  |---|---:|---:|
+  | `140e77df` pre-async baseline | 0.8754x | 0.9202x |
+  | `ef1e39c9` per-op bridge | 2.5898x | 2.0795x |
+  | `19e35b81` hoisted | **1.1253x** | **1.1309x** |
+
+  25 scenarios: 4 faster / 6 comparable / 15 slower, avg 1.14x; the tight
+  rows have CV 0.4-1.5% on both engines.
+- Result: the hoist removes ~2.3x of pure instrument distortion, confirming
+  the bd-zavyn attribution end-to-end. The residual engine-side cost of the
+  async migration on this shape is ~1.29x (1.1253/0.8754) — that residual,
+  not the retracted 2.96x, is what `bd-dqdoe` still owes an attribution for
+  (known candidates: single-entry runtime residual per the gate0-bridge
+  diagnostic, UnixFile fallback-path tax per bd-trfah/bd-fo6xw).
+- Caveats: host load 4-8 during the run and no cgroup isolation, so this is
+  a DIRECTIONAL receipt, not a citable magnitude; the artifact self-declares
+  non-citable via the unchanged Gate 0 validation errors. Env-gated
+  diagnostic profilers (`FSQLITE_BENCH_PROFILE_*`) remain per-op; they never
+  feed scored rows.
+- Retry/next: re-run under Gate 0's paired ABBA + provenance regime for a
+  citable magnitude; until then no README claim may cite these numbers
+  beyond "the per-operation bridge distortion is fixed".
+
+## 2026-07-26 - MEASURE: the io_uring data path is unreachable in production (100% unix fallback)
+
+- Scope: `IoUringFile::{read,write,write_tracked}` on Linux file-backed databases
+  opened through the normal `fsqlite::Connection` API. Not a timing measurement —
+  a structural counter reading, so host load does not affect the verdict.
+- Files: `crates/fsqlite-vfs/src/uring.rs` (gates at `:1069`, `:1188`, `:1318`),
+  `crates/fsqlite-types/src/cx.rs:917` (`attached_native_cx`),
+  `crates/fsqlite-vfs/src/unix.rs:1971-1986` and `:88-101` (the fallback path).
+- Instrument: `PRAGMA fsqlite.io_uring_stats` (`connection.rs:51712`, behind
+  `diagnostic-pragmas`, which `native` -> `default` already enables). No new code
+  was needed to take this measurement; the counter already existed.
+- Binary self-report (bd-8wumh contract): debug `fsqlite-cli`, SHA-256
+  `8ea1d0a198e9ec474d86b9f0aee4269a20c70d687431afa699a2b3e342926e2c`,
+  342,159,600 bytes, built 2026-07-26 13:36:10 -0400.
+- Method: 20,000-row file-backed WAL database (`page_size` 4096; 4.1 MB db +
+  4.2 MB wal) populated in one process, then read from a COLD second process
+  (`PRAGMA wal_checkpoint(TRUNCATE)` followed by two full table scans) so every
+  page read is a genuine buffer-pool miss.
+- Result:
+
+  | counter | value |
+  |---|---:|
+  | `read_samples_total` | `0` |
+  | `write_samples_total` | `0` |
+  | `unix_fallbacks_total` | `7520` |
+
+  Zero io_uring operations. This is an absolute, not a ratio.
+- Mechanism: the three data-path methods gate on `cx.attached_native_cx()` alone.
+  That accessor reads only the attached field and never consults ambient
+  `asupersync::Cx::current()`. Nothing on the `Connection::open` -> `execute`
+  path calls `set_native_cx` on a connection root/op `Cx` — the only
+  `connection.rs` sites are a background task (`:73826`) and a test (`:97020`).
+  `create_child` does propagate it (`cx.rs:1199-1202`), but there is nothing to
+  propagate. One layer up, `page_cache.rs:3421-3422` already resolves the native
+  context as `Cx::current().or_else(|| cx.attached_native_cx())`.
+- Inside the regression window: at control `b612eb7b` the read gate was
+  `if self.has_uring_data_path()` with fallback only on I/O error, and no
+  native-cx requirement. `uring.rs` existed and `IoUringVfs` was already selected
+  for file opens at the control (11 references in `connection.rs`), so the VFS
+  selection is not new; the always-failing gate is.
+- Cost paid on every fallback, per page read: `Arc::clone` -> `spawn_blocking_io`
+  (thread-pool hop + reschedule) -> `vec![0u8; page_size]` in `read_owned_at`
+  (allocation **plus** a zero-fill memset) -> `pread` -> `buf.copy_from_slice`
+  (a second full-page memcpy). Three full-page memory traversals where the
+  pre-async path did one `pread` into the caller's buffer. Writes are symmetric
+  (`buf.to_vec()` at `unix.rs:2018`). The owned-buffer shape is forced by
+  `spawn_blocking_io` requiring `'static`, so removing it is a design change and
+  not a local edit. `UnixFile` also does not override `write_page_batch`, so
+  pager batch writes take the default sequential loop
+  (`fsqlite-vfs/src/traits.rs:1012-1023`).
+- NOT established: any share of the `bd-dqdoe` 1.895x. Two gates exist at HEAD —
+  `runtime.is_available()` (`:1065`) and the native-cx gate (`:1069`) — and
+  `unix_fallbacks_total` does not distinguish which fired. No timing claim is
+  made here; the measuring host was loaded and is non-citable for latency.
+- **REJECTED FIX (same day, by measurement):** substituting
+  `NativeCx::current().or_else(|| cx.attached_native_cx())` at all three gates —
+  mirroring `page_cache.rs:3421` — **breaks the engine**. Rebuilt CLI SHA-256
+  `5f08e3223009e733246bc5220a63f4a671122ab169a7b62f3878cd22f4ca0711`
+  (341,195,032 bytes, built 2026-07-26 13:46:52 -0400). A three-statement
+  workload (`CREATE TABLE` + one `INSERT` + `SELECT`) fails with:
+
+  ```
+  cannot start tracked shared io_uring write: cannot start shared io_uring driver:
+  [ASUP-E001] runtime is no longer available — the runtime behind this handle was
+  dropped or shut down; spawn before shutdown begins, or hold a strong runtime
+  reference for the spawner's lifetime
+  ```
+
+  followed by `no such table: t` on every subsequent statement.
+  `unix_fallbacks_total` fell 7520 -> 133 (the path was genuinely being taken)
+  while `read_samples_total` / `write_samples_total` stayed at `0` (no operation
+  ever succeeded through it).
+- **Revert verified on a third binary**, so the sequence is a controlled triple
+  rather than a broken-then-assumed-fixed pair. Reverted CLI SHA-256
+  `7556a865e0b09a6552fd0fe1194419dfeded731c...` (341,178,832 bytes, built
+  2026-07-26 13:56:18 -0400) runs the identical failing repro to completion:
+  `PRAGMA page_size` -> `4096`, `journal_mode` -> `wal`, `SELECT count(*)` -> `1`,
+  zero errors.
+
+  | binary | outcome | `unix_fallbacks_total` | `read/write_samples_total` |
+  |---|---|---:|---:|
+  | `8ea1d0a1…` (original) | works | 7520 | 0 |
+  | `5f08e322…` (candidate fix) | **broken**: driver error, then `no such table` | 133 | 0 |
+  | `7556a865…` (reverted) | works | 134 | 0 |
+
+  The reverted arm reproduces the original 100%-fallback behaviour exactly, so
+  the revert restores the prior state rather than merely compiling.
+- **Therefore the gate is load-bearing, not an oversight.** The ambient `Cx`
+  inside a short-lived `block_on` belongs to a runtime that is torn down when
+  that call returns, and the *shared* io_uring driver needs a spawner that
+  outlives the operation. `page_cache.rs` can use `Cx::current()` because it
+  spawns a task on that same runtime and joins it before returning; the VFS data
+  path cannot. `attached_native_cx()` is how a caller declares "here is a runtime
+  whose lifetime I guarantee." Reverted, with this reasoning recorded inline at
+  `uring.rs:1069` so the next reader does not re-attempt it.
+- **Root cause is upstream, and it is the same one as `bd-zavyn`.** io_uring is
+  unreachable in production because the sync bridge gives *every operation its
+  own runtime*, so no caller can ever offer the lifetime guarantee the driver
+  needs. That is the same per-operation `block_on` architecture that inflates the
+  benchmark timings. One cause, two symptoms: measured harness overhead, and a
+  fast path that can never engage.
+- Retry condition: only after the sync bridge is restructured so a runtime spans
+  at least a transaction (the `bd-zavyn` hoist) **and** a durable native `Cx` is
+  attached to the connection at open time. Re-measure `read_samples_total` before
+  claiming any io_uring benefit. Do not re-try the `Cx::current()` substitution on
+  its own — it is refuted.
+- Follow-ups filed: the PRAGMA surfaces only `unix_fallbacks_total` while the
+  struct also carries `read_unix_fallbacks_total` / `write_unix_fallbacks_total`
+  (`fsqlite-observability/src/lib.rs:144`, `:146`); and `comprehensive-bench`
+  resolves `native` + `linux-asupersync-uring` through `fsqlite-harness` feature
+  unification, so it can assert a fallback-rate receipt per run rather than
+  relying on a separate probe.
+- Tracking: `bd-fo6xw`, referenced from `bd-dqdoe`.
+
+## 2026-07-26 - CORRECTION: comprehensive-bench DOES build with native + linux-asupersync-uring
+
+- `bd-dqdoe` lists "the suite does not exercise the default native/linux-uring
+  feature config" as a benchmark-methodology defect. That is not what the
+  resolved feature graph does.
+- `crates/fsqlite-e2e/Cargo.toml:29` declares
+  `fsqlite = { default-features = false, features = ["json","fts5","rtree"] }`,
+  which on its own would exclude `native` and `linux-asupersync-uring`. But
+  `fsqlite-e2e` depends on `fsqlite-harness`, which takes `fsqlite` with default
+  features, and Cargo features are additive across the graph.
+- Verified with `cargo tree -p fsqlite-e2e -e features -i fsqlite`: both
+  `fsqlite feature "native"` and `fsqlite feature "linux-asupersync-uring"`
+  resolve ON via `fsqlite feature "default"` <- `fsqlite-harness`.
+- Consequence, and why this matters rather than being pedantry: `native` also
+  enables `diagnostic-pragmas`, so `PRAGMA fsqlite.io_uring_stats` is available
+  inside `comprehensive-bench` itself. The uring fallback rate can therefore be
+  recorded as a per-run provenance receipt instead of being probed out-of-band.
+- Retry condition: none — this is a correction to a stated defect, not a rejected
+  optimization. If the feature declaration on `fsqlite-e2e` is ever tightened, or
+  the `fsqlite-harness` dependency is dropped, re-check the resolved graph before
+  assuming either configuration.
+
+## 2026-07-26 - AUDIT: top-five VOID resurrection queue gets exact-dispatch and A/A adjudication
+
+- Scope: the hand-read six-class audit in `docs/LEDGER_RESURRECTION.md`
+  classified the ten genuine source rows as `VOID-NONULL`; the top five were
+  selected in their documented order. The required negative-evidence grep was
+  therefore the queue itself plus the original rows at ledger lines 18,529,
+  13,625, 11,422, 7,626, and 10,126. No new lever was proposed.
+- Contract: `pipeline_stage_bench --features bench-internals` ran independent
+  A/A and A/B file-backed fixtures, 41 paired rounds, min-of-three inner
+  replicates, 10,000 median-bootstrap resamples, output checksums, and exact
+  candidate-branch counters. Its decision band was `1 ± 2 * max distance of
+  the A/A CI from 1`, with a 1% minimum. The full claim CI, not its point
+  median, had to clear that band. `cv_gate=never`.
+- Build/run: the combined strict-remote build command was
+  `RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=3600
+  RCH_WORKER=vmi1153651 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec
+  -- cargo bench --profile release-perf -j7 -p fsqlite-e2e --bench
+  pipeline_stage_bench --features bench-internals --
+  --ledger-resurrection-all`. Worker `vmi1153651`; the release-perf ELF
+  reported SHA-256
+  `bbbbe7c56ed067aa07ca47d9a403875ed91d111232c600cf08ba96f05fe9cc64`,
+  25,949,584 bytes. After the second case proved unreachable and stopped the
+  first combined runner, cases 3-5 executed that preserved exact ELF directly
+  on the same worker. From the remote repository root it reported these source
+  identities:
+  `pipeline_stage_bench.rs`
+  `7c1bf644489b67b9d26992bd989e5144de61711a7b74988b701c1c28ced86ee0`
+  (63,240 bytes), `cursor.rs`
+  `44708dee681345743a9001d1d71ec98ca70217a2863ed95f5cff911ddda81fb7`
+  (893,330 bytes), `value.rs`
+  `88e7bbffb4270e5b979aea5b9645bea07d144935580bb8bfca177e2ab5ad6df3`
+  (130,075 bytes), and `connection.rs`
+  `5aa035dfa56ef3ccc7b91083c3a124651f0a059a220388407a35afc6a1121820`
+  (8,654,968 bytes).
+
+  | queue / candidate | exact hits | A/A median, 95% CI | A/B median, 95% CI | decisive band | six-class result |
+  |---|---:|---|---|---|---|
+  | 1 table seek-cache MRU short-circuit | 488,064 | `1.008096 [0.969946, 1.055463]` | `1.007533 [0.970819, 1.057989]` | `<0.889074` or `>1.110926` | `VALID-AB`, `INCONCLUSIVE` |
+  | 2 same-leaf DELETE search hint | **0** | not published | not interpreted | exact reachability required first | `VOID-ZEROSELF`, `INVALID` |
+  | 3 SmallText direct traits | 4,975,104 | `1.021957 [0.993031, 1.036486]` | `1.026980 [0.986791, 1.084763]` | `<0.927028` or `>1.072972` | `VALID-AB`, `INCONCLUSIVE` |
+  | 4 fixed-width REAL update | 503,808 | `1.000416 [0.956153, 1.028183]` | `0.978947 [0.956454, 1.021725]` | `<0.912307` or `>1.087693` | `VALID-AB`, `INCONCLUSIVE` |
+  | 5 lazy decoded scratch | 15,744 | `1.002169 [0.987739, 1.011725]` | `0.991003 [0.938007, 1.078962]` | `<0.975477` or `>1.024523` | `VALID-AB`, `INCONCLUSIVE` |
+
+- Adjudication: no candidate was re-won. Four original `VOID-NONULL` rows are
+  now valid A/B evidence but remain inconclusive; their entire claim intervals
+  overlap the measured null-derived bands. The DELETE row is confirmed
+  unreachable: an exact zero dispatch count is stronger than sampled
+  approximately-zero self-time, so its timing is not interpreted. Candidate
+  4's claim CV was 252.982%; it is recorded as diagnostic provenance and did
+  not decide the row.
+- Retry predicates:
+  1. Seek-cache MRU: retry only after a mechanism/profile change predicts an
+     effect larger than the current 11.09% gain band, or on a host/run design
+     that demonstrates an A/A radius at or below 0.5%; require the full claim
+     CI above the recomputed band.
+  2. DELETE search hint: do not time it again until a pre-timing probe records
+     a non-zero `delete_leaf_search_hint` exact dispatch count for the named
+     fixture; then rerun the complete A/A+A/B contract.
+  3. SmallText traits: retry only after a counted instruction/allocation
+     reduction is added or a profile attributes enough self-time to predict
+     more than the measured 7.30% gain band; retain the 4,975,104-hit
+     reachability proof.
+  4. Fixed-width REAL: retry after the confirmed write baseline regression is
+     fixed and a quieter fixture brings the null radius below 1%; preserve
+     fixed-width-hit counting and exact value/checksum restoration.
+  5. Lazy scratch: retry only after a counted allocation/decode reduction is
+     demonstrated and the full claim CI can clear the recomputed band; preserve
+     the one-row transaction shape and non-zero lazy-scratch count.
+- Harness follow-up: the queue runner now reports zero dispatch as structured
+  `reachability_gate=INVALID`, continues later candidates, and exits 2 after
+  the combined invocation. It also resolves source identities from
+  `CARGO_MANIFEST_DIR`, so Cargo's launch directory cannot silently produce
+  `unavailable` hashes.
+
+## 2026-07-26 - MEASURE: concurrent writers at matched `synchronous=NORMAL` with same-invocation C/C null controls
+
+- Allocation: Lane M was directed to remeasure concurrent writers after
+  adjudicating `bd-minmax-prefix-seek-4fuo6`. The mandatory negative-evidence
+  grep found the 2026-07-23 `bd-x5gzk` entry below: do **not** use
+  `comprehensive_bench --filter concurrent`, whose file-WAL C arm has already
+  failed three attempts with irreducible run-to-run noise. This measurement
+  therefore used the focused `mt-mvcc-bench`.
+- Contract: each thread-count row used 21 paired rounds and four independent
+  fresh file-backed databases per round: C null A, C null B, C baseline, and
+  FrankenSQLite candidate. Odd rounds reverse execution order. Every worker
+  connection in both engines explicitly used `journal_mode=WAL`,
+  `synchronous=NORMAL`, and `busy_timeout=5000`; inserts were prepared; table
+  shape, row count, and non-overlapping rowid ranges were matched. The report
+  used 10,000 bootstrap resamples of the median per-round ratio. CV and MAD
+  were printed but `cv_gate=never`. The decision threshold was the claim CI
+  beyond twice the same-row C/C 95%-CI radius, with a 1% minimum effect.
+- Command, shared table:
+  `RCH_WORKER=vmi1149989 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch
+  exec -- cargo run --profile release-perf -j7 -p fsqlite-e2e --bin
+  mt-mvcc-bench -- --rows-per-thread=1000 --threads=1,2,4,8 --iters=21
+  --json-output=/tmp/frankensqlite-mt-shared-20260725.json
+  --summary-md=/tmp/frankensqlite-mt-shared-20260725.md
+  --history-json=/tmp/frankensqlite-mt-shared-history-20260725.json`.
+  Worker `vmi1149989`, exit 0. The program's first stdout line identified ELF
+  SHA-256
+  `cd51cf5b7e20761de32b38a1933a230ea493ab52a86a681419064b4573e79386`,
+  19,249,488 bytes. Benchmark-source SHA-256 was
+  `76f6cffe86676b2cff4b5da4daea2acb3afb37a7bb8e4303ecef225453e78f77`
+  (65,768 bytes).
+
+  | threads | C/C null median, 95% CI | F/C claim median, 95% CI | F/C marginal p50 writes/s | failures F/C | verdict |
+  |---:|---|---|---:|---:|---|
+  | 1 | `1.069254 [0.944104, 1.132008]` | `0.812434 [0.796425, 0.917790]` | `225,560 / 283,075` | `0 / 0` | `INCONCLUSIVE` |
+  | 2 | `1.177248 [0.916400, 1.233933]` | `0.566566 [0.478737, 0.658484]` | `165,483 / 287,230` | `0 / 0` | `INCONCLUSIVE` |
+  | 4 | `0.996769 [0.906437, 1.057966]` | `1.065671 [0.877737, 1.271667]` | `188,692 / 175,909` | `0 / 0` | `INCONCLUSIVE` |
+  | 8 | `1.008665 [0.986537, 1.288017]` | `1.869339 [1.798963, 1.991750]` | `166,672 / 94,160` | `0 / 0` | `FSQLITE_FASTER` |
+
+- Command, separate table per writer: the same command plus
+  `--separate-tables`, with separate `/tmp/frankensqlite-mt-separate-*`
+  output paths. Worker `vmi1149989`, exit 0. The program identified ELF
+  SHA-256
+  `0a5f7554ad90f7fc8326f003404f2d00f42cd814e7630cc160e52f8af9908789`,
+  19,249,488 bytes, and the same benchmark-source SHA-256
+  `76f6cffe86676b2cff4b5da4daea2acb3afb37a7bb8e4303ecef225453e78f77`.
+
+  | threads | C/C null median, 95% CI | F/C claim median, 95% CI | F/C marginal p50 writes/s | failures F/C | verdict |
+  |---:|---|---|---:|---:|---|
+  | 1 | `1.023313 [0.822642, 1.267544]` | `0.809914 [0.726962, 0.879560]` | `207,567 / 244,237` | `0 / 0` | `INCONCLUSIVE` |
+  | 2 | `1.017204 [0.862429, 1.100505]` | `0.553239 [0.488900, 0.707912]` | `164,789 / 271,822` | `0 / 0` | `FSQLITE_SLOWER` |
+  | 4 | `0.991678 [0.950798, 1.011827]` | `1.016963 [0.793856, 1.153680]` | `198,425 / 176,200` | `0 / 0` | `INCONCLUSIVE` |
+  | 8 | `0.990736 [0.672570, 1.266288]` | `2.965575 [2.625840, 3.289043]` | `244,465 / 73,614` | `0 / 0` | `FSQLITE_FASTER` |
+
+- Adjudication: high CVs did not kill any row. The same-invocation null
+  controls instead prevented raw low-thread ratios from becoming false speed
+  claims. The exact-binary conclusions are: a shared-table 8-thread win, a
+  separate-table 8-thread win, a separate-table 2-thread regression, and five
+  inconclusive rows. These replace the uncited historical `40.99x`
+  separate-table and three-iteration `2.57x / 1.79x` shared-table README
+  claims. The remote `/tmp` JSON/Markdown outputs are worker-local; the exact
+  stdout evidence is preserved in this repository-resident entry.
+- Retry predicate: remeasure after any engine, durability, transaction-loop,
+  or harness change, or when a dedicated host can shrink the relevant C/C null
+  radius. Keep the exact same per-connection `NORMAL` setting, fresh
+  four-fixture pairing, self-reported ELF/source identities, counted failures,
+  and median-CI decision. Reopen an inconclusive row only if its new claim CI
+  clears twice its own same-invocation null radius. Do not use CV, historical
+  pass-over-pass drift, or a near-1.0 marginal ratio as a verdict.
+
+## 2026-07-26 - ATTRIBUTION HOLD: the current/control slowdown is not an async-only experiment
+
+- Target: the apparent broad regression reported while migrating the public
+  engine surface to async. A same-host `comprehensive-bench --quick` comparison
+  found C SQLite nearly unchanged while FrankenSQLite's current/control median
+  factor was about `1.895x`; this proves a FrankenSQLite-side historical delta,
+  not its cause. The control `b612eb7b` is 194 commits and 336 changed files
+  behind the current tree, spanning dependencies, benchmark code, and most
+  engine layers. See `bd-dqdoe`.
+- Evidence: both reports were generated on 2026-07-25 UTC on the same
+  Threadripper PRO 5995WX host with the same nightly toolchain and
+  `release-perf` profile. Current cohort
+  `5419dff5ed53fbc2e109dac0d6b9dfb5b9e7e1de` is
+  `tests/artifacts/perf/gate0-historical-drift-20260725T1625Z-trj/current-5419dff5.json`
+  with SHA-256
+  `9c9b93fea7e7288719c92b4b1b8af16c979875c037430580bd8377cdf5d878a2`;
+  control cohort `b612eb7b5513c03c7cf5a091208c9cfe7d20c755` is
+  `tests/artifacts/perf/gate0-historical-drift-20260725T1625Z-trj/control-b612eb7b.json`
+  with SHA-256
+  `fd59d2fdf37a0a4deddddeefe0fed583fa3664cb88f083fd6a5984ebd171a0e7`.
+  The durable files are byte-for-byte copies of the original
+  `trj:/data/tmp/fsqlite-bench-async-verify/{async-verify,ctrl-preasync}.json`
+  reports.
+  Across the 93 rows with both FrankenSQLite medians, the median of
+  current/control median-time ratios is `1.894854261715`; across 96 C SQLite
+  rows the same statistic is `1.000576994455`. These legacy reports omit
+  embedded Git identity and use the invalidated unpaired/adaptive design
+  documented below, so the external checkout receipts and hashes preserve only
+  a historical drift signal.
+- Result: causal labels such as “async made the engine 1.9x slower” are held.
+  The comparison is useful release-blocking evidence of drift, but it is not an
+  async-only A/B and must not justify an engine optimization by itself.
+- Retry attribution only with a buildable narrow boundary, identical benchmark
+  driver and settings, paired same-host ordering, work receipts, and a profile
+  or counter that measures the proposed mechanism. C SQLite stability is a
+  host-drift control; it does not turn a 194-commit interval into a causal A/B.
+
+## 2026-07-26 - BOUNDARY HOLD: `c967eaeb..13ec577f` localizes a merge interval, not one mechanism
+
+- Target: the narrowest buildable pre/post boundary around the public async
+  migration. `31fc4a3b` is not a valid cohort because the benchmark build fails
+  with eight synchronous-value-versus-`Future` errors in the B-tree cursor.
+  `c967eaeb014988ac0496c3acea24e69d4707fe68` and
+  `13ec577f14433b19a28ea67cc4400c542a2b4349` both build and accept the same
+  `--quick --filter txn --no-html --json-out` invocation.
+- Evidence: durable build logs, toolchain capture, and smoke reports are under
+  `tests/artifacts/perf/gate0-boundary-c967eaeb-13ec577f-20260725/`.
+  The original frozen binaries remain in the local campaign directory
+  `/data/projects/frankensqlite-boundary-gate0-20260725-Bi6rUk/artifacts/`;
+  the pre binary SHA-256 is
+  `f191c209ee46d887bb51ac217ed9a8071624023169c76380963cc83ec513bef5`;
+  the post binary SHA-256 is
+  `bcb9ce0f440375d96b26f5ee0d5e0a79e3b8b560632aabfa9c5705d54570c4d4`.
+  Their build-log SHA-256 values are
+  `a4bd41edc44cc29b0b45b1cbe12c5ff05ab6065b782c52aa81388b80a731cefd`
+  and
+  `5182953a662cc3260e0009c079757d07ffe2f099ee3eefcb543c2f0536dd8f9d`.
+  The follow-up diagnostic matrix is under
+  `tests/artifacts/perf/gate0-boundary-abba-c967eaeb-13ec577f-20260726T0531Z-trj/`:
+  24 fresh processes in six alternating ABBA/BAAB blocks, pinned to CPU 2 on a
+  128-logical-CPU Threadripper PRO 5995WX. All runs exited zero and emitted all
+  nine transaction rows. Equal-scenario, block-paired log contrasts give a
+  FrankenSQLite post/pre ratio of `2.650381` (diagnostic exact
+  order-stratified bootstrap
+  interval `[2.602754, 2.701227]`), a C SQLite post/pre control of `0.994767`
+  (`[0.985593, 1.003108]`), and a difference-in-differences ratio of `2.664324`
+  (`[2.609429, 2.720374]`). The host was lightly loaded and under the
+  performance governor, but CPU 2 was not isolated from its sibling, IRQs, or
+  unrelated work; the legacy driver also lacks the new symmetric work receipts,
+  so these intervals remain diagnostic rather than release-citable.
+- Result: the boundary now proves a large, repeatable FrankenSQLite-side timing
+  discontinuity while its within-run C control is stable. A second diagnostic
+  matrix at
+  `tests/artifacts/perf/gate0-boundary-three-cohort-c967eaeb-a0ab400a-13ec577f-20260726T0542Z-trj/`
+  ran all six permutations twice: 36 fresh processes, 12 complete
+  three-cohort blocks, each cohort in each position four times. The substantive
+  async-branch parent `a0ab400a` versus repaired parent `c967eaeb` is
+  `2.667659` for FrankenSQLite and `0.993471` for C SQLite; the
+  difference-in-differences is `2.685191` (diagnostic exact
+  permutation-stratified interval `[2.646376, 2.724576]`). The merge result
+  versus `a0ab400a` is only `1.003082` after the C control
+  (`[0.989065, 1.017297]`). Thus the merge
+  resolution itself adds no measurable aggregate discontinuity here; the
+  slowdown is already present in the async branch parent.
+- This still does not prove an async mechanism. The repaired and async branch
+  parents diverge from unbuildable `31fc4a3b` and differ across engine plus
+  driver code. `a0ab400a` also introduces the harness runtime bridge that makes
+  the benchmark buildable. The matrix cannot distinguish runtime entry per
+  operation from intrinsic engine work, boxing, stack frames, or another
+  branch change.
+- Retry with a same-source three-arm bridge experiment: one runtime entry for
+  the whole workload, one entry per operation, and a ready-future control.
+  Attribute any residual engine cost only after CPU/allocation profiles and a
+  one-variable A/B; keep profiling outside the timing matrix.
+
+## 2026-07-26 - DIAGNOSTIC: per-operation runtime entry is large; the worker facade is not the fix
+
+- Target: resolve the boundary hold above with a same-source bridge experiment
+  on prepared INSERT, raw `execute_with_params` INSERT, and a ready-future
+  control. Source
+  `413ed24cd0ff8dcfa2bbc7ed395dd1cf5db4e25f` compares one
+  reused `Runtime::block_on` around the complete timed sample, one reused
+  thread-local `Runtime::block_on` per timed operation, and the public
+  `AsyncConnection` synchronous worker facade. The four-process outer profile
+  order is ABBA (`release-perf`, `release`, `release`, `release-perf`) across
+  two seeds, with 48 samples per arm and 1,000 operations per database sample.
+- Evidence:
+  `tests/artifacts/perf/gate0-bridge-413ed24c-20260726T0806Z-trj/`.
+  All four v2 reports pass independent structural validation and retain 2,496
+  raw samples plus exact complete-cluster bootstrap and sign-randomization
+  results. They are explicitly **non-citable**: every process records 224
+  provenance errors from active SBH, excess load, excess I/O PSI, and the
+  declared watchdog/topology limitations.
+- Diagnostic result: under `release-perf`, per-operation entry versus one
+  enclosing runtime is `2.2003x` for prepared INSERT (`+621.7 ns/op`) and
+  `1.4866x` for raw INSERT (`+441.9 ns/op`), replicated across both seeds.
+  Under shipped `release`, the same contrasts are `2.2946x`
+  (`+1,177.1 ns/op`) and `1.5383x` (`+840.0 ns/op`). Exact within-process
+  randomization rejects a zero paired effect in every replication. The
+  ready-future slopes, 217.1 ns/entry and 316.1 ns/entry respectively, explain
+  only part of the real-operation gap: the proven mechanism is repeated
+  runtime entry plus scheduler/future interaction, not runtime construction or
+  a single constant entry cost.
+- Rejection: do not use the current worker facade as the sync-throughput fix.
+  It is deliberately a whole-system arm—SQL/parameter cloning, response-channel
+  allocation, channel transit, worker scheduling, and
+  `futures_lite::block_on`—and measured `6.3993x` slower than per-operation
+  entry (`9.5134x` slower than inside-runtime) under `release-perf`, and
+  `4.2968x` (`6.6099x`) under shipped `release`.
+- Profile hold: the `opt-level=z` binary is 30.8% smaller than the
+  `opt-level=3` binary, while selected prepared/raw engine arms are
+  `1.7206-1.8291x` slower in the counterbalanced profile point estimates.
+  With two profile-level seed replications and non-citable host provenance,
+  this is a release-profile risk signal, not a final profile choice.
+- Retry the runtime bridge only with isolated-host provenance if a citable
+  magnitude is needed. The engineering retry condition is more useful:
+  benchmark one runtime per scenario as primary engine throughput, retain the
+  per-operation sync adapter as a separate score, add a batched sync entry
+  point, and profile the residual before changing WAL dispatch. Retry the
+  worker approach only after removing or amortizing its measured cloning,
+  channel, scheduling, and secondary-executor costs. Decide the release profile
+  with a citable size/throughput Pareto matrix, not this diagnostic alone.
+- README publication hold: exact ratios from this artifact were removed from
+  `README.md` on 2026-07-26 because the artifact's own contract says that every
+  report is non-citable. The README now links the diagnostic evidence without
+  publishing its magnitudes or treating it as causal attribution. Restore
+  numeric claims only after Gate 0 passes the isolated-cpuset, full-dynticks,
+  IRQ, watchdog, host-load, I/O-pressure, and symmetric-work-receipt gates.
+
+## 2026-07-26 - REJECTED ATTRIBUTION: boxed WAL futures are not yet a measured root cause
+
+- Target: the hypothesis that one `Box::pin` allocation per `WalBackend` call
+  explains the write-heavy historical regression. `WalFuture` and
+  `LocalPagerFuture` boxing are already present before the narrow buildable
+  `c967eaeb..13ec577f` boundary, and no allocation count, heap profile, CPU
+  profile, or same-source boxed-versus-static-dispatch A/B established their
+  contribution.
+- Result: reject the causal claim and do not redesign the WAL trait boundary
+  from timing-shape intuition. The mechanism remains plausible, but the current
+  evidence ceiling is unknown.
+- Retry only after a paired boundary run reproduces the loss and a heap/CPU
+  profile attributes material timed-region cost to future allocation or dynamic
+  dispatch. Any candidate must preserve pluggable WAL semantics and pass an
+  allocation-count plus end-to-end paired keep gate.
+
+## 2026-07-26 - REJECTED: redundant trigger re-entry boxing does not solve recursive stack depth
+
+- Target: the hypothesis that an extra `Box::pin` around the already-boxed
+  trigger statement future would move enough async state to the heap to permit
+  materially deeper recursive triggers. This is the trigger re-entry path
+  tracked by `bd-wymdl`, not the hot `WalBackend` attribution above.
+- Evidence: a same-debug-profile pinned-stack A/B measured the extra wrapper as
+  adding about `1,200` bytes per recursive level; removing it is part of
+  `5fb10ffc`. After removal, an optimized build with `opt-level = "z"`,
+  `lto = false`, and `codegen-units = 16` still measured a steady
+  `129,328` bytes per level, of which `125,648` bytes was the
+  `execute_statement_impl_after_background_status` frame. The debug build
+  remained about `185,408` bytes per level. The targeted engine gate passed
+  114 tests, including the depth-limit and last-connection teardown
+  regressions. These are stack measurements, not throughput measurements.
+- Result: reject the redundant box. Heap storage for a future does not break
+  the recursive native-stack poll chain, and this instance made per-level stack
+  use worse. `MAX_TRIGGER_DEPTH` remains 8 so debug consumers receive an error
+  before process abort; approaching SQLite's depth of 1000 requires an explicit
+  statement work stack or another trampoline, not a larger thread stack or an
+  extra box.
+- Retry only after a compiler/runtime representation change or a design that
+  removes recursive polling. Re-measure both the default raw API and optional
+  worker API on pinned 1/2/4/8/16 MiB stacks, prove the configured depth error
+  fires before abort in debug and optimized profiles, and separately benchmark
+  any throughput effect rather than inferring it from frame size.
+
+## 2026-07-26 - INVALIDATED EVIDENCE: legacy comprehensive scorecards are diagnostic-only
+
+- Target: `comprehensive-bench` full/quick reports, including
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
+  The legacy driver measures all C SQLite samples before all FrankenSQLite
+  samples, lets each engine stop independently on an adaptive time budget, and
+  computes tail ratios from only a handful of unpaired samples. Many scored
+  write rows omit affected-row/final-state receipts, many reads discard results,
+  host/topology state is not release-gated, and historical concurrent-writer
+  rows used unmatched durability.
+- Result: existing numeric rows remain useful routing diagnostics, but their
+  aggregate score, p90/p99, “faster” count, and CI eligibility cannot support a
+  release or README performance claim. Gate 0 makes this measurement design
+  explicitly non-citable until the runner is paired and fully receipted.
+- Retry only after fixed-count paired ABBA/BAAB execution, symmetric work
+  oracles, matched read-back durability, topology-pinned host receipts, and
+  final artifact validation land. Do not compare a new candidate against these
+  historical scorecards as if they were a causal baseline.
+
+## 2026-07-26 - INVALIDATED EVIDENCE: pre-Gate-0 `mt-oltp-bench` reader and ratio rows
+
+- Target: earlier `mt-oltp-bench` mixed reader/writer output. The migrated
+  reader path could construct a future without polling it, ignore the query
+  result, and still increment its operation count; aggregate latency was
+  derived from thread summaries rather than retained operation samples, and
+  engine runs were not paired/counterbalanced.
+- Result: all pre-v2 reader latency/throughput and engine-ratio claims from this
+  binary are invalid. Merely wrapping the query in `block_on` is insufficient
+  unless errors, row cardinality/type/value, consumed payload, completed work,
+  database postflight, and ordering are also receipted.
+- Retry with report schema `fsqlite-e2e.mt_oltp_bench_report.v2` or newer and
+  external Gate-0 source/build/host provenance. The corrected harness must keep
+  exact expected/completed work, real operation latency samples, paired
+  alternating ABBA/BAAB order, full-precision ratios, and fail-closed JSON.
 
 ## 2026-07-11 - SURFACE: prepared ORDER BY/LIMIT bypasses the assigned runtime/storage lane
 
@@ -17795,6 +18945,50 @@ test is on the executed path, not merely linked into it.
 - NET: the 3rd shipped byte-exact codegen win this session, extending the MIN/MAX-via-index family to
   the composite `WHERE a=?` prefix. Diagnostic retained: minmax_prefix_profile.rs.
 
+### 2026-07-25 contract remeasurement — CONFIRMED KEEP at 580.90× MAX / 630.95× MIN
+
+- Allocation adjudication: the Lane-M addendum described
+  `bd-minmax-prefix-seek-4fuo6` as an unclaimed ~800× target, but the tracker,
+  live code, and entry above show that it shipped in `69b7a5d6` on 2026-07-12.
+  This run therefore remeasured the shipped path rather than duplicating the
+  production edit.
+- Command: `RCH_WORKER=vmi1149989 RCH_REQUIRE_REMOTE=1 env -u
+  CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -j7 -p
+  fsqlite --bench minmax_prefix_contract_bench`. The pinned worker admitted
+  seven slots and completed with exit 0. The program's first stdout line
+  self-reported ELF SHA-256
+  `86dcef9cfe33453cd9887e1bc25882d6bf9bfebccd8f75aa9004b791654251bb`
+  and length `20,320,976` bytes. Frozen source SHA-256 was
+  `a576bd0c5827d4f56c2224f431dd3200d20d316a6669225f61c59b1aa0b599c2`
+  for `crates/fsqlite/tests/minmax_prefix_profile.rs` and
+  `41cbbdba27a9c970d5156e6cb9268e9e481c1792d594b10daea9f071e65be2f6`
+  for `crates/fsqlite-vdbe/src/codegen.rs`. The optional in-program source
+  lookup reported `unavailable` because RCH launched the ELF outside the
+  source root; the hashes above were taken from the frozen synced worktree
+  immediately after the invocation.
+- Contract: four independent 20,000-row in-memory fixtures, 20 groups,
+  41 interleaved rounds, min-of-3 sampling, at least 2 ms per arm, and 10,000
+  bootstrap resamples of the per-round median ratio. Each claim used a
+  same-invocation baseline/baseline null before scan/seek. CV and MAD were
+  printed as provenance only; `cv_gate=never`.
+- MAX gate: `NOT INDEXED` scan p50 `4,244.792 us`, composite-index seek p50
+  `7.864 us`; median scan/seek ratio `580.898657×`, bootstrap 95% CI
+  `[564.480228, 631.714692]`. Its A/A ratio median was `1.001640`, 95% CI
+  `[0.986116, 1.014937]` (CV `7.268%`, MAD `0.026828`). `SeekLE` opcode gate
+  passed and both arms returned checksum `d8683176eb525bb9`.
+- MIN gate: `NOT INDEXED` scan p50 `3,897.738 us`, composite-index seek p50
+  `6.195 us`; median scan/seek ratio `630.947384×`, bootstrap 95% CI
+  `[594.184013, 651.490126]`. Its A/A ratio median was `1.011398`, 95% CI
+  `[0.999017, 1.021636]` (CV `9.359%`, MAD `0.029507`). `SeekGE` opcode gate
+  passed and both arms returned checksum `0fefd7e52260439d`.
+- Verdict: both are `CONFIRMED_KEEP` under the campaign rule: each claim CI
+  lies wholly above parity, exceeds twice its own A/A 95%-CI radius, and is
+  well above the 1% minimum effect. Retry only after a change to MIN/MAX
+  codegen, partial-prefix B-tree positioning, or index comparison semantics;
+  require the same opcode/checksum gates and a same-invocation median-CI
+  decision. Never reopen this shipped lever merely because CV exceeds a
+  threshold.
+
 ## 2026-07-11 - NEGATIVE: partial-key SeekLE/SeekGT is O(block) (forward walk), not O(log n) — a codegen value-sentinel fix is byte-exact-UNSAFE; the real fix is a chartered btree biased seek (bd-seek-partial-key-oblock-kwdxa)
 
 - Result type: NEGATIVE / root-caused, no clean one-pass fix. Found while benching the just-shipped
@@ -19514,6 +20708,111 @@ UpperBound, so `index_seek_upper_bound` mis-positions when a value's run spans m
 bead) — likely the interior descent must propagate the UpperBound bias, or the leaf-crossing successor logic
 (cursor.rs:4247) must re-seek. Codegen WIP is correct in shape; unblocking is a btree-cursor fix. Did NOT ship.
 
+## 2026-07-24 - BLOCKER: comprehensive frontier refresh cannot compile after the async `TransactionHandle` migration
+
+- Result type: build blocker before the timed path, not a performance REJECT.
+  The attempted refresh used clean merged HEAD
+  `e4be5aee34f4919fa73071f351f9018d094d9422` and strict remote execution:
+  `RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec
+  -- cargo run -j2 --profile release-perf -p fsqlite-e2e --bin
+  comprehensive-bench -- --quick --json-out
+  tests/artifacts/perf/snowybrook-full-quick-20260724T0200Z.json --no-html`
+  (RCH job `j-29944835100115059`). Worker placement was honored and no local
+  Cargo fallback ran.
+- Failure: `fsqlite-btree` stopped compilation with eight type errors in
+  `crates/fsqlite-btree/src/cursor.rs:385-432`. `TransactionPageIo` implements
+  synchronous `PageReader`/`PageWriter`, but its calls to
+  `TransactionHandle::{get_page,write_page,write_page_data,
+  restore_staged_page_data,allocate_page,free_page}` now return Futures.
+  Representative diagnostics were E0277 (`?` cannot be applied to a Future)
+  and E0308 (expected `Result<...>`, found
+  `impl Future<Output = Result<...>>`).
+- Root cause is the incomplete contract migration in commit `213448b0`
+  (`fix(wal): db-fsync recovery fence before WAL truncate over an async
+  checkpoint target`). That commit changed the `TransactionHandle` methods in
+  `crates/fsqlite-pager/src/traits.rs` from synchronous Results to Futures but
+  did not touch `crates/fsqlite-btree/src/cursor.rs`; later commits through
+  merged HEAD did not bridge or migrate the synchronous B-tree adapter.
+- No artifact, benchmark result, new worst-ratio ranking, or candidate
+  performance claim exists for this attempt. The last admissible frontier
+  artifact remains
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/full-quick.json`
+  from pre-migration source `d2ec37bf`. The consecutive performance-REJECT
+  count therefore remains one; a build blocker is not counted as REJECT #2.
+- This measured-frontier lane did not patch the async architecture. An
+  ad-hoc blocking executor inside `TransactionPageIo` would make
+  cancellation/runtime semantics part of a benchmark-enabling workaround and
+  would cross the separately owned architectural lane. The owning fix must
+  make the B-tree page-I/O contract and async pager contract coherent, with
+  explicit asupersync/cancellation semantics, before performance work resumes.
+- `zz_*_bench.rs` triage refresh: all 29 benches are still present, still
+  declare `EPHEMERAL ... Not for commit`, and remain ignored single-shot
+  `Instant` probes without interleaved null controls, repeated-sample CV, or a
+  general SQLite differential oracle. None became a durable KEEP candidate;
+  the complete preserved filename list and promotion requirements remain in
+  the 2026-07-22 probe-triage entry. The separate
+  `zz_seekgap_probe.rs` is also still present. No probe was edited, committed,
+  archived, or deleted.
+- Retry predicate: first require exact current `origin/main` to pass
+  `RCH_REQUIRE_REMOTE=1 rch exec -- cargo check -p fsqlite-btree` on a remote
+  worker, then require the exact-SHA release-perf comprehensive command above
+  to reach and finish the timed `--quick` matrix. Only then refresh the
+  artifact, re-rank stable rows, and resume one-lever profile/A-B/conformance
+  cycles.
+
+## 2026-07-24 - REJECT/SURFACE: refreshed worst ratio still fails the small-N DELETE retry gate
+
+- Result type: profile-gated lever REJECT with no source mutation. The fresh
+  comprehensive quick artifact is
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/full-quick.json`
+  (SHA-256
+  `d8d6fa76bc0641879b3b97bbb67bfacb4ea43bdd4f50b883596356297e50c534`).
+  It was built and run remotely on `vmi1227854` from exact source commit
+  `d2ec37bf627df1d0351d68b6bfa0f394fd0ae97c` with
+  `RCH_REQUIRE_REMOTE=1 rch exec -- cargo run -j2 --profile release-perf -p
+  fsqlite-e2e --bin comprehensive-bench -- --quick --json-out
+  tests/artifacts/perf/darkbarn-full-quick-20260724T0030Z.json --no-html`.
+  The report's dirty flag is the RCH transfer scratch directory; its recorded
+  source SHA is exact and the release-perf binary is newer than that HEAD.
+- Refresh result: 93 scenarios in 13.382 seconds; 75 FrankenSQLite-faster, 6
+  comparable, 12 C-SQLite-faster; primary category-weighted score
+  `0.4271456883` and geomean ratio `0.3125652025`. The worst raw ratio is again
+  `UPDATE/DELETE Throughput / 100 rows / delete 5 rows`: C `2.354 us`
+  (CV `3.81%`) versus FrankenSQLite `7.902 us` (CV `6.96%`), ratio
+  `3.356839x`.
+- One lever screened: elide/coalesce the retained direct-DELETE run's
+  top-level direct-write flush or explicit-COMMIT boundary. A second
+  same-worker remote profile run used the same release-perf source and
+  `FSQLITE_BENCH_PROFILE_DML=1`, filtered to `update-delete`; its JSON is
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/update-delete-profile.json`
+  (SHA-256
+  `b2bb4fde4541183f9bc41f885445de1622b5c10a6a0386b737ece2a0ac35b6e5`).
+  The target repeated at C `3.696 us` (CV `9.61%`) versus FrankenSQLite
+  `10.166 us` (CV `11.95%`), ratio `2.750541x`. Phase counters showed no
+  dominant removable component: `begin_ns=2163`, `commit_roundtrip_ns=2103`,
+  `delete_seek_ns=1192`, `delete_leaf_flush_ns=2283`, and the complete
+  top-level `direct_flush_ns=2774` (27.3% of the measured F median). This
+  reproduces the 2026-05-10 direct-write-flush-wrapper rejection rather than
+  admitting another wrapper or transaction-control edit.
+- Verdict: rejected before implementation. The row is only `10.166 us`
+  absolute, both focused comparator CVs exceed 5%, and no single removable
+  component clears 30%. Therefore source A/B, null-control, and conformance
+  gates were not entered; inventing a candidate here would violate the
+  profile-first eligibility rule and cross into the architectural MVCC
+  transaction lane.
+- `zz_*` triage refresh: all 30 preserved probe files are still present and
+  still carry their `EPHEMERAL ... Not for commit` marker. None is useful as a
+  durable test as-is; the complete preserved filename list and promotion
+  requirements remain in the 2026-07-22 untracked-probe entry below. No probe
+  was edited, committed, archived, or deleted.
+- Retry predicate: reopen this small-N DELETE family only when a same-worker
+  baseline is stable below 5% CV, exceeds `50 us` absolute, and attributes
+  more than 30% to one correctness-optional component not already rejected in
+  this ledger. Any candidate must then clear an interleaved same-worker A/B
+  with a null control, both variants below 5% CV, at least a 10% target
+  improvement, no 1K/10K DELETE regression, and SQLite differential
+  conformance.
+
 ## 2026-07-22 - KEEP + BLOCKER ROOT-CAUSED: adaptive DISTINCT loose/skip scan lands at 23.5x; the "skip-scan hang" was ResultRow register drain, never the btree (bd-distinct-loose-scan-c8nay)
 
 - Result type: lever KEEP + blocker resolution. Prior state: 2026-07-11 (reverted, hang),
@@ -19679,6 +20978,605 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   least 10% with both variants below 5% CV and no regression in the 1k/10k
   DELETE rows.
 
+## 2026-07-23 - REJECT (misdirected charter): "leader-follower group commit for the compat pager WAL path" (bd-6hgad); the machinery already exists and cannot coalesce in the NORMAL-sync benchmark shape
+
+- Result type: lever REJECT + blocker/premise resolution for bd-6hgad
+  ("wal_group_commits=0 ... group commit machinery never fires; 8w parity row
+  pays 108 solo WAL commits"). The chartered lever was CopperCliff's
+  "leader-follower group commit for the compat pager WAL path" on the premise
+  that the compat path has NO cross-committer group commit.
+- PREMISE DISPROVEN (source read): the compat WAL commit path
+  (`commit_wal_group_commit_with_snapshot`, pager.rs:11019) already implements
+  full leader-follower group commit — a shared per-database `GroupCommitQueue`
+  consolidator (FILLING->FLUSHING->COMPLETE, epoch pipelining, Flusher/Waiter
+  roles via `submit_batch`, waiter takeover via `claim_flusher_vacancy`,
+  cross-batch overlap aborts, durable certificates). BOTH WAL commit call sites
+  (pager.rs:13004 plain, :13440 concurrent/retained) funnel through it. It is
+  not structurally absent.
+- WHY `wal_group_commits=0` (metric wiring, not behavior): the counter the
+  bench prints (`wal_group_commits`) is sourced from
+  `GLOBAL_GROUP_COMMIT_METRICS.record_group_commit`, whose ONLY call site is
+  Native-mode `native_commit.rs:578`. The compat flusher records a DIFFERENT
+  family (`GLOBAL_CONSOLIDATION_METRICS`: groups_flushed, transactions_batched,
+  flusher_commits, waiter_commits). So zero is a native-only counter never
+  incremented on the compat path — not evidence the path never groups.
+- EMPIRICAL (debug binary; FSQLITE_TRACE_GROUP_COMMIT=1 +
+  FSQLITE_WAL_DETAILED_COMMIT_METRICS=1 + FSQLITE_BENCH_PROFILE_CONCURRENT=1,
+  `--filter concurrent`, 2w/4w/8w): 204 group-commit epochs traced; EVERY epoch
+  `batch_size=1`, `members=[single]`, `fsync_seq=0`, `control_mode=conservative`,
+  `fallback_reason=operator_forced`. The machinery FIRES but never COALESCES.
+- ROOT CAUSE of no-coalescing (two independent reasons, either sufficient):
+  (1) `synchronous=NORMAL` => `WalCommitSyncPolicy::Deferred` =>
+  `should_sync_on_commit()` false => NO fsync on commit (fsync_seq=0 confirms).
+  Group commit's entire value is amortizing the expensive fsync across N
+  committers; with no fsync there is nothing to amortize. (2) The benchmark
+  workload is a FEW LARGE transactions (per writer: 1 `BEGIN CONCURRENT` + 1000
+  INSERT + 1 COMMIT), so only ~N commits occur near-simultaneously and the
+  cheap no-fsync flush completes before peers submit into the same FILLING
+  window. Forcing coalescing would require a deliberate arrival-wait (adds
+  latency to every commit) and only helps at high writer counts where
+  FrankenSQLite ALREADY WINS (release artifact cod-fullquick-refresh-20260722:
+  4w 0.90x, 8w 0.42x; the only concurrent LOSS is 2w at 1.22x, the case with
+  the LEAST coalescing opportunity — 2 committers).
+- RETRY PREDICATE: only reconsider a group-commit coalescing lever if the
+  measured workload runs `synchronous=FULL`/`EXTRA` (WalCommitSyncPolicy::
+  PerCommit, real per-commit fsync) AND presents many small concurrent
+  transactions whose commits overlap in wall-clock time, AND a same-worker
+  null-controlled A/B shows the amortized-fsync throughput gain exceeds the
+  added arrival-wait latency at the target writer count with CV<5%. Under
+  NORMAL sync with few large txns, batch_size=1 is optimal, not a defect.
+- SEPARATE (not yet actioned) observation for future levers: every SOLO compat
+  flush still performs certificate-sidecar I/O inside the serialized region
+  (open+backward-scan read via `latest_authorized_durable_certificate_record`,
+  then open+append via `append_durable_certificate_record`, wal_adapter.rs).
+  This is per-commit overhead C SQLite lacks. NOT pursued here: it touches the
+  cross-process durability-publication chain finished today (bd-3wop3.1.3,
+  f190223a) and any in-memory caching of the "latest authorized certificate"
+  must preserve cross-process seed reconciliation (`reconcile_authorized_seed`).
+  Requires release-perf profiling to confirm it is not dwarfed by btree_insert
+  before it is worth the correctness risk.
+- Preflight: `sql_pipeline_candidate_preflight --operation
+  WalGroupCommitEngagement --direction other` => verdict "allowed", zero
+  matched no-retry records. concurrent_mode stays true (untouched).
+
+## 2026-07-23 - CONVERGENCE (no clean lever): comprehensive-bench worst-ratios are now the irreducible MVCC transaction tax on small-N single-threaded writes; the concurrent-writer lane is WON
+
+- Result type: lever-family REJECT + landscape finding. Fresh release-perf
+  `--quick` baseline (14 MB binary built today, `taskset -c 4-11`,
+  Threadripper 5975WX, under heavy shared-host load): the concurrent-writer
+  section — the project's raison d'être — is DECISIVELY WON at every writer
+  count: 2w 0.589x (F 56.2 / C 95.3 ms), 4w 0.562x (F 107 / C 190 ms), 8w
+  0.866x (F 308 / C 355 ms). The 2w 1.22x LOSS seen in the day-old artifact
+  cod-fullquick-refresh-20260722T1800Z is GONE; that artifact's C concurrent
+  medians were ~20x smaller and its 2w row is not reproducible (C concurrent CV
+  here is 15-40%, i.e. file-backed WAL disk noise under load — do NOT A/B the
+  concurrent rows on a loaded host).
+- The remaining worst-ratios are ALL small-N single-threaded `:memory:` write
+  rows, and every one shrinks monotonically as N grows (the fixed-cost
+  signature): DELETE 100/del-5 3.18x, 1000/del-50 1.91x, 10000/del-500 1.24x;
+  INSERT tiny/small 100-row ~1.20x, 10000-row ~1.01x. C wins these because it
+  pays no per-transaction MVCC/safety cost; the amortized-away gap IS that cost.
+- PROFILED both (release-perf, FSQLITE_BENCH_PROFILE_DML / _INSERT):
+  - DELETE 50/1000 (`:memory:`, `direct_delete` fast path): `delete_physical_ns=0`
+    (leaf delete already fully optimized — the ledger's delete_rowid_with_reason
+    micro-levers are all already rejected), the only sizeable delete sub-cost is
+    `delete_seek_ns` ~4.3us/50 = 86 ns/seek (shared B-tree descent, C does the
+    same), rest is begin (2.1us) + commit_roundtrip (3.2us) fixed tax.
+  - INSERT tiny_1col 100/single-txn (F~85 / C~71 us, 14us gap): the gap is the
+    MVCC/safety tax spread across `begin_ns`=2.5us (snapshot/concurrent setup),
+    per-row `change_tracking_ns`=3.1us (MVCC modified-page tracking — REQUIRED
+    for conflict detection), `schema_validation_ns`=3.8us, `memdb_apply_ns`=2.9us,
+    and part of `row_build_ns`=13.9us. No single fat component.
+- Why schema_validation is NOT a lever: `ensure_schema_unchanged*`
+  (connection.rs:5848/5905) is already a minimal cookie+generation integer
+  identity compare (`schema_cookie() != self.schema_cookie`), ~38 ns/insert, not
+  a re-derivation. It is a per-execute safety gate that must run to catch
+  concurrent schema changes; there is nothing to hoist.
+- VERDICT: no fat, un-mined, low-risk lever exists in the small-N write rows.
+  The costs are (a) already minimized, (b) fundamentally required for the
+  concurrent-writer safety guarantees, or (c) heavily mined and rejected (see
+  the 2026-07-10/07-11 prepared-DELETE and rowid-fusion entries, and the
+  2026-07-22 adaptive micro-sampling / prepared-DELETE-batch rejects). The
+  small-N MVCC transaction tax is the PRICE of the concurrent-writer advantage.
+- RETRY PREDICATE: only reopen small-N write optimization if a profiler
+  attributes >30% of a stable (CV<5%, absolute >50us) row to a SINGLE component
+  that is provably not required per-execute for MVCC/SSI correctness, with a
+  same-worker null-controlled A/B clearing the 5% CV gate on a QUIET host.
+  Chasing the 3-4us sub-components individually will not clear noise and risks
+  the concurrent-writer correctness guarantees. Do not A/B concurrent (file-WAL)
+  rows on a loaded host — the disk noise (C CV 15-40%) swamps any engine effect.
+
+## 2026-07-23 - BENCHMARK-INTEGRITY (not a perf lever): the concurrent-writer section compares C-SQLite at synchronous=FULL vs FrankenSQLite at NORMAL — a durability asymmetry that flatters FrankenSQLite; the win must be re-measured at matched sync
+
+- Result type: benchmark fairness finding + charter (bd filed). NOT a perf
+  lever; it corrects the comparison the concurrent-writer claim rests on.
+- OBSERVATION (comprehensive_bench.rs `bench_concurrent_writers`): the C-SQLite
+  writer connections execute only `PRAGMA journal_mode=WAL; PRAGMA
+  busy_timeout=5000;` (line ~3443) and NEVER set `synchronous`. The setup
+  connection sets NORMAL, but `synchronous` is per-connection and does not carry
+  to the writer connections. FrankenSQLite writers explicitly set NORMAL via
+  `apply_pragmas_fsqlite`.
+- EMPIRICAL (build-free, python sqlite3 3.46.1; SQLITE_DEFAULT_SYNCHRONOUS is
+  compile-time-stable at 2=FULL and the repo `.cargo/config` adds only
+  `-DSQLITE_ENABLE_MATH_FUNCTIONS`, no sync override, so rusqlite's bundled
+  libsqlite3-sys 0.38.1 build matches): a fresh connection reports
+  `synchronous=2 (FULL)`, and issuing `PRAGMA journal_mode=WAL` does NOT reduce
+  it. => the concurrent bench's C writers run at FULL = a real WAL fsync on
+  EVERY commit; FrankenSQLite's NORMAL maps to `WalCommitSyncPolicy::Deferred`
+  = NO per-commit fsync (independently confirmed: fsync_seq=0 across 204 traced
+  epochs). The two engines are NOT compared at matched durability.
+- MAGNITUDE (why it matters): in this workload each writer does one COMMIT, so
+  C pays N serialized WAL fsyncs (one per writer) that F pays zero of. On the
+  ext4 `/data/tmp` backing store an fsync is ~1-10 ms; at 8w that is up to tens
+  of ms of pure fsync on C's side alone. The 8w row (F 308 / C 355 ms) could
+  narrow substantially — possibly to parity — once C is set to NORMAL. So the
+  reported concurrent win (2w 0.59x / 4w 0.56x / 8w 0.87x) OVERSTATES the
+  MVCC-parallelism advantage by an unquantified sync-mode component.
+- INSTRUMENT ADDED (uncommitted, default-inert): `concurrent_sync_override()`
+  gated on `FSQLITE_BENCH_CONCURRENT_SYNC` (unset => exact historical baseline;
+  `normal`/`full` => force BOTH engines' writer connections to that identical
+  mode). This enables (a) the fair re-measurement at matched NORMAL and (b) a
+  matched-FULL probe of whether FrankenSQLite group commit amortizes fsyncs
+  across concurrent committers (the real MVCC value proposition, and the retry
+  predicate for the bd-6hgad group-commit lever above).
+- BLOCKER: the release-perf LTO relink was SIGTERM-killed on the rch fleet 3x
+  (exit 143 at the link stage on vmi1149989/vmi1153651/hz1), so the matched-sync
+  A/B could not be run at KEEP quality this session. The finding stands on the
+  code+python evidence; the quantification is filed as a bead.
+- RECOMMENDATION: set the C writer connections to `synchronous=NORMAL` to match
+  intent + FrankenSQLite + the SQLite-recommended WAL default, then RE-MEASURE
+  and honestly restate the concurrent-writer numbers. If FrankenSQLite still
+  wins at matched NORMAL, the claim is clean; if the win shrinks, the README's
+  concurrent-writer numbers need correction per the doc-invariant rules. Also
+  add a matched-FULL row so the durability-serious comparison is on record.
+  Do not "fix" this by lowering C to NORMAL silently and keeping the old
+  numbers — the corrected numbers must be published.
+- QUANTIFIED (debug binary via the `FSQLITE_BENCH_CONCURRENT_SYNC` instrument;
+  C arm is release-compiled bundled libsqlite3-sys so C times are VALID, F debug
+  times ignored). Three configs, `--filter concurrent`, `taskset -c 4-11`, under
+  shared-host load (4w/8w C-normal CV was 105%/20% — noise-wrecked, inconclusive;
+  only the 2w comparison is clean at CV 2.9/5.6/4.8%):
+    * 2w C-default(implicit FULL) 134.0 ms vs C-normal 86.1 ms vs C-full 100.4 ms
+      => C-NORMAL is ~36% faster than C-FULL (norm/def = 0.643). The per-commit
+      WAL fsync is a real, large cost for C at low writer counts, and C-default
+      tracks C-full (both FULL), proving the default is indeed FULL.
+    * Combined with the release baseline (2w F 56.2 / C-default 95.3 ms = 0.59x):
+      a fair 2w C-normal ~= 95.3 * 0.64 ~= 61 ms, so F 56 vs C 61 ~= 0.92x — the
+      headline 1.7x (0.59x) win COLLAPSES to ~1.09x (near parity) once C is set
+      to the same NORMAL durability. 4w/8w fair ratios are unquantified (noise)
+      but 8w was already only 0.87x, so matched sync could flip it to a LOSS.
+- COALESCING PROBE (config 3, both FULL, FSQLITE_TRACE_GROUP_COMMIT=1): real
+  fsyncs confirmed on the FrankenSQLite side (max fsync_seq=168, i.e. PerCommit
+  sync active), yet ALL 204 group-commit epochs are batch_size=1, members=[1].
+  => Even under FULL sync, where the fsync lengthens the flush window, the
+  group-commit consolidator NEVER coalesces for this workload. This closes the
+  bd-6hgad retry predicate's second leg: the batching lever cannot help the
+  concurrent bench regardless of sync mode, because each writer issues exactly
+  ONE commit (1 BEGIN CONCURRENT + 1000 INSERT + 1 COMMIT) so commits never
+  overlap in the FILLING window. Under matched FULL, FrankenSQLite therefore
+  pays N serialized SOLO fsyncs just like C, with no amortization edge, plus its
+  MVCC overhead — a likely LOSS or tie, not a win.
+- BOTTOM LINE: the reported concurrent-writer advantage is substantially a
+  synchronous-mode artifact (C-FULL vs F-NORMAL), not pure MVCC parallelism. The
+  MVCC-parallelism benefit is real but modest and must be re-measured at matched
+  sync on a QUIET host with a release-perf binary before any concurrent-writer
+  speed claim is published. Group-commit coalescing cannot widen the gap for the
+  current few-large-txns workload; a many-small-overlapping-txns workload (e.g.
+  OLTP: many short transactions per connection) is required to exercise it, and
+  is the correct shape for both the fsync-amortization claim and any future
+  group-commit lever. See bd-x5gzk (fairness) and bd-6hgad (group commit).
+- ALL-THREAD-COUNT QUANTIFICATION (2026-07-23, quieter host load ~14; debug
+  binary, C arm release-compiled => C times valid). C-side default(implicit
+  FULL) vs `FSQLITE_BENCH_CONCURRENT_SYNC=normal`: 2w 138.0->105.6 ms (0.765,
+  CV 1.9/6.8); 4w 183.6->132.4 ms (0.721, CV 9.1/16.0); 8w 267.3->215.2 ms
+  (0.805, CV 8.8/14.2). The per-commit WAL fsync inflates C's time ~20-28% at
+  every writer count. Applying these ratios to the release baseline C-default
+  (2w 95 / 4w 190 / 8w 355 ms) against release F (2w 56 / 4w 107 / 8w 308 ms)
+  gives the FAIR (matched-NORMAL) estimate: 2w 0.77x, 4w 0.78x, 8w 1.08x. So the
+  buggy-bench win (2w 0.59x / 4w 0.56x / 8w 0.87x) shrinks to ~1.3x at 2-4w and
+  the 8w row FLIPS from a 0.87x win to a ~1.08x LOSS. Fair concurrent geomean
+  ~0.87x (~1.15x faster) vs the buggy ~0.77x (README line 1230's "1.30x
+  faster"). This IS the correction README line 1230 needs; the mt-mvcc-bench
+  headline rows (README 1240-1253) are already fair and unaffected. Precise
+  release-quality fair F/C ratios still want a genuinely-quiet host (a 3-way
+  local release build storm and file-WAL disk noise cap the F-side precision
+  here); the qualitative conclusion (win shrinks ~20-28%, 8w -> parity/loss) is
+  robust and sufficient to act on the README correction.
+- HONESTY CORRECTION (2026-07-23, later): the definitive release-perf run on a
+  genuinely QUIET host (load 8, zero competing builds, taskset 8-23) REFUTES the
+  precision of the estimate above. Three concurrent runs: DEFAULT(C=FULL) F/C
+  2w 0.595 / 4w 0.694 / 8w 0.987; =NORMAL(fair) 2w 0.464 / 4w 0.805 / 8w 1.184;
+  DEFAULT#2 2w 0.531 / 4w 0.545 / 8w 0.723. The two DEFAULT runs disagree by
+  20-35%, 8w C-FULL hit CV=104%, and DECISIVELY the =NORMAL C-2w median
+  (124.8 ms) came out SLOWER than C-FULL-2w (95.2 ms) — impossible from sync
+  mode alone (NORMAL is strictly less work than FULL), which proves run-to-run
+  disk/scheduling noise (C median spread ~95-138 ms) SWAMPS the ~20-28% fsync
+  effect. So the comprehensive_bench concurrent (file-WAL) section CANNOT
+  cleanly quantify the sync magnitude on this shared host even at load 8; the
+  "~24% at 2w / fair estimate 0.77x/1.08x" above was a lucky-clean debug sample,
+  NOT reproducible — treat it as noise-level, not a measurement. F is stable
+  across runs (2w ~57 / 4w ~106 / 8w ~308 ms); it is C that is wildly variable.
+  WHAT SURVIVES: (a) the sync asymmetry is real (code + python, not a
+  measurement); (b) FIX = add `synchronous=NORMAL` to the C writer connections
+  to match mt_mvcc_bench; (c) do NOT publish any "fair number" from
+  comprehensive_bench concurrent — it is unreliable; cite mt_mvcc_bench (fair,
+  higher-iteration) for the honest concurrent-writer story; (d) README line 1230
+  ("1.30x faster in the full-quick mix") is both unfair AND unreliable — replace
+  it with a caveat that defers to the mt-mvcc-bench section rather than any
+  comprehensive_bench concurrent number.
+- LANDED (2026-07-25, commit on `main`): all three surviving items are now done.
+  (b) `bench_concurrent_writers`' C writer connections set
+  `PRAGMA synchronous=NORMAL` alongside `journal_mode=WAL` +
+  `busy_timeout=5000`, with an inline comment stating that `synchronous` is
+  per-connection so the setup connection's NORMAL does not carry. The
+  `FSQLITE_BENCH_CONCURRENT_SYNC` override survives and now selects WHICH matched
+  level (`normal`/`full`) both engines run at rather than repairing an unmatched
+  default. The section's report description states the matched-durability
+  contract and carries the disk-noise warning inline, so the caveat travels with
+  every generated HTML/JSON report instead of living only in the README.
+  (c)+(d) README's `concurrent_writers` category row is reduced to "do not cite"
+  and is followed by a blockquote naming BOTH defects (unmatched sync in the
+  measured artifact, plus irreducible file-WAL disk noise), stating explicitly
+  that no corrected ratio is published because none can be reliably measured from
+  this section, and deferring the concurrent-writer claim to `mt-mvcc-bench`.
+- DO NOT RETRY (this is the point of the entry): re-running
+  `comprehensive_bench --filter concurrent` to "get the fair number" is a known
+  dead end on a shared host. It has now been attempted at debug quality, at
+  release-perf quality on a quiet host (load 8, taskset, zero competing builds),
+  and across three configs; the C-side run-to-run spread (95-138 ms at 2w) is
+  larger than the ~20-28 % fsync effect, and one =NORMAL run came out SLOWER than
+  its =FULL counterpart — impossible from sync mode alone, hence noise. The
+  landed fix makes the DEFAULT comparison honest; it does not make this section
+  precise, and no amount of re-running will. Retry predicate: a dedicated
+  quiet-disk host (or tmpfs-backed WAL, which changes the workload) AND a
+  higher-iteration harness — at which point `mt_mvcc_bench` is the better vehicle
+  anyway. For the group-commit angle see bd-6hgad (closed wontfix) and bd-acuhw
+  (OLTP-shaped concurrent section, the only shape that can coalesce).
+
+## 2026-07-23 - PROFILE + DIRECTION (bd-smxhz): concurrent-writer separate-tables scaling collapses under disk contention; root cause is a FrankenSQLite-specific per-commit file-open storm; lever = VFS fd caching
+
+- Result type: profiling finding + chartered lever direction (NOT a reject; a
+  high-value lever handed off because implementation is major + A/B-blocked).
+- SYMPTOM (mt-mvcc-bench at HEAD, release-perf, /data/tmp ext4 shared host with
+  competing builds): SEPARATE-TABLES (250 rows/thread) F/C throughput was 2.6x
+  (1w) / 2.0x (2-4w) / 3.0-3.3x (8w) across two runs, F wps ~23k->53k (nearly
+  FLAT with thread count) — vs README's quiet-dedicated-host 1w 0.42x / 4w 7.66x
+  / 8w 40.99x (F 264k->1022k wps). SHARED-TABLE 8w was CLOSE (mine 3.73x vs
+  README 3.42x). The parallelism advantage collapses 40x -> 3x under contention.
+- DISCRIMINATOR (rules out uniform slow hardware): at 8w separate-tables my C
+  (15.9k wps) is only ~1.5x below README C (24k), while my F (~30-53k) is
+  ~20-35x below README F (1022k). Slow hardware would scale C and F together;
+  it doesn't => the collapse is F-SPECIFIC.
+- ROOT CAUSE (strace openat, tiny 8w/200-row/1-iter separate-tables run, 843
+  total openat): FrankenSQLite does a per-commit/op FILE-OPEN STORM C SQLite
+  lacks — main DB reopened 270x (~17/commit), -wal 147x (~9/commit), -wal-cert
+  (durable certificate sidecar) 31x (~2/commit), plus -fsqlite-ns-gate /
+  -fsqlite-ns-use cross-process namespace lock files 95x each (BOOTSTRAP: begin()
+  is per-CONNECTION-open at pager.rs:8065, ~12 opens/conn across open-phases, not
+  per-commit — acceptable). Every openat/close is a metadata syscall: ~free on a
+  quiet fast disk (README => 40.99x) but serialized under contention, so all
+  writers block on file metadata ops regardless of separate tables.
+- LEVER (direction; NOT implemented — major + correctness-sensitive + A/B needs a
+  quiet host): VFS-level file-descriptor CACHING / persistent handles for the DB
+  + WAL + certificate sidecar across a connection's commits, eliminating the
+  per-commit open/close churn. Touches the unsafe fsqlite-vfs crate + pager;
+  file-locking + durability semantics may depend on some open/close cycles, so it
+  must preserve them (and the certificate read cache must preserve cross-process
+  reconcile_authorized_seed). Steps: (1) add flush-critical-section syscall
+  timing to attribute DB-reopen vs WAL vs sidecar; (2) design the fd cache; (3)
+  same-worker A/B on a genuinely quiet host.
+- IMPLICATION for README: the mt-mvcc-bench 40.99x is a BEST-CASE quiet-fast-disk
+  number; it should be caveated as disk-speed/contention-sensitive. The honest
+  concurrent-writer story is environment-dependent — big win on fast quiet
+  storage, ~3x under contention.
+- CANNOT distinguish "regression since README" from "environment" without the
+  README's exact host; the C-vs-F asymmetry strongly implicates F's commit-path
+  I/O regardless. Preflight ConcurrentCommitPathDiskIO=allowed. concurrent_mode
+  stays true.
+- PRECISE ROOT CAUSE (addendum): the 270 DB reopens are dominated by 222 opens
+  with flags `O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC` — these are FILE-IDENTITY
+  PROBES, not I/O. `validate_path_identity` (namespace.rs:238) does
+  open_identity_probe -> open(O_NOFOLLOW|O_NONBLOCK) + FileIdentity::from_file
+  (fstat dev/inode) + close, to verify the DB file was not substituted. It runs
+  at EVERY operation boundary: `ensure_current_wal_path` (wal_adapter.rs:1598,
+  starting ~every WAL op) and `validate_namespace_binding` (pager.rs:6381, ~9
+  pager boundaries incl. commit 12762/13734). A commit doing N WAL ops re-probes
+  N times. This is a DELIBERATE TOCTOU security feature (commit 1136c171
+  "fix(vfs): bind native database namespaces to stable identities"), NOT
+  runtime-disable-able. C SQLite holds ONE fd per connection; the held inode
+  guarantees identity with zero per-op syscalls. FIX (preserves security): hold
+  the DB+WAL fd across a connection's operations — the held inode IS the identity
+  guarantee, so per-op path re-probing AND the reopen churn both vanish. Major
+  fsqlite-vfs change touching deliberately-added security machinery; needs design
+  review + quiet-host A/B. Cheaper interim (probe once/txn not once/op) weakens
+  the TOCTOU window and needs security sign-off — do not do it unilaterally.
+
+## 2026-07-23 - KEEP (conformance-gated, no perf A/B needed): extend DISTINCT loose/skip scan AND COUNT(DISTINCT) index walk to COMPOSITE indexes whose LEADING term is the target column
+
+- Result type: coverage-extension KEEP. Broadens two already-proven fast paths
+  — the `SELECT DISTINCT <col>` loose/skip scan (bd-distinct-loose-scan-c8nay,
+  23.5x vs sorter) and the `COUNT(DISTINCT <col>)` index walk
+  (bd-count-distinct-index-walk, vs full-scan dedup) — from single-column-only
+  to ANY index whose LEADING key term is the target column in ASC BINARY order.
+- CHANGE (codegen.rs): `distinct_loose_scan_plan` (~11282) and
+  `count_distinct_index_walk_plan` (~10529) previously gated on
+  `idx.key_term_count() == 1`. Relaxed to `>= 1` while keeping the term-0 checks
+  (leading column-name match, `!key_term_descending(0)`, `key_term_collation(0)`
+  BINARY), and switched `find(..)` -> `filter(..).min_by_key(key_term_count)` so
+  the NARROWEST qualifying index is chosen (preserves the historical
+  single-column pick when one exists).
+- WHY SAFE: both codegens read ONLY index Column 0, and the loose scan probes
+  with a 1-field prefix `[value]`, so entries sharing the leading value
+  (whatever the trailing terms) are cleared/counted identically to a
+  single-column index. `supports_direct_column_lookup()` (`where_clause.is_none()`
+  + `columns.len() == key_term_count()`) still excludes partial (WHERE) and
+  expression indexes => the chosen index has full plain-column coverage. Only
+  the leading term's ASC+BINARY governs; a trailing DESC term does NOT
+  disqualify (explicitly tested).
+- GATE (deterministic; no perf A/B because it extends already-proven fast
+  paths): byte-exact vs rusqlite. distinct_loose_scan_oracle +1 test
+  (composite int, composite text, `(a ASC, b DESC)`, both-single-and-composite
+  narrowest-pick); count_distinct_index_walk_oracle +1 test (composite-only
+  `(a,b)`/`(c,b)`, trailing-DESC `(a ASC,b DESC)`). All 8 tests in both oracles
+  PASS. EXPLAIN opcode gates confirm the FAST PATH fires: no `SorterOpen` for
+  the loose scan; the COMPOSITE index (not the base table) is walked for
+  COUNT(DISTINCT). No regression: the pre-existing "shadow schema" test still
+  picks the single-column index via min_by_key. fmt clean; `clippy -p
+  fsqlite-vdbe --lib -- -D warnings` clean.
+- PERF: composite-case magnitude NOT separately benched — the benefit is
+  INHERITED (composite DISTINCT/COUNT-DISTINCT now uses the loose scan / index
+  walk instead of the sorter / full-scan dedup, verified by the fast-path-fires
+  EXPLAIN assertions). Do NOT claim a specific N-x for composite without a
+  dedicated same-worker bench; the honest claim is "now served by the proven
+  fast path instead of the fallback."
+- Preflight DistinctLooseScanCompositeIndex=allowed. Files: codegen.rs,
+  distinct_loose_scan_oracle.rs, count_distinct_index_walk_oracle.rs.
+- ENV NOTE (unrelated to this change): `cargo clippy -p fsqlite -p fsqlite-vdbe
+  --all-targets` failed with `unresolved import io_uring` in fsqlite-vfs on the
+  rch worker (a target enabled by --all-targets pulls the io_uring feature which
+  did not resolve there); the normal `-p fsqlite` test build of the full stack
+  compiled cleanly and both oracles ran. Pre-existing/environmental, in a crate
+  this change does not touch.
+
+## 2026-07-23 - KEEP (conformance-gated): extend the DISTINCT loose/skip scan to MULTI-COLUMN `SELECT DISTINCT a, b, …` over a leading-prefix index
+
+- Result type: coverage-extension KEEP, building on the single-column composite
+  KEEP above. `SELECT DISTINCT a, b, …` (N plain BINARY columns in SELECT order)
+  is now served by the loose/skip scan whenever an index's LEADING N key terms
+  are exactly those columns in that order (each ASC BINARY) — instead of the
+  dedup sorter. Work scales with the number of distinct N-tuples, not rows.
+- CHANGE (codegen.rs): `distinct_loose_scan_plan` now collects all output column
+  names (each plain, non-generated, BINARY) and matches them to an index's
+  leading N terms via `(0..n).all(...)` (name-in-order + `!key_term_descending(i)`
+  + BINARY collation), still `min_by_key(key_term_count)` for the narrowest
+  index; `DistinctLooseScan` carries `key_col_count`. `codegen_select_distinct_
+  loose_scan` generalized from 1 to N: reads index columns 0..N-1 into
+  contiguous `out_regs`, `alloc_regs(n)` for the probe + cur blocks, N `Copy`s
+  BEFORE `ResultRow` (drain-safe), the adaptive Next probe does N `Column` reads
+  + N `Ne` checks (NULLEQ 0x80 + BINARY; a change on ANY column jumps back to
+  emit), and an N-field `MakeRecord` + `SeekGT` skips the whole leading-tuple
+  run. n=1 reproduces the original single-column emitter exactly.
+- WHY BYTE-EXACT (the risk that did NOT materialize): for `SELECT DISTINCT
+  <prefix cols>` over a covering index, C SQLite walks the same index and emits
+  the distinct tuples in index order; the skip scan emits the same tuples in the
+  same order (just skipping duplicates faster). Restricting to output-columns =
+  index-leading-prefix IN ORDER keeps the emit order identical; reversed /
+  non-prefix orders DECLINE to the sorter (verified). The N-field prefix probe
+  `[v0..vN-1]` clears all entries sharing that leading tuple via the same
+  UpperBound-bias shorter-prefix rule as the 1-field case.
+- GATE (deterministic): byte-exact vs rusqlite. distinct_loose_scan_oracle +1
+  test (2-col int with NULLs in each column; 2-col DISTINCT as a prefix of a
+  3-term index (a,b,c); TEXT+INT 2-col; `ORDER BY a,b` byte-exact) plus a
+  DECLINE control (`DISTINCT b, a` reversed => SorterOpen fires, set-equal). All
+  5 loose-scan oracle tests pass, no hang (1.04s), no regression (single-column
+  + composite tests still pass). fmt clean; `clippy -p fsqlite-vdbe --lib -D
+  warnings` clean.
+- PERF: multi-column magnitude NOT separately benched; benefit inherited (uses
+  the proven skip scan instead of the dedup sorter, verified by the no-SorterOpen
+  EXPLAIN gate). Common shape now accelerated: `CREATE INDEX ix ON t(a, b);
+  SELECT DISTINCT a, b`.
+- Preflight DistinctLooseScanCompositeIndex=allowed (same lane). Files:
+  codegen.rs, distinct_loose_scan_oracle.rs. See bd-azfqc.
+
+## 2026-07-23 - KEEP (conformance-gated): pure range on the LEADING term of a composite-only index now SEEKS instead of full-scanning (bd-bn45n)
+
+- Result type: full-scan -> index-seek KEEP. `WHERE a <range>` (pure range on
+  the leading key term, no equality prefix) over a composite-only `index(a, …)`
+  (no single-column `index(a)`) previously fell all the way back to a full table
+  scan; it now uses the composite index prefix-range seek. Equality
+  (`WHERE a = x`) already index-seeked — this closes the range gap.
+- EVIDENCE of the gap (EXPLAIN probe, idx_ab(a,b) only): `WHERE a < 5` emitted
+  `Init,Transaction,OpenRead,Rewind,Column,…,Ge,…,Next` — a full table scan (no
+  index OpenRead/SeekGE); `WHERE a = 5` emitted `MakeRecord,OpenRead,SeekGE,
+  IdxGT,IdxRowid` — an index seek. Root cause: the single-column range fast path
+  gates on `key_term_count()==1` (declines composite) AND
+  `composite_index_prefix_range_target` required a NON-empty equality prefix
+  (`if prefix_exprs.is_empty() { continue; }`), so a pure leading-term range
+  matched neither path.
+- CHANGE (codegen.rs, 2 edits): (1) `composite_index_prefix_range_target` now
+  allows an EMPTY equality prefix — the existing `else` branch computes the range
+  on `columns[0]`, the residual guard still rejects any conjunct that doesn't pin
+  the (empty) prefix or the leading range, and `index_range_fast_path_is_safe`
+  still gates affinity. (2) `codegen_select_composite_index_prefix_range_scan`
+  skips the prefix-change `IdxGT` when `prefix_len==0` (a zero-column IdxGT is a
+  degenerate no-op); the SeekGE lower anchor + the `Gt`/`Ge` range-upper check
+  alone terminate the walk. `IdxRowid` reads the rowid position-independently.
+- WHY SAFE: ORDER BY is AUTO-DECLINED for the empty-prefix shape —
+  `composite_order_by_satisfied` requires `prefix_len + 1 == key_term_count()`
+  (range on the LAST term), which `0 + 1 == 2` fails on a >=2-term index, so any
+  ORDER BY falls to the sorter (no order-divergence risk, unlike a naive range
+  extension). NULLs in the leading term are excluded by the no-lower-bound
+  `IsNull -> skip` path, matching C SQLite (`a <op> x` is false for NULL).
+  Composite-only (`key_terms >= 2`) so single-column indexes are untouched.
+- GATE (deterministic): byte-exact vs rusqlite (sorted set — no ORDER BY, so
+  emission order is implementation-defined). composite_prefix_range_residual_
+  oracle +1 test `composite_pure_leading_range_matches_sqlite`: `< <= > >=
+  BETWEEN` and two-sided ranges, a NULL run in `a`, covering (a,b) and
+  non-covering (id,c) output, and a non-key residual (`c=1`) that must decline to
+  a scan. EXPLAIN asserts SeekGE fires (not full scan) and NO prefix IdxGT for
+  the empty-prefix seek. All pass; the pre-existing equality-prefix residual test
+  still passes; golden_bytecode_snapshots 8/8 (no drift); clippy -p fsqlite-vdbe
+  --lib -D warnings clean; fmt clean.
+- PERF: magnitude not separately benched; the win is structural (full scan
+  O(rows) -> index seek O(log n + matches) for a selective leading-term range).
+  Common shape: `CREATE INDEX ix ON t(category, created_at); SELECT … WHERE
+  category < X` / `created_at BETWEEN …` on the leading term.
+- FOLLOW-UP (not done): the ORDER-BY-satisfying composite leading-range (stream
+  (a,b,rowid) satisfies `ORDER BY a` but not `ORDER BY a, rowid`) is left to the
+  sorter; wiring a sorter-eliding ordered form would need a stricter
+  order-satisfaction check for the empty-prefix case. Preflight
+  CompositeRangeIndexSeek=allowed. Files: codegen.rs,
+  composite_prefix_range_residual_oracle.rs. See bd-bn45n.
+
+## 2026-07-24 - KEEP: MySQL-style skip scan for `WHERE b = <const>` on a 2-col index (bd-nax2y approach B) + surfaced/fixed a bf19adc0 composite-range regression
+
+- LEVER: a `SELECT <cols> FROM t WHERE b = <const>` where `b` is the SECOND term
+  of a 2-column ASC BINARY index whose LEADING term is unconstrained (and no
+  single-column index on `b` exists — that declines so a normal equality seek
+  wins) was full-scanning. Now `skip_scan_eq_target` detects the shape and
+  `codegen_select_skip_scan` enumerates distinct leading values (SeekGT past each
+  leading run) and per value seeks the `(leading, const)` run.
+- PERF-SAFETY WITHOUT STATS: an adaptive walk probes `SKIP_SCAN_WALK_PROBES` (3)
+  `Next`s before paying a root-to-leaf `SeekGE(leading, const, i64::MIN)`, so a
+  near-unique leading column degrades to a full index WALK (at-worst == full
+  scan, no high-cardinality regression). No planner/stats dependency (mirrors the
+  DISTINCT loose-scan adaptive-Next idiom).
+- TWO BUGS FOUND + FIXED DURING IMPL (both cost real cycles):
+  (1) COMPARISON-OPCODE OPERAND ORDER. `emit_jump_to_label(OP, p1, p3, label)`
+  jumps when `reg[P3] OP reg[P1]` — p3 is the LEFT operand. The directional `Gt`
+  that advances past a block on `a > const` must be emitted `Gt(const_reg,
+  a_reg)`, NOT `Gt(a_reg, const_reg)` (which tests `const > a` == `a < const`, so
+  it advanced past every block on its first sub-const row and the seek path never
+  ran; multi-row runs returned empty). BOTH the outer and the walk-copy sites
+  needed it; a `replace_all` on the 8-space walk line missed the 4-space outer
+  line — verify indentation when replace_all touches "identical" lines. NULL
+  leading values MASKED the bug (NULL comparisons never jump), and blocks whose
+  min-`a` == const were caught by the symmetric `Eq` before the bad `Gt`, so 3/5
+  oracle cases passed while the seek was totally dead. Diagnosed by dumping
+  EXPLAIN bytecode + an engine-side eprintln on the index seek opcodes (only
+  `SeekGT` ever fired — `SeekGE` was never reached).
+  (2) The `SeekGE(x, const, MIN)` probe is a FULL 3-field key with an `i64::MIN`
+  rowid sentinel (this engine pads a SHORT seek probe toward the HIGH end, which
+  is why the 1-field `SeekGT` advance correctly lands past the whole `(x,*)` run;
+  a bare 2-field probe would overshoot the run).
+- SURFACED + FIXED A bf19adc0 REGRESSION (found via this feature's conformance
+  sweep, not its own tests): the empty-prefix composite leading-range
+  (`composite_index_prefix_range_target`, bd-bn45n) seeked the WIDER composite
+  `idx_ab` for `WHERE a <range>` even when a narrower single-column `idx_a` was
+  declared — undoing bd-agg-range-shadowed-index for the non-aggregate path
+  (results correct; only the opcode-gate `opens idx_a` failed). FIX: when
+  `range_pos == 0` (empty prefix), decline the composite if a usable single-column
+  ascending index on the leading column exists (criteria mirror the single-col
+  range planner VERBATIM so we never decline into a full-table scan). bd-bn45n's
+  own composite-ONLY tests still seek the composite (guard inert without idx_a).
+- GATE (deterministic): byte-exact vs rusqlite (sorted set — no ORDER BY).
+  skip_scan_oracle (5 tests): low/high-cardinality leading columns (seek vs walk
+  paths), NULLs in both columns, covering + non-covering output, TEXT + long
+  duplicate runs, empty/all-same/all-null/single edges, and the decline controls
+  (single-col index on target; leading-column constraint). Full 56-oracle
+  conformance sweep GREEN (118 result binaries, 0 failed) — no other regression.
+  golden_bytecode_snapshots 8/8 (no drift); clippy -p fsqlite-vdbe --lib -D
+  warnings clean; fmt clean.
+- FOLLOW-UP (bd-nax2y remaining scope, NOT this cut): range / IN / BETWEEN on the
+  2nd column, >2-col indexes, DESC/collation, ORDER BY streaming. Preflight
+  SkipScanNonLeadingTerm=allowed. Files: codegen.rs, skip_scan_oracle.rs. Memory:
+  [[vdbe-comparison-opcode-operand-order]].
+
+### 2026-07-24 addendum — skip scan extended (same KEEP, bd-nax2y): >2-column indexes + inclusive-lower RANGE
+
+- >2-COLUMN (commit bdb4a596): `WHERE b = <const>` on `idx(a, b, c, …)` (b the 2nd term) now fires,
+  not just 2-col. Probe fills trailing KEY terms with NULL (sorts before every value → lands on the
+  FIRST `(a, const, …)`; a MIN integer skips past `(…, NULL, …)` rows) and the rowid slot with
+  `i64::MIN`. Bug found+fixed: initially used MIN for trailing key cols → dropped every trailing-NULL
+  row. 2-col path byte-identical (empty trailing loop).
+- RANGE (commit f5138ff6): `WHERE b <range>` with an INCLUSIVE lower (optional upper) — `>=`,
+  `BETWEEN`, `>= AND <`. Separate `skip_scan_range_target` (residual-safe: EVERY conjunct must be a
+  bound on the target) + `codegen_select_skip_scan_range`, leaving the equality path untouched.
+  Per-entry classified by `emit_skip_scan_range_decision` (above upper → advance; in range → emit;
+  below/NULL → walk); seek anchors `(x, lo, NULL…, -inf)`. PASSED conformance first try (comparisons
+  grounded in the composite prefix+range operand order + [[vdbe-comparison-opcode-operand-order]]).
+- GATE: skip_scan_oracle 9 tests (2-col eq, >2-col eq, 3 range, decline controls); golden 8/8; clippy
+  clean; FULL 56-oracle sweep GREEN (batched --jobs 4 to dodge the parallel-link OOM,
+  [[rch-parallel-link-oom-bus-error]]).
+- STILL DEFERRED (fall to a correct scan, not this cycle): exclusive lower `>` (needs a post-seek skip
+  of the `==lo` run), no-lower `<`/`<=` (needs a NULL-run walk; seeking to NULL would loop), IN-list,
+  ORDER BY streaming, DESC/non-BINARY.
+
+### 2026-07-24 addendum 2 — skip-scan RANGE coverage completed (bd-nax2y)
+
+- Exclusive lower `> k` (commit 5270ac80): a 2-field `SeekGT(x, lo)` lands past the whole `(x, lo, *)`
+  run on the first `b > lo` (engine UpperBound bias: shorter equal-prefix probe sorts less-than). No
+  post-seek skip loop.
+- No-lower `< k` / `<= k` (commit 1e10f770): no seekable lower, so each block is walked from its start
+  by an unbounded null-skip loop (NULLs sort first + excluded → the only sub-range values); the required
+  upper bound terminates the run, `SeekGT` still skips leading values. `NotNull(a) → emit_run` classifies.
+- Skip scan is now COMPREHENSIVE for the WHERE shape: equality (any-arity ASC BINARY index) + range
+  (inclusive/exclusive lower, no-lower, optional inclusive/exclusive upper). All passed conformance FIRST
+  try (comparisons grounded in the composite operand order + [[vdbe-comparison-opcode-operand-order]]).
+- GATE (whole cycle): skip_scan_oracle 9 tests; golden 8/8; clippy clean; FULL 56-oracle sweep GREEN
+  (batched --jobs 4, [[rch-parallel-link-oom-bus-error]]).
+- STILL DEFERRED (each falls to a correct scan; ledgered as next levers, none proven infeasible):
+  * ORDER BY streaming — the emission is already `leading ASC(NULLs first), second ASC, rowid ASC`, so
+    no emitter change is needed; only an order-satisfaction check + relaxing the `order_by.is_empty()`
+    gate. Deferred for ordering-correctness subtlety (collation / NULLS / the b-constant equality case),
+    not complexity. Reference: `range_order_by_is_deterministic` / `fixed_order_by_equality_prefix_len`.
+  * IN-list `b IN (…)` — needs a nested loop (distinct leading × IN values).
+  * DESC / non-BINARY collation index — needs reverse iteration.
+- FRONTIER note (worst-ratio comprehensive-bench, now sole-producer): the worst ratio is small-N DELETE
+  (`delete 5 rows / 100 rows`, C 2.354us vs F 7.902us, 3.36x), already REJECTED by cod on 2026-07-24 —
+  MVCC per-txn `begin_ns`+`commit_roundtrip_ns` dominate (~42%) with NO single removable component ≥30%
+  and CVs >5%; reducing it crosses into the security-sensitive MVCC/identity-probe lane (commit
+  1136c171). Retry predicate unmet (needs a same-worker improvement signal on a quiet host). Frontier
+  stays REJECT-gated; the architectural skip-scan lane carried this cycle.
+
+## 2026-07-24 - BLOCKER (frontier, sole-producer confirm): every comprehensive-bench loser is WRITE-side + host too noisy for a KEEP-quality A/B
+
+- Analyzed the refreshed `cod-fullquick-refresh-20260724T0030Z/full-quick.json` (93 scenarios).
+  ALL 10 scenarios where FrankenSQLite is slower than C SQLite (`ratio_fsqlite_over_csqlite > 1.12`)
+  are WRITE-side; there are ZERO read/query losers — FrankenSQLite BEATS C SQLite on every SELECT
+  workload (the skip-scan / read lane is won, not a frontier):
+  * write_single (DELETE/UPDATE): delete-5/100 3.36x, delete-50/1000 2.00x, delete-500/10000 1.80x,
+    update-10/100 1.44x, update-100/1000 1.35x.
+  * write_bulk (INSERT): large-10col 1000-row 1.50x, large-10col 10000-row 1.29x, small-3col batched
+    1.27x, small-3col autocommit 1.18x, tiny-1col 100-row 1.15x.
+- ROOT SHAPE: two write costs. (a) small-N DELETE/UPDATE — dominated by MVCC per-transaction
+  begin_ns+commit_roundtrip_ns (~42%, cod's 2026-07-24 REJECT); (b) single-transaction BULK INSERT
+  (large-10col) — per-ROW cost (record encode / index insert / MVCC version), transaction overhead
+  amortized. (b) is the more addressable shape (not transaction-control), but see the gate below.
+- BLOCKER: EVERY loser's fsqlite CV exceeds 5% (7.0% / 18.3% / 12.9% / 18.2% / 47.1% / 4.3%* / 12.3% /
+  13.7% / 22.7% / 11.6%) — so no lever here can pass the KEEP-quality gate (same-worker A/B, CV<5%,
+  null-control) on the current shared remote host, which is under load (a `ld` signal-7 Bus error hit
+  this cycle, [[rch-parallel-link-oom-bus-error]]). The DELETE/UPDATE family additionally crosses into
+  the security-sensitive MVCC/identity-probe lane (commit 1136c171 — no touch without sign-off).
+- RETRY PREDICATE: reopen the frontier when a QUIET dedicated host is available (fsqlite CV < 5% on the
+  target scenario). First target then = the single-transaction large-10col BULK INSERT per-row path
+  (profile with FSQLITE_BENCH_PROFILE_DML, look for a >=30% removable non-txn component); the small-N
+  DELETE/UPDATE stays behind the MVCC sign-off. (*update-100/1000 shows 4.3% but is only 1.35x and its
+  cost is transaction-control — same MVCC lane.)
+- VERDICT: frontier is a ledgered BLOCKER (host-quietness + MVCC-security). The read/skip-scan lane is
+  comprehensively complete AND winning on every read workload — no read-side frontier exists.
+
+## 2026-07-24 - REJECT (frontier, code screen, no A/B needed): bulk-INSERT per-row path is already optimized; residual is inherent MVCC/COW
+
+- Retry-target from the BLOCKER entry above (single-transaction large-10col bulk INSERT, 1.50x). Screened
+  the `Opcode::Insert` hot path (engine.rs ~9904) WITHOUT a perf A/B, looking for a per-row algorithmic
+  inefficiency justifiable on code alone. Found the path is ALREADY heavily optimized (all prior bd-*):
+  * MakeRecord SIDEBAND buffer — the record bytes are taken from a lookaside, avoiding an Arc alloc for
+    the Blob/Text record (`sideband_is_armed_for` / `take_buf`); `take_reg` moves instead of cloning.
+  * APPEND fast-path (bd-p666i/bd-0zxi6) — a strictly-increasing rowid skips the full B-tree seek
+    entirely (matches C SQLite BTREE_APPEND).
+  * `table_insert_prechecked_absent` — when the existence probe already proved the row absent, the
+    insert reuses that leaf position instead of re-seeking.
+  * rightmost-leaf cache refresh on append; decode-cache invalidation scoped to the write.
+- CONCLUSION: no removable per-row redundancy remains. The residual vs C SQLite is INHERENT to the MVCC
+  design — copy-on-write page duplication for concurrent writers, per-row version tracking, and RaptorQ
+  durability — i.e. the concurrent-writer capability that IS the product (concurrent_mode default true,
+  never to be weakened). Reducing it means weakening MVCC/durability, out of scope.
+- VERDICT: REJECTED on code screen (no eligible micro-perf A/B was entered — the host is also too noisy,
+  per the BLOCKER entry). This is the 2nd frontier REJECT (after cod's small-N DELETE). Combined with the
+  all-write-side BLOCKER, the comprehensive-bench frontier is firmly blocked: reads are won, writes are
+  inherent-MVCC-cost. Retry predicate unchanged (quiet host + MVCC sign-off for any deeper write lever).
+
 ## 2026-07-22 - BLOCKER: live B-epsilon/cell-delta DELETE bridge is not a one-lever edit
 
 - Target after the second consecutive DELETE rejection: the refreshed worst
@@ -19793,3 +21691,97 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   the independent remote correctness worker timed out. Resume in a quiescent
   remote window satisfying the predicate above, then choose a different alien
   primitive if the ownership representation still lacks profile attribution.
+
+## 2026-07-27 - KEEP (batched hop) + DEFER (inline lane): UnixFile per-page I/O tax is ~90% blocking-pool round-trip; write_page_batch now pays ONE hop per batch (4.9x); global inline pread/pwrite REJECTED by async-contract review
+
+- Target workload: every file-backed read/write. Per bd-fo6xw this path is
+  100% of production I/O (7520 unix fallbacks, 0 io_uring samples), so the
+  per-page cost multiplies into every write-side benchmark row and every cold
+  read. Filed as bd-trfah; also feeds bd-dqdoe attribution (step-4 bridge
+  controls).
+- Method: same-binary paired decomposition harness (final source + all three
+  JSON runs in `tests/artifacts/perf/vfs-tax-decomposition-20260727T0257Z-csd/`),
+  15 rotated-order rounds, fixed-seed LCG offsets, counting global allocator,
+  8 MiB page-cache-warm file, `taskset -c 56-63` on csd. Host loadavg 8-21:
+  absolute ns are inflated; the paired decomposition and ratios are the
+  claim, not absolute latency. NOT citable for README numbers.
+- Measured (medians, ns/op, pre-change): shipped read 15,594 vs inline
+  counterfactual 1,164 (13.4x); shipped write 18,881 vs 1,676 (11.3x); empty
+  `spawn_blocking_io` round-trip 14,049 with 4 allocs; `vec![0;4096]` +
+  full-page copy only 147. Model check: (shipped − inline) 14,430 ≈
+  (hop + alloc/copy) 14,196. **The bd-trfah title's "3 full-page traversals"
+  is real but immaterial (~1% of the tax); ~90% is the blocking-pool
+  round-trip itself.**
+- An inline (`≤64 KiB` on calling thread) prototype was built and validated —
+  shipped read collapsed to 1,232 ns/op (0.94x vs counterfactual, allocs/op
+  5.04 → 0.01) — then **withdrawn before landing** on RusticBasin's
+  async-contract objection (bd-trfah thread, 2026-07-27): on the raw async
+  `Connection` API engine futures run on shared asupersync scheduler workers,
+  and page I/O can block arbitrarily under reclaim/device stalls; inline
+  `truncate`/`sync` is pre-existing debt, not precedent. Global inline
+  blocking I/O is off-contract.
+- LANDED instead (`crates/fsqlite-vfs/src/unix.rs`, `write_page_batch`
+  override only; no trait changes): stage the pager batch and issue ONE
+  `spawn_blocking_io` hop that pwrites every page. Measured with the same
+  harness: **2,893 ns/op per page at group size 16 vs 14,313 ns/op for the
+  per-page pooled default — 4.9x on pager commit batches**, contract-safe.
+  Staging `to_vec` copies are ~1% of the former per-page cost.
+- DEFERRED (tracked in the bd-trfah thread + follow-up bead): the remaining
+  ~2x to the inline floor (1,516 ns/op) needs the actor-lane design
+  RusticBasin proposed — a Cx capability marker (e.g.
+  `blocking_io_inline_safe`) set only on `AsyncConnection`'s dedicated engine
+  OS thread, with UnixFile inlining EINTR-safe positional I/O only under that
+  marker. Requires three-arm measurement (fallback-thread vs actor-inline vs
+  pool/gateway) plus scheduler-latency proof under induced slow I/O.
+  Coordinate the exact Cx field with RusticBasin before edits.
+- Bridge controls for bd-dqdoe: per-op `block_on(async {})` on a persistent
+  runtime = 754 ns/op (consistent with bd-zavyn's ~333 ns instrument-drift
+  scale on a quieter host); fresh-runtime-per-op = 5.4 ms/op (production does
+  NOT do this — timing rules it out). The dominant engine-side per-I/O
+  mechanism is the per-page pool hop: now amortized for batch writes, still
+  present for single-page reads/writes pending the actor lane and the
+  bd-zavyn hoist.
+- Retry condition for global inline I/O: only with an explicit
+  scheduler-latency/cancellation gate under induced slow I/O proving
+  unrelated tasks are not stalled, or under the actor-lane capability marker
+  above. Do not re-attempt a bare inline fast path in `read`/`write_tracked`.
+
+## 2026-07-27 - NULL RESULT (honest A/B) + ATTRIBUTION: the two landed fixes do not move comprehensive-bench INSERT shapes; per-STATEMENT sync-bridge entry is the dominant quantified suspect for the remaining ~2.4x
+
+- Question: did 7547724b (bench runtime-entry hoist, bd-zavyn/bd-mnlk2) plus
+  a20b3144 (UnixFile write_page_batch single hop, bd-trfah) move the INSERT
+  suite? Interleaved ABBA-AB, 6 runs, `--quick --filter insert --no-html`,
+  `taskset -c 48-63` on csd (loadavg 9-13), same-day builds from clean
+  worktrees: pre 648460d3 sha256 `1c947f92…2bf4`, post a20b3144 sha256
+  `8d4c4495…ef8b`. Logs + runner:
+  `tests/artifacts/perf/prepost-insert-ab-20260727T1452Z-csd/`.
+- Result: average time ratio pre = 2.42x / 2.48x / 2.46x, post = 2.46x /
+  2.41x / 2.36x. **No material movement.** Expected in hindsight: the batch
+  fix fires on pager checkpoint batches (outside these timed windows) and
+  7547724b touched the oplog executor + four OTHER bins, not
+  comprehensive_bench's INSERT scenarios.
+- ATTRIBUTION (per-scenario gap vs the measured 754 ns/op persistent-runtime
+  `block_on` re-entry from `vfs-tax-decomposition-20260727T0257Z-csd`):
+  10K-row single-txn tiny gap 10.2 ms vs 10K x 754 ns = 7.5 ms (~74%);
+  1000-row batched gap 1.10 ms vs 0.75 ms (~68%); 100-row single-txn gap
+  165 us vs 75 us (~45%). The per-STATEMENT sync-bridge entry inside the
+  timed loop is the dominant quantified suspect for the large-N INSERT gap.
+  Per DustyOrchid's source proof (bd-dqdoe thread 2026-07-27): the bridge
+  re-enters a REUSED thread-local runtime — entry/task/waker scheduling per
+  op, not construction/teardown; my 5.4 ms/op fresh-runtime arm confirms
+  production cannot be doing that shape.
+- Consequence, and this is the important part: this cost is NOT purely
+  instrument. Any consumer of the synchronous API that drives one statement
+  per `block_on` pays it identically. Fix directions (both needed):
+  (a) bench/consumer side — one runtime entry per transaction/scenario
+  (CrimsonFinch's bd-zavyn hoist extended to comprehensive_bench's timed
+  loops); (b) product side — a sync facade that amortizes runtime entry
+  across statements (transaction-scoped entry), which is also the
+  precondition for io_uring per bd-fo6xw.
+- Residual after bridge subtraction (~2.7-4.6 ms at 10K rows, ~90 us at 100
+  rows) matches the known real-engine costs (bd-aoj0g O(n^2) secondary-index
+  cache locality; MVCC/COW write tax per the 2026-07-23 convergence entry).
+- Retry condition: re-run this exact A/B after a comprehensive_bench
+  timed-loop hoist lands, and separately after any product-side sync-facade
+  change; expect the 10K-row rows to move by several ms if the attribution
+  is right.

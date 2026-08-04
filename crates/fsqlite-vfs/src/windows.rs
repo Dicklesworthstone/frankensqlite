@@ -21,7 +21,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
@@ -46,7 +46,9 @@ const STOCK_SQLITE_SHARED_SIZE: u64 = 510;
 // SQLite's Windows WAL VFS places the eight WAL lock bytes at offsets 120..128
 // of the real `-shm` file. WAL_WRITE_LOCK and WAL_CKPT_LOCK are slots 0 and 1.
 const STOCK_SQLITE_SHM_LOCK_BASE: u64 = 120;
+#[cfg(test)]
 const STOCK_SQLITE_WAL_WRITE_BYTE: u64 = STOCK_SQLITE_SHM_LOCK_BASE;
+#[cfg(test)]
 const STOCK_SQLITE_WAL_CKPT_BYTE: u64 = STOCK_SQLITE_SHM_LOCK_BASE + 1;
 
 const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
@@ -66,7 +68,7 @@ fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> std::io::R
     })
 }
 
-fn read_owned_at(file: File, len: usize, offset: u64) -> std::io::Result<(Vec<u8>, usize)> {
+fn read_owned_at(file: &File, len: usize, offset: u64) -> std::io::Result<(Vec<u8>, usize)> {
     let mut data = vec![0_u8; len];
     let mut total = 0_usize;
     while total < data.len() {
@@ -81,7 +83,7 @@ fn read_owned_at(file: File, len: usize, offset: u64) -> std::io::Result<(Vec<u8
     Ok((data, total))
 }
 
-fn write_owned_at(file: File, data: Vec<u8>, offset: u64) -> std::io::Result<()> {
+fn write_owned_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
     let mut total = 0_usize;
     while total < data.len() {
         let current = blocking_io_offset(offset, total, "write")?;
@@ -101,8 +103,8 @@ fn write_owned_at(file: File, data: Vec<u8>, offset: u64) -> std::io::Result<()>
 }
 
 fn write_owned_at_tracked(
-    file: File,
-    data: Vec<u8>,
+    file: &File,
+    data: &[u8],
     offset: u64,
     mut completion: VfsWriteCompletionSource,
 ) -> std::io::Result<()> {
@@ -169,7 +171,7 @@ fn split_u64(value: u64) -> (u32, u32) {
     (value as u32, (value >> 32) as u32)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum WindowsRangeLockMode {
     Shared,
     Exclusive,
@@ -226,6 +228,19 @@ fn try_lock_stock_sqlite_shared_range(file: &File, offset: u64, len: u64) -> Res
 }
 
 fn unlock_stock_sqlite_range(file: &File, offset: u64, len: u64) -> Result<()> {
+    unlock_stock_sqlite_range_impl(file, offset, len, true)
+}
+
+fn unlock_stock_sqlite_range_strict(file: &File, offset: u64, len: u64) -> Result<()> {
+    unlock_stock_sqlite_range_impl(file, offset, len, false)
+}
+
+fn unlock_stock_sqlite_range_impl(
+    file: &File,
+    offset: u64,
+    len: u64,
+    missing_is_unlocked: bool,
+) -> Result<()> {
     let (bytes_low, bytes_high) = split_u64(len);
     let mut overlapped = WindowsOverlapped::at(offset);
     // SAFETY: the handle and OVERLAPPED invariants are the same as in
@@ -244,11 +259,32 @@ fn unlock_stock_sqlite_range(file: &File, offset: u64, len: u64) -> Result<()> {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_NOT_LOCKED) {
+    if missing_is_unlocked && error.raw_os_error() == Some(ERROR_NOT_LOCKED) {
         Ok(())
     } else {
         Err(FrankenError::Io(error))
     }
+}
+
+fn restore_missing_stock_sqlite_range_fence(
+    file: &File,
+    offset: u64,
+    len: u64,
+    mode: WindowsRangeLockMode,
+    operation: &str,
+    unlock_error: &FrankenError,
+) -> Option<String> {
+    let FrankenError::Io(error) = unlock_error else {
+        return None;
+    };
+    if error.raw_os_error() != Some(ERROR_NOT_LOCKED) {
+        return None;
+    }
+
+    let restore_result = try_lock_stock_sqlite_range_with_mode(file, offset, len, mode);
+    Some(format!(
+        "{operation} observed ERROR_NOT_LOCKED for stock SQLite range offset={offset} len={len}; attempted {mode:?} re-fence: {restore_result:?}"
+    ))
 }
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
@@ -452,6 +488,8 @@ struct WindowsShmState {
     regions: HashMap<u32, ShmRegion>,
     slots: Vec<ShmSlotState>,
     owner_refs: HashMap<u64, u32>,
+    stock_shm_file: Option<File>,
+    poisoned: Option<String>,
 }
 
 impl Default for WindowsShmState {
@@ -461,6 +499,8 @@ impl Default for WindowsShmState {
             regions: HashMap::new(),
             slots: vec![ShmSlotState::default(); slot_count],
             owner_refs: HashMap::new(),
+            stock_shm_file: None,
+            poisoned: None,
         }
     }
 }
@@ -1042,70 +1082,34 @@ impl WindowsStockMainLocks {
     }
 }
 
-/// Stock-SQLite-visible WAL portion of an external maintenance fence.
+/// Retry state for one external-maintenance acquisition attempt.
 ///
-/// Ordinary main-file locking already mirrors every level onto stock SQLite's
-/// real database bytes. Whole-image maintenance additionally retains the real
-/// WAL write/checkpoint slots tracked here.
+/// Ordinary SHM locking mirrors the WAL slots onto stock SQLite's real `-shm`
+/// bytes. The attempt records only slots newly acquired by maintenance, so
+/// restoration cannot release same-owner locks that predated the attempt.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct WindowsExternalMaintenanceLocks {
     wal_mode: bool,
-    shm_file: Option<File>,
-    shm_write: bool,
-    shm_checkpoint: bool,
+    prior_main_level: LockLevel,
+    main_restore_pending: bool,
+    wal_write_acquired: bool,
+    wal_checkpoint_acquired: bool,
 }
 
 impl WindowsExternalMaintenanceLocks {
-    const fn new(wal_mode: bool) -> Self {
+    const fn new(wal_mode: bool, prior_main_level: LockLevel) -> Self {
         Self {
             wal_mode,
-            shm_file: None,
-            shm_write: false,
-            shm_checkpoint: false,
+            prior_main_level,
+            main_restore_pending: true,
+            wal_write_acquired: false,
+            wal_checkpoint_acquired: false,
         }
     }
 
-    /// Release every acquired range in strict reverse order. A failed explicit
-    /// unlock leaves its bit set until this state is dropped; closing the
-    /// dedicated handles is Win32's guaranteed final release path.
-    fn release(&mut self) -> Result<()> {
-        let mut failures = Vec::new();
-
-        if self.shm_checkpoint {
-            match self.shm_file.as_ref() {
-                Some(shm_file) => {
-                    match unlock_stock_sqlite_range(shm_file, STOCK_SQLITE_WAL_CKPT_BYTE, 1) {
-                        Ok(()) => self.shm_checkpoint = false,
-                        Err(error) => failures.push(format!("WAL checkpoint byte: {error}")),
-                    }
-                }
-                None => failures.push("WAL checkpoint byte: missing -shm handle".to_owned()),
-            }
-        }
-        if self.shm_write {
-            match self.shm_file.as_ref() {
-                Some(shm_file) => {
-                    match unlock_stock_sqlite_range(shm_file, STOCK_SQLITE_WAL_WRITE_BYTE, 1) {
-                        Ok(()) => self.shm_write = false,
-                        Err(error) => failures.push(format!("WAL write byte: {error}")),
-                    }
-                }
-                None => failures.push("WAL write byte: missing -shm handle".to_owned()),
-            }
-        }
-
-        if !self.shm_write && !self.shm_checkpoint {
-            self.shm_file.take();
-        }
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(FrankenError::internal(format!(
-                "could not release stock SQLite Windows maintenance ranges: {}",
-                failures.join("; ")
-            )))
-        }
+    const fn restoration_complete(&self) -> bool {
+        !self.main_restore_pending && !self.wal_write_acquired && !self.wal_checkpoint_acquired
     }
 }
 
@@ -1212,6 +1216,8 @@ impl Vfs for WindowsVfs {
                 file: Some(file),
                 os_locks: Some(os_locks),
                 stock_main_locks: None,
+                #[cfg(test)]
+                fail_next_stock_main_clone: false,
                 external_shared_snapshot_prior_level: None,
                 external_maintenance_locks: None,
                 owner_id,
@@ -1315,6 +1321,8 @@ impl Vfs for WindowsVfs {
                 file: Some(file),
                 os_locks: Some(os_locks),
                 stock_main_locks: None,
+                #[cfg(test)]
+                fail_next_stock_main_clone: false,
                 external_shared_snapshot_prior_level: None,
                 external_maintenance_locks: None,
                 owner_id,
@@ -1388,6 +1396,8 @@ pub struct WindowsFile {
     file: Option<File>,
     os_locks: Option<WindowsOsLockFiles>,
     stock_main_locks: Option<WindowsStockMainLocks>,
+    #[cfg(test)]
+    fail_next_stock_main_clone: bool,
     external_shared_snapshot_prior_level: Option<LockLevel>,
     external_maintenance_locks: Option<WindowsExternalMaintenanceLocks>,
     owner_id: u64,
@@ -1434,10 +1444,21 @@ impl WindowsFile {
             .ok_or_else(|| FrankenError::internal("windows lock files are closed"))
     }
 
-    fn stock_main_locks_mut(&mut self) -> Result<&mut WindowsStockMainLocks> {
+    fn ensure_stock_main_locks(&mut self) -> Result<()> {
         if self.stock_main_locks.is_none() {
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_stock_main_clone) {
+                return Err(FrankenError::Io(std::io::Error::other(
+                    "injected Windows main-handle clone failure",
+                )));
+            }
             self.stock_main_locks = Some(WindowsStockMainLocks::new(self.file_ref()?.try_clone()?));
         }
+        Ok(())
+    }
+
+    fn stock_main_locks_mut(&mut self) -> Result<&mut WindowsStockMainLocks> {
+        self.ensure_stock_main_locks()?;
         self.stock_main_locks
             .as_mut()
             .ok_or_else(|| FrankenError::internal("windows stock main lock handle is closed"))
@@ -1453,36 +1474,228 @@ impl WindowsFile {
         Ok(state)
     }
 
+    fn ensure_stock_shm_file<'a>(
+        state: &'a mut WindowsShmState,
+        shm_path: &Path,
+    ) -> Result<&'a File> {
+        if let Some(detail) = &state.poisoned {
+            return Err(FrankenError::internal(format!(
+                "Windows SHM lock state is poisoned: {detail}"
+            )));
+        }
+        if state.stock_shm_file.is_none() {
+            let (file, _) = open_windows_lock_sidecar(shm_path)?;
+            state.stock_shm_file = Some(file);
+        }
+        state
+            .stock_shm_file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("Windows stock SHM lock handle is closed"))
+    }
+
+    fn stock_shm_lock_byte(slot: u32) -> Result<u64> {
+        if slot >= WAL_TOTAL_LOCKS {
+            return Err(FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            });
+        }
+        Ok(STOCK_SQLITE_SHM_LOCK_BASE + u64::from(slot))
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn release_shm_owner_state(&mut self, delete: bool) -> Result<()> {
-        let Some(state_arc) = self.shm_state.take() else {
+        let Some(state_arc) = self.shm_state.as_ref().map(Arc::clone) else {
             if delete {
                 drop(fs::remove_file(&self.shm_path));
             }
             return Ok(());
         };
 
-        let orphaned = {
+        let mut owner_detached = false;
+        let release_result = (|| -> Result<bool> {
             let mut state = state_arc
                 .lock()
                 .map_err(|_| lock_poisoned("windows shm state"))?;
-
-            for slot in &mut state.slots {
-                slot.shared_holders.remove(&self.owner_id);
-                if slot.exclusive_owner == Some(self.owner_id) {
-                    slot.exclusive_owner = None;
-                }
+            let owner_ref_count = state.owner_refs.get(&self.owner_id).copied().unwrap_or(0);
+            if owner_ref_count == 0 {
+                return Err(FrankenError::internal(format!(
+                    "owner {} is not registered in Windows SHM state",
+                    self.owner_id
+                )));
             }
-
-            if let Some(count) = state.owner_refs.get_mut(&self.owner_id) {
-                if *count > 1 {
-                    *count -= 1;
+            if state.poisoned.is_some() {
+                // A failed promotion/downgrade restoration means the local
+                // slot table can no longer prove which ranges the OS retains.
+                // Keep the process-scoped handle and every possibly-live range
+                // until the whole poisoned cohort drains. Closing it for one
+                // departing owner would silently unfence other owners that may
+                // already be inside WAL critical sections. Future SHM calls
+                // still fail closed through the poison check.
+                if owner_ref_count > 1 {
+                    state.owner_refs.insert(self.owner_id, owner_ref_count - 1);
                 } else {
-                    state.owner_refs.remove(&self.owner_id);
+                    let _ = state.owner_refs.remove(&self.owner_id);
                 }
+                let orphaned = state.owner_refs.is_empty();
+                if orphaned {
+                    drop(state.stock_shm_file.take());
+                    for slot in &mut state.slots {
+                        slot.shared_holders.clear();
+                        slot.exclusive_owner = None;
+                    }
+                    state.poisoned = None;
+                }
+                return Ok(orphaned);
             }
-            state.owner_refs.is_empty()
-        };
+            if owner_ref_count > 1 {
+                state.owner_refs.insert(self.owner_id, owner_ref_count - 1);
+                return Ok(false);
+            }
 
+            let last_process_owner = state.owner_refs.len() == 1;
+            if last_process_owner {
+                // Closing the process-scoped handle is the final synchronous
+                // release for every outstanding range. Keep the state mutex
+                // held until CloseHandle completes so no local opener can
+                // observe the slots as free before the OS does.
+                drop(state.stock_shm_file.take());
+                for slot in &mut state.slots {
+                    let _ = slot.shared_holders.remove(&self.owner_id);
+                    if slot.exclusive_owner == Some(self.owner_id) {
+                        slot.exclusive_owner = None;
+                    }
+                }
+                let _ = state.owner_refs.remove(&self.owner_id);
+                state.poisoned = None;
+                return Ok(true);
+            }
+
+            for slot in 0..WAL_TOTAL_LOCKS {
+                let idx = to_slot_index(slot)?;
+                let owns_exclusive = state.slots[idx].exclusive_owner == Some(self.owner_id);
+                let owns_shared = state.slots[idx].shared_holders.contains_key(&self.owner_id);
+                if !owns_exclusive && !owns_shared {
+                    continue;
+                }
+                let other_shared = state.slots[idx]
+                    .shared_holders
+                    .iter()
+                    .any(|(owner, count)| *owner != self.owner_id && *count > 0);
+                let lock_byte = Self::stock_shm_lock_byte(slot)?;
+                let Some(shm_file) = state.stock_shm_file.as_ref() else {
+                    let detail = format!(
+                        "owner {} has SHM slot {slot} state without a stock -shm handle",
+                        self.owner_id
+                    );
+                    state.poisoned = Some(detail.clone());
+                    let _ = state.owner_refs.remove(&self.owner_id);
+                    owner_detached = true;
+                    return Err(FrankenError::internal(detail));
+                };
+
+                if owns_exclusive {
+                    if other_shared {
+                        if let Err(overlay_error) =
+                            try_lock_stock_sqlite_shared_range(shm_file, lock_byte, 1)
+                        {
+                            state.poisoned = Some(format!(
+                                "owner-close shared overlay failed for slot {slot}: {overlay_error}"
+                            ));
+                            let _ = state.owner_refs.remove(&self.owner_id);
+                            owner_detached = true;
+                            return Err(FrankenError::internal(format!(
+                                "Windows SHM owner-close could not preserve surviving shared slot {slot}: {overlay_error}"
+                            )));
+                        }
+                        if let Err(unlock_error) =
+                            unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1)
+                        {
+                            let detail = restore_missing_stock_sqlite_range_fence(
+                                shm_file,
+                                lock_byte,
+                                1,
+                                WindowsRangeLockMode::Exclusive,
+                                "owner-close exclusive downgrade",
+                                &unlock_error,
+                            )
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "owner-close exclusive unlock failed after installing shared overlay for slot {slot}: {unlock_error}"
+                                )
+                            });
+                            state.poisoned = Some(detail);
+                            let _ = state.owner_refs.remove(&self.owner_id);
+                            owner_detached = true;
+                            return Err(FrankenError::internal(format!(
+                                "Windows SHM owner-close installed a shared overlay but could not release exclusive slot {slot}: {unlock_error}"
+                            )));
+                        }
+                    } else if let Err(unlock_error) =
+                        unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1)
+                    {
+                        let detail = restore_missing_stock_sqlite_range_fence(
+                            shm_file,
+                            lock_byte,
+                            1,
+                            WindowsRangeLockMode::Exclusive,
+                            "owner-close exclusive unlock",
+                            &unlock_error,
+                        )
+                        .unwrap_or_else(|| {
+                            format!(
+                                "owner-close exclusive unlock failed for slot {slot}: {unlock_error}"
+                            )
+                        });
+                        state.poisoned = Some(detail);
+                        let _ = state.owner_refs.remove(&self.owner_id);
+                        owner_detached = true;
+                        return Err(FrankenError::internal(format!(
+                            "Windows SHM owner-close could not release exclusive slot {slot}: {unlock_error}"
+                        )));
+                    }
+                    state.slots[idx].exclusive_owner = None;
+                } else if owns_shared && !other_shared {
+                    if let Err(unlock_error) =
+                        unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1)
+                    {
+                        let detail = restore_missing_stock_sqlite_range_fence(
+                            shm_file,
+                            lock_byte,
+                            1,
+                            WindowsRangeLockMode::Shared,
+                            "owner-close shared unlock",
+                            &unlock_error,
+                        )
+                        .unwrap_or_else(|| {
+                            format!(
+                                "owner-close shared unlock failed for slot {slot}: {unlock_error}"
+                            )
+                        });
+                        state.poisoned = Some(detail);
+                        let _ = state.owner_refs.remove(&self.owner_id);
+                        owner_detached = true;
+                        return Err(FrankenError::internal(format!(
+                            "Windows SHM owner-close could not release shared slot {slot}: {unlock_error}"
+                        )));
+                    }
+                }
+                let _ = state.slots[idx].shared_holders.remove(&self.owner_id);
+            }
+
+            let _ = state.owner_refs.remove(&self.owner_id);
+            Ok(false)
+        })();
+
+        let orphaned = match release_result {
+            Ok(orphaned) => orphaned,
+            Err(error) => {
+                if owner_detached {
+                    drop(self.shm_state.take());
+                }
+                return Err(error);
+            }
+        };
+        drop(self.shm_state.take());
         if orphaned {
             windows_shm_table().remove_if_orphaned(&self.shm_path, &state_arc)?;
         }
@@ -1524,88 +1737,115 @@ impl WindowsFile {
         }
     }
 
-    fn acquire_cooperative_wal_maintenance_locks(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
-        if wal_mode {
-            self.shm_lock(
-                cx,
-                WAL_WRITE_LOCK,
-                WAL_CKPT_LOCK - WAL_WRITE_LOCK + 1,
-                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn release_cooperative_wal_maintenance_locks(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
-        if wal_mode {
-            self.shm_lock(
-                cx,
-                WAL_WRITE_LOCK,
-                WAL_CKPT_LOCK - WAL_WRITE_LOCK + 1,
-                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
-            )
+    fn restore_ordinary_lock_level(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        if self.lock_level < level {
+            self.lock(cx, level)
         } else {
-            Ok(())
+            self.unlock(cx, level)
         }
     }
 
-    fn acquire_stock_sqlite_maintenance_locks(&mut self, wal_mode: bool) -> Result<()> {
-        if self.external_maintenance_locks.is_some() {
-            return Err(FrankenError::internal(
-                "stock SQLite Windows maintenance fence is already held",
-            ));
+    fn acquire_cooperative_wal_maintenance_locks(
+        &mut self,
+        cx: &Cx,
+        wal_mode: bool,
+        write_preheld: bool,
+        checkpoint_preheld: bool,
+    ) -> Result<()> {
+        if !wal_mode {
+            return Ok(());
         }
-        self.ensure_open()?;
-        let mut locks = WindowsExternalMaintenanceLocks::new(wal_mode);
 
-        let acquisition_result = (|| -> Result<()> {
-            if wal_mode {
-                let (shm_file, _) = open_windows_lock_sidecar(&self.shm_path)?;
-                locks.shm_file = Some(shm_file);
-                let shm_file = locks.shm_file.as_ref().ok_or_else(|| {
-                    FrankenError::internal("Windows maintenance lost its -shm handle")
-                })?;
-                try_lock_stock_sqlite_range(shm_file, STOCK_SQLITE_WAL_WRITE_BYTE, 1)?;
-                locks.shm_write = true;
-                try_lock_stock_sqlite_range(shm_file, STOCK_SQLITE_WAL_CKPT_BYTE, 1)?;
-                locks.shm_checkpoint = true;
+        if !write_preheld {
+            self.external_maintenance_locks
+                .as_mut()
+                .ok_or_else(|| {
+                    FrankenError::internal(
+                        "Windows maintenance has no attempt marker before acquiring WAL write",
+                    )
+                })?
+                .wal_write_acquired = true;
+            let result = self.shm_lock(
+                cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            );
+            if result.is_err()
+                && let Some(attempt) = self.external_maintenance_locks.as_mut()
+            {
+                attempt.wal_write_acquired = false;
             }
-
-            // The ordinary main-file lock path mirrors every SQLite lock level
-            // onto the real database bytes. This dedicated state intentionally
-            // acquires only the stock-visible WAL slots; the caller acquires
-            // main EXCLUSIVE afterward to preserve WAL-then-main ordering.
-            Ok(())
-        })();
-
-        if let Err(acquisition_error) = acquisition_result {
-            let cleanup_result = locks.release();
-            // Even if an explicit UnlockFileEx failed, dropping these
-            // dedicated handles releases every range before CloseHandle
-            // returns. Never strand a partial acquisition on `self.file`.
-            drop(locks);
-            return match cleanup_result {
-                Ok(()) => Err(acquisition_error),
-                Err(cleanup_error) => Err(FrankenError::internal(format!(
-                    "stock SQLite Windows maintenance lock failed and partial-acquisition unwind also failed: lock={acquisition_error}; unwind={cleanup_error}"
-                ))),
-            };
+            result?;
         }
 
-        self.external_maintenance_locks = Some(locks);
+        if !checkpoint_preheld {
+            self.external_maintenance_locks
+                .as_mut()
+                .ok_or_else(|| {
+                    FrankenError::internal(
+                        "Windows maintenance has no attempt marker before acquiring WAL checkpoint",
+                    )
+                })?
+                .wal_checkpoint_acquired = true;
+            let result =
+                self.shm_lock(cx, WAL_CKPT_LOCK, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
+            if result.is_err()
+                && let Some(attempt) = self.external_maintenance_locks.as_mut()
+            {
+                attempt.wal_checkpoint_acquired = false;
+            }
+            result?;
+        }
         Ok(())
     }
 
-    fn release_stock_sqlite_maintenance_locks(&mut self) -> Result<()> {
-        let Some(mut locks) = self.external_maintenance_locks.take() else {
-            return Ok(());
+    fn owns_exclusive_shm_slot(&self, slot: u32) -> Result<bool> {
+        let Some(state) = &self.shm_state else {
+            return Ok(false);
         };
-        let release_result = locks.release();
-        // See the acquisition unwind above: handle closure is the final,
-        // synchronous lock-release fallback for any range whose explicit
-        // UnlockFileEx call failed.
-        drop(locks);
-        release_result
+        let state = state
+            .lock()
+            .map_err(|_| lock_poisoned("windows shm state"))?;
+        let idx = to_slot_index(slot)?;
+        Ok(state
+            .slots
+            .get(idx)
+            .is_some_and(|slot| slot.exclusive_owner == Some(self.owner_id)))
+    }
+
+    fn verify_stock_sqlite_maintenance_locks(&mut self, wal_mode: bool) -> Result<()> {
+        self.ensure_open()?;
+        if wal_mode {
+            let state = self.ensure_shm_state()?;
+            let state = state
+                .lock()
+                .map_err(|_| lock_poisoned("windows shm state"))?;
+            if let Some(detail) = &state.poisoned {
+                return Err(FrankenError::internal(format!(
+                    "Windows maintenance found poisoned SHM state: {detail}"
+                )));
+            }
+            for slot in WAL_WRITE_LOCK..=WAL_CKPT_LOCK {
+                let idx = to_slot_index(slot)?;
+                let slot_state = state
+                    .slots
+                    .get(idx)
+                    .ok_or_else(|| FrankenError::internal("shm slot index out of bounds"))?;
+                if slot_state.exclusive_owner != Some(self.owner_id) {
+                    return Err(FrankenError::internal(format!(
+                        "Windows maintenance lost its ordinary exclusive SHM slot {slot}"
+                    )));
+                }
+            }
+            if state.stock_shm_file.is_none() {
+                return Err(FrankenError::internal(
+                    "Windows maintenance has SHM state without a stock -shm handle",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn validate_shm_request(offset: u32, n: u32) -> Result<u32> {
@@ -1627,30 +1867,69 @@ impl WindowsFile {
         Ok(end)
     }
 
-    fn acquire_shared_slot(state: &mut WindowsShmState, slot: u32, owner_id: u64) -> Result<()> {
+    fn acquire_shared_slot(&self, state: &mut WindowsShmState, slot: u32) -> Result<()> {
+        if let Some(detail) = &state.poisoned {
+            return Err(FrankenError::internal(format!(
+                "Windows SHM lock state is poisoned: {detail}"
+            )));
+        }
         let idx = to_slot_index(slot)?;
         let slot_state = state
             .slots
             .get_mut(idx)
             .ok_or_else(|| FrankenError::internal("shm slot index out of bounds"))?;
         if let Some(exclusive_owner) = slot_state.exclusive_owner {
-            if exclusive_owner != owner_id {
+            if exclusive_owner != self.owner_id {
                 return Err(FrankenError::Busy);
             }
         }
-        *slot_state.shared_holders.entry(owner_id).or_insert(0) += 1;
+        let has_shared = slot_state
+            .shared_holders
+            .values()
+            .copied()
+            .any(|count| count > 0);
+        let prior_count = slot_state
+            .shared_holders
+            .get(&self.owner_id)
+            .copied()
+            .unwrap_or(0);
+        let next_count = prior_count
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::internal("Windows SHM shared lock count overflow"))?;
+        if !has_shared && slot_state.exclusive_owner.is_none() {
+            let lock_byte = Self::stock_shm_lock_byte(slot)?;
+            let shm_path = self.shm_path.clone();
+            try_lock_stock_sqlite_shared_range(
+                Self::ensure_stock_shm_file(state, &shm_path)?,
+                lock_byte,
+                1,
+            )?;
+        }
+        state.slots[idx]
+            .shared_holders
+            .insert(self.owner_id, next_count);
         Ok(())
     }
 
-    fn acquire_exclusive_slot(state: &mut WindowsShmState, slot: u32, owner_id: u64) -> Result<()> {
+    /// Acquire an exclusive slot and report whether this call changed state.
+    ///
+    /// An already-held exclusive lock is an idempotent success. The caller
+    /// must not unwind that pre-existing hold if a later slot in the same
+    /// multi-slot request fails.
+    fn acquire_exclusive_slot(&self, state: &mut WindowsShmState, slot: u32) -> Result<bool> {
+        if let Some(detail) = &state.poisoned {
+            return Err(FrankenError::internal(format!(
+                "Windows SHM lock state is poisoned: {detail}"
+            )));
+        }
         let idx = to_slot_index(slot)?;
         let slot_state = state
             .slots
             .get_mut(idx)
             .ok_or_else(|| FrankenError::internal("shm slot index out of bounds"))?;
 
-        if slot_state.exclusive_owner == Some(owner_id) {
-            return Ok(());
+        if slot_state.exclusive_owner == Some(self.owner_id) {
+            return Ok(false);
         }
 
         if slot_state.exclusive_owner.is_some() {
@@ -1660,46 +1939,185 @@ impl WindowsFile {
         if slot_state
             .shared_holders
             .iter()
-            .any(|(owner, count)| *owner != owner_id && *count > 0)
+            .any(|(owner, count)| *owner != self.owner_id && *count > 0)
         {
             return Err(FrankenError::Busy);
         }
 
-        slot_state.exclusive_owner = Some(owner_id);
-        Ok(())
+        let lock_byte = Self::stock_shm_lock_byte(slot)?;
+        let has_shared = slot_state
+            .shared_holders
+            .values()
+            .copied()
+            .any(|count| count > 0);
+        let shm_path = self.shm_path.clone();
+        let shm_file = Self::ensure_stock_shm_file(state, &shm_path)?;
+        if has_shared {
+            // LockFileEx cannot atomically promote a shared range. Drop the
+            // process-scoped shared lock, attempt EXCLUSIVE, and restore the
+            // shared lock before returning if promotion loses a race.
+            if let Err(unlock_error) = unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1) {
+                if let Some(detail) = restore_missing_stock_sqlite_range_fence(
+                    shm_file,
+                    lock_byte,
+                    1,
+                    WindowsRangeLockMode::Shared,
+                    "exclusive promotion",
+                    &unlock_error,
+                ) {
+                    state.poisoned = Some(detail.clone());
+                    return Err(FrankenError::internal(detail));
+                }
+                return Err(unlock_error);
+            }
+            if let Err(lock_error) = try_lock_stock_sqlite_range(shm_file, lock_byte, 1) {
+                let restore_result = try_lock_stock_sqlite_shared_range(shm_file, lock_byte, 1);
+                if restore_result.is_err() {
+                    state.poisoned = Some(format!(
+                        "exclusive promotion failed for slot {slot}: lock={lock_error}; restore={restore_result:?}"
+                    ));
+                }
+                return match restore_result {
+                    Ok(()) => Err(lock_error),
+                    Err(restore_error) => Err(FrankenError::internal(format!(
+                        "Windows SHM exclusive promotion failed and could not restore shared slot {slot}: lock={lock_error}; restore={restore_error}"
+                    ))),
+                };
+            }
+        } else {
+            try_lock_stock_sqlite_range(shm_file, lock_byte, 1)?;
+        }
+        state.slots[idx].exclusive_owner = Some(self.owner_id);
+        Ok(true)
     }
 
-    fn release_shared_slot(state: &mut WindowsShmState, slot: u32, owner_id: u64) -> Result<()> {
+    fn release_shared_slot(&self, state: &mut WindowsShmState, slot: u32) -> Result<()> {
+        if let Some(detail) = &state.poisoned {
+            return Err(FrankenError::internal(format!(
+                "Windows SHM lock state is poisoned: {detail}"
+            )));
+        }
         let idx = to_slot_index(slot)?;
         let slot_state = state
             .slots
             .get_mut(idx)
             .ok_or_else(|| FrankenError::internal("shm slot index out of bounds"))?;
-        let Some(holder_count) = slot_state.shared_holders.get_mut(&owner_id) else {
+        let Some(holder_count) = slot_state.shared_holders.get(&self.owner_id).copied() else {
             return Err(FrankenError::LockFailed {
-                detail: format!("owner {owner_id} does not hold shared SHM slot {slot}"),
+                detail: format!(
+                    "owner {} does not hold shared SHM slot {slot}",
+                    self.owner_id
+                ),
             });
         };
-        if *holder_count > 1 {
-            *holder_count -= 1;
-        } else {
-            slot_state.shared_holders.remove(&owner_id);
+        if holder_count > 1 {
+            state.slots[idx]
+                .shared_holders
+                .insert(self.owner_id, holder_count - 1);
+            return Ok(());
         }
+        let other_shared = slot_state
+            .shared_holders
+            .iter()
+            .any(|(owner, count)| *owner != self.owner_id && *count > 0);
+        if slot_state.exclusive_owner.is_none() && !other_shared {
+            let lock_byte = Self::stock_shm_lock_byte(slot)?;
+            let shm_file = state.stock_shm_file.as_ref().ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "owner {} has shared SHM slot {slot} without a stock -shm handle",
+                    self.owner_id
+                ))
+            })?;
+            if let Err(unlock_error) = unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1) {
+                if let Some(detail) = restore_missing_stock_sqlite_range_fence(
+                    shm_file,
+                    lock_byte,
+                    1,
+                    WindowsRangeLockMode::Shared,
+                    "shared unlock",
+                    &unlock_error,
+                ) {
+                    state.poisoned = Some(detail.clone());
+                    return Err(FrankenError::internal(detail));
+                }
+                return Err(unlock_error);
+            }
+        }
+        let _ = state.slots[idx].shared_holders.remove(&self.owner_id);
         Ok(())
     }
 
-    fn release_exclusive_slot(state: &mut WindowsShmState, slot: u32, owner_id: u64) -> Result<()> {
+    fn release_exclusive_slot(&self, state: &mut WindowsShmState, slot: u32) -> Result<()> {
+        if let Some(detail) = &state.poisoned {
+            return Err(FrankenError::internal(format!(
+                "Windows SHM lock state is poisoned: {detail}"
+            )));
+        }
         let idx = to_slot_index(slot)?;
         let slot_state = state
             .slots
             .get_mut(idx)
             .ok_or_else(|| FrankenError::internal("shm slot index out of bounds"))?;
-        if slot_state.exclusive_owner != Some(owner_id) {
+        if slot_state.exclusive_owner != Some(self.owner_id) {
             return Err(FrankenError::LockFailed {
-                detail: format!("owner {owner_id} does not hold exclusive SHM slot {slot}"),
+                detail: format!(
+                    "owner {} does not hold exclusive SHM slot {slot}",
+                    self.owner_id
+                ),
             });
         }
-        slot_state.exclusive_owner = None;
+        let lock_byte = Self::stock_shm_lock_byte(slot)?;
+        let preserve_shared = slot_state
+            .shared_holders
+            .values()
+            .copied()
+            .any(|count| count > 0);
+        let shm_file = state.stock_shm_file.as_ref().ok_or_else(|| {
+            FrankenError::internal(format!(
+                "owner {} has exclusive SHM slot {slot} without a stock -shm handle",
+                self.owner_id
+            ))
+        })?;
+        if preserve_shared {
+            // Win32 permits a SHARED range to overlap an EXCLUSIVE range on
+            // the same handle. Its first matching UnlockFileEx then removes
+            // EXCLUSIVE while leaving SHARED, which makes this downgrade
+            // continuous from the perspective of every other process.
+            try_lock_stock_sqlite_shared_range(shm_file, lock_byte, 1)?;
+            if let Err(unlock_error) = unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1) {
+                let detail = restore_missing_stock_sqlite_range_fence(
+                    shm_file,
+                    lock_byte,
+                    1,
+                    WindowsRangeLockMode::Exclusive,
+                    "exclusive downgrade",
+                    &unlock_error,
+                )
+                .unwrap_or_else(|| {
+                    format!(
+                        "exclusive unlock failed after installing shared overlay for slot {slot}: {unlock_error}"
+                    )
+                });
+                state.poisoned = Some(detail);
+                return Err(FrankenError::internal(format!(
+                    "Windows SHM installed a shared overlay but could not release exclusive slot {slot}: {unlock_error}"
+                )));
+            }
+        } else if let Err(unlock_error) = unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1) {
+            if let Some(detail) = restore_missing_stock_sqlite_range_fence(
+                shm_file,
+                lock_byte,
+                1,
+                WindowsRangeLockMode::Exclusive,
+                "exclusive unlock",
+                &unlock_error,
+            ) {
+                state.poisoned = Some(detail.clone());
+                return Err(FrankenError::internal(detail));
+            }
+            return Err(unlock_error);
+        }
+        state.slots[idx].exclusive_owner = None;
         Ok(())
     }
 }
@@ -1711,16 +2129,12 @@ impl VfsFile for WindowsFile {
         }
 
         let mut first_error = if self.external_shared_snapshot_prior_level.is_some() {
-            self.unlock_external_shared_snapshot(cx).err()
+            self.restore_external_shared_snapshot_attempt(cx).err()
         } else {
             None
         };
-        let external_wal_mode = self
-            .external_maintenance_locks
-            .as_ref()
-            .map(|locks| locks.wal_mode);
-        if let Some(wal_mode) = external_wal_mode
-            && let Err(error) = self.unlock_external_maintenance(cx, wal_mode)
+        if self.external_maintenance_locks.is_some()
+            && let Err(error) = self.restore_external_maintenance_attempt(cx)
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -1747,7 +2161,7 @@ impl VfsFile for WindowsFile {
         // fallback even if an explicit UnlockFileEx call above failed.
         drop(self.stock_main_locks.take());
         self.external_shared_snapshot_prior_level = None;
-        drop(self.external_maintenance_locks.take());
+        let _ = self.external_maintenance_locks.take();
         drop(self.os_locks.take());
         drop(self.file.take());
         self.lock_level = LockLevel::None;
@@ -1764,61 +2178,51 @@ impl VfsFile for WindowsFile {
         Ok(FileIdentity::from_file(self.file_ref()?)?)
     }
 
-    fn read<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a mut [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-        async move {
-            checkpoint_or_abort(cx)?;
-            let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
-            let requested = buf.len();
-            let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
-                .await
-                .map_err(FrankenError::Io)?;
-            checkpoint_or_abort(cx)?;
-            buf.copy_from_slice(&data);
-            Ok(total)
-        }
-    }
-
-    fn write<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
-    }
-
-    fn write_tracked<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
-        offset: u64,
-        completion: VfsWriteCompletion,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            let file = match (|| {
-                checkpoint_or_abort(cx)?;
-                self.file_ref()?.try_clone().map_err(FrankenError::Io)
-            })() {
-                Ok(file) => file,
-                Err(error) => {
-                    completion.complete_error();
-                    return Err(error);
-                }
-            };
-            let data = buf.to_vec();
-            let source_completion = VfsWriteCompletionSource::new(completion.clone());
-            spawn_blocking_io(move || {
-                write_owned_at_tracked(file, data, offset, source_completion)
-            })
+    async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        checkpoint_or_abort(cx)?;
+        let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+        let requested = buf.len();
+        let (data, total) = spawn_blocking_io(move || read_owned_at(&file, requested, offset))
             .await
             .map_err(FrankenError::Io)?;
-            checkpoint_or_abort(cx)
-        }
+        checkpoint_or_abort(cx)?;
+        buf.copy_from_slice(&data);
+        Ok(total)
+    }
+
+    async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+        let data = buf.to_vec();
+        spawn_blocking_io(move || write_owned_at(&file, &data, offset))
+            .await
+            .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)
+    }
+
+    async fn write_tracked(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        let file = match (|| {
+            checkpoint_or_abort(cx)?;
+            self.file_ref()?.try_clone().map_err(FrankenError::Io)
+        })() {
+            Ok(file) => file,
+            Err(error) => {
+                completion.complete_error();
+                return Err(error);
+            }
+        };
+        let data = buf.to_vec();
+        let source_completion = VfsWriteCompletionSource::new(completion.clone());
+        spawn_blocking_io(move || write_owned_at_tracked(&file, &data, offset, source_completion))
+            .await
+            .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -1844,6 +2248,11 @@ impl VfsFile for WindowsFile {
             return Ok(());
         }
 
+        // Materialize the stock-visible handle before acquiring any
+        // cooperative sidecar lock. If duplicating the main handle fails,
+        // no partial lock acquisition is left hidden behind the unchanged
+        // logical lock level.
+        self.ensure_stock_main_locks()?;
         let prior_level = self.lock_level;
         while self.lock_level < level {
             let next = next_lock_level(self.lock_level)
@@ -1890,17 +2299,19 @@ impl VfsFile for WindowsFile {
             ));
         }
 
+        self.ensure_stock_main_locks()?;
         let prior_level = self.lock_level;
-        self.lock(cx, LockLevel::Shared)?;
         self.external_shared_snapshot_prior_level = Some(prior_level);
-        Ok(())
+        self.lock(cx, LockLevel::Shared)
     }
 
-    fn unlock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
-        let Some(prior_level) = self.external_shared_snapshot_prior_level.take() else {
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        let Some(prior_level) = self.external_shared_snapshot_prior_level else {
             return Ok(());
         };
-        self.unlock(cx, prior_level)
+        self.restore_ordinary_lock_level(cx, prior_level)?;
+        self.external_shared_snapshot_prior_level = None;
+        Ok(())
     }
 
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
@@ -1914,68 +2325,107 @@ impl VfsFile for WindowsFile {
                 "Windows external maintenance fence is already held",
             ));
         }
+
+        self.ensure_stock_main_locks()?;
+        let (write_preheld, checkpoint_preheld) = if wal_mode {
+            (
+                self.owns_exclusive_shm_slot(WAL_WRITE_LOCK)?,
+                self.owns_exclusive_shm_slot(WAL_CKPT_LOCK)?,
+            )
+        } else {
+            (false, false)
+        };
+        self.external_maintenance_locks = Some(WindowsExternalMaintenanceLocks::new(
+            wal_mode,
+            self.lock_level,
+        ));
+
         // Every participant uses the same deadlock-free order: WAL
-        // writer/checkpointer slots first, then main-file EXCLUSIVE. Acquire
-        // the cooperative slots before the matching real `-shm` bytes so a
-        // FrankenSQLite peer cannot enter between the two surfaces.
-        self.acquire_cooperative_wal_maintenance_locks(cx, wal_mode)?;
-        if let Err(stock_error) = self.acquire_stock_sqlite_maintenance_locks(wal_mode) {
-            let cooperative_cleanup = self.release_cooperative_wal_maintenance_locks(cx, wal_mode);
-            return match cooperative_cleanup {
-                Ok(()) => Err(stock_error),
-                Err(cleanup_error) => Err(FrankenError::internal(format!(
-                    "Windows external maintenance fence failed and cooperative cleanup also failed: stock={stock_error}; cleanup={cleanup_error}"
-                ))),
-            };
-        }
-        if let Err(main_error) = self.lock(cx, LockLevel::Exclusive) {
-            let stock_cleanup = self.release_stock_sqlite_maintenance_locks();
-            let cooperative_cleanup = self.release_cooperative_wal_maintenance_locks(cx, wal_mode);
-            return match (stock_cleanup, cooperative_cleanup) {
-                (Ok(()), Ok(())) => Err(main_error),
-                (stock_result, cooperative_result) => Err(FrankenError::internal(format!(
-                    "Windows external maintenance could not acquire main EXCLUSIVE or release its WAL fences: main={main_error}; stock_cleanup={stock_result:?}; cooperative_cleanup={cooperative_result:?}"
-                ))),
-            };
-        }
+        // writer/checkpointer slots first, then main-file EXCLUSIVE. Ordinary
+        // Windows SHM acquisition publishes the process-local slot and its
+        // matching real `-shm` byte together under the shared state mutex.
+        self.acquire_cooperative_wal_maintenance_locks(
+            cx,
+            wal_mode,
+            write_preheld,
+            checkpoint_preheld,
+        )?;
+        self.verify_stock_sqlite_maintenance_locks(wal_mode)?;
+        self.lock(cx, LockLevel::Exclusive)?;
         Ok(())
     }
 
-    fn unlock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
-        let actual_wal_mode = self
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        let Some((actual_wal_mode, prior_main_level, main_restore_pending)) =
+            self.external_maintenance_locks.as_ref().map(|attempt| {
+                (
+                    attempt.wal_mode,
+                    attempt.prior_main_level,
+                    attempt.main_restore_pending,
+                )
+            })
+        else {
+            return Ok(());
+        };
+        let mut failures = Vec::new();
+
+        if main_restore_pending {
+            match self.restore_ordinary_lock_level(cx, prior_main_level) {
+                Ok(()) => {
+                    if let Some(attempt) = self.external_maintenance_locks.as_mut() {
+                        attempt.main_restore_pending = false;
+                    }
+                }
+                Err(error) => failures.push(format!("main lock level: {error}")),
+            }
+        }
+
+        if actual_wal_mode {
+            for (slot, checkpoint_slot) in [(WAL_CKPT_LOCK, true), (WAL_WRITE_LOCK, false)] {
+                let attempt = self.external_maintenance_locks.as_ref().ok_or_else(|| {
+                    FrankenError::internal(
+                        "Windows maintenance lost its attempt marker during restoration",
+                    )
+                })?;
+                let acquired = if checkpoint_slot {
+                    attempt.wal_checkpoint_acquired
+                } else {
+                    attempt.wal_write_acquired
+                };
+                if !acquired {
+                    continue;
+                }
+                match self.shm_lock(cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE) {
+                    Ok(()) => {
+                        if let Some(attempt) = self.external_maintenance_locks.as_mut() {
+                            if checkpoint_slot {
+                                attempt.wal_checkpoint_acquired = false;
+                            } else {
+                                attempt.wal_write_acquired = false;
+                            }
+                        }
+                    }
+                    Err(error) => failures.push(format!("WAL slot {slot}: {error}")),
+                }
+            }
+        }
+
+        let restoration_complete = self
             .external_maintenance_locks
             .as_ref()
-            .map_or(wal_mode, |locks| locks.wal_mode);
-        let mode_mismatch =
-            self.external_maintenance_locks.is_some() && actual_wal_mode != wal_mode;
-        // Release in the exact reverse of acquisition: main, real WAL bytes,
-        // then the in-process/cooperative WAL slots.
-        let main_result = self.unlock(cx, LockLevel::None);
-        let stock_result = self.release_stock_sqlite_maintenance_locks();
-        let cooperative_result =
-            self.release_cooperative_wal_maintenance_locks(cx, actual_wal_mode);
+            .is_some_and(WindowsExternalMaintenanceLocks::restoration_complete);
+        if restoration_complete && failures.is_empty() {
+            let _ = self.external_maintenance_locks.take();
+        }
 
-        let release_result = if main_result.is_ok()
-            && stock_result.is_ok()
-            && cooperative_result.is_ok()
-        {
+        if failures.is_empty() {
             Ok(())
         } else {
             Err(FrankenError::internal(format!(
-                "Windows external maintenance could not release every lock: main={main_result:?}; stock={stock_result:?}; cooperative={cooperative_result:?}"
+                "Windows external maintenance restoration was incomplete: {}",
+                failures.join("; ")
             )))
-        };
-        if mode_mismatch {
-            return match release_result {
-                Ok(()) => Err(FrankenError::internal(format!(
-                    "Windows external maintenance unlock mode mismatch: acquired wal_mode={actual_wal_mode}, requested wal_mode={wal_mode}"
-                ))),
-                Err(release_error) => Err(FrankenError::internal(format!(
-                    "Windows external maintenance unlock mode mismatch and cleanup failed: acquired wal_mode={actual_wal_mode}, requested wal_mode={wal_mode}; cleanup={release_error}"
-                ))),
-            };
         }
-        release_result
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
@@ -2159,38 +2609,62 @@ impl VfsFile for WindowsFile {
         if lock_requested {
             let mut acquired: Vec<u32> = Vec::new();
             for slot in offset..end {
-                let result = if exclusive_requested {
-                    Self::acquire_exclusive_slot(&mut state, slot, self.owner_id)
+                let changed = if exclusive_requested {
+                    self.acquire_exclusive_slot(&mut state, slot)
                 } else {
-                    Self::acquire_shared_slot(&mut state, slot, self.owner_id)
+                    self.acquire_shared_slot(&mut state, slot).map(|()| true)
                 };
 
-                if let Err(err) = result {
-                    for acquired_slot in acquired.into_iter().rev() {
-                        let rollback = if exclusive_requested {
-                            Self::release_exclusive_slot(&mut state, acquired_slot, self.owner_id)
-                        } else {
-                            Self::release_shared_slot(&mut state, acquired_slot, self.owner_id)
-                        };
-                        if rollback.is_err() {
-                            break;
+                let changed = match changed {
+                    Ok(changed) => changed,
+                    Err(err) => {
+                        let mut rollback_errors = Vec::new();
+                        for acquired_slot in acquired.into_iter().rev() {
+                            let rollback = if exclusive_requested {
+                                self.release_exclusive_slot(&mut state, acquired_slot)
+                            } else {
+                                self.release_shared_slot(&mut state, acquired_slot)
+                            };
+                            if let Err(rollback_error) = rollback {
+                                rollback_errors
+                                    .push(format!("slot {acquired_slot}: {rollback_error}"));
+                            }
                         }
+                        if rollback_errors.is_empty() {
+                            return Err(err);
+                        }
+                        return Err(FrankenError::internal(format!(
+                            "Windows SHM acquisition failed and reverse-order unwind was incomplete: lock={err}; unwind={}",
+                            rollback_errors.join("; ")
+                        )));
                     }
-                    return Err(err);
+                };
+                if changed {
+                    acquired.push(slot);
                 }
-                acquired.push(slot);
             }
             return Ok(());
         }
 
-        for slot in offset..end {
-            if exclusive_requested {
-                Self::release_exclusive_slot(&mut state, slot, self.owner_id)?;
+        let mut release_errors = Vec::new();
+        for slot in (offset..end).rev() {
+            let release = if exclusive_requested {
+                self.release_exclusive_slot(&mut state, slot)
             } else {
-                Self::release_shared_slot(&mut state, slot, self.owner_id)?;
+                self.release_shared_slot(&mut state, slot)
+            };
+            if let Err(error) = release {
+                release_errors.push(format!("slot {slot}: {error}"));
             }
         }
-        Ok(())
+        if release_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(FrankenError::internal(format!(
+                "Windows SHM range release was incomplete: {}",
+                release_errors.join("; ")
+            )))
+        }
     }
 
     fn shm_barrier(&self) {
@@ -2207,7 +2681,13 @@ impl Drop for WindowsFile {
     fn drop(&mut self) {
         if !self.is_closed() || self.shm_state.is_some() {
             let cx = Cx::new();
-            let _ = self.close(&cx);
+            if let Err(error) = self.close(&cx) {
+                warn!(
+                    path = %self.path.display(),
+                    error = %error,
+                    "Windows VFS cleanup failed during file drop"
+                );
+            }
         }
     }
 }
@@ -2215,8 +2695,11 @@ impl Drop for WindowsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::process::Command;
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::process::{Child, ChildStdin, Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     struct TempPathCleanup(PathBuf);
@@ -2227,8 +2710,149 @@ mod tests {
         }
     }
 
+    struct SqliteWalKeeper {
+        child: Option<Child>,
+        stdin: Option<ChildStdin>,
+    }
+
+    impl SqliteWalKeeper {
+        fn start(path: &Path) -> Self {
+            let mut child = Command::new("sqlite3")
+                .arg(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn sqlite3 WAL keeper");
+            let mut stdin = child.stdin.take().expect("keeper stdin");
+            let stdout = child.stdout.take().expect("keeper stdout");
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                let mut stdout = BufReader::new(stdout);
+                let mut line = String::new();
+                let mut saw_wal = false;
+                loop {
+                    line.clear();
+                    match stdout.read_line(&mut line) {
+                        Ok(0) => {
+                            let _ = ready_tx
+                                .send(Err("sqlite3 keeper exited before readiness".to_string()));
+                            return;
+                        }
+                        Ok(_) if line.trim().eq_ignore_ascii_case("wal") => saw_wal = true,
+                        Ok(_) if line.trim() == "FSQLITE_WAL_READY" => {
+                            let _ = ready_tx.send(Ok(saw_wal));
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "could not read sqlite3 keeper readiness: {error}"
+                            )));
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let write_result = writeln!(
+                stdin,
+                ".bail on\nPRAGMA journal_mode=WAL;\nSELECT 'FSQLITE_WAL_READY';"
+            )
+            .and_then(|()| stdin.flush());
+            let readiness = write_result
+                .map_err(|error| format!("could not initialize sqlite3 keeper: {error}"))
+                .and_then(|()| {
+                    ready_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|error| format!("sqlite3 keeper readiness timed out: {error}"))?
+                });
+            match readiness {
+                Ok(true) => {
+                    reader.join().expect("join sqlite3 readiness reader");
+                    Self {
+                        child: Some(child),
+                        stdin: Some(stdin),
+                    }
+                }
+                Ok(false) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    reader.join().expect("join sqlite3 readiness reader");
+                    panic!("sqlite3 keeper did not confirm WAL mode");
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    reader.join().expect("join sqlite3 readiness reader");
+                    panic!("{error}");
+                }
+            }
+        }
+
+        fn shutdown(mut self) {
+            if let Some(mut stdin) = self.stdin.take() {
+                let _ = writeln!(stdin, ".quit");
+                let _ = stdin.flush();
+            }
+            let Some(mut child) = self.child.take() else {
+                return;
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "sqlite3 WAL keeper exited with {status}");
+                        return;
+                    }
+                    Ok(None) => thread::sleep(Duration::from_millis(10)),
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("could not wait for sqlite3 WAL keeper: {error}");
+                    }
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("sqlite3 WAL keeper did not exit within five seconds");
+        }
+    }
+
+    impl Drop for SqliteWalKeeper {
+        fn drop(&mut self) {
+            drop(self.stdin.take());
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     fn open_flags_create() -> VfsOpenFlags {
         VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
+    }
+
+    fn open_stock_shm_probe(path: &Path) -> File {
+        let (file, _) = open_windows_lock_sidecar(path).expect("open stock -shm lock probe");
+        file
+    }
+
+    fn inject_missing_stock_shm_range(
+        file: &WindowsFile,
+        slot: u32,
+    ) -> Arc<Mutex<WindowsShmState>> {
+        let state = file.shm_state.as_ref().map(Arc::clone).expect("SHM state");
+        let lock_byte = WindowsFile::stock_shm_lock_byte(slot).expect("stock SHM lock byte");
+        {
+            let state_guard = state.lock().expect("lock SHM state for fault injection");
+            let shm_file = state_guard
+                .stock_shm_file
+                .as_ref()
+                .expect("aggregate stock -shm handle");
+            unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1)
+                .expect("inject missing aggregate SHM range");
+        }
+        state
     }
 
     fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -2367,13 +2991,13 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("create_write.db");
         let vfs = WindowsVfs::new();
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create())
             .expect("open file");
 
-        file.write(&cx, b"hello windows", 0).expect("write");
+        crate::block_on_test_io(&cx, file.write(&cx, b"hello windows", 0)).expect("write");
         let mut buf = [0_u8; 13];
-        let n = file.read(&cx, &mut buf, 0).expect("read");
+        let n = crate::block_on_test_io(&cx, file.read(&cx, &mut buf, 0)).expect("read");
         assert_eq!(n, 13);
         assert_eq!(&buf, b"hello windows");
     }
@@ -2485,13 +3109,13 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("read_at.db");
         let vfs = WindowsVfs::new();
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create())
             .expect("open file");
-        file.write(&cx, b"0123456789", 0).expect("write");
+        crate::block_on_test_io(&cx, file.write(&cx, b"0123456789", 0)).expect("write");
 
         let mut buf = [0_u8; 4];
-        let n = file.read(&cx, &mut buf, 3).expect("read");
+        let n = crate::block_on_test_io(&cx, file.read(&cx, &mut buf, 3)).expect("read");
         assert_eq!(n, 4);
         assert_eq!(&buf, b"3456");
     }
@@ -2502,14 +3126,14 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("write_at.db");
         let vfs = WindowsVfs::new();
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create())
             .expect("open file");
-        file.write(&cx, b"abcdefghij", 0).expect("write base");
-        file.write(&cx, b"WXYZ", 2).expect("write overlay");
+        crate::block_on_test_io(&cx, file.write(&cx, b"abcdefghij", 0)).expect("write base");
+        crate::block_on_test_io(&cx, file.write(&cx, b"WXYZ", 2)).expect("write overlay");
 
         let mut buf = [0_u8; 10];
-        let n = file.read(&cx, &mut buf, 0).expect("read");
+        let n = crate::block_on_test_io(&cx, file.read(&cx, &mut buf, 0)).expect("read");
         assert_eq!(n, 10);
         assert_eq!(&buf, b"abWXYZghij");
     }
@@ -2523,7 +3147,7 @@ mod tests {
         let (mut file, _) = vfs
             .open(&cx, Some(&path), open_flags_create())
             .expect("open file");
-        file.write(&cx, &[7_u8; 4096], 0).expect("write");
+        crate::block_on_test_io(&cx, file.write(&cx, &[7_u8; 4096], 0)).expect("write");
         assert_eq!(file.file_size(&cx).expect("size"), 4096);
 
         file.truncate(&cx, 1024).expect("truncate");
@@ -2896,6 +3520,188 @@ mod tests {
     }
 
     #[test]
+    fn test_external_attempt_restore_before_acquisition_is_noop() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("external_restore_before_attempt.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open external-fence handle");
+
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("snapshot restoration before acquisition");
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("maintenance restoration before acquisition");
+
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert!(file.external_shared_snapshot_prior_level.is_none());
+        assert!(file.external_maintenance_locks.is_none());
+        assert!(
+            file.shm_state.is_none(),
+            "a restoration before acquisition must not create SHM state"
+        );
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_stock_main_clone_failure_precedes_cooperative_external_locks() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("external_clone_failure.db");
+        let vfs = WindowsVfs::new();
+        let (mut attempted, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open attempted external-fence handle");
+        let (mut probe, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open independent lock probe");
+
+        attempted.fail_next_stock_main_clone = true;
+        let snapshot_error = attempted
+            .lock_external_shared_snapshot(&cx)
+            .expect_err("injected stock-main handle duplication must fail");
+        assert!(
+            snapshot_error
+                .to_string()
+                .contains("injected Windows main-handle clone failure")
+        );
+        assert_eq!(attempted.lock_level, LockLevel::None);
+        assert!(attempted.stock_main_locks.is_none());
+        assert!(attempted.external_shared_snapshot_prior_level.is_none());
+        assert!(
+            attempted
+                .os_locks
+                .as_ref()
+                .is_some_and(|locks| locks.held_levels == [false; 4])
+        );
+        assert!(attempted.shm_state.is_none());
+
+        probe
+            .lock(&cx, LockLevel::Exclusive)
+            .expect("failed snapshot preflight must leave no cooperative lock");
+        probe
+            .unlock(&cx, LockLevel::None)
+            .expect("release snapshot probe");
+        attempted
+            .restore_external_shared_snapshot_attempt(&cx)
+            .expect("preflight failure leaves restoration as an idempotent no-op");
+
+        attempted.fail_next_stock_main_clone = true;
+        let maintenance_error = attempted
+            .lock_external_maintenance(&cx, true)
+            .expect_err("injected stock-main handle duplication must fail");
+        assert!(
+            maintenance_error
+                .to_string()
+                .contains("injected Windows main-handle clone failure")
+        );
+        assert_eq!(attempted.lock_level, LockLevel::None);
+        assert!(attempted.stock_main_locks.is_none());
+        assert!(attempted.external_maintenance_locks.is_none());
+        assert!(
+            attempted
+                .os_locks
+                .as_ref()
+                .is_some_and(|locks| locks.held_levels == [false; 4])
+        );
+        assert!(
+            attempted.shm_state.is_none(),
+            "maintenance preflight must fail before opening or locking -shm"
+        );
+        assert!(
+            !sqlite_shm_path(&path).exists(),
+            "maintenance preflight must not create a stock-visible -shm file"
+        );
+
+        probe
+            .lock(&cx, LockLevel::Exclusive)
+            .expect("failed maintenance preflight must leave no cooperative lock");
+        probe
+            .unlock(&cx, LockLevel::None)
+            .expect("release maintenance probe");
+        attempted
+            .restore_external_maintenance_attempt(&cx)
+            .expect("preflight failure leaves restoration as an idempotent no-op");
+        attempted
+            .lock_external_shared_snapshot(&cx)
+            .expect("one-shot clone failures must permit a clean snapshot retry");
+        attempted
+            .restore_external_shared_snapshot_attempt(&cx)
+            .expect("restore snapshot retry");
+        attempted
+            .lock_external_maintenance(&cx, true)
+            .expect("one-shot clone failure must permit a clean maintenance retry");
+        attempted
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore maintenance retry");
+
+        attempted.close(&cx).unwrap();
+        probe.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_attempt_restore_is_idempotent_after_success() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("external_double_restore.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open external-fence handle");
+
+        file.lock_external_shared_snapshot(&cx)
+            .expect("acquire snapshot fence");
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("first snapshot restoration");
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("second snapshot restoration");
+
+        file.lock_external_maintenance(&cx, false)
+            .expect("acquire maintenance fence");
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("first maintenance restoration");
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("second maintenance restoration");
+
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert!(file.external_shared_snapshot_prior_level.is_none());
+        assert!(file.external_maintenance_locks.is_none());
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_maintenance_restore_uses_recorded_wal_mode() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("external_maintenance_recorded_mode.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open external-fence handle");
+
+        file.lock_external_maintenance(&cx, true)
+            .expect("acquire WAL maintenance fence");
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("restore every surface recorded by the backend attempt");
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert!(
+            !file
+                .owns_exclusive_shm_slot(WAL_WRITE_LOCK)
+                .expect("inspect restored write slot")
+        );
+        assert!(
+            !file
+                .owns_exclusive_shm_slot(WAL_CKPT_LOCK)
+                .expect("inspect restored checkpoint slot")
+        );
+        assert!(file.external_maintenance_locks.is_none());
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("repeated restoration remains a no-op");
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
     fn test_external_shared_snapshot_uses_stock_sqlite_main_range() {
         let cx = Cx::new();
         let dir = tempdir().unwrap();
@@ -2932,7 +3738,7 @@ mod tests {
             .expect("unlock pending probe");
 
         snapshot
-            .unlock_external_shared_snapshot(&cx)
+            .restore_external_shared_snapshot_attempt(&cx)
             .expect("release external shared-snapshot fence");
         try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_SHARED_FIRST, STOCK_SQLITE_SHARED_SIZE)
             .expect("released shared range must be exclusively acquirable");
@@ -2968,7 +3774,11 @@ mod tests {
             Err(FrankenError::Busy)
         ));
         assert_eq!(snapshot.lock_level, LockLevel::None);
-        assert!(snapshot.external_shared_snapshot_prior_level.is_none());
+        assert_eq!(
+            snapshot.external_shared_snapshot_prior_level,
+            Some(LockLevel::None),
+            "a failed acquisition must retain its exact pre-attempt baseline until restoration succeeds"
+        );
         let stock = snapshot
             .stock_main_locks
             .as_ref()
@@ -2982,6 +3792,14 @@ mod tests {
         unlock_stock_sqlite_range(&blocker, STOCK_SQLITE_PENDING_BYTE, 1)
             .expect("unlock pending probe");
 
+        snapshot
+            .restore_external_shared_snapshot_attempt(&cx)
+            .expect("restore failed snapshot attempt");
+        assert!(
+            snapshot.external_shared_snapshot_prior_level.is_none(),
+            "successful restoration must disarm the acquisition-attempt marker"
+        );
+
         unlock_stock_sqlite_range(
             &blocker,
             STOCK_SQLITE_SHARED_FIRST,
@@ -2992,7 +3810,7 @@ mod tests {
             .lock_external_shared_snapshot(&cx)
             .expect("retry after contention must succeed");
         snapshot
-            .unlock_external_shared_snapshot(&cx)
+            .restore_external_shared_snapshot_attempt(&cx)
             .expect("retry fence must release cleanly");
         snapshot.close(&cx).unwrap();
     }
@@ -3017,15 +3835,18 @@ mod tests {
             maintenance.lock_external_maintenance(&cx, false),
             Err(FrankenError::Busy)
         ));
+        maintenance
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore failed maintenance attempt");
         snapshot
-            .unlock_external_shared_snapshot(&cx)
+            .restore_external_shared_snapshot_attempt(&cx)
             .expect("release shared snapshot");
 
         maintenance
             .lock_external_maintenance(&cx, false)
             .expect("maintenance must succeed after shared snapshot releases");
         maintenance
-            .unlock_external_maintenance(&cx, false)
+            .restore_external_maintenance_attempt(&cx)
             .expect("release maintenance");
         snapshot.close(&cx).unwrap();
         maintenance.close(&cx).unwrap();
@@ -3066,7 +3887,7 @@ mod tests {
         }
 
         maintenance
-            .unlock_external_maintenance(&cx, false)
+            .restore_external_maintenance_attempt(&cx)
             .expect("release external maintenance fence");
         for (offset, len) in [
             (STOCK_SQLITE_PENDING_BYTE, 1),
@@ -3111,7 +3932,7 @@ mod tests {
         }
 
         maintenance
-            .unlock_external_maintenance(&cx, true)
+            .restore_external_maintenance_attempt(&cx)
             .expect("release WAL external maintenance fence");
         for offset in [STOCK_SQLITE_WAL_WRITE_BYTE, STOCK_SQLITE_WAL_CKPT_BYTE] {
             try_lock_stock_sqlite_range(&probe, offset, 1)
@@ -3122,7 +3943,122 @@ mod tests {
     }
 
     #[test]
-    fn test_external_maintenance_partial_wal_acquisition_unwinds_every_lock() {
+    fn test_external_maintenance_restore_preserves_prior_main_level() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stock_maintenance_prior_main.db");
+        let vfs = WindowsVfs::new();
+        let (mut maintenance, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open maintenance handle");
+
+        maintenance
+            .lock(&cx, LockLevel::Reserved)
+            .expect("acquire preexisting RESERVED level");
+        maintenance
+            .lock_external_maintenance(&cx, false)
+            .expect("upgrade to external maintenance");
+        assert_eq!(maintenance.lock_level, LockLevel::Exclusive);
+        assert_eq!(
+            maintenance
+                .external_maintenance_locks
+                .as_ref()
+                .expect("maintenance marker")
+                .prior_main_level,
+            LockLevel::Reserved
+        );
+
+        maintenance
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore exact preexisting main level");
+        assert_eq!(maintenance.lock_level, LockLevel::Reserved);
+        assert_eq!(
+            maintenance
+                .stock_main_locks
+                .as_ref()
+                .expect("stock main lock state")
+                .lock_level,
+            LockLevel::Reserved
+        );
+        maintenance
+            .restore_external_maintenance_attempt(&cx)
+            .expect("second restoration must preserve the prior level");
+        assert_eq!(maintenance.lock_level, LockLevel::Reserved);
+
+        maintenance
+            .unlock(&cx, LockLevel::None)
+            .expect("release preexisting RESERVED level");
+        maintenance.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_maintenance_restore_preserves_preheld_wal_slot() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stock_maintenance_preheld_wal.db");
+        let shm_path = sqlite_shm_path(&path);
+        let vfs = WindowsVfs::new();
+        let (mut maintenance, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open maintenance handle");
+
+        maintenance
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .expect("acquire preexisting WAL write slot");
+        maintenance
+            .lock_external_maintenance(&cx, true)
+            .expect("acquire maintenance around preheld WAL write");
+        let attempt = maintenance
+            .external_maintenance_locks
+            .as_ref()
+            .expect("maintenance marker");
+        assert!(!attempt.wal_write_acquired);
+        assert!(attempt.wal_checkpoint_acquired);
+
+        maintenance
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore only attempt-owned WAL slots");
+        assert!(maintenance.external_maintenance_locks.is_none());
+        assert!(
+            maintenance
+                .owns_exclusive_shm_slot(WAL_WRITE_LOCK)
+                .expect("inspect preheld write slot"),
+            "restoration must preserve same-owner preexisting ownership"
+        );
+        assert!(
+            !maintenance
+                .owns_exclusive_shm_slot(WAL_CKPT_LOCK)
+                .expect("inspect attempt-owned checkpoint slot")
+        );
+
+        let probe = open_stock_shm_probe(&shm_path);
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_CKPT_BYTE, 1)
+            .expect("attempt-owned checkpoint byte must be released");
+        unlock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_CKPT_BYTE, 1)
+            .expect("unlock checkpoint probe");
+
+        maintenance
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .expect("release preexisting WAL write slot");
+        maintenance.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_maintenance_partial_wal_acquisition_is_retry_restorable() {
         let cx = Cx::new();
         let dir = tempdir().unwrap();
         let path = dir.path().join("stock_maintenance_unwind.db");
@@ -3140,16 +4076,32 @@ mod tests {
             Err(FrankenError::Busy)
         ));
 
-        // The write byte was acquired before checkpoint contention and must
-        // have been unwound. Main ranges were never reached and the local
-        // cooperative locks must also have been released so a retry can work.
+        // The write byte was acquired before checkpoint contention. The armed
+        // attempt must remember exactly that new ownership while preserving
+        // the still-unacquired checkpoint slot for a retry-safe restoration.
         assert_eq!(maintenance.lock_level, LockLevel::None);
+        let attempt = maintenance
+            .external_maintenance_locks
+            .as_ref()
+            .expect("failed attempt retains its restoration marker");
+        assert!(attempt.main_restore_pending);
+        assert!(attempt.wal_write_acquired);
+        assert!(!attempt.wal_checkpoint_acquired);
         assert!(
             maintenance.stock_main_locks.is_none(),
             "real WAL contention must be resolved before opening the dedicated stock-main lock handle"
         );
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&blocker, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+
+        maintenance
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore partial WAL acquisition");
+        assert!(maintenance.external_maintenance_locks.is_none());
         try_lock_stock_sqlite_range(&blocker, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
-            .expect("partial WAL write lock must be unwound");
+            .expect("restoration must release the attempt-owned WAL write byte");
         unlock_stock_sqlite_range(&blocker, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
             .expect("unlock WAL write probe");
         unlock_stock_sqlite_range(&blocker, STOCK_SQLITE_WAL_CKPT_BYTE, 1)
@@ -3159,13 +4111,13 @@ mod tests {
             .lock_external_maintenance(&cx, true)
             .expect("retry after contention must succeed");
         maintenance
-            .unlock_external_maintenance(&cx, true)
+            .restore_external_maintenance_attempt(&cx)
             .expect("retry fence must release cleanly");
         maintenance.close(&cx).unwrap();
     }
 
     #[test]
-    fn test_external_maintenance_partial_main_acquisition_unwinds_every_lock() {
+    fn test_external_maintenance_failed_main_acquisition_is_retry_restorable() {
         let cx = Cx::new();
         let dir = tempdir().unwrap();
         let path = dir.path().join("stock_maintenance_main_unwind.db");
@@ -3192,9 +4144,16 @@ mod tests {
             Err(FrankenError::Busy)
         ));
 
-        // PENDING and RESERVED were acquired before the SHARED-range
-        // contention. Both must have been unwound, as must the FrankenSQLite
-        // sidecar locks, so a retry can succeed after the blocker leaves.
+        // Ordinary main-lock acquisition rolls its own partial prefix back,
+        // while the external-attempt marker retains both newly acquired WAL
+        // slots until the caller performs the required restoration.
+        let attempt = maintenance
+            .external_maintenance_locks
+            .as_ref()
+            .expect("failed main acquisition retains its restoration marker");
+        assert!(attempt.main_restore_pending);
+        assert!(attempt.wal_write_acquired);
+        assert!(attempt.wal_checkpoint_acquired);
         for offset in [STOCK_SQLITE_PENDING_BYTE, STOCK_SQLITE_RESERVED_BYTE] {
             try_lock_stock_sqlite_range(&blocker, offset, 1)
                 .expect("partial main lock must be unwound");
@@ -3205,10 +4164,21 @@ mod tests {
             .read(true)
             .write(true)
             .open(&shm_path)
-            .expect("open released -shm lock probe");
+            .expect("open -shm lock probe");
+        for offset in [STOCK_SQLITE_WAL_WRITE_BYTE, STOCK_SQLITE_WAL_CKPT_BYTE] {
+            assert!(matches!(
+                try_lock_stock_sqlite_range(&shm_probe, offset, 1),
+                Err(FrankenError::Busy)
+            ));
+        }
+
+        maintenance
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore failed main acquisition");
+        assert!(maintenance.external_maintenance_locks.is_none());
         for offset in [STOCK_SQLITE_WAL_WRITE_BYTE, STOCK_SQLITE_WAL_CKPT_BYTE] {
             try_lock_stock_sqlite_range(&shm_probe, offset, 1)
-                .expect("main-lock failure must unwind the earlier real WAL fence");
+                .expect("restoration must release the earlier real WAL fence");
             unlock_stock_sqlite_range(&shm_probe, offset, 1).expect("unlock WAL-range probe");
         }
         unlock_stock_sqlite_range(
@@ -3222,8 +4192,68 @@ mod tests {
             .lock_external_maintenance(&cx, true)
             .expect("retry after contention must succeed");
         maintenance
-            .unlock_external_maintenance(&cx, true)
+            .restore_external_maintenance_attempt(&cx)
             .expect("retry fence must release cleanly");
+        maintenance.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_maintenance_restore_retries_each_failed_surface() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stock_maintenance_partial_restore.db");
+        let vfs = WindowsVfs::new();
+        let (mut maintenance, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open maintenance handle");
+
+        maintenance
+            .lock_external_maintenance(&cx, true)
+            .expect("acquire WAL maintenance fence");
+        let state = maintenance
+            .shm_state
+            .as_ref()
+            .map(Arc::clone)
+            .expect("maintenance SHM state");
+        state
+            .lock()
+            .expect("inject SHM restoration failure")
+            .poisoned = Some("injected maintenance restoration failure".to_string());
+
+        assert!(
+            maintenance
+                .restore_external_maintenance_attempt(&cx)
+                .is_err(),
+            "poisoned WAL surfaces must make the first restoration fail"
+        );
+        assert_eq!(
+            maintenance.lock_level,
+            LockLevel::None,
+            "main restoration must still run when both WAL surfaces fail"
+        );
+        let attempt = maintenance
+            .external_maintenance_locks
+            .as_ref()
+            .expect("failed restoration retains its exact attempt marker");
+        assert!(!attempt.main_restore_pending);
+        assert!(attempt.wal_write_acquired);
+        assert!(attempt.wal_checkpoint_acquired);
+
+        state.lock().expect("clear injected SHM failure").poisoned = None;
+        maintenance
+            .restore_external_maintenance_attempt(&cx)
+            .expect("retry every still-owned WAL surface");
+        assert!(maintenance.external_maintenance_locks.is_none());
+        assert!(
+            !maintenance
+                .owns_exclusive_shm_slot(WAL_WRITE_LOCK)
+                .expect("inspect restored write slot")
+        );
+        assert!(
+            !maintenance
+                .owns_exclusive_shm_slot(WAL_CKPT_LOCK)
+                .expect("inspect restored checkpoint slot")
+        );
         maintenance.close(&cx).unwrap();
     }
 
@@ -3241,10 +4271,545 @@ mod tests {
             .expect("acquire shared");
         file.shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
             .expect("upgrade to exclusive");
+        let probe = open_stock_shm_probe(&file.shm_path);
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
         file.shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
             .expect("downgrade from exclusive");
+        assert!(
+            matches!(
+                try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+                Err(FrankenError::Busy)
+            ),
+            "exclusive unlock must restore the owner's earlier shared OS lock"
+        );
         file.shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
             .expect("release preserved shared lock");
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("final shared unlock must release the real WAL byte");
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("unlock final probe");
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_failed_promotion_restores_shared_lock() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_failed_promotion.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        file.shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .expect("acquire FrankenSQLite shared lock");
+        let probe = open_stock_shm_probe(&file.shm_path);
+        try_lock_stock_sqlite_shared_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("acquire independent stock shared lock");
+
+        assert!(matches!(
+            file.shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE),
+            Err(FrankenError::Busy)
+        ));
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("release independent shared blocker");
+        assert!(
+            matches!(
+                try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+                Err(FrankenError::Busy)
+            ),
+            "failed promotion must restore FrankenSQLite's aggregate shared lock"
+        );
+
+        file.shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .expect("release restored FrankenSQLite shared lock");
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("shared byte must release after the original owner unlocks");
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("unlock final probe");
+    }
+
+    #[test]
+    fn test_windowsvfs_missing_ordinary_shm_unlock_restores_fence_and_poison() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let vfs = WindowsVfs::new();
+
+        for (label, mode_flag) in [
+            ("shared", SQLITE_SHM_SHARED),
+            ("exclusive", SQLITE_SHM_EXCLUSIVE),
+        ] {
+            let path = dir.path().join(format!("shm_missing_{label}_unlock.db"));
+            let (mut file, _) = vfs
+                .open(&cx, Some(&path), open_flags_create())
+                .expect("open file");
+            file.shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_LOCK | mode_flag)
+                .expect("acquire SHM lock");
+            let state = inject_missing_stock_shm_range(&file, WAL_WRITE_LOCK);
+
+            assert!(matches!(
+                file.shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_UNLOCK | mode_flag,),
+                Err(FrankenError::Internal(_))
+            ));
+            {
+                let state = state.lock().expect("inspect poisoned SHM state");
+                assert!(
+                    state
+                        .poisoned
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("ERROR_NOT_LOCKED")),
+                    "missing {label} unlock must poison the process lock domain"
+                );
+            }
+
+            let probe = open_stock_shm_probe(&file.shm_path);
+            assert!(
+                matches!(
+                    try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+                    Err(FrankenError::Busy)
+                ),
+                "missing {label} unlock must restore a stock-visible fence before failing"
+            );
+            file.shm_unmap(&cx, false)
+                .expect("final poisoned owner drains the domain");
+            try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+                .expect("final poison teardown releases the restored fence");
+            unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+                .expect("unlock final probe");
+        }
+    }
+
+    #[test]
+    fn test_windowsvfs_missing_promotion_unlock_restores_shared_fence_and_poison() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_missing_promotion_unlock.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        file.shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .expect("acquire shared SHM lock");
+        let state = inject_missing_stock_shm_range(&file, WAL_WRITE_LOCK);
+
+        assert!(matches!(
+            file.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            ),
+            Err(FrankenError::Internal(_))
+        ));
+        assert!(
+            state
+                .lock()
+                .expect("inspect poisoned SHM state")
+                .poisoned
+                .as_deref()
+                .is_some_and(|detail| detail.contains("ERROR_NOT_LOCKED")),
+            "a missing promotion unlock must poison the process lock domain"
+        );
+
+        let probe = open_stock_shm_probe(&file.shm_path);
+        assert!(
+            matches!(
+                try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+                Err(FrankenError::Busy)
+            ),
+            "failed promotion must restore the aggregate shared fence"
+        );
+        file.shm_unmap(&cx, false)
+            .expect("final poisoned owner drains the domain");
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("final poison teardown releases the restored fence");
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("unlock final probe");
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_shared_lock_is_process_aggregated_and_refcounted() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_shared_aggregate.db");
+        let vfs = WindowsVfs::new();
+        let (mut file_a, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open A");
+        let (mut file_b, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open B");
+
+        file_a
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .expect("A first shared");
+        file_a
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .expect("A repeated shared");
+        file_b
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .expect("B shared");
+
+        let probe = open_stock_shm_probe(&file_a.shm_path);
+        try_lock_stock_sqlite_shared_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("independent stock shared lock must coexist");
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("unlock shared probe");
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+
+        file_a
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .expect("A first shared release");
+        assert!(
+            matches!(
+                try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+                Err(FrankenError::Busy)
+            ),
+            "A refcount and B's hold must keep the aggregate byte locked"
+        );
+        file_a
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .expect("A final shared release");
+        assert!(
+            matches!(
+                try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+                Err(FrankenError::Busy)
+            ),
+            "B's shared hold must survive A's final release"
+        );
+        file_b
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .expect("B shared release");
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("last process-local shared release must unlock the real byte");
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("unlock exclusive probe");
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_exclusive_locks_all_stock_wal_bytes() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_all_slots.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+
+        for slot in 0..WAL_TOTAL_LOCKS {
+            let lock_byte = STOCK_SQLITE_SHM_LOCK_BASE + u64::from(slot);
+            file.shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                .expect("acquire exclusive slot");
+            let probe = open_stock_shm_probe(&file.shm_path);
+            assert!(
+                matches!(
+                    try_lock_stock_sqlite_shared_range(&probe, lock_byte, 1),
+                    Err(FrankenError::Busy)
+                ),
+                "slot {slot} must exclude an independent shared probe"
+            );
+            assert!(
+                matches!(
+                    try_lock_stock_sqlite_range(&probe, lock_byte, 1),
+                    Err(FrankenError::Busy)
+                ),
+                "slot {slot} must exclude an independent exclusive probe"
+            );
+            file.shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+                .expect("release exclusive slot");
+            try_lock_stock_sqlite_range(&probe, lock_byte, 1)
+                .expect("released slot must be independently acquirable");
+            unlock_stock_sqlite_range_strict(&probe, lock_byte, 1)
+                .expect("unlock independent probe");
+        }
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_multislot_failure_unwinds_real_and_local_locks() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_multislot_unwind.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        let blocker = open_stock_shm_probe(&file.shm_path);
+        try_lock_stock_sqlite_range(&blocker, STOCK_SQLITE_WAL_CKPT_BYTE, 1)
+            .expect("block checkpoint slot");
+
+        assert!(matches!(
+            file.shm_lock(&cx, 0, 3, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE),
+            Err(FrankenError::Busy)
+        ));
+
+        for slot in [0_u32, 2] {
+            let lock_byte = STOCK_SQLITE_SHM_LOCK_BASE + u64::from(slot);
+            try_lock_stock_sqlite_range(&blocker, lock_byte, 1)
+                .expect("partial multi-slot acquisition must unwind real byte");
+            unlock_stock_sqlite_range_strict(&blocker, lock_byte, 1).expect("unlock unwind probe");
+        }
+        unlock_stock_sqlite_range_strict(&blocker, STOCK_SQLITE_WAL_CKPT_BYTE, 1)
+            .expect("release checkpoint blocker");
+
+        file.shm_lock(&cx, 0, 3, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .expect("retry must prove local slot state was also unwound");
+        file.shm_lock(&cx, 0, 3, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .expect("release retry");
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_multislot_unlock_attempts_every_slot_after_error() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_multislot_unlock_error.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        file.shm_lock(&cx, 0, 2, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .expect("acquire two exclusive slots");
+
+        let state = file.shm_state.as_ref().map(Arc::clone).expect("SHM state");
+        {
+            let mut state = state.lock().expect("lock SHM state");
+            state.slots[1].exclusive_owner = None;
+        }
+        assert!(matches!(
+            file.shm_lock(&cx, 0, 2, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE),
+            Err(FrankenError::Internal(_))
+        ));
+
+        let probe = open_stock_shm_probe(&file.shm_path);
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("slot 0 must release even after slot 1 reports an error");
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("unlock slot 0 probe");
+        assert!(
+            matches!(
+                try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_CKPT_BYTE, 1),
+                Err(FrankenError::Busy)
+            ),
+            "the deliberately mismatched slot 1 real lock must remain fail-closed"
+        );
+
+        {
+            let mut state = state.lock().expect("lock SHM state for cleanup");
+            state.slots[1].exclusive_owner = Some(file.owner_id);
+        }
+        file.shm_lock(
+            &cx,
+            WAL_CKPT_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("release deliberately mismatched slot");
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_unmap_close_and_drop_release_stock_bytes() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let vfs = WindowsVfs::new();
+
+        for action in ["unmap", "close", "drop"] {
+            let path = dir.path().join(format!("shm_release_{action}.db"));
+            let (mut file, _) = vfs
+                .open(&cx, Some(&path), open_flags_create())
+                .expect("open file");
+            file.shm_lock(&cx, 0, 2, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                .expect("acquire two slots");
+            let shm_path = file.shm_path.clone();
+            match action {
+                "unmap" => file.shm_unmap(&cx, false).expect("unmap"),
+                "close" => file.close(&cx).expect("close"),
+                "drop" => drop(file),
+                _ => unreachable!(),
+            }
+
+            let probe = open_stock_shm_probe(&shm_path);
+            for slot in 0_u32..2 {
+                let lock_byte = STOCK_SQLITE_SHM_LOCK_BASE + u64::from(slot);
+                try_lock_stock_sqlite_range(&probe, lock_byte, 1)
+                    .expect("lifecycle release must unlock real byte");
+                unlock_stock_sqlite_range_strict(&probe, lock_byte, 1)
+                    .expect("unlock lifecycle probe");
+            }
+        }
+    }
+
+    #[test]
+    fn test_windowsvfs_poisoned_shm_handle_stays_fenced_until_all_owners_drain() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_poisoned_cohort.db");
+        let vfs = WindowsVfs::new();
+        let (mut file_a, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open A");
+        let (mut file_b, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open B");
+        file_a
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .expect("A acquires WAL write slot");
+        file_b
+            .shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .expect("B acquires WAL checkpoint slot");
+
+        let state = file_a
+            .shm_state
+            .as_ref()
+            .map(Arc::clone)
+            .expect("SHM state");
+        state.lock().expect("poison SHM state").poisoned =
+            Some("injected restoration failure".to_string());
+
+        file_a
+            .shm_unmap(&cx, false)
+            .expect("first poisoned owner detaches");
+        let probe = open_stock_shm_probe(&file_b.shm_path);
+        for lock_byte in [STOCK_SQLITE_WAL_WRITE_BYTE, STOCK_SQLITE_WAL_CKPT_BYTE] {
+            assert!(
+                matches!(
+                    try_lock_stock_sqlite_range(&probe, lock_byte, 1),
+                    Err(FrankenError::Busy)
+                ),
+                "a poisoned cohort must retain every possibly-live range until its last owner drains"
+            );
+        }
+        assert!(
+            state
+                .lock()
+                .expect("inspect poisoned state")
+                .poisoned
+                .is_some(),
+            "the surviving owner must remain attached to a fail-closed domain"
+        );
+        assert!(matches!(
+            file_b.shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            ),
+            Err(FrankenError::Internal(_))
+        ));
+
+        file_b
+            .shm_unmap(&cx, false)
+            .expect("last poisoned owner detaches");
+        for lock_byte in [STOCK_SQLITE_WAL_WRITE_BYTE, STOCK_SQLITE_WAL_CKPT_BYTE] {
+            try_lock_stock_sqlite_range(&probe, lock_byte, 1)
+                .expect("last poisoned owner must close the aggregate handle");
+            unlock_stock_sqlite_range_strict(&probe, lock_byte, 1)
+                .expect("unlock final poison-teardown probe");
+        }
+        assert!(
+            windows_shm_table()
+                .get(&file_b.shm_path)
+                .expect("inspect SHM table")
+                .is_none(),
+            "the fully drained poisoned domain must leave the global table"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_owner_close_unlock_failure_detaches_into_poisoned_cohort() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_owner_close_unlock_failure.db");
+        let vfs = WindowsVfs::new();
+        let (mut file_a, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open A");
+        let (mut file_b, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open B");
+        file_a
+            .shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .expect("A acquires WAL write slot");
+        let state = file_b.ensure_shm_state().expect("register B");
+
+        // Fault injection: release the aggregate OS range behind the local
+        // slot table. The next strict owner-close unlock must see
+        // ERROR_NOT_LOCKED, poison the shared domain, and detach A rather than
+        // strand an owner ref that can never be drained after A is dropped.
+        {
+            let state = state.lock().expect("lock SHM state for fault injection");
+            let shm_file = state
+                .stock_shm_file
+                .as_ref()
+                .expect("aggregate stock -shm handle");
+            unlock_stock_sqlite_range_strict(shm_file, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+                .expect("inject missing aggregate shared range");
+        }
+
+        assert!(matches!(
+            file_a.shm_unmap(&cx, false),
+            Err(FrankenError::Internal(_))
+        ));
+        let probe = open_stock_shm_probe(&file_b.shm_path);
+        assert!(
+            matches!(
+                try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+                Err(FrankenError::Busy)
+            ),
+            "owner-close ERROR_NOT_LOCKED recovery must restore the stock-visible fence"
+        );
+        assert!(
+            file_a.shm_state.is_none(),
+            "an owner detached into a poisoned cohort must not retain a retry-only SHM ref"
+        );
+        {
+            let state = state.lock().expect("inspect poisoned cohort");
+            assert!(state.poisoned.is_some());
+            assert!(!state.owner_refs.contains_key(&file_a.owner_id));
+            assert!(state.owner_refs.contains_key(&file_b.owner_id));
+            assert!(
+                state.slots[to_slot_index(WAL_WRITE_LOCK).expect("slot index")]
+                    .shared_holders
+                    .contains_key(&file_a.owner_id),
+                "possibly-live claims stay recorded until the final cohort owner drains"
+            );
+        }
+        assert!(matches!(
+            file_b.shm_lock(
+                &cx,
+                WAL_CKPT_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            ),
+            Err(FrankenError::Internal(_))
+        ));
+
+        file_b
+            .shm_unmap(&cx, false)
+            .expect("final poisoned owner drains the cohort");
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("final poisoned owner must release the restored fence");
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("unlock final owner-close probe");
+        assert!(
+            windows_shm_table()
+                .get(&file_b.shm_path)
+                .expect("inspect SHM table")
+                .is_none(),
+            "final poison teardown must remove the stale owner claim and global domain"
+        );
     }
 
     #[test]
@@ -3626,6 +5191,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_e2e_windowsvfs_c_sqlite_interop() {
         let sqlite_available = Command::new("sqlite3")
             .arg("--version")
@@ -3642,10 +5208,20 @@ mod tests {
 
         let create_status = Command::new("sqlite3")
             .arg(path_str)
-            .arg("CREATE TABLE t(x INTEGER); INSERT INTO t(x) VALUES (1),(2),(3);")
+            .arg(
+                "PRAGMA journal_mode=WAL; \
+                 CREATE TABLE t(x INTEGER); \
+                 INSERT INTO t(x) VALUES (1),(2),(3);",
+            )
             .status()
             .expect("run sqlite3 create");
         assert!(create_status.success());
+
+        // Keep a stock SQLite connection open so its real file-backed WAL
+        // index remains initialized while FrankenSQLite exercises only the
+        // lock protocol. Windows shm_map is still heap-backed, so this test
+        // intentionally makes no broader WAL-index visibility claim.
+        let keeper = SqliteWalKeeper::start(&path);
 
         let vfs = WindowsVfs::new();
         let (mut file, _) = vfs
@@ -3656,10 +5232,96 @@ mod tests {
             )
             .expect("open via windows vfs");
         let mut header = [0_u8; 16];
-        let read = file.read(&cx, &mut header, 0).expect("read sqlite header");
+        let read = crate::block_on_test_io(&cx, file.read(&cx, &mut header, 0))
+            .expect("read sqlite header");
         assert_eq!(read, 16);
         assert_eq!(&header, b"SQLite format 3\0");
+
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("FrankenSQLite acquires stock-visible WAL write slot");
+        let blocked_writer = Command::new("sqlite3")
+            .arg(path_str)
+            .arg("PRAGMA busy_timeout=0; INSERT INTO t(x) VALUES (4);")
+            .output()
+            .expect("run contending sqlite3 writer");
+        assert!(
+            !blocked_writer.status.success(),
+            "stock SQLite writer must not enter while FrankenSQLite holds WAL_WRITE_LOCK"
+        );
+        let blocked_stderr = String::from_utf8_lossy(&blocked_writer.stderr).to_ascii_lowercase();
+        assert!(
+            blocked_stderr.contains("locked") || blocked_stderr.contains("busy"),
+            "stock writer should report lock contention, stderr={blocked_stderr:?}"
+        );
+
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("release stock-visible WAL write slot");
+        let writer_after_release = Command::new("sqlite3")
+            .arg(path_str)
+            .arg("PRAGMA busy_timeout=0; INSERT INTO t(x) VALUES (4);")
+            .output()
+            .expect("run sqlite3 writer after release");
+        assert!(
+            writer_after_release.status.success(),
+            "stock SQLite writer must succeed after WAL_WRITE_LOCK release: {}",
+            String::from_utf8_lossy(&writer_after_release.stderr)
+        );
+
+        file.shm_lock(
+            &cx,
+            WAL_CKPT_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("FrankenSQLite acquires stock-visible WAL checkpoint slot");
+        let blocked_checkpoint = Command::new("sqlite3")
+            .arg(path_str)
+            .arg("PRAGMA busy_timeout=0; PRAGMA wal_checkpoint(TRUNCATE);")
+            .output()
+            .expect("run contending sqlite3 checkpoint");
+        assert!(blocked_checkpoint.status.success());
+        let blocked_checkpoint_stdout =
+            String::from_utf8(blocked_checkpoint.stdout).expect("checkpoint stdout utf8");
+        assert!(
+            blocked_checkpoint_stdout
+                .lines()
+                .any(|line| line.starts_with("1|")),
+            "stock checkpoint must report BUSY while FrankenSQLite holds WAL_CKPT_LOCK, stdout={blocked_checkpoint_stdout:?}"
+        );
+        file.shm_lock(
+            &cx,
+            WAL_CKPT_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("release stock-visible WAL checkpoint slot");
+        let checkpoint_after_release = Command::new("sqlite3")
+            .arg(path_str)
+            .arg("PRAGMA busy_timeout=0; PRAGMA wal_checkpoint(TRUNCATE);")
+            .output()
+            .expect("run sqlite3 checkpoint after release");
+        assert!(checkpoint_after_release.status.success());
+        let checkpoint_after_release_stdout =
+            String::from_utf8(checkpoint_after_release.stdout).expect("checkpoint stdout utf8");
+        assert!(
+            checkpoint_after_release_stdout
+                .lines()
+                .any(|line| line.starts_with("0|")),
+            "stock checkpoint must succeed after WAL_CKPT_LOCK release, stdout={checkpoint_after_release_stdout:?}"
+        );
         file.close(&cx).expect("close vfs file");
+
+        keeper.shutdown();
 
         let query_output = Command::new("sqlite3")
             .arg(path_str)
@@ -3668,7 +5330,7 @@ mod tests {
             .expect("run sqlite3 query");
         assert!(query_output.status.success());
         let stdout = String::from_utf8(query_output.stdout).expect("utf8");
-        assert_eq!(stdout.trim(), "3");
+        assert_eq!(stdout.trim(), "4");
     }
 
     #[test]

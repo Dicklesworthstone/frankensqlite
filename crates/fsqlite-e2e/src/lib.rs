@@ -6,6 +6,34 @@
 //! - **Differential comparison**: running identical SQL against FrankenSQLite and C SQLite
 //! - **Corruption injection**: byte/page/sector-level corruption for recovery testing
 
+// The engine futures composed here are deeply nested; the default limit
+// overflows while type-checking them.
+#![recursion_limit = "512"]
+// bd-h9o9r: this crate drives fsqlite-core's deliberately non-`Send`,
+// deeply nested engine futures (the same nesting behind the
+// `recursion_limit` above); `future_not_send` and `large_futures`
+// contradict that design — see fsqlite-core/src/lib.rs for the full
+// rationale, including why boxing was rejected by the perf ledger.
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
+
+/// Drive an engine future to completion on a harness-owned runtime.
+///
+/// This crate compares FrankenSQLite against synchronous reference engines
+/// (rusqlite) and drives multi-threaded benchmark workloads through sync
+/// executor traits, so the FrankenSQLite side needs a synchronous bridge. The
+/// E2E harness is the top-level consumer here, so owning a runtime is correct
+/// (the engine itself still never builds one — see AGENTS.md).
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    thread_local! {
+        static RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build fsqlite-e2e runtime");
+    }
+    RUNTIME.with(|runtime| runtime.block_on(future))
+}
+
 pub mod baseline;
 pub mod batch_runner;
 pub mod bench_summary;

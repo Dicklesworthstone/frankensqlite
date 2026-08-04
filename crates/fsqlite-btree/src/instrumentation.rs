@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use fsqlite_types::PageNumber;
+use fsqlite_types::{PageNumber, sync_primitives::Instant};
 use serde::{Deserialize, Serialize};
 
 /// Supported B-tree operation types for observability.
@@ -268,7 +268,13 @@ const ADAPTIVE_FILL_FACTOR_MAX_EXTRA_SHIFT_BPS: usize = 1_500;
 const ADAPTIVE_FILL_FACTOR_LEFT_FLOOR_BPS: usize = 1_500;
 const ADAPTIVE_FILL_FACTOR_RIGHT_CEIL_BPS: usize = 9_000;
 
-static CONFLICT_TOPOLOGY_POLICY_MODE: AtomicU64 = AtomicU64::new(2);
+// Non-baseline modes currently retain process-global, page-number-keyed state.
+// Keep them operator-opt-in until that state is owned by an individual database:
+// enabling them by default would let independent databases serialize here and
+// influence one another's split advice for the same page number.
+const CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW: u64 = 0;
+static CONFLICT_TOPOLOGY_POLICY_MODE: AtomicU64 =
+    AtomicU64::new(CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW);
 static CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
 static ADAPTIVE_FILL_FACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static ADAPTIVE_FILL_FACTOR_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
@@ -473,6 +479,10 @@ pub fn set_conflict_topology_policy_mode(mode: ConflictTopologyPolicyMode) {
 }
 
 /// Current rollout mode for conflict-topology split policy.
+///
+/// The default is [`ConflictTopologyPolicyMode::Baseline`]. Advisory and
+/// enforced modes are experimental operator overrides until their mutable heat
+/// state is scoped to a single database rather than the whole process.
 #[must_use]
 pub fn conflict_topology_policy_mode() -> ConflictTopologyPolicyMode {
     apply_conflict_topology_policy_env_once();
@@ -1021,6 +1031,13 @@ pub(crate) fn copy_profile_enabled() -> bool {
     BTREE_COPY_PROFILE_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Read the B-tree copy-profile instrumentation gate.
+#[inline]
+#[must_use]
+pub fn btree_copy_profile_enabled() -> bool {
+    copy_profile_enabled()
+}
+
 /// Start a profiling timer for a hot-path segment.
 ///
 /// Returns `Some(Instant::now())` only when the copy profile gate is enabled;
@@ -1034,12 +1051,12 @@ pub(crate) fn copy_profile_enabled() -> bool {
 /// was checked only inside the recorder — wasting two `clock_gettime`
 /// syscalls per hot-path op.
 #[inline]
-pub(crate) fn profile_start() -> Option<std::time::Instant> {
-    copy_profile_enabled().then(std::time::Instant::now)
+pub(crate) fn profile_start() -> Option<Instant> {
+    copy_profile_enabled().then(Instant::now)
 }
 
 #[inline]
-fn profile_elapsed_ns(start: Option<std::time::Instant>) -> Option<u64> {
+fn profile_elapsed_ns(start: Option<Instant>) -> Option<u64> {
     let s = start?;
     Some(u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX))
 }
@@ -1169,7 +1186,7 @@ pub(crate) fn record_page_header_rebuild() {
     BTREE_PAGE_HEADER_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_fast_table_leaf_payload_append_mutate(start: Option<std::time::Instant>) {
+pub(crate) fn record_fast_table_leaf_payload_append_mutate(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1177,14 +1194,14 @@ pub(crate) fn record_fast_table_leaf_payload_append_mutate(start: Option<std::ti
     BTREE_FAST_TABLE_LEAF_PAYLOAD_MUTATE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_fast_table_leaf_payload_append_stage(start: Option<std::time::Instant>) {
+pub(crate) fn record_fast_table_leaf_payload_append_stage(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
     BTREE_FAST_TABLE_LEAF_PAYLOAD_STAGE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_fast_table_leaf_full_cell_append_mutate(start: Option<std::time::Instant>) {
+pub(crate) fn record_fast_table_leaf_full_cell_append_mutate(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1192,14 +1209,14 @@ pub(crate) fn record_fast_table_leaf_full_cell_append_mutate(start: Option<std::
     BTREE_FAST_TABLE_LEAF_FULL_CELL_MUTATE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_fast_table_leaf_full_cell_append_stage(start: Option<std::time::Instant>) {
+pub(crate) fn record_fast_table_leaf_full_cell_append_stage(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
     BTREE_FAST_TABLE_LEAF_FULL_CELL_STAGE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_quick_balance_attempt(start: Option<std::time::Instant>, hit: bool) {
+pub(crate) fn record_quick_balance_attempt(start: Option<Instant>, hit: bool) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1210,7 +1227,7 @@ pub(crate) fn record_quick_balance_attempt(start: Option<std::time::Instant>, hi
     BTREE_QUICK_BALANCE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_local_split_attempt(start: Option<std::time::Instant>, hit: bool) {
+pub(crate) fn record_local_split_attempt(start: Option<Instant>, hit: bool) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1221,7 +1238,7 @@ pub(crate) fn record_local_split_attempt(start: Option<std::time::Instant>, hit:
     BTREE_LOCAL_SPLIT_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_nonroot_balance(start: Option<std::time::Instant>) {
+pub(crate) fn record_nonroot_balance(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1240,7 +1257,7 @@ pub(crate) fn record_balance_for_delete() {
     BTREE_BALANCE_FOR_DELETE_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_delete_leaf_run_materialize(start: Option<std::time::Instant>) {
+pub(crate) fn record_delete_leaf_run_materialize(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1248,7 +1265,7 @@ pub(crate) fn record_delete_leaf_run_materialize(start: Option<std::time::Instan
     BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_delete_leaf_run_write(start: Option<std::time::Instant>) {
+pub(crate) fn record_delete_leaf_run_write(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1256,7 +1273,7 @@ pub(crate) fn record_delete_leaf_run_write(start: Option<std::time::Instant>) {
     BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_delete_leaf_run_search(start: Option<std::time::Instant>) {
+pub(crate) fn record_delete_leaf_run_search(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1264,7 +1281,7 @@ pub(crate) fn record_delete_leaf_run_search(start: Option<std::time::Instant>) {
     BTREE_DELETE_LEAF_RUN_SEARCH_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_delete_leaf_run_duplicate_check(start: Option<std::time::Instant>) {
+pub(crate) fn record_delete_leaf_run_duplicate_check(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1272,7 +1289,7 @@ pub(crate) fn record_delete_leaf_run_duplicate_check(start: Option<std::time::In
     BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_delete_leaf_run_compact_check(start: Option<std::time::Instant>) {
+pub(crate) fn record_delete_leaf_run_compact_check(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1280,7 +1297,7 @@ pub(crate) fn record_delete_leaf_run_compact_check(start: Option<std::time::Inst
     BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_delete_leaf_run_cell_parse(start: Option<std::time::Instant>) {
+pub(crate) fn record_delete_leaf_run_cell_parse(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1288,7 +1305,7 @@ pub(crate) fn record_delete_leaf_run_cell_parse(start: Option<std::time::Instant
     BTREE_DELETE_LEAF_RUN_CELL_PARSE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_bulk_table_grouping(start: Option<std::time::Instant>) {
+pub(crate) fn record_bulk_table_grouping(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1296,7 +1313,7 @@ pub(crate) fn record_bulk_table_grouping(start: Option<std::time::Instant>) {
     BTREE_BULK_TABLE_GROUPING_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_bulk_table_leaf_page_build(start: Option<std::time::Instant>) {
+pub(crate) fn record_bulk_table_leaf_page_build(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1304,7 +1321,7 @@ pub(crate) fn record_bulk_table_leaf_page_build(start: Option<std::time::Instant
     BTREE_BULK_TABLE_LEAF_PAGE_BUILD_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_bulk_table_leaf_page_write(start: Option<std::time::Instant>) {
+pub(crate) fn record_bulk_table_leaf_page_write(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1312,7 +1329,7 @@ pub(crate) fn record_bulk_table_leaf_page_write(start: Option<std::time::Instant
     BTREE_BULK_TABLE_LEAF_PAGE_WRITE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_bulk_table_interior_page_build(start: Option<std::time::Instant>) {
+pub(crate) fn record_bulk_table_interior_page_build(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1320,7 +1337,7 @@ pub(crate) fn record_bulk_table_interior_page_build(start: Option<std::time::Ins
     BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_bulk_table_interior_page_write(start: Option<std::time::Instant>) {
+pub(crate) fn record_bulk_table_interior_page_write(start: Option<Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
     };
@@ -1831,6 +1848,11 @@ mod tests {
 
         // from_raw maps any out-of-range value to Enforced (defensive default).
         assert_eq!(ConflictTopologyPolicyMode::from_raw(99), Enforced);
+        assert_eq!(
+            ConflictTopologyPolicyMode::from_raw(super::CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW),
+            Baseline,
+            "the shipped default must bypass process-global conflict-topology state"
+        );
     }
 
     #[test]
@@ -2305,7 +2327,7 @@ mod tests {
     ///
     /// Run via:
     /// ```text
-    /// cargo test -p fsqlite-btree --lib --release -- --ignored --nocapture \
+    /// cargo test -p fsqlite-btree --lib --profile release-perf -- --ignored --nocapture \
     ///   bench_btree_metrics_gate_per_op_cost
     /// ```
     /// Wrapper that prevents LLVM from hoisting the gate-load out of the

@@ -5,16 +5,15 @@
 //! exposing raw epoch internals.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use crossbeam_epoch::{Collector, Guard, LocalHandle};
-use fsqlite_types::sync_primitives::Mutex;
+use fsqlite_types::sync_primitives::{Duration, Instant, Mutex};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -780,6 +779,28 @@ impl Drop for VersionGuardTicket {
 
 use crate::core_types::VersionIdx;
 
+/// Maximum number of safe retired slots a normal EBR maintenance cycle may
+/// recycle.
+///
+/// This is a deterministic work-unit bound, not a wall-clock claim. Safe
+/// backlog beyond the cap remains queued for the next maintenance cycle.
+pub const MAX_EBR_RECLAIM_SLOTS_PER_CYCLE: usize = 4_096;
+
+/// Per-queue receipt for bounded EBR reclamation cycles.
+///
+/// Available only to unit tests and opt-in integration-test support so normal
+/// builds retain the bounded reclamation contract without receipt counters.
+#[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbrReclaimCycleReceipt {
+    /// Number of completed cycles that recycled at least one safe slot.
+    pub collection_cycles_total: u64,
+    /// Number of slots recycled by completed bounded cycles.
+    pub slots_reclaimed_total: u64,
+    /// Largest slot count reclaimed in any one bounded cycle.
+    pub max_slots_reclaimed_per_cycle: u64,
+}
+
 /// Queue of version slots pending reclamation after epoch advancement.
 ///
 /// When GC retires a version via `VersionArena::take_for_retirement()`, the
@@ -807,11 +828,20 @@ use crate::core_types::VersionIdx;
 #[derive(Debug)]
 pub struct EbrRetireQueue {
     /// Pending retired batches grouped by retire epoch.
-    pending: Mutex<Vec<RetiredBatch>>,
+    pending: Mutex<VecDeque<RetiredBatch>>,
     /// Counter for total slots retired through this queue.
     total_retired: AtomicU64,
     /// Counter for total slots recycled (drained and returned to arena).
     total_recycled: AtomicU64,
+    /// Test-only count of bounded maintenance cycles that reclaimed work.
+    #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+    collection_cycles_total: AtomicU64,
+    /// Test-only total reclaimed by bounded maintenance cycles.
+    #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+    slots_reclaimed_by_bounded_cycles: AtomicU64,
+    /// Test-only largest bounded maintenance-cycle reclaim count.
+    #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+    max_slots_reclaimed_per_cycle: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -825,9 +855,15 @@ impl EbrRetireQueue {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            pending: Mutex::new(Vec::new()),
+            pending: Mutex::new(VecDeque::new()),
             total_retired: AtomicU64::new(0),
             total_recycled: AtomicU64::new(0),
+            #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+            collection_cycles_total: AtomicU64::new(0),
+            #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+            slots_reclaimed_by_bounded_cycles: AtomicU64::new(0),
+            #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+            max_slots_reclaimed_per_cycle: AtomicU64::new(0),
         }
     }
 
@@ -857,7 +893,7 @@ impl EbrRetireQueue {
         }
     }
 
-    /// Drain all pending retirements if it's safe to recycle them.
+    /// Drain at most [`MAX_EBR_RECLAIM_SLOTS_PER_CYCLE`] safe retirements.
     ///
     /// Returns the drained indices if all active guards have advanced past the
     /// retired batches being reclaimed.
@@ -880,28 +916,36 @@ impl EbrRetireQueue {
         }
 
         let safe_epoch = reclaim_safe_epoch(current_epoch, min_pinned_epoch);
-        let drain_batches = reclaimable_batch_count(&pending, safe_epoch);
-        if drain_batches == 0 {
-            return Vec::new();
-        }
+        let mut remaining_slots = MAX_EBR_RECLAIM_SLOTS_PER_CYCLE;
+        let mut drained = Vec::new();
+        while remaining_slots > 0 {
+            let Some(batch) = pending.front_mut() else {
+                break;
+            };
+            if batch.retire_epoch >= safe_epoch {
+                break;
+            }
 
-        let retained_batches = pending.split_off(drain_batches);
-        let drained_batches = std::mem::replace(&mut *pending, retained_batches);
+            let reclaimed_from_batch = batch.indices.len().min(remaining_slots);
+            // Slots in one epoch batch have the same reclamation eligibility,
+            // so their recycle order is not semantically observable. Drain
+            // from the tail to leave the carried-over prefix in place without
+            // shifting a potentially huge retained batch each cycle.
+            let tail_start = batch.indices.len() - reclaimed_from_batch;
+            drained.extend(batch.indices.drain(tail_start..));
+            remaining_slots -= reclaimed_from_batch;
+            if batch.indices.is_empty() {
+                pending.pop_front();
+            }
+        }
         drop(pending);
-
-        let drained_len = drained_batches
-            .iter()
-            .map(|batch| batch.indices.len())
-            .sum::<usize>();
-        let mut drained = Vec::with_capacity(drained_len);
-        for mut batch in drained_batches {
-            drained.append(&mut batch.indices);
-        }
 
         let count = u64::try_from(drained.len()).unwrap_or(u64::MAX);
         if count > 0 {
             self.total_recycled.fetch_add(count, Ordering::Relaxed);
             GLOBAL_EBR_METRICS.record_gc_freed(count);
+            #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+            self.record_collection_cycle(count);
         }
 
         drained
@@ -951,30 +995,53 @@ impl EbrRetireQueue {
     pub fn total_recycled(&self) -> u64 {
         self.total_recycled.load(Ordering::Relaxed)
     }
+
+    /// Read this queue's deterministic bounded-reclamation receipt.
+    #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+    #[must_use]
+    pub fn reclaim_cycle_receipt(&self) -> EbrReclaimCycleReceipt {
+        EbrReclaimCycleReceipt {
+            collection_cycles_total: self.collection_cycles_total.load(Ordering::Relaxed),
+            slots_reclaimed_total: self
+                .slots_reclaimed_by_bounded_cycles
+                .load(Ordering::Relaxed),
+            max_slots_reclaimed_per_cycle: self
+                .max_slots_reclaimed_per_cycle
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(any(test, feature = "ebr-reclaim-test-support"))]
+    fn record_collection_cycle(&self, reclaimed_slots: u64) {
+        self.collection_cycles_total.fetch_add(1, Ordering::Relaxed);
+        self.slots_reclaimed_by_bounded_cycles
+            .fetch_add(reclaimed_slots, Ordering::Relaxed);
+        self.max_slots_reclaimed_per_cycle
+            .fetch_max(reclaimed_slots, Ordering::Relaxed);
+    }
 }
 
 /// Append a single `VersionIdx` to the batch for `epoch`.
 ///
 /// Epochs advance monotonically, so the common case is that `epoch`
 /// matches the last batch or is newer.  The fast path avoids the
-/// `O(log n)` binary search and `O(n)` `Vec::insert` that the old
-/// code paid on every call.
+/// linear insertion path reserved for out-of-order epochs.
 #[inline]
-fn append_to_epoch_batch(pending: &mut Vec<RetiredBatch>, epoch: u64, idx: VersionIdx) {
-    if let Some(last) = pending.last_mut() {
+fn append_to_epoch_batch(pending: &mut VecDeque<RetiredBatch>, epoch: u64, idx: VersionIdx) {
+    if let Some(last) = pending.back_mut() {
         if last.retire_epoch == epoch {
             last.indices.push(idx);
             return;
         }
         if last.retire_epoch < epoch {
-            pending.push(RetiredBatch {
+            pending.push_back(RetiredBatch {
                 retire_epoch: epoch,
                 indices: vec![idx],
             });
             return;
         }
     } else {
-        pending.push(RetiredBatch {
+        pending.push_back(RetiredBatch {
             retire_epoch: epoch,
             indices: vec![idx],
         });
@@ -982,16 +1049,21 @@ fn append_to_epoch_batch(pending: &mut Vec<RetiredBatch>, epoch: u64, idx: Versi
     }
     // Rare: out-of-order epoch (should not happen with monotonic epochs,
     // but preserve correctness).
-    match pending.binary_search_by_key(&epoch, |batch| batch.retire_epoch) {
-        Ok(existing) => pending[existing].indices.push(idx),
-        Err(insert_at) => pending.insert(
-            insert_at,
-            RetiredBatch {
-                retire_epoch: epoch,
-                indices: vec![idx],
-            },
-        ),
+    if let Some(existing) = pending.iter().position(|batch| batch.retire_epoch == epoch) {
+        pending[existing].indices.push(idx);
+        return;
     }
+    let insert_at = pending
+        .iter()
+        .position(|batch| batch.retire_epoch > epoch)
+        .unwrap_or(pending.len());
+    pending.insert(
+        insert_at,
+        RetiredBatch {
+            retire_epoch: epoch,
+            indices: vec![idx],
+        },
+    );
 }
 
 #[inline]
@@ -1002,8 +1074,12 @@ fn reclaim_safe_epoch(current_epoch: u64, min_pinned_epoch: Option<u64>) -> u64 
 }
 
 #[inline]
-fn reclaimable_batch_count(pending: &[RetiredBatch], safe_epoch: u64) -> usize {
-    pending.partition_point(|batch| batch.retire_epoch < safe_epoch)
+#[cfg(test)]
+fn reclaimable_batch_count(pending: &VecDeque<RetiredBatch>, safe_epoch: u64) -> usize {
+    pending
+        .iter()
+        .take_while(|batch| batch.retire_epoch < safe_epoch)
+        .count()
 }
 
 impl Default for EbrRetireQueue {
@@ -1015,6 +1091,7 @@ impl Default for EbrRetireQueue {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{HashSet, VecDeque},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1442,7 +1519,7 @@ mod tests {
     // D5: EbrRetireQueue tests
     // ===================================================================
 
-    use super::{EbrRetireQueue, VersionIdx};
+    use super::{EbrRetireQueue, MAX_EBR_RECLAIM_SLOTS_PER_CYCLE, VersionIdx};
 
     #[test]
     fn ebr_retire_queue_retire_and_drain() {
@@ -1514,6 +1591,32 @@ mod tests {
     }
 
     #[test]
+    fn test_ebr_pinned_reader_defers_then_recycles_retirement() {
+        let registry = Arc::new(VersionGuardRegistry::default());
+        let queue = EbrRetireQueue::new();
+        let reader = VersionGuard::pin(Arc::clone(&registry));
+        let retired = VersionIdx::new(1, 2, 3);
+
+        // This verifies pin-protected retire/recycle correctness. The e2e
+        // keeper separately proves bounded collection-cycle telemetry.
+        queue.retire(retired, registry.current_epoch());
+        let blocked = queue.drain_if_safe(registry.advance_epoch(), registry.min_pinned_epoch());
+        assert!(
+            blocked.is_empty(),
+            "a live reader retains the staged retirement"
+        );
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.total_retired(), 1);
+        assert_eq!(queue.total_recycled(), 0);
+
+        drop(reader);
+        let recycled = queue.drain_if_safe(registry.advance_epoch(), registry.min_pinned_epoch());
+        assert_eq!(recycled, vec![retired]);
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(queue.total_recycled(), 1);
+    }
+
+    #[test]
     fn ebr_retire_queue_multiple_epochs() {
         let queue = EbrRetireQueue::new();
 
@@ -1569,7 +1672,7 @@ mod tests {
 
     #[test]
     fn ebr_retire_queue_reclaimable_prefix_tracks_strict_epoch_boundary() {
-        let pending = vec![
+        let pending = VecDeque::from([
             super::RetiredBatch {
                 retire_epoch: 1,
                 indices: vec![VersionIdx::new(0, 0, 0)],
@@ -1586,7 +1689,7 @@ mod tests {
                 retire_epoch: 8,
                 indices: vec![VersionIdx::new(0, 3, 0)],
             },
-        ];
+        ]);
 
         assert_eq!(super::reclaim_safe_epoch(9, Some(5)), 5);
         assert_eq!(super::reclaim_safe_epoch(4, None), 4);
@@ -1594,6 +1697,53 @@ mod tests {
         assert_eq!(super::reclaimable_batch_count(&pending, 3), 1);
         assert_eq!(super::reclaimable_batch_count(&pending, 4), 3);
         assert_eq!(super::reclaimable_batch_count(&pending, 9), 4);
+    }
+
+    #[test]
+    fn ebr_retire_queue_bounded_single_batch_preserves_membership_and_eventually_drains() {
+        let queue = EbrRetireQueue::new();
+        let backlog = MAX_EBR_RECLAIM_SLOTS_PER_CYCLE * 2 + 1;
+        let retired = (0..backlog)
+            .map(|slot| VersionIdx::new(0, u32::try_from(slot).expect("keeper slot fits u32"), 0))
+            .collect::<Vec<_>>();
+        let expected = retired.iter().copied().collect::<HashSet<_>>();
+        queue.retire_batch(retired, 0);
+        let mut observed = HashSet::with_capacity(backlog);
+
+        let first = queue.drain_if_safe(1, None);
+        assert_eq!(first.len(), MAX_EBR_RECLAIM_SLOTS_PER_CYCLE);
+        assert!(first.into_iter().all(|idx| observed.insert(idx)));
+        assert_eq!(queue.pending_count(), MAX_EBR_RECLAIM_SLOTS_PER_CYCLE + 1);
+
+        let second = queue.drain_if_safe(2, None);
+        assert_eq!(second.len(), MAX_EBR_RECLAIM_SLOTS_PER_CYCLE);
+        assert!(second.into_iter().all(|idx| observed.insert(idx)));
+        assert_eq!(queue.pending_count(), 1);
+
+        let final_cycle = queue.drain_if_safe(3, None);
+        assert_eq!(final_cycle.len(), 1);
+        assert!(final_cycle.into_iter().all(|idx| observed.insert(idx)));
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(
+            observed, expected,
+            "every retired slot recycles exactly once"
+        );
+        assert_eq!(
+            queue.total_recycled(),
+            u64::try_from(backlog).expect("backlog fits recycle counter")
+        );
+
+        let receipt = queue.reclaim_cycle_receipt();
+        assert_eq!(receipt.collection_cycles_total, 3);
+        assert_eq!(
+            receipt.max_slots_reclaimed_per_cycle,
+            u64::try_from(MAX_EBR_RECLAIM_SLOTS_PER_CYCLE)
+                .expect("reclaim bound fits receipt counter")
+        );
+        assert_eq!(
+            receipt.slots_reclaimed_total,
+            u64::try_from(backlog).expect("backlog fits receipt counter")
+        );
     }
 
     #[test]

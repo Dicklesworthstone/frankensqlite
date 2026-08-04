@@ -1,5 +1,6 @@
-//! bd-5310l parse-phase profile: split per-statement parse time into LEX (tokenize) vs PARSE
-//! (recursive-descent AST build) so the ONE lever can target the dominant half.
+//! bd-5310l parse-phase profile: split per-statement parse time into LEX
+//! (tokenize) vs PARSE (parser and AST build) so the ONE lever can target the
+//! dominant half.
 //!
 //! Run under release-perf:
 //!   RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
@@ -7,8 +8,9 @@
 //!     -- --ignored --nocapture
 //!
 //! `lex` times `Lexer::tokenize` alone; `full parse` times
-//! `parse_single_statement_with_scratch` (tokenize + parse, scratch reused); the difference is the
-//! recursive-descent / AST-build cost. Same SQL repeated per shape (steady state).
+//! `parse_single_statement_with_scratch` (tokenize + parse, scratch reused);
+//! the difference approximates the parser-machine / AST-build cost. Same SQL
+//! repeated per shape (steady state).
 
 // ns/count -> f64 for the split; precision loss is irrelevant to the ratio.
 #![allow(clippy::cast_precision_loss)]

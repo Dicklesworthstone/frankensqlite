@@ -4,17 +4,18 @@
 //! schema — table-clashes-with-table, view-clashes-with-view, view-clashes-with-
 //! table (and vice versa) — unless `IF NOT EXISTS` is used. This pins that
 //! frank rejects the same conflicts and that IF NOT EXISTS silences them.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 
-fn ddl_case(setup: &[&str], test: &str) -> Option<String> {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn ddl_case(setup: &[&str], test: &str) -> Option<String> {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in setup {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
-    let fe = f.execute(test);
+    let fe = f.execute(test).await;
     let re = r.execute_batch(test);
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => None,
@@ -25,11 +26,13 @@ fn ddl_case(setup: &[&str], test: &str) -> Option<String> {
     }
 }
 
-fn check(cases: &[(&[&str], &str)], label: &str) {
-    let mismatches: Vec<String> = cases
-        .iter()
-        .filter_map(|(setup, test)| ddl_case(setup, test))
-        .collect();
+async fn check(cases: &[(&[&str], &str)], label: &str) {
+    let mut mismatches: Vec<String> = Vec::new();
+    for (setup, test) in cases {
+        if let Some(m) = ddl_case(setup, test).await {
+            mismatches.push(m);
+        }
+    }
     assert!(
         mismatches.is_empty(),
         "{label}: {} mismatch(es)\n{}",
@@ -40,57 +43,66 @@ fn check(cases: &[(&[&str], &str)], label: &str) {
 
 #[test]
 fn create_if_not_exists_on_existing_ok() {
-    check(
-        &[
-            (
-                &["CREATE TABLE t (a)"],
-                "CREATE TABLE IF NOT EXISTS t (a)", // already exists -> no error
-            ),
-            (
-                &["CREATE TABLE t (a)", "CREATE VIEW v AS SELECT a FROM t"],
-                "CREATE VIEW IF NOT EXISTS v AS SELECT a FROM t",
-            ),
-            // IF NOT EXISTS silences a CROSS-kind clash too (SQLite behavior).
-            (
-                &["CREATE TABLE t (a)"],
-                "CREATE VIEW IF NOT EXISTS t AS SELECT 1",
-            ),
-            (
-                &["CREATE VIEW w AS SELECT 1"],
-                "CREATE TABLE IF NOT EXISTS w (a)",
-            ),
-        ],
-        "create_if_not_exists_on_existing_ok",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            &[
+                (
+                    &["CREATE TABLE t (a)"],
+                    "CREATE TABLE IF NOT EXISTS t (a)", // already exists -> no error
+                ),
+                (
+                    &["CREATE TABLE t (a)", "CREATE VIEW v AS SELECT a FROM t"],
+                    "CREATE VIEW IF NOT EXISTS v AS SELECT a FROM t",
+                ),
+                // IF NOT EXISTS silences a CROSS-kind clash too (SQLite behavior).
+                (
+                    &["CREATE TABLE t (a)"],
+                    "CREATE VIEW IF NOT EXISTS t AS SELECT 1",
+                ),
+                (
+                    &["CREATE VIEW w AS SELECT 1"],
+                    "CREATE TABLE IF NOT EXISTS w (a)",
+                ),
+            ],
+            "create_if_not_exists_on_existing_ok",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn create_duplicate_same_kind_rejected() {
-    // Same-kind duplicates are correctly rejected by both.
-    check(
-        &[
-            (&["CREATE TABLE t (a)"], "CREATE TABLE t (b)"),
-            (
-                &["CREATE TABLE u (a)", "CREATE VIEW v AS SELECT a FROM u"],
-                "CREATE VIEW v AS SELECT a FROM u",
-            ),
-        ],
-        "create_duplicate_same_kind_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Same-kind duplicates are correctly rejected by both.
+        check(
+            &[
+                (&["CREATE TABLE t (a)"], "CREATE TABLE t (b)"),
+                (
+                    &["CREATE TABLE u (a)", "CREATE VIEW v AS SELECT a FROM u"],
+                    "CREATE VIEW v AS SELECT a FROM u",
+                ),
+            ],
+            "create_duplicate_same_kind_rejected",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn create_duplicate_cross_kind_rejected() {
-    check(
-        &[
-            // view conflicts with existing table
-            (&["CREATE TABLE t (a)"], "CREATE VIEW t AS SELECT 1"),
-            // table conflicts with existing view
-            (
-                &["CREATE TABLE u (a)", "CREATE VIEW w AS SELECT a FROM u"],
-                "CREATE TABLE w (a)",
-            ),
-        ],
-        "create_duplicate_cross_kind_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            &[
+                // view conflicts with existing table
+                (&["CREATE TABLE t (a)"], "CREATE VIEW t AS SELECT 1"),
+                // table conflicts with existing view
+                (
+                    &["CREATE TABLE u (a)", "CREATE VIEW w AS SELECT a FROM u"],
+                    "CREATE TABLE w (a)",
+                ),
+            ],
+            "create_duplicate_cross_kind_rejected",
+        )
+        .await;
+    });
 }

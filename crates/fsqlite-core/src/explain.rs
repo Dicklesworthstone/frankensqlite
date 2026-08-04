@@ -309,6 +309,68 @@ pub fn aggregate_index_seek_facts(program: &VdbeProgram) -> Option<AggregateInde
     })
 }
 
+/// True when the emitted program positions a cursor opened on `index_name`
+/// with a key seek (`SeekGE`/`SeekGT`/`SeekLE`/`SeekLT`).
+///
+/// bd-jyyae: `EXPLAIN QUERY PLAN` renders the planner directive, but codegen
+/// can decline the directive's access path — `IN (SELECT ...)` predicates
+/// compile to a full table scan probing an ephemeral membership index, while
+/// the directive still claims `SEARCH ... USING INDEX`. The claim is true
+/// exactly when a seek opcode positions a cursor opened on that index — a
+/// property of the opcodes, not of planner intent. `Rewind`/`Next` on an
+/// index cursor is a scan of the index, not a search, and deliberately does
+/// not count.
+#[must_use]
+pub fn program_seeks_named_index(program: &VdbeProgram, index_name: &str) -> bool {
+    let ops = program.ops();
+    let mut index_cursors: HashSet<i32> = HashSet::new();
+    for op in ops {
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite)
+            && let P4::Index(name) = &op.p4
+            && name == index_name
+        {
+            index_cursors.insert(op.p1);
+        }
+    }
+    if index_cursors.is_empty() {
+        return false;
+    }
+    ops.iter().any(|op| {
+        matches!(
+            op.opcode,
+            Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+        ) && index_cursors.contains(&op.p1)
+    })
+}
+
+/// True when the emitted program probes a cursor opened on `table_name`
+/// directly by rowid (`SeekRowid`/`NotExists`).
+///
+/// bd-jyyae companion to [`program_seeks_named_index`] for the
+/// `SEARCH ... USING INTEGER PRIMARY KEY (rowid=?)` directive claim. The
+/// probe must target a cursor opened on the named table so that a rowid seek
+/// elsewhere in the program (an index's table-lookup leg, a subquery) cannot
+/// vouch for a main-table claim.
+#[must_use]
+pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> bool {
+    let ops = program.ops();
+    let mut table_cursors: HashSet<i32> = HashSet::new();
+    for op in ops {
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite)
+            && let P4::Table(name) = &op.p4
+            && name == table_name
+        {
+            table_cursors.insert(op.p1);
+        }
+    }
+    if table_cursors.is_empty() {
+        return false;
+    }
+    ops.iter().any(|op| {
+        matches!(op.opcode, Opcode::SeekRowid | Opcode::NotExists) && table_cursors.contains(&op.p1)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -498,5 +560,155 @@ mod tests {
             has_temp_btree,
             "EQP should include temp B-tree marker for sorter plans, got: {rows:?}"
         );
+    }
+
+    /// The truthful equality-probe shape: `SeekGE` positions the index
+    /// cursor, `IdxRowid`/`SeekRowid` fetch the table row (the program
+    /// `EXPLAIN SELECT * FROM t WHERE k = 2` actually emits).
+    fn build_index_seek_program() -> VdbeProgram {
+        let mut b = ProgramBuilder::new();
+        let end_label = b.emit_label();
+        let done_label = b.emit_label();
+        let skip_label = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("t".to_owned()), 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            1,
+            3,
+            0,
+            P4::Index("idx_t_k".to_owned()),
+            0,
+        );
+        b.emit_jump_to_label(Opcode::SeekGE, 1, 0, done_label, P4::None, 0);
+        b.emit_op(Opcode::IdxRowid, 1, 9, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, 0, 9, skip_label, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 1, 2, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+        b.resolve_label(skip_label);
+        b.emit_op(Opcode::Next, 1, 5, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Close, 1, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+
+        b.finish().unwrap()
+    }
+
+    /// The bd-jyyae divergence shape: full `Rewind`/`Next` scan of the table
+    /// with an ephemeral membership probe (`OpenAutoindex` + `Found`) — the
+    /// program `SELECT * FROM t WHERE k IN (SELECT id FROM r)` actually
+    /// emits. No cursor is ever opened on `idx_t_k`, and no seek runs.
+    fn build_in_subquery_scan_program() -> VdbeProgram {
+        let mut b = ProgramBuilder::new();
+        let end_label = b.emit_label();
+        let done_label = b.emit_label();
+        let skip_label = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("t".to_owned()), 0);
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, done_label, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 1, 5, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 5, 1, 7, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Found, 12294, 0, skip_label, P4::None, 0);
+        b.emit_op(Opcode::Rowid, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        b.resolve_label(skip_label);
+        b.emit_op(Opcode::Next, 0, 4, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Close, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+
+        b.finish().unwrap()
+    }
+
+    // === bd-jyyae: directive seek claims must be provable from the opcodes ===
+
+    #[test]
+    fn test_program_seeks_named_index_true_for_seek_shape() {
+        let prog = build_index_seek_program();
+        assert!(program_seeks_named_index(&prog, "idx_t_k"));
+    }
+
+    #[test]
+    fn test_program_seeks_named_index_false_for_in_subquery_scan() {
+        let prog = build_in_subquery_scan_program();
+        assert!(
+            !program_seeks_named_index(&prog, "idx_t_k"),
+            "a Rewind/Next membership-probe scan must not vouch for a SEARCH claim"
+        );
+    }
+
+    #[test]
+    fn test_program_seeks_named_index_false_for_index_only_scan() {
+        // An index cursor driven only by Rewind/Next is an index SCAN, not a
+        // SEARCH: the equality/range claim must not be vouched for.
+        let mut b = ProgramBuilder::new();
+        let end_label = b.emit_label();
+        let done_label = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            1,
+            3,
+            0,
+            P4::Index("idx_t_k".to_owned()),
+            0,
+        );
+        b.emit_jump_to_label(Opcode::Rewind, 1, 0, done_label, P4::None, 0);
+        b.emit_op(Opcode::Column, 1, 0, 1, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Next, 1, 4, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+
+        let prog = b.finish().unwrap();
+        assert!(!program_seeks_named_index(&prog, "idx_t_k"));
+    }
+
+    #[test]
+    fn test_program_seeks_rowid_on_table_true_for_rowid_probe() {
+        let mut b = ProgramBuilder::new();
+        let end_label = b.emit_label();
+        let done_label = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("t".to_owned()), 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, done_label, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 1, 2, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+
+        let prog = b.finish().unwrap();
+        assert!(program_seeks_rowid_on_table(&prog, "t"));
+        assert!(
+            !program_seeks_rowid_on_table(&prog, "other"),
+            "a rowid probe on t must not vouch for a claim about another table"
+        );
+    }
+
+    #[test]
+    fn test_program_seeks_rowid_on_table_false_for_scan() {
+        let prog = build_simple_select_program();
+        assert!(!program_seeks_rowid_on_table(&prog, "t"));
+    }
+
+    #[test]
+    fn test_index_table_lookup_leg_does_not_vouch_for_table_rowid_claim() {
+        // The SeekRowid in an index seek's table-lookup leg targets the table
+        // cursor, so it legitimately proves a rowid probe on that cursor —
+        // but the *index* claim for an unrelated index must still fail.
+        let prog = build_index_seek_program();
+        assert!(!program_seeks_named_index(&prog, "idx_other"));
     }
 }

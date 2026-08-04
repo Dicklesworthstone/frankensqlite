@@ -5,6 +5,7 @@
 //! `GROUP BY` itself ("aggregate functions are not allowed in the GROUP BY
 //! clause"). This pins that frank rejects it too, while still accepting a regular
 //! GROUP BY plus aggregates in the SELECT list.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -22,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -55,24 +56,24 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn engines() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn engines() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in [
         "CREATE TABLE t (a INTEGER, b INTEGER)",
         "INSERT INTO t VALUES (1,10),(1,20),(2,30)",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
 }
 
-fn check(queries: &[&str], label: &str) {
-    let (f, r) = engines();
+async fn check(queries: &[&str], label: &str) {
+    let (f, r) = engines().await;
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -96,24 +97,30 @@ fn check(queries: &[&str], label: &str) {
 
 #[test]
 fn group_by_aggregate_rejected() {
-    // Aggregate inside GROUP BY itself -> SQLite error on both engines.
-    check(
-        &[
-            "SELECT a FROM t GROUP BY count(*)",
-            "SELECT a FROM t GROUP BY sum(a)",
-            "SELECT a FROM t GROUP BY a + count(*)", // aggregate buried in expression
-        ],
-        "group_by_aggregate_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Aggregate inside GROUP BY itself -> SQLite error on both engines.
+        check(
+            &[
+                "SELECT a FROM t GROUP BY count(*)",
+                "SELECT a FROM t GROUP BY sum(a)",
+                "SELECT a FROM t GROUP BY a + count(*)", // aggregate buried in expression
+            ],
+            "group_by_aggregate_rejected",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn ordinary_group_by_ok() {
-    // The well-formed contrast: GROUP BY a column, aggregate in the SELECT list.
-    check(
-        &[
-            "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a", // (1,2,30),(2,1,30)
-        ],
-        "ordinary_group_by_ok",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // The well-formed contrast: GROUP BY a column, aggregate in the SELECT list.
+        check(
+            &[
+                "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a", // (1,2,30),(2,1,30)
+            ],
+            "ordinary_group_by_ok",
+        )
+        .await;
+    });
 }

@@ -3,15 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use fsqlite_error::{FrankenError, Result};
+use fsqlite_error::Result;
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
-use crate::shm::{
-    SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_UNLOCK, ShmRegion, WAL_CKPT_LOCK,
-    WAL_WRITE_LOCK,
-};
+use crate::shm::ShmRegion;
 
 /// Opaque identity of an already-open filesystem object.
 ///
@@ -781,6 +778,7 @@ impl VfsWriteCompletion {
     /// backend still owns the completion instant, while the outer operation
     /// can never truthfully report full-write success.
     #[doc(hidden)]
+    #[must_use]
     pub fn error_mapped_child(&self) -> Self {
         Self {
             inner: Arc::new(Mutex::new(VfsWriteCompletionInner {
@@ -830,12 +828,14 @@ impl Default for VfsWriteCompletion {
 /// it, and driver teardown can discard an uncompleted request. Keeping this
 /// guard with that source ensures those paths terminate as `Error` instead of
 /// leaving a caller-retained token pending forever.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub(crate) struct VfsWriteCompletionSource {
     completion: VfsWriteCompletion,
     armed: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl VfsWriteCompletionSource {
     pub(crate) fn new(completion: VfsWriteCompletion) -> Self {
         Self {
@@ -855,6 +855,7 @@ impl VfsWriteCompletionSource {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for VfsWriteCompletionSource {
     fn drop(&mut self) {
         if self.armed {
@@ -952,8 +953,8 @@ pub trait VfsFile: Send + Sync {
     ///
     /// Implementations must derive this from the open descriptor (or from
     /// descriptor metadata captured at open time), never by resolving the
-    /// current pathname. The default is `None` for memory and custom backends
-    /// that cannot provide a stable comparable identity.
+    /// current pathname. The default is `None` for custom backends that cannot
+    /// provide a stable comparable identity.
     fn file_identity(&self) -> Result<Option<FileIdentity>> {
         Ok(None)
     }
@@ -1057,81 +1058,40 @@ pub trait VfsFile: Send + Sync {
     /// Acquire the cross-process SHARED fence used while capturing a coherent
     /// main-database snapshot.
     ///
-    /// Native Unix locks already use stock SQLite's main-file byte ranges, so
-    /// the default is the ordinary SHARED lock. Platform VFSes whose ordinary
-    /// locks are private coordination surfaces must additionally fence the
-    /// byte ranges used by the system SQLite VFS.
-    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
-        self.lock(cx, LockLevel::Shared)
-    }
+    /// The backend must publish an exact attempt marker before its first raw
+    /// lock side effect. A clean or partial acquisition error retains that
+    /// marker until [`Self::restore_external_shared_snapshot_attempt`]
+    /// succeeds.
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()>;
 
-    /// Release a fence acquired by [`Self::lock_external_shared_snapshot`].
-    fn unlock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
-        self.unlock(cx, LockLevel::None)
-    }
+    /// Restore the exact baseline of an external shared-snapshot attempt.
+    ///
+    /// This is an attempt obligation, not an ordinary unlock. It must be safe
+    /// before any raw lock was acquired, after clean or partial acquisition
+    /// failure, after success, and on repeated calls. An error must retain
+    /// enough exact backend state for a later retry.
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()>;
 
     /// Acquire the cross-process fence for an operation that replaces the
     /// complete main-database image in place.
     ///
-    /// The default implementation composes the ordinary SQLite lock surfaces:
-    /// in WAL mode it first excludes writers and checkpointers through the
-    /// adjacent WAL write/checkpoint slots, then obtains the main-database
-    /// EXCLUSIVE lock. Platform VFSes whose ordinary locks are not visible to
-    /// the system SQLite VFS must override this hook with a stock-compatible
-    /// external fence.
-    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
-        if wal_mode {
-            self.shm_lock(
-                cx,
-                WAL_WRITE_LOCK,
-                WAL_CKPT_LOCK - WAL_WRITE_LOCK + 1,
-                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
-            )?;
-        }
+    /// The backend must record the requested journal mode, exact prior main
+    /// lock level, and only the WAL slots newly acquired by this attempt before
+    /// returning control to the caller.
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()>;
 
-        if let Err(lock_error) = self.lock(cx, LockLevel::Exclusive) {
-            if wal_mode
-                && let Err(unlock_error) = self.shm_lock(
-                    cx,
-                    WAL_WRITE_LOCK,
-                    WAL_CKPT_LOCK - WAL_WRITE_LOCK + 1,
-                    SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
-                )
-            {
-                return Err(FrankenError::internal(format!(
-                    "external maintenance could not acquire the main database lock or release WAL maintenance locks: lock={lock_error}; unlock={unlock_error}"
-                )));
-            }
-            return Err(lock_error);
-        }
-        Ok(())
-    }
-
-    /// Release a fence acquired by [`Self::lock_external_maintenance`].
+    /// Restore the exact baseline of an external maintenance acquisition
+    /// attempt.
     ///
-    /// Both lock surfaces are attempted even if one release fails, so a
-    /// cleanup error cannot silently strand the other cross-process lock.
-    fn unlock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
-        let main_result = self.unlock(cx, LockLevel::None);
-        let wal_result = if wal_mode {
-            self.shm_lock(
-                cx,
-                WAL_WRITE_LOCK,
-                WAL_CKPT_LOCK - WAL_WRITE_LOCK + 1,
-                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
-            )
-        } else {
-            Ok(())
-        };
-
-        match (main_result, wal_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(main_error), Err(wal_error)) => Err(FrankenError::internal(format!(
-                "external maintenance could not release all locks: main={main_error}; wal={wal_error}"
-            ))),
-        }
-    }
+    /// This is deliberately distinct from strict ordinary SHM unlocks. The
+    /// backend-owned attempt marker is authoritative about whether WAL
+    /// surfaces participated; callers cannot supply a second, possibly stale
+    /// mode. Restoration must be idempotent before acquisition, after clean or
+    /// partial failure, after success, and across retries. Every retained
+    /// surface is attempted even if another restoration fails. Each
+    /// successfully restored surface is forgotten only after its raw unlock
+    /// succeeds.
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()>;
 
     /// Check if another process holds a reserved lock.
     ///
@@ -1192,6 +1152,11 @@ pub trait VfsFile: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    // Test doubles implement the async `VfsFile` surface with synchronous
+    // bodies; the futures must stay lazy to honor the trait contract, so the
+    // `async` is deliberate even though no body awaits.
+    #![allow(clippy::unused_async_trait_impl)]
+
     use super::*;
 
     fn poll_ready<F: std::future::Future>(future: F) -> F::Output {
@@ -1248,6 +1213,18 @@ mod tests {
             fn unlock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
                 Ok(())
             }
+            fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
             fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
                 Ok(false)
             }
@@ -1269,9 +1246,22 @@ mod tests {
             }
         }
 
-        let file = DummyFile;
+        let cx = Cx::new();
+        let mut file = DummyFile;
         assert_eq!(file.sector_size(), 4096);
         assert_eq!(file.device_characteristics(), 0);
+        assert!(matches!(
+            file.lock_external_shared_snapshot(&cx),
+            Err(fsqlite_error::FrankenError::Unsupported)
+        ));
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("restoring an unsupported snapshot attempt is idempotent");
+        assert!(matches!(
+            file.lock_external_maintenance(&cx, true),
+            Err(fsqlite_error::FrankenError::Unsupported)
+        ));
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("restoring an unsupported maintenance attempt is idempotent");
     }
 
     /// Verify that VfsFile trait defaults are what we expect.
@@ -1301,6 +1291,18 @@ mod tests {
                 Ok(())
             }
             fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
@@ -1426,6 +1428,18 @@ mod tests {
             fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
                 Ok(())
             }
+            fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
             fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
                 Ok(false)
             }
@@ -1477,6 +1491,18 @@ mod tests {
                 Ok(())
             }
             fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
@@ -1558,6 +1584,18 @@ mod tests {
                 Ok(())
             }
             fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
@@ -1646,6 +1684,18 @@ mod tests {
             fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
                 Ok(())
             }
+            fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
             fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
                 Ok(false)
             }
@@ -1701,6 +1751,18 @@ mod tests {
                 Ok(())
             }
             fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
@@ -1791,6 +1853,18 @@ mod tests {
                 Ok(())
             }
             fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {

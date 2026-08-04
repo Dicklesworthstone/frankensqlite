@@ -16,9 +16,10 @@ fn render(v: &SqliteValue) -> String {
         ),
     }
 }
-fn frank_state(c: &Connection) -> Vec<Vec<String>> {
+async fn frank_state(c: &Connection) -> Vec<Vec<String>> {
     let mut r: Vec<Vec<String>> = c
         .query("SELECT id, a, c, x FROM t")
+        .await
         .unwrap()
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -49,8 +50,9 @@ fn sqlite_state(c: &rusqlite::Connection) -> Vec<Vec<String>> {
     r.sort();
     r
 }
-fn explain_ops(c: &Connection, sql: &str) -> Vec<String> {
+async fn explain_ops(c: &Connection, sql: &str) -> Vec<String> {
     c.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .map(|row| match row.values().get(1) {
@@ -64,8 +66,12 @@ fn op_count(ops: &[String], opcode: &str) -> usize {
     ops.iter().filter(|op| op.as_str() == opcode).count()
 }
 
-fn assert_range_plan(c: &Connection, sql: &str, expected_range_ops: Option<(&str, Option<&str>)>) {
-    let ops = explain_ops(c, sql);
+async fn assert_range_plan(
+    c: &Connection,
+    sql: &str,
+    expected_range_ops: Option<(&str, Option<&str>)>,
+) {
+    let ops = explain_ops(c, sql).await;
     assert_eq!(op_count(&ops, "RowSetRead"), 1, "plan: {ops:?}");
     assert_eq!(op_count(&ops, "RowSetAdd"), 1, "plan: {ops:?}");
     assert_eq!(op_count(&ops, "Next"), 1, "plan: {ops:?}");
@@ -108,14 +114,14 @@ fn assert_range_plan(c: &Connection, sql: &str, expected_range_ops: Option<(&str
         assert_eq!(op_count(&ops, "SeekGT"), 0, "plan: {ops:?}");
     }
 }
-fn fresh() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn fresh() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT);",
         "CREATE INDEX idx_c ON t(c);",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     for i in 1..=300_i64 {
@@ -125,14 +131,14 @@ fn fresh() -> (Connection, rusqlite::Connection) {
             i % 12,
             i % 7
         );
-        f.execute(&s).unwrap();
+        f.execute(&s).await.unwrap();
         r.execute_batch(&s).unwrap();
     }
     (f, r)
 }
 
-fn assert_integrity(f: &Connection, r: &rusqlite::Connection) {
-    let frank = f.query("PRAGMA integrity_check").unwrap();
+async fn assert_integrity(f: &Connection, r: &rusqlite::Connection) {
+    let frank = f.query("PRAGMA integrity_check").await.unwrap();
     assert!(matches!(
         frank.first().and_then(|row| row.values().first()),
         Some(SqliteValue::Text(result)) if result.to_string() == "ok"
@@ -143,22 +149,23 @@ fn assert_integrity(f: &Connection, r: &rusqlite::Connection) {
     assert_eq!(sqlite, "ok");
 }
 
-fn check(dml: &str, expected_range_ops: Option<(&str, Option<&str>)>) {
-    let (f, r) = fresh();
-    assert_range_plan(&f, dml, expected_range_ops);
-    f.execute(dml).unwrap();
+async fn check(dml: &str, expected_range_ops: Option<(&str, Option<&str>)>) {
+    let (f, r) = fresh().await;
+    assert_range_plan(&f, dml, expected_range_ops).await;
+    f.execute(dml).await.unwrap();
     r.execute_batch(dml).unwrap();
     assert_eq!(
-        frank_state(&f),
+        frank_state(&f).await,
         sqlite_state(&r),
         "state diverged after `{dml}`"
     );
-    assert_integrity(&f, &r);
+    assert_integrity(&f, &r).await;
 }
 
-fn frank_returning(c: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_returning(c: &Connection, sql: &str) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = c
         .query(sql)
+        .await
         .unwrap()
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -193,101 +200,116 @@ fn sqlite_returning(c: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 }
 #[test]
 fn dml_rowid_range_matches_sqlite() {
-    // DELETE: LOWER-bounded range -> SeekGE/SeekGT + walk, no Rewind, byte-exact resulting table.
-    check(
-        "DELETE FROM t WHERE id BETWEEN 50 AND 100",
-        Some(("SeekGE", Some("Gt"))),
-    );
-    check("DELETE FROM t WHERE id > 250", Some(("SeekGT", None))); // lower-only, exclusive
-    check(
-        "DELETE FROM t WHERE id >= 100 AND id <= 150",
-        Some(("SeekGE", Some("Gt"))),
-    ); // both inclusive
-    check(
-        "DELETE FROM t WHERE id > 100 AND id < 110",
-        Some(("SeekGT", Some("Ge"))),
-    ); // both exclusive
-    check(
-        "DELETE FROM t WHERE id BETWEEN 999 AND 1099",
-        Some(("SeekGE", Some("Gt"))),
-    ); // lower-bounded empty range (all absent)
-    check("DELETE FROM t WHERE id >= 298", Some(("SeekGE", None))); // near the end
-    check(
-        "DELETE FROM t AS q WHERE 50 <= q.id AND 60 > q.rowid",
-        Some(("SeekGE", Some("Ge"))),
-    ); // reversed operands and alias-qualified IPK/rowid references
-    check(
-        "DELETE FROM t WHERE id >= 200 AND id < 100",
-        Some(("SeekGE", Some("Ge"))),
-    ); // contradictory bounds are an exact empty bounded walk
-
-    // UPDATE: same lower-bounded range shapes, incl. a SET that rewrites the rowid.
-    check(
-        "UPDATE t SET x = 'r' WHERE id BETWEEN 50 AND 100",
-        Some(("SeekGE", Some("Gt"))),
-    );
-    check(
-        "UPDATE t SET a = a + 1 WHERE id > 250",
-        Some(("SeekGT", None)),
-    );
-    check(
-        "UPDATE t SET c = c * 2 WHERE id >= 100 AND id <= 150",
-        Some(("SeekGE", Some("Gt"))),
-    );
-    check(
-        "UPDATE t SET id = id + 10000 WHERE id BETWEEN 60 AND 62",
-        Some(("SeekGE", Some("Gt"))),
-    ); // rewrites the ROWID
-    check(
-        "UPDATE t SET x = 'e' WHERE id BETWEEN 999 AND 1099",
-        Some(("SeekGE", Some("Gt"))),
-    ); // empty range -> no-op
-
-    // Controls: UPPER-ONLY ranges (no lower bound to seek to) decline to the Rewind walk this cut, as do
-    // a non-rowid range, an unindexed residual conjunction, parameter bounds, and unary-negative
-    // bounds. Use `a` for the residual control: `c` has an index and is intentionally eligible for
-    // the independent indexed-equality DML lane.
-    check("DELETE FROM t WHERE id < 20", None); // upper-only -> Rewind
-    check("DELETE FROM t WHERE id <= 3", None); // upper-only
-    check("DELETE FROM t WHERE a BETWEEN 5 AND 10", None); // a is not the rowid
-    check("DELETE FROM t WHERE id BETWEEN 50 AND 100 AND a = 5", None); // residual -> not bare range
-    check(
-        "UPDATE t SET x = 'c' WHERE id BETWEEN 50 AND 100 AND a = 5",
-        None,
-    );
-    check("UPDATE t SET x = 'neg' WHERE id > -2", None); // unary-negative lower bound
-
-    // Parameter bounds decline the literal-only lane, while SET/WHERE slots and affected counts remain
-    // byte-for-byte compatible with SQLite.
-    let (f, r) = fresh();
-    let parameterized = "UPDATE t SET x = ? WHERE id >= ? AND id < ?";
-    assert_range_plan(&f, parameterized, None);
-    let f_changed = f
-        .execute_with_params(
-            parameterized,
-            &[
-                SqliteValue::Text("bound".into()),
-                SqliteValue::Integer(10),
-                SqliteValue::Integer(14),
-            ],
+    asupersync::test_utils::run_test(|| async {
+        // DELETE: LOWER-bounded range -> SeekGE/SeekGT + walk, no Rewind, byte-exact resulting table.
+        check(
+            "DELETE FROM t WHERE id BETWEEN 50 AND 100",
+            Some(("SeekGE", Some("Gt"))),
         )
-        .unwrap();
-    let r_changed = r
-        .execute(parameterized, rusqlite::params!["bound", 10_i64, 14_i64])
-        .unwrap();
-    assert_eq!(f_changed, r_changed);
-    assert_eq!(frank_state(&f), sqlite_state(&r));
-    assert_integrity(&f, &r);
+        .await;
+        check("DELETE FROM t WHERE id > 250", Some(("SeekGT", None))).await; // lower-only, exclusive
+        check(
+            "DELETE FROM t WHERE id >= 100 AND id <= 150",
+            Some(("SeekGE", Some("Gt"))),
+        )
+        .await; // both inclusive
+        check(
+            "DELETE FROM t WHERE id > 100 AND id < 110",
+            Some(("SeekGT", Some("Ge"))),
+        )
+        .await; // both exclusive
+        check(
+            "DELETE FROM t WHERE id BETWEEN 999 AND 1099",
+            Some(("SeekGE", Some("Gt"))),
+        )
+        .await; // lower-bounded empty range (all absent)
+        check("DELETE FROM t WHERE id >= 298", Some(("SeekGE", None))).await; // near the end
+        check(
+            "DELETE FROM t AS q WHERE 50 <= q.id AND 60 > q.rowid",
+            Some(("SeekGE", Some("Ge"))),
+        )
+        .await; // reversed operands and alias-qualified IPK/rowid references
+        check(
+            "DELETE FROM t WHERE id >= 200 AND id < 100",
+            Some(("SeekGE", Some("Ge"))),
+        )
+        .await; // contradictory bounds are an exact empty bounded walk
 
-    // DELETE RETURNING reads the old row image in Pass 2; the bounded collector must not alter either
-    // the returned set or the final table/index state.
-    let (f, r) = fresh();
-    let returning = "DELETE FROM t WHERE id BETWEEN 40 AND 44 RETURNING id, c, x";
-    assert_range_plan(&f, returning, Some(("SeekGE", Some("Gt"))));
-    assert_eq!(
-        frank_returning(&f, returning),
-        sqlite_returning(&r, returning)
-    );
-    assert_eq!(frank_state(&f), sqlite_state(&r));
-    assert_integrity(&f, &r);
+        // UPDATE: same lower-bounded range shapes, incl. a SET that rewrites the rowid.
+        check(
+            "UPDATE t SET x = 'r' WHERE id BETWEEN 50 AND 100",
+            Some(("SeekGE", Some("Gt"))),
+        )
+        .await;
+        check(
+            "UPDATE t SET a = a + 1 WHERE id > 250",
+            Some(("SeekGT", None)),
+        )
+        .await;
+        check(
+            "UPDATE t SET c = c * 2 WHERE id >= 100 AND id <= 150",
+            Some(("SeekGE", Some("Gt"))),
+        )
+        .await;
+        check(
+            "UPDATE t SET id = id + 10000 WHERE id BETWEEN 60 AND 62",
+            Some(("SeekGE", Some("Gt"))),
+        )
+        .await; // rewrites the ROWID
+        check(
+            "UPDATE t SET x = 'e' WHERE id BETWEEN 999 AND 1099",
+            Some(("SeekGE", Some("Gt"))),
+        )
+        .await; // empty range -> no-op
+
+        // Controls: UPPER-ONLY ranges (no lower bound to seek to) decline to the Rewind walk this cut, as do
+        // a non-rowid range, an unindexed residual conjunction, parameter bounds, and unary-negative
+        // bounds. Use `a` for the residual control: `c` has an index and is intentionally eligible for
+        // the independent indexed-equality DML lane.
+        check("DELETE FROM t WHERE id < 20", None).await; // upper-only -> Rewind
+        check("DELETE FROM t WHERE id <= 3", None).await; // upper-only
+        check("DELETE FROM t WHERE a BETWEEN 5 AND 10", None).await; // a is not the rowid
+        check("DELETE FROM t WHERE id BETWEEN 50 AND 100 AND a = 5", None).await; // residual -> not bare range
+        check(
+            "UPDATE t SET x = 'c' WHERE id BETWEEN 50 AND 100 AND a = 5",
+            None,
+        )
+        .await;
+        check("UPDATE t SET x = 'neg' WHERE id > -2", None).await; // unary-negative lower bound
+
+        // Parameter bounds decline the literal-only lane, while SET/WHERE slots and affected counts remain
+        // byte-for-byte compatible with SQLite.
+        let (f, r) = fresh().await;
+        let parameterized = "UPDATE t SET x = ? WHERE id >= ? AND id < ?";
+        assert_range_plan(&f, parameterized, None).await;
+        let f_changed = f
+            .execute_with_params(
+                parameterized,
+                &[
+                    SqliteValue::Text("bound".into()),
+                    SqliteValue::Integer(10),
+                    SqliteValue::Integer(14),
+                ],
+            )
+            .await
+            .unwrap();
+        let r_changed = r
+            .execute(parameterized, rusqlite::params!["bound", 10_i64, 14_i64])
+            .unwrap();
+        assert_eq!(f_changed, r_changed);
+        assert_eq!(frank_state(&f).await, sqlite_state(&r));
+        assert_integrity(&f, &r).await;
+
+        // DELETE RETURNING reads the old row image in Pass 2; the bounded collector must not alter either
+        // the returned set or the final table/index state.
+        let (f, r) = fresh().await;
+        let returning = "DELETE FROM t WHERE id BETWEEN 40 AND 44 RETURNING id, c, x";
+        assert_range_plan(&f, returning, Some(("SeekGE", Some("Gt")))).await;
+        assert_eq!(
+            frank_returning(&f, returning).await,
+            sqlite_returning(&r, returning)
+        );
+        assert_eq!(frank_state(&f).await, sqlite_state(&r));
+        assert_integrity(&f, &r).await;
+    });
 }

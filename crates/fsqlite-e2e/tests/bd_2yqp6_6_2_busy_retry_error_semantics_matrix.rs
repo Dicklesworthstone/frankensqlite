@@ -8,6 +8,7 @@
 //! - concurrent-mode default anti-regression behavior.
 
 #![allow(clippy::too_many_lines)]
+#![recursion_limit = "512"]
 
 use std::env;
 use std::fs;
@@ -247,72 +248,74 @@ fn bead_metadata_constants_are_stable_for_replay() {
 
 #[test]
 fn bd_2yqp6_6_2_busy_retry_error_semantics_matrix() {
-    let scenarios = selected_scenarios();
-    assert!(
-        !scenarios.is_empty(),
-        "at least one scenario must be selected"
-    );
+    asupersync::test_utils::run_test(|| async {
+        let scenarios = selected_scenarios();
+        assert!(
+            !scenarios.is_empty(),
+            "at least one scenario must be selected"
+        );
 
-    let mut records = Vec::new();
-    let mut first_failure: Option<String> = None;
+        let mut records = Vec::new();
+        let mut first_failure: Option<String> = None;
 
-    for scenario in scenarios {
-        let run_id = format!("{BEAD_ID}-{}-{DEFAULT_SEED:016x}", scenario.scenario_id());
-        let trace_id = format!("trace-{run_id}");
+        for scenario in scenarios {
+            let run_id = format!("{BEAD_ID}-{}-{DEFAULT_SEED:016x}", scenario.scenario_id());
+            let trace_id = format!("trace-{run_id}");
 
-        let run_a = run_scenario(scenario);
-        let run_b = run_scenario(scenario);
-        let deterministic_replay = run_a.fingerprint() == run_b.fingerprint();
+            let run_a = run_scenario(scenario).await;
+            let run_b = run_scenario(scenario).await;
+            let deterministic_replay = run_a.fingerprint() == run_b.fingerprint();
 
-        let mut diagnostics = Vec::new();
-        if !deterministic_replay {
-            diagnostics.push("non-deterministic engine outcome fingerprint".to_owned());
+            let mut diagnostics = Vec::new();
+            if !deterministic_replay {
+                diagnostics.push("non-deterministic engine outcome fingerprint".to_owned());
+            }
+
+            let checks = scenario_checks(scenario, &run_a, &mut diagnostics, deterministic_replay);
+
+            let outcome = if diagnostics.is_empty() {
+                "pass"
+            } else {
+                "fail"
+            };
+            let first_failure_for_record = diagnostics.first().cloned();
+            if first_failure.is_none() {
+                first_failure = first_failure_for_record.clone();
+            }
+
+            let record = json!({
+                "bead_id": BEAD_ID,
+                "trace_id": trace_id,
+                "run_id": run_id,
+                "scenario_id": scenario.scenario_id(),
+                "seed": DEFAULT_SEED,
+                "scenario": {
+                    "description": scenario.description(),
+                },
+                "timing_ms": {
+                    "sqlite3": run_a.sqlite_timing_ms,
+                    "fsqlite": run_a.fsqlite_timing_ms,
+                },
+                "outcome": outcome,
+                "first_failure": first_failure_for_record,
+                "checks": checks,
+                "sqlite3": run_a.sqlite,
+                "fsqlite": run_a.fsqlite,
+                "concurrent_mode_guard": run_a.guard,
+                "log_standard_ref": LOG_STANDARD_REF,
+                "replay_command": format!("{REPLAY_COMMAND} {}", scenario.scenario_id()),
+            });
+
+            assert_outcome_schema_valid(&record);
+            println!("SCENARIO_OUTCOME:{record}");
+            records.push(record);
         }
 
-        let checks = scenario_checks(scenario, &run_a, &mut diagnostics, deterministic_replay);
-
-        let outcome = if diagnostics.is_empty() {
-            "pass"
-        } else {
-            "fail"
-        };
-        let first_failure_for_record = diagnostics.first().cloned();
-        if first_failure.is_none() {
-            first_failure = first_failure_for_record.clone();
+        maybe_write_artifact(&records, first_failure.as_deref());
+        if let Some(failure) = first_failure {
+            panic!("busy/retry/error semantics matrix failed: {failure}");
         }
-
-        let record = json!({
-            "bead_id": BEAD_ID,
-            "trace_id": trace_id,
-            "run_id": run_id,
-            "scenario_id": scenario.scenario_id(),
-            "seed": DEFAULT_SEED,
-            "scenario": {
-                "description": scenario.description(),
-            },
-            "timing_ms": {
-                "sqlite3": run_a.sqlite_timing_ms,
-                "fsqlite": run_a.fsqlite_timing_ms,
-            },
-            "outcome": outcome,
-            "first_failure": first_failure_for_record,
-            "checks": checks,
-            "sqlite3": run_a.sqlite,
-            "fsqlite": run_a.fsqlite,
-            "concurrent_mode_guard": run_a.guard,
-            "log_standard_ref": LOG_STANDARD_REF,
-            "replay_command": format!("{REPLAY_COMMAND} {}", scenario.scenario_id()),
-        });
-
-        assert_outcome_schema_valid(&record);
-        println!("SCENARIO_OUTCOME:{record}");
-        records.push(record);
-    }
-
-    maybe_write_artifact(&records, first_failure.as_deref());
-    if let Some(failure) = first_failure {
-        panic!("busy/retry/error semantics matrix failed: {failure}");
-    }
+    });
 }
 
 fn selected_scenarios() -> Vec<ScenarioKind> {
@@ -337,15 +340,15 @@ fn selected_scenarios() -> Vec<ScenarioKind> {
     }
 }
 
-fn run_scenario(scenario: ScenarioKind) -> ScenarioRun {
+async fn run_scenario(scenario: ScenarioKind) -> ScenarioRun {
     match scenario {
-        ScenarioKind::BusySnapshotConflict => run_busy_snapshot_conflict(),
-        ScenarioKind::BusyLockImmediate => run_busy_lock_immediate(),
-        ScenarioKind::ConcurrentModeDefaultGuard => run_concurrent_mode_default_guard(),
+        ScenarioKind::BusySnapshotConflict => run_busy_snapshot_conflict().await,
+        ScenarioKind::BusyLockImmediate => run_busy_lock_immediate().await,
+        ScenarioKind::ConcurrentModeDefaultGuard => run_concurrent_mode_default_guard().await,
     }
 }
 
-fn run_busy_snapshot_conflict() -> ScenarioRun {
+async fn run_busy_snapshot_conflict() -> ScenarioRun {
     let dir =
         tempdir().unwrap_or_else(|e| panic!("create tempdir for busy snapshot scenario: {e}"));
     let sqlite_path = dir.path().join("busy_snapshot_sqlite.db");
@@ -356,7 +359,7 @@ fn run_busy_snapshot_conflict() -> ScenarioRun {
     let sqlite_ms = duration_to_ms(started_sqlite.elapsed().as_millis());
 
     let started_fsqlite = Instant::now();
-    let fsqlite = run_fsqlite_busy_snapshot_like(fsqlite_path.as_path());
+    let fsqlite = run_fsqlite_busy_snapshot_like(fsqlite_path.as_path()).await;
     let fsqlite_ms = duration_to_ms(started_fsqlite.elapsed().as_millis());
 
     ScenarioRun {
@@ -368,7 +371,7 @@ fn run_busy_snapshot_conflict() -> ScenarioRun {
     }
 }
 
-fn run_busy_lock_immediate() -> ScenarioRun {
+async fn run_busy_lock_immediate() -> ScenarioRun {
     let dir = tempdir().unwrap_or_else(|e| panic!("create tempdir for busy lock scenario: {e}"));
     let sqlite_path = dir.path().join("busy_lock_sqlite.db");
     let fsqlite_path = dir.path().join("busy_lock_fsqlite.db");
@@ -378,7 +381,7 @@ fn run_busy_lock_immediate() -> ScenarioRun {
     let sqlite_ms = duration_to_ms(started_sqlite.elapsed().as_millis());
 
     let started_fsqlite = Instant::now();
-    let fsqlite = run_fsqlite_busy_lock(fsqlite_path.as_path());
+    let fsqlite = run_fsqlite_busy_lock(fsqlite_path.as_path()).await;
     let fsqlite_ms = duration_to_ms(started_fsqlite.elapsed().as_millis());
 
     ScenarioRun {
@@ -390,9 +393,9 @@ fn run_busy_lock_immediate() -> ScenarioRun {
     }
 }
 
-fn run_concurrent_mode_default_guard() -> ScenarioRun {
+async fn run_concurrent_mode_default_guard() -> ScenarioRun {
     let started_fsqlite = Instant::now();
-    let (fsqlite, guard) = run_fsqlite_default_guard_checks();
+    let (fsqlite, guard) = run_fsqlite_default_guard_checks().await;
     let fsqlite_ms = duration_to_ms(started_fsqlite.elapsed().as_millis());
 
     ScenarioRun {
@@ -461,39 +464,39 @@ fn run_sqlite_busy_snapshot_like(path: &Path) -> EngineOutcome {
     }
 }
 
-fn run_fsqlite_busy_snapshot_like(path: &Path) -> EngineOutcome {
-    if let Err(err) = initialize_fsqlite_db(path) {
+async fn run_fsqlite_busy_snapshot_like(path: &Path) -> EngineOutcome {
+    if let Err(err) = initialize_fsqlite_db(path).await {
         return EngineOutcome::from_fsqlite_error(err);
     }
 
-    let conn1 = match open_fsqlite_worker(path, true) {
+    let conn1 = match open_fsqlite_worker(path, true).await {
         Ok(conn) => conn,
         Err(err) => return EngineOutcome::from_fsqlite_error(err),
     };
-    let conn2 = match open_fsqlite_worker(path, true) {
+    let conn2 = match open_fsqlite_worker(path, true).await {
         Ok(conn) => conn,
         Err(err) => return EngineOutcome::from_fsqlite_error(err),
     };
 
-    if let Err(err) = conn1.execute("BEGIN CONCURRENT;") {
+    if let Err(err) = conn1.execute("BEGIN CONCURRENT;").await {
         return EngineOutcome::from_fsqlite_error(err);
     }
-    if let Err(err) = conn2.execute("BEGIN CONCURRENT;") {
-        let _ = conn1.execute("ROLLBACK;");
+    if let Err(err) = conn2.execute("BEGIN CONCURRENT;").await {
+        drop(conn1.execute("ROLLBACK;").await);
         return EngineOutcome::from_fsqlite_error(err);
     }
-    if let Err(err) = conn1.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
-        let _ = conn1.execute("ROLLBACK;");
-        let _ = conn2.execute("ROLLBACK;");
+    if let Err(err) = conn1.execute("UPDATE t SET v = v + 1 WHERE id = 1;").await {
+        drop(conn1.execute("ROLLBACK;").await);
+        drop(conn2.execute("ROLLBACK;").await);
         return EngineOutcome::from_fsqlite_error(err);
     }
 
-    let second_update = conn2.execute("UPDATE t SET v = v + 1 WHERE id = 1;");
-    let commit1 = conn1.execute("COMMIT;");
+    let second_update = conn2.execute("UPDATE t SET v = v + 1 WHERE id = 1;").await;
+    let commit1 = conn1.execute("COMMIT;").await;
 
     match second_update {
         Err(err) => {
-            let _ = conn2.execute("ROLLBACK;");
+            drop(conn2.execute("ROLLBACK;").await);
             if let Err(commit_err) = commit1 {
                 return EngineOutcome::from_fsqlite_error(commit_err);
             }
@@ -501,10 +504,10 @@ fn run_fsqlite_busy_snapshot_like(path: &Path) -> EngineOutcome {
         }
         Ok(_) => {
             if let Err(err) = commit1 {
-                let _ = conn2.execute("ROLLBACK;");
+                drop(conn2.execute("ROLLBACK;").await);
                 return EngineOutcome::from_fsqlite_error(err);
             }
-            match conn2.execute("COMMIT;") {
+            match conn2.execute("COMMIT;").await {
                 Ok(_) => EngineOutcome::ok(
                     "fsqlite",
                     Some("both writers committed (no conflicting page detected)".to_owned()),
@@ -546,27 +549,27 @@ fn run_sqlite_busy_lock(path: &Path) -> EngineOutcome {
     }
 }
 
-fn run_fsqlite_busy_lock(path: &Path) -> EngineOutcome {
-    if let Err(err) = initialize_fsqlite_db(path) {
+async fn run_fsqlite_busy_lock(path: &Path) -> EngineOutcome {
+    if let Err(err) = initialize_fsqlite_db(path).await {
         return EngineOutcome::from_fsqlite_error(err);
     }
 
-    let conn1 = match open_fsqlite_worker(path, false) {
+    let conn1 = match open_fsqlite_worker(path, false).await {
         Ok(conn) => conn,
         Err(err) => return EngineOutcome::from_fsqlite_error(err),
     };
-    let conn2 = match open_fsqlite_worker(path, false) {
+    let conn2 = match open_fsqlite_worker(path, false).await {
         Ok(conn) => conn,
         Err(err) => return EngineOutcome::from_fsqlite_error(err),
     };
 
-    if let Err(err) = conn1.execute("BEGIN IMMEDIATE;") {
+    if let Err(err) = conn1.execute("BEGIN IMMEDIATE;").await {
         return EngineOutcome::from_fsqlite_error(err);
     }
 
-    let second_begin = conn2.execute("BEGIN IMMEDIATE;");
-    let _ = conn1.execute("ROLLBACK;");
-    let _ = conn2.execute("ROLLBACK;");
+    let second_begin = conn2.execute("BEGIN IMMEDIATE;").await;
+    drop(conn1.execute("ROLLBACK;").await);
+    drop(conn2.execute("ROLLBACK;").await);
 
     match second_begin {
         Ok(_) => EngineOutcome::ok(
@@ -580,8 +583,8 @@ fn run_fsqlite_busy_lock(path: &Path) -> EngineOutcome {
     }
 }
 
-fn run_fsqlite_default_guard_checks() -> (EngineOutcome, ConcurrentModeGuard) {
-    let conn = match FsqliteConnection::open(":memory:") {
+async fn run_fsqlite_default_guard_checks() -> (EngineOutcome, ConcurrentModeGuard) {
+    let conn = match FsqliteConnection::open(":memory:").await {
         Ok(conn) => conn,
         Err(err) => {
             let outcome = EngineOutcome::from_fsqlite_error(err);
@@ -598,16 +601,22 @@ fn run_fsqlite_default_guard_checks() -> (EngineOutcome, ConcurrentModeGuard) {
     let default_on = conn.is_concurrent_mode_default();
 
     let begin_promotes_to_concurrent =
-        conn.execute("BEGIN;").is_ok() && conn.is_concurrent_transaction();
-    let _ = conn.execute("ROLLBACK;");
+        conn.execute("BEGIN;").await.is_ok() && conn.is_concurrent_transaction();
+    drop(conn.execute("ROLLBACK;").await);
 
-    let pragma_off_disables_promotion = conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").is_ok()
+    let pragma_off_disables_promotion = conn
+        .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+        .await
+        .is_ok()
         && !conn.is_concurrent_mode_default()
-        && conn.execute("BEGIN;").is_ok()
+        && conn.execute("BEGIN;").await.is_ok()
         && !conn.is_concurrent_transaction();
-    let _ = conn.execute("ROLLBACK;");
+    drop(conn.execute("ROLLBACK;").await);
 
-    let pragma_on_restores_default = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").is_ok()
+    let pragma_on_restores_default = conn
+        .execute("PRAGMA fsqlite.concurrent_mode=ON;")
+        .await
+        .is_ok()
         && conn.is_concurrent_mode_default();
 
     let guard = ConcurrentModeGuard {
@@ -650,27 +659,28 @@ fn initialize_sqlite_db(path: &Path) -> rusqlite::Result<()> {
     )
 }
 
-fn initialize_fsqlite_db(path: &Path) -> Result<(), FrankenError> {
-    let conn = FsqliteConnection::open(path_to_utf8(path))?;
-    conn.execute("PRAGMA journal_mode=WAL;")?;
-    conn.execute("PRAGMA busy_timeout=0;")?;
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")?;
-    conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")?;
+async fn initialize_fsqlite_db(path: &Path) -> Result<(), FrankenError> {
+    let conn = FsqliteConnection::open(path_to_utf8(path)).await?;
+    conn.execute("PRAGMA journal_mode=WAL;").await?;
+    conn.execute("PRAGMA busy_timeout=0;").await?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+        .await?;
+    conn.execute("INSERT INTO t (id, v) VALUES (1, 0);").await?;
     Ok(())
 }
 
-fn open_fsqlite_worker(
+async fn open_fsqlite_worker(
     path: &Path,
     concurrent_mode: bool,
 ) -> Result<FsqliteConnection, FrankenError> {
-    let conn = FsqliteConnection::open(path_to_utf8(path))?;
-    conn.execute("PRAGMA busy_timeout=0;")?;
+    let conn = FsqliteConnection::open(path_to_utf8(path)).await?;
+    conn.execute("PRAGMA busy_timeout=0;").await?;
     let pragma = if concurrent_mode {
         "PRAGMA fsqlite.concurrent_mode=ON;"
     } else {
         "PRAGMA fsqlite.concurrent_mode=OFF;"
     };
-    conn.execute(pragma)?;
+    conn.execute(pragma).await?;
     Ok(conn)
 }
 

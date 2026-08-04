@@ -21,15 +21,15 @@
 //! - `sync_count`: total syncs
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use fsqlite_error::Result;
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
+use fsqlite_types::sync_primitives::Instant;
 
 use crate::shm::ShmRegion;
-use crate::traits::{FileIdentity, VfsFile, VfsWriteCompletion};
+use crate::traits::{FileIdentity, SyncKind, VfsFile, VfsWriteCompletion};
 
 // ---------------------------------------------------------------------------
 // Global metrics counters
@@ -260,62 +260,61 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         self.inner.file_identity()
     }
 
-    fn read<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a mut [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-        async move {
-            GLOBAL_VFS_METRICS.read_ops.fetch_add(1, Ordering::Relaxed);
-            let bytes_requested = buf.len() as u64;
-            let result = vfs_trace_op!(
-                "read_async",
-                &*self.path,
-                bytes_requested,
-                self.inner.read(cx, buf, offset).await
-            );
-            if let Ok(read) = &result {
-                GLOBAL_VFS_METRICS
-                    .read_bytes_total
-                    .fetch_add(*read as u64, Ordering::Relaxed);
-            }
-            result
+    async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        GLOBAL_VFS_METRICS.read_ops.fetch_add(1, Ordering::Relaxed);
+        let bytes_requested = buf.len() as u64;
+        let result = vfs_trace_op!(
+            "read_async",
+            &*self.path,
+            bytes_requested,
+            self.inner.read(cx, buf, offset).await
+        );
+        if let Ok(read) = &result {
+            GLOBAL_VFS_METRICS
+                .read_bytes_total
+                .fetch_add(*read as u64, Ordering::Relaxed);
         }
+        result
     }
 
-    fn write<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
+    async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+        let bytes = buf.len() as u64;
+        let result = vfs_trace_op!(
+            "write_async",
+            &*self.path,
+            bytes,
+            self.inner.write(cx, buf, offset).await
+        );
+        if result.is_ok() {
+            GLOBAL_VFS_METRICS
+                .write_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        result
     }
 
-    fn write_tracked<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
+    async fn write_tracked(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
-            let bytes = buf.len() as u64;
-            let result = vfs_trace_op!(
-                "write_async",
-                &*self.path,
-                bytes,
-                self.inner.write_tracked(cx, buf, offset, completion).await
-            );
-            if result.is_ok() {
-                GLOBAL_VFS_METRICS
-                    .write_bytes_total
-                    .fetch_add(bytes, Ordering::Relaxed);
-            }
-            result
+    ) -> Result<()> {
+        GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+        let bytes = buf.len() as u64;
+        let result = vfs_trace_op!(
+            "write_async",
+            &*self.path,
+            bytes,
+            self.inner.write_tracked(cx, buf, offset, completion).await
+        );
+        if result.is_ok() {
+            GLOBAL_VFS_METRICS
+                .write_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
         }
+        result
     }
 
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -328,6 +327,16 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
     fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
         GLOBAL_VFS_METRICS.sync_ops.fetch_add(1, Ordering::Relaxed);
         vfs_trace_op!("sync", &*self.path, 0_u64, self.inner.sync(cx, flags))
+    }
+
+    fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        GLOBAL_VFS_METRICS.sync_ops.fetch_add(1, Ordering::Relaxed);
+        vfs_trace_op!(
+            "durable_sync",
+            &*self.path,
+            0_u64,
+            self.inner.durable_sync(cx, kind)
+        )
     }
 
     fn file_size(&self, cx: &Cx) -> Result<u64> {
@@ -357,6 +366,50 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
             .unlock_ops
             .fetch_add(1, Ordering::Relaxed);
         vfs_trace_lock!("unlock", &*self.path, level, self.inner.unlock(cx, level))
+    }
+
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        GLOBAL_VFS_METRICS.lock_ops.fetch_add(1, Ordering::Relaxed);
+        vfs_trace_lock!(
+            "lock_external_shared_snapshot",
+            &*self.path,
+            LockLevel::Shared,
+            self.inner.lock_external_shared_snapshot(cx)
+        )
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        GLOBAL_VFS_METRICS
+            .unlock_ops
+            .fetch_add(1, Ordering::Relaxed);
+        vfs_trace_lock!(
+            "restore_external_shared_snapshot_attempt",
+            &*self.path,
+            LockLevel::None,
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        )
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        GLOBAL_VFS_METRICS.lock_ops.fetch_add(1, Ordering::Relaxed);
+        vfs_trace_lock!(
+            "lock_external_maintenance",
+            &*self.path,
+            LockLevel::Exclusive,
+            self.inner.lock_external_maintenance(cx, wal_mode)
+        )
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        GLOBAL_VFS_METRICS
+            .unlock_ops
+            .fetch_add(1, Ordering::Relaxed);
+        vfs_trace_lock!(
+            "restore_external_maintenance_attempt",
+            &*self.path,
+            LockLevel::None,
+            self.inner.restore_external_maintenance_attempt(cx)
+        )
     }
 
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
@@ -413,11 +466,117 @@ impl<F: VfsFile> TracingFile<F> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
     use super::*;
     use crate::memory::MemoryVfs;
     use crate::traits::Vfs;
+    use fsqlite_error::FrankenError;
     use fsqlite_types::flags::VfsOpenFlags;
+
+    struct DurableSyncProbe {
+        sync: Arc<AtomicU64>,
+        durable_sync: Arc<AtomicU64>,
+        ordinary_write: Arc<AtomicU64>,
+        tracked_write: Arc<AtomicU64>,
+    }
+
+    impl VfsFile for DurableSyncProbe {
+        fn close(&mut self, _: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn read<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: &'a mut [u8],
+            _: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+            std::future::ready(Ok(0))
+        }
+
+        fn write<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: &'a [u8],
+            _: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            self.ordinary_write.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok(()))
+        }
+
+        fn write_tracked<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: &'a [u8],
+            _: u64,
+            completion: VfsWriteCompletion,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            self.tracked_write.fetch_add(1, Ordering::Relaxed);
+            completion.complete_success();
+            std::future::ready(Ok(()))
+        }
+
+        fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+            self.sync.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn durable_sync(&mut self, _: &Cx, _: SyncKind) -> Result<()> {
+            self.durable_sync.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn file_size(&self, _: &Cx) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn lock_external_shared_snapshot(&mut self, _: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, _: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_lock(&mut self, _: &Cx, _: u32, _: u32, _: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_barrier(&self) {}
+
+        fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn tracing_file_wraps_operations() {
@@ -457,6 +616,50 @@ mod tests {
 
         // Close.
         traced.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn tracing_file_forwards_durable_sync_without_collapsing_its_intent() {
+        let cx = Cx::new();
+        let sync_calls = Arc::new(AtomicU64::new(0));
+        let durable_sync_calls = Arc::new(AtomicU64::new(0));
+        let probe = DurableSyncProbe {
+            sync: Arc::clone(&sync_calls),
+            durable_sync: Arc::clone(&durable_sync_calls),
+            ordinary_write: Arc::new(AtomicU64::new(0)),
+            tracked_write: Arc::new(AtomicU64::new(0)),
+        };
+        let before = GLOBAL_VFS_METRICS.snapshot();
+        let mut traced = TracingFile::new(probe, "durable-probe.db");
+
+        traced.durable_sync(&cx, SyncKind::FullDurable).unwrap();
+
+        assert_eq!(sync_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(durable_sync_calls.load(Ordering::Relaxed), 1);
+        assert!(GLOBAL_VFS_METRICS.snapshot().sync_ops > before.sync_ops);
+    }
+
+    #[test]
+    fn tracing_file_ordinary_write_does_not_enter_tracked_write_path() {
+        let cx = Cx::new();
+        let write_calls = Arc::new(AtomicU64::new(0));
+        let tracked_write_calls = Arc::new(AtomicU64::new(0));
+        let probe = DurableSyncProbe {
+            sync: Arc::new(AtomicU64::new(0)),
+            durable_sync: Arc::new(AtomicU64::new(0)),
+            ordinary_write: Arc::clone(&write_calls),
+            tracked_write: Arc::clone(&tracked_write_calls),
+        };
+        let traced = TracingFile::new(probe, "ordinary-write-probe.db");
+
+        traced.write(&cx, b"payload", 0).unwrap();
+
+        assert_eq!(write_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            tracked_write_calls.load(Ordering::Relaxed),
+            0,
+            "ordinary writes must not allocate a tracked-completion token"
+        );
     }
 
     #[test]

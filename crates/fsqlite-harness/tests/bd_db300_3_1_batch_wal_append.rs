@@ -204,7 +204,7 @@ fn elapsed_ns(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn low_level_scenario(frame_count: usize) -> Result<LowLevelScenarioReport, String> {
+async fn low_level_scenario(frame_count: usize) -> Result<LowLevelScenarioReport, String> {
     let cx = Cx::default();
     let vfs_single = MemoryVfs::new();
     let vfs_batch = MemoryVfs::new();
@@ -226,6 +226,7 @@ fn low_level_scenario(frame_count: usize) -> Result<LowLevelScenarioReport, Stri
 
     let single_file = tracing_wal_file(&vfs_single, &cx, &single_path, true)?;
     let mut wal_single = WalFile::create(&cx, single_file, PAGE_SIZE_U32, 0, wal_salts())
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=single_create error={error}"))?;
     let single_before = GLOBAL_VFS_METRICS.snapshot();
     let single_start = Instant::now();
@@ -237,6 +238,7 @@ fn low_level_scenario(frame_count: usize) -> Result<LowLevelScenarioReport, Stri
                 page,
                 commit_sizes[index],
             )
+            .await
             .map_err(|error| format!("bead_id={BEAD_ID} case=single_append error={error}"))?;
     }
     let single_elapsed_ns = elapsed_ns(single_start);
@@ -244,6 +246,7 @@ fn low_level_scenario(frame_count: usize) -> Result<LowLevelScenarioReport, Stri
 
     let batch_file = tracing_wal_file(&vfs_batch, &cx, &batch_path, true)?;
     let mut wal_batch = WalFile::create(&cx, batch_file, PAGE_SIZE_U32, 0, wal_salts())
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=batch_create error={error}"))?;
     let batch_frames: Vec<_> = pages
         .iter()
@@ -258,6 +261,7 @@ fn low_level_scenario(frame_count: usize) -> Result<LowLevelScenarioReport, Stri
     let batch_start = Instant::now();
     wal_batch
         .append_frames(&cx, &batch_frames)
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=batch_append error={error}"))?;
     let batch_elapsed_ns = elapsed_ns(batch_start);
     let batch_after = GLOBAL_VFS_METRICS.snapshot();
@@ -267,9 +271,11 @@ fn low_level_scenario(frame_count: usize) -> Result<LowLevelScenarioReport, Stri
     for frame_index in 0..frame_count {
         let (single_header, single_data) = wal_single
             .read_frame(&cx, frame_index)
+            .await
             .map_err(|error| format!("bead_id={BEAD_ID} case=single_read error={error}"))?;
         let (batch_header, batch_data) = wal_batch
             .read_frame(&cx, frame_index)
+            .await
             .map_err(|error| format!("bead_id={BEAD_ID} case=batch_read error={error}"))?;
         if single_header != batch_header || single_data != batch_data {
             frame_content_equivalent = false;
@@ -299,55 +305,63 @@ fn low_level_scenario(frame_count: usize) -> Result<LowLevelScenarioReport, Stri
     })
 }
 
-fn pager_scenario(dirty_pages: usize) -> Result<PagerScenarioReport, String> {
+async fn pager_scenario(dirty_pages: usize) -> Result<PagerScenarioReport, String> {
     let cx = Cx::default();
     let vfs = MemoryVfs::new();
     let db_path = PathBuf::from(format!("/bd_db300_3_1_pager_{dirty_pages}.db"));
     let wal_path = PathBuf::from(format!("/bd_db300_3_1_pager_{dirty_pages}.db-wal"));
 
-    let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &db_path, PageSize::DEFAULT).map_err(
-        |error| {
+    let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &db_path, PageSize::DEFAULT)
+        .await
+        .map_err(|error| {
             format!(
                 "bead_id={BEAD_ID} case=pager_open path={} error={error}",
                 db_path.display()
             )
-        },
-    )?;
+        })?;
 
     let wal_file = tracing_wal_file(&vfs, &cx, &wal_path, true)?;
     let wal = WalFile::create(&cx, wal_file, PAGE_SIZE_U32, 0, wal_salts())
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=pager_wal_create error={error}"))?;
     pager
         .set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
         .map_err(|error| format!("bead_id={BEAD_ID} case=set_wal_backend error={error}"))?;
     pager
         .set_journal_mode(&cx, JournalMode::Wal)
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=set_journal_mode error={error}"))?;
 
     let page_size = PageSize::DEFAULT.as_usize();
     let mut txn = pager
         .begin(&cx, TransactionMode::Immediate)
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=begin_txn error={error}"))?;
     txn.write_page(&cx, PageNumber::ONE, &vec![0x11; page_size])
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=write_page1 error={error}"))?;
     for index in 1..dirty_pages {
         let page_number = txn
             .allocate_page(&cx)
+            .await
             .map_err(|error| format!("bead_id={BEAD_ID} case=allocate_page error={error}"))?;
         let seed = u8::try_from(index % 251).expect("seed fits in u8");
         txn.write_page(&cx, page_number, &sample_page(seed))
+            .await
             .map_err(|error| format!("bead_id={BEAD_ID} case=write_allocated error={error}"))?;
     }
 
     let before_commit = GLOBAL_VFS_METRICS.snapshot();
     let commit_start = Instant::now();
     txn.commit(&cx)
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=commit error={error}"))?;
     let commit_elapsed_ns = elapsed_ns(commit_start);
     let after_commit = GLOBAL_VFS_METRICS.snapshot();
 
     let reader_file = open_memory_wal_file(&vfs, &cx, &wal_path, false)?;
     let wal_reader = WalFile::open(&cx, reader_file)
+        .await
         .map_err(|error| format!("bead_id={BEAD_ID} case=wal_reopen error={error}"))?;
     let wal_frame_count = wal_reader.frame_count();
     let mut commit_frame_count = 0_usize;
@@ -356,6 +370,7 @@ fn pager_scenario(dirty_pages: usize) -> Result<PagerScenarioReport, String> {
     for frame_index in 0..wal_frame_count {
         let (header, _) = wal_reader
             .read_frame(&cx, frame_index)
+            .await
             .map_err(|error| format!("bead_id={BEAD_ID} case=wal_reopen_read error={error}"))?;
         if header.db_size > 0 {
             commit_frame_count += 1;
@@ -392,172 +407,180 @@ fn write_report(path: &Path, report: &BatchWalAppendReport) -> Result<(), String
 
 #[test]
 fn test_e2e_bd_db300_3_1_batch_wal_append_verification() -> Result<(), String> {
-    let context = verification_context()?;
-    let report_path = context.artifact_dir.join("batch_wal_append_report.json");
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let context = verification_context()?;
+            let report_path = context.artifact_dir.join("batch_wal_append_report.json");
 
-    eprintln!(
-        "INFO bead_id={BEAD_ID} phase=metadata run_id={} trace_id={} scenario_id={} seed={} artifact_dir={}",
-        context.run_id,
-        context.trace_id,
-        context.scenario_id,
-        context.seed,
-        context.artifact_dir.display()
-    );
-
-    let mut low_level_matrix = Vec::new();
-    for frame_count in LOW_LEVEL_FRAME_MATRIX {
-        let scenario = low_level_scenario(frame_count)?;
-        eprintln!(
-            "DEBUG bead_id={BEAD_ID} phase=low_level scenario_id={} frame_count={} \
-             single_write_ops={} batch_write_ops={} single_elapsed_ns={} batch_elapsed_ns={}",
-            scenario.scenario_id,
-            scenario.frame_count,
-            scenario.single_io.write_ops,
-            scenario.batch_io.write_ops,
-            scenario.single_elapsed_ns,
-            scenario.batch_elapsed_ns
-        );
-        if scenario.batch_elapsed_ns > scenario.single_elapsed_ns {
             eprintln!(
-                "WARN bead_id={BEAD_ID} phase=low_level scenario_id={} \
-                 batch_elapsed_ns={} single_elapsed_ns={} note=batch_slower_in_memory_run",
-                scenario.scenario_id, scenario.batch_elapsed_ns, scenario.single_elapsed_ns
+                "INFO bead_id={BEAD_ID} phase=metadata run_id={} trace_id={} scenario_id={} seed={} artifact_dir={}",
+                context.run_id,
+                context.trace_id,
+                context.scenario_id,
+                context.seed,
+                context.artifact_dir.display()
             );
+
+            let mut low_level_matrix = Vec::new();
+            for frame_count in LOW_LEVEL_FRAME_MATRIX {
+                let scenario = low_level_scenario(frame_count).await?;
+                eprintln!(
+                    "DEBUG bead_id={BEAD_ID} phase=low_level scenario_id={} frame_count={} \
+                     single_write_ops={} batch_write_ops={} single_elapsed_ns={} batch_elapsed_ns={}",
+                    scenario.scenario_id,
+                    scenario.frame_count,
+                    scenario.single_io.write_ops,
+                    scenario.batch_io.write_ops,
+                    scenario.single_elapsed_ns,
+                    scenario.batch_elapsed_ns
+                );
+                if scenario.batch_elapsed_ns > scenario.single_elapsed_ns {
+                    eprintln!(
+                        "WARN bead_id={BEAD_ID} phase=low_level scenario_id={} \
+                         batch_elapsed_ns={} single_elapsed_ns={} note=batch_slower_in_memory_run",
+                        scenario.scenario_id, scenario.batch_elapsed_ns, scenario.single_elapsed_ns
+                    );
+                }
+                assert!(
+                    scenario.checksum_equivalent,
+                    "bead_id={BEAD_ID} case=checksum_equivalent scenario={}",
+                    scenario.scenario_id
+                );
+                assert!(
+                    scenario.frame_content_equivalent,
+                    "bead_id={BEAD_ID} case=frame_content_equivalent scenario={}",
+                    scenario.scenario_id
+                );
+                assert_eq!(
+                    scenario.single_io.write_ops,
+                    u64::try_from(scenario.frame_count).expect("frame count fits u64"),
+                    "bead_id={BEAD_ID} case=single_write_ops scenario={}",
+                    scenario.scenario_id
+                );
+                assert_eq!(
+                    scenario.batch_io.write_ops, 1,
+                    "bead_id={BEAD_ID} case=batch_write_ops scenario={}",
+                    scenario.scenario_id
+                );
+                low_level_matrix.push(scenario);
+            }
+
+            let mut pager_matrix = Vec::new();
+            for dirty_pages in PAGER_DIRTY_PAGE_MATRIX {
+                let scenario = pager_scenario(dirty_pages).await?;
+                eprintln!(
+                    "INFO bead_id={BEAD_ID} phase=pager_commit scenario_id={} dirty_pages={} \
+                     wal_write_ops={} wal_sync_ops={} wal_frame_count={} commit_elapsed_ns={}",
+                    scenario.scenario_id,
+                    scenario.dirty_pages,
+                    scenario.wal_io.write_ops,
+                    scenario.wal_io.sync_ops,
+                    scenario.wal_frame_count,
+                    scenario.commit_elapsed_ns
+                );
+                assert_eq!(
+                    scenario.wal_io.write_ops, 1,
+                    "bead_id={BEAD_ID} case=pager_single_wal_write scenario={}",
+                    scenario.scenario_id
+                );
+                assert_eq!(
+                    scenario.wal_frame_count, scenario.dirty_pages,
+                    "bead_id={BEAD_ID} case=pager_frame_count scenario={}",
+                    scenario.scenario_id
+                );
+                assert_eq!(
+                    scenario.commit_frame_count, 1,
+                    "bead_id={BEAD_ID} case=pager_commit_frame_count scenario={}",
+                    scenario.scenario_id
+                );
+                assert!(
+                    scenario.commit_marker_last,
+                    "bead_id={BEAD_ID} case=pager_commit_marker_last scenario={}",
+                    scenario.scenario_id
+                );
+                assert_eq!(
+                    scenario.commit_db_size,
+                    u32::try_from(scenario.dirty_pages).expect("dirty_pages fits u32"),
+                    "bead_id={BEAD_ID} case=pager_commit_db_size scenario={}",
+                    scenario.scenario_id
+                );
+                pager_matrix.push(scenario);
+            }
+
+            let total_single_write_ops = low_level_matrix
+                .iter()
+                .map(|scenario| scenario.single_io.write_ops)
+                .sum();
+            let total_batch_write_ops = low_level_matrix
+                .iter()
+                .map(|scenario| scenario.batch_io.write_ops)
+                .sum();
+            let min_write_op_reduction = low_level_matrix
+                .iter()
+                .map(|scenario| scenario.write_op_reduction)
+                .min()
+                .unwrap_or(0);
+            let all_checksum_equivalent = low_level_matrix
+                .iter()
+                .all(|scenario| scenario.checksum_equivalent && scenario.frame_content_equivalent);
+            let all_pager_commits_single_write = pager_matrix
+                .iter()
+                .all(|scenario| scenario.wal_io.write_ops == 1 && scenario.commit_marker_last);
+
+            let report = BatchWalAppendReport {
+                schema_version: "fsqlite.batch-wal-append.v1",
+                bead_id: BEAD_ID,
+                run_id: context.run_id.clone(),
+                trace_id: context.trace_id.clone(),
+                scenario_id: context.scenario_id.clone(),
+                seed: context.seed,
+                low_level_matrix,
+                pager_matrix,
+                summary: BatchWalAppendSummary {
+                    low_level_scenarios: LOW_LEVEL_FRAME_MATRIX.len(),
+                    pager_scenarios: PAGER_DIRTY_PAGE_MATRIX.len(),
+                    min_write_op_reduction,
+                    total_single_write_ops,
+                    total_batch_write_ops,
+                    all_checksum_equivalent,
+                    all_pager_commits_single_write,
+                },
+            };
+
+            write_report(&report_path, &report)?;
+            let report_json = serde_json::to_string_pretty(&report).map_err(|error| {
+                format!("bead_id={BEAD_ID} case=serialize_report_stdout error={error}")
+            })?;
+
+            println!("BEGIN_BD_DB300_3_1_REPORT");
+            println!("{report_json}");
+            println!("END_BD_DB300_3_1_REPORT");
+
+            eprintln!(
+                "INFO bead_id={BEAD_ID} phase=artifact_written run_id={} trace_id={} scenario_id={} artifact_path={}",
+                context.run_id,
+                context.trace_id,
+                context.scenario_id,
+                report_path.display()
+            );
+
+            assert!(
+                report.summary.all_checksum_equivalent,
+                "bead_id={BEAD_ID} case=summary_checksum_equivalent"
+            );
+            assert!(
+                report.summary.all_pager_commits_single_write,
+                "bead_id={BEAD_ID} case=summary_pager_single_write"
+            );
+            assert!(
+                report.summary.total_single_write_ops > report.summary.total_batch_write_ops,
+                "bead_id={BEAD_ID} case=summary_write_ops_reduced"
+            );
+
+            Ok(())
         }
-        assert!(
-            scenario.checksum_equivalent,
-            "bead_id={BEAD_ID} case=checksum_equivalent scenario={}",
-            scenario.scenario_id
-        );
-        assert!(
-            scenario.frame_content_equivalent,
-            "bead_id={BEAD_ID} case=frame_content_equivalent scenario={}",
-            scenario.scenario_id
-        );
-        assert_eq!(
-            scenario.single_io.write_ops,
-            u64::try_from(scenario.frame_count).expect("frame count fits u64"),
-            "bead_id={BEAD_ID} case=single_write_ops scenario={}",
-            scenario.scenario_id
-        );
-        assert_eq!(
-            scenario.batch_io.write_ops, 1,
-            "bead_id={BEAD_ID} case=batch_write_ops scenario={}",
-            scenario.scenario_id
-        );
-        low_level_matrix.push(scenario);
-    }
-
-    let mut pager_matrix = Vec::new();
-    for dirty_pages in PAGER_DIRTY_PAGE_MATRIX {
-        let scenario = pager_scenario(dirty_pages)?;
-        eprintln!(
-            "INFO bead_id={BEAD_ID} phase=pager_commit scenario_id={} dirty_pages={} \
-             wal_write_ops={} wal_sync_ops={} wal_frame_count={} commit_elapsed_ns={}",
-            scenario.scenario_id,
-            scenario.dirty_pages,
-            scenario.wal_io.write_ops,
-            scenario.wal_io.sync_ops,
-            scenario.wal_frame_count,
-            scenario.commit_elapsed_ns
-        );
-        assert_eq!(
-            scenario.wal_io.write_ops, 1,
-            "bead_id={BEAD_ID} case=pager_single_wal_write scenario={}",
-            scenario.scenario_id
-        );
-        assert_eq!(
-            scenario.wal_frame_count, scenario.dirty_pages,
-            "bead_id={BEAD_ID} case=pager_frame_count scenario={}",
-            scenario.scenario_id
-        );
-        assert_eq!(
-            scenario.commit_frame_count, 1,
-            "bead_id={BEAD_ID} case=pager_commit_frame_count scenario={}",
-            scenario.scenario_id
-        );
-        assert!(
-            scenario.commit_marker_last,
-            "bead_id={BEAD_ID} case=pager_commit_marker_last scenario={}",
-            scenario.scenario_id
-        );
-        assert_eq!(
-            scenario.commit_db_size,
-            u32::try_from(scenario.dirty_pages).expect("dirty_pages fits u32"),
-            "bead_id={BEAD_ID} case=pager_commit_db_size scenario={}",
-            scenario.scenario_id
-        );
-        pager_matrix.push(scenario);
-    }
-
-    let total_single_write_ops = low_level_matrix
-        .iter()
-        .map(|scenario| scenario.single_io.write_ops)
-        .sum();
-    let total_batch_write_ops = low_level_matrix
-        .iter()
-        .map(|scenario| scenario.batch_io.write_ops)
-        .sum();
-    let min_write_op_reduction = low_level_matrix
-        .iter()
-        .map(|scenario| scenario.write_op_reduction)
-        .min()
-        .unwrap_or(0);
-    let all_checksum_equivalent = low_level_matrix
-        .iter()
-        .all(|scenario| scenario.checksum_equivalent && scenario.frame_content_equivalent);
-    let all_pager_commits_single_write = pager_matrix
-        .iter()
-        .all(|scenario| scenario.wal_io.write_ops == 1 && scenario.commit_marker_last);
-
-    let report = BatchWalAppendReport {
-        schema_version: "fsqlite.batch-wal-append.v1",
-        bead_id: BEAD_ID,
-        run_id: context.run_id.clone(),
-        trace_id: context.trace_id.clone(),
-        scenario_id: context.scenario_id.clone(),
-        seed: context.seed,
-        low_level_matrix,
-        pager_matrix,
-        summary: BatchWalAppendSummary {
-            low_level_scenarios: LOW_LEVEL_FRAME_MATRIX.len(),
-            pager_scenarios: PAGER_DIRTY_PAGE_MATRIX.len(),
-            min_write_op_reduction,
-            total_single_write_ops,
-            total_batch_write_ops,
-            all_checksum_equivalent,
-            all_pager_commits_single_write,
-        },
-    };
-
-    write_report(&report_path, &report)?;
-    let report_json = serde_json::to_string_pretty(&report)
-        .map_err(|error| format!("bead_id={BEAD_ID} case=serialize_report_stdout error={error}"))?;
-
-    println!("BEGIN_BD_DB300_3_1_REPORT");
-    println!("{report_json}");
-    println!("END_BD_DB300_3_1_REPORT");
-
-    eprintln!(
-        "INFO bead_id={BEAD_ID} phase=artifact_written run_id={} trace_id={} scenario_id={} artifact_path={}",
-        context.run_id,
-        context.trace_id,
-        context.scenario_id,
-        report_path.display()
-    );
-
-    assert!(
-        report.summary.all_checksum_equivalent,
-        "bead_id={BEAD_ID} case=summary_checksum_equivalent"
-    );
-    assert!(
-        report.summary.all_pager_commits_single_write,
-        "bead_id={BEAD_ID} case=summary_pager_single_write"
-    );
-    assert!(
-        report.summary.total_single_write_ops > report.summary.total_batch_write_ops,
-        "bead_id={BEAD_ID} case=summary_write_ops_reduced"
-    );
-
-    Ok(())
+        .await;
+    });
+    outcome
 }

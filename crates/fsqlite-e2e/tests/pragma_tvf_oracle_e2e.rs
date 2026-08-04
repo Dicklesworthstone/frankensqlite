@@ -25,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,11 +58,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -73,10 +73,10 @@ fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
     (f, r)
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -103,74 +103,87 @@ const TBL: &[&str] =
 
 #[test]
 fn pragma_table_info_tvf_projection() {
-    let (f, r) = setup(TBL);
-    check(
-        &f,
-        &r,
-        &[
-            // Whole-row projection of the metadata, in column (cid) order.
-            "SELECT cid, name, type, \"notnull\", pk FROM pragma_table_info('t') ORDER BY cid",
-            // Just the names, ordered.
-            "SELECT name FROM pragma_table_info('t') ORDER BY cid",
-        ],
-        "pragma_table_info_tvf_projection",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(TBL).await;
+        check(
+            &f,
+            &r,
+            &[
+                // Whole-row projection of the metadata, in column (cid) order.
+                "SELECT cid, name, type, \"notnull\", pk FROM pragma_table_info('t') ORDER BY cid",
+                // Just the names, ordered.
+                "SELECT name FROM pragma_table_info('t') ORDER BY cid",
+            ],
+            "pragma_table_info_tvf_projection",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn pragma_table_info_tvf_filter_and_count() {
-    let (f, r) = setup(TBL);
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT count(*) FROM pragma_table_info('t')", // 4
-            "SELECT name FROM pragma_table_info('t') WHERE pk = 1", // id
-            "SELECT name FROM pragma_table_info('t') WHERE \"notnull\" = 1 ORDER BY cid", // a
-            "SELECT count(*) FROM pragma_table_info('t') WHERE type = 'INTEGER'", // 2
-            // dflt_value carries the literal text of the default expression.
-            "SELECT name, dflt_value FROM pragma_table_info('t') WHERE dflt_value IS NOT NULL", // b, 'x'
-        ],
-        "pragma_table_info_tvf_filter_and_count",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(TBL).await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT count(*) FROM pragma_table_info('t')", // 4
+                "SELECT name FROM pragma_table_info('t') WHERE pk = 1", // id
+                "SELECT name FROM pragma_table_info('t') WHERE \"notnull\" = 1 ORDER BY cid", // a
+                "SELECT count(*) FROM pragma_table_info('t') WHERE type = 'INTEGER'", // 2
+                // dflt_value carries the literal text of the default expression.
+                "SELECT name, dflt_value FROM pragma_table_info('t') WHERE dflt_value IS NOT NULL", // b, 'x'
+            ],
+            "pragma_table_info_tvf_filter_and_count",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn pragma_table_info_tvf_self_subquery() {
-    let (f, r) = setup(TBL);
-    check(
-        &f,
-        &r,
-        &[
-            // The cid of the primary-key column, fed back through a subquery.
-            "SELECT name FROM pragma_table_info('t') \
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(TBL).await;
+        check(
+            &f,
+            &r,
+            &[
+                // The cid of the primary-key column, fed back through a subquery.
+                "SELECT name FROM pragma_table_info('t') \
              WHERE cid = (SELECT cid FROM pragma_table_info('t') WHERE pk = 1)",
-            // Max cid == column_count - 1.
-            "SELECT max(cid) FROM pragma_table_info('t')", // 3
-        ],
-        "pragma_table_info_tvf_self_subquery",
-    );
+                // Max cid == column_count - 1.
+                "SELECT max(cid) FROM pragma_table_info('t')", // 3
+            ],
+            "pragma_table_info_tvf_self_subquery",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn pragma_foreign_key_list_tvf() {
-    let (f, r) = setup(&[
-        "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
-        "CREATE TABLE child (\
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "CREATE TABLE child (\
          id INTEGER PRIMARY KEY, \
          pid INTEGER REFERENCES parent(id) ON DELETE CASCADE ON UPDATE SET NULL)",
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            // The referenced table, local/foreign columns, and the actions.
-            "SELECT \"table\", \"from\", \"to\", on_update, on_delete \
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                // The referenced table, local/foreign columns, and the actions.
+                "SELECT \"table\", \"from\", \"to\", on_update, on_delete \
              FROM pragma_foreign_key_list('child')",
-            "SELECT count(*) FROM pragma_foreign_key_list('child')", // 1
-            "SELECT count(*) FROM pragma_foreign_key_list('parent')", // 0
-            "SELECT \"from\" FROM pragma_foreign_key_list('child') WHERE \"table\" = 'parent'", // pid
-        ],
-        "pragma_foreign_key_list_tvf",
-    );
+                "SELECT count(*) FROM pragma_foreign_key_list('child')", // 1
+                "SELECT count(*) FROM pragma_foreign_key_list('parent')", // 0
+                "SELECT \"from\" FROM pragma_foreign_key_list('child') WHERE \"table\" = 'parent'", // pid
+            ],
+            "pragma_foreign_key_list_tvf",
+        )
+        .await;
+    });
 }

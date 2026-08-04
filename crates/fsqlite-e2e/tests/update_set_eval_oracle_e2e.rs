@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,11 +57,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -71,7 +71,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -95,55 +95,67 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn update_set_swaps_columns() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
-            "INSERT INTO t VALUES (1,10,20),(2,30,40)",
-            "UPDATE t SET a = b, b = a", // swap each row using original values
-        ],
-        &["SELECT id, a, b FROM t ORDER BY id"], // (1,20,10),(2,40,30)
-        "update_set_swaps_columns",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+                "INSERT INTO t VALUES (1,10,20),(2,30,40)",
+                "UPDATE t SET a = b, b = a", // swap each row using original values
+            ],
+            &["SELECT id, a, b FROM t ORDER BY id"], // (1,20,10),(2,40,30)
+            "update_set_swaps_columns",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_set_rhs_uses_original_row() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
-            "INSERT INTO t VALUES (1,10,0)",
-            // b must get the OLD a (10), not the new a (11).
-            "UPDATE t SET a = a + 1, b = a",
-        ],
-        &["SELECT id, a, b FROM t ORDER BY id"], // (1,11,10)
-        "update_set_rhs_uses_original_row",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+                "INSERT INTO t VALUES (1,10,0)",
+                // b must get the OLD a (10), not the new a (11).
+                "UPDATE t SET a = a + 1, b = a",
+            ],
+            &["SELECT id, a, b FROM t ORDER BY id"], // (1,11,10)
+            "update_set_rhs_uses_original_row",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_set_multi_column_cross_refs() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)",
-            "INSERT INTO t VALUES (1,1,2,3)",
-            // All RHS use the original (1,2,3): a=b+c=5, b=a+c=4, c=a+b=3.
-            "UPDATE t SET a = b + c, b = a + c, c = a + b",
-        ],
-        &["SELECT id, a, b, c FROM t ORDER BY id"], // (1,5,4,3)
-        "update_set_multi_column_cross_refs",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)",
+                "INSERT INTO t VALUES (1,1,2,3)",
+                // All RHS use the original (1,2,3): a=b+c=5, b=a+c=4, c=a+b=3.
+                "UPDATE t SET a = b + c, b = a + c, c = a + b",
+            ],
+            &["SELECT id, a, b, c FROM t ORDER BY id"], // (1,5,4,3)
+            "update_set_multi_column_cross_refs",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_set_constant_offset_from_old() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
-            "INSERT INTO t VALUES (1,5,0),(2,7,0)",
-            // b derives from the original a even though a is also being changed.
-            "UPDATE t SET a = a * 10, b = a + 100",
-        ],
-        &["SELECT id, a, b FROM t ORDER BY id"], // (1,50,105),(2,70,107)
-        "update_set_constant_offset_from_old",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+                "INSERT INTO t VALUES (1,5,0),(2,7,0)",
+                // b derives from the original a even though a is also being changed.
+                "UPDATE t SET a = a * 10, b = a + 100",
+            ],
+            &["SELECT id, a, b FROM t ORDER BY id"], // (1,50,105),(2,70,107)
+            "update_set_constant_offset_from_old",
+        )
+        .await;
+    });
 }

@@ -25,6 +25,11 @@
 //!   FSQLITE_BENCH_PERF_CTL=`<fifo>`      Enable/disable an attached perf session around exact DML windows.
 //!   FSQLITE_BENCH_PERF_ACK=`<fifo>`      Wait for perf control acknowledgements before crossing each boundary.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed windows await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
@@ -386,7 +391,7 @@ fn sparse_isolated_delete_id(iter: usize, index: usize, rows: usize) -> Result<i
 
 fn apply_benchmark_pragmas(conn: &fsqlite::Connection) -> Result<(), RunError> {
     for pragma in BENCHMARK_PRAGMAS {
-        conn.execute(pragma)
+        fsqlite_e2e::block_on(conn.execute(pragma))
             .map_err(|err| RunError::Runtime(format!("apply benchmark pragma {pragma}: {err}")))?;
     }
 
@@ -398,7 +403,7 @@ fn apply_benchmark_pragmas(conn: &fsqlite::Connection) -> Result<(), RunError> {
             "PRAGMA fsqlite.write_merge = LAB_UNSAFE;",
             "PRAGMA fsqlite.ssi_e_process_alpha = 0.001;",
         ] {
-            conn.execute(pragma).map_err(|err| {
+            fsqlite_e2e::block_on(conn.execute(pragma)).map_err(|err| {
                 RunError::Runtime(format!("apply benchmark pragma {pragma}: {err}"))
             })?;
         }
@@ -408,10 +413,10 @@ fn apply_benchmark_pragmas(conn: &fsqlite::Connection) -> Result<(), RunError> {
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        conn.execute("PRAGMA fsqlite.fused_entry_mode = forced_fallback;")
+        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.fused_entry_mode = forced_fallback;"))
             .map_err(|err| {
-                RunError::Runtime(format!("apply fused fallback benchmark pragma: {err}"))
-            })?;
+            RunError::Runtime(format!("apply fused fallback benchmark pragma: {err}"))
+        })?;
     }
 
     Ok(())
@@ -825,31 +830,37 @@ fn run_fsqlite_benchmark(
     let mut total_populate_ns: u128 = 0;
 
     for iter in 0..args.iters {
-        let conn = fsqlite::Connection::open(":memory:")
+        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:"))
             .map_err(|err| RunError::Runtime(format!("open in-memory database: {err}")))?;
         apply_benchmark_pragmas(&conn)?;
-        conn.execute(BENCH_CREATE_SQL)
+        fsqlite_e2e::block_on(conn.execute(BENCH_CREATE_SQL))
             .map_err(|err| RunError::Runtime(format!("create benchmark table: {err}")))?;
-        conn.execute("BEGIN")
+        fsqlite_e2e::block_on(conn.execute("BEGIN"))
             .map_err(|err| RunError::Runtime(format!("begin populate transaction: {err}")))?;
-        let stmt = conn
-            .prepare(BENCH_INSERT_SQL)
+        let stmt = fsqlite_e2e::block_on(conn.prepare(BENCH_INSERT_SQL))
             .map_err(|err| RunError::Runtime(format!("prepare populate statement: {err}")))?;
+        // bd-mnlk2 / bd-zavyn: one runtime entry per timed window so the
+        // sample measures the engine, not a ~333 ns bridge entry per row.
         let t0 = Instant::now();
-        for i in 0..rows_i64 {
-            stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                .map_err(|err| RunError::Runtime(format!("populate row {i}: {err}")))?;
-        }
-        conn.execute("COMMIT")
-            .map_err(|err| RunError::Runtime(format!("commit populate transaction: {err}")))?;
+        fsqlite_e2e::block_on(async {
+            for i in 0..rows_i64 {
+                stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
+                    .await
+                    .map_err(|err| RunError::Runtime(format!("populate row {i}: {err}")))?;
+            }
+            conn.execute("COMMIT")
+                .await
+                .map_err(|err| RunError::Runtime(format!("commit populate transaction: {err}")))?;
+            Ok::<(), RunError>(())
+        })?;
         total_populate_ns += t0.elapsed().as_nanos();
 
         if args.workload.do_update() {
-            conn.execute("BEGIN")
+            fsqlite_e2e::block_on(conn.execute("BEGIN"))
                 .map_err(|err| RunError::Runtime(format!("begin update transaction: {err}")))?;
-            let update = conn
-                .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
-                .map_err(|err| RunError::Runtime(format!("prepare update statement: {err}")))?;
+            let update =
+                fsqlite_e2e::block_on(conn.prepare("UPDATE bench SET value = ?2 WHERE id = ?1"))
+                    .map_err(|err| RunError::Runtime(format!("prepare update statement: {err}")))?;
             let profile = DmlProfileScope::start(DmlProfileLabel::iter(
                 args.profile_mode,
                 DmlProfileOperation::Update,
@@ -857,28 +868,32 @@ fn run_fsqlite_benchmark(
                 args.rows,
             ))?;
             let t0 = Instant::now();
-            for i in 0..update_count {
-                let id = i64::try_from(i).map_err(|_| {
-                    RunError::Usage("update_count index overflowed i64".to_string())
-                })? * 10;
-                update
-                    .execute_with_params(&[
-                        fsqlite::SqliteValue::Integer(id),
-                        fsqlite::SqliteValue::Float(999.99),
-                    ])
-                    .map_err(|err| RunError::Runtime(format!("update row {id}: {err}")))?;
-            }
-            conn.execute("COMMIT")
-                .map_err(|err| RunError::Runtime(format!("commit update transaction: {err}")))?;
+            fsqlite_e2e::block_on(async {
+                for i in 0..update_count {
+                    let id = i64::try_from(i).map_err(|_| {
+                        RunError::Usage("update_count index overflowed i64".to_string())
+                    })? * 10;
+                    update
+                        .execute_with_params(&[
+                            fsqlite::SqliteValue::Integer(id),
+                            fsqlite::SqliteValue::Float(999.99),
+                        ])
+                        .await
+                        .map_err(|err| RunError::Runtime(format!("update row {id}: {err}")))?;
+                }
+                conn.execute("COMMIT").await.map_err(|err| {
+                    RunError::Runtime(format!("commit update transaction: {err}"))
+                })?;
+                Ok::<(), RunError>(())
+            })?;
             total_update_ns += t0.elapsed().as_nanos();
             profile.finish()?;
         }
 
         if args.workload.do_delete() {
-            conn.execute("BEGIN")
+            fsqlite_e2e::block_on(conn.execute("BEGIN"))
                 .map_err(|err| RunError::Runtime(format!("begin delete transaction: {err}")))?;
-            let delete = conn
-                .prepare("DELETE FROM bench WHERE id = ?1")
+            let delete = fsqlite_e2e::block_on(conn.prepare("DELETE FROM bench WHERE id = ?1"))
                 .map_err(|err| RunError::Runtime(format!("prepare delete statement: {err}")))?;
             let profile = DmlProfileScope::start(DmlProfileLabel::iter(
                 args.profile_mode,
@@ -887,16 +902,21 @@ fn run_fsqlite_benchmark(
                 args.rows,
             ))?;
             let t0 = Instant::now();
-            for i in 0..delete_count {
-                let id = i64::try_from(i).map_err(|_| {
-                    RunError::Usage("delete_count index overflowed i64".to_string())
-                })? * 20;
-                delete
-                    .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                    .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
-            }
-            conn.execute("COMMIT")
-                .map_err(|err| RunError::Runtime(format!("commit delete transaction: {err}")))?;
+            fsqlite_e2e::block_on(async {
+                for i in 0..delete_count {
+                    let id = i64::try_from(i).map_err(|_| {
+                        RunError::Usage("delete_count index overflowed i64".to_string())
+                    })? * 20;
+                    delete
+                        .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                        .await
+                        .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
+                }
+                conn.execute("COMMIT").await.map_err(|err| {
+                    RunError::Runtime(format!("commit delete transaction: {err}"))
+                })?;
+                Ok::<(), RunError>(())
+            })?;
             total_delete_ns += t0.elapsed().as_nanos();
             profile.finish()?;
         }
@@ -933,32 +953,38 @@ fn run_fsqlite_exact_gate_benchmark(
     }
 
     let t_all = Instant::now();
-    let conn = fsqlite::Connection::open(":memory:")
+    let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:"))
         .map_err(|err| RunError::Runtime(format!("open exact-gate database: {err}")))?;
     apply_benchmark_pragmas(&conn)?;
-    conn.execute(BENCH_CREATE_SQL)
+    fsqlite_e2e::block_on(conn.execute(BENCH_CREATE_SQL))
         .map_err(|err| RunError::Runtime(format!("create exact-gate table: {err}")))?;
-    conn.execute("BEGIN")
+    fsqlite_e2e::block_on(conn.execute("BEGIN"))
         .map_err(|err| RunError::Runtime(format!("begin exact-gate population: {err}")))?;
-    let insert = conn
-        .prepare(BENCH_INSERT_SQL)
+    let insert = fsqlite_e2e::block_on(conn.prepare(BENCH_INSERT_SQL))
         .map_err(|err| RunError::Runtime(format!("prepare exact-gate population: {err}")))?;
+    // bd-mnlk2 / bd-zavyn: one runtime entry per timed window so samples
+    // measure the engine, not a ~333 ns bridge entry per row.
     let populate_start = Instant::now();
-    for rowid in 0..rows_i64 {
-        insert
-            .execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)])
-            .map_err(|err| RunError::Runtime(format!("populate exact-gate row {rowid}: {err}")))?;
-    }
-    conn.execute("COMMIT")
-        .map_err(|err| RunError::Runtime(format!("commit exact-gate population: {err}")))?;
+    fsqlite_e2e::block_on(async {
+        for rowid in 0..rows_i64 {
+            insert
+                .execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)])
+                .await
+                .map_err(|err| {
+                    RunError::Runtime(format!("populate exact-gate row {rowid}: {err}"))
+                })?;
+        }
+        conn.execute("COMMIT")
+            .await
+            .map_err(|err| RunError::Runtime(format!("commit exact-gate population: {err}")))?;
+        Ok::<(), RunError>(())
+    })?;
     let total_populate_ns = populate_start.elapsed().as_nanos();
     drop(insert);
 
-    let delete = conn
-        .prepare("DELETE FROM bench WHERE id = ?1")
+    let delete = fsqlite_e2e::block_on(conn.prepare("DELETE FROM bench WHERE id = ?1"))
         .map_err(|err| RunError::Runtime(format!("prepare exact-gate DELETE: {err}")))?;
-    let restore = conn
-        .prepare(BENCH_INSERT_SQL)
+    let restore = fsqlite_e2e::block_on(conn.prepare(BENCH_INSERT_SQL))
         .map_err(|err| RunError::Runtime(format!("prepare exact-gate restore: {err}")))?;
 
     let total_iters = args
@@ -979,55 +1005,60 @@ fn run_fsqlite_exact_gate_benchmark(
             DmlProfileScope { state: None }
         };
         let delete_start = Instant::now();
-        conn.execute("BEGIN").map_err(|err| {
-            RunError::Runtime(format!("begin exact-gate DELETE iteration {iter}: {err}"))
-        })?;
-        for index in 0..delete_count {
-            let rowid = i64::try_from(index)
-                .map_err(|_| RunError::Usage("delete index must fit within i64".to_string()))?
-                * 20;
-            let affected = delete
-                .execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)])
-                .map_err(|err| {
-                    RunError::Runtime(format!(
-                        "exact-gate DELETE iteration {iter} row {rowid}: {err}"
-                    ))
-                })?;
-            if affected != 1 {
-                return Err(RunError::Runtime(format!(
-                    "exact-gate DELETE iteration {iter} row {rowid} affected {affected} rows"
-                )));
+        fsqlite_e2e::block_on(async {
+            conn.execute("BEGIN").await.map_err(|err| {
+                RunError::Runtime(format!("begin exact-gate DELETE iteration {iter}: {err}"))
+            })?;
+            for index in 0..delete_count {
+                let rowid = i64::try_from(index)
+                    .map_err(|_| RunError::Usage("delete index must fit within i64".to_string()))?
+                    * 20;
+                let affected = delete
+                    .execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)])
+                    .await
+                    .map_err(|err| {
+                        RunError::Runtime(format!(
+                            "exact-gate DELETE iteration {iter} row {rowid}: {err}"
+                        ))
+                    })?;
+                if affected != 1 {
+                    return Err(RunError::Runtime(format!(
+                        "exact-gate DELETE iteration {iter} row {rowid} affected {affected} rows"
+                    )));
+                }
             }
-        }
-        conn.execute("COMMIT").map_err(|err| {
-            RunError::Runtime(format!("commit exact-gate DELETE iteration {iter}: {err}"))
+            conn.execute("COMMIT").await.map_err(|err| {
+                RunError::Runtime(format!("commit exact-gate DELETE iteration {iter}: {err}"))
+            })?;
+            Ok::<(), RunError>(())
         })?;
         if measured_iter.is_some() {
             total_delete_ns = total_delete_ns.saturating_add(delete_start.elapsed().as_nanos());
         }
         profile.finish()?;
 
-        conn.execute("BEGIN").map_err(|err| {
+        fsqlite_e2e::block_on(conn.execute("BEGIN")).map_err(|err| {
             RunError::Runtime(format!("begin exact-gate restore iteration {iter}: {err}"))
         })?;
         for index in 0..delete_count {
             let rowid = i64::try_from(index)
                 .map_err(|_| RunError::Usage("restore index must fit within i64".to_string()))?
                 * 20;
-            let affected = restore
-                .execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)])
-                .map_err(|err| {
-                    RunError::Runtime(format!(
-                        "exact-gate restore iteration {iter} row {rowid}: {err}"
-                    ))
-                })?;
+            let affected = fsqlite_e2e::block_on(
+                restore.execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)]),
+            )
+            .map_err(|err| {
+                RunError::Runtime(format!(
+                    "exact-gate restore iteration {iter} row {rowid}: {err}"
+                ))
+            })?;
             if affected != 1 {
                 return Err(RunError::Runtime(format!(
                     "exact-gate restore iteration {iter} row {rowid} affected {affected} rows"
                 )));
             }
         }
-        conn.execute("COMMIT").map_err(|err| {
+        fsqlite_e2e::block_on(conn.execute("COMMIT")).map_err(|err| {
             RunError::Runtime(format!("commit exact-gate restore iteration {iter}: {err}"))
         })?;
     }
@@ -1176,33 +1207,39 @@ fn run_fsqlite_isolated_benchmark(
 ) -> Result<TimingTotals, RunError> {
     let t_all = Instant::now();
     let populate_rows_i64 = isolated_populate_rows_i64(args, rows_i64, delete_count)?;
-    let conn = fsqlite::Connection::open(":memory:")
+    let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:"))
         .map_err(|err| RunError::Runtime(format!("open in-memory database: {err}")))?;
     apply_benchmark_pragmas(&conn)?;
-    conn.execute(BENCH_CREATE_SQL)
+    fsqlite_e2e::block_on(conn.execute(BENCH_CREATE_SQL))
         .map_err(|err| RunError::Runtime(format!("create benchmark table: {err}")))?;
-    conn.execute("BEGIN")
+    fsqlite_e2e::block_on(conn.execute("BEGIN"))
         .map_err(|err| RunError::Runtime(format!("begin populate transaction: {err}")))?;
-    let stmt = conn
-        .prepare(BENCH_INSERT_SQL)
+    let stmt = fsqlite_e2e::block_on(conn.prepare(BENCH_INSERT_SQL))
         .map_err(|err| RunError::Runtime(format!("prepare populate statement: {err}")))?;
+    // bd-mnlk2 / bd-zavyn: one runtime entry per timed window so samples
+    // measure the engine, not a ~333 ns bridge entry per row.
     let t0 = Instant::now();
-    for i in 0..populate_rows_i64 {
-        stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-            .map_err(|err| RunError::Runtime(format!("populate row {i}: {err}")))?;
-    }
-    conn.execute("COMMIT")
-        .map_err(|err| RunError::Runtime(format!("commit populate transaction: {err}")))?;
+    fsqlite_e2e::block_on(async {
+        for i in 0..populate_rows_i64 {
+            stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
+                .await
+                .map_err(|err| RunError::Runtime(format!("populate row {i}: {err}")))?;
+        }
+        conn.execute("COMMIT")
+            .await
+            .map_err(|err| RunError::Runtime(format!("commit populate transaction: {err}")))?;
+        Ok::<(), RunError>(())
+    })?;
     let total_populate_ns = t0.elapsed().as_nanos();
 
     let mut total_update_ns: u128 = 0;
     let mut total_delete_ns: u128 = 0;
 
     if args.workload.do_update() {
-        let update = conn
-            .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
-            .map_err(|err| RunError::Runtime(format!("prepare update statement: {err}")))?;
-        conn.execute("BEGIN").map_err(|err| {
+        let update =
+            fsqlite_e2e::block_on(conn.prepare("UPDATE bench SET value = ?2 WHERE id = ?1"))
+                .map_err(|err| RunError::Runtime(format!("prepare update statement: {err}")))?;
+        fsqlite_e2e::block_on(conn.execute("BEGIN")).map_err(|err| {
             RunError::Runtime(format!("begin isolated update transaction: {err}"))
         })?;
         let profile = DmlProfileScope::start(DmlProfileLabel::aggregate(
@@ -1212,34 +1249,37 @@ fn run_fsqlite_isolated_benchmark(
             args.iters,
         ))?;
         let t0 = Instant::now();
-        for iter in 0..args.iters {
-            let next_value = (iter as f64).mul_add(0.001, 999.99);
-            for i in 0..update_count {
-                let id = i64::try_from(i).map_err(|_| {
-                    RunError::Usage("update_count index overflowed i64".to_string())
-                })? * 10;
-                update
-                    .execute_with_params(&[
-                        fsqlite::SqliteValue::Integer(id),
-                        fsqlite::SqliteValue::Float(next_value),
-                    ])
-                    .map_err(|err| RunError::Runtime(format!("update row {id}: {err}")))?;
+        fsqlite_e2e::block_on(async {
+            for iter in 0..args.iters {
+                let next_value = (iter as f64).mul_add(0.001, 999.99);
+                for i in 0..update_count {
+                    let id = i64::try_from(i).map_err(|_| {
+                        RunError::Usage("update_count index overflowed i64".to_string())
+                    })? * 10;
+                    update
+                        .execute_with_params(&[
+                            fsqlite::SqliteValue::Integer(id),
+                            fsqlite::SqliteValue::Float(next_value),
+                        ])
+                        .await
+                        .map_err(|err| RunError::Runtime(format!("update row {id}: {err}")))?;
+                }
             }
-        }
+            Ok::<(), RunError>(())
+        })?;
         total_update_ns = t0.elapsed().as_nanos();
         profile.finish()?;
-        conn.execute("ROLLBACK").map_err(|err| {
+        fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map_err(|err| {
             RunError::Runtime(format!("rollback isolated update transaction: {err}"))
         })?;
     }
 
     if args.workload.do_delete() {
-        let delete = conn
-            .prepare("DELETE FROM bench WHERE id = ?1")
+        let delete = fsqlite_e2e::block_on(conn.prepare("DELETE FROM bench WHERE id = ?1"))
             .map_err(|err| RunError::Runtime(format!("prepare delete statement: {err}")))?;
         if args.profile_mode == ProfileMode::RollbackIsolated {
             for iter in 0..args.iters {
-                conn.execute("BEGIN").map_err(|err| {
+                fsqlite_e2e::block_on(conn.execute("BEGIN")).map_err(|err| {
                     RunError::Runtime(format!(
                         "begin rollback-isolated delete transaction {iter}: {err}"
                     ))
@@ -1251,17 +1291,21 @@ fn run_fsqlite_isolated_benchmark(
                     args.rows,
                 ))?;
                 let t0 = Instant::now();
-                for i in 0..delete_count {
-                    let id = i64::try_from(i).map_err(|_| {
-                        RunError::Usage("delete_count index overflowed i64".to_string())
-                    })? * 20;
-                    delete
-                        .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                        .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
-                }
+                fsqlite_e2e::block_on(async {
+                    for i in 0..delete_count {
+                        let id = i64::try_from(i).map_err(|_| {
+                            RunError::Usage("delete_count index overflowed i64".to_string())
+                        })? * 20;
+                        delete
+                            .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                            .await
+                            .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
+                    }
+                    Ok::<(), RunError>(())
+                })?;
                 total_delete_ns += t0.elapsed().as_nanos();
                 profile.finish()?;
-                conn.execute("ROLLBACK").map_err(|err| {
+                fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map_err(|err| {
                     RunError::Runtime(format!(
                         "rollback rollback-isolated delete transaction {iter}: {err}"
                     ))
@@ -1271,7 +1315,7 @@ fn run_fsqlite_isolated_benchmark(
                 }
             }
         } else {
-            conn.execute("BEGIN").map_err(|err| {
+            fsqlite_e2e::block_on(conn.execute("BEGIN")).map_err(|err| {
                 RunError::Runtime(format!("begin isolated delete transaction: {err}"))
             })?;
             let profile = DmlProfileScope::start(DmlProfileLabel::aggregate(
@@ -1281,24 +1325,28 @@ fn run_fsqlite_isolated_benchmark(
                 args.iters,
             ))?;
             let t0 = Instant::now();
-            for iter in 0..args.iters {
-                for i in 0..delete_count {
-                    let id = if args.profile_mode == ProfileMode::SparseIsolated {
-                        sparse_isolated_delete_id(iter, i, args.rows)?
-                    } else {
-                        isolated_delete_id(iter, i, delete_count)?
-                    };
-                    delete
-                        .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                        .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
+            fsqlite_e2e::block_on(async {
+                for iter in 0..args.iters {
+                    for i in 0..delete_count {
+                        let id = if args.profile_mode == ProfileMode::SparseIsolated {
+                            sparse_isolated_delete_id(iter, i, args.rows)?
+                        } else {
+                            isolated_delete_id(iter, i, delete_count)?
+                        };
+                        delete
+                            .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                            .await
+                            .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
+                    }
+                    if iter == 0 {
+                        eprintln!("  (first isolated delete iter complete)");
+                    }
                 }
-                if iter == 0 {
-                    eprintln!("  (first isolated delete iter complete)");
-                }
-            }
+                Ok::<(), RunError>(())
+            })?;
             total_delete_ns = t0.elapsed().as_nanos();
             profile.finish()?;
-            conn.execute("COMMIT").map_err(|err| {
+            fsqlite_e2e::block_on(conn.execute("COMMIT")).map_err(|err| {
                 RunError::Runtime(format!("commit isolated delete transaction: {err}"))
             })?;
         }

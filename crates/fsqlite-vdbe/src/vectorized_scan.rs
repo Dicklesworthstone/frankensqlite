@@ -503,7 +503,7 @@ fn checked_offset_span(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
     use std::future::Future;
     use std::rc::Rc;
@@ -549,19 +549,63 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     struct SharedTrackingPageIo {
-        store: Rc<RefCell<MemPageStore>>,
+        store: Rc<Cell<Option<Rc<MemPageStore>>>>,
         hinted_pages: Rc<RefCell<Vec<PageNumber>>>,
+        stall_write_after_store_take: bool,
+    }
+
+    struct SharedPageStoreGuard {
+        slot: Rc<Cell<Option<Rc<MemPageStore>>>>,
+        store: Option<MemPageStore>,
+    }
+
+    impl SharedPageStoreGuard {
+        fn take(slot: Rc<Cell<Option<Rc<MemPageStore>>>>) -> fsqlite_error::Result<Self> {
+            let Some(shared) = slot.take() else {
+                return Err(fsqlite_error::FrankenError::internal(
+                    "shared page store already has an active writer",
+                ));
+            };
+            let store = match Rc::try_unwrap(shared) {
+                Ok(store) => store,
+                Err(shared) => {
+                    slot.set(Some(shared));
+                    return Err(fsqlite_error::FrankenError::internal(
+                        "shared page store has active readers during a write",
+                    ));
+                }
+            };
+            Ok(Self {
+                slot,
+                store: Some(store),
+            })
+        }
+
+        fn store_mut(&mut self) -> fsqlite_error::Result<&mut MemPageStore> {
+            self.store.as_mut().ok_or_else(|| {
+                fsqlite_error::FrankenError::internal("shared page store guard lost ownership")
+            })
+        }
+    }
+
+    impl Drop for SharedPageStoreGuard {
+        fn drop(&mut self) {
+            if let Some(store) = self.store.take() {
+                self.slot.set(Some(Rc::new(store)));
+            }
+        }
     }
 
     impl SharedTrackingPageIo {
         fn new(page_size: u32, root_page: PageNumber) -> Self {
             Self {
-                store: Rc::new(RefCell::new(MemPageStore::with_empty_table(
+                store: Rc::new(Cell::new(Some(Rc::new(MemPageStore::with_empty_table(
                     root_page, page_size,
-                ))),
+                ))))),
                 hinted_pages: Rc::new(RefCell::new(Vec::new())),
+                stall_write_after_store_take: false,
             }
         }
 
@@ -577,7 +621,17 @@ mod tests {
             cx: &'a Cx,
             page_no: PageNumber,
         ) -> impl Future<Output = fsqlite_error::Result<Vec<u8>>> + 'a {
-            async move { self.store.borrow().read_page(cx, page_no).await }
+            let store = Rc::clone(&self.store);
+            async move {
+                let Some(shared) = store.take() else {
+                    return Err(fsqlite_error::FrankenError::internal(
+                        "shared page store has an active writer during a read",
+                    ));
+                };
+                let snapshot = Rc::clone(&shared);
+                store.set(Some(shared));
+                snapshot.read_page(cx, page_no).await
+            }
         }
 
         fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
@@ -593,14 +647,25 @@ mod tests {
             page_no: PageNumber,
             data: &'a [u8],
         ) -> impl Future<Output = fsqlite_error::Result<()>> + 'a {
-            async move { self.store.borrow_mut().write_page(cx, page_no, data).await }
+            let store = Rc::clone(&self.store);
+            let stall_after_take = self.stall_write_after_store_take;
+            async move {
+                let mut store = SharedPageStoreGuard::take(store)?;
+                if stall_after_take {
+                    std::future::pending::<()>().await;
+                }
+                store.store_mut()?.write_page(cx, page_no, data).await
+            }
         }
 
         fn allocate_page<'a>(
             &'a mut self,
             cx: &'a Cx,
         ) -> impl Future<Output = fsqlite_error::Result<PageNumber>> + 'a {
-            async move { self.store.borrow_mut().allocate_page(cx).await }
+            async move {
+                let mut store = SharedPageStoreGuard::take(Rc::clone(&self.store))?;
+                store.store_mut()?.allocate_page(cx).await
+            }
         }
 
         fn free_page<'a>(
@@ -608,10 +673,45 @@ mod tests {
             cx: &'a Cx,
             page_no: PageNumber,
         ) -> impl Future<Output = fsqlite_error::Result<()>> + 'a {
-            async move { self.store.borrow_mut().free_page(cx, page_no).await }
+            async move {
+                let mut store = SharedPageStoreGuard::take(Rc::clone(&self.store))?;
+                store.store_mut()?.free_page(cx, page_no).await
+            }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    #[test]
+    fn shared_tracking_page_io_restores_store_when_write_future_is_cancelled() {
+        use std::task::{Context, Poll, Waker};
+
+        let root_page = PageNumber::new(ROOT_PAGE).expect("root page should be non-zero");
+        let mut io = SharedTrackingPageIo::new(PAGE_SIZE, root_page);
+        io.stall_write_after_store_take = true;
+        let store = Rc::clone(&io.store);
+        let cx = Cx::new();
+        let page = vec![0_u8; PAGE_SIZE as usize];
+        let mut pending = Box::pin(fsqlite_btree::PageWriter::write_page(
+            &mut io, &cx, root_page, &page,
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(matches!(pending.as_mut().poll(&mut context), Poll::Pending));
+        assert!(
+            store.take().is_none(),
+            "polled write future should own the page store"
+        );
+        drop(pending);
+        let restored_store = store
+            .take()
+            .expect("dropping a pending write future must restore the page store");
+        store.set(Some(restored_store));
+
+        let restored = block_on_test(io.read_page(&cx, root_page))
+            .expect("restored page store should remain readable");
+        assert_eq!(restored.len(), PAGE_SIZE as usize);
     }
 
     fn specs() -> Vec<ColumnSpec> {

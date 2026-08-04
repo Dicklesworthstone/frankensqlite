@@ -8,6 +8,7 @@
 //! one `execute` call (not split by the harness); the resulting state is then
 //! compared against rusqlite. A divergence (e.g. only the first statement runs)
 //! is the finding.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -25,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -60,10 +61,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
 
 /// Run a whole multi-statement batch in ONE execute call on each engine, assert
 /// success/failure agreement, then compare the query results.
-fn batch(batch_sql: &str, queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn batch(batch_sql: &str, queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
-    let fe = f.execute(batch_sql);
+    let fe = f.execute(batch_sql).await;
     let re = r.execute_batch(batch_sql);
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -72,7 +73,7 @@ fn batch(batch_sql: &str, queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -96,68 +97,83 @@ fn batch(batch_sql: &str, queries: &[&str], label: &str) {
 
 #[test]
 fn multi_stmt_create_then_inserts() {
-    batch(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); \
-         INSERT INTO t VALUES (1,'a'); \
-         INSERT INTO t VALUES (2,'b'); \
-         INSERT INTO t VALUES (3,'c');",
-        &[
-            "SELECT id, v FROM t ORDER BY id", // 3 rows
-            "SELECT count(*) FROM t",          // 3
-        ],
-        "multi_stmt_create_then_inserts",
-    );
+    asupersync::test_utils::run_test(|| async {
+        batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); \
+             INSERT INTO t VALUES (1,'a'); \
+             INSERT INTO t VALUES (2,'b'); \
+             INSERT INTO t VALUES (3,'c');",
+            &[
+                "SELECT id, v FROM t ORDER BY id", // 3 rows
+                "SELECT count(*) FROM t",          // 3
+            ],
+            "multi_stmt_create_then_inserts",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn multi_stmt_ddl_dml_update_delete() {
-    batch(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER); \
-         INSERT INTO t VALUES (1,10),(2,20),(3,30); \
-         UPDATE t SET v = v * 2 WHERE id >= 2; \
-         DELETE FROM t WHERE id = 1;",
-        &["SELECT id, v FROM t ORDER BY id"], // (2,40),(3,60)
-        "multi_stmt_ddl_dml_update_delete",
-    );
+    asupersync::test_utils::run_test(|| async {
+        batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER); \
+             INSERT INTO t VALUES (1,10),(2,20),(3,30); \
+             UPDATE t SET v = v * 2 WHERE id >= 2; \
+             DELETE FROM t WHERE id = 1;",
+            &["SELECT id, v FROM t ORDER BY id"], // (2,40),(3,60)
+            "multi_stmt_ddl_dml_update_delete",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn multi_stmt_with_comments_and_whitespace() {
-    batch(
-        "CREATE TABLE t (id INTEGER);\n\
-         -- a line comment\n\
-         INSERT INTO t VALUES (1);\n\
-         /* block comment */ INSERT INTO t VALUES (2);\n\
-         INSERT INTO t VALUES (3);\n",
-        &["SELECT id FROM t ORDER BY id", "SELECT count(*) FROM t"], // 1,2,3 ; 3
-        "multi_stmt_with_comments_and_whitespace",
-    );
+    asupersync::test_utils::run_test(|| async {
+        batch(
+            "CREATE TABLE t (id INTEGER);\n\
+             -- a line comment\n\
+             INSERT INTO t VALUES (1);\n\
+             /* block comment */ INSERT INTO t VALUES (2);\n\
+             INSERT INTO t VALUES (3);\n",
+            &["SELECT id FROM t ORDER BY id", "SELECT count(*) FROM t"], // 1,2,3 ; 3
+            "multi_stmt_with_comments_and_whitespace",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn multi_stmt_multiple_creates() {
-    batch(
-        "CREATE TABLE a (x INTEGER); \
-         CREATE TABLE b (y TEXT); \
-         INSERT INTO a VALUES (1),(2); \
-         INSERT INTO b VALUES ('p'),('q');",
-        &[
-            "SELECT x FROM a ORDER BY x", // 1,2
-            "SELECT y FROM b ORDER BY y", // 'p','q'
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('a','b')", // 2
-        ],
-        "multi_stmt_multiple_creates",
-    );
+    asupersync::test_utils::run_test(|| async {
+        batch(
+            "CREATE TABLE a (x INTEGER); \
+             CREATE TABLE b (y TEXT); \
+             INSERT INTO a VALUES (1),(2); \
+             INSERT INTO b VALUES ('p'),('q');",
+            &[
+                "SELECT x FROM a ORDER BY x", // 1,2
+                "SELECT y FROM b ORDER BY y", // 'p','q'
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('a','b')", // 2
+            ],
+            "multi_stmt_multiple_creates",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn multi_stmt_insert_select_chain() {
-    batch(
-        "CREATE TABLE src (n INTEGER); \
-         INSERT INTO src VALUES (1),(2),(3),(4); \
-         CREATE TABLE evens (n INTEGER); \
-         INSERT INTO evens SELECT n FROM src WHERE n % 2 = 0;",
-        &["SELECT n FROM evens ORDER BY n"], // 2,4
-        "multi_stmt_insert_select_chain",
-    );
+    asupersync::test_utils::run_test(|| async {
+        batch(
+            "CREATE TABLE src (n INTEGER); \
+             INSERT INTO src VALUES (1),(2),(3),(4); \
+             CREATE TABLE evens (n INTEGER); \
+             INSERT INTO evens SELECT n FROM src WHERE n % 2 = 0;",
+            &["SELECT n FROM evens ORDER BY n"], // 2,4
+            "multi_stmt_insert_select_chain",
+        )
+        .await;
+    });
 }

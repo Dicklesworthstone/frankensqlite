@@ -310,6 +310,10 @@ tmp_rch_probe/
 # Suffixed rch target shards (correctness lane, retained-dml lane, per-job
 # job-id + nanos shards) — created by concurrent `rch` cargo invocations.
 .rch-target-*/
+# The shared target pool is named PLURAL with no separator, so neither
+# `.rch-target/` nor `.rch-target-*/` above matches it. It is a symlink into
+# /data/tmp/rch-targets-pool.
+.rch-targets/
 .rch-correctness-target/
 .rch-retained-dml-target/
 
@@ -365,5 +369,16 @@ tests/artifacts/parity-status/
 
 # Library-updater progress file (machine-local, transient)
 claude-upgrade-progress.json
-# Agent scratch test files (machine-local, never tracked)
-**/zz_scratch_*.rs
+# Agent scratch test files (machine-local, never tracked).
+#
+# The `zz_` prefix is the swarm's own marker for a throwaway probe: these files
+# open with `//! EPHEMERAL bench. Not for commit.` and are deleted once the
+# measurement they exist for is recorded. The narrower `zz_scratch_*` pattern
+# never matched what the agents actually write (`zz_<subject>_bench.rs`,
+# `zz_<subject>_probe.rs`), so thirty of them sat in `git status` indefinitely.
+# No `zz_` file has ever been tracked here.
+**/zz_*.rs
+# RCH must see Cargo's locally discovered integration-test entrypoints while
+# remote-only validation is in progress. Keep these untracked; this exception
+# is temporary and is not part of the campaign commit.
+!crates/fsqlite/tests/zz_*.rs

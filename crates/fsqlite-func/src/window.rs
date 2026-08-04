@@ -11,6 +11,8 @@ use std::any::Any;
 use fsqlite_error::Result;
 use fsqlite_types::SqliteValue;
 
+use crate::FunctionArity;
+
 /// A window SQL function (e.g. `SUM() OVER (...)`, custom moving averages).
 ///
 /// Window functions extend aggregates with:
@@ -54,24 +56,32 @@ pub trait WindowFunction: Send + Sync {
     /// The number of arguments this function accepts (`-1` = variadic).
     fn num_args(&self) -> i32;
 
-    /// Minimum accepted SQL argument count for variadic functions.
+    /// Minimum accepted SQL argument count for a variadic function.
     ///
     /// Some built-in window functions receive ORDER BY values internally even
     /// when their SQL call syntax accepts no visible arguments. These bounds
-    /// describe SQL-visible arity, not the runtime step argument slice.
+    /// describe SQL-visible arity, not the runtime step argument slice. The
+    /// default is zero; fixed-arity functions do not consult this method.
     fn min_args(&self) -> i32 {
-        self.num_args().max(0)
+        0
     }
 
-    /// Maximum accepted SQL argument count, or `None` for unbounded variadic
-    /// functions.
+    /// Maximum accepted SQL argument count for a variadic function.
+    ///
+    /// The default is unbounded. Fixed-arity functions are matched directly
+    /// from [`Self::num_args`] and do not consult this method.
     fn max_args(&self) -> Option<i32> {
-        (self.num_args() >= 0).then(|| self.num_args())
+        None
     }
 
-    /// Return whether this function accepts `num_args` SQL arguments.
-    fn accepts_arg_count(&self, num_args: i32) -> bool {
-        num_args >= self.min_args() && self.max_args().is_none_or(|max| num_args <= max)
+    /// Return the complete SQL-visible arity contract in one metadata call.
+    ///
+    /// Registries use this method exactly once before publication, preventing
+    /// a reentrant or stateful [`Self::num_args`] implementation from producing
+    /// a key and bounds from different observations.
+    fn arity(&self) -> FunctionArity {
+        let declared = self.num_args();
+        FunctionArity::from_declared_args(declared, || (self.min_args(), self.max_args()))
     }
 
     /// The function name, used in error messages and EXPLAIN output.
@@ -140,6 +150,10 @@ where
 
     fn max_args(&self) -> Option<i32> {
         self.inner.max_args()
+    }
+
+    fn arity(&self) -> FunctionArity {
+        self.inner.arity()
     }
 
     fn name(&self) -> &str {

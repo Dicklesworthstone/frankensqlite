@@ -14,8 +14,9 @@ fn render(v: &SqliteValue) -> String {
         SqliteValue::Blob(_) => "blob".into(),
     }
 }
-fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
+async fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
     c.query(s)
+        .await
         .unwrap_or_else(|e| panic!("frank `{s}`: {e}"))
         .iter()
         .map(|r| r.values().iter().map(render).collect())
@@ -43,53 +44,54 @@ fn sq(c: &rusqlite::Connection, s: &str) -> Vec<Vec<String>> {
 }
 #[test]
 fn eq_seek_exact_matches_sqlite() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT);",
-        "CREATE INDEX idx_a ON t(a);",
-        "CREATE INDEX idx_c ON t(c);",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    // a in 0..49 (each ~10 rows -> duplicate runs); some NULLs; c text.
-    for i in 1..=500_i64 {
-        let a = if i <= 5 {
-            "NULL".to_owned()
-        } else {
-            format!("{}", i % 50)
-        };
-        let s = format!("INSERT INTO t VALUES ({i}, {a}, {}, 'k{}');", i % 7, i % 20);
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
-    // Mixed storage classes in the INTEGER column a (real + text stay off-integer).
-    for (id, val) in [(9001, "7.5"), (9002, "'abc'")] {
-        let s = format!("INSERT INTO t VALUES ({id}, {val}, 0, 'z');");
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
-    let cmp = |s: &str| assert_eq!(fr(&f, s), sq(&r, s), "diverged: `{s}`");
-    for s in [
-        // Existing keys (duplicate runs).
-        "SELECT COUNT(*) FROM t WHERE a = 7",
-        "SELECT SUM(b) FROM t WHERE a = 7",
-        "SELECT MIN(a), MAX(a) FROM t WHERE a = 7",
-        "SELECT COUNT(*) FROM t WHERE a = 0",
-        // NONEXISTENT keys -> exact seek, no fallback scan (the lever).
-        "SELECT COUNT(*) FROM t WHERE a = 999",
-        "SELECT SUM(b) FROM t WHERE a = 999",
-        "SELECT MIN(a) FROM t WHERE a = 999",
-        "SELECT COUNT(*) FROM t WHERE a = -1",
-        "SELECT COALESCE(SUM(b), -9) FROM t WHERE a = 999",
-        // Non-exact: TEXT column (keeps fallback) - existing + nonexistent.
-        "SELECT COUNT(*) FROM t WHERE c = 'k3'",
-        "SELECT COUNT(*) FROM t WHERE c = 'nope'",
-        // Non-exact: real literal on the INTEGER column (keeps fallback).
-        "SELECT COUNT(*) FROM t WHERE a = 7.5",
-        "SELECT COUNT(*) FROM t WHERE a = 7.0",
-    ] {
-        cmp(s);
-    }
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT);",
+            "CREATE INDEX idx_a ON t(a);",
+            "CREATE INDEX idx_c ON t(c);",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        // a in 0..49 (each ~10 rows -> duplicate runs); some NULLs; c text.
+        for i in 1..=500_i64 {
+            let a = if i <= 5 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 50)
+            };
+            let s = format!("INSERT INTO t VALUES ({i}, {a}, {}, 'k{}');", i % 7, i % 20);
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
+        // Mixed storage classes in the INTEGER column a (real + text stay off-integer).
+        for (id, val) in [(9001, "7.5"), (9002, "'abc'")] {
+            let s = format!("INSERT INTO t VALUES ({id}, {val}, 0, 'z');");
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
+        for s in [
+            // Existing keys (duplicate runs).
+            "SELECT COUNT(*) FROM t WHERE a = 7",
+            "SELECT SUM(b) FROM t WHERE a = 7",
+            "SELECT MIN(a), MAX(a) FROM t WHERE a = 7",
+            "SELECT COUNT(*) FROM t WHERE a = 0",
+            // NONEXISTENT keys -> exact seek, no fallback scan (the lever).
+            "SELECT COUNT(*) FROM t WHERE a = 999",
+            "SELECT SUM(b) FROM t WHERE a = 999",
+            "SELECT MIN(a) FROM t WHERE a = 999",
+            "SELECT COUNT(*) FROM t WHERE a = -1",
+            "SELECT COALESCE(SUM(b), -9) FROM t WHERE a = 999",
+            // Non-exact: TEXT column (keeps fallback) - existing + nonexistent.
+            "SELECT COUNT(*) FROM t WHERE c = 'k3'",
+            "SELECT COUNT(*) FROM t WHERE c = 'nope'",
+            // Non-exact: real literal on the INTEGER column (keeps fallback).
+            "SELECT COUNT(*) FROM t WHERE a = 7.5",
+            "SELECT COUNT(*) FROM t WHERE a = 7.0",
+        ] {
+            assert_eq!(fr(&f, s).await, sq(&r, s), "diverged: `{s}`");
+        }
+    });
 }

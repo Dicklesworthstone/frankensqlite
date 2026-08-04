@@ -22,8 +22,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -55,12 +55,12 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -84,27 +84,33 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn values_consistent_arity_ok() {
-    assert_scalar(
-        &[
-            "SELECT * FROM (VALUES (1,2),(3,4),(5,6)) ORDER BY 1", // (1,2),(3,4),(5,6)
-            "SELECT * FROM (VALUES ('a',1),('b',2)) ORDER BY 1",   // (a,1),(b,2)
-            "SELECT * FROM (VALUES (1)) ",                         // single 1-col row
-        ],
-        "values_consistent_arity_ok",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT * FROM (VALUES (1,2),(3,4),(5,6)) ORDER BY 1", // (1,2),(3,4),(5,6)
+                "SELECT * FROM (VALUES ('a',1),('b',2)) ORDER BY 1",   // (a,1),(b,2)
+                "SELECT * FROM (VALUES (1)) ",                         // single 1-col row
+            ],
+            "values_consistent_arity_ok",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn values_ragged_arity_rejected() {
     // SQLite rejects each of these ("all VALUES must have the same number of
     // terms"); the test confirms frank rejects them too (no silent pad/truncate).
-    assert_scalar(
-        &[
-            "VALUES (1,2),(3)",
-            "VALUES (1),(2,3)",
-            "SELECT * FROM (VALUES (1,2,3),(4,5))",
-            "SELECT * FROM (VALUES (1),(2),(3,4)) ORDER BY 1",
-        ],
-        "values_ragged_arity_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "VALUES (1,2),(3)",
+                "VALUES (1),(2,3)",
+                "SELECT * FROM (VALUES (1,2,3),(4,5))",
+                "SELECT * FROM (VALUES (1),(2),(3,4)) ORDER BY 1",
+            ],
+            "values_ragged_arity_rejected",
+        )
+        .await;
+    });
 }

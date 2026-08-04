@@ -49,9 +49,10 @@ pub use cursor::{
 pub use instrumentation::{
     BtreeCopyProfileSnapshot, BtreeLeafReuseSnapshot, BtreeMetricsSnapshot, BtreeOpType,
     BtreeOperationTotals, ConflictTopologyPolicyMode, ConflictTopologySplitAdvice,
-    HotPageDeflectionStatus, btree_copy_profile_snapshot, btree_leaf_reuse_snapshot,
-    btree_metrics_enabled, btree_metrics_snapshot, conflict_topology_policy_enabled,
-    conflict_topology_policy_mode, conflict_topology_split_advice, record_conflict_topology_heat,
+    HotPageDeflectionStatus, btree_copy_profile_enabled, btree_copy_profile_snapshot,
+    btree_leaf_reuse_snapshot, btree_metrics_enabled, btree_metrics_snapshot,
+    conflict_topology_policy_enabled, conflict_topology_policy_mode,
+    conflict_topology_split_advice, record_conflict_topology_heat,
     record_conflict_topology_heat_batch, reset_btree_copy_profile, reset_btree_leaf_reuse_profile,
     reset_btree_metrics, reset_conflict_topology_policy_state, set_btree_copy_profile_enabled,
     set_btree_metrics_enabled, set_conflict_topology_policy_mode,

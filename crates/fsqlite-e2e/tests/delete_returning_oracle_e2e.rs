@@ -5,6 +5,7 @@
 //! DELETE-all RETURNING, and multi-row UPDATE RETURNING (which must report the
 //! NEW values for every affected row). RETURNING output order is unspecified in
 //! SQLite, so result sets are sorted before comparison.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
 
 /// Run a RETURNING statement and collect its rows, sorted for order-insensitive
 /// comparison.
-fn frank_returning_sorted(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_returning_sorted(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     let mut out: Vec<Vec<String>> = rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -67,16 +68,17 @@ fn sqlite_returning_sorted(
 
 /// Set up identical tables, run `mutation` (a RETURNING statement) on each engine
 /// comparing its returned rows, then compare a follow-up state query.
-fn returning_case(setup: &[&str], mutation: &str, state_query: &str, label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn returning_case(setup: &[&str], mutation: &str, state_query: &str, label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in setup {
         f.execute(s)
+            .await
             .unwrap_or_else(|e| panic!("{label} frank `{s}`: {e}"));
         r.execute_batch(s)
             .unwrap_or_else(|e| panic!("{label} rusqlite `{s}`: {e}"));
     }
-    let fr = frank_returning_sorted(&f, mutation);
+    let fr = frank_returning_sorted(&f, mutation).await;
     let rr = sqlite_returning_sorted(&r, mutation);
     match (&fr, &rr) {
         (Ok(a), Ok(b)) => assert_eq!(a, b, "{label}: RETURNING rows differ\n  `{mutation}`"),
@@ -85,7 +87,7 @@ fn returning_case(setup: &[&str], mutation: &str, state_query: &str, label: &str
         (Err(_), Err(_)) => {}
     }
     // Also confirm the resulting table state matches.
-    let fs = frank_returning_sorted(&f, state_query);
+    let fs = frank_returning_sorted(&f, state_query).await;
     let rs = sqlite_returning_sorted(&r, state_query);
     assert_eq!(
         fs.ok(),
@@ -101,40 +103,52 @@ const T: [&str; 2] = [
 
 #[test]
 fn delete_returning_star() {
-    returning_case(
-        &T,
-        "DELETE FROM t WHERE v >= 30 RETURNING *", // returns deleted rows 3,4
-        "SELECT id, v, label FROM t ORDER BY id",  // 1,2 remain
-        "delete_returning_star",
-    );
+    asupersync::test_utils::run_test(|| async {
+        returning_case(
+            &T,
+            "DELETE FROM t WHERE v >= 30 RETURNING *", // returns deleted rows 3,4
+            "SELECT id, v, label FROM t ORDER BY id",  // 1,2 remain
+            "delete_returning_star",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn delete_returning_columns_and_expr() {
-    returning_case(
-        &T,
-        "DELETE FROM t WHERE id = 2 RETURNING id, v * 2 AS dbl, label", // (2,40,'b')
-        "SELECT count(*) FROM t",                                       // 3
-        "delete_returning_columns_and_expr",
-    );
+    asupersync::test_utils::run_test(|| async {
+        returning_case(
+            &T,
+            "DELETE FROM t WHERE id = 2 RETURNING id, v * 2 AS dbl, label", // (2,40,'b')
+            "SELECT count(*) FROM t",                                       // 3
+            "delete_returning_columns_and_expr",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn delete_all_returning() {
-    returning_case(
-        &T,
-        "DELETE FROM t RETURNING id", // 1,2,3,4
-        "SELECT count(*) FROM t",     // 0
-        "delete_all_returning",
-    );
+    asupersync::test_utils::run_test(|| async {
+        returning_case(
+            &T,
+            "DELETE FROM t RETURNING id", // 1,2,3,4
+            "SELECT count(*) FROM t",     // 0
+            "delete_all_returning",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_returning_multi_row_new_values() {
-    returning_case(
-        &T,
-        "UPDATE t SET v = v + 1 WHERE v >= 20 RETURNING id, v", // (2,21),(3,31),(4,41)
-        "SELECT id, v FROM t ORDER BY id",
-        "update_returning_multi_row_new_values",
-    );
+    asupersync::test_utils::run_test(|| async {
+        returning_case(
+            &T,
+            "UPDATE t SET v = v + 1 WHERE v >= 20 RETURNING id, v", // (2,21),(3,31),(4,41)
+            "SELECT id, v FROM t ORDER BY id",
+            "update_returning_multi_row_new_values",
+        )
+        .await;
+    });
 }

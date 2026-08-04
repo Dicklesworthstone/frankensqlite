@@ -1,0 +1,425 @@
+{
+  "schema_version": "fsqlite-e2e.comprehensive-bench-report.v3",
+  "generated_at_utc": "2026-07-26 05:31:35 UTC",
+  "total_elapsed_ms": 380,
+  "config": {
+    "quick": true,
+    "filter": "txn",
+    "warmup_iterations": 2,
+    "min_iterations": 3,
+    "max_iterations": 10,
+    "target_duration_secs": 5,
+    "row_counts": [
+      100,
+      1000,
+      10000
+    ],
+    "html_output_path": null,
+    "json_output_path": "/data/tmp/fsqlite-gate0-boundary-c967-13ec-corrected.m4trb0/09-pre.json",
+    "json_stdout": false
+  },
+  "environment": {
+    "os": "Ubuntu 25.10",
+    "arch": "x86_64",
+    "kernel_release": "6.17.0-41-generic",
+    "cpu_model": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+    "cpu_cores": 128,
+    "ram_gb": 499.2539710998535,
+    "active_toolchain": "nightly-x86_64-unknown-linux-gnu (default)",
+    "rust_version": "rustc 1.99.0-nightly (008fa22ce 2026-07-25)",
+    "cargo_version": "cargo 1.99.0-nightly (3efb1f477 2026-07-17)",
+    "git_commit_sha": null,
+    "git_branch": null,
+    "git_head_unix_ts": null,
+    "git_dirty": null,
+    "benchmark_binary_modified_unix_ts": 1785043867,
+    "benchmark_binary_older_than_git_head": null,
+    "build_profile": "release-perf"
+  },
+  "summary": {
+    "total_scenarios": 9,
+    "franken_faster": 6,
+    "comparable": 0,
+    "csqlite_faster": 3,
+    "avg_ratio": 0.9929064497894061,
+    "average_ratio": 0.9929064497894061,
+    "geomean_ratio": 0.9741141722754318,
+    "median_ratio": 0.8891688143974305,
+    "p90_ratio": 1.335206871613992,
+    "p99_ratio": 1.335206871613992,
+    "primary_metric": "per_category_weighted.score",
+    "per_category": {
+      "concurrent_writers": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "mixed": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "read_aggregate": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "read_single": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "write_bulk": {
+        "n": 6,
+        "avg_ratio": 1.0076509334355184,
+        "geomean_ratio": 0.9825345627548303,
+        "median_ratio": 0.8891688143974305,
+        "p90_ratio": 1.335206871613992,
+        "p99_ratio": 1.335206871613992
+      },
+      "write_single": {
+        "n": 3,
+        "avg_ratio": 0.9634174824971815,
+        "geomean_ratio": 0.957489262892063,
+        "median_ratio": 0.9213671885080716,
+        "p90_ratio": 1.1125017755962057,
+        "p99_ratio": 1.1125017755962057
+      }
+    },
+    "per_category_weighted": {
+      "primary": true,
+      "score": 0.963690091282397,
+      "weights": {
+        "concurrent_writers": 0.05,
+        "mixed": 0.05,
+        "read_aggregate": 0.15,
+        "read_single": 0.35,
+        "write_bulk": 0.1,
+        "write_single": 0.3
+      },
+      "observed_weight": 0.4,
+      "missing_categories": [
+        "concurrent_writers",
+        "mixed",
+        "read_aggregate",
+        "read_single"
+      ]
+    }
+  },
+  "ci_regression_gate": {
+    "schema_version": "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2",
+    "bead_id": "bd-m4tju",
+    "depends_on_bead_id": "bd-0winn",
+    "status": "rich_scorecard_schema_ready",
+    "thresholds": {
+      "avg_ratio_baseline": 2.74,
+      "avg_ratio_max": null,
+      "mt_p95_ratio_max": null,
+      "primary_score_max_regression_pct": 0.03,
+      "geomean_max_regression_pct": 0.05,
+      "per_category_geomean_max_regression_pct": 0.1,
+      "p90_max_regression_pct": 0.15,
+      "threshold_source": "bd-d4m5k rich scorecard: primary gate is per_category_weighted.score"
+    },
+    "observed": {
+      "avg_ratio": 0.9929064497894061,
+      "primary_score": 0.963690091282397,
+      "geomean_ratio": 0.9741141722754318,
+      "median_ratio": 0.8891688143974305,
+      "p90_ratio": 1.335206871613992,
+      "max_mt_p95_ratio": null,
+      "max_mt_p95_scenario_id": null
+    }
+  },
+  "sections": [
+    {
+      "section_id": "insertthroughput-transaction-strategy-comparison-small-3col",
+      "title": "INSERTThroughput — Transaction Strategy Comparison (small_3col)",
+      "description": "Compares autocommit, batched (1K/txn), and single-txn strategies.",
+      "rows": [
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-autocommit",
+          "scenario": "100 rows / autocommit",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.126718,
+            "mean_ms": 0.128882,
+            "min_ms": 0.12248900000000001,
+            "p95_ms": 0.140493,
+            "p99_ms": 0.140493,
+            "stddev_ms": 0.005993,
+            "cv_pct": 4.649989913253984,
+            "rows_per_sec": 789153.8692214207,
+            "us_per_row": 1.26718,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.14097400000000002,
+            "mean_ms": 0.141376,
+            "min_ms": 0.136876,
+            "p95_ms": 0.148548,
+            "p99_ms": 0.148548,
+            "stddev_ms": 0.003614,
+            "cv_pct": 2.55630375735627,
+            "rows_per_sec": 709350.6604054648,
+            "us_per_row": 1.4097400000000002,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.1125017755962057
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-batched-100-txn",
+          "scenario": "100 rows / batched (100/txn)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.07793599999999999,
+            "mean_ms": 0.07938,
+            "min_ms": 0.076342,
+            "p95_ms": 0.089597,
+            "p99_ms": 0.089597,
+            "stddev_ms": 0.003925,
+            "cv_pct": 4.944570420760897,
+            "rows_per_sec": 1283104.085403408,
+            "us_per_row": 0.7793599999999999,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.10309299999999999,
+            "mean_ms": 0.103782,
+            "min_ms": 0.099045,
+            "p95_ms": 0.111278,
+            "p99_ms": 0.111278,
+            "stddev_ms": 0.004118,
+            "cv_pct": 3.967932782178027,
+            "rows_per_sec": 969997.9630042777,
+            "us_per_row": 1.0309300000000001,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.3227904947649354
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-single-txn",
+          "scenario": "100 rows / single txn",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.078817,
+            "mean_ms": 0.079328,
+            "min_ms": 0.075581,
+            "p95_ms": 0.086852,
+            "p99_ms": 0.086852,
+            "stddev_ms": 0.003975,
+            "cv_pct": 5.010841064945542,
+            "rows_per_sec": 1268761.8153444054,
+            "us_per_row": 0.78817,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.105237,
+            "mean_ms": 0.107088,
+            "min_ms": 0.097803,
+            "p95_ms": 0.132969,
+            "p99_ms": 0.132969,
+            "stddev_ms": 0.010512,
+            "cv_pct": 9.816225907664725,
+            "rows_per_sec": 950236.1336792193,
+            "us_per_row": 1.05237,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.335206871613992
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-autocommit",
+          "scenario": "1000 rows / autocommit",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.852494,
+            "mean_ms": 0.855666,
+            "min_ms": 0.838368,
+            "p95_ms": 0.9081389999999999,
+            "p99_ms": 0.9081389999999999,
+            "stddev_ms": 0.018018,
+            "cv_pct": 2.1057281696362833,
+            "rows_per_sec": 1173028.7837802963,
+            "us_per_row": 0.852494,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.7854599999999999,
+            "mean_ms": 0.7855479999999999,
+            "min_ms": 0.7766230000000001,
+            "p95_ms": 0.803804,
+            "p99_ms": 0.803804,
+            "stddev_ms": 0.007085999999999999,
+            "cv_pct": 0.9020454510736454,
+            "rows_per_sec": 1273139.3069029613,
+            "us_per_row": 0.7854599999999999,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.9213671885080716
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-batched-1000-txn",
+          "scenario": "1000 rows / batched (1000/txn)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.362398,
+            "mean_ms": 0.363717,
+            "min_ms": 0.35822000000000004,
+            "p95_ms": 0.37092400000000003,
+            "p99_ms": 0.37092400000000003,
+            "stddev_ms": 0.004377,
+            "cv_pct": 1.2034081442440139,
+            "rows_per_sec": 2759397.1269157114,
+            "us_per_row": 0.36239799999999994,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.322233,
+            "mean_ms": 0.319656,
+            "min_ms": 0.291274,
+            "p95_ms": 0.33040800000000004,
+            "p99_ms": 0.33040800000000004,
+            "stddev_ms": 0.010402,
+            "cv_pct": 3.254123182421103,
+            "rows_per_sec": 3103344.474339996,
+            "us_per_row": 0.322233,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.8891688143974305
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-single-txn",
+          "scenario": "1000 rows / single txn",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.322894,
+            "mean_ms": 0.32341200000000003,
+            "min_ms": 0.319648,
+            "p95_ms": 0.327513,
+            "p99_ms": 0.327513,
+            "stddev_ms": 0.002799,
+            "cv_pct": 0.8654595376794925,
+            "rows_per_sec": 3096991.582376879,
+            "us_per_row": 0.322894,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.28318,
+            "mean_ms": 0.282944,
+            "min_ms": 0.277469,
+            "p95_ms": 0.29021199999999997,
+            "p99_ms": 0.29021199999999997,
+            "stddev_ms": 0.00415,
+            "cv_pct": 1.4667213300158335,
+            "rows_per_sec": 3531322.8335334416,
+            "us_per_row": 0.28318,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.8770060762974846
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-autocommit",
+          "scenario": "10000 rows / autocommit",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 7.156649,
+            "mean_ms": 7.158832,
+            "min_ms": 7.127213,
+            "p95_ms": 7.267555,
+            "p99_ms": 7.267555,
+            "stddev_ms": 0.038522999999999995,
+            "cv_pct": 0.5381185087176232,
+            "rows_per_sec": 1397302.0054497572,
+            "us_per_row": 0.7156649,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 6.128836000000001,
+            "mean_ms": 6.1633130000000005,
+            "min_ms": 6.108668000000001,
+            "p95_ms": 6.353977,
+            "p99_ms": 6.353977,
+            "stddev_ms": 0.07750900000000001,
+            "cv_pct": 1.2575866258942228,
+            "rows_per_sec": 1631631.1939167567,
+            "us_per_row": 0.6128836,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.8563834833872669
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-batched-1000-txn",
+          "scenario": "10000 rows / batched (1000/txn)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 2.8671830000000003,
+            "mean_ms": 2.8701909999999997,
+            "min_ms": 2.8512239999999998,
+            "p95_ms": 2.890227,
+            "p99_ms": 2.890227,
+            "stddev_ms": 0.012602,
+            "cv_pct": 0.4390648566593652,
+            "rows_per_sec": 3487743.8935707975,
+            "us_per_row": 0.2867183,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 2.137259,
+            "mean_ms": 2.182086,
+            "min_ms": 2.130917,
+            "p95_ms": 2.431318,
+            "p99_ms": 2.431318,
+            "stddev_ms": 0.09554599999999999,
+            "cv_pct": 4.378654186865229,
+            "rows_per_sec": 4678890.111118961,
+            "us_per_row": 0.2137259,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.7454212026229229
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-single-txn",
+          "scenario": "10000 rows / single txn",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 2.921847,
+            "mean_ms": 2.93221,
+            "min_ms": 2.902851,
+            "p95_ms": 3.04176,
+            "p99_ms": 3.04176,
+            "stddev_ms": 0.039873000000000006,
+            "cv_pct": 1.3598275703309108,
+            "rows_per_sec": 3422492.6904112366,
+            "us_per_row": 0.2921847,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 2.5604500000000003,
+            "mean_ms": 2.553872,
+            "min_ms": 2.512601,
+            "p95_ms": 2.618399,
+            "p99_ms": 2.618399,
+            "stddev_ms": 0.028708,
+            "cv_pct": 1.124097057330986,
+            "rows_per_sec": 3905563.47517038,
+            "us_per_row": 0.256045,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.876312140916345
+        }
+      ]
+    }
+  ]
+}

@@ -10,14 +10,17 @@
 //! use fsqlite::Connection;
 //! use fsqlite::migrate::MigrationRunner;
 //!
-//! let conn = Connection::open("my.db").unwrap();
+//! # async fn example() {
+//! let conn = Connection::open("my.db").await.unwrap();
 //! let result = MigrationRunner::new()
 //!     .add(1, "create_users", "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
 //!     .add(2, "add_email", "ALTER TABLE users ADD COLUMN email TEXT;")
 //!     .run(&conn)
+//!     .await
 //!     .unwrap();
 //!
 //! assert_eq!(result.current, 2);
+//! # }
 //! ```
 
 use fsqlite_error::FrankenError;
@@ -108,7 +111,7 @@ impl MigrationRunner {
     ///
     /// Returns `FrankenError` if any SQL statement fails or the tracking
     /// table cannot be created/queried.
-    pub fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
+    pub async fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
         // Ensure the tracking table exists.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS _schema_migrations (\
@@ -116,23 +119,24 @@ impl MigrationRunner {
                 name TEXT NOT NULL, \
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
             );",
-        )?;
+        )
+        .await?;
 
         // Read the current maximum version.
-        let initial_version = Self::read_current_version(conn)?;
+        let initial_version = Self::read_current_version(conn).await?;
         let was_fresh = initial_version == 0;
         let mut applied = Vec::new();
 
         for migration in &self.migrations {
-            if Self::version_is_applied(conn, migration.version)? {
+            if Self::version_is_applied(conn, migration.version).await? {
                 continue;
             }
 
-            if Self::apply_one(conn, migration)? {
+            if Self::apply_one(conn, migration).await? {
                 applied.push(migration.version);
             }
         }
-        let current_version = Self::read_current_version(conn)?;
+        let current_version = Self::read_current_version(conn).await?;
 
         Ok(MigrationResult {
             applied,
@@ -142,8 +146,10 @@ impl MigrationRunner {
     }
 
     /// Reads `MAX(version)` from `_schema_migrations`, returning 0 if empty.
-    fn read_current_version(conn: &Connection) -> Result<i64, FrankenError> {
-        let rows = conn.query("SELECT MAX(version) FROM _schema_migrations;")?;
+    async fn read_current_version(conn: &Connection) -> Result<i64, FrankenError> {
+        let rows = conn
+            .query("SELECT MAX(version) FROM _schema_migrations;")
+            .await?;
         if let Some(row) = rows.first() {
             match row.get(0) {
                 Some(SqliteValue::Integer(v)) => Ok(*v),
@@ -154,11 +160,13 @@ impl MigrationRunner {
         }
     }
 
-    fn version_is_applied(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
-        let rows = conn.query_with_params(
-            "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
-            &[SqliteValue::Integer(version)],
-        )?;
+    async fn version_is_applied(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
+        let rows = conn
+            .query_with_params(
+                "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
+                &[SqliteValue::Integer(version)],
+            )
+            .await?;
         Ok(!rows.is_empty())
     }
 
@@ -167,10 +175,10 @@ impl MigrationRunner {
     ///
     /// Returns `true` when this connection actually applied the migration and
     /// `false` when another connection finished it first.
-    fn apply_one(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
+    async fn apply_one(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
         let started = Instant::now();
         loop {
-            match Self::apply_one_once(conn, migration) {
+            match Self::apply_one_once(conn, migration).await {
                 Err(FrankenError::Busy) if started.elapsed() < MIGRATION_BUSY_RETRY_TIMEOUT => {
                     thread::sleep(MIGRATION_BUSY_RETRY_BACKOFF);
                 }
@@ -179,40 +187,45 @@ impl MigrationRunner {
         }
     }
 
-    fn apply_one_once(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
-        conn.execute("BEGIN IMMEDIATE;")?;
-        let result = (|| -> Result<bool, FrankenError> {
-            if Self::version_is_applied(conn, migration.version)? {
-                conn.execute("COMMIT;")?;
+    async fn apply_one_once(
+        conn: &Connection,
+        migration: &Migration,
+    ) -> Result<bool, FrankenError> {
+        conn.execute("BEGIN IMMEDIATE;").await?;
+        let result: Result<bool, FrankenError> = async {
+            if Self::version_is_applied(conn, migration.version).await? {
+                conn.execute("COMMIT;").await?;
                 return Ok(false);
             }
 
-            Self::apply_one_inner(conn, migration)?;
-            conn.execute("COMMIT;")?;
+            Self::apply_one_inner(conn, migration).await?;
+            conn.execute("COMMIT;").await?;
             Ok(true)
-        })();
+        }
+        .await;
 
         match result {
             Ok(applied) => Ok(applied),
             Err(err) => {
                 // Best-effort rollback; ignore rollback errors since
                 // the original error is more informative.
-                let _ = conn.execute("ROLLBACK;");
+                let _ = conn.execute("ROLLBACK;").await;
                 Err(err)
             }
         }
     }
 
     /// Executes migration SQL and records the version, without transaction management.
-    fn apply_one_inner(conn: &Connection, migration: &Migration) -> Result<(), FrankenError> {
-        conn.execute_batch(migration.up_sql)?;
+    async fn apply_one_inner(conn: &Connection, migration: &Migration) -> Result<(), FrankenError> {
+        conn.execute_batch(migration.up_sql).await?;
         conn.execute_with_params(
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             &[
                 SqliteValue::Integer(migration.version),
                 SqliteValue::Text(migration.name.into()),
             ],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 }
@@ -229,198 +242,224 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    fn mem_conn() -> Connection {
-        Connection::open(":memory:").expect("in-memory connection should open")
+    async fn mem_conn() -> Connection {
+        Connection::open(":memory:")
+            .await
+            .expect("in-memory connection should open")
     }
 
     #[test]
     fn fresh_database_applies_all_migrations() {
-        let conn = mem_conn();
-        let result = MigrationRunner::new()
-            .add(
-                1,
-                "create_items",
-                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-            )
-            .add(
-                2,
-                "add_description",
-                "ALTER TABLE items ADD COLUMN description TEXT",
-            )
-            .run(&conn)
-            .unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            let result = MigrationRunner::new()
+                .add(
+                    1,
+                    "create_items",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                )
+                .add(
+                    2,
+                    "add_description",
+                    "ALTER TABLE items ADD COLUMN description TEXT",
+                )
+                .run(&conn)
+                .await
+                .unwrap();
 
-        assert!(result.was_fresh);
-        assert_eq!(result.applied, vec![1, 2]);
-        assert_eq!(result.current, 2);
+            assert!(result.was_fresh);
+            assert_eq!(result.applied, vec![1, 2]);
+            assert_eq!(result.current, 2);
 
-        // Verify the table exists and has both columns.
-        conn.execute("INSERT INTO items (id, name, description) VALUES (1, 'test', 'desc');")
-            .unwrap();
-        let rows = conn
-            .query("SELECT id, name, description FROM items;")
-            .unwrap();
-        assert_eq!(rows.len(), 1);
+            // Verify the table exists and has both columns.
+            conn.execute("INSERT INTO items (id, name, description) VALUES (1, 'test', 'desc');")
+                .await
+                .unwrap();
+            let rows = conn
+                .query("SELECT id, name, description FROM items;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+        });
     }
 
     #[test]
     fn partial_resume_only_applies_new_migrations() {
-        let conn = mem_conn();
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
 
-        // Apply V1 only.
-        let r1 = MigrationRunner::new()
-            .add(
-                1,
-                "create_items",
-                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-            )
-            .run(&conn)
-            .unwrap();
+            // Apply V1 only.
+            let r1 = MigrationRunner::new()
+                .add(
+                    1,
+                    "create_items",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                )
+                .run(&conn)
+                .await
+                .unwrap();
 
-        assert!(r1.was_fresh);
-        assert_eq!(r1.applied, vec![1]);
-        assert_eq!(r1.current, 1);
+            assert!(r1.was_fresh);
+            assert_eq!(r1.applied, vec![1]);
+            assert_eq!(r1.current, 1);
 
-        // Now run with V1 + V2 — only V2 should apply.
-        let r2 = MigrationRunner::new()
-            .add(
-                1,
-                "create_items",
-                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-            )
-            .add(
-                2,
-                "add_description",
-                "ALTER TABLE items ADD COLUMN description TEXT",
-            )
-            .run(&conn)
-            .unwrap();
+            // Now run with V1 + V2 — only V2 should apply.
+            let r2 = MigrationRunner::new()
+                .add(
+                    1,
+                    "create_items",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                )
+                .add(
+                    2,
+                    "add_description",
+                    "ALTER TABLE items ADD COLUMN description TEXT",
+                )
+                .run(&conn)
+                .await
+                .unwrap();
 
-        assert!(!r2.was_fresh);
-        assert_eq!(r2.applied, vec![2]);
-        assert_eq!(r2.current, 2);
+            assert!(!r2.was_fresh);
+            assert_eq!(r2.applied, vec![2]);
+            assert_eq!(r2.current, 2);
+        });
     }
 
     #[test]
     fn idempotent_rerun_applies_nothing() {
-        let conn = mem_conn();
-        let runner = MigrationRunner::new().add(
-            1,
-            "create_items",
-            "CREATE TABLE items (id INTEGER PRIMARY KEY)",
-        );
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            let runner = MigrationRunner::new().add(
+                1,
+                "create_items",
+                "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+            );
 
-        let r1 = runner.run(&conn).unwrap();
-        assert_eq!(r1.applied, vec![1]);
+            let r1 = runner.run(&conn).await.unwrap();
+            assert_eq!(r1.applied, vec![1]);
 
-        let r2 = runner.run(&conn).unwrap();
-        assert!(r2.applied.is_empty());
-        assert_eq!(r2.current, 1);
-        assert!(!r2.was_fresh);
+            let r2 = runner.run(&conn).await.unwrap();
+            assert!(r2.applied.is_empty());
+            assert_eq!(r2.current, 1);
+            assert!(!r2.was_fresh);
+        });
     }
 
     #[test]
     fn failed_migration_rolls_back() {
-        let conn = mem_conn();
-        let runner = MigrationRunner::new()
-            .add(
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            let runner = MigrationRunner::new()
+                .add(
+                    1,
+                    "create_items",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+                )
+                .add(
+                    2,
+                    "bad_migration",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+                ); // duplicate
+
+            let err = runner.run(&conn).await;
+            // V1 should have succeeded, V2 should have failed.
+            // Since V1 committed before V2 started, V1 is permanent.
+            assert!(err.is_err());
+            assert!(
+                !conn.in_transaction(),
+                "failed migration should not leave an open transaction behind"
+            );
+
+            // V1 should be recorded.
+            let runner2 = MigrationRunner::new().add(
                 1,
                 "create_items",
                 "CREATE TABLE items (id INTEGER PRIMARY KEY)",
-            )
-            .add(
-                2,
-                "bad_migration",
-                "CREATE TABLE items (id INTEGER PRIMARY KEY)",
-            ); // duplicate
-
-        let err = runner.run(&conn);
-        // V1 should have succeeded, V2 should have failed.
-        // Since V1 committed before V2 started, V1 is permanent.
-        assert!(err.is_err());
-        assert!(
-            !conn.in_transaction(),
-            "failed migration should not leave an open transaction behind"
-        );
-
-        // V1 should be recorded.
-        let runner2 = MigrationRunner::new().add(
-            1,
-            "create_items",
-            "CREATE TABLE items (id INTEGER PRIMARY KEY)",
-        );
-        let r2 = runner2.run(&conn).unwrap();
-        assert!(!r2.was_fresh);
-        assert_eq!(r2.current, 1);
-        assert!(r2.applied.is_empty());
+            );
+            let r2 = runner2.run(&conn).await.unwrap();
+            assert!(!r2.was_fresh);
+            assert_eq!(r2.current, 1);
+            assert!(r2.applied.is_empty());
+        });
     }
 
     #[test]
     fn multi_statement_migration() {
-        let conn = mem_conn();
-        let result = MigrationRunner::new()
-            .add(
-                1,
-                "create_schema",
-                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL); \
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            let result = MigrationRunner::new()
+                .add(
+                    1,
+                    "create_schema",
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL); \
                  CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT NOT NULL)",
-            )
-            .run(&conn)
-            .unwrap();
+                )
+                .run(&conn)
+                .await
+                .unwrap();
 
-        assert_eq!(result.applied, vec![1]);
+            assert_eq!(result.applied, vec![1]);
 
-        // Both tables should exist.
-        conn.execute("INSERT INTO users (id, name) VALUES (1, 'alice');")
-            .unwrap();
-        conn.execute("INSERT INTO posts (id, user_id, title) VALUES (1, 1, 'hello');")
-            .unwrap();
+            // Both tables should exist.
+            conn.execute("INSERT INTO users (id, name) VALUES (1, 'alice');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO posts (id, user_id, title) VALUES (1, 1, 'hello');")
+                .await
+                .unwrap();
+        });
     }
 
     #[test]
     fn empty_runner_on_fresh_db() {
-        let conn = mem_conn();
-        let result = MigrationRunner::new().run(&conn).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            let result = MigrationRunner::new().run(&conn).await.unwrap();
 
-        assert!(result.was_fresh);
-        assert!(result.applied.is_empty());
-        assert_eq!(result.current, 0);
+            assert!(result.was_fresh);
+            assert!(result.applied.is_empty());
+            assert_eq!(result.current, 0);
+        });
     }
 
     #[test]
     fn migration_records_name_in_tracking_table() {
-        let conn = mem_conn();
-        MigrationRunner::new()
-            .add(
-                1,
-                "initial_schema",
-                "CREATE TABLE t1 (id INTEGER PRIMARY KEY)",
-            )
-            .add(2, "add_index", "CREATE INDEX idx_t1 ON t1(id)")
-            .run(&conn)
-            .unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            MigrationRunner::new()
+                .add(
+                    1,
+                    "initial_schema",
+                    "CREATE TABLE t1 (id INTEGER PRIMARY KEY)",
+                )
+                .add(2, "add_index", "CREATE INDEX idx_t1 ON t1(id)")
+                .run(&conn)
+                .await
+                .unwrap();
 
-        let rows = conn
-            .query("SELECT version, name FROM _schema_migrations ORDER BY version;")
-            .unwrap();
-        assert_eq!(rows.len(), 2);
+            let rows = conn
+                .query("SELECT version, name FROM _schema_migrations ORDER BY version;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
 
-        match rows[0].get(0) {
-            Some(SqliteValue::Integer(1)) => {}
-            other => panic!("expected Integer(1), got {other:?}"),
-        }
-        match rows[0].get(1) {
-            Some(SqliteValue::Text(s)) if &**s == "initial_schema" => {}
-            other => panic!("expected Text('initial_schema'), got {other:?}"),
-        }
-        match rows[1].get(0) {
-            Some(SqliteValue::Integer(2)) => {}
-            other => panic!("expected Integer(2), got {other:?}"),
-        }
-        match rows[1].get(1) {
-            Some(SqliteValue::Text(s)) if &**s == "add_index" => {}
-            other => panic!("expected Text('add_index'), got {other:?}"),
-        }
+            match rows[0].get(0) {
+                Some(SqliteValue::Integer(1)) => {}
+                other => panic!("expected Integer(1), got {other:?}"),
+            }
+            match rows[0].get(1) {
+                Some(SqliteValue::Text(s)) if &**s == "initial_schema" => {}
+                other => panic!("expected Text('initial_schema'), got {other:?}"),
+            }
+            match rows[1].get(0) {
+                Some(SqliteValue::Integer(2)) => {}
+                other => panic!("expected Integer(2), got {other:?}"),
+            }
+            match rows[1].get(1) {
+                Some(SqliteValue::Text(s)) if &**s == "add_index" => {}
+                other => panic!("expected Text('add_index'), got {other:?}"),
+            }
+        });
     }
 
     #[test]
@@ -434,8 +473,8 @@ mod tests {
             up_sql: "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
         };
 
-        {
-            let conn = Connection::open(&db_path_str).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(&db_path_str).await.unwrap();
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS _schema_migrations (\
                     version INTEGER PRIMARY KEY, \
@@ -443,8 +482,9 @@ mod tests {
                     applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
                 );",
             )
+            .await
             .unwrap();
-        }
+        });
 
         let barrier = Arc::new(Barrier::new(2));
         let handles: Vec<_> = (0..2)
@@ -452,11 +492,21 @@ mod tests {
                 let db_path_str = db_path_str.clone();
                 let barrier = Arc::clone(&barrier);
                 let migration = migration.clone();
+                // Each OS thread drives its own runtime: `Connection` is
+                // !Send + !Sync, so the connection must be opened, used, and
+                // dropped entirely inside the thread that owns it.
                 thread::spawn(move || {
-                    let conn = Connection::open(&db_path_str).unwrap();
-                    assert_eq!(MigrationRunner::read_current_version(&conn).unwrap(), 0);
-                    barrier.wait();
-                    MigrationRunner::apply_one(&conn, &migration).unwrap()
+                    let mut applied = false;
+                    asupersync::test_utils::run_test(|| async {
+                        let conn = Connection::open(&db_path_str).await.unwrap();
+                        assert_eq!(
+                            MigrationRunner::read_current_version(&conn).await.unwrap(),
+                            0
+                        );
+                        barrier.wait();
+                        applied = MigrationRunner::apply_one(&conn, &migration).await.unwrap();
+                    });
+                    applied
                 })
             })
             .collect();
@@ -474,109 +524,125 @@ mod tests {
         assert_eq!(applied_count, 1);
         assert_eq!(skipped_count, 1);
 
-        let conn = Connection::open(&db_path_str).unwrap();
-        let rows = conn
-            .query("SELECT version, name FROM _schema_migrations ORDER BY version;")
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
-        assert_eq!(
-            rows[0].get(1),
-            Some(&SqliteValue::Text("create_items".into()))
-        );
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(&db_path_str).await.unwrap();
+            let rows = conn
+                .query("SELECT version, name FROM _schema_migrations ORDER BY version;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+            assert_eq!(
+                rows[0].get(1),
+                Some(&SqliteValue::Text("create_items".into()))
+            );
+        });
     }
 
     #[test]
     fn apply_one_runs_missing_lower_version_even_if_higher_version_exists() {
-        let conn = mem_conn();
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS _schema_migrations (\
-                version INTEGER PRIMARY KEY, \
-                name TEXT NOT NULL, \
-                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
-            );",
-        )
-        .unwrap();
-        conn.execute_with_params(
-            "INSERT INTO _schema_migrations(version, name) VALUES (?1, ?2);",
-            &[
-                SqliteValue::Integer(2),
-                SqliteValue::Text("already_applied".into()),
-            ],
-        )
-        .unwrap();
-
-        let migration = Migration {
-            version: 1,
-            name: "outdated",
-            up_sql: "CREATE TABLE should_not_exist (id INTEGER PRIMARY KEY);",
-        };
-
-        let applied = MigrationRunner::apply_one(&conn, &migration).unwrap();
-        assert!(applied);
-        assert!(
-            !conn
-                .query("SELECT name FROM sqlite_master WHERE name = 'should_not_exist';")
-                .unwrap()
-                .is_empty(),
-            "missing lower-version migration should still run even if a higher version row already exists",
-        );
-        let versions = conn
-            .query("SELECT version FROM _schema_migrations ORDER BY version;")
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS _schema_migrations (\
+                    version INTEGER PRIMARY KEY, \
+                    name TEXT NOT NULL, \
+                    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
+                );",
+            )
+            .await
             .unwrap();
-        assert_eq!(
-            versions
-                .iter()
-                .map(|row| row.get(0).unwrap().to_integer())
-                .collect::<Vec<_>>(),
-            vec![1, 2],
-            "runner must preserve non-contiguous/mixed-binary migration histories instead of treating MAX(version) as authoritative",
-        );
+            conn.execute_with_params(
+                "INSERT INTO _schema_migrations(version, name) VALUES (?1, ?2);",
+                &[
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("already_applied".into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+            let migration = Migration {
+                version: 1,
+                name: "outdated",
+                up_sql: "CREATE TABLE should_not_exist (id INTEGER PRIMARY KEY);",
+            };
+
+            let applied = MigrationRunner::apply_one(&conn, &migration).await.unwrap();
+            assert!(applied);
+            assert!(
+                !conn
+                    .query("SELECT name FROM sqlite_master WHERE name = 'should_not_exist';")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "missing lower-version migration should still run even if a higher version row already exists",
+            );
+            let versions = conn
+                .query("SELECT version FROM _schema_migrations ORDER BY version;")
+                .await
+                .unwrap();
+            assert_eq!(
+                versions
+                    .iter()
+                    .map(|row| row.get(0).unwrap().to_integer())
+                    .collect::<Vec<_>>(),
+                vec![1, 2],
+                "runner must preserve non-contiguous/mixed-binary migration histories instead of treating MAX(version) as authoritative",
+            );
+        });
     }
 
     #[test]
     fn run_applies_missing_lower_version_even_if_higher_version_exists() {
-        let conn = mem_conn();
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS _schema_migrations (\
-                version INTEGER PRIMARY KEY, \
-                name TEXT NOT NULL\
-            );",
-        )
-        .unwrap();
-        conn.execute("INSERT INTO _schema_migrations(version, name) VALUES (2, 'second');")
-            .unwrap();
-
-        let result = MigrationRunner::new()
-            .add(
-                1,
-                "create_sparse",
-                "CREATE TABLE sparse_fixed (id INTEGER PRIMARY KEY);",
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS _schema_migrations (\
+                    version INTEGER PRIMARY KEY, \
+                    name TEXT NOT NULL\
+                );",
             )
-            .add(
-                2,
-                "noop_second",
-                "CREATE TABLE should_not_run (id INTEGER PRIMARY KEY);",
-            )
-            .run(&conn)
+            .await
             .unwrap();
+            conn.execute("INSERT INTO _schema_migrations(version, name) VALUES (2, 'second');")
+                .await
+                .unwrap();
 
-        assert_eq!(result.applied, vec![1]);
-        assert_eq!(result.current, 2);
-        assert!(!result.was_fresh);
-        assert!(
-            !conn
-                .query("SELECT name FROM sqlite_master WHERE name = 'sparse_fixed';")
-                .unwrap()
-                .is_empty(),
-            "public runner should repair sparse histories by applying the missing lower migration",
-        );
-        assert!(
-            conn.query("SELECT name FROM sqlite_master WHERE name = 'should_not_run';")
-                .unwrap()
-                .is_empty(),
-            "already-applied higher migration must stay skipped",
-        );
+            let result = MigrationRunner::new()
+                .add(
+                    1,
+                    "create_sparse",
+                    "CREATE TABLE sparse_fixed (id INTEGER PRIMARY KEY);",
+                )
+                .add(
+                    2,
+                    "noop_second",
+                    "CREATE TABLE should_not_run (id INTEGER PRIMARY KEY);",
+                )
+                .run(&conn)
+                .await
+                .unwrap();
+
+            assert_eq!(result.applied, vec![1]);
+            assert_eq!(result.current, 2);
+            assert!(!result.was_fresh);
+            assert!(
+                !conn
+                    .query("SELECT name FROM sqlite_master WHERE name = 'sparse_fixed';")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "public runner should repair sparse histories by applying the missing lower migration",
+            );
+            assert!(
+                conn.query("SELECT name FROM sqlite_master WHERE name = 'should_not_run';")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "already-applied higher migration must stay skipped",
+            );
+        });
     }
 
     #[test]

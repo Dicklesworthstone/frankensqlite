@@ -5,6 +5,7 @@
 //! `json_group_object(key, value)` (build a JSON object), plain and with
 //! GROUP BY, over mixed value types and NULLs. Compared against rusqlite
 //! (bundled SQLite ~3.46).
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -22,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -55,10 +56,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -80,14 +81,14 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn data() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn data() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, k TEXT, v INTEGER)",
         "INSERT INTO t VALUES (1,'a','x',10),(2,'a','y',20),(3,'b','z',30)",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -95,67 +96,79 @@ fn data() -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn json_group_array_basic_and_grouped() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT json_group_array(v) FROM t", // [10,20,30]
-            "SELECT g, json_group_array(v) FROM t GROUP BY g ORDER BY g", // a:[10,20], b:[30]
-            "SELECT json_group_array(k) FROM t", // ["x","y","z"]
-        ],
-        "json_group_array_basic_and_grouped",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT json_group_array(v) FROM t", // [10,20,30]
+                "SELECT g, json_group_array(v) FROM t GROUP BY g ORDER BY g", // a:[10,20], b:[30]
+                "SELECT json_group_array(k) FROM t", // ["x","y","z"]
+            ],
+            "json_group_array_basic_and_grouped",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_group_object_basic_and_grouped() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT json_group_object(k, v) FROM t", // {"x":10,"y":20,"z":30}
-            "SELECT g, json_group_object(k, v) FROM t GROUP BY g ORDER BY g", // a:{x:10,y:20}, b:{z:30}
-        ],
-        "json_group_object_basic_and_grouped",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT json_group_object(k, v) FROM t", // {"x":10,"y":20,"z":30}
+                "SELECT g, json_group_object(k, v) FROM t GROUP BY g ORDER BY g", // a:{x:10,y:20}, b:{z:30}
+            ],
+            "json_group_object_basic_and_grouped",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_group_array_mixed_and_null() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE m (id INTEGER PRIMARY KEY, v)",
-        "INSERT INTO m VALUES (1,1),(2,2.5),(3,'text'),(4,NULL)",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    check(
-        &f,
-        &r,
-        &[
-            // Mixed storage classes + NULL -> JSON array [1,2.5,"text",null].
-            "SELECT json_group_array(v) FROM m",
-            // Validity + element count.
-            "SELECT json_valid(json_group_array(v)), json_array_length(json_group_array(v)) FROM m",
-        ],
-        "json_group_array_mixed_and_null",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE m (id INTEGER PRIMARY KEY, v)",
+            "INSERT INTO m VALUES (1,1),(2,2.5),(3,'text'),(4,NULL)",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        check(
+            &f,
+            &r,
+            &[
+                // Mixed storage classes + NULL -> JSON array [1,2.5,"text",null].
+                "SELECT json_group_array(v) FROM m",
+                // Validity + element count.
+                "SELECT json_valid(json_group_array(v)), json_array_length(json_group_array(v)) FROM m",
+            ],
+            "json_group_array_mixed_and_null",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_group_array_empty_group() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // Aggregate over zero matching rows.
-            "SELECT json_group_array(v) FROM t WHERE v > 1000",
-        ],
-        "json_group_array_empty_group",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // Aggregate over zero matching rows.
+                "SELECT json_group_array(v) FROM t WHERE v > 1000",
+            ],
+            "json_group_array_empty_group",
+        )
+        .await;
+    });
 }

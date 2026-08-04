@@ -764,7 +764,25 @@ pub struct NullifFunc;
 
 impl ScalarFunction for NullifFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args[0] == args[1] {
+        self.invoke_with_collation(args, None)
+    }
+
+    fn consumes_argument_collation(&self) -> bool {
+        true
+    }
+
+    fn invoke_with_collation(
+        &self,
+        args: &[SqliteValue],
+        collation: Option<&dyn crate::collation::CollationFunction>,
+    ) -> Result<SqliteValue> {
+        let equal = match (&args[0], &args[1], collation) {
+            (SqliteValue::Text(left), SqliteValue::Text(right), Some(collation)) => {
+                collation.compare(left.as_bytes(), right.as_bytes()) == std::cmp::Ordering::Equal
+            }
+            _ => args[0] == args[1],
+        };
+        if equal {
             Ok(SqliteValue::Null)
         } else {
             Ok(args[0].clone())
@@ -1619,13 +1637,31 @@ pub struct ScalarMaxFunc;
 
 impl ScalarFunction for ScalarMaxFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        self.invoke_with_collation(args, None)
+    }
+
+    fn consumes_argument_collation(&self) -> bool {
+        true
+    }
+
+    fn invoke_with_collation(
+        &self,
+        args: &[SqliteValue],
+        collation: Option<&dyn crate::collation::CollationFunction>,
+    ) -> Result<SqliteValue> {
         // Scalar max: if ANY argument is NULL, returns NULL
         if let Some(null) = null_propagate(args) {
             return Ok(null);
         }
         let mut max = &args[0];
         for arg in &args[1..] {
-            if arg.partial_cmp(max) == Some(std::cmp::Ordering::Greater) {
+            let ordering = match (arg, max, collation) {
+                (SqliteValue::Text(left), SqliteValue::Text(right), Some(collation)) => {
+                    Some(collation.compare(left.as_bytes(), right.as_bytes()))
+                }
+                _ => arg.partial_cmp(max),
+            };
+            if ordering == Some(std::cmp::Ordering::Greater) {
                 max = arg;
             }
         }
@@ -1651,13 +1687,37 @@ pub struct ScalarMinFunc;
 
 impl ScalarFunction for ScalarMinFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        self.invoke_with_collation(args, None)
+    }
+
+    fn consumes_argument_collation(&self) -> bool {
+        true
+    }
+
+    fn invoke_with_collation(
+        &self,
+        args: &[SqliteValue],
+        collation: Option<&dyn crate::collation::CollationFunction>,
+    ) -> Result<SqliteValue> {
         // Scalar min: if ANY argument is NULL, returns NULL
         if let Some(null) = null_propagate(args) {
             return Ok(null);
         }
         let mut min = &args[0];
         for arg in &args[1..] {
-            if arg.partial_cmp(min) == Some(std::cmp::Ordering::Less) {
+            let ordering = match (arg, min, collation) {
+                (SqliteValue::Text(left), SqliteValue::Text(right), Some(collation)) => {
+                    Some(collation.compare(left.as_bytes(), right.as_bytes()))
+                }
+                _ => arg.partial_cmp(min),
+            };
+            // SQLite's scalar min() selects the later argument on a tie. This
+            // is observable when equal numeric values use different storage
+            // classes or a collation considers distinct text values equal.
+            if matches!(
+                ordering,
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ) {
                 min = arg;
             }
         }
@@ -1739,6 +1799,10 @@ impl ScalarFunction for SqliteVersionFunc {
         )))
     }
 
+    fn is_deterministic(&self) -> bool {
+        false
+    }
+
     fn num_args(&self) -> i32 {
         0
     }
@@ -1757,6 +1821,10 @@ impl ScalarFunction for SqliteSourceIdFunc {
         Ok(SqliteValue::Text(SmallText::new(
             fsqlite_types::FRANKENSQLITE_SOURCE_ID,
         )))
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 
     fn num_args(&self) -> i32 {
@@ -1783,6 +1851,10 @@ impl ScalarFunction for SqliteCompileoptionUsedFunc {
         ))))
     }
 
+    fn is_deterministic(&self) -> bool {
+        false
+    }
+
     fn num_args(&self) -> i32 {
         1
     }
@@ -1807,6 +1879,10 @@ impl ScalarFunction for SqliteCompileoptionGetFunc {
             Some(opt) => Ok(SqliteValue::Text(SmallText::new(opt))),
             None => Ok(SqliteValue::Null),
         }
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 
     fn num_args(&self) -> i32 {
@@ -1840,6 +1916,14 @@ impl ScalarFunction for LikeFunc {
 
     fn num_args(&self) -> i32 {
         -1 // 2 or 3 args
+    }
+
+    fn min_args(&self) -> i32 {
+        2
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(3)
     }
 
     fn name(&self) -> &str {
@@ -2210,10 +2294,10 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
     registry.register_scalar(GlobFunc);
 
     // Meta
-    registry.register_scalar(SqliteVersionFunc);
-    registry.register_scalar(SqliteSourceIdFunc);
-    registry.register_scalar(SqliteCompileoptionUsedFunc);
-    registry.register_scalar(SqliteCompileoptionGetFunc);
+    registry.register_slow_changing_scalar(SqliteVersionFunc);
+    registry.register_slow_changing_scalar(SqliteSourceIdFunc);
+    registry.register_slow_changing_scalar(SqliteCompileoptionUsedFunc);
+    registry.register_slow_changing_scalar(SqliteCompileoptionGetFunc);
 
     // Connection-state stubs
     registry.register_scalar(ChangesFunc);
@@ -4048,6 +4132,32 @@ mod tests {
         assert_eq!(result, SqliteValue::Null);
     }
 
+    #[test]
+    fn test_scalar_min_selects_later_equal_value_while_max_keeps_first() {
+        let min = ScalarMinFunc;
+        let max = ScalarMaxFunc;
+        let numeric = [SqliteValue::Integer(1), SqliteValue::Float(1.0)];
+        assert!(matches!(
+            min.invoke(&numeric).unwrap(),
+            SqliteValue::Float(value) if value == 1.0
+        ));
+        assert_eq!(max.invoke(&numeric).unwrap(), SqliteValue::Integer(1));
+
+        let text = [
+            SqliteValue::Text(SmallText::new("a")),
+            SqliteValue::Text(SmallText::new("A")),
+        ];
+        let nocase = crate::collation::NoCaseCollation;
+        assert_eq!(
+            min.invoke_with_collation(&text, Some(&nocase)).unwrap(),
+            SqliteValue::Text(SmallText::new("A"))
+        );
+        assert_eq!(
+            max.invoke_with_collation(&text, Some(&nocase)).unwrap(),
+            SqliteValue::Text(SmallText::new("a"))
+        );
+    }
+
     // ── quote ────────────────────────────────────────────────────────────
 
     #[test]
@@ -5161,6 +5271,10 @@ mod tests {
         assert!(!ChangesFunc.is_deterministic());
         assert!(!TotalChangesFunc.is_deterministic());
         assert!(!LastInsertRowidFunc.is_deterministic());
+        assert!(!SqliteVersionFunc.is_deterministic());
+        assert!(!SqliteSourceIdFunc.is_deterministic());
+        assert!(!SqliteCompileoptionUsedFunc.is_deterministic());
+        assert!(!SqliteCompileoptionGetFunc.is_deterministic());
     }
 
     #[test]
@@ -5202,8 +5316,110 @@ mod tests {
         let lir = registry.find_scalar("last_insert_rowid", 0).unwrap();
         assert!(!lir.is_deterministic());
 
+        for (name, num_args) in [
+            ("sqlite_version", 0),
+            ("sqlite_source_id", 0),
+            ("sqlite_compileoption_used", 1),
+            ("sqlite_compileoption_get", 1),
+        ] {
+            assert_eq!(
+                registry.scalar_is_deterministic(name, num_args),
+                Some(false),
+                "{name} must publish non-deterministic registry metadata"
+            );
+        }
+
         // Deterministic function check.
         let abs = registry.find_scalar("abs", 1).unwrap();
         assert!(abs.is_deterministic());
+    }
+
+    #[test]
+    fn test_registry_builtin_query_constancy_metadata() {
+        use crate::{ScalarQueryConstancy, ScalarSchemaSafety};
+
+        let mut registry = FunctionRegistry::default();
+        register_builtins(&mut registry);
+
+        for (name, num_args) in [
+            ("sqlite_version", 0),
+            ("sqlite_source_id", 0),
+            ("sqlite_compileoption_used", 1),
+            ("sqlite_compileoption_get", 1),
+        ] {
+            let resolved = registry.resolve_scalar(name, num_args).unwrap();
+            assert_eq!(resolved.schema_safety(), ScalarSchemaSafety::Never);
+            assert_eq!(
+                resolved.query_constancy(),
+                ScalarQueryConstancy::SlowChanging,
+                "{name}/{num_args} must match SQLite's slow-changing metadata"
+            );
+        }
+
+        for (name, num_args) in [
+            ("date", 0),
+            ("time", 0),
+            ("datetime", 0),
+            ("julianday", 0),
+            ("unixepoch", 0),
+            ("strftime", 1),
+            ("timediff", 2),
+        ] {
+            let resolved = registry.resolve_scalar(name, num_args).unwrap();
+            assert_eq!(
+                resolved.schema_safety(),
+                ScalarSchemaSafety::DateTimeConditional
+            );
+            assert_eq!(
+                resolved.query_constancy(),
+                ScalarQueryConstancy::SlowChanging,
+                "{name}/{num_args} must be query-constant despite conditional schema safety"
+            );
+        }
+
+        for (name, num_args) in [
+            ("random", 0),
+            ("randomblob", 1),
+            ("changes", 0),
+            ("total_changes", 0),
+            ("last_insert_rowid", 0),
+        ] {
+            assert_eq!(
+                registry
+                    .resolve_scalar(name, num_args)
+                    .unwrap()
+                    .query_constancy(),
+                ScalarQueryConstancy::Volatile,
+                "{name}/{num_args} must remain volatile"
+            );
+        }
+
+        for (name, num_args) in [("abs", 1), ("like", 2), ("like", 3), ("glob", 2)] {
+            assert_eq!(
+                registry
+                    .resolve_scalar(name, num_args)
+                    .unwrap()
+                    .query_constancy(),
+                ScalarQueryConstancy::Constant,
+                "{name}/{num_args} must remain constant"
+            );
+        }
+
+        for (name, num_args) in [
+            ("sqlite_version", 1),
+            ("sqlite_compileoption_used", 0),
+            ("like", 1),
+            ("like", 4),
+            ("glob", 1),
+        ] {
+            assert_eq!(
+                registry
+                    .resolve_scalar(name, num_args)
+                    .unwrap()
+                    .query_constancy(),
+                ScalarQueryConstancy::Volatile,
+                "{name}/{num_args} wrong-arity sentinel must fail closed"
+            );
+        }
     }
 }

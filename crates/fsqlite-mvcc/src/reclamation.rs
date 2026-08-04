@@ -100,7 +100,9 @@ mod tests {
 
     use super::{advance_epoch_and_reclaim, retire_and_reclaim};
     use crate::core_types::{VersionArena, VersionIdx};
-    use crate::ebr::{EbrRetireQueue, VersionGuard, VersionGuardRegistry};
+    use crate::ebr::{
+        EbrRetireQueue, MAX_EBR_RECLAIM_SLOTS_PER_CYCLE, VersionGuard, VersionGuardRegistry,
+    };
 
     fn make_version(pgno: u32, seq: u64) -> PageVersion {
         PageVersion {
@@ -154,5 +156,45 @@ mod tests {
         assert_eq!(reclaimed.recycled_slots, 1);
         assert_eq!(retire_queue.pending_count(), 0);
         assert_eq!(arena.free_count(), 1);
+    }
+
+    #[test]
+    fn advance_epoch_and_reclaim_bounds_backlog_and_eventually_recycles_it() {
+        let registry = Arc::new(VersionGuardRegistry::default());
+        let retire_queue = EbrRetireQueue::new();
+        let mut arena = VersionArena::new();
+        let backlog = MAX_EBR_RECLAIM_SLOTS_PER_CYCLE * 2 + 1;
+
+        let retired = (0..backlog)
+            .map(|slot| {
+                let index = arena.alloc(make_version(
+                    1,
+                    u64::try_from(slot + 1).expect("keeper sequence fits u64"),
+                ));
+                let _version = arena.take_for_retirement(index);
+                index
+            })
+            .collect::<Vec<_>>();
+        retire_queue.retire_batch(retired, registry.current_epoch());
+
+        let expected_cycles = [
+            MAX_EBR_RECLAIM_SLOTS_PER_CYCLE,
+            MAX_EBR_RECLAIM_SLOTS_PER_CYCLE,
+            1,
+        ];
+        let mut recycled_total = 0_usize;
+        for expected_slots in expected_cycles {
+            let pass = advance_epoch_and_reclaim(&registry, &retire_queue, &mut arena);
+            assert_eq!(pass.recycled_slots, expected_slots);
+            assert!(
+                pass.recycled_slots <= MAX_EBR_RECLAIM_SLOTS_PER_CYCLE,
+                "one production maintenance pass must respect the declared reclaim bound"
+            );
+            recycled_total += pass.recycled_slots;
+            assert_eq!(arena.free_count(), recycled_total);
+        }
+
+        assert_eq!(retire_queue.pending_count(), 0);
+        assert_eq!(recycled_total, backlog);
     }
 }

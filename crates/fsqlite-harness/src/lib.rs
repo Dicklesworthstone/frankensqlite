@@ -4,6 +4,33 @@
 //! verification tooling (trace exporters, schedule exploration harnesses, etc.)
 //! that other crates can call into from their own tests.
 
+// The engine futures composed here are deeply nested; the default limit
+// overflows while type-checking them.
+#![recursion_limit = "512"]
+// bd-h9o9r: this crate drives fsqlite-core's deliberately non-`Send`,
+// deeply nested engine futures (the same nesting behind the
+// `recursion_limit` above); `future_not_send` and `large_futures`
+// contradict that design — see fsqlite-core/src/lib.rs for the full
+// rationale, including why boxing was rejected by the perf ledger.
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
+
+/// Drive an engine future to completion on a harness-owned runtime.
+///
+/// The harness compares FrankenSQLite against synchronous reference engines
+/// (rusqlite, the `sqlite3` binary) through sync traits like `SqlExecutor`, so
+/// the FrankenSQLite side needs a synchronous bridge. The harness is a test
+/// driver — the top-level consumer — so owning a runtime here is correct.
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    thread_local! {
+        static RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build fsqlite-harness runtime");
+    }
+    RUNTIME.with(|runtime| runtime.block_on(future))
+}
+
 pub mod adversarial_search;
 pub mod agent_swarm_trace;
 pub mod backlog_quality_gate;
@@ -84,6 +111,7 @@ pub mod supervision;
 pub mod t6sv2_checklist;
 pub mod tcl_conformance;
 pub mod test_diagnostics;
+pub mod test_inventory;
 pub mod tla;
 pub mod toolchain_determinism;
 pub mod unit_fixtures;

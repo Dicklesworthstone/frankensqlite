@@ -698,14 +698,18 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         ScriptEntryBuilder::new(
             "scripts/test_inventory.sh",
             ScriptKind::ShellUtility,
-            "Test realism inventory analyzer (CSV output)",
+            "Tracked-source test realism and Turso adaptation inventory",
         )
         .command("bash scripts/test_inventory.sh")
         .scenarios(&["INFRA-2"])
         .storage(&[StorageMode::InMemory])
         .concurrency(&[ConcurrencyMode::Sequential])
-        .artifacts(&["target/test-inventory/test_inventory.csv"])
-        .timeout(120)
+        .artifacts(&[
+            "target/test-inventory/test_inventory.json",
+            "target/test-inventory/summary.md",
+            "target/test-inventory/test_inventory.csv",
+        ])
+        .timeout(180)
         .build(),
     );
 

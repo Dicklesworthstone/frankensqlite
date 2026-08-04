@@ -38,10 +38,6 @@ use crate::shm::ShmRegion;
 use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource};
 use crate::unix::{UnixFile, UnixVfs};
 
-#[cfg(feature = "linux-uring-fs")]
-compile_error!(
-    "legacy `linux-uring-fs` backend is disabled; use `linux-asupersync-uring` (homegrown runtime path)"
-);
 #[cfg(not(feature = "linux-asupersync-uring"))]
 compile_error!("fsqlite-vfs on Linux requires `linux-asupersync-uring`");
 
@@ -1022,6 +1018,22 @@ impl VfsFile for IoUringFile {
         self.inner.unlock(cx, level)
     }
 
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_shared_snapshot(cx)
+    }
+
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_shared_snapshot_attempt(cx)
+    }
+
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        self.inner.lock_external_maintenance(cx, wal_mode)
+    }
+
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_maintenance_attempt(cx)
+    }
+
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
         self.inner.check_reserved_lock(cx)
     }
@@ -1036,6 +1048,21 @@ impl VfsFile for IoUringFile {
 
     fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
         self.inner.shm_map(cx, region, size, extend)
+    }
+
+    // bd-trfah/bd-bjm5d: forward the batch write to the wrapped UnixFile.
+    // Without this, the trait default loops `self.write`, which falls back
+    // per page through the uring gate — one blocking-pool hop per page —
+    // and the UnixFile single-hop batch override (4.9x on group-16 batches)
+    // is unreachable on Linux, where IoUringFile wraps every file-backed
+    // database. The uring data path has no batch submission today; when it
+    // grows one, this forward becomes the fallback arm.
+    fn write_page_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.inner.write_page_batch(cx, writes)
     }
 
     fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
@@ -1066,6 +1093,28 @@ impl IoUringFile {
             record_io_uring_read_unix_fallback();
             return self.inner.read(cx, buf, offset).await;
         }
+        // DO NOT "fix" this by falling back to `NativeCx::current()`.
+        //
+        // That looks correct — `page_cache.rs:3421` resolves its native context as
+        // `Cx::current().or_else(|| cx.attached_native_cx())`, and this gate fails on
+        // every production call because nothing on the `Connection::open` -> `execute`
+        // path attaches a native `Cx` (measured: 100% unix fallback, bd-fo6xw). It was
+        // tried on 2026-07-26 and it breaks the engine:
+        //
+        //     cannot start tracked shared io_uring write: cannot start shared io_uring
+        //     driver: [ASUP-E001] runtime is no longer available — the runtime behind
+        //     this handle was dropped or shut down
+        //
+        // followed by `no such table` on every subsequent statement. The reason is that
+        // the ambient `Cx` inside a short-lived `block_on` belongs to a runtime that is
+        // torn down when that call returns, and the *shared* io_uring driver needs a
+        // spawner that outlives the operation. `page_cache.rs` gets away with it because
+        // it spawns a task on that same runtime and joins it before returning.
+        //
+        // The attached context is therefore a deliberate contract, not an oversight: it
+        // is how a caller states "here is a runtime whose lifetime I guarantee". The
+        // real defect is upstream — the sync bridge gives every operation its own
+        // runtime, so no such guarantee exists. See bd-fo6xw and bd-zavyn.
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_read_unix_fallback();
             return self.inner.read(cx, buf, offset).await;
@@ -1185,6 +1234,7 @@ impl IoUringFile {
             record_io_uring_write_unix_fallback();
             return self.inner.write(cx, buf, offset).await;
         }
+        // See `read_data_path`: do not substitute `NativeCx::current()` here.
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_write_unix_fallback();
             return self.inner.write(cx, buf, offset).await;
@@ -1315,6 +1365,7 @@ impl IoUringFile {
             record_io_uring_write_unix_fallback();
             return self.inner.write_tracked(cx, buf, offset, completion).await;
         }
+        // See `read_data_path`: do not substitute `NativeCx::current()` here.
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_write_unix_fallback();
             return self.inner.write_tracked(cx, buf, offset, completion).await;
@@ -1440,9 +1491,98 @@ mod tests {
     use fsqlite_observability::{io_uring_latency_snapshot, reset_io_uring_latency_metrics};
     use fsqlite_types::flags::VfsOpenFlags;
     use std::future::Future;
+    use std::io::Write;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+    use tracing_subscriber::prelude::*;
 
     static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    const ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES: usize = 512 * 1024;
+    const ASYNC_VFS_TRACE_TARGET: &str = "fsqlite_vfs::uring";
+
+    #[derive(Clone)]
+    struct BoundedTraceWriter {
+        bytes: Arc<StdMutex<Vec<u8>>>,
+        truncated: Arc<AtomicBool>,
+    }
+
+    impl BoundedTraceWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Arc::new(StdMutex::new(Vec::with_capacity(
+                    ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES,
+                ))),
+                truncated: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn flush_to_stderr(&self) {
+            let bytes = self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::io::stderr()
+                .write_all(&bytes)
+                .expect("the bounded async-VFS trace must be written to stderr");
+        }
+
+        fn has_events(&self) -> bool {
+            !self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        }
+
+        fn is_truncated(&self) -> bool {
+            self.truncated.load(Ordering::Acquire)
+        }
+
+        fn event_count(&self, event: &str) -> usize {
+            let needle = format!(r#""event":"{event}""#);
+            self.bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .windows(needle.len())
+                .filter(|window| *window == needle.as_bytes())
+                .count()
+        }
+    }
+
+    struct BoundedTraceWriteGuard<'a> {
+        bytes: StdMutexGuard<'a, Vec<u8>>,
+        truncated: &'a AtomicBool,
+    }
+
+    impl Write for BoundedTraceWriteGuard<'_> {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let remaining = ASYNC_VFS_TRACE_CAPTURE_LIMIT_BYTES.saturating_sub(self.bytes.len());
+            self.bytes
+                .extend_from_slice(&buffer[..buffer.len().min(remaining)]);
+            if buffer.len() > remaining {
+                self.truncated.store(true, Ordering::Release);
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BoundedTraceWriter {
+        type Writer = BoundedTraceWriteGuard<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BoundedTraceWriteGuard {
+                bytes: self
+                    .bytes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                truncated: &self.truncated,
+            }
+        }
+    }
 
     fn test_runtime() -> &'static Runtime {
         static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -1695,12 +1835,10 @@ mod tests {
         const READ_SIZE: usize = 4096;
 
         let _guard = io_uring_test_guard();
-        if std::env::var_os("FSQLITE_ASYNC_VFS_TRACE").is_some() {
-            let _ = tracing_subscriber::fmt()
-                .json()
-                .with_max_level(tracing::Level::TRACE)
-                .try_init();
+        if run_async_vfs_trace_in_subprocess() {
+            return;
         }
+        let trace_writer = init_async_vfs_test_tracing();
         test_runtime().block_on(async {
             let native_cx = NativeCx::current().expect("runtime block_on should install Cx");
             let cx = Cx::new();
@@ -1714,38 +1852,47 @@ mod tests {
 
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("shared_ring_100_reads.db");
-            let (file, _) = vfs
-                .open(&cx, Some(&path), open_flags_create_unlocked())
-                .expect("open should succeed");
             let mut seeded = vec![0_u8; READ_COUNT * READ_SIZE];
             for (page_index, page) in seeded.chunks_exact_mut(READ_SIZE).enumerate() {
                 page.fill(u8::try_from(page_index).expect("100 pages fit in u8"));
             }
-            file.write(&cx, &seeded, 0)
-                .await
-                .expect("seed write should succeed");
+            std::fs::write(&path, seeded).expect("synchronous seed write should succeed");
+            let (file, _) = vfs
+                .open(&cx, Some(&path), open_flags_create_unlocked())
+                .expect("open should succeed");
 
             let starts_before = file.runtime.driver_starts.load(Ordering::Relaxed);
             let submitted_before = file.runtime.submitted_requests.load(Ordering::Relaxed);
-            let file = Arc::new(file);
-            let runtime_handle = test_runtime().handle();
-            let mut handles = Vec::with_capacity(READ_COUNT);
+            let runtime = Arc::clone(&file.runtime);
+            let backing_file = file
+                .inner
+                .canonical_file()
+                .expect("opened file must retain its canonical handle");
+            let mut requests = Vec::with_capacity(READ_COUNT);
             for page_index in 0..READ_COUNT {
-                let task_file = Arc::clone(&file);
-                let task_cx = cx.create_child();
                 let offset = u64::try_from(page_index * READ_SIZE).expect("offset fits u64");
-                handles.push(runtime_handle.spawn(async move {
-                    let task_native_cx =
-                        NativeCx::current().expect("runtime task should install Cx");
-                    task_cx.set_native_cx(task_native_cx);
-                    let mut data = vec![0_u8; READ_SIZE];
-                    let bytes_read = task_file.read(&task_cx, &mut data, offset).await?;
-                    Ok::<_, FrankenError>((page_index, bytes_read, data))
-                }));
+                let (request_id, receiver) = runtime
+                    .enqueue_read(
+                        &cx,
+                        &native_cx,
+                        Arc::clone(&backing_file),
+                        READ_SIZE,
+                        offset,
+                    )
+                    .expect("read request should enqueue");
+                requests.push((page_index, request_id, receiver));
             }
-
-            for handle in handles {
-                let (page_index, bytes_read, data) = handle.await.expect("read should succeed");
+            runtime
+                .ensure_driver(&native_cx)
+                .expect("one driver should start after all reads are queued");
+            for (page_index, request_id, mut receiver) in requests {
+                let completion = receiver
+                    .recv(&native_cx)
+                    .await
+                    .expect("queued read should complete");
+                let DriverCompletion::Read { data, bytes_read } = completion else {
+                    panic!("request {request_id} must complete as a read");
+                };
                 assert_eq!(bytes_read, READ_SIZE);
                 assert!(
                     data.iter().all(|byte| *byte
@@ -1771,6 +1918,130 @@ mod tests {
                 "all one hundred reads must reach one submission queue batch"
             );
         });
+        if let Some(trace_writer) = trace_writer {
+            assert!(
+                trace_writer.has_events(),
+                "FSQLITE_ASYNC_VFS_TRACE must retain bounded JSON trace output"
+            );
+            assert!(
+                !trace_writer.is_truncated(),
+                "FSQLITE_ASYNC_VFS_TRACE must retain the complete bounded JSON trace"
+            );
+            assert_eq!(
+                trace_writer.event_count("read_at_start"),
+                READ_COUNT,
+                "FSQLITE_ASYNC_VFS_TRACE must retain every read start"
+            );
+            assert_eq!(
+                trace_writer.event_count("read_at_complete"),
+                READ_COUNT,
+                "FSQLITE_ASYNC_VFS_TRACE must retain every read completion"
+            );
+            trace_writer.flush_to_stderr();
+        }
+    }
+
+    const ASYNC_VFS_TRACE_ENV: &str = "FSQLITE_ASYNC_VFS_TRACE";
+    const ASYNC_VFS_TRACE_SUBPROCESS_ENV: &str = "FSQLITE_ASYNC_VFS_TRACE_SUBPROCESS";
+    const SHARED_RING_TRACE_TEST: &str =
+        "uring::tests::test_shared_ring_multiplexes_one_hundred_concurrent_reads";
+
+    /// Installs the verbose JSON subscriber only in the dedicated trace child.
+    ///
+    /// The 100-read workload spans runtime threads, so a thread-local
+    /// subscriber would omit events. The parent test therefore starts a child
+    /// filtered to this one test when tracing is requested; no later test can
+    /// observe this process-global subscriber.
+    fn init_async_vfs_test_tracing() -> Option<BoundedTraceWriter> {
+        if std::env::var_os(ASYNC_VFS_TRACE_ENV).is_none()
+            || std::env::var_os(ASYNC_VFS_TRACE_SUBPROCESS_ENV).is_none()
+        {
+            return None;
+        }
+
+        let writer = BoundedTraceWriter::new();
+        assert!(
+            !tracing::dispatcher::has_been_set(),
+            "the dedicated async-VFS trace process must start without a subscriber"
+        );
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(writer.clone())
+                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                        metadata.target() == ASYNC_VFS_TRACE_TARGET
+                    })),
+            )
+            .try_init()
+            .expect("the dedicated async-VFS trace process must install its subscriber");
+        Some(writer)
+    }
+
+    /// Runs trace-enabled async-VFS work in a process that executes no other
+    /// libtest test, retaining the opt-in trace contract without polluting the
+    /// normal shared test binary.
+    fn run_async_vfs_trace_in_subprocess() -> bool {
+        if std::env::var_os(ASYNC_VFS_TRACE_ENV).is_none()
+            || std::env::var_os(ASYNC_VFS_TRACE_SUBPROCESS_ENV).is_some()
+        {
+            return false;
+        }
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the libtest binary path must be available"),
+        )
+        .arg(SHARED_RING_TRACE_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(ASYNC_VFS_TRACE_ENV, "1")
+        .env(ASYNC_VFS_TRACE_SUBPROCESS_ENV, "1")
+        .status()
+        .expect("the dedicated async-VFS trace process must start");
+
+        assert!(
+            status.success(),
+            "the dedicated async-VFS trace process must complete successfully"
+        );
+        true
+    }
+
+    #[test]
+    fn async_vfs_trace_opt_in_does_not_install_a_process_global_subscriber() {
+        const PROBE_ENV: &str = "FSQLITE_ASYNC_VFS_TRACE_GLOBAL_SUBSCRIBER_PROBE";
+        const TEST_FILTER: &str =
+            "async_vfs_trace_opt_in_does_not_install_a_process_global_subscriber";
+
+        if std::env::var_os(PROBE_ENV).is_some() {
+            assert!(
+                !tracing::dispatcher::has_been_set(),
+                "the fresh keeper process must start without a tracing subscriber"
+            );
+            assert!(
+                run_async_vfs_trace_in_subprocess(),
+                "the trace opt-in must isolate the traced workload in a child process"
+            );
+            assert!(
+                !tracing::dispatcher::has_been_set(),
+                "the trace-enabled child must not leak a subscriber to a later parent test"
+            );
+            return;
+        }
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the libtest binary path must be available"),
+        )
+        .arg(TEST_FILTER)
+        .arg("--test-threads=1")
+        .env(ASYNC_VFS_TRACE_ENV, "1")
+        .env(PROBE_ENV, "1")
+        .status()
+        .expect("the fresh keeper process must start");
+
+        assert!(
+            status.success(),
+            "the fresh keeper process must confirm the trace opt-in leaves no global subscriber"
+        );
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
@@ -2162,51 +2433,6 @@ mod tests {
             "abort should not fall back to unix or record fallback metrics"
         );
         Ok(())
-    }
-
-    #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    #[test]
-    fn test_lock_mutex_or_io_handles_poison_without_panicking() {
-        let mutex = Mutex::new(7_u8);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-            std::panic::panic_any("poison mutex");
-        }));
-        let err = lock_mutex_or_io(&mutex).expect_err("lock should fail");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert_eq!(err.to_string(), IO_URING_LOCK_POISONED_MSG);
-    }
-
-    #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    #[test]
-    fn test_poisoned_runtime_falls_back_to_unix_path_and_disables_backend() {
-        let cx = Cx::new();
-        let vfs = IoUringVfs::new();
-        if !vfs.is_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("uring_poison_fallback.db");
-        let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
-            .expect("open should succeed");
-
-        if let Some(ring_mutex) = file.runtime.ring.as_ref() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _guard = ring_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                std::panic::panic_any("poison io_uring runtime lock");
-            }));
-        }
-
-        block_on_test(&cx, file.write(&cx, b"fallback", 0))
-            .expect("write should fall back and succeed");
-        let mut buf = [0_u8; 8];
-        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0))
-            .expect("read should fall back and succeed");
-        assert_eq!(n, 8);
-        assert_eq!(&buf, b"fallback");
-        assert!(vfs.runtime.is_disabled());
-        assert!(!vfs.is_available());
     }
 
     #[cfg(feature = "linux-asupersync-uring")]

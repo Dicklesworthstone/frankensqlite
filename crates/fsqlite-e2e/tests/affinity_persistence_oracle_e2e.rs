@@ -7,6 +7,7 @@
 //! is serialized to disk and read back on a fresh connection. In particular it
 //! pins the NUMERIC REAL->INTEGER reduction fix (fix(types) d1cf117d) end-to-end
 //! on a file-backed database.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -18,8 +19,8 @@ fn test_tmpdir() -> tempfile::TempDir {
 }
 
 /// Render a FrankenSQLite result set as `Vec<Vec<String>>` for comparison.
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -69,14 +70,15 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
 
 /// Apply DDL/DML to a file-backed FrankenSQLite db (then drop the connection to
 /// force a close), and to a fresh rusqlite in-memory db. Returns the db path.
-fn setup(dir: &tempfile::TempDir, stmts: &[&str]) -> (String, rusqlite::Connection) {
+async fn setup(dir: &tempfile::TempDir, stmts: &[&str]) -> (String, rusqlite::Connection) {
     let db_path = dir.path().join("affinity_persist.db");
     let db_str = db_path.to_string_lossy().into_owned();
     {
-        let fconn = Connection::open(&db_str).expect("open frank");
+        let fconn = Connection::open(&db_str).await.expect("open frank");
         for s in stmts {
             fconn
                 .execute(s)
+                .await
                 .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
         }
         // Drop closes the connection, flushing the row image to disk.
@@ -90,13 +92,13 @@ fn setup(dir: &tempfile::TempDir, stmts: &[&str]) -> (String, rusqlite::Connecti
     (db_str, rconn)
 }
 
-fn assert_parity(db_str: &str, rconn: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn assert_parity(db_str: &str, rconn: &rusqlite::Connection, queries: &[&str], label: &str) {
     // Reopen the file-backed db on a fresh connection so the schema + rows are
     // re-hydrated from disk rather than served from the writer's in-memory state.
-    let fconn = Connection::open(db_str).expect("reopen frank");
+    let fconn = Connection::open(db_str).await.expect("reopen frank");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&fconn, q), sqlite_rows(rconn, q)) {
+        match (frank_rows(&fconn, q).await, sqlite_rows(rconn, q)) {
             (Ok(f), Ok(s)) if f == s => {}
             (Ok(f), Ok(s)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {f:?}\n  csql:  {s:?}"))
@@ -124,83 +126,99 @@ fn assert_parity(db_str: &str, rconn: &rusqlite::Connection, queries: &[&str], l
 
 #[test]
 fn affinity_storage_class_persists_across_reopen() {
-    let dir = test_tmpdir();
-    let (db, rconn) = setup(
-        &dir,
-        &[
-            "CREATE TABLE t (i INTEGER, t TEXT, r REAL, n NUMERIC, b BLOB)",
-            // '123'->int, 456->text, '78.5'->real, '90'->int, 'hi'->text(blob aff).
-            "INSERT INTO t VALUES ('123', 456, '78.5', '90', 'hi')",
-        ],
-    );
-    assert_parity(
-        &db,
-        &rconn,
-        &["SELECT typeof(i), i, typeof(t), t, typeof(r), r, typeof(n), n, typeof(b), b FROM t"],
-        "affinity_storage_class_persists_across_reopen",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let (db, rconn) = setup(
+            &dir,
+            &[
+                "CREATE TABLE t (i INTEGER, t TEXT, r REAL, n NUMERIC, b BLOB)",
+                // '123'->int, 456->text, '78.5'->real, '90'->int, 'hi'->text(blob aff).
+                "INSERT INTO t VALUES ('123', 456, '78.5', '90', 'hi')",
+            ],
+        )
+        .await;
+        assert_parity(
+            &db,
+            &rconn,
+            &["SELECT typeof(i), i, typeof(t), t, typeof(r), r, typeof(n), n, typeof(b), b FROM t"],
+            "affinity_storage_class_persists_across_reopen",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn numeric_real_reduction_persists_across_reopen() {
-    // Pins fix(types) d1cf117d on a file-backed db: an integral REAL stored in a
-    // NUMERIC column is reduced to INTEGER and survives the disk round-trip.
-    let dir = test_tmpdir();
-    let (db, rconn) = setup(
-        &dir,
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, n NUMERIC)",
-            "INSERT INTO t(n) VALUES (4.0), (5.5), ('3.0e2'), ('123'), ('abc')",
-        ],
-    );
-    assert_parity(
-        &db,
-        &rconn,
-        &["SELECT id, typeof(n), n FROM t ORDER BY id"],
-        "numeric_real_reduction_persists_across_reopen",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Pins fix(types) d1cf117d on a file-backed db: an integral REAL stored in a
+        // NUMERIC column is reduced to INTEGER and survives the disk round-trip.
+        let dir = test_tmpdir();
+        let (db, rconn) = setup(
+            &dir,
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n NUMERIC)",
+                "INSERT INTO t(n) VALUES (4.0), (5.5), ('3.0e2'), ('123'), ('abc')",
+            ],
+        )
+        .await;
+        assert_parity(
+            &db,
+            &rconn,
+            &["SELECT id, typeof(n), n FROM t ORDER BY id"],
+            "numeric_real_reduction_persists_across_reopen",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn comparison_affinity_persists_across_reopen() {
-    let dir = test_tmpdir();
-    let (db, rconn) = setup(
-        &dir,
-        &[
-            "CREATE TABLE t (i INTEGER, x TEXT)",
-            "INSERT INTO t VALUES (2,'2'),(5,'5'),(10,'10'),(100,'100')",
-        ],
-    );
-    assert_parity(
-        &db,
-        &rconn,
-        &[
-            // RHS literal acquires the column's affinity, after reopen.
-            "SELECT i FROM t WHERE i = '5'",
-            "SELECT x FROM t WHERE x = 5",
-            "SELECT i FROM t WHERE i > '3' ORDER BY i",
-            "SELECT x FROM t WHERE x < '7' ORDER BY x",
-            "SELECT i FROM t ORDER BY i",
-            "SELECT x FROM t ORDER BY x",
-        ],
-        "comparison_affinity_persists_across_reopen",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let (db, rconn) = setup(
+            &dir,
+            &[
+                "CREATE TABLE t (i INTEGER, x TEXT)",
+                "INSERT INTO t VALUES (2,'2'),(5,'5'),(10,'10'),(100,'100')",
+            ],
+        )
+        .await;
+        assert_parity(
+            &db,
+            &rconn,
+            &[
+                // RHS literal acquires the column's affinity, after reopen.
+                "SELECT i FROM t WHERE i = '5'",
+                "SELECT x FROM t WHERE x = 5",
+                "SELECT i FROM t WHERE i > '3' ORDER BY i",
+                "SELECT x FROM t WHERE x < '7' ORDER BY x",
+                "SELECT i FROM t ORDER BY i",
+                "SELECT x FROM t ORDER BY x",
+            ],
+            "comparison_affinity_persists_across_reopen",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn integer_real_lossless_persists_across_reopen() {
-    let dir = test_tmpdir();
-    let (db, rconn) = setup(
-        &dir,
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO t(v) VALUES (1.0), (1.5), ('1e3'), ('2.0')",
-        ],
-    );
-    assert_parity(
-        &db,
-        &rconn,
-        &["SELECT id, typeof(v), v FROM t ORDER BY id"],
-        "integer_real_lossless_persists_across_reopen",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let (db, rconn) = setup(
+            &dir,
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t(v) VALUES (1.0), (1.5), ('1e3'), ('2.0')",
+            ],
+        )
+        .await;
+        assert_parity(
+            &db,
+            &rconn,
+            &["SELECT id, typeof(v), v FROM t ORDER BY id"],
+            "integer_real_lossless_persists_across_reopen",
+        )
+        .await;
+    });
 }

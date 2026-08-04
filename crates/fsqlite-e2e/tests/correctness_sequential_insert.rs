@@ -13,6 +13,7 @@
 //! returns `Real(N.0)` when a REAL column value is an exact integer.  The
 //! comparison helpers below account for this by using fractional values that
 //! never resolve to exact integers (multiplier `0.00137` instead of `0.001`).
+#![recursion_limit = "512"]
 
 use fsqlite::{Connection as FsqliteConnection, SqliteValue as FsqliteValue};
 use fsqlite_e2e::comparison::{ComparisonRunner, SqlBackend, SqlValue};
@@ -143,9 +144,10 @@ fn sql_value_from_rusqlite(value: &RusqliteValue) -> SqlValue {
     }
 }
 
-fn execute_fsqlite_workload(conn: &FsqliteConnection, statements: &[String]) {
+async fn execute_fsqlite_workload(conn: &FsqliteConnection, statements: &[String]) {
     for (index, sql) in statements.iter().enumerate() {
         conn.execute(sql)
+            .await
             .unwrap_or_else(|error| panic!("fsqlite statement {index} failed: {error}"));
     }
 }
@@ -157,8 +159,9 @@ fn execute_rusqlite_workload(conn: &RusqliteConnection, statements: &[String]) {
     }
 }
 
-fn fetch_fsqlite_rows(conn: &FsqliteConnection, sql: &str) -> Vec<Vec<SqlValue>> {
+async fn fetch_fsqlite_rows(conn: &FsqliteConnection, sql: &str) -> Vec<Vec<SqlValue>> {
     conn.query(sql)
+        .await
         .expect("query fsqlite rows")
         .into_iter()
         .map(|row| row.values().iter().map(sql_value_from_fsqlite).collect())
@@ -318,66 +321,71 @@ fn sequential_insert_flood_logical_state_hash() {
 
 #[test]
 fn sequential_insert_file_backed_reopen_matches_sqlite() {
-    let base_row_count = 4_096_usize;
-    let mut stmts = generate_insert_stmts(base_row_count);
-    let edge_case_stmts = generate_edge_case_stmts(
-        i64::try_from(base_row_count + 1).expect("base row count fits in i64"),
-    );
-    let expected_rows = base_row_count + edge_case_stmts.len();
-    stmts.extend(edge_case_stmts);
-
-    let temp = tempdir().expect("tempdir");
-    let fsqlite_path = temp.path().join("sequential_insert_fsqlite.db");
-    let csqlite_path = temp.path().join("sequential_insert_csqlite.db");
-    let fsqlite_path_string = fsqlite_path.to_string_lossy().into_owned();
-
-    {
-        let fsqlite_conn =
-            FsqliteConnection::open(fsqlite_path_string.as_str()).expect("open fsqlite db");
-        let csqlite_conn = RusqliteConnection::open(&csqlite_path).expect("open csqlite db");
-        execute_fsqlite_workload(&fsqlite_conn, &stmts);
-        execute_rusqlite_workload(&csqlite_conn, &stmts);
-    }
-
-    let reopened_fsqlite =
-        FsqliteConnection::open(fsqlite_path_string.as_str()).expect("reopen fsqlite db");
-    let reopened_csqlite = RusqliteConnection::open(&csqlite_path).expect("reopen csqlite db");
-
-    let ordered_rows_sql = "SELECT id, name, value, data, created FROM e2e_insert_test ORDER BY id";
-    let fsqlite_rows = fetch_fsqlite_rows(&reopened_fsqlite, ordered_rows_sql);
-    let csqlite_rows = fetch_rusqlite_rows(&reopened_csqlite, ordered_rows_sql);
-
-    assert_eq!(
-        csqlite_rows.len(),
-        expected_rows,
-        "expected {expected_rows} rows in the C SQLite file-backed oracle"
-    );
-    assert_eq!(
-        fsqlite_rows.len(),
-        expected_rows,
-        "expected {expected_rows} rows in the FrankenSQLite file-backed database"
-    );
-
-    for index in [
-        0_usize,
-        (base_row_count / 2) - 1,
-        base_row_count - 1,
-        expected_rows - 4,
-        expected_rows - 3,
-        expected_rows - 1,
-    ] {
-        assert_eq!(
-            csqlite_rows[index], fsqlite_rows[index],
-            "file-backed row mismatch at logical row index {index}"
+    asupersync::test_utils::run_test(|| async {
+        let base_row_count = 4_096_usize;
+        let mut stmts = generate_insert_stmts(base_row_count);
+        let edge_case_stmts = generate_edge_case_stmts(
+            i64::try_from(base_row_count + 1).expect("base row count fits in i64"),
         );
-    }
+        let expected_rows = base_row_count + edge_case_stmts.len();
+        stmts.extend(edge_case_stmts);
 
-    let csqlite_hash = normalized_rows_hash(&csqlite_rows);
-    let fsqlite_hash = normalized_rows_hash(&fsqlite_rows);
-    assert_eq!(
-        csqlite_hash, fsqlite_hash,
-        "file-backed logical state hash mismatch after reopen:\n  csqlite={csqlite_hash}\n  fsqlite={fsqlite_hash}"
-    );
+        let temp = tempdir().expect("tempdir");
+        let fsqlite_path = temp.path().join("sequential_insert_fsqlite.db");
+        let csqlite_path = temp.path().join("sequential_insert_csqlite.db");
+        let fsqlite_path_string = fsqlite_path.to_string_lossy().into_owned();
+
+        {
+            let fsqlite_conn = FsqliteConnection::open(fsqlite_path_string.as_str())
+                .await
+                .expect("open fsqlite db");
+            let csqlite_conn = RusqliteConnection::open(&csqlite_path).expect("open csqlite db");
+            execute_fsqlite_workload(&fsqlite_conn, &stmts).await;
+            execute_rusqlite_workload(&csqlite_conn, &stmts);
+        }
+
+        let reopened_fsqlite = FsqliteConnection::open(fsqlite_path_string.as_str())
+            .await
+            .expect("reopen fsqlite db");
+        let reopened_csqlite = RusqliteConnection::open(&csqlite_path).expect("reopen csqlite db");
+
+        let ordered_rows_sql =
+            "SELECT id, name, value, data, created FROM e2e_insert_test ORDER BY id";
+        let fsqlite_rows = fetch_fsqlite_rows(&reopened_fsqlite, ordered_rows_sql).await;
+        let csqlite_rows = fetch_rusqlite_rows(&reopened_csqlite, ordered_rows_sql);
+
+        assert_eq!(
+            csqlite_rows.len(),
+            expected_rows,
+            "expected {expected_rows} rows in the C SQLite file-backed oracle"
+        );
+        assert_eq!(
+            fsqlite_rows.len(),
+            expected_rows,
+            "expected {expected_rows} rows in the FrankenSQLite file-backed database"
+        );
+
+        for index in [
+            0_usize,
+            (base_row_count / 2) - 1,
+            base_row_count - 1,
+            expected_rows - 4,
+            expected_rows - 3,
+            expected_rows - 1,
+        ] {
+            assert_eq!(
+                csqlite_rows[index], fsqlite_rows[index],
+                "file-backed row mismatch at logical row index {index}"
+            );
+        }
+
+        let csqlite_hash = normalized_rows_hash(&csqlite_rows);
+        let fsqlite_hash = normalized_rows_hash(&fsqlite_rows);
+        assert_eq!(
+            csqlite_hash, fsqlite_hash,
+            "file-backed logical state hash mismatch after reopen:\n  csqlite={csqlite_hash}\n  fsqlite={fsqlite_hash}"
+        );
+    });
 }
 
 #[test]

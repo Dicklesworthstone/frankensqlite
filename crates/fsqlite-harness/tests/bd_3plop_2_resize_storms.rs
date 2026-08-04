@@ -126,42 +126,50 @@ fn workspace_root() -> Result<PathBuf, String> {
         .map_err(|error| format!("workspace_root_canonicalize_failed: {error}"))
 }
 
-fn configure_connection(conn: &Connection) -> Result<(), String> {
+async fn configure_connection(conn: &Connection) -> Result<(), String> {
     conn.execute("PRAGMA journal_mode = WAL")
+        .await
         .map_err(|error| format!("pragma_wal_failed error={error}"))?;
     conn.execute("PRAGMA synchronous = NORMAL")
+        .await
         .map_err(|error| format!("pragma_sync_failed error={error}"))?;
     conn.execute("PRAGMA busy_timeout = 25")
+        .await
         .map_err(|error| format!("pragma_busy_timeout_failed error={error}"))?;
     Ok(())
 }
 
-fn open_db(path: &str) -> Result<Connection, String> {
-    let conn =
-        Connection::open(path).map_err(|error| format!("open_failed path={path} {error}"))?;
-    configure_connection(&conn)?;
+async fn open_db(path: &str) -> Result<Connection, String> {
+    let conn = Connection::open(path)
+        .await
+        .map_err(|error| format!("open_failed path={path} {error}"))?;
+    configure_connection(&conn).await?;
     Ok(conn)
 }
 
-fn setup_database(path: &str) -> Result<(), String> {
-    let conn = open_db(path)?;
+async fn setup_database(path: &str) -> Result<(), String> {
+    let conn = open_db(path).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+        .await
         .map_err(|error| format!("create_table_failed error={error}"))?;
     conn.execute("DELETE FROM kv")
+        .await
         .map_err(|error| format!("delete_table_failed error={error}"))?;
 
     for key in 1..=512_u64 {
         let sql = format!("INSERT INTO kv (id, v) VALUES ({key}, {key})");
         conn.execute(&sql)
+            .await
             .map_err(|error| format!("seed_insert_failed key={key} error={error}"))?;
     }
 
     Ok(())
 }
 
-fn set_cache_size(conn: &Connection, cache_size: i64) -> Result<(), String> {
+async fn set_cache_size(conn: &Connection, cache_size: i64) -> Result<(), String> {
     let sql = format!("PRAGMA cache_size={cache_size};");
     conn.execute(&sql)
+        .await
         .map_err(|error| format!("set_cache_size_failed cache_size={cache_size} error={error}"))?;
     Ok(())
 }
@@ -174,9 +182,10 @@ fn parse_i64_cell(row: &Row, index: usize, label: &str) -> Result<i64, String> {
     }
 }
 
-fn get_cache_size(conn: &Connection) -> Result<i64, String> {
+async fn get_cache_size(conn: &Connection) -> Result<i64, String> {
     let rows = conn
         .query("PRAGMA cache_size;")
+        .await
         .map_err(|error| format!("pragma_cache_size_query_failed error={error}"))?;
     let Some(row) = rows.first() else {
         return Err("pragma_cache_size_empty_result".to_owned());
@@ -184,9 +193,10 @@ fn get_cache_size(conn: &Connection) -> Result<i64, String> {
     parse_i64_cell(row, 0, "pragma_cache_size")
 }
 
-fn integrity_ok(conn: &Connection) -> Result<bool, String> {
+async fn integrity_ok(conn: &Connection) -> Result<bool, String> {
     let rows = conn
         .query("PRAGMA integrity_check;")
+        .await
         .map_err(|error| format!("integrity_check_failed error={error}"))?;
     let Some(row) = rows.first() else {
         return Err("integrity_check_empty_result".to_owned());
@@ -199,9 +209,10 @@ fn integrity_ok(conn: &Connection) -> Result<bool, String> {
     }
 }
 
-fn checksum(conn: &Connection) -> Result<Checksum, String> {
+async fn checksum(conn: &Connection) -> Result<Checksum, String> {
     let count_rows = conn
         .query("SELECT count(*) FROM kv;")
+        .await
         .map_err(|error| format!("checksum_count_query_failed error={error}"))?;
     let Some(count_row) = count_rows.first() else {
         return Err("checksum_count_empty_result".to_owned());
@@ -212,6 +223,7 @@ fn checksum(conn: &Connection) -> Result<Checksum, String> {
 
     let sum_rows = conn
         .query("SELECT sum(v) FROM kv;")
+        .await
         .map_err(|error| format!("checksum_sum_query_failed error={error}"))?;
     let Some(sum_row) = sum_rows.first() else {
         return Err("checksum_sum_empty_result".to_owned());
@@ -225,7 +237,7 @@ fn checksum(conn: &Connection) -> Result<Checksum, String> {
     Ok(Checksum { row_count, sum_v })
 }
 
-fn run_resize_pattern(
+async fn run_resize_pattern(
     conn: &Connection,
     pattern: &[i64],
     iterations: usize,
@@ -237,7 +249,7 @@ fn run_resize_pattern(
 
     for step in 0..iterations {
         let cache_size = pattern[step % pattern.len()];
-        set_cache_size(conn, cache_size)?;
+        set_cache_size(conn, cache_size).await?;
         if sleep_millis > 0 {
             thread::sleep(Duration::from_millis(sleep_millis));
         }
@@ -246,57 +258,73 @@ fn run_resize_pattern(
     Ok(iterations)
 }
 
+/// Runs entirely inside a spawned worker thread; owns its own runtime because
+/// `Connection` is `!Send`.
 #[allow(clippy::needless_pass_by_value)]
 fn run_query_worker(path: String, loops: usize, expected: Checksum) -> Result<usize, String> {
-    let conn = open_db(&path)?;
-    for idx in 0..loops {
-        let observed = checksum(&conn)?;
-        if observed.row_count != expected.row_count || observed.sum_v != expected.sum_v {
-            return Err(format!(
-                "query_checksum_mismatch idx={idx} expected={expected:?} observed={observed:?}"
-            ));
+    let mut outcome: Result<usize, String> = Err("query_worker_did_not_run".to_owned());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = open_db(&path).await?;
+            for idx in 0..loops {
+                let observed = checksum(&conn).await?;
+                if observed.row_count != expected.row_count || observed.sum_v != expected.sum_v {
+                    return Err(format!(
+                        "query_checksum_mismatch idx={idx} expected={expected:?} observed={observed:?}"
+                    ));
+                }
+            }
+            Ok(loops)
         }
-    }
-    Ok(loops)
+        .await;
+    });
+    outcome
 }
 
+/// Runs entirely inside a spawned worker thread; owns its own runtime because
+/// `Connection` is `!Send`.
 #[allow(clippy::needless_pass_by_value)]
 fn run_writer_worker(path: String, thread_idx: usize, ops: usize) -> WriteStats {
-    let Ok(conn) = open_db(&path) else {
-        return WriteStats {
-            committed: 0,
-            aborted: ops,
+    let mut outcome: Option<WriteStats> = None;
+    asupersync::test_utils::run_test(|| async {
+        let Ok(conn) = open_db(&path).await else {
+            outcome = Some(WriteStats {
+                committed: 0,
+                aborted: ops,
+            });
+            return;
         };
-    };
 
-    let mut committed = 0;
-    let mut aborted = 0;
+        let mut committed = 0;
+        let mut aborted = 0;
 
-    for op in 0..ops {
-        let key = ((thread_idx * ops) + op) % 512 + 1;
-        let update_sql = format!("UPDATE kv SET v = v + 1 WHERE id = {key}");
+        for op in 0..ops {
+            let key = ((thread_idx * ops) + op) % 512 + 1;
+            let update_sql = format!("UPDATE kv SET v = v + 1 WHERE id = {key}");
 
-        match conn.execute(&update_sql) {
-            Ok(changed) => {
-                if changed > 0 {
-                    committed += changed;
-                } else {
+            match conn.execute(&update_sql).await {
+                Ok(changed) => {
+                    if changed > 0 {
+                        committed += changed;
+                    } else {
+                        aborted += 1;
+                    }
+                }
+                Err(_) => {
                     aborted += 1;
                 }
             }
-            Err(_) => {
-                aborted += 1;
-            }
         }
-    }
 
-    WriteStats { committed, aborted }
+        outcome = Some(WriteStats { committed, aborted });
+    });
+    outcome.expect("writer worker must produce stats")
 }
 
-fn rapid_shrink_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
-    setup_database(path)?;
-    let conn = open_db(path)?;
-    let checksum_before = checksum(&conn)?;
+async fn rapid_shrink_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
+    setup_database(path).await?;
+    let conn = open_db(path).await?;
+    let checksum_before = checksum(&conn).await?;
 
     let started = Instant::now();
     let pattern = [
@@ -309,11 +337,11 @@ fn rapid_shrink_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
         -32,
         SMALL_CACHE_KIB,
     ];
-    let resize_ops = run_resize_pattern(&conn, &pattern, steps, 1)?;
+    let resize_ops = run_resize_pattern(&conn, &pattern, steps, 1).await?;
 
-    let final_cache_size = get_cache_size(&conn)?;
-    let checksum_after = checksum(&conn)?;
-    let integrity_ok = integrity_ok(&conn)?;
+    let final_cache_size = get_cache_size(&conn).await?;
+    let checksum_after = checksum(&conn).await?;
+    let integrity_ok = integrity_ok(&conn).await?;
     let elapsed_ms = started.elapsed().as_millis();
 
     Ok(CaseArtifact {
@@ -332,10 +360,10 @@ fn rapid_shrink_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
     })
 }
 
-fn rapid_grow_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
-    setup_database(path)?;
-    let conn = open_db(path)?;
-    let checksum_before = checksum(&conn)?;
+async fn rapid_grow_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
+    setup_database(path).await?;
+    let conn = open_db(path).await?;
+    let checksum_before = checksum(&conn).await?;
 
     let started = Instant::now();
     let pattern = [
@@ -348,11 +376,11 @@ fn rapid_grow_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
         -700,
         LARGE_CACHE_KIB,
     ];
-    let resize_ops = run_resize_pattern(&conn, &pattern, steps, 1)?;
+    let resize_ops = run_resize_pattern(&conn, &pattern, steps, 1).await?;
 
-    let final_cache_size = get_cache_size(&conn)?;
-    let checksum_after = checksum(&conn)?;
-    let integrity_ok = integrity_ok(&conn)?;
+    let final_cache_size = get_cache_size(&conn).await?;
+    let checksum_after = checksum(&conn).await?;
+    let integrity_ok = integrity_ok(&conn).await?;
     let elapsed_ms = started.elapsed().as_millis();
 
     Ok(CaseArtifact {
@@ -371,18 +399,18 @@ fn rapid_grow_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
     })
 }
 
-fn oscillation_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
-    setup_database(path)?;
-    let conn = open_db(path)?;
-    let checksum_before = checksum(&conn)?;
+async fn oscillation_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
+    setup_database(path).await?;
+    let conn = open_db(path).await?;
+    let checksum_before = checksum(&conn).await?;
 
     let started = Instant::now();
     let pattern = [SMALL_CACHE_KIB, LARGE_CACHE_KIB];
-    let resize_ops = run_resize_pattern(&conn, &pattern, steps.saturating_mul(2), 2)?;
+    let resize_ops = run_resize_pattern(&conn, &pattern, steps.saturating_mul(2), 2).await?;
 
-    let final_cache_size = get_cache_size(&conn)?;
-    let checksum_after = checksum(&conn)?;
-    let integrity_ok = integrity_ok(&conn)?;
+    let final_cache_size = get_cache_size(&conn).await?;
+    let checksum_after = checksum(&conn).await?;
+    let integrity_ok = integrity_ok(&conn).await?;
     let elapsed_ms = started.elapsed().as_millis();
 
     Ok(CaseArtifact {
@@ -401,14 +429,14 @@ fn oscillation_case(path: &str, steps: usize) -> Result<CaseArtifact, String> {
     })
 }
 
-fn concurrent_resize_queries_case(
+async fn concurrent_resize_queries_case(
     path: &str,
     steps: usize,
     loops: usize,
 ) -> Result<CaseArtifact, String> {
-    setup_database(path)?;
-    let conn = open_db(path)?;
-    let checksum_before = checksum(&conn)?;
+    setup_database(path).await?;
+    let conn = open_db(path).await?;
+    let checksum_before = checksum(&conn).await?;
 
     let worker_path = path.to_owned();
     let started = Instant::now();
@@ -420,15 +448,15 @@ fn concurrent_resize_queries_case(
         LARGE_CACHE_KIB,
         MID_CACHE_KIB,
     ];
-    let resize_ops = run_resize_pattern(&conn, &pattern, steps, 1)?;
+    let resize_ops = run_resize_pattern(&conn, &pattern, steps, 1).await?;
 
     let query_ops = query_handle
         .join()
         .map_err(|_| "query_worker_join_failed_possible_deadlock".to_owned())??;
 
-    let final_cache_size = get_cache_size(&conn)?;
-    let checksum_after = checksum(&conn)?;
-    let integrity_ok = integrity_ok(&conn)?;
+    let final_cache_size = get_cache_size(&conn).await?;
+    let checksum_after = checksum(&conn).await?;
+    let integrity_ok = integrity_ok(&conn).await?;
     let elapsed_ms = started.elapsed().as_millis();
 
     Ok(CaseArtifact {
@@ -447,14 +475,14 @@ fn concurrent_resize_queries_case(
     })
 }
 
-fn concurrent_resize_writes_case(
+async fn concurrent_resize_writes_case(
     path: &str,
     steps: usize,
     ops_per_writer: usize,
 ) -> Result<CaseArtifact, String> {
-    setup_database(path)?;
-    let conn = open_db(path)?;
-    let checksum_before = checksum(&conn)?;
+    setup_database(path).await?;
+    let conn = open_db(path).await?;
+    let checksum_before = checksum(&conn).await?;
 
     let started = Instant::now();
     let mut writer_handles = Vec::with_capacity(CONCURRENT_WRITERS);
@@ -471,7 +499,7 @@ fn concurrent_resize_writes_case(
         SMALL_CACHE_KIB,
         MID_CACHE_KIB,
     ];
-    let resize_ops = run_resize_pattern(&conn, &pattern, steps, 1)?;
+    let resize_ops = run_resize_pattern(&conn, &pattern, steps, 1).await?;
 
     let mut write_ops = 0;
     let mut write_aborts = 0;
@@ -483,10 +511,10 @@ fn concurrent_resize_writes_case(
         write_aborts += stats.aborted;
     }
 
-    let final_cache_size = get_cache_size(&conn)?;
-    let verify_conn = open_db(path)?;
-    let checksum_after = checksum(&verify_conn)?;
-    let integrity_ok = integrity_ok(&verify_conn)?;
+    let final_cache_size = get_cache_size(&conn).await?;
+    let verify_conn = open_db(path).await?;
+    let checksum_after = checksum(&verify_conn).await?;
+    let integrity_ok = integrity_ok(&verify_conn).await?;
     let elapsed_ms = started.elapsed().as_millis();
 
     Ok(CaseArtifact {
@@ -505,7 +533,7 @@ fn concurrent_resize_writes_case(
     })
 }
 
-fn run_case(
+async fn run_case(
     scenario: Scenario,
     steps: usize,
     loops: usize,
@@ -518,12 +546,14 @@ fn run_case(
         .ok_or_else(|| "db_path_utf8_failed".to_owned())?;
 
     match scenario {
-        Scenario::RapidShrink => rapid_shrink_case(path, steps),
-        Scenario::RapidGrow => rapid_grow_case(path, steps),
-        Scenario::Oscillation => oscillation_case(path, steps),
-        Scenario::ConcurrentResizeQueries => concurrent_resize_queries_case(path, steps, loops),
+        Scenario::RapidShrink => rapid_shrink_case(path, steps).await,
+        Scenario::RapidGrow => rapid_grow_case(path, steps).await,
+        Scenario::Oscillation => oscillation_case(path, steps).await,
+        Scenario::ConcurrentResizeQueries => {
+            concurrent_resize_queries_case(path, steps, loops).await
+        }
         Scenario::ConcurrentResizeWrites => {
-            concurrent_resize_writes_case(path, steps, ops_per_writer)
+            concurrent_resize_writes_case(path, steps, ops_per_writer).await
         }
     }
 }
@@ -553,130 +583,147 @@ fn write_suite_artifact(suite: &SuiteArtifact) -> Result<PathBuf, String> {
 
 #[test]
 fn test_bd_3plop_2_cache_size_roundtrip() {
-    let temp_dir = tempdir().expect("tempdir should be created");
-    let db_path = temp_dir.path().join("roundtrip.db");
-    let db_str = db_path.to_str().expect("db path should be utf8");
+    asupersync::test_utils::run_test(|| async {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("roundtrip.db");
+        let db_str = db_path.to_str().expect("db path should be utf8");
 
-    setup_database(db_str).expect("database setup should succeed");
-    let conn = open_db(db_str).expect("connection should open");
+        setup_database(db_str)
+            .await
+            .expect("database setup should succeed");
+        let conn = open_db(db_str).await.expect("connection should open");
 
-    set_cache_size(&conn, SMALL_CACHE_KIB).expect("cache_size small set should succeed");
-    let small = get_cache_size(&conn).expect("cache_size small query should succeed");
-    assert_eq!(
-        small, SMALL_CACHE_KIB,
-        "cache_size small roundtrip must match"
-    );
+        set_cache_size(&conn, SMALL_CACHE_KIB)
+            .await
+            .expect("cache_size small set should succeed");
+        let small = get_cache_size(&conn)
+            .await
+            .expect("cache_size small query should succeed");
+        assert_eq!(
+            small, SMALL_CACHE_KIB,
+            "cache_size small roundtrip must match"
+        );
 
-    set_cache_size(&conn, LARGE_CACHE_KIB).expect("cache_size large set should succeed");
-    let large = get_cache_size(&conn).expect("cache_size large query should succeed");
-    assert_eq!(
-        large, LARGE_CACHE_KIB,
-        "cache_size large roundtrip must match"
-    );
+        set_cache_size(&conn, LARGE_CACHE_KIB)
+            .await
+            .expect("cache_size large set should succeed");
+        let large = get_cache_size(&conn)
+            .await
+            .expect("cache_size large query should succeed");
+        assert_eq!(
+            large, LARGE_CACHE_KIB,
+            "cache_size large roundtrip must match"
+        );
+    });
 }
 
 #[test]
 fn test_e2e_bd_3plop_2_resize_storms() {
-    let steps = resize_steps();
-    let loops = query_loops();
-    let ops_per_writer = writer_ops();
+    asupersync::test_utils::run_test(|| async {
+        let steps = resize_steps();
+        let loops = query_loops();
+        let ops_per_writer = writer_ops();
 
-    let mut cases = Vec::new();
-    for scenario in Scenario::ALL {
-        let case = run_case(scenario, steps, loops, ops_per_writer).unwrap_or_else(|error| {
-            panic!(
-                "bead_id={BEAD_ID} scenario={} steps={} loops={} writer_ops={} failed: {error}",
-                scenario.as_str(),
-                steps,
-                loops,
-                ops_per_writer,
-            )
-        });
+        let mut cases = Vec::new();
+        for scenario in Scenario::ALL {
+            let case = run_case(scenario, steps, loops, ops_per_writer)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "bead_id={BEAD_ID} scenario={} steps={} loops={} writer_ops={} failed: {error}",
+                        scenario.as_str(),
+                        steps,
+                        loops,
+                        ops_per_writer,
+                    )
+                });
 
-        assert!(
-            case.integrity_ok,
-            "bead_id={BEAD_ID} scenario={} integrity_check must pass",
-            case.scenario
-        );
-        assert!(
-            case.deadlock_free,
-            "bead_id={BEAD_ID} scenario={} must complete without deadlock",
-            case.scenario
-        );
-        assert!(
-            case.starvation_free,
-            "bead_id={BEAD_ID} scenario={} exceeded max case time budget {}ms",
-            case.scenario,
-            max_case_millis()
-        );
-        if case.scenario == Scenario::ConcurrentResizeQueries.as_str() {
-            assert_eq!(
-                case.checksum_before.row_count, case.checksum_after.row_count,
-                "bead_id={BEAD_ID} query scenario row_count must remain stable"
-            );
-            assert_eq!(
-                case.checksum_before.sum_v, case.checksum_after.sum_v,
-                "bead_id={BEAD_ID} query scenario sum(v) must remain stable"
-            );
-        }
-        if case.scenario == Scenario::ConcurrentResizeWrites.as_str() {
             assert!(
-                case.checksum_after.row_count >= case.checksum_before.row_count,
-                "bead_id={BEAD_ID} write scenario row_count must not shrink"
+                case.integrity_ok,
+                "bead_id={BEAD_ID} scenario={} integrity_check must pass",
+                case.scenario
             );
             assert!(
-                case.checksum_after.sum_v >= case.checksum_before.sum_v,
-                "bead_id={BEAD_ID} write scenario sum(v) must not decrease"
+                case.deadlock_free,
+                "bead_id={BEAD_ID} scenario={} must complete without deadlock",
+                case.scenario
             );
+            assert!(
+                case.starvation_free,
+                "bead_id={BEAD_ID} scenario={} exceeded max case time budget {}ms",
+                case.scenario,
+                max_case_millis()
+            );
+            if case.scenario == Scenario::ConcurrentResizeQueries.as_str() {
+                assert_eq!(
+                    case.checksum_before.row_count, case.checksum_after.row_count,
+                    "bead_id={BEAD_ID} query scenario row_count must remain stable"
+                );
+                assert_eq!(
+                    case.checksum_before.sum_v, case.checksum_after.sum_v,
+                    "bead_id={BEAD_ID} query scenario sum(v) must remain stable"
+                );
+            }
+            if case.scenario == Scenario::ConcurrentResizeWrites.as_str() {
+                assert!(
+                    case.checksum_after.row_count >= case.checksum_before.row_count,
+                    "bead_id={BEAD_ID} write scenario row_count must not shrink"
+                );
+                assert!(
+                    case.checksum_after.sum_v >= case.checksum_before.sum_v,
+                    "bead_id={BEAD_ID} write scenario sum(v) must not decrease"
+                );
+            }
+
+            eprintln!(
+                "INFO bead_id={BEAD_ID} case=resize_storm scenario={} resize_ops={} query_ops={} write_ops={} write_aborts={} final_cache_size={} integrity_ok={} deadlock_free={} starvation_free={} elapsed_ms={} checksum_before_row_count={} checksum_after_row_count={} checksum_before_sum_v={} checksum_after_sum_v={}",
+                case.scenario,
+                case.resize_ops,
+                case.query_ops,
+                case.write_ops,
+                case.write_aborts,
+                case.final_cache_size,
+                case.integrity_ok,
+                case.deadlock_free,
+                case.starvation_free,
+                case.elapsed_ms,
+                case.checksum_before.row_count,
+                case.checksum_after.row_count,
+                case.checksum_before.sum_v,
+                case.checksum_after.sum_v,
+            );
+
+            cases.push(case);
         }
 
+        let run_id = format!(
+            "{BEAD_ID}-steps{steps}-q{loops}-w{ops_per_writer}-{}",
+            0xCACE_u64
+        );
+        let suite = SuiteArtifact {
+            schema_version: 1,
+            bead_id: BEAD_ID.to_owned(),
+            run_id: run_id.clone(),
+            resize_steps: steps,
+            query_loops: loops,
+            writer_ops: ops_per_writer,
+            cases,
+            acceptance_checks: vec![
+                "all 5 resize-storm scenarios executed".to_owned(),
+                "no deadlocks observed (all threads joined successfully)".to_owned(),
+                "integrity_check passed for every scenario".to_owned(),
+                "query checksum remained stable during resize+queries scenario".to_owned(),
+                "write scenario completed with bounded runtime and non-decreasing checksums"
+                    .to_owned(),
+            ],
+        };
+
+        let artifact_path = write_suite_artifact(&suite).expect("suite artifact should be written");
         eprintln!(
-            "INFO bead_id={BEAD_ID} case=resize_storm scenario={} resize_ops={} query_ops={} write_ops={} write_aborts={} final_cache_size={} integrity_ok={} deadlock_free={} starvation_free={} elapsed_ms={} checksum_before_row_count={} checksum_after_row_count={} checksum_before_sum_v={} checksum_after_sum_v={}",
-            case.scenario,
-            case.resize_ops,
-            case.query_ops,
-            case.write_ops,
-            case.write_aborts,
-            case.final_cache_size,
-            case.integrity_ok,
-            case.deadlock_free,
-            case.starvation_free,
-            case.elapsed_ms,
-            case.checksum_before.row_count,
-            case.checksum_after.row_count,
-            case.checksum_before.sum_v,
-            case.checksum_after.sum_v,
+            "INFO bead_id={BEAD_ID} case=suite_artifact path={} run_id={} scenarios={}",
+            artifact_path.display(),
+            run_id,
+            suite.cases.len(),
         );
-
-        cases.push(case);
-    }
-
-    let run_id = format!(
-        "{BEAD_ID}-steps{steps}-q{loops}-w{ops_per_writer}-{}",
-        0xCACE_u64
-    );
-    let suite = SuiteArtifact {
-        schema_version: 1,
-        bead_id: BEAD_ID.to_owned(),
-        run_id: run_id.clone(),
-        resize_steps: steps,
-        query_loops: loops,
-        writer_ops: ops_per_writer,
-        cases,
-        acceptance_checks: vec![
-            "all 5 resize-storm scenarios executed".to_owned(),
-            "no deadlocks observed (all threads joined successfully)".to_owned(),
-            "integrity_check passed for every scenario".to_owned(),
-            "query checksum remained stable during resize+queries scenario".to_owned(),
-            "write scenario completed with bounded runtime and non-decreasing checksums".to_owned(),
-        ],
-    };
-
-    let artifact_path = write_suite_artifact(&suite).expect("suite artifact should be written");
-    eprintln!(
-        "INFO bead_id={BEAD_ID} case=suite_artifact path={} run_id={} scenarios={}",
-        artifact_path.display(),
-        run_id,
-        suite.cases.len(),
-    );
+    });
 }

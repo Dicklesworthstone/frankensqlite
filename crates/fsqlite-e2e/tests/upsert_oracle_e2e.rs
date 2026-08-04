@@ -27,8 +27,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -60,11 +60,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -74,7 +74,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -98,102 +98,123 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn upsert_do_nothing() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO t VALUES (1,10),(2,20)",
-            "INSERT INTO t (id,v) VALUES (1,999) ON CONFLICT(id) DO NOTHING", // skipped
-            "INSERT INTO t (id,v) VALUES (3,30) ON CONFLICT(id) DO NOTHING",  // inserted
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,10),(2,20),(3,30)
-        "upsert_do_nothing",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                "INSERT INTO t (id,v) VALUES (1,999) ON CONFLICT(id) DO NOTHING", // skipped
+                "INSERT INTO t (id,v) VALUES (3,30) ON CONFLICT(id) DO NOTHING",  // inserted
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,10),(2,20),(3,30)
+            "upsert_do_nothing",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn upsert_do_update_excluded() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO t VALUES (1,10)",
-            "INSERT INTO t (id,v) VALUES (1,99) ON CONFLICT(id) DO UPDATE SET v = excluded.v", // 1->99
-            "INSERT INTO t (id,v) VALUES (2,5) ON CONFLICT(id) DO UPDATE SET v = excluded.v", // insert
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,99),(2,5)
-        "upsert_do_update_excluded",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO t (id,v) VALUES (1,99) ON CONFLICT(id) DO UPDATE SET v = excluded.v", // 1->99
+                "INSERT INTO t (id,v) VALUES (2,5) ON CONFLICT(id) DO UPDATE SET v = excluded.v", // insert
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,99),(2,5)
+            "upsert_do_update_excluded",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn upsert_combine_existing_and_excluded_counter() {
-    scenario(
-        &[
-            "CREATE TABLE counts (k TEXT PRIMARY KEY, n INTEGER)",
-            "INSERT INTO counts VALUES ('a',1)",
-            // Classic counter idiom: n = existing n + excluded n.
-            "INSERT INTO counts (k,n) VALUES ('a',10) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n",
-            "INSERT INTO counts (k,n) VALUES ('b',5) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n",
-            "INSERT INTO counts (k,n) VALUES ('a',100) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n",
-        ],
-        &["SELECT k, n FROM counts ORDER BY k"], // (a,111),(b,5)
-        "upsert_combine_existing_and_excluded_counter",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE counts (k TEXT PRIMARY KEY, n INTEGER)",
+                "INSERT INTO counts VALUES ('a',1)",
+                // Classic counter idiom: n = existing n + excluded n.
+                "INSERT INTO counts (k,n) VALUES ('a',10) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n",
+                "INSERT INTO counts (k,n) VALUES ('b',5) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n",
+                "INSERT INTO counts (k,n) VALUES ('a',100) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n",
+            ],
+            &["SELECT k, n FROM counts ORDER BY k"], // (a,111),(b,5)
+            "upsert_combine_existing_and_excluded_counter",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn upsert_do_update_conditional_where() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO t VALUES (1,10),(2,20)",
-            // Only update when the new value beats the existing one.
-            "INSERT INTO t (id,v) VALUES (1,5) ON CONFLICT(id) DO UPDATE SET v = excluded.v WHERE excluded.v > t.v",
-            "INSERT INTO t (id,v) VALUES (2,99) ON CONFLICT(id) DO UPDATE SET v = excluded.v WHERE excluded.v > t.v",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,10) unchanged, (2,99) updated
-        "upsert_do_update_conditional_where",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                // Only update when the new value beats the existing one.
+                "INSERT INTO t (id,v) VALUES (1,5) ON CONFLICT(id) DO UPDATE SET v = excluded.v WHERE excluded.v > t.v",
+                "INSERT INTO t (id,v) VALUES (2,99) ON CONFLICT(id) DO UPDATE SET v = excluded.v WHERE excluded.v > t.v",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,10) unchanged, (2,99) updated
+            "upsert_do_update_conditional_where",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn upsert_on_non_pk_unique_target() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, hits INTEGER)",
-            "INSERT INTO t VALUES (1,'a@x',1)",
-            // Conflict on the UNIQUE email column -> bump the existing row's hits.
-            "INSERT INTO t (id,email,hits) VALUES (2,'a@x',1) ON CONFLICT(email) DO UPDATE SET hits = hits + 1",
-        ],
-        &["SELECT id, email, hits FROM t ORDER BY id"], // single row (1,'a@x',2)
-        "upsert_on_non_pk_unique_target",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, hits INTEGER)",
+                "INSERT INTO t VALUES (1,'a@x',1)",
+                // Conflict on the UNIQUE email column -> bump the existing row's hits.
+                "INSERT INTO t (id,email,hits) VALUES (2,'a@x',1) ON CONFLICT(email) DO UPDATE SET hits = hits + 1",
+            ],
+            &["SELECT id, email, hits FROM t ORDER BY id"], // single row (1,'a@x',2)
+            "upsert_on_non_pk_unique_target",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn upsert_bare_on_conflict_do_nothing() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO t VALUES (1,10)",
-            // Targetless DO NOTHING swallows any conflict.
-            "INSERT INTO t (id,v) VALUES (1,99) ON CONFLICT DO NOTHING",
-            "INSERT INTO t (id,v) VALUES (2,20) ON CONFLICT DO NOTHING",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,10),(2,20)
-        "upsert_bare_on_conflict_do_nothing",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,10)",
+                // Targetless DO NOTHING swallows any conflict.
+                "INSERT INTO t (id,v) VALUES (1,99) ON CONFLICT DO NOTHING",
+                "INSERT INTO t (id,v) VALUES (2,20) ON CONFLICT DO NOTHING",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,10),(2,20)
+            "upsert_bare_on_conflict_do_nothing",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn upsert_multi_row_mixed_insert_and_update() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO t VALUES (1,10)",
-            // Row 1 conflicts (updated), rows 2/3 are fresh inserts.
-            "INSERT INTO t (id,v) VALUES (1,1),(2,2),(3,3) ON CONFLICT(id) DO UPDATE SET v = excluded.v",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,1),(2,2),(3,3)
-        "upsert_multi_row_mixed_insert_and_update",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,10)",
+                // Row 1 conflicts (updated), rows 2/3 are fresh inserts.
+                "INSERT INTO t (id,v) VALUES (1,1),(2,2),(3,3) ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,1),(2,2),(3,3)
+            "upsert_multi_row_mixed_insert_and_update",
+        )
+        .await;
+    });
 }

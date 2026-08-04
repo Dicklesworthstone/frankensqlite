@@ -7,15 +7,16 @@
 //! constraints"). This pins that frank accepts the constant/simple forms and
 //! rejects the non-constant DEFAULT and subquery-in-CHECK forms. Only statement
 //! success/failure is compared, on a fresh connection per statement.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 
-fn check_ddl(stmts: &[&str], label: &str) {
+async fn check_ddl(stmts: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for s in stmts {
-        let f = Connection::open(":memory:").expect("open frank");
+        let f = Connection::open(":memory:").await.expect("open frank");
         let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -37,37 +38,46 @@ fn check_ddl(stmts: &[&str], label: &str) {
 
 #[test]
 fn constant_default_and_simple_check_ok() {
-    check_ddl(
-        &[
-            "CREATE TABLE t (a, b DEFAULT (1 + 2))", // constant expression
-            "CREATE TABLE t (a DEFAULT 5)",          // literal
-            "CREATE TABLE t (a DEFAULT NULL)",       // NULL
-            "CREATE TABLE t (a, CHECK (a > 0))",     // simple CHECK
-            "CREATE TABLE t (a, b, CHECK (a < b))",  // CHECK over columns (no subquery)
-        ],
-        "constant_default_and_simple_check_ok",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check_ddl(
+            &[
+                "CREATE TABLE t (a, b DEFAULT (1 + 2))", // constant expression
+                "CREATE TABLE t (a DEFAULT 5)",          // literal
+                "CREATE TABLE t (a DEFAULT NULL)",       // NULL
+                "CREATE TABLE t (a, CHECK (a > 0))",     // simple CHECK
+                "CREATE TABLE t (a, b, CHECK (a < b))",  // CHECK over columns (no subquery)
+            ],
+            "constant_default_and_simple_check_ok",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn non_constant_default_rejected() {
-    check_ddl(
-        &[
-            "CREATE TABLE t (a, b DEFAULT (a))", // references another column
-            "CREATE TABLE t (a, b DEFAULT (a + 1))", // references another column
-            "CREATE TABLE t (a DEFAULT (SELECT 1))", // subquery in DEFAULT
-        ],
-        "non_constant_default_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check_ddl(
+            &[
+                "CREATE TABLE t (a, b DEFAULT (a))", // references another column
+                "CREATE TABLE t (a, b DEFAULT (a + 1))", // references another column
+                "CREATE TABLE t (a DEFAULT (SELECT 1))", // subquery in DEFAULT
+            ],
+            "non_constant_default_rejected",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn subquery_in_check_rejected() {
-    check_ddl(
-        &[
-            "CREATE TABLE t (a, CHECK (a IN (SELECT 1)))", // subquery in CHECK
-            "CREATE TABLE t (a, CHECK ((SELECT 1) = 1))",  // subquery in CHECK
-        ],
-        "subquery_in_check_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check_ddl(
+            &[
+                "CREATE TABLE t (a, CHECK (a IN (SELECT 1)))", // subquery in CHECK
+                "CREATE TABLE t (a, CHECK ((SELECT 1) = 1))",  // subquery in CHECK
+            ],
+            "subquery_in_check_rejected",
+        )
+        .await;
+    });
 }

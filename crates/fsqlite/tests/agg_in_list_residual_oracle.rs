@@ -29,8 +29,9 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -61,19 +62,23 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
-fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
-    conn.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(
-        |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
-    )
+async fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
+        )
 }
 
 /// Set up matching frank + sqlite connections with `ddl`, populate 3000 rows, run the byte-exact
 /// battery over IN-list + residual shapes, and gate that each still seeks (never Rewind full-scans).
-fn check_schema(label: &str, ddl: &[&str]) {
-    let f = Connection::open(":memory:").expect("frank");
+async fn check_schema(label: &str, ddl: &[&str]) {
+    let f = Connection::open(":memory:").await.expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in ddl {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     for i in 1..=3000_i64 {
@@ -85,17 +90,9 @@ fn check_schema(label: &str, ddl: &[&str]) {
             format!("{}", i % 10)
         };
         let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {});", i % 100);
-        f.execute(&stmt).unwrap();
+        f.execute(&stmt).await.unwrap();
         r.execute_batch(&stmt).unwrap();
     }
-
-    let cmp = |sql: &str| {
-        assert_eq!(
-            frank_rows(&f, sql),
-            sqlite_rows(&r, sql),
-            "[{label}] diverged: `{sql}`"
-        );
-    };
 
     // Residual on a NON-indexed column, comparison / BETWEEN / IN / equality / inequality residuals,
     // residuals that reference the composite index's second column (with NULLs), and residuals that
@@ -119,7 +116,11 @@ fn check_schema(label: &str, ddl: &[&str]) {
         "SELECT SUM(x) FROM t WHERE a IN (999, 1000) AND x > 0",
     ];
     for sql in queries {
-        cmp(sql);
+        assert_eq!(
+            frank_rows(&f, sql).await,
+            sqlite_rows(&r, sql),
+            "[{label}] diverged: `{sql}`"
+        );
     }
 
     // Opcode gate: a residual must not defeat the seek — every shape still SeekGE's the index and
@@ -130,11 +131,11 @@ fn check_schema(label: &str, ddl: &[&str]) {
         "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 11) AND b IS NULL",
     ] {
         assert!(
-            has_op(&f, sql, "SeekGE"),
+            has_op(&f, sql, "SeekGE").await,
             "[{label}] IN-list + residual must seek the index: `{sql}`"
         );
         assert!(
-            !has_op(&f, sql, "Rewind"),
+            !has_op(&f, sql, "Rewind").await,
             "[{label}] IN-list + residual must not full-scan (Rewind): `{sql}`"
         );
     }
@@ -142,22 +143,26 @@ fn check_schema(label: &str, ddl: &[&str]) {
 
 #[test]
 fn in_list_residual_seek_matches_sqlite() {
-    // Single-column index: the residual is applied over rows seeked by `idx_a`.
-    check_schema(
-        "single idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
-    // Composite index declared FIRST, shadowing idx_a: residuals on `b` (the second column) and on
-    // the non-indexed `x` must both re-apply correctly after the IN-list seek.
-    check_schema(
-        "idx_ab shadows idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
-            "CREATE INDEX idx_ab ON t(a, b);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Single-column index: the residual is applied over rows seeked by `idx_a`.
+        check_schema(
+            "single idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+        // Composite index declared FIRST, shadowing idx_a: residuals on `b` (the second column) and on
+        // the non-indexed `x` must both re-apply correctly after the IN-list seek.
+        check_schema(
+            "idx_ab shadows idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
+                "CREATE INDEX idx_ab ON t(a, b);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+    });
 }

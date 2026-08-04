@@ -47,6 +47,18 @@ impl VfsFile for DemoFile {
     fn unlock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
         Ok(())
     }
+    fn lock_external_shared_snapshot(&mut self, _cx: &Cx) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+    fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+    fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+    fn restore_external_maintenance_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
         Ok(false)
     }

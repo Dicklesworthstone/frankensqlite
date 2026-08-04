@@ -676,10 +676,80 @@ pub fn set_cell_mvcc_mode(mode: CellMvccMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsqlite_types::{BtreeRef, TxnEpoch, TxnId};
+    use std::sync::{Arc, Barrier};
+
+    use fsqlite_btree::{BtreePageHeader, BtreePageType};
+    use fsqlite_types::{
+        BtreeRef, PageSize, SchemaEpoch, TableId, TxnEpoch, TxnId, serial_type::write_varint,
+    };
+
+    use crate::cell_visibility::CellDeltaKind;
+
+    const TEST_PAGE_SIZE: u32 = 4096;
 
     fn test_txn(id: u64) -> TxnToken {
         TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(0))
+    }
+
+    fn test_snapshot(high: u64) -> Snapshot {
+        Snapshot {
+            high: CommitSeq::new(high),
+            schema_epoch: SchemaEpoch::new(0),
+        }
+    }
+
+    fn empty_leaf_table_page() -> PageData {
+        let mut page = PageData::zeroed(PageSize::new(TEST_PAGE_SIZE).unwrap());
+        let bytes = page.as_bytes_mut();
+        bytes[0] = BtreePageType::LeafTable as u8;
+        bytes[5] = 0x10;
+        bytes[6] = 0x00;
+        page
+    }
+
+    fn leaf_table_cell(rowid: i64, payload: &[u8]) -> Vec<u8> {
+        let mut cell = Vec::with_capacity(payload.len().saturating_add(20));
+        let mut varint = [0u8; 10];
+        let payload_len = u64::try_from(payload.len()).expect("test payload length fits u64");
+        let encoded_len = write_varint(&mut varint, payload_len);
+        cell.extend_from_slice(&varint[..encoded_len]);
+
+        let rowid = u64::try_from(rowid).expect("test rowid is non-negative");
+        let encoded_len = write_varint(&mut varint, rowid);
+        cell.extend_from_slice(&varint[..encoded_len]);
+        cell.extend_from_slice(payload);
+        cell
+    }
+
+    fn test_cell_delta(
+        kind: CellDeltaKind,
+        page_number: PageNumber,
+        btree: BtreeRef,
+        rowid: i64,
+        payload: &[u8],
+        txn: TxnToken,
+        commit_seq: u64,
+    ) -> CellDelta {
+        let cell_data = match &kind {
+            CellDeltaKind::Insert | CellDeltaKind::Update => leaf_table_cell(rowid, payload),
+            CellDeltaKind::Delete => Vec::new(),
+        };
+        CellDelta {
+            cell_key: CellKey::table_row(btree, rowid),
+            commit_seq: CommitSeq::new(commit_seq),
+            created_by: txn,
+            kind,
+            page_number,
+            cell_data,
+            prev_idx: None,
+        }
+    }
+
+    fn next_test_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
     }
 
     fn leaf_table_page(page_no: PageNumber, cell_count: u16, available: u32) -> PageMetadata {
@@ -1144,9 +1214,6 @@ mod tests {
 
     #[test]
     fn test_escalation_preserves_uncommitted_deltas() {
-        use crate::cell_visibility::CellDeltaKind;
-        use fsqlite_types::{PageSize, SchemaEpoch, TableId};
-
         // Create a minimal page (leaf page header + some space)
         let mut base_page = PageData::zeroed(PageSize::new(4096).unwrap());
         // Set leaf table page header: flag byte 0x0D (leaf|table), freeblock=0, cell_count=0
@@ -1209,51 +1276,359 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires B-tree split integration (C-TRANSITION integration)"]
     fn test_escalation_insert_triggers_split() {
-        // This test would verify:
-        // 1. Start cell-level tracking on a nearly-full page
-        // 2. Insert that fills the page
-        // 3. Next insert triggers split detection
-        // 4. System escalates to page-level before split
-        // 5. Split proceeds correctly with materialized page
-        //
-        // Requires full B-tree integration to detect split conditions.
+        let page_number = PageNumber::new(2).unwrap();
+        let txn = test_txn(51);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_log = CellVisibilityLog::new(1024 * 1024);
+        let page_tracking = PageTrackingState::new();
+        let mut tracker = TxnEscalationTracker::new();
+        tracker.add_cell_level(page_number);
+
+        let first_insert = BtreeOp::TableInsert {
+            rowid: 1,
+            payload_size: 50,
+        };
+        let before_fill = leaf_table_page(page_number, 10, 100);
+        let before_ctx = RoutingContext {
+            mode: CellMvccMode::On,
+            cell_log: &cell_log,
+            page_tracking: &page_tracking,
+            current_txn: txn,
+            materialization_threshold: 32,
+        };
+        let first_decision = should_use_cell_path(&before_ctx, &before_fill, &first_insert);
+        assert_eq!(
+            first_decision,
+            RoutingDecision::cell_level(RoutingReason::CellLevelEligible)
+        );
+
+        let pending = test_cell_delta(
+            CellDeltaKind::Insert,
+            page_number,
+            btree,
+            1,
+            &[0xA5; 50],
+            txn,
+            0,
+        );
+        let after_fill = leaf_table_page(page_number, 11, 60);
+        let split_decision = should_use_cell_path(&before_ctx, &after_fill, &first_insert);
+        assert_eq!(
+            split_decision,
+            RoutingDecision::page_level(RoutingReason::StructuralOperation),
+            "the insert that no longer fits must select the page path before splitting"
+        );
+
+        let result = escalate_to_page_level(
+            &empty_leaf_table_page(),
+            page_number,
+            &[],
+            &[pending],
+            &test_snapshot(0),
+            TEST_PAGE_SIZE,
+            &mut tracker,
+        )
+        .expect("pre-split escalation must materialize the pending cell delta");
+        let header = BtreePageHeader::parse(result.materialized_page.as_bytes(), 0)
+            .expect("escalation must produce a valid leaf-table page");
+
+        assert_eq!(result.deltas_applied, 1);
+        assert_eq!(result.discarded_cells, vec![CellKey::table_row(btree, 1)]);
+        assert_eq!(header.page_type, BtreePageType::LeafTable);
+        assert_eq!(header.cell_count, 1);
+        assert!(tracker.is_escalated(page_number));
+        assert!(!tracker.is_cell_level(page_number));
     }
 
     #[test]
-    #[ignore = "requires full SQL execution stack (C-TRANSITION integration)"]
     fn test_cell_path_result_identical_to_page_path() {
-        // This test would verify:
-        // 1. Execute same sequence of operations with cell_mvcc = ON
-        // 2. Execute same sequence of operations with cell_mvcc = OFF
-        // 3. Compare final database bytes - must be identical
-        //
-        // Requires full fsqlite-core Connection to execute SQL.
+        let page_number = PageNumber::new(2).unwrap();
+        let txn = test_txn(52);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let snapshot = test_snapshot(10);
+        let base = empty_leaf_table_page();
+        let deltas = vec![
+            test_cell_delta(
+                CellDeltaKind::Insert,
+                page_number,
+                btree,
+                1,
+                b"alpha",
+                txn,
+                1,
+            ),
+            test_cell_delta(
+                CellDeltaKind::Insert,
+                page_number,
+                btree,
+                2,
+                b"bravo",
+                txn,
+                2,
+            ),
+            test_cell_delta(
+                CellDeltaKind::Insert,
+                page_number,
+                btree,
+                3,
+                b"charlie",
+                txn,
+                3,
+            ),
+            test_cell_delta(
+                CellDeltaKind::Update,
+                page_number,
+                btree,
+                2,
+                b"updated-bravo",
+                txn,
+                4,
+            ),
+            test_cell_delta(CellDeltaKind::Delete, page_number, btree, 1, &[], txn, 5),
+        ];
+
+        let cell_path = materialize_page(
+            &base,
+            page_number,
+            &deltas,
+            &snapshot,
+            TEST_PAGE_SIZE,
+            MaterializationTrigger::Checkpoint,
+        )
+        .expect("batched cell-path materialization must succeed");
+
+        let mut page_path = base;
+        for delta in &deltas {
+            page_path = materialize_page(
+                &page_path,
+                page_number,
+                std::slice::from_ref(delta),
+                &snapshot,
+                TEST_PAGE_SIZE,
+                MaterializationTrigger::Explicit,
+            )
+            .expect("incremental page-path materialization must succeed")
+            .page;
+        }
+
+        assert_eq!(cell_path.cell_count, 2);
+        assert_eq!(
+            cell_path.page, page_path,
+            "batching logical cell deltas must produce the same page bytes as applying each write incrementally"
+        );
     }
 
     #[test]
-    #[ignore = "requires concurrent transaction infrastructure (C-TRANSITION integration)"]
     fn test_mixed_concurrent_txns() {
-        // This test would verify:
-        // 1. txn A uses cell-level on pages 1, 2
-        // 2. txn B uses page-level on pages 3, 4
-        // 3. Both commit successfully
-        // 4. No interference between paths
-        //
-        // Requires transaction manager integration.
+        let cell_log = CellVisibilityLog::new(1024 * 1024);
+        let page_tracking = PageTrackingState::new();
+        let barrier = Arc::new(Barrier::new(2));
+        let txn_cell = test_txn(61);
+        let txn_page = test_txn(62);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_pages = [PageNumber::new(2).unwrap(), PageNumber::new(3).unwrap()];
+        let page_pages = [PageNumber::new(4).unwrap(), PageNumber::new(5).unwrap()];
+
+        let (cell_decisions, page_decisions) = std::thread::scope(|scope| {
+            let cell_barrier = Arc::clone(&barrier);
+            let cell_log_ref = &cell_log;
+            let page_tracking_ref = &page_tracking;
+            let cell_worker = scope.spawn(move || {
+                cell_barrier.wait();
+                let ctx = RoutingContext {
+                    mode: CellMvccMode::On,
+                    cell_log: cell_log_ref,
+                    page_tracking: page_tracking_ref,
+                    current_txn: txn_cell,
+                    materialization_threshold: 32,
+                };
+                let op = BtreeOp::TableInsert {
+                    rowid: 1,
+                    payload_size: 16,
+                };
+                let decisions = cell_pages.map(|page_number| {
+                    let page = leaf_table_page(page_number, 1, 512);
+                    let decision = should_use_cell_path(&ctx, &page, &op);
+                    let key = CellKey::table_row(btree, i64::from(page_number.get()));
+                    cell_log_ref
+                        .record_insert(key, page_number, vec![0xC1; 16], txn_cell)
+                        .expect("cell-path write must fit its budget");
+                    decision
+                });
+                cell_log_ref.commit_txn(txn_cell, CommitSeq::new(10));
+                decisions
+            });
+
+            let page_barrier = Arc::clone(&barrier);
+            let cell_log_ref = &cell_log;
+            let page_tracking_ref = &page_tracking;
+            let page_worker = scope.spawn(move || {
+                for page_number in page_pages {
+                    page_tracking_ref.register_page_level(page_number, txn_page);
+                }
+                page_barrier.wait();
+                let ctx = RoutingContext {
+                    mode: CellMvccMode::On,
+                    cell_log: cell_log_ref,
+                    page_tracking: page_tracking_ref,
+                    current_txn: txn_page,
+                    materialization_threshold: 32,
+                };
+                let decisions = page_pages.map(|page_number| {
+                    let page = leaf_table_page(page_number, 1, 512);
+                    should_use_cell_path(&ctx, &page, &BtreeOp::PageSplit)
+                });
+                page_tracking_ref.unregister_all(txn_page);
+                decisions
+            });
+
+            (
+                cell_worker.join().expect("cell-path worker must finish"),
+                page_worker.join().expect("page-path worker must finish"),
+            )
+        });
+
+        for decision in cell_decisions {
+            assert_eq!(
+                decision,
+                RoutingDecision::cell_level(RoutingReason::CellLevelEligible)
+            );
+        }
+        for decision in page_decisions {
+            assert_eq!(
+                decision,
+                RoutingDecision::page_level(RoutingReason::StructuralOperation)
+            );
+        }
+        for page_number in cell_pages {
+            assert_eq!(cell_log.page_delta_count(page_number), 1);
+            assert_eq!(page_tracking.page_level_txn_count(page_number), 0);
+        }
+        for page_number in page_pages {
+            assert_eq!(cell_log.page_delta_count(page_number), 0);
+            assert_eq!(page_tracking.page_level_txn_count(page_number), 0);
+        }
     }
 
     #[test]
-    #[ignore = "requires threading and contention testing (C-TRANSITION integration)"]
     fn test_escalation_under_contention() {
-        // This test would verify:
-        // 1. 4 threads operating concurrently
-        // 2. One thread triggers escalation on its page
-        // 3. Other threads continue cell-level on other pages
-        // 4. No deadlock, no corruption
-        //
-        // Requires multi-threaded test harness.
+        let cell_log = CellVisibilityLog::new(1024 * 1024);
+        let page_tracking = PageTrackingState::new();
+        let barrier = Arc::new(Barrier::new(4));
+        let btree = BtreeRef::Table(TableId::new(1));
+
+        let outcomes = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker_id in 0u32..4 {
+                let worker_barrier = Arc::clone(&barrier);
+                let cell_log_ref = &cell_log;
+                let page_tracking_ref = &page_tracking;
+                workers.push(scope.spawn(move || {
+                    let page_number = PageNumber::new(20 + worker_id).unwrap();
+                    let txn = test_txn(70 + u64::from(worker_id));
+                    worker_barrier.wait();
+
+                    if worker_id == 0 {
+                        let mut tracker = TxnEscalationTracker::new();
+                        tracker.add_cell_level(page_number);
+                        let ctx = RoutingContext {
+                            mode: CellMvccMode::On,
+                            cell_log: cell_log_ref,
+                            page_tracking: page_tracking_ref,
+                            current_txn: txn,
+                            materialization_threshold: 32,
+                        };
+                        let decision = should_use_cell_path(
+                            &ctx,
+                            &leaf_table_page(page_number, 20, 20),
+                            &BtreeOp::TableInsert {
+                                rowid: 1,
+                                payload_size: 32,
+                            },
+                        );
+                        let delta = test_cell_delta(
+                            CellDeltaKind::Insert,
+                            page_number,
+                            btree,
+                            1,
+                            b"escalated",
+                            txn,
+                            0,
+                        );
+                        let result = escalate_to_page_level(
+                            &empty_leaf_table_page(),
+                            page_number,
+                            &[],
+                            &[delta],
+                            &test_snapshot(0),
+                            TEST_PAGE_SIZE,
+                            &mut tracker,
+                        )
+                        .expect("contended escalation must complete");
+                        let header = BtreePageHeader::parse(result.materialized_page.as_bytes(), 0)
+                            .expect("contended escalation must produce a valid page");
+                        (
+                            decision,
+                            tracker.is_escalated(page_number),
+                            header.cell_count,
+                        )
+                    } else {
+                        let ctx = RoutingContext {
+                            mode: CellMvccMode::On,
+                            cell_log: cell_log_ref,
+                            page_tracking: page_tracking_ref,
+                            current_txn: txn,
+                            materialization_threshold: 32,
+                        };
+                        let decision = should_use_cell_path(
+                            &ctx,
+                            &leaf_table_page(page_number, 1, 512),
+                            &BtreeOp::TableInsert {
+                                rowid: i64::from(worker_id),
+                                payload_size: 16,
+                            },
+                        );
+                        cell_log_ref
+                            .record_insert(
+                                CellKey::table_row(btree, i64::from(worker_id)),
+                                page_number,
+                                vec![u8::try_from(worker_id).unwrap(); 16],
+                                txn,
+                            )
+                            .expect("independent cell-path write must fit its budget");
+                        cell_log_ref.commit_txn(txn, CommitSeq::new(20 + u64::from(worker_id)));
+                        (decision, false, 0)
+                    }
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("contention worker must finish"))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            outcomes[0],
+            (
+                RoutingDecision::page_level(RoutingReason::StructuralOperation),
+                true,
+                1,
+            )
+        );
+        for (worker_index, (decision, escalated, cell_count)) in
+            outcomes.iter().copied().enumerate().skip(1)
+        {
+            assert_eq!(
+                decision,
+                RoutingDecision::cell_level(RoutingReason::CellLevelEligible),
+                "worker {worker_index} must remain on the independent cell path"
+            );
+            assert!(!escalated);
+            assert_eq!(cell_count, 0);
+            let page_number = PageNumber::new(20 + u32::try_from(worker_index).unwrap()).unwrap();
+            assert_eq!(cell_log.page_delta_count(page_number), 1);
+        }
     }
 
     #[test]
@@ -1313,24 +1688,210 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires proptest infrastructure (C-TRANSITION stress)"]
     fn test_random_routing_1000_ops() {
-        // Property-based test:
-        // Given: 1000 random operations with random page sizes/fill levels
-        // Property: All routing decisions are correct per the decision tree
-        //
-        // Requires proptest configuration.
+        let btree = BtreeRef::Table(TableId::new(1));
+        let measure_log = CellVisibilityLog::with_per_txn_budget(1024 * 1024, 1024 * 1024);
+        let measure_txn = test_txn(1000);
+        measure_log
+            .record_insert(
+                CellKey::table_row(btree, 1),
+                PageNumber::new(2).unwrap(),
+                vec![0; 8],
+                measure_txn,
+            )
+            .expect("measurement delta must fit");
+        let one_delta_budget = measure_log.txn_bytes(measure_txn);
+        assert!(one_delta_budget > 0);
+
+        let cell_log = CellVisibilityLog::with_per_txn_budget(64 * 1024 * 1024, one_delta_budget);
+        let page_tracking = PageTrackingState::new();
+        let mut rng_state = 0xC0FF_EE12_3456_7890;
+        let mut reason_counts = [0usize; 8];
+
+        for case in 0usize..1000 {
+            let scenario = case % reason_counts.len();
+            let page_number = PageNumber::new(1000 + u32::try_from(case).unwrap()).unwrap();
+            let txn_base = 10_000 + u64::try_from(case).unwrap() * 10;
+            let current_txn = test_txn(txn_base);
+            let available = 100 + u32::try_from(next_test_random(&mut rng_state) % 900).unwrap();
+            let cell_count = u16::try_from(next_test_random(&mut rng_state) % 64).unwrap();
+            let mut page = leaf_table_page(page_number, cell_count, available);
+            let mode = match scenario {
+                0 => CellMvccMode::Off,
+                1 => CellMvccMode::Auto,
+                _ => CellMvccMode::On,
+            };
+            if scenario == 1 {
+                page.is_table = false;
+            }
+            if scenario == 2 {
+                page.is_leaf = false;
+            }
+            let op = if scenario == 3 {
+                BtreeOp::PageSplit
+            } else {
+                BtreeOp::TableInsert {
+                    rowid: i64::try_from(case).unwrap(),
+                    payload_size: 8,
+                }
+            };
+
+            let other_txn = test_txn(txn_base + 1);
+            if scenario == 4 {
+                page_tracking.register_page_level(page_number, other_txn);
+            }
+
+            let threshold = if scenario == 5 { 2 } else { 32 };
+            if scenario == 5 {
+                for delta_index in 0u64..3 {
+                    let delta_txn = test_txn(txn_base + 2 + delta_index);
+                    cell_log
+                        .record_insert(
+                            CellKey::table_row(
+                                btree,
+                                i64::try_from(case * 10).unwrap()
+                                    + i64::try_from(delta_index).unwrap(),
+                            ),
+                            page_number,
+                            vec![0; 8],
+                            delta_txn,
+                        )
+                        .expect("threshold delta must fit");
+                    cell_log.commit_txn(delta_txn, CommitSeq::new(1 + delta_index));
+                }
+            }
+            if scenario == 6 {
+                cell_log
+                    .record_insert(
+                        CellKey::table_row(btree, i64::try_from(case).unwrap()),
+                        PageNumber::new(3000 + u32::try_from(case).unwrap()).unwrap(),
+                        vec![0; 8],
+                        current_txn,
+                    )
+                    .expect("one current-txn delta must exactly fill its budget");
+                assert_eq!(cell_log.txn_bytes(current_txn), one_delta_budget);
+            }
+
+            let ctx = RoutingContext {
+                mode,
+                cell_log: &cell_log,
+                page_tracking: &page_tracking,
+                current_txn,
+                materialization_threshold: threshold,
+            };
+            let decision = should_use_cell_path(&ctx, &page, &op);
+            let expected_reason = match scenario {
+                0 => RoutingReason::CellMvccDisabled,
+                1 => RoutingReason::IndexPageAutoMode,
+                2 => RoutingReason::InteriorPage,
+                3 => RoutingReason::StructuralOperation,
+                4 => RoutingReason::PageTrackedByOtherTxn,
+                5 => RoutingReason::MaterializationThresholdExceeded,
+                6 => RoutingReason::MemoryBudgetExceeded,
+                7 => RoutingReason::CellLevelEligible,
+                _ => unreachable!("scenario is reduced modulo eight"),
+            };
+            assert_eq!(
+                decision.reason, expected_reason,
+                "routing mismatch in case {case}: available={available}, cell_count={cell_count}"
+            );
+            assert_eq!(decision.use_cell_level, scenario == 7);
+            reason_counts[scenario] += 1;
+
+            if scenario == 4 {
+                page_tracking.unregister_page_level(page_number, other_txn);
+            }
+            if scenario == 5 {
+                assert_eq!(
+                    cell_log.clear_page_deltas(page_number, CommitSeq::new(u64::MAX)),
+                    3
+                );
+            }
+            if scenario == 6 {
+                assert_eq!(cell_log.rollback_txn(current_txn), 1);
+            }
+        }
+
+        assert_eq!(reason_counts, [125; 8]);
     }
 
     #[test]
-    #[ignore = "requires repeated fill/split cycle (C-TRANSITION stress)"]
     fn test_rapid_escalation_cycle() {
-        // Stress test:
-        // 1. Repeatedly fill page with cell deltas to trigger split
-        // 2. Each split triggers escalation
-        // 3. Verify escalation/materialization cycle is stable
-        // 4. No memory leaks, no corruption
-        //
-        // Requires B-tree split/merge integration.
+        let cell_log = CellVisibilityLog::new(1024 * 1024);
+        let page_tracking = PageTrackingState::new();
+        let btree = BtreeRef::Table(TableId::new(1));
+        let base = empty_leaf_table_page();
+        let mut tracker = TxnEscalationTracker::new();
+        let mut expected_page = None;
+
+        for cycle in 0u32..64 {
+            let page_number = PageNumber::new(100 + cycle).unwrap();
+            let txn = test_txn(200 + u64::from(cycle));
+            tracker.add_cell_level(page_number);
+
+            let ctx = RoutingContext {
+                mode: CellMvccMode::On,
+                cell_log: &cell_log,
+                page_tracking: &page_tracking,
+                current_txn: txn,
+                materialization_threshold: 32,
+            };
+            let split_decision = should_use_cell_path(
+                &ctx,
+                &leaf_table_page(page_number, 16, 24),
+                &BtreeOp::TableInsert {
+                    rowid: 17,
+                    payload_size: 64,
+                },
+            );
+            assert_eq!(
+                split_decision,
+                RoutingDecision::page_level(RoutingReason::StructuralOperation)
+            );
+
+            let deltas = (1i64..=16)
+                .map(|rowid| {
+                    test_cell_delta(
+                        CellDeltaKind::Insert,
+                        page_number,
+                        btree,
+                        rowid,
+                        &[0x5A; 64],
+                        txn,
+                        0,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let result = escalate_to_page_level(
+                &base,
+                page_number,
+                &[],
+                &deltas,
+                &test_snapshot(0),
+                TEST_PAGE_SIZE,
+                &mut tracker,
+            )
+            .expect("repeated escalation must materialize without overflow");
+            let header = BtreePageHeader::parse(result.materialized_page.as_bytes(), 0)
+                .expect("repeated escalation must preserve a valid page header");
+
+            assert_eq!(result.deltas_applied, deltas.len());
+            assert_eq!(result.discarded_cells.len(), deltas.len());
+            assert_eq!(header.page_type, BtreePageType::LeafTable);
+            assert_eq!(header.cell_count, 16);
+            assert!(tracker.is_escalated(page_number));
+            if let Some(expected) = &expected_page {
+                assert_eq!(
+                    &result.materialized_page, expected,
+                    "cycle {cycle} produced non-deterministic materialized bytes"
+                );
+            } else {
+                expected_page = Some(result.materialized_page.clone());
+            }
+
+            tracker.clear();
+            assert_eq!(tracker.cell_level_pages().count(), 0);
+            assert_eq!(tracker.escalated_pages().count(), 0);
+        }
     }
 }
