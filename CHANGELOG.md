@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.2.0] -- Unreleased (async storage stack, adaptive skip-scan execution, parallel-WAL durability certificates)
+## [0.2.0] -- 2026-08-04 (async storage stack, adaptive skip-scan execution, parallel-WAL durability certificates)
 
 Next full-workspace lockstep release (`0.1.19 -> 0.2.0`). `v0.1.19` is the
 semantic and crates.io predecessor, but it is not an ancestor of current
