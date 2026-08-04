@@ -4553,83 +4553,84 @@ fn load_release_evidence_manifest_from_path(
         &manifest.tested_commit,
     )?;
     let mut expected_pack = HashMap::new();
-    let mut insert_pack_leaf = |leaf: EvidenceLeaf| -> Result<(), String> {
-        if expected_pack
-            .insert(
-                leaf.path.clone(),
-                (leaf.digest_algorithm.clone(), leaf.digest),
-            )
-            .is_some()
-        {
-            return Err("release evidence pack has duplicate declared leaf paths".to_owned());
-        }
-        Ok(())
-    };
-    for leaf in [
-        manifest.signer_attestation.clone(),
-        manifest.cargo_lock.clone(),
-        manifest.rust_toolchain.clone(),
-        manifest.pre_capture_untracked.clone(),
-        manifest.compiler_inventory_attestation.clone(),
-        manifest.auxiliary_scorecards.c1.scorecard.clone(),
-        manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
-        manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
-        manifest.auxiliary_scorecards.persistent.scorecard.clone(),
-        manifest
-            .auxiliary_scorecards
-            .persistent
-            .pack_manifest
-            .clone(),
-        manifest
-            .auxiliary_scorecards
-            .persistent
-            .commit_provenance
-            .clone(),
-    ] {
-        insert_pack_leaf(leaf)?;
-    }
-    for leaf in run_evidence_pack_leaves(root, &manifest.workspace, "workspace")? {
-        insert_pack_leaf(leaf)?;
-    }
-    for receipt in &manifest.run_receipts {
-        for leaf in run_evidence_pack_leaves(
-            root,
-            &receipt.evidence,
-            &format!("current-run receipt `{}`", receipt.locator()),
-        )? {
+    {
+        let mut insert_pack_leaf = |leaf: EvidenceLeaf| -> Result<(), String> {
+            if expected_pack
+                .insert(
+                    leaf.path.clone(),
+                    (leaf.digest_algorithm.clone(), leaf.digest),
+                )
+                .is_some()
+            {
+                return Err("release evidence pack has duplicate declared leaf paths".to_owned());
+            }
+            Ok(())
+        };
+        for leaf in [
+            manifest.signer_attestation.clone(),
+            manifest.cargo_lock.clone(),
+            manifest.rust_toolchain.clone(),
+            manifest.pre_capture_untracked.clone(),
+            manifest.compiler_inventory_attestation.clone(),
+            manifest.auxiliary_scorecards.c1.scorecard.clone(),
+            manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
+            manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
+            manifest.auxiliary_scorecards.persistent.scorecard.clone(),
+            manifest
+                .auxiliary_scorecards
+                .persistent
+                .pack_manifest
+                .clone(),
+            manifest
+                .auxiliary_scorecards
+                .persistent
+                .commit_provenance
+                .clone(),
+        ] {
             insert_pack_leaf(leaf)?;
         }
-    }
-    for (name, run) in [
-        (
-            "compiler all-target list",
-            &compiler_inventory.inventory_runs.all_targets,
-        ),
-        (
-            "compiler ignored all-target list",
-            &compiler_inventory.inventory_runs.all_targets_ignored,
-        ),
-        (
-            "compiler doctest list",
-            &compiler_inventory.inventory_runs.doctests,
-        ),
-        (
-            "compiler ignored doctest list",
-            &compiler_inventory.inventory_runs.doctests_ignored,
-        ),
-    ] {
-        for leaf in run_evidence_pack_leaves(root, run, name)? {
+        for leaf in run_evidence_pack_leaves(root, &manifest.workspace, "workspace")? {
             insert_pack_leaf(leaf)?;
         }
+        for receipt in &manifest.run_receipts {
+            for leaf in run_evidence_pack_leaves(
+                root,
+                &receipt.evidence,
+                &format!("current-run receipt `{}`", receipt.locator()),
+            )? {
+                insert_pack_leaf(leaf)?;
+            }
+        }
+        for (name, run) in [
+            (
+                "compiler all-target list",
+                &compiler_inventory.inventory_runs.all_targets,
+            ),
+            (
+                "compiler ignored all-target list",
+                &compiler_inventory.inventory_runs.all_targets_ignored,
+            ),
+            (
+                "compiler doctest list",
+                &compiler_inventory.inventory_runs.doctests,
+            ),
+            (
+                "compiler ignored doctest list",
+                &compiler_inventory.inventory_runs.doctests_ignored,
+            ),
+        ] {
+            for leaf in run_evidence_pack_leaves(root, run, name)? {
+                insert_pack_leaf(leaf)?;
+            }
+        }
+        for leaf in &compiler_inventory.inventory_leaves {
+            insert_pack_leaf(EvidenceLeaf {
+                path: leaf.path.clone(),
+                digest_algorithm: leaf.blake3_algorithm.clone(),
+                digest: leaf.blake3.clone(),
+            })?;
+        }
     }
-    for leaf in &compiler_inventory.inventory_leaves {
-        insert_pack_leaf(EvidenceLeaf {
-            path: leaf.path.clone(),
-            digest_algorithm: leaf.blake3_algorithm.clone(),
-            digest: leaf.blake3.clone(),
-        })?;
-    }
-    drop(insert_pack_leaf);
     let actual_pack = manifest
         .evidence_pack
         .iter()
@@ -7338,6 +7339,22 @@ fn test_regression_guard_rch_status_binding_rejects_mixed_or_local_jobs() {
             .is_ok()
     );
 
+    let mut other_worker = active_build.clone();
+    other_worker.id += 1;
+    other_worker.worker_id = "worker-b".to_owned();
+    let active_pool = envelope(vec![active_build.clone(), other_worker], Vec::new());
+    assert!(
+        validate_rch_status_binding(
+            &receipt,
+            &execution,
+            stderr,
+            &active_pool,
+            &completed,
+            "keeper",
+        )
+        .is_ok()
+    );
+
     let mut local = completed_build.clone();
     local.location = "local".to_owned();
     let mut wrong_worker = completed_build.clone();
@@ -7361,7 +7378,9 @@ fn test_regression_guard_rch_status_binding_rejects_mixed_or_local_jobs() {
         );
     }
 
-    let shared_worker = envelope(vec![active_build.clone(), active_build], Vec::new());
+    let mut co_resident = active_build.clone();
+    co_resident.id += 1;
+    let shared_worker = envelope(vec![active_build, co_resident], Vec::new());
     assert!(
         validate_rch_status_binding(
             &receipt,
@@ -8049,7 +8068,7 @@ fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
             &manifest_digest,
         )
         .expect_err("a v1 release manifest must fail closed under the v2 verifier")
-        .contains("missing field `signature_path`")
+        .contains("unable to parse release evidence manifest")
     );
 
     fs::write(root.join(&workspace_path), "tampered\n").expect("tamper transcript");
@@ -8062,7 +8081,7 @@ fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
             &manifest_digest,
         )
         .expect_err("a v1 release manifest must remain rejected after tampering")
-        .contains("missing field `signature_path`")
+        .contains("unable to parse release evidence manifest")
     );
     assert!(git(&["add", &workspace_path]).success());
     assert!(git(&["commit", "-m", "tamper evidence"]).success());
@@ -8076,7 +8095,7 @@ fn test_regression_guard_release_manifest_loader_is_commit_and_content_bound() {
             &manifest_digest,
         )
         .expect_err("a v1 release manifest must remain rejected after commit changes")
-        .contains("missing field `signature_path`")
+        .contains("unable to parse release evidence manifest")
     );
 }
 

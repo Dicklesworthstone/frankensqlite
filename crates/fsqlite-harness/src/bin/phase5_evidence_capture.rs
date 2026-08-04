@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -26,6 +27,7 @@ const EVIDENCE_ROOT: &str = "tests/artifacts/release-evidence";
 const MANIFEST_NAME: &str = "manifest.json";
 const BASELINE: &str = "tests/regression_baseline.json";
 const GUARD_LOCATOR: &str = "crates/fsqlite-harness/tests/phase5_regression_guard.rs::phase5_regression_guard_full_workspace_against_baseline";
+const MAX_CAPTURE_WORKERS: usize = 2;
 const USAGE: &str = "usage: phase5_evidence_capture (--plan | --baseline-only --baseline-output-dir <absolute-external-dir> | --output <tests/artifacts/release-evidence/<commit>/manifest.json> --c1-pack-dir <absolute-external-dir> --persistent-pack-dir <absolute-external-dir>) [--tested-commit <40-hex>]";
 
 #[derive(Debug, Deserialize)]
@@ -293,7 +295,10 @@ fn run() -> Result<(), String> {
     require_pristine_capture_checkout(&root)?;
     let pack_inputs =
         validate_pack_inputs(&root, &tested_commit, &c1_pack_dir, &persistent_pack_dir)?;
-    let worker = required_worker()?;
+    let workers = required_workers()?;
+    let primary_worker = workers
+        .first()
+        .ok_or_else(|| "phase-5 worker pool unexpectedly resolved empty".to_owned())?;
     let namespace_path = root.join(&namespace);
     prepare_evidence_namespace(&namespace_path, &namespace)?;
 
@@ -351,7 +356,7 @@ fn run() -> Result<(), String> {
         &root,
         &namespace,
         "compiler-all-targets",
-        &worker,
+        primary_worker,
         &[
             "cargo",
             "test",
@@ -367,7 +372,7 @@ fn run() -> Result<(), String> {
         &root,
         &namespace,
         "compiler-all-targets-ignored",
-        &worker,
+        primary_worker,
         &[
             "cargo",
             "test",
@@ -384,7 +389,7 @@ fn run() -> Result<(), String> {
         &root,
         &namespace,
         "compiler-doctests",
-        &worker,
+        primary_worker,
         &[
             "cargo",
             "test",
@@ -400,7 +405,7 @@ fn run() -> Result<(), String> {
         &root,
         &namespace,
         "compiler-doctests-ignored",
-        &worker,
+        primary_worker,
         &[
             "cargo",
             "test",
@@ -436,7 +441,7 @@ fn run() -> Result<(), String> {
         &root,
         &namespace,
         "workspace",
-        &worker,
+        primary_worker,
         &[
             "cargo",
             "test",
@@ -446,26 +451,7 @@ fn run() -> Result<(), String> {
             "--test-threads=1",
         ],
     )?;
-    let mut receipts = Vec::new();
-    for entry in &runs {
-        let label = format!("run-{}", blake3::hash(entry.locator().as_bytes()).to_hex());
-        let evidence = capture_run(
-            &root,
-            &root,
-            &namespace,
-            &label,
-            &worker,
-            &exact_argv(entry)?,
-        )?;
-        receipts.push(RunReceipt {
-            source_path: entry.source_path.clone(),
-            test_name: entry.test_name.clone(),
-            requirement_blake3: blake3::hash(entry.evidence.requirement.as_bytes())
-                .to_hex()
-                .to_string(),
-            evidence,
-        });
-    }
+    let receipts = capture_release_runs(&root, &namespace, &runs, &workers)?;
     let signing_path = format!("{namespace}/signing/signer-attestation.json");
     let signature_path = format!("{namespace}/signing/manifest.minisig");
     let provisional = Manifest {
@@ -675,7 +661,7 @@ fn exact_argv(entry: &IgnoredTest) -> Result<Vec<String>, String> {
     argv.extend(["--".into(), "--exact".into()]);
     match entry.cfg_condition.as_deref() {
         None | Some("test") => argv.push("--ignored".into()),
-        Some("debug_assertions") | Some("all(debug_assertions,test)") => {}
+        Some("debug_assertions" | "all(debug_assertions,test)") => {}
         Some(condition) => return Err(format!("unsupported cfg condition `{condition}`")),
     }
     argv.extend(["--nocapture".into(), "--test-threads=1".into()]);
@@ -720,7 +706,12 @@ fn plan_json(tested_commit: &str, runs: &[&IgnoredTest]) -> Result<Value, String
             ["cargo", "test", "--locked", "--workspace", "--doc", "--", "--list", "--ignored"]
         ],
         "runs": runs.iter().map(|entry| exact_argv(entry)).collect::<Result<Vec<_>, _>>()?,
-        "required_environment": ["FSQLITE_PHASE5_RCH_WORKER", "NO_COLOR=1", "RCH_LOG_FORMAT=json"],
+        "required_environment": [
+            "exactly one of FSQLITE_PHASE5_RCH_WORKER or FSQLITE_PHASE5_RCH_WORKERS",
+            "NO_COLOR=1",
+            "RCH_LOG_FORMAT=json"
+        ],
+        "worker_pool": {"maximum": MAX_CAPTURE_WORKERS, "receipt_order": "baseline locator order"},
         "required_capture_inputs": ["--c1-pack-dir <absolute external dir>", "--persistent-pack-dir <absolute external dir>"],
         "signing": "DSR detached signature is intentionally not produced by this runner"
     }))
@@ -730,17 +721,55 @@ fn expected_namespace(commit: &str) -> String {
     format!("{EVIDENCE_ROOT}/{commit}")
 }
 
-fn required_worker() -> Result<String, String> {
-    let worker = env::var("FSQLITE_PHASE5_RCH_WORKER")
-        .map_err(|_| "FSQLITE_PHASE5_RCH_WORKER is required for strict capture".to_owned())?;
-    if worker.is_empty()
-        || !worker
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return Err("FSQLITE_PHASE5_RCH_WORKER must be a canonical worker id".to_owned());
+fn parse_worker_pool(value: &str) -> Result<Vec<String>, String> {
+    let workers = value.split(',').map(str::to_owned).collect::<Vec<_>>();
+    if workers.is_empty() || workers.len() > MAX_CAPTURE_WORKERS {
+        return Err(format!(
+            "worker pool must contain between one and {MAX_CAPTURE_WORKERS} workers"
+        ));
     }
-    Ok(worker)
+    let mut unique = BTreeSet::new();
+    for worker in &workers {
+        if worker.is_empty()
+            || !worker
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("worker pool entries must be canonical worker ids".to_owned());
+        }
+        if !unique.insert(worker.clone()) {
+            return Err("worker pool must not contain duplicate worker ids".to_owned());
+        }
+    }
+    Ok(workers)
+}
+
+fn parse_single_worker(value: &str) -> Result<Vec<String>, String> {
+    let workers = parse_worker_pool(value)?;
+    if workers.len() != 1 {
+        return Err("FSQLITE_PHASE5_RCH_WORKER accepts exactly one worker id".to_owned());
+    }
+    Ok(workers)
+}
+
+fn required_workers() -> Result<Vec<String>, String> {
+    let single = env::var("FSQLITE_PHASE5_RCH_WORKER");
+    let pool = env::var("FSQLITE_PHASE5_RCH_WORKERS");
+    match (single, pool) {
+        (Ok(_), Ok(_)) => Err(
+            "set exactly one of FSQLITE_PHASE5_RCH_WORKER or FSQLITE_PHASE5_RCH_WORKERS"
+                .to_owned(),
+        ),
+        (Ok(worker), Err(env::VarError::NotPresent)) => parse_single_worker(&worker),
+        (Err(env::VarError::NotPresent), Ok(workers)) => parse_worker_pool(&workers),
+        (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => Err(
+            "FSQLITE_PHASE5_RCH_WORKER or FSQLITE_PHASE5_RCH_WORKERS is required for strict capture"
+                .to_owned(),
+        ),
+        (Err(error), _) | (_, Err(error)) => {
+            Err(format!("phase-5 worker environment is not Unicode: {error}"))
+        }
+    }
 }
 
 fn controlled_env(worker: &str) -> BTreeMap<String, String> {
@@ -1276,6 +1305,139 @@ fn strict_cargo(root: &Path, worker: &str, argv: &[String]) -> Result<StrictOutp
         job_id,
         active_status,
         completed_status,
+    })
+}
+
+#[derive(Debug)]
+struct ParallelMapState {
+    next: usize,
+    stopped: bool,
+}
+
+fn parallel_map_ordered<T, R, F>(
+    items: &[T],
+    workers: &[String],
+    operation: F,
+) -> Result<Vec<R>, String>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(usize, &T, &str) -> Result<R, String> + Sync,
+{
+    if workers.is_empty() {
+        return Err("parallel capture requires at least one worker".to_owned());
+    }
+    let state = Mutex::new(ParallelMapState {
+        next: 0,
+        stopped: false,
+    });
+    let results = Mutex::new(
+        (0..items.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Result<R, String>>>>(),
+    );
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers.len());
+        for worker in workers {
+            let operation = &operation;
+            let state = &state;
+            let results = &results;
+            handles.push(scope.spawn(move || -> Result<(), String> {
+                loop {
+                    let index = {
+                        let mut schedule = state.lock().map_err(|_| {
+                            "parallel capture scheduler lock was poisoned".to_owned()
+                        })?;
+                        if schedule.stopped || schedule.next >= items.len() {
+                            return Ok(());
+                        }
+                        let index = schedule.next;
+                        schedule.next += 1;
+                        index
+                    };
+                    let result = operation(index, &items[index], worker);
+                    let failed = result.is_err();
+                    if failed {
+                        state
+                            .lock()
+                            .map_err(|_| "parallel capture scheduler lock was poisoned".to_owned())?
+                            .stopped = true;
+                    }
+                    let mut slots = results
+                        .lock()
+                        .map_err(|_| "parallel capture result lock was poisoned".to_owned())?;
+                    if slots[index].replace(result).is_some() {
+                        return Err(format!(
+                            "parallel capture produced duplicate result index {index}"
+                        ));
+                    }
+                    drop(slots);
+                    if failed {
+                        return Ok(());
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| "parallel capture worker thread panicked".to_owned())??;
+        }
+        Ok::<(), String>(())
+    })?;
+
+    let slots = results
+        .into_inner()
+        .map_err(|_| "parallel capture result lock was poisoned".to_owned())?;
+    if let Some((index, error)) = slots.iter().enumerate().find_map(|(index, result)| {
+        result
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .map(|error| (index, error))
+    }) {
+        return Err(format!("parallel capture item {index} failed: {error}"));
+    }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| match result {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(_)) => Err(format!(
+                "parallel capture item {index} lost its reported failure"
+            )),
+            None => Err(format!(
+                "parallel capture stopped without a result for item {index}"
+            )),
+        })
+        .collect()
+}
+
+fn capture_release_runs(
+    root: &Path,
+    namespace: &str,
+    runs: &[&IgnoredTest],
+    workers: &[String],
+) -> Result<Vec<RunReceipt>, String> {
+    let prepared = runs
+        .iter()
+        .map(|entry| {
+            Ok((
+                *entry,
+                format!("run-{}", blake3::hash(entry.locator().as_bytes()).to_hex()),
+                exact_argv(entry)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    parallel_map_ordered(&prepared, workers, |_, (entry, label, argv), worker| {
+        let evidence = capture_run(root, root, namespace, label, worker, argv)?;
+        Ok(RunReceipt {
+            source_path: entry.source_path.clone(),
+            test_name: entry.test_name.clone(),
+            requirement_blake3: blake3::hash(entry.evidence.requirement.as_bytes())
+                .to_hex()
+                .to_string(),
+            evidence,
+        })
     })
 }
 
@@ -2133,7 +2295,10 @@ fn capture_baseline_only(
     output_directory: &Path,
 ) -> Result<(), String> {
     require_pristine_capture_checkout(root)?;
-    let worker = required_worker()?;
+    let workers = required_workers()?;
+    let worker = workers
+        .first()
+        .ok_or_else(|| "phase-5 worker pool unexpectedly resolved empty".to_owned())?;
     prepare_external_baseline_root(root, output_directory, source_commit)?;
     let namespace = format!("{EVIDENCE_ROOT}/{source_commit}/baseline");
     let workspace = capture_run(
@@ -2141,7 +2306,7 @@ fn capture_baseline_only(
         output_directory,
         &namespace,
         "workspace",
-        &worker,
+        worker,
         &[
             "cargo",
             "test",
@@ -2213,9 +2378,71 @@ fn prepare_external_baseline_root(
 mod tests {
     use super::{
         BUILD_SHAPING_ENV_EXACT, PackKind, adopt_active_job, external_pack_source_names,
-        is_build_shaping_env, strict_rch_command, validate_persistent_citation_receipt,
-        validate_remote_target_mapping,
+        is_build_shaping_env, parallel_map_ordered, parse_single_worker, parse_worker_pool,
+        strict_rch_command, validate_persistent_citation_receipt, validate_remote_target_mapping,
     };
+
+    #[test]
+    fn worker_pool_parser_is_bounded_unique_and_canonical() {
+        assert_eq!(
+            parse_worker_pool("ovh-a,vmi1227854"),
+            Ok(vec!["ovh-a".to_owned(), "vmi1227854".to_owned()])
+        );
+        assert_eq!(parse_worker_pool("ovh-a"), Ok(vec!["ovh-a".to_owned()]));
+        assert_eq!(parse_single_worker("ovh-a"), Ok(vec!["ovh-a".to_owned()]));
+        assert!(parse_single_worker("ovh-a,vmi1227854").is_err());
+        for invalid in [
+            "",
+            "ovh-a,",
+            ",ovh-a",
+            "ovh-a, ovh-b",
+            "ovh-a,ovh-a",
+            "ovh-a,ovh-b,ovh-c",
+            "ovh/a",
+        ] {
+            assert!(parse_worker_pool(invalid).is_err(), "accepted `{invalid}`");
+        }
+    }
+
+    #[test]
+    fn parallel_map_preserves_input_order_across_out_of_order_completion() {
+        let items = [0_u64, 1, 2, 3];
+        let workers = ["worker-a".to_owned(), "worker-b".to_owned()];
+        let output = parallel_map_ordered(&items, &workers, |index, item, _| {
+            if index == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(format!("{index}:{item}"))
+        })
+        .expect("parallel ordered map");
+        assert_eq!(output, ["0:0", "1:1", "2:2", "3:3"]);
+    }
+
+    #[test]
+    fn parallel_map_stops_claiming_after_first_observed_failure() {
+        let items = [0_u8, 1, 2, 3];
+        let workers = ["worker-a".to_owned(), "worker-b".to_owned()];
+        let barrier = std::sync::Barrier::new(2);
+        let claimed = std::sync::Mutex::new(Vec::new());
+        let error = parallel_map_ordered(&items, &workers, |index, _, _| {
+            claimed.lock().expect("claimed indices").push(index);
+            if index < 2 {
+                barrier.wait();
+            }
+            if index == 1 {
+                return Err("synthetic failure".to_owned());
+            }
+            if index == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(index)
+        })
+        .expect_err("failure must abort parallel map");
+        let mut claimed = claimed.into_inner().expect("claimed indices");
+        claimed.sort_unstable();
+        assert_eq!(claimed, [0, 1]);
+        assert!(error.contains("item 1 failed: synthetic failure"));
+    }
 
     #[test]
     fn build_shaping_environment_is_removed_without_hiding_credentials() {
