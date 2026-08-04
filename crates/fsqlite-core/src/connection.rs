@@ -30148,26 +30148,31 @@ impl Connection {
         let was_auto = self.ensure_autocommit_txn().await?;
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
-        let use_statement_savepoint = self.should_use_statement_savepoint(
-            was_auto,
-            preserve_prior_changes_on_constraint_violation,
-        );
+        let use_statement_savepoint = self.should_use_statement_savepoint(was_auto);
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint("insert_select", async || {
-                self.execute_insert_select_materialized_rows(insert, source_rows)
-                    .await
-            })
+            let op_cx = self.op_cx()?;
+            self.with_internal_statement_savepoint_and_cx(
+                &op_cx,
+                "insert_select",
+                preserve_prior_changes_on_constraint_violation,
+                async || {
+                    self.execute_insert_select_materialized_rows(insert, source_rows)
+                        .await
+                },
+            )
             .await
         } else {
             self.execute_insert_select_materialized_rows(insert, source_rows)
                 .await
         };
+        let preserved_constraint_failure_rows = preserve_prior_changes_on_constraint_violation
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_is_constraint_violation(error)
+            )
+            && self.constraint_error_state_can_preserve_rows();
         let commit_autocommit_on_error = was_auto
-            && ((preserve_prior_changes_on_constraint_violation
-                && matches!(
-                    result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
-                ))
+            && (preserved_constraint_failure_rows
                 // RAISE(FAIL) in a BEFORE trigger keeps the rows already inserted
                 // by this statement; commit them instead of rolling back.
                 || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
