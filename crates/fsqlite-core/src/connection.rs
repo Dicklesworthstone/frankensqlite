@@ -23,6 +23,13 @@
     // initialization only, never observable through Hash/Eq.
     clippy::mutable_key_type
 )]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::await_holding_lock,
+        reason = "the process-global test serializer must remain held across awaited test bodies"
+    )
+)]
 
 mod conformal_retry;
 mod pragma_maintenance;
@@ -10290,6 +10297,11 @@ pub struct Connection {
     statement_fk_validation_tables: RefCell<Vec<String>>,
     /// Prevent final-image FK rechecks from recursively queueing themselves.
     statement_fk_validation_rechecking: Cell<bool>,
+    /// SET DEFAULT child rows changed by the active logical statement.
+    ///
+    /// SQLite retains these action-row increments in `total_changes()` even
+    /// when statement-end FK validation rejects and rolls back the statement.
+    statement_fk_set_default_changes: Cell<usize>,
     /// Exact logical rows implicitly deleted by the most recent successful
     /// VDBE REPLACE execution.
     last_replace_victims: RefCell<Vec<ReplaceVictim>>,
@@ -10750,30 +10762,29 @@ impl Drop for TakenLiveVtabRestoreGuard<'_> {
         let origin = taken.origin;
         let mut instance = Some(taken.instance);
         let restored = match origin {
-            LiveVtabRegistryOrigin::Live => self
-                .conn
-                .vtab_instances
-                .try_borrow_mut()
-                .ok()
-                .is_some_and(|mut registry| {
-                    if registry.contains_key(&self.table_key) {
-                        false
-                    } else {
-                        registry.insert(
-                            self.table_key.clone(),
-                            instance
-                                .take()
-                                .expect("cancellation restore owns live-vtab instance"),
-                        );
-                        true
-                    }
-                }),
+            LiveVtabRegistryOrigin::Live => {
+                self.conn
+                    .vtab_instances
+                    .try_borrow_mut()
+                    .is_ok_and(|mut registry| {
+                        if registry.contains_key(&self.table_key) {
+                            false
+                        } else {
+                            registry.insert(
+                                self.table_key.clone(),
+                                instance
+                                    .take()
+                                    .expect("cancellation restore owns live-vtab instance"),
+                            );
+                            true
+                        }
+                    })
+            }
             LiveVtabRegistryOrigin::Dropped => self
                 .conn
                 .dropped_vtab_instances
                 .try_borrow_mut()
-                .ok()
-                .is_some_and(|mut registry| {
+                .is_ok_and(|mut registry| {
                     if registry.contains_key(&self.table_key) {
                         false
                     } else {
@@ -11064,8 +11075,10 @@ impl Drop for StatementFkValidationDepthGuard<'_> {
 struct StatementFkValidationSuffixGuard<'a> {
     tables: &'a RefCell<Vec<String>>,
     deferred: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
+    set_default_changes: &'a Cell<usize>,
     table_start: usize,
     deferred_start: usize,
+    previous_set_default_changes: usize,
     armed: bool,
 }
 
@@ -11073,14 +11086,18 @@ impl<'a> StatementFkValidationSuffixGuard<'a> {
     fn new(
         tables: &'a RefCell<Vec<String>>,
         deferred: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
+        set_default_changes: &'a Cell<usize>,
     ) -> Self {
         let table_start = tables.borrow().len();
         let deferred_start = deferred.borrow().len();
+        let previous_set_default_changes = set_default_changes.replace(0);
         Self {
             tables,
             deferred,
+            set_default_changes,
             table_start,
             deferred_start,
+            previous_set_default_changes,
             armed: true,
         }
     }
@@ -11096,6 +11113,8 @@ impl<'a> StatementFkValidationSuffixGuard<'a> {
 
 impl Drop for StatementFkValidationSuffixGuard<'_> {
     fn drop(&mut self) {
+        self.set_default_changes
+            .set(self.previous_set_default_changes);
         if self.armed {
             self.tables.borrow_mut().truncate(self.table_start);
             self.deferred.borrow_mut().truncate(self.deferred_start);
@@ -11678,6 +11697,7 @@ impl Connection {
             statement_fk_validation_depth: Cell::new(0),
             statement_fk_validation_tables: RefCell::new(Vec::new()),
             statement_fk_validation_rechecking: Cell::new(false),
+            statement_fk_set_default_changes: Cell::new(0),
             last_replace_victims: RefCell::new(Vec::new()),
             fk_parent_validation_cache: RefCell::new(None),
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
@@ -12132,6 +12152,7 @@ impl Connection {
             statement_fk_validation_depth: Cell::new(0),
             statement_fk_validation_tables: RefCell::new(Vec::new()),
             statement_fk_validation_rechecking: Cell::new(false),
+            statement_fk_set_default_changes: Cell::new(0),
             last_replace_victims: RefCell::new(Vec::new()),
             fk_parent_validation_cache: RefCell::new(None),
             // MVCC conflict observability (bd-t6sv2.1)
@@ -15180,7 +15201,48 @@ impl Connection {
         *self.last_table_program_error_state.borrow_mut() = Some(TableProgramErrorState {
             changes,
             last_insert_rowid,
+            rollback_visible_total_changes: 0,
+            force_statement_rollback: false,
         });
+    }
+
+    fn record_fk_validation_error_state(
+        &self,
+        changes: usize,
+        last_insert_rowid: Option<i64>,
+        rollback_visible_total_changes: usize,
+    ) {
+        *self.last_table_program_error_state.borrow_mut() = Some(TableProgramErrorState {
+            changes,
+            last_insert_rowid,
+            rollback_visible_total_changes,
+            force_statement_rollback: true,
+        });
+    }
+
+    fn retain_rollback_visible_total_changes(&self, changes: usize) {
+        if changes == 0 {
+            return;
+        }
+        let mut error_state = self.last_table_program_error_state.borrow_mut();
+        if let Some(state) = error_state.as_mut() {
+            state.rollback_visible_total_changes =
+                state.rollback_visible_total_changes.saturating_add(changes);
+        } else {
+            *error_state = Some(TableProgramErrorState {
+                changes: self.last_changes.get(),
+                last_insert_rowid: None,
+                rollback_visible_total_changes: changes,
+                force_statement_rollback: false,
+            });
+        }
+    }
+
+    fn constraint_error_state_can_preserve_rows(&self) -> bool {
+        self.last_table_program_error_state
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| !state.force_statement_rollback)
     }
 
     fn take_table_program_error_state(&self) -> Option<TableProgramErrorState> {
@@ -15193,21 +15255,38 @@ impl Connection {
         error: &FrankenError,
         previous_total_changes: usize,
         previous_last_insert_rowid: i64,
-    ) {
+    ) -> bool {
         let error_state = self.take_table_program_error_state();
         if preserve_prior_changes_on_constraint_violation && error_is_constraint_violation(error) {
-            if let Some(state) = error_state {
+            if let Some(state) = error_state
+                .as_ref()
+                .copied()
+                .filter(|state| !state.force_statement_rollback)
+            {
                 self.restore_change_tracking_state(
                     state.changes,
-                    previous_total_changes.saturating_add(state.changes),
+                    previous_total_changes
+                        .saturating_add(state.changes)
+                        .saturating_add(state.rollback_visible_total_changes),
                     state
                         .last_insert_rowid
                         .unwrap_or(previous_last_insert_rowid),
                 );
-                return;
+                return true;
             }
         }
-        self.restore_change_tracking_state(0, previous_total_changes, previous_last_insert_rowid);
+        let rollback_visible_total_changes = error_state
+            .as_ref()
+            .map_or(0, |state| state.rollback_visible_total_changes);
+        let failed_last_insert_rowid = error_state
+            .and_then(|state| state.last_insert_rowid)
+            .unwrap_or(previous_last_insert_rowid);
+        self.restore_change_tracking_state(
+            0,
+            previous_total_changes.saturating_add(rollback_visible_total_changes),
+            failed_last_insert_rowid,
+        );
+        false
     }
 
     fn record_last_insert_rowid(&self, rowid: i64) {
@@ -22302,26 +22381,35 @@ impl Connection {
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         self.txn_metrics_note_write();
         let use_statement_savepoint = !skip_statement_savepoint_in_explicit_txn
-            && self.should_use_statement_savepoint(
-                was_auto,
-                preserve_prior_changes_on_constraint_violation,
-            );
+            && self.should_use_statement_savepoint(was_auto);
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(
                 execution_cx,
                 statement_kind,
-                execute_body,
+                preserve_prior_changes_on_constraint_violation,
+                async || {
+                    self.with_statement_fk_validation_scope(
+                        preserve_prior_changes_on_constraint_violation,
+                        execute_body,
+                    )
+                    .await
+                },
             )
             .await
         } else {
-            execute_body().await
+            self.with_statement_fk_validation_scope(
+                preserve_prior_changes_on_constraint_violation,
+                execute_body,
+            )
+            .await
         };
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+        let mut preserved_constraint_failure_rows = false;
         let result = match result {
             Ok(affected) => Ok(affected),
             Err(error) => {
-                self.restore_failed_statement_tracking(
+                preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
                     preserve_prior_changes_on_constraint_violation,
                     &error,
                     previous_total_changes,
@@ -22340,12 +22428,7 @@ impl Connection {
                 }
             }
         };
-        let commit_autocommit_on_error = was_auto
-            && preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+        let commit_autocommit_on_error = was_auto && preserved_constraint_failure_rows;
         let execution_ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start =
             (direct_insert_autocommit_candidate && was_auto).then(Instant::now);
@@ -26793,7 +26876,7 @@ impl Connection {
         F: std::ops::AsyncFnOnce() -> Result<T>,
     {
         let cx = self.op_cx()?;
-        self.with_internal_statement_savepoint_and_cx(&cx, purpose, body)
+        self.with_internal_statement_savepoint_and_cx(&cx, purpose, false, body)
             .await
     }
 
@@ -26801,6 +26884,7 @@ impl Connection {
         &self,
         cx: &Cx,
         purpose: &str,
+        preserve_constraint_failure_rows: bool,
         body: F,
     ) -> Result<T>
     where
@@ -26919,10 +27003,15 @@ impl Connection {
                 Ok(value)
             }
             Err(statement_error) => {
-                // RAISE(FAIL): the statement fails but its already-applied rows
-                // are KEPT. Release the savepoint exactly as on success (instead
-                // of rolling back to it), then propagate the error.
-                if matches!(statement_error, FrankenError::RaiseFail(_)) {
+                // FAIL keeps already-applied rows. Release the savepoint exactly
+                // as on success unless final-image FK validation upgraded the
+                // failure to SQLite's statement-rollback FK semantics.
+                let preserve_constraint_failure = preserve_constraint_failure_rows
+                    && error_is_constraint_violation(&statement_error)
+                    && self.constraint_error_state_can_preserve_rows();
+                if matches!(statement_error, FrankenError::RaiseFail(_))
+                    || preserve_constraint_failure
+                {
                     let pager_release_result = {
                         let mut active_txn = self.active_txn.borrow_mut();
                         active_txn
@@ -26934,7 +27023,7 @@ impl Connection {
                             .rollback_after_savepoint_boundary_failure(
                                 cx,
                                 &format!(
-                                    "RAISE(FAIL) statement pager release failed after {purpose}"
+                                    "FAIL-preserving statement pager release failed after {purpose}"
                                 ),
                                 error,
                             )
@@ -26945,7 +27034,7 @@ impl Connection {
                             .rollback_after_savepoint_boundary_failure(
                                 cx,
                                 &format!(
-                                    "RAISE(FAIL) virtual-table release failed after {purpose}"
+                                    "FAIL-preserving virtual-table release failed after {purpose}"
                                 ),
                                 error,
                             )
@@ -27489,14 +27578,9 @@ impl Connection {
         true
     }
 
-    fn should_use_statement_savepoint(
-        &self,
-        was_auto: bool,
-        preserve_prior_changes_on_constraint_violation: bool,
-    ) -> bool {
+    fn should_use_statement_savepoint(&self, was_auto: bool) -> bool {
         self.active_txn_is_open_or_borrowed()
             && self.internal_statement_savepoint_depth.get() == 0
-            && !preserve_prior_changes_on_constraint_violation
             && (!was_auto || self.retained_autocommit_batch_active())
     }
 
@@ -27843,40 +27927,43 @@ impl Connection {
                     }
                 }
             }
-            let use_statement_savepoint = self.should_use_statement_savepoint(
-                was_auto,
-                statement_preserves_prior_changes_on_constraint(statement.as_ref()),
-            ) && matches!(
-                statement.as_ref(),
-                Statement::Insert(_)
-                    | Statement::Update(_)
-                    | Statement::Delete(_)
-                    | Statement::CreateVirtualTable(_)
-                    | Statement::Drop(_)
-                    | Statement::CreateIndex(_)
-                    | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
-                        action: AlterTableAction::DropColumn(_),
-                        ..
-                    })
-                    | Statement::Reindex(_)
-            );
+            let use_statement_savepoint = self.should_use_statement_savepoint(was_auto)
+                && matches!(
+                    statement.as_ref(),
+                    Statement::Insert(_)
+                        | Statement::Update(_)
+                        | Statement::Delete(_)
+                        | Statement::CreateVirtualTable(_)
+                        | Statement::Drop(_)
+                        | Statement::CreateIndex(_)
+                        | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
+                            action: AlterTableAction::DropColumn(_),
+                            ..
+                        })
+                        | Statement::Reindex(_)
+                );
             let rollback_on_constraint_violation =
                 statement_rolls_back_transaction_on_constraint(statement.as_ref());
             let execute_body_start = hot_path_profile_enabled().then(Instant::now);
             let result = if use_statement_savepoint {
-                self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, async || {
-                    self.execute_statement_dispatch_impl(
-                        &op_cx,
-                        statement.as_ref(),
-                        params,
-                        precompiled,
-                        derived_storage_log_select.as_ref(),
-                    )
-                    .await
-                })
+                self.with_internal_statement_savepoint_and_cx(
+                    &op_cx,
+                    statement_kind,
+                    statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                    async || {
+                        self.execute_statement_dispatch_with_fk_scope(
+                            &op_cx,
+                            statement.as_ref(),
+                            params,
+                            precompiled,
+                            derived_storage_log_select.as_ref(),
+                        )
+                        .await
+                    },
+                )
                 .await
             } else {
-                self.execute_statement_dispatch_impl(
+                self.execute_statement_dispatch_with_fk_scope(
                     &op_cx,
                     statement.as_ref(),
                     params,
@@ -27886,6 +27973,7 @@ impl Connection {
                 .await
             };
             record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+            let mut preserved_constraint_failure_rows = false;
             let result = match result {
                 Ok(rows) => Ok(rows),
                 Err(error) => {
@@ -27893,7 +27981,7 @@ impl Connection {
                         statement.as_ref(),
                         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
                     ) {
-                        self.restore_failed_statement_tracking(
+                        preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
                             statement_preserves_prior_changes_on_constraint(statement.as_ref()),
                             &error,
                             previous_total_changes,
@@ -27914,11 +28002,7 @@ impl Connection {
                 }
             };
             let commit_autocommit_on_error = was_auto
-                && ((statement_preserves_prior_changes_on_constraint(statement.as_ref())
-                && matches!(
-                    result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
-                ))
+                && (preserved_constraint_failure_rows
                 // RAISE(FAIL) keeps the statement's already-applied rows, so an
                 // autocommit statement must commit them rather than roll back.
                 || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
@@ -28017,8 +28101,50 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let op_cx = self.op_cx()?;
-        self.execute_statement_dispatch_impl(&op_cx, statement, params, None, None)
+        self.execute_statement_dispatch_with_fk_scope(&op_cx, statement, params, None, None)
             .await
+    }
+
+    /// Establish one final-image FK validation scope around every ordinary DML
+    /// statement. Nested trigger, cascade, and row-replay dispatches join this
+    /// scope so transient intermediate images are not rejected before the
+    /// statement has finished applying all of its rows and FK actions.
+    async fn execute_statement_dispatch_with_fk_scope(
+        &self,
+        cx: &Cx,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+        precompiled: Option<&VdbeProgram>,
+        derived_storage_log_select: Option<&SelectStatement>,
+    ) -> Result<Vec<Row>> {
+        if matches!(
+            statement,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            let preserve_constraint_failure_rows =
+                statement_preserves_prior_changes_on_constraint(statement);
+            return self
+                .with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+                    self.execute_statement_dispatch_impl(
+                        cx,
+                        statement,
+                        params,
+                        precompiled,
+                        derived_storage_log_select,
+                    )
+                    .await
+                })
+                .await;
+        }
+
+        self.execute_statement_dispatch_impl(
+            cx,
+            statement,
+            params,
+            precompiled,
+            derived_storage_log_select,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -30028,26 +30154,31 @@ impl Connection {
         let was_auto = self.ensure_autocommit_txn().await?;
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
-        let use_statement_savepoint = self.should_use_statement_savepoint(
-            was_auto,
-            preserve_prior_changes_on_constraint_violation,
-        );
+        let use_statement_savepoint = self.should_use_statement_savepoint(was_auto);
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint("insert_select", async || {
-                self.execute_insert_select_materialized_rows(insert, source_rows)
-                    .await
-            })
+            let op_cx = self.op_cx()?;
+            self.with_internal_statement_savepoint_and_cx(
+                &op_cx,
+                "insert_select",
+                preserve_prior_changes_on_constraint_violation,
+                async || {
+                    self.execute_insert_select_materialized_rows(insert, source_rows)
+                        .await
+                },
+            )
             .await
         } else {
             self.execute_insert_select_materialized_rows(insert, source_rows)
                 .await
         };
+        let preserved_constraint_failure_rows = preserve_prior_changes_on_constraint_violation
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_is_constraint_violation(error)
+            )
+            && self.constraint_error_state_can_preserve_rows();
         let commit_autocommit_on_error = was_auto
-            && ((preserve_prior_changes_on_constraint_violation
-                && matches!(
-                    result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
-                ))
+            && (preserved_constraint_failure_rows
                 // RAISE(FAIL) in a BEFORE trigger keeps the rows already inserted
                 // by this statement; commit them instead of rolling back.
                 || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
@@ -31077,11 +31208,11 @@ impl Connection {
                         break None;
                     };
                     current_row.truncate(frame.len_before_join);
-                    let candidate_count = frame
-                        .matching_right_rows
-                        .is_empty()
-                        .then_some(usize::from(frame.emit_left_null))
-                        .unwrap_or_else(|| frame.matching_right_rows.len());
+                    let candidate_count = if frame.matching_right_rows.is_empty() {
+                        usize::from(frame.emit_left_null)
+                    } else {
+                        frame.matching_right_rows.len()
+                    };
                     if frame.next_candidate < candidate_count {
                         let right_row_index =
                             frame.matching_right_rows.get(frame.next_candidate).copied();
@@ -32024,6 +32155,11 @@ impl Connection {
         }
 
         let table_name = insert.table.name.as_str();
+        if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+            && self.table_is_foreign_key_parent(table_name)
+        {
+            return false;
+        }
         if self.has_live_vtab_instance(table_name) {
             return false;
         }
@@ -32756,7 +32892,8 @@ impl Connection {
         if self.insert_targets_live_fts5_command_column(insert) {
             return Ok(true);
         }
-        Ok(fts5_maintenance_insert_command(insert).is_some()
+        Ok(self.targets_shadowed_main(&insert.table)
+            || fts5_maintenance_insert_command(insert).is_some()
             || self.attached_target_schema(&insert.table)?.is_some())
     }
 
@@ -32765,7 +32902,8 @@ impl Connection {
         update: &fsqlite_ast::UpdateStatement,
     ) -> Result<bool> {
         let registry = self.attached_schemas.borrow();
-        Ok(determine_attached_update_schema(update, &registry)?.is_some())
+        Ok(self.targets_shadowed_main(&update.table.name)
+            || determine_attached_update_schema(update, &registry)?.is_some())
     }
 
     fn prepared_delete_requires_deferred_dispatch(
@@ -32773,7 +32911,8 @@ impl Connection {
         delete: &fsqlite_ast::DeleteStatement,
     ) -> Result<bool> {
         let registry = self.attached_schemas.borrow();
-        Ok(determine_attached_delete_schema(delete, &registry)?.is_some())
+        Ok(self.targets_shadowed_main(&delete.table.name)
+            || determine_attached_delete_schema(delete, &registry)?.is_some())
     }
 
     fn prepared_update_supports_precompiled_program(update: &fsqlite_ast::UpdateStatement) -> bool {
@@ -44656,95 +44795,194 @@ impl Connection {
     }
 
     async fn delete_sqlite_sequence_entry(&self, table_name: &str) -> Result<()> {
-        self.with_pager_write_txn(async |cx, txn| {
+        let deleted_rows = self.with_pager_write_txn(async |cx, txn| {
             let Some(root_page) = self.sqlite_sequence_root_page() else {
-                return Ok(());
+                return Ok(None);
             };
             let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
-                return Ok(());
+                return Ok(None);
             };
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-            if !cursor.first(cx).await? {
-                return Ok(());
-            }
-            loop {
-                let rowid = cursor.rowid(cx).await?;
-                let payload = cursor.payload(cx).await?;
-                let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            let matching_rowids = {
+                let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+                let mut matching_rowids = Vec::new();
+                if cursor.first(cx).await? {
+                    loop {
+                        let rowid = cursor.rowid(cx).await?;
+                        let payload = cursor.payload(cx).await?;
+                        let values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_sequence row {rowid} payload is not a valid SQLite record"
+                                ),
+                            }
+                        })?;
+                        if let Some(SqliteValue::Text(existing_name)) = values.first()
+                            && existing_name.eq_ignore_ascii_case(table_name)
+                        {
+                            matching_rowids.push(rowid);
+                        }
+                        if !cursor.next(cx).await? {
+                            break;
+                        }
+                    }
+                }
+                matching_rowids
+            };
+            for &rowid in &matching_rowids {
+                let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+                if !cursor.table_move_to(cx, rowid).await?.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
-                            "sqlite_sequence row {rowid} payload is not a valid SQLite record"
+                            "sqlite_sequence row {rowid} vanished while dropping `{table_name}`"
                         ),
-                    })?;
-                if let Some(SqliteValue::Text(existing_name)) = values.first()
-                    && existing_name.eq_ignore_ascii_case(table_name)
-                {
-                    tracing::trace!(table = table_name, "sqlite_sequence delete entry");
-                    return cursor.delete(cx).await;
+                    });
                 }
-                if !cursor.next(cx).await? {
-                    break;
-                }
+                cursor.delete(cx).await?;
             }
-            Ok(())
+            tracing::trace!(table = table_name, rows = matching_rowids.len(), "sqlite_sequence delete entries");
+            Ok(Some((root_page, matching_rowids)))
         })
-        .await
+        .await?;
+
+        self.sqlite_sequence_cache
+            .borrow_mut()
+            .remove(&table_name.to_ascii_lowercase());
+        if let Some((root_page, storage_rowids)) = deleted_rows {
+            let mirror_rowids = self
+                .db
+                .borrow()
+                .get_table(root_page)
+                .map(|table| {
+                    table
+                        .iter_rows()
+                        .filter_map(|(rowid, values)| {
+                            values.first().and_then(|value| match value {
+                                SqliteValue::Text(existing_name)
+                                    if existing_name.eq_ignore_ascii_case(table_name) =>
+                                {
+                                    Some(rowid)
+                                }
+                                _ => None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut db = self.db.borrow_mut();
+            for rowid in storage_rowids.into_iter().chain(mirror_rowids) {
+                db.delete_rowid(root_page, rowid);
+            }
+        }
+        Ok(())
     }
 
     async fn rename_sqlite_sequence_entry(&self, old_name: &str, new_name: &str) -> Result<()> {
         let old_key = old_name.to_ascii_lowercase();
         let new_key = new_name.to_ascii_lowercase();
-        let seq = {
-            let mut cache = self.sqlite_sequence_cache.borrow_mut();
-            let Some(seq) = cache.remove(&old_key) else {
-                return Ok(());
-            };
-            cache.insert(new_key.clone(), seq);
-            seq
-        };
-
-        self.with_pager_write_txn(async |cx, txn| {
-            self.upsert_sqlite_sequence_in_txn(cx, txn, new_name, seq)
-                .await?;
+        let renamed_rows = self.with_pager_write_txn(async |cx, txn| {
             let Some(root_page) = self.sqlite_sequence_root_page() else {
-                return Ok(());
+                return Ok(None);
             };
             let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
-                return Ok(());
+                return Ok(None);
             };
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-            if !cursor.first(cx).await? {
-                return Ok(());
-            }
-            loop {
-                let rowid = cursor.rowid(cx).await?;
-                let payload = cursor.payload(cx).await?;
-                let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "sqlite_sequence row {rowid} payload is not a valid SQLite record"
-                        ),
-                    })?;
-                if let Some(SqliteValue::Text(existing_name)) = values.first()
-                    && existing_name.eq_ignore_ascii_case(old_name)
-                {
-                    if cursor.table_move_to(cx, rowid).await?.is_found() {
-                        cursor.delete(cx).await?;
+            let matching_rows = {
+                let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+                let mut matching_rows = Vec::new();
+                if cursor.first(cx).await? {
+                    loop {
+                        let rowid = cursor.rowid(cx).await?;
+                        let payload = cursor.payload(cx).await?;
+                        let values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_sequence row {rowid} payload is not a valid SQLite record"
+                                ),
+                            }
+                        })?;
+                        if let Some(SqliteValue::Text(existing_name)) = values.first()
+                            && existing_name.eq_ignore_ascii_case(old_name)
+                        {
+                            let seq = values.get(1).cloned().ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "sqlite_sequence row {rowid} is missing its seq value"
+                                    ),
+                                }
+                            })?;
+                            matching_rows.push((rowid, seq));
+                        }
+                        if !cursor.next(cx).await? {
+                            break;
+                        }
                     }
-                    tracing::trace!(
-                        old = old_name,
-                        new = new_name,
-                        "sqlite_sequence rename entry"
-                    );
-                    break;
                 }
-                if !cursor.next(cx).await? {
-                    break;
+                matching_rows
+            };
+            for (rowid, seq) in &matching_rows {
+                let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+                if !cursor.table_move_to(cx, *rowid).await?.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_sequence row {rowid} vanished while renaming `{old_name}`"
+                        ),
+                    });
                 }
+                cursor.delete(cx).await?;
+                let record = serialize_record(&[
+                    SqliteValue::Text(new_name.into()),
+                    seq.clone(),
+                ]);
+                cursor.table_insert(cx, *rowid, &record).await?;
             }
-            Ok(())
+            tracing::trace!(old = old_name, new = new_name, rows = matching_rows.len(), "sqlite_sequence rename entries");
+            Ok(Some((root_page, matching_rows)))
         })
-        .await
+        .await?;
+
+        let mut cache = self.sqlite_sequence_cache.borrow_mut();
+        cache.remove(&old_key);
+        drop(cache);
+        if let Some((root_page, rows)) = renamed_rows {
+            let mirror_rowids = self
+                .db
+                .borrow()
+                .get_table(root_page)
+                .map(|table| {
+                    table
+                        .iter_rows()
+                        .filter_map(|(rowid, values)| {
+                            values.first().and_then(|value| match value {
+                                SqliteValue::Text(existing_name)
+                                    if existing_name.eq_ignore_ascii_case(old_name) =>
+                                {
+                                    Some(rowid)
+                                }
+                                _ => None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut db = self.db.borrow_mut();
+            for rowid in mirror_rowids {
+                db.delete_rowid(root_page, rowid);
+            }
+            for (rowid, seq) in &rows {
+                db.upsert_row(
+                    root_page,
+                    *rowid,
+                    vec![SqliteValue::Text(new_name.into()), seq.clone()],
+                );
+            }
+            drop(db);
+            if let Some((_, seq)) = rows.last() {
+                self.sqlite_sequence_cache
+                    .borrow_mut()
+                    .insert(new_key, seq.to_integer());
+            }
+        }
+        Ok(())
     }
 
     async fn try_fast_path_autoincrement_sequence_after_insert(
@@ -46116,6 +46354,11 @@ impl Connection {
                             .map(|index| schema.remove(index))
                     });
                 if let Some(table) = table {
+                    // `schema_index_of` is used by the catalog helpers below.
+                    // Rebuild immediately after removing the table so shifted
+                    // vector positions cannot redirect a lookup to another
+                    // table's root page during this DROP statement.
+                    self.rebuild_schema_indices();
                     // Free all B-tree pages for the table and its indexes back
                     // to the pager freelist BEFORE removing in-memory state.
                     // Virtual tables may have materialized root pages in the
@@ -46147,7 +46390,6 @@ impl Connection {
                     }
                     let dropped_key = name_key;
                     self.autoincrement_tables.borrow_mut().remove(&dropped_key);
-                    self.sqlite_sequence_cache.borrow_mut().remove(&dropped_key);
                     if obj_name.eq_ignore_ascii_case("sqlite_sequence") {
                         self.sqlite_sequence_cache.borrow_mut().clear();
                     } else {
@@ -47396,12 +47638,6 @@ impl Connection {
                 self.autoincrement_tables
                     .borrow_mut()
                     .insert(new_key.clone());
-                let removed_seq = self.sqlite_sequence_cache.borrow_mut().remove(&old_key);
-                if let Some(seq) = removed_seq {
-                    self.sqlite_sequence_cache
-                        .borrow_mut()
-                        .insert(new_key.clone(), seq);
-                }
                 self.rename_sqlite_sequence_entry(&old_name, new_name)
                     .await?;
             }
@@ -47513,10 +47749,8 @@ impl Connection {
         let mut updates = Vec::new();
         let mut views = self.views.borrow_mut();
         for view in views.iter_mut() {
-            if rename_table_refs_in_select(&mut view.query, old_name, new_name) {
-                if !view.temporary {
-                    updates.push((view.name.clone(), render_create_view_sql(view)));
-                }
+            if rename_table_refs_in_select(&mut view.query, old_name, new_name) && !view.temporary {
+                updates.push((view.name.clone(), render_create_view_sql(view)));
             }
         }
         updates
@@ -49364,6 +49598,7 @@ impl Connection {
             StatementFkValidationSuffixGuard::new(
                 &self.statement_fk_validation_tables,
                 &self.deferred_fk_checks,
+                &self.statement_fk_set_default_changes,
             )
         });
         let depth_guard =
@@ -49373,6 +49608,10 @@ impl Connection {
 
         if !outermost {
             return result;
+        }
+
+        if result.is_err() {
+            self.retain_rollback_visible_total_changes(self.statement_fk_set_default_changes.get());
         }
 
         let validate_retained_rows = match result.as_ref() {
@@ -49396,17 +49635,37 @@ impl Connection {
             .split_off(table_start);
         child_tables.sort_by_key(|table| table.to_ascii_lowercase());
         child_tables.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        let retained_changes = self.last_changes.get();
+        let retained_total_changes = self.total_changes.get();
+        let retained_last_insert_rowid = self.current_last_insert_rowid();
 
         let _rechecking_guard =
             BoolCellRestoreGuard::new(&self.statement_fk_validation_rechecking, true);
-        for child_table in &child_tables {
-            let sql = format!("SELECT * FROM {}", quote_identifier(child_table));
-            let rows = self.query(&sql).await?;
-            for row in rows {
-                self.check_fk_parent_exists(child_table, row.values())
-                    .await?;
+        let validation_result = async {
+            for child_table in &child_tables {
+                let sql = format!("SELECT * FROM {}", quote_identifier(child_table));
+                let rows = self.query(&sql).await?;
+                for row in rows {
+                    self.check_fk_parent_exists(child_table, row.values())
+                        .await?;
+                }
             }
+            Ok(())
         }
+        .await;
+        if let Err(error) = validation_result {
+            self.record_fk_validation_error_state(
+                retained_changes,
+                (retained_changes > 0).then_some(retained_last_insert_rowid),
+                self.statement_fk_set_default_changes.get(),
+            );
+            return Err(error);
+        }
+        self.restore_change_tracking_state(
+            retained_changes,
+            retained_total_changes,
+            retained_last_insert_rowid,
+        );
 
         if let Some(suffix_guard) = suffix_guard.as_mut() {
             suffix_guard.discharge();
@@ -49422,6 +49681,26 @@ impl Connection {
                 .borrow_mut()
                 .push(table_name.to_owned());
         }
+    }
+
+    /// Queue final-image validation after SET DEFAULT writes values while
+    /// ordinary child-side enforcement is suppressed by `fk_cascade_depth`.
+    fn queue_set_default_fk_validation(&self, table_name: &str, changed_rows: usize) -> Result<()> {
+        if self.statement_fk_validation_depth.get() == 0
+            || self.statement_fk_validation_rechecking.get()
+        {
+            return Err(FrankenError::internal(
+                "SET DEFAULT FK validation requires a logical statement scope",
+            ));
+        }
+
+        self.statement_fk_set_default_changes.set(
+            self.statement_fk_set_default_changes
+                .get()
+                .saturating_add(changed_rows),
+        );
+        self.queue_statement_fk_validation_table(table_name);
+        Ok(())
     }
 
     /// Enforce parent-existence checks for rows inserted by an INSERT statement.
@@ -50093,7 +50372,8 @@ impl Connection {
                     let _cascade = self.enter_fk_cascade()?;
                     self.execute_with_params(&sql, parent_values).await
                 };
-                result?;
+                let changed_rows = result?;
+                self.queue_set_default_fk_validation(child_table, changed_rows)?;
                 Ok(())
             }
         }
@@ -50343,7 +50623,8 @@ impl Connection {
                     let _cascade = self.enter_fk_cascade()?;
                     self.execute_with_params(&sql, old_parent_values).await
                 };
-                result?;
+                let changed_rows = result?;
+                self.queue_set_default_fk_validation(child_table, changed_rows)?;
                 Ok(())
             }
         }
@@ -51139,7 +51420,7 @@ impl Connection {
             let view_defs: Vec<ViewDef> = self.views.borrow().clone();
             let mut materialized = MaterializedTablesCleanupGuard::new(self);
             let metadata_schema = self.schema.borrow().clone();
-            let mut metadata_resolver = CteResultMetadataResolver::new(self, &metadata_schema);
+            let metadata_resolver = CteResultMetadataResolver::new(self, &metadata_schema);
 
             let mut executable_select = select.clone();
             let referenced = self.rewrite_materialized_view_sources(&mut executable_select);
@@ -58652,6 +58933,47 @@ impl Connection {
         }
     }
 
+    /// Whether an explicitly `main.`-qualified DML target is currently parked
+    /// behind a same-named TEMP table in the connection's visible schema.
+    fn targets_shadowed_main(&self, target: &fsqlite_ast::QualifiedName) -> bool {
+        target
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
+            && self
+                .shadowed_main_tables
+                .borrow()
+                .contains_key(&target.name.to_ascii_lowercase())
+    }
+
+    /// Replace only an explicitly `main.`-qualified DML target in a disposable
+    /// schema snapshot. Unqualified and `temp.` targets retain normal TEMP
+    /// shadowing semantics.
+    fn apply_shadowed_main_target_substitution(
+        &self,
+        schema: &mut [TableSchema],
+        target: &fsqlite_ast::QualifiedName,
+    ) {
+        if !target
+            .schema
+            .as_deref()
+            .is_some_and(|scope| scope.eq_ignore_ascii_case("main"))
+        {
+            return;
+        }
+        let target_name_lc = target.name.to_ascii_lowercase();
+        let shadowed = self.shadowed_main_tables.borrow();
+        let Some(main_table) = shadowed.get(&target_name_lc) else {
+            return;
+        };
+        if let Some(slot) = schema
+            .iter_mut()
+            .find(|table| table.name.eq_ignore_ascii_case(&target.name))
+        {
+            *slot = main_table.clone();
+        }
+    }
+
     /// Return every schema root owned by connection-local TEMP tables.
     ///
     /// TEMP objects use the ordinary schema metadata shape, but their storage
@@ -60978,7 +61300,7 @@ impl Connection {
                     continue;
                 }
                 self.eval_fromless_window_expr(
-                    &effective,
+                    effective,
                     &resolved_order_named_windows,
                     group_has_input_for_windows,
                 )
@@ -66681,8 +67003,8 @@ impl Connection {
         let registry_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
         let mut collations = vec![None; result_width];
         if needs_collation_aware_dedup {
-            for index in 0..result_width {
-                collations[index] = resolve_compound_column_collation_candidate(
+            for (index, collation) in collations.iter_mut().enumerate() {
+                *collation = resolve_compound_column_collation_candidate(
                     &candidate_rows,
                     index,
                     &registry_snap,
@@ -71116,27 +71438,36 @@ impl Connection {
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
         let insert = self.resolve_insert_values_subqueries(insert).await?;
-        {
-            let schema = self.schema.borrow();
-            let table_schema = schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
-                .ok_or_else(|| {
-                    FrankenError::Internal(format!("no such table: {}", insert.table.name))
-                })?;
+        let targets_shadowed_main = self.targets_shadowed_main(&insert.table);
+        let rowid_alias_col_idx = {
+            let visible_schema = self.schema.borrow();
+            let shadowed_schema = self.shadowed_main_tables.borrow();
+            let table_schema = if targets_shadowed_main {
+                shadowed_schema.get(&insert.table.name.to_ascii_lowercase())
+            } else {
+                visible_schema
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
+            }
+            .ok_or_else(|| {
+                FrankenError::Internal(format!("no such table: {}", insert.table.name))
+            })?;
             Self::validate_insert_target_columns(
                 table_schema,
                 &insert.table.name,
                 &insert.columns,
             )?;
             self.validate_table_index_runtime_dependencies(table_schema)?;
-        }
+            if targets_shadowed_main {
+                table_schema.columns.iter().position(|column| column.is_ipk)
+            } else {
+                self.rowid_alias_columns
+                    .borrow()
+                    .get(&insert.table.name.to_ascii_lowercase())
+                    .copied()
+            }
+        };
         let mut builder = ProgramBuilder::new();
-        let rowid_alias_col_idx = self
-            .rowid_alias_columns
-            .borrow()
-            .get(&insert.table.name.to_ascii_lowercase())
-            .copied();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
@@ -71144,12 +71475,13 @@ impl Connection {
         };
         let temp_roots = self.temp_storage_roots();
         self.with_codegen_function_context(|| {
-            if temp_roots.is_empty() {
+            if temp_roots.is_empty() && !targets_shadowed_main {
                 let schema = self.schema.borrow();
                 codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
                     .map_err(codegen_error_to_franken)
             } else {
                 let mut schema = self.schema.borrow().clone();
+                self.apply_shadowed_main_target_substitution(&mut schema, &insert.table);
                 Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
                 codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
                     .map_err(codegen_error_to_franken)
@@ -71221,22 +71553,31 @@ impl Connection {
 
     /// Compile an UPDATE through the VDBE codegen.
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
-        {
-            let schema = self.schema.borrow();
-            let table = schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&update.table.name.name))
-                .ok_or_else(|| FrankenError::NoSuchTable {
-                    name: update.table.name.name.clone(),
-                })?;
+        let targets_shadowed_main = self.targets_shadowed_main(&update.table.name);
+        let rowid_alias_col_idx = {
+            let visible_schema = self.schema.borrow();
+            let shadowed_schema = self.shadowed_main_tables.borrow();
+            let table = if targets_shadowed_main {
+                shadowed_schema.get(&update.table.name.name.to_ascii_lowercase())
+            } else {
+                visible_schema
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case(&update.table.name.name))
+            }
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: update.table.name.name.clone(),
+            })?;
             self.validate_table_index_runtime_dependencies(table)?;
-        }
+            if targets_shadowed_main {
+                table.columns.iter().position(|column| column.is_ipk)
+            } else {
+                self.rowid_alias_columns
+                    .borrow()
+                    .get(&update.table.name.name.to_ascii_lowercase())
+                    .copied()
+            }
+        };
         let mut builder = ProgramBuilder::new();
-        let rowid_alias_col_idx = self
-            .rowid_alias_columns
-            .borrow()
-            .get(&update.table.name.name.to_ascii_lowercase())
-            .copied();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
@@ -71244,12 +71585,13 @@ impl Connection {
         };
         let temp_roots = self.temp_storage_roots();
         self.with_codegen_function_context(|| {
-            if temp_roots.is_empty() {
+            if temp_roots.is_empty() && !targets_shadowed_main {
                 let schema = self.schema.borrow();
                 codegen_update(&mut builder, update, &schema, &ctx)
                     .map_err(codegen_error_to_franken)
             } else {
                 let mut schema = self.schema.borrow().clone();
+                self.apply_shadowed_main_target_substitution(&mut schema, &update.table.name);
                 Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
                 codegen_update(&mut builder, update, &schema, &ctx)
                     .map_err(codegen_error_to_franken)
@@ -71261,14 +71603,20 @@ impl Connection {
 
     /// Compile a DELETE through the VDBE codegen.
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
+        let targets_shadowed_main = self.targets_shadowed_main(&delete.table.name);
         {
-            let schema = self.schema.borrow();
-            let table = schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&delete.table.name.name))
-                .ok_or_else(|| FrankenError::NoSuchTable {
-                    name: delete.table.name.name.clone(),
-                })?;
+            let visible_schema = self.schema.borrow();
+            let shadowed_schema = self.shadowed_main_tables.borrow();
+            let table = if targets_shadowed_main {
+                shadowed_schema.get(&delete.table.name.name.to_ascii_lowercase())
+            } else {
+                visible_schema
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case(&delete.table.name.name))
+            }
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: delete.table.name.name.clone(),
+            })?;
             self.validate_table_index_runtime_dependencies(table)?;
         }
         let mut builder = ProgramBuilder::new();
@@ -71279,12 +71627,13 @@ impl Connection {
         };
         let temp_roots = self.temp_storage_roots();
         self.with_codegen_function_context(|| {
-            if temp_roots.is_empty() {
+            if temp_roots.is_empty() && !targets_shadowed_main {
                 let schema = self.schema.borrow();
                 codegen_delete(&mut builder, delete, &schema, &ctx)
                     .map_err(codegen_error_to_franken)
             } else {
                 let mut schema = self.schema.borrow().clone();
+                self.apply_shadowed_main_target_substitution(&mut schema, &delete.table.name);
                 Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
                 codegen_delete(&mut builder, delete, &schema, &ctx)
                     .map_err(codegen_error_to_franken)
@@ -74642,7 +74991,7 @@ fn collect_from_clause_collation_lookup(
         {
             if using_cols
                 .iter()
-                .any(|using_col| using_col.eq_ignore_ascii_case(&right_name))
+                .any(|using_col| using_col.eq_ignore_ascii_case(right_name))
             {
                 lookup.using_skip_indices.insert(right_idx);
                 if let Some(left_position) = left_meta
@@ -75069,7 +75418,7 @@ impl<'a> CteResultMetadataResolver<'a> {
         metadata
     }
 
-    fn resolve_view(&mut self, view_index: usize) -> MaterializedCteResultMetadata {
+    fn resolve_view(&self, view_index: usize) -> MaterializedCteResultMetadata {
         if let Some(metadata) = self.view_cache.borrow().get(&view_index) {
             return metadata.clone();
         }
@@ -75191,7 +75540,7 @@ impl<'a> CteResultMetadataResolver<'a> {
                         .and_then(|index| rows.get(index))
                         .map_or_else(Vec::new, |row| {
                             row.iter()
-                                .map(|expr| self.resolve_expr_collation(expr, None, None))
+                                .map(|expr| Self::resolve_expr_collation(expr, None, None))
                                 .collect()
                         });
                 let affinity_terms = donor_index
@@ -75242,7 +75591,7 @@ impl<'a> CteResultMetadataResolver<'a> {
                     .collect(),
                 collations: rows.first().map_or_else(Vec::new, |row| {
                     row.iter()
-                        .map(|expr| self.resolve_expr_collation(expr, None, outer_lookup))
+                        .map(|expr| Self::resolve_expr_collation(expr, None, outer_lookup))
                         .collect()
                 }),
                 affinity_rows: rows
@@ -75270,7 +75619,7 @@ impl<'a> CteResultMetadataResolver<'a> {
                         Expr::Column(column, _) => column.column.to_string(),
                         _ => format!("_c{result_index}"),
                     }));
-                    collations.push(self.resolve_expr_collation(
+                    collations.push(Self::resolve_expr_collation(
                         expr,
                         from_lookup.as_ref(),
                         outer_lookup,
@@ -75637,7 +75986,6 @@ impl<'a> CteResultMetadataResolver<'a> {
     }
 
     fn resolve_expr_collation(
-        &mut self,
         expr: &'a Expr,
         from_lookup: Option<&CteFromMetadataLookup>,
         outer_lookup: Option<&CteFromMetadataLookup>,
@@ -75663,10 +76011,10 @@ impl<'a> CteResultMetadataResolver<'a> {
                 op: UnaryOp::Plus,
                 expr,
                 ..
-            } => self.resolve_expr_collation(expr, from_lookup, outer_lookup),
+            } => Self::resolve_expr_collation(expr, from_lookup, outer_lookup),
             Expr::RowValue(values, _) => {
                 values.first().map_or(CollationCandidate::Absent, |value| {
-                    self.resolve_expr_collation(value, from_lookup, outer_lookup)
+                    Self::resolve_expr_collation(value, from_lookup, outer_lookup)
                 })
             }
             // A projected COLLATE inside a direct scalar subquery does not
@@ -75987,7 +76335,7 @@ fn collect_from_clause_affinity_lookup(
         {
             if using_cols
                 .iter()
-                .any(|using_col| using_col.eq_ignore_ascii_case(&right_name))
+                .any(|using_col| using_col.eq_ignore_ascii_case(right_name))
             {
                 lookup.using_skip_indices.insert(right_idx);
                 if let Some(left_position) = left_meta
@@ -83759,7 +84107,7 @@ fn scalar_in_operand_supported_by_complex_vdbe(
     let table_label = alias.as_deref().unwrap_or(&name.name);
     let output_is_local = match columns.as_slice() {
         [ResultColumn::Expr { expr, .. }] => {
-            !scalar_expr_has_invalid_local_binding(expr, table, table_label, &HashSet::new())
+            !scalar_expr_has_invalid_local_binding(expr, table, table_label)
         }
         [ResultColumn::Star] => table.columns.len() == 1,
         [ResultColumn::TableStar(qualifier)] => {
@@ -83768,9 +84116,9 @@ fn scalar_in_operand_supported_by_complex_vdbe(
         _ => false,
     };
     output_is_local
-        && where_clause.as_deref().is_none_or(|expr| {
-            !scalar_expr_has_invalid_local_binding(expr, table, table_label, &HashSet::new())
-        })
+        && where_clause
+            .as_deref()
+            .is_none_or(|expr| !scalar_expr_has_invalid_local_binding(expr, table, table_label))
 }
 
 fn select_has_in_subquery_operand_requiring_semantic_fallback(
@@ -84267,7 +84615,7 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
                 return false;
             };
             let table_label = alias.as_deref().unwrap_or(&name.name);
-            if scalar_expr_has_invalid_local_binding(expr, table, table_label, &HashSet::new()) {
+            if scalar_expr_has_invalid_local_binding(expr, table, table_label) {
                 return false;
             }
             if where_clause.as_deref().is_some_and(|where_expr| {
@@ -84276,14 +84624,8 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
             }) {
                 return false;
             }
-            let output_aliases = collect_select_core_result_aliases(&sub.body.select);
             !where_clause.as_deref().is_some_and(|where_expr| {
-                scalar_expr_has_invalid_local_binding(
-                    where_expr,
-                    table,
-                    table_label,
-                    &output_aliases,
-                )
+                scalar_expr_has_invalid_local_binding(where_expr, table, table_label)
             })
         }
         SelectCore::Values(_) => false,
@@ -84302,7 +84644,6 @@ fn scalar_expr_has_invalid_local_binding(
     expr: &Expr,
     table: &TableSchema,
     table_label: &str,
-    output_aliases: &HashSet<String>,
 ) -> bool {
     match expr {
         Expr::Column(column, _) => {
@@ -84319,24 +84660,24 @@ fn scalar_expr_has_invalid_local_binding(
             // can distinguish those cases from `no such column`.
         }
         Expr::BinaryOp { left, right, .. } => {
-            scalar_expr_has_invalid_local_binding(left, table, table_label, output_aliases)
-                || scalar_expr_has_invalid_local_binding(right, table, table_label, output_aliases)
+            scalar_expr_has_invalid_local_binding(left, table, table_label)
+                || scalar_expr_has_invalid_local_binding(right, table, table_label)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label, output_aliases)
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label, output_aliases)
-                || scalar_expr_has_invalid_local_binding(low, table, table_label, output_aliases)
-                || scalar_expr_has_invalid_local_binding(high, table, table_label, output_aliases)
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
+                || scalar_expr_has_invalid_local_binding(low, table, table_label)
+                || scalar_expr_has_invalid_local_binding(high, table, table_label)
         }
         Expr::In { expr, set, .. } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label, output_aliases)
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
                 || matches!(
                     set,
                     InSet::List(values)
@@ -84344,7 +84685,6 @@ fn scalar_expr_has_invalid_local_binding(
                             value,
                             table,
                             table_label,
-                            output_aliases,
                         ))
                 )
         }
@@ -84354,20 +84694,10 @@ fn scalar_expr_has_invalid_local_binding(
             escape,
             ..
         } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label, output_aliases)
-                || scalar_expr_has_invalid_local_binding(
-                    pattern,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
+                || scalar_expr_has_invalid_local_binding(pattern, table, table_label)
                 || escape.as_deref().is_some_and(|escape| {
-                    scalar_expr_has_invalid_local_binding(
-                        escape,
-                        table,
-                        table_label,
-                        output_aliases,
-                    )
+                    scalar_expr_has_invalid_local_binding(escape, table, table_label)
                 })
         }
         Expr::Case {
@@ -84377,17 +84707,12 @@ fn scalar_expr_has_invalid_local_binding(
             ..
         } => {
             operand.as_deref().is_some_and(|operand| {
-                scalar_expr_has_invalid_local_binding(operand, table, table_label, output_aliases)
+                scalar_expr_has_invalid_local_binding(operand, table, table_label)
             }) || whens.iter().any(|(when_expr, then_expr)| {
-                scalar_expr_has_invalid_local_binding(when_expr, table, table_label, output_aliases)
-                    || scalar_expr_has_invalid_local_binding(
-                        then_expr,
-                        table,
-                        table_label,
-                        output_aliases,
-                    )
+                scalar_expr_has_invalid_local_binding(when_expr, table, table_label)
+                    || scalar_expr_has_invalid_local_binding(then_expr, table, table_label)
             }) || else_expr.as_deref().is_some_and(|else_expr| {
-                scalar_expr_has_invalid_local_binding(else_expr, table, table_label, output_aliases)
+                scalar_expr_has_invalid_local_binding(else_expr, table, table_label)
             })
         }
         Expr::FunctionCall {
@@ -84403,22 +84728,17 @@ fn scalar_expr_has_invalid_local_binding(
                         arg,
                         table,
                         table_label,
-                        output_aliases,
                     ))
-            ) || order_by.iter().any(|term| {
-                scalar_expr_has_invalid_local_binding(
-                    &term.expr,
-                    table,
-                    table_label,
-                    output_aliases,
-                )
-            }) || filter.as_deref().is_some_and(|filter| {
-                scalar_expr_has_invalid_local_binding(filter, table, table_label, output_aliases)
-            })
+            ) || order_by
+                .iter()
+                .any(|term| scalar_expr_has_invalid_local_binding(&term.expr, table, table_label))
+                || filter.as_deref().is_some_and(|filter| {
+                    scalar_expr_has_invalid_local_binding(filter, table, table_label)
+                })
         }
         Expr::JsonAccess { expr, path, .. } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label, output_aliases)
-                || scalar_expr_has_invalid_local_binding(path, table, table_label, output_aliases)
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
+                || scalar_expr_has_invalid_local_binding(path, table, table_label)
         }
         Expr::RowValue(_, _) | Expr::Raise { .. } => true,
         Expr::BoundOuterValue { .. }
@@ -102090,6 +102410,8 @@ struct ConcurrentPageIoContext {
 struct TableProgramErrorState {
     changes: usize,
     last_insert_rowid: Option<i64>,
+    rollback_visible_total_changes: usize,
+    force_statement_rollback: bool,
 }
 
 #[derive(Debug)]
@@ -102855,7 +103177,7 @@ fn validate_used_window_key_collations(
         validate_window_key_expr_collations(connection, expr, registry)?;
     }
     if let Some(frame) = &window.frame {
-        validate_window_frame_collation_consumers(connection, frame, registry)?;
+        validate_window_frame_collation_consumers(frame, registry)?;
     }
     Ok(())
 }
@@ -105168,8 +105490,8 @@ fn sqlite_ordinal(position: usize) -> String {
 
 fn nested_order_column_error(error: FrankenError) -> FrankenError {
     match error {
-        FrankenError::Internal(detail) => detail.strip_prefix("column not found: ").map_or(
-            FrankenError::Internal(detail.clone()),
+        FrankenError::Internal(detail) => detail.strip_prefix("column not found: ").map_or_else(
+            || FrankenError::Internal(detail.clone()),
             |name| FrankenError::NoSuchColumn {
                 name: name.to_owned(),
             },
@@ -107534,7 +107856,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             })
     }
 
-    fn validate_referenced_view(&mut self, name: &QualifiedName) -> Result<()> {
+    fn validate_referenced_view(&self, name: &QualifiedName) -> Result<()> {
         match name.schema.as_deref() {
             None => {
                 if self.validate_local_referenced_relation(
@@ -107594,7 +107916,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
     }
 
     fn validate_local_referenced_relation(
-        &mut self,
+        &self,
         relation_name: &str,
         requested_scope: PragmaSchemaScope,
     ) -> Result<bool> {
@@ -108249,7 +108571,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             )));
         }
         if !cte.columns.is_empty() {
-            names = cte.columns.clone();
+            names.clone_from(&cte.columns);
             metadata.approximate_names = vec![false; names.len()];
             metadata.generated_suffix_upper_bounds = vec![None; names.len()];
             metadata.width_is_exact = true;
@@ -110030,18 +110352,16 @@ fn validate_select_core_collation_boundaries(
                         )?;
                     }
                 }
-            } else {
-                if *distinct == Distinctness::Distinct {
-                    for column in columns.iter().rev() {
-                        if let ResultColumn::Expr { expr, .. } = column {
-                            validate_expr_collation_winner(expr, registry)?;
-                            validate_used_window_collation_boundaries(
-                                connection,
-                                expr,
-                                &named_windows,
-                                registry,
-                            )?;
-                        }
+            } else if *distinct == Distinctness::Distinct {
+                for column in columns.iter().rev() {
+                    if let ResultColumn::Expr { expr, .. } = column {
+                        validate_expr_collation_winner(expr, registry)?;
+                        validate_used_window_collation_boundaries(
+                            connection,
+                            expr,
+                            &named_windows,
+                            registry,
+                        )?;
                     }
                 }
             }
@@ -110487,13 +110807,12 @@ fn validate_used_window_collation_boundaries(
 }
 
 fn validate_window_frame_collation_consumers(
-    connection: &Connection,
     frame: &FrameSpec,
     registry: &CollationRegistry,
 ) -> Result<()> {
     let validate_bound = |bound: &FrameBound| match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-            validate_window_frame_expr_collation_consumers(connection, expr, registry)
+            validate_window_frame_expr_collation_consumers(expr, registry)
         }
         FrameBound::UnboundedPreceding
         | FrameBound::CurrentRow
@@ -110512,7 +110831,6 @@ fn validate_window_frame_collation_consumers(
 /// resolved here; direct comparison/list operators in the offset remain live.
 #[allow(clippy::too_many_lines)]
 fn validate_window_frame_expr_collation_consumers(
-    connection: &Connection,
     expr: &Expr,
     registry: &CollationRegistry,
 ) -> Result<()> {
@@ -110538,24 +110856,24 @@ fn validate_window_frame_expr_collation_consumers(
             if binary_op_consumes_collation(*op) {
                 validate_window_frame_binary_comparison_collation(left, right, registry)?;
             }
-            validate_window_frame_expr_collation_consumers(connection, left, registry)?;
-            validate_window_frame_expr_collation_consumers(connection, right, registry)?;
+            validate_window_frame_expr_collation_consumers(left, registry)?;
+            validate_window_frame_expr_collation_consumers(right, registry)?;
             Ok(())
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. } => {
-            validate_window_frame_expr_collation_consumers(connection, expr, registry)
+            validate_window_frame_expr_collation_consumers(expr, registry)
         }
         Expr::Between {
             expr, low, high, ..
         } => {
             validate_window_frame_binary_comparison_collation(expr, low, registry)?;
-            validate_window_frame_expr_collation_consumers(connection, expr, registry)?;
-            validate_window_frame_expr_collation_consumers(connection, low, registry)?;
+            validate_window_frame_expr_collation_consumers(expr, registry)?;
+            validate_window_frame_expr_collation_consumers(low, registry)?;
             validate_window_frame_binary_comparison_collation(expr, high, registry)?;
-            validate_window_frame_expr_collation_consumers(connection, high, registry)?;
+            validate_window_frame_expr_collation_consumers(high, registry)?;
             Ok(())
         }
         Expr::In { expr, set, .. } => {
@@ -110571,9 +110889,9 @@ fn validate_window_frame_expr_collation_consumers(
                 } else {
                     validate_window_frame_in_list_membership_collations(expr, values, registry)?;
                 }
-                validate_window_frame_expr_collation_consumers(connection, expr, registry)?;
+                validate_window_frame_expr_collation_consumers(expr, registry)?;
                 for value in values {
-                    validate_window_frame_expr_collation_consumers(connection, value, registry)?;
+                    validate_window_frame_expr_collation_consumers(value, registry)?;
                 }
             }
             Ok(())
@@ -110584,10 +110902,10 @@ fn validate_window_frame_expr_collation_consumers(
             escape,
             ..
         } => {
-            validate_window_frame_expr_collation_consumers(connection, pattern, registry)?;
-            validate_window_frame_expr_collation_consumers(connection, expr, registry)?;
+            validate_window_frame_expr_collation_consumers(pattern, registry)?;
+            validate_window_frame_expr_collation_consumers(expr, registry)?;
             if let Some(escape) = escape {
-                validate_window_frame_expr_collation_consumers(connection, escape, registry)?;
+                validate_window_frame_expr_collation_consumers(escape, registry)?;
             }
             Ok(())
         }
@@ -110598,32 +110916,28 @@ fn validate_window_frame_expr_collation_consumers(
             ..
         } => {
             if let Some(operand) = operand {
-                validate_window_frame_expr_collation_consumers(connection, operand, registry)?;
+                validate_window_frame_expr_collation_consumers(operand, registry)?;
                 for (condition, value) in whens {
-                    validate_window_frame_expr_collation_consumers(
-                        connection, condition, registry,
-                    )?;
+                    validate_window_frame_expr_collation_consumers(condition, registry)?;
                     validate_window_frame_binary_comparison_collation(
                         operand, condition, registry,
                     )?;
-                    validate_window_frame_expr_collation_consumers(connection, value, registry)?;
+                    validate_window_frame_expr_collation_consumers(value, registry)?;
                 }
             } else {
                 for (condition, value) in whens {
-                    validate_window_frame_expr_collation_consumers(
-                        connection, condition, registry,
-                    )?;
-                    validate_window_frame_expr_collation_consumers(connection, value, registry)?;
+                    validate_window_frame_expr_collation_consumers(condition, registry)?;
+                    validate_window_frame_expr_collation_consumers(value, registry)?;
                 }
             }
             if let Some(else_expr) = else_expr {
-                validate_window_frame_expr_collation_consumers(connection, else_expr, registry)?;
+                validate_window_frame_expr_collation_consumers(else_expr, registry)?;
             }
             Ok(())
         }
         Expr::RowValue(values, _) => {
             for value in values {
-                validate_window_frame_expr_collation_consumers(connection, value, registry)?;
+                validate_window_frame_expr_collation_consumers(value, registry)?;
             }
             Ok(())
         }
@@ -112859,8 +113173,10 @@ fn compile_expression_select(
     let select = &rewritten_select;
 
     let mut builder = ProgramBuilder::new();
-    let mut bind_state = BindParamState::default();
-    bind_state.function_registry = Some(Arc::clone(&function_registry));
+    let mut bind_state = BindParamState {
+        function_registry: Some(Arc::clone(&function_registry)),
+        ..BindParamState::default()
+    };
     let init_target = builder.emit_label();
     builder.emit_jump_to_label(Opcode::Init, 0, 0, init_target, P4::None, 0);
 

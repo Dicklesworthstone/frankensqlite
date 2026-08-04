@@ -35352,6 +35352,14 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
             "CREATE TABLE c_default (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_default(id) ON DELETE SET DEFAULT)",
             "INSERT INTO p_default VALUES (0, 'DEFAULT'), (1, 'AAA')",
             "INSERT INTO c_default VALUES (1, 1)",
+            "CREATE TABLE p_without_rowid (tenant TEXT, id INTEGER, symbol TEXT UNIQUE, PRIMARY KEY (tenant, id)) WITHOUT ROWID",
+            "CREATE TABLE c_without_rowid (id INTEGER PRIMARY KEY, tenant TEXT, parent_id INTEGER, FOREIGN KEY (tenant, parent_id) REFERENCES p_without_rowid(tenant, id) ON DELETE CASCADE)",
+            "INSERT INTO p_without_rowid VALUES ('X', 1, 'AAA'), ('X', 2, 'BBB')",
+            "INSERT INTO c_without_rowid VALUES (1, 'X', 1), (2, 'X', 2)",
+            "CREATE TABLE p_update_replace (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+            "CREATE TABLE c_update_replace (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_update_replace(id) ON DELETE CASCADE)",
+            "INSERT INTO p_update_replace VALUES (1, 'AAA'), (2, 'BBB')",
+            "INSERT INTO c_update_replace VALUES (1, 1), (2, 2)",
         ];
         apply_fsqlite_statements(&fconn, &action_setup).await;
         apply_rusqlite_statements(&rconn, &action_setup);
@@ -35376,6 +35384,8 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
         for sql in [
             "INSERT OR REPLACE INTO p_null VALUES (2, 'AAA')",
             "INSERT OR REPLACE INTO p_default VALUES (2, 'AAA')",
+            "INSERT OR REPLACE INTO p_without_rowid VALUES ('X', 10, 'AAA')",
+            "UPDATE OR REPLACE p_update_replace SET symbol = 'BBB' WHERE id = 1",
         ] {
             assert_eq!(fconn.execute(sql).await.unwrap(), 1);
             assert_eq!(rconn.execute(sql, []).unwrap(), 1);
@@ -35393,6 +35403,10 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
                 "SELECT id, parent_id FROM c_cascade ORDER BY id",
                 "SELECT id, parent_id FROM c_null ORDER BY id",
                 "SELECT id, parent_id FROM c_default ORDER BY id",
+                "SELECT tenant, id, symbol FROM p_without_rowid ORDER BY tenant, id",
+                "SELECT id, tenant, parent_id FROM c_without_rowid ORDER BY id",
+                "SELECT id, symbol FROM p_update_replace ORDER BY id",
+                "SELECT id, parent_id FROM c_update_replace ORDER BY id",
                 "PRAGMA foreign_key_check",
                 "SELECT changes(), total_changes(), last_insert_rowid()",
             ],
@@ -35483,5 +35497,507 @@ fn test_conformance_replace_victim_savepoint_rollback_and_reopen_s76r() {
             ],
         )
         .await;
+    });
+}
+
+/// SET DEFAULT remains subject to the child's FK constraint. The outer DELETE,
+/// UPDATE, or implicit REPLACE delete must fail atomically when the declared
+/// default does not name an existing parent row.
+#[test]
+fn test_conformance_fk_set_default_rejects_missing_parent_gh167_gh168() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p_delete (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_delete (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_delete(id) ON DELETE SET DEFAULT)",
+            "INSERT INTO p_delete VALUES (1)",
+            "INSERT INTO c_delete VALUES (1, 1)",
+            "CREATE TABLE p_update (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_update (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_update(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_update VALUES (1)",
+            "INSERT INTO c_update VALUES (1, 1)",
+        ];
+        apply_fsqlite_statements(&fconn, &setup).await;
+        apply_rusqlite_statements(&rconn, &setup);
+
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "DELETE FROM p_delete WHERE id = 1",
+            "gh167_set_default_delete_missing_parent",
+        )
+        .await;
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE p_update SET id = 2 WHERE id = 1",
+            "gh168_set_default_update_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "gh167_gh168_set_default_missing_parent",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_delete ORDER BY id",
+                "SELECT id, parent_id FROM c_delete ORDER BY id",
+                "SELECT id FROM p_update ORDER BY id",
+                "SELECT id, parent_id FROM c_update ORDER BY id",
+                "PRAGMA foreign_key_check",
+            ],
+        )
+        .await;
+        fconn.close().await.expect("close FrankenSQLite connection");
+    });
+}
+
+/// The wider SET DEFAULT rollback/counter matrix extends the GH #167/#168
+/// missing-parent contract to implicit REPLACE deletes and conflict policies.
+#[test]
+fn test_conformance_fk_set_default_requires_valid_parent_s76q_default() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p_delete (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_delete (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_delete(id) ON DELETE SET DEFAULT)",
+            "INSERT INTO p_delete VALUES (1)",
+            "INSERT INTO c_delete VALUES (1, 1)",
+            "CREATE TABLE p_update (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_update (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_update(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_update VALUES (1)",
+            "INSERT INTO c_update VALUES (1, 1)",
+            "CREATE TABLE p_replace (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+            "CREATE TABLE c_replace (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_replace(id) ON DELETE SET DEFAULT)",
+            "INSERT INTO p_replace VALUES (1, 'AAA')",
+            "INSERT INTO c_replace VALUES (1, 1)",
+            "CREATE TABLE p_repair (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_repair (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_repair(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_repair VALUES (1), (2)",
+            "INSERT INTO c_repair VALUES (1, 1)",
+            "CREATE TABLE p_update_fail (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_update_fail (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_update_fail(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_update_fail VALUES (1)",
+            "INSERT INTO c_update_fail VALUES (1, 1)",
+            "CREATE TABLE p_late_error (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_late_error (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_late_error(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_late_error VALUES (0), (1), (2)",
+            "INSERT INTO c_late_error VALUES (1, 1), (2, 2)",
+        ];
+        apply_fsqlite_statements(&fconn, &setup).await;
+        apply_rusqlite_statements(&rconn, &setup);
+
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "DELETE FROM p_delete WHERE id = 1",
+            "set_default_delete_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_delete_failure_counters",
+            &fconn,
+            &rconn,
+            &["SELECT changes(), total_changes(), last_insert_rowid()"],
+        )
+        .await;
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE p_update SET id = 2 WHERE id = 1",
+            "set_default_update_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_update_failure_counters",
+            &fconn,
+            &rconn,
+            &["SELECT changes(), total_changes(), last_insert_rowid()"],
+        )
+        .await;
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "INSERT OR REPLACE INTO p_replace VALUES (2, 'AAA')",
+            "set_default_replace_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_replace_failure_counters",
+            &fconn,
+            &rconn,
+            &["SELECT changes(), total_changes(), last_insert_rowid()"],
+        )
+        .await;
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE OR FAIL p_update_fail SET id = 2 WHERE id = 1",
+            "set_default_update_or_fail_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_update_or_fail_failure_counters",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_update_fail ORDER BY id",
+                "SELECT id, parent_id FROM c_update_fail ORDER BY id",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        )
+        .await;
+        fconn.execute("BEGIN").await.unwrap();
+        rconn.execute_batch("BEGIN").unwrap();
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE OR FAIL p_update_fail SET id = 2 WHERE id = 1",
+            "set_default_update_or_fail_explicit_txn",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_update_or_fail_explicit_txn_counters",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_update_fail ORDER BY id",
+                "SELECT id, parent_id FROM c_update_fail ORDER BY id",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        )
+        .await;
+        fconn.execute("ROLLBACK").await.unwrap();
+        rconn.execute_batch("ROLLBACK").unwrap();
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE p_late_error SET id = 3 WHERE id IN (1, 2)",
+            "set_default_action_before_late_unique_error",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_late_error_failure_counters",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_late_error ORDER BY id",
+                "SELECT id, parent_id FROM c_late_error ORDER BY id",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        )
+        .await;
+
+        let repair_sql = "UPDATE p_repair SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 0 END";
+        assert_eq!(fconn.execute(repair_sql).await.unwrap(), 2);
+        assert_eq!(rconn.execute(repair_sql, []).unwrap(), 2);
+
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_missing_parent",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_delete ORDER BY id",
+                "SELECT id, parent_id FROM c_delete ORDER BY id",
+                "SELECT id FROM p_update ORDER BY id",
+                "SELECT id, parent_id FROM c_update ORDER BY id",
+                "SELECT id, symbol FROM p_replace ORDER BY id",
+                "SELECT id, parent_id FROM c_replace ORDER BY id",
+                "SELECT id FROM p_repair ORDER BY id",
+                "SELECT id, parent_id FROM c_repair ORDER BY id",
+                "SELECT id FROM p_update_fail ORDER BY id",
+                "SELECT id, parent_id FROM c_update_fail ORDER BY id",
+                "SELECT id FROM p_late_error ORDER BY id",
+                "SELECT id, parent_id FROM c_late_error ORDER BY id",
+                "PRAGMA foreign_key_check",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        )
+        .await;
+    });
+}
+
+/// GH #145 (FSQL-BUG-004): an UPSERT conflict target that carries a
+/// partial-index predicate resolves to the matching partial UNIQUE index. The
+/// probe must be skipped when the attempted row is outside that predicate, and
+/// a genuinely mismatched target must fail instead of falling back to rowid.
+#[test]
+fn test_conformance_upsert_partial_unique_index_conflict_target_gh145() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, active INTEGER)",
+            "CREATE UNIQUE INDEX uq ON t(email) WHERE active = 1",
+            "INSERT INTO t VALUES (1, 'a@example.com', 1)",
+            "INSERT INTO t VALUES (2, 'a@example.com', 0)",
+        ];
+        apply_fsqlite_statements(&fconn, &setup).await;
+        apply_rusqlite_statements(&rconn, &setup);
+
+        let matching_upsert = "INSERT INTO t VALUES (3, 'a@example.com', 1) \
+                               ON CONFLICT(email) WHERE active = 1 \
+                               DO UPDATE SET id = excluded.id";
+        assert!(fconn.execute(matching_upsert).await.is_ok());
+        assert!(rconn.execute_batch(matching_upsert).is_ok());
+        assert_logged_atomic_oracle_snapshot(
+            "gh145_matching_partial_unique_target",
+            &fconn,
+            &rconn,
+            &["SELECT id, email, active FROM t ORDER BY id"],
+        )
+        .await;
+
+        let outside_predicate = "INSERT INTO t VALUES (4, 'a@example.com', 0) \
+                                 ON CONFLICT(email) WHERE active = 1 \
+                                 DO UPDATE SET id = excluded.id";
+        assert!(fconn.execute(outside_predicate).await.is_ok());
+        assert!(rconn.execute_batch(outside_predicate).is_ok());
+        assert_logged_atomic_oracle_snapshot(
+            "gh145_partial_probe_skips_inactive_row",
+            &fconn,
+            &rconn,
+            &["SELECT id, email, active FROM t ORDER BY id"],
+        )
+        .await;
+
+        let mismatched_target = "INSERT INTO t VALUES (5, 'a@example.com', 1) \
+                                 ON CONFLICT(email) WHERE active = 0 \
+                                 DO UPDATE SET id = excluded.id";
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            mismatched_target,
+            "gh145_mismatched_partial_unique_target",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "gh145_mismatched_target_is_atomic",
+            &fconn,
+            &rconn,
+            &["SELECT id, email, active FROM t ORDER BY id"],
+        )
+        .await;
+    });
+}
+
+/// GH #147 (FSQL-BUG-006): default concurrent mode leaves a forward-only
+/// AUTOINCREMENT gap after savepoint rollback. This keeper pins the observed
+/// divergence from stock SQLite while requiring allocated rowids to remain
+/// unique and strictly increasing.
+#[test]
+fn test_conformance_autoincrement_savepoint_rollback_gap_is_intentional_gh147() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = ["CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)"];
+        apply_fsqlite_statements(&fconn, &setup).await;
+        apply_rusqlite_statements(&rconn, &setup);
+
+        let sequence = [
+            "BEGIN",
+            "INSERT INTO t (val) VALUES ('a')",
+            "SAVEPOINT sp",
+            "INSERT INTO t (val) VALUES ('b')",
+            "ROLLBACK TO sp",
+            "INSERT INTO t (val) VALUES ('c')",
+            "COMMIT",
+        ];
+        apply_fsqlite_statements(&fconn, &sequence).await;
+        apply_rusqlite_statements(&rconn, &sequence);
+
+        let frank_rows = query_fsqlite_strings(&fconn, "SELECT id, val FROM t ORDER BY id")
+            .await
+            .expect("query FrankenSQLite AUTOINCREMENT rows");
+        let sqlite_rows = query_rusqlite_strings(&rconn, "SELECT id, val FROM t ORDER BY id")
+            .expect("query stock SQLite AUTOINCREMENT rows");
+        assert_eq!(
+            frank_rows,
+            vec![
+                vec!["1".to_owned(), "'a'".to_owned()],
+                vec!["3".to_owned(), "'c'".to_owned()],
+            ],
+            "concurrent reservations must leave a forward-only gap after rollback"
+        );
+        assert_eq!(
+            sqlite_rows,
+            vec![
+                vec!["1".to_owned(), "'a'".to_owned()],
+                vec!["2".to_owned(), "'c'".to_owned()],
+            ],
+            "the reference engine must continue to pin the documented divergence"
+        );
+
+        let frank_sequence =
+            query_fsqlite_strings(&fconn, "SELECT seq FROM sqlite_sequence WHERE name = 't'")
+                .await
+                .expect("query FrankenSQLite sqlite_sequence");
+        assert_eq!(frank_sequence, vec![vec!["3".to_owned()]]);
+        fconn.close().await.expect("close FrankenSQLite connection");
+    });
+}
+
+/// GH #144 (FSQL-BUG-003): an explicit `main.` DML target must keep naming the
+/// persistent table even when a TEMP table with the same bare name shadows it.
+#[test]
+fn test_conformance_main_qualified_dml_ignores_temp_shadow_gh144() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "CREATE TABLE main.t(id INTEGER PRIMARY KEY, value TEXT)",
+            "INSERT INTO main.t VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+            "CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, value TEXT)",
+            "INSERT INTO temp.t VALUES (9, 'temp')",
+        ];
+        apply_fsqlite_statements(&fconn, &setup).await;
+        apply_rusqlite_statements(&rconn, &setup);
+
+        let mutations = [
+            "INSERT INTO main.t VALUES (4, 'four')",
+            "UPDATE main.t SET value = 'ONE' WHERE id = 1",
+            "DELETE FROM main.t WHERE id = 2",
+            "INSERT INTO temp.t VALUES (10, 'temporary')",
+            "UPDATE temp.t SET value = 'TEMP' WHERE id = 9",
+            "DELETE FROM temp.t WHERE id = 10",
+        ];
+        apply_fsqlite_statements(&fconn, &mutations).await;
+        apply_rusqlite_statements(&rconn, &mutations);
+
+        let prepared_mutations = [
+            "INSERT INTO main.t VALUES (5, 'five')",
+            "UPDATE main.t SET value = 'FOUR' WHERE id = 4",
+            "DELETE FROM main.t WHERE id = 3",
+        ];
+        for sql in prepared_mutations {
+            let statement = fconn.prepare(sql).await.expect("prepare FrankenSQLite DML");
+            statement
+                .execute_with_params(&[])
+                .await
+                .expect("execute prepared FrankenSQLite DML");
+            rconn.execute(sql, []).expect("execute reference DML");
+        }
+
+        assert_logged_atomic_oracle_snapshot(
+            "gh144_main_qualified_dml_temp_shadow",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id, value FROM main.t ORDER BY id",
+                "SELECT id, value FROM temp.t ORDER BY id",
+            ],
+        )
+        .await;
+        fconn.close().await.expect("close FrankenSQLite connection");
+    });
+}
+
+/// GH #150 (FSQL-BUG-009): renaming an AUTOINCREMENT table must move its
+/// `sqlite_sequence` row, and dropping the renamed table must remove that row.
+#[test]
+fn test_conformance_alter_rename_drop_sqlite_sequence_gh150() {
+    asupersync::test_utils::run_test(|| async {
+        let temp = tempfile::tempdir().unwrap();
+        let frank_path = temp.path().join("frank.db");
+        let oracle_path = temp.path().join("oracle.db");
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+            "INSERT INTO t (v) VALUES ('a'), ('b'), ('c')",
+            "CREATE TABLE duplicate_seq (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "INSERT INTO duplicate_seq DEFAULT VALUES",
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('duplicate_seq', 99)",
+        ];
+        {
+            let fconn = Connection::open(frank_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let rconn = rusqlite::Connection::open(&oracle_path).unwrap();
+            apply_fsqlite_statements(&fconn, &setup).await;
+            apply_rusqlite_statements(&rconn, &setup);
+            fconn.close().await.expect("close FrankenSQLite connection");
+        }
+
+        {
+            let fconn = Connection::open(frank_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let rconn = rusqlite::Connection::open(&oracle_path).unwrap();
+            let rename = [
+                "ALTER TABLE t RENAME TO t2",
+                "ALTER TABLE duplicate_seq RENAME TO duplicate_seq2",
+                "INSERT INTO t2 (v) VALUES ('d')",
+            ];
+            apply_fsqlite_statements(&fconn, &rename).await;
+            apply_rusqlite_statements(&rconn, &rename);
+
+            assert_logged_atomic_oracle_snapshot(
+                "gh150_cold_cache_rename_moves_sqlite_sequence_row",
+                &fconn,
+                &rconn,
+                &[
+                    "SELECT name, seq FROM sqlite_sequence ORDER BY name, rowid",
+                    "SELECT count(*) FROM sqlite_sequence",
+                    "SELECT count(*) FROM sqlite_sequence WHERE name = 't'",
+                    "SELECT count(*) FROM sqlite_sequence WHERE name = 'duplicate_seq'",
+                    "SELECT id, v FROM t2 ORDER BY id",
+                ],
+            )
+            .await;
+            fconn.close().await.expect("close FrankenSQLite connection");
+        }
+
+        {
+            let fconn = Connection::open(frank_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let rconn = rusqlite::Connection::open(&oracle_path).unwrap();
+            assert_logged_atomic_oracle_snapshot(
+                "gh150_rename_survives_reopen",
+                &fconn,
+                &rconn,
+                &[
+                    "SELECT name, seq FROM sqlite_sequence ORDER BY name, rowid",
+                    "SELECT count(*) FROM sqlite_sequence WHERE name = 't'",
+                    "SELECT count(*) FROM sqlite_sequence WHERE name = 'duplicate_seq'",
+                    "SELECT id, v FROM t2 ORDER BY id",
+                ],
+            )
+            .await;
+
+            let drop_statement = ["DROP TABLE t2", "DROP TABLE duplicate_seq2"];
+            apply_fsqlite_statements(&fconn, &drop_statement).await;
+            apply_rusqlite_statements(&rconn, &drop_statement);
+
+            assert_logged_atomic_oracle_snapshot(
+                "gh150_drop_removes_sqlite_sequence_row",
+                &fconn,
+                &rconn,
+                &[
+                    "SELECT name, seq FROM sqlite_sequence ORDER BY name, rowid",
+                    "SELECT count(*) FROM sqlite_sequence",
+                ],
+            )
+            .await;
+            fconn.close().await.expect("close FrankenSQLite connection");
+        }
+
+        let fconn = Connection::open(frank_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let rconn = rusqlite::Connection::open(&oracle_path).unwrap();
+        assert_logged_atomic_oracle_snapshot(
+            "gh150_drop_survives_reopen",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT name, seq FROM sqlite_sequence ORDER BY name, rowid",
+                "SELECT count(*) FROM sqlite_sequence",
+            ],
+        )
+        .await;
+        fconn.close().await.expect("close FrankenSQLite connection");
     });
 }

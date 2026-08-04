@@ -2672,14 +2672,21 @@ still serves as an authoritative reference.
   interpretation or durable rewriting. Convert such a database to UTF-8 with
   stock SQLite before opening it in FrankenSQLite. This restriction concerns
   SQLite TEXT encoding; arbitrary bytes stored as BLOB values are unaffected.
-- **Read-only opens are not fully mutation-free in v0.2.0.** First contact with
-  a clean stock SQLite database can create FrankenSQLite namespace sidecars;
-  Windows read-only opens can create lock sidecars. Some compatibility opens
-  also update volatile SQLite header counters or metadata. Do not use v0.2.0
-  where the database directory is immutable or where main-file content or
-  modification-time stability across opens is required
-  ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140),
-  [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294)).
+- **Read-only opens are not fully mutation-free in v0.2.0.** A database that
+  FrankenSQLite has opened before joins its existing namespace without
+  rewriting the `-fsqlite-ns-gate` or `-fsqlite-ns-use` sidecar. First contact
+  with a stock SQLite database instead creates both sidecars and therefore
+  requires a writable parent directory. Windows opens also create the
+  `-lock-shared`, `-lock-reserved`, and `-lock-pending` sidecars, including for
+  read-only access. Namespace identity binds the database file's device and
+  inode, so a database copied to different media cannot be rebound read-only.
+  Do not use v0.2.0 where the database directory is immutable or where a copied
+  database must open directly from read-only media
+  ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140)). The
+  namespace-sidecar rewrite reported in
+  [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294) is fixed
+  for previously opened databases; its remaining first-contact case is tracked
+  in #140.
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.

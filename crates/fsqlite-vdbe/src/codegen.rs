@@ -1092,34 +1092,100 @@ fn find_upsert_target_index<'a>(
     target: Option<&UpsertTarget>,
 ) -> Option<(usize, &'a IndexSchema)> {
     let target = target?;
-    // Extract column names from target expressions.
-    let target_cols: Vec<&str> = target
+    // Only plain columns can match this direct UNIQUE-index probe. Expression
+    // targets fail closed until the probe can evaluate expression-index keys.
+    let target_cols: Vec<(&str, Option<&str>)> = target
         .columns
         .iter()
-        .filter_map(|ic| match &ic.expr {
-            Expr::Column(col_ref, _) => Some(col_ref.column.as_ref()),
+        .map(|indexed_column| match &indexed_column.expr {
+            Expr::Column(column, _) => {
+                Some((column.column.as_ref(), indexed_column.collation.as_deref()))
+            }
             _ => None,
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     if target_cols.is_empty() {
         return None;
     }
     // Check if the target matches a UNIQUE index (not the PK).
     for (idx_offset, index) in table.indexes.iter().enumerate() {
         if !index.is_unique
-            || !index.supports_direct_column_lookup()
+            || index.columns.is_empty()
+            || index.columns.len() != index.key_term_count()
             || index.columns.len() != target_cols.len()
         {
             continue;
         }
-        let all_match = target_cols
-            .iter()
-            .all(|tc| index.columns.iter().any(|ic| ic.eq_ignore_ascii_case(tc)));
-        if all_match {
+        let mut matched_index_columns = vec![false; index.columns.len()];
+        let columns_match = target_cols.iter().all(|(target_column, target_collation)| {
+            let Some(index_position) =
+                index
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .position(|(index_position, index_column)| {
+                        matched_index_columns
+                            .get(index_position)
+                            .is_some_and(|matched| !matched)
+                            && index_column.eq_ignore_ascii_case(target_column)
+                            && target_collation.is_none_or(|target_collation| {
+                                index
+                                    .key_term_collation(index_position)
+                                    .unwrap_or("BINARY")
+                                    .eq_ignore_ascii_case(target_collation)
+                            })
+                    })
+            else {
+                return false;
+            };
+            let Some(matched) = matched_index_columns.get_mut(index_position) else {
+                return false;
+            };
+            *matched = true;
+            true
+        });
+        if columns_match && upsert_target_matches_index_predicate(table, target, index) {
             return Some((idx_offset, index));
         }
     }
     None
+}
+
+/// SQLite permits an arbitrary conflict-target WHERE clause to accompany a
+/// non-partial UNIQUE index. A partial index, however, is an arbiter only when
+/// the target predicate structurally matches its stored predicate.
+fn upsert_target_matches_index_predicate(
+    table: &TableSchema,
+    target: &UpsertTarget,
+    index: &IndexSchema,
+) -> bool {
+    let Some(index_predicate_sql) = index.where_clause.as_deref() else {
+        return true;
+    };
+    let Some(target_predicate) = target.where_clause.as_ref() else {
+        return false;
+    };
+    let Ok(index_predicate) = parse_sql_expr(index_predicate_sql) else {
+        return false;
+    };
+    expressions_match_table_locally(target_predicate, &index_predicate, table, None)
+}
+
+fn upsert_target_matches_rowid_primary_key(table: &TableSchema, target: &UpsertTarget) -> bool {
+    let [indexed_column] = target.columns.as_slice() else {
+        return false;
+    };
+    if indexed_column.collation.is_some() {
+        return false;
+    }
+    let Expr::Column(column, _) = &indexed_column.expr else {
+        return false;
+    };
+    table
+        .column_index(&column.column)
+        .and_then(|index| table.columns.get(index))
+        .is_some_and(|column| column.is_ipk)
+        || table.resolves_to_hidden_rowid(&column.column)
 }
 
 /// Emit UPSERT DO UPDATE assignments into `target_regs`.
@@ -19308,9 +19374,17 @@ pub fn codegen_insert(
             assignments,
             where_clause,
         },
-        ..
+        target,
     }) = upsert_clause
     {
+        if let Some(target) = target
+            && find_upsert_target_index(table, Some(target)).is_none()
+            && !upsert_target_matches_rowid_primary_key(table, target)
+        {
+            return Err(CodegenError::Unsupported(
+                "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint".to_owned(),
+            ));
+        }
         for assign in assignments {
             validate_assignment_target(table, &assign.target)?;
             validate_upsert_expr_columns(&assign.value, table, target_alias)?;
@@ -19805,6 +19879,16 @@ fn codegen_insert_values(
                 let update_rowid_reg = if let Some((idx_offset, index)) =
                     find_upsert_target_index(table, upsert_clause.target.as_ref())
                 {
+                    let attempted_row_ctx = ScanCtx {
+                        cursor,
+                        table,
+                        table_alias,
+                        schema: None,
+                        register_base: Some(val_regs),
+                        secondaries: &[],
+                    };
+                    emit_index_predicate_guard(b, index, &attempted_row_ctx, insert_label);
+
                     // UNIQUE index conflict check.
                     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                     let idx_cursor = cursor + 1 + idx_offset as i32;
@@ -51775,6 +51859,131 @@ mod tests {
         assert_eq!(
             table_record_headers, 2,
             "UPSERT DO UPDATE should use precomputed headers for both conflict-update and insert table records"
+        );
+    }
+
+    fn partial_unique_upsert_schema() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("id", 'D', true),
+                ColumnInfo::basic("email", 'B', false),
+                ColumnInfo::basic("active", 'D', false),
+            ],
+            indexes: vec![IndexSchema {
+                name: "uq_active_email".to_owned(),
+                root_page: 3,
+                columns: vec!["email".to_owned()],
+                key_expressions: Vec::new(),
+                key_sort_directions: vec![SortDirection::Asc],
+                where_clause: Some("active = 1".to_owned()),
+                is_unique: true,
+                key_collations: vec![None],
+                conflict_action: None,
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    fn partial_unique_upsert_statement(predicate: &str) -> InsertStatement {
+        InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: Vec::new(),
+            source: InsertSource::Values(vec![vec![
+                placeholder(1),
+                placeholder(2),
+                placeholder(3),
+            ]]),
+            upsert: vec![UpsertClause {
+                target: Some(UpsertTarget {
+                    columns: vec![IndexedColumn {
+                        expr: Expr::Column(ColumnRef::bare("email"), Span::ZERO),
+                        collation: None,
+                        direction: None,
+                    }],
+                    where_clause: Some(expr_sql(predicate)),
+                }),
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::Column("id".to_owned()),
+                        value: Expr::Column(ColumnRef::qualified("excluded", "id"), Span::ZERO),
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn upsert_partial_unique_target_matches_predicate_and_guards_probe() {
+        let schema = partial_unique_upsert_schema();
+        let statement = partial_unique_upsert_statement("active = 1");
+        let target = statement.upsert[0]
+            .target
+            .as_ref()
+            .expect("test UPSERT should have a conflict target");
+        assert_eq!(
+            find_upsert_target_index(&schema[0], Some(target))
+                .map(|(offset, index)| { (offset, index.name.as_str()) }),
+            Some((0, "uq_active_email"))
+        );
+
+        let mut builder = ProgramBuilder::new();
+        codegen_insert(
+            &mut builder,
+            &statement,
+            &schema,
+            &CodegenContext {
+                rowid_alias_col_idx: Some(0),
+                ..CodegenContext::default()
+            },
+        )
+        .expect("matching partial UNIQUE target should compile");
+        let program = builder.finish().expect("UPSERT program should finish");
+        let predicate_guard = program
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::IfNot)
+            .expect("partial UNIQUE probe should be guarded by its predicate");
+        let conflict_probe = program
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::NoConflict && op.p1 == 1)
+            .expect("matching partial UNIQUE index should supply the conflict probe");
+        assert!(
+            predicate_guard < conflict_probe,
+            "the attempted row must satisfy the partial predicate before probing the index"
+        );
+    }
+
+    #[test]
+    fn upsert_partial_unique_target_rejects_mismatched_predicate() {
+        let schema = partial_unique_upsert_schema();
+        let statement = partial_unique_upsert_statement("active = 0");
+        let mut builder = ProgramBuilder::new();
+        let error = codegen_insert(
+            &mut builder,
+            &statement,
+            &schema,
+            &CodegenContext {
+                rowid_alias_col_idx: Some(0),
+                ..CodegenContext::default()
+            },
+        )
+        .expect_err("mismatched partial-index predicate must not fall back to the rowid probe");
+        assert!(
+            matches!(error, CodegenError::Unsupported(ref message)
+                if message.contains("does not match any PRIMARY KEY or UNIQUE constraint")),
+            "unexpected unmatched-target error: {error:?}"
         );
     }
 

@@ -10,12 +10,56 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 pub const SQLITE_VERSION_CONTRACT_PATH: &str = "docs/contracts/sqlite_version_contract.toml";
 pub const SUPPORTED_SURFACE_MATRIX_PATH: &str = "docs/contracts/supported_surface_matrix.toml";
 pub const FEATURE_UNIVERSE_LEDGER_PATH: &str = "docs/contracts/feature_universe_ledger.toml";
+pub const PARITY_TAXONOMY_PATH: &str = "docs/contracts/parity_taxonomy.toml";
+pub const CORPUS_MANIFEST_PATH: &str = "docs/contracts/corpus_manifest.toml";
 pub const PARITY_SCORE_CONTRACT_PATH: &str = "docs/contracts/parity_score_contract.toml";
+pub const CONTRACT_AUTHORITY_REGISTRY_SCHEMA_VERSION: &str =
+    "fsqlite.canonical_contract_authority.v1";
+const INERT_CONTRACT_POINTER_SCHEMA_VERSION: &str = "fsqlite.inert_contract_pointer.v1";
+const INERT_ROOT_DISPOSITION: &str =
+    "historical_payload_inert; docs/contracts path is the sole authority";
+
+/// One authoritative contract path and its inert repository-root pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CanonicalContractAuthority {
+    pub logical_name: &'static str,
+    pub canonical_path: &'static str,
+    pub inert_root_path: &'static str,
+}
+
+pub const CANONICAL_CONTRACT_AUTHORITIES: &[CanonicalContractAuthority] = &[
+    CanonicalContractAuthority {
+        logical_name: "supported_surface_matrix",
+        canonical_path: SUPPORTED_SURFACE_MATRIX_PATH,
+        inert_root_path: "supported_surface_matrix.toml",
+    },
+    CanonicalContractAuthority {
+        logical_name: "feature_universe_ledger",
+        canonical_path: FEATURE_UNIVERSE_LEDGER_PATH,
+        inert_root_path: "feature_universe_ledger.toml",
+    },
+    CanonicalContractAuthority {
+        logical_name: "parity_taxonomy",
+        canonical_path: PARITY_TAXONOMY_PATH,
+        inert_root_path: "parity_taxonomy.toml",
+    },
+    CanonicalContractAuthority {
+        logical_name: "sqlite_version_contract",
+        canonical_path: SQLITE_VERSION_CONTRACT_PATH,
+        inert_root_path: "sqlite_version_contract.toml",
+    },
+    CanonicalContractAuthority {
+        logical_name: "corpus_manifest",
+        canonical_path: CORPUS_MANIFEST_PATH,
+        inert_root_path: "corpus_manifest.toml",
+    },
+];
 
 #[derive(Debug)]
 pub enum CanonicalParityContractError {
@@ -51,10 +95,61 @@ impl Error for CanonicalParityContractError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContractDiagnostic {
     pub code: &'static str,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContractAuthorityEvidence {
+    pub logical_name: String,
+    pub canonical_path: String,
+    pub canonical_sha256: String,
+    pub inert_root_path: String,
+    pub inert_root_sha256: String,
+    pub inert_pointer_schema_version: String,
+    pub inert_pointer_canonical_path: String,
+    pub inert_pointer_canonical_sha256: String,
+    pub root_disposition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpecializedContractConstantEvidence {
+    pub owner: String,
+    pub logical_name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CanonicalContractAuthorityReport {
+    pub schema_version: String,
+    pub authorities: Vec<ContractAuthorityEvidence>,
+    pub specialized_constants: Vec<SpecializedContractConstantEvidence>,
+    pub diagnostics: Vec<ContractDiagnostic>,
+}
+
+impl CanonicalContractAuthorityReport {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.diagnostics.is_empty()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InertContractPointerDocument {
+    inert_contract_pointer: InertContractPointer,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InertContractPointer {
+    schema_version: String,
+    canonical_path: String,
+    canonical_sha256: String,
+    disposition: String,
+    legacy_payload: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +318,7 @@ impl CanonicalParityContractBundle {
         self.validate_surface_matrix(&mut diagnostics);
         self.validate_feature_ledger(&mut diagnostics);
         self.validate_reference_paths(workspace_root, &mut diagnostics);
+        diagnostics.extend(canonical_contract_authority_report(workspace_root).diagnostics);
         CanonicalParityContractValidation { diagnostics }
     }
 
@@ -470,6 +566,270 @@ pub fn validate_workspace_canonical_parity_contract(
     Ok(bundle.validate(workspace_root))
 }
 
+/// Resolve a logical contract name through the sole canonical registry.
+#[must_use]
+pub fn canonical_contract_path(logical_name: &str) -> Option<&'static str> {
+    CANONICAL_CONTRACT_AUTHORITIES
+        .iter()
+        .find(|authority| authority.logical_name == logical_name)
+        .map(|authority| authority.canonical_path)
+}
+
+/// Build a stable, machine-readable proof for canonical and inert root paths.
+#[must_use]
+pub fn canonical_contract_authority_report(
+    workspace_root: &Path,
+) -> CanonicalContractAuthorityReport {
+    let mut authorities = Vec::with_capacity(CANONICAL_CONTRACT_AUTHORITIES.len());
+    let mut diagnostics = Vec::new();
+
+    for authority in CANONICAL_CONTRACT_AUTHORITIES {
+        let canonical_path = workspace_root.join(authority.canonical_path);
+        let canonical_content = match fs::read_to_string(&canonical_path) {
+            Ok(content) => Some(content),
+            Err(error) => {
+                diagnostics.push(ContractDiagnostic {
+                    code: "missing_canonical_contract",
+                    message: format!(
+                        "{} canonical path '{}' is unreadable: {error}",
+                        authority.logical_name,
+                        canonical_path.display()
+                    ),
+                });
+                None
+            }
+        };
+        if let Some(content) = canonical_content.as_deref() {
+            if content.trim().is_empty() {
+                diagnostics.push(ContractDiagnostic {
+                    code: "empty_canonical_contract",
+                    message: format!(
+                        "{} canonical path '{}' is empty",
+                        authority.logical_name,
+                        canonical_path.display()
+                    ),
+                });
+            } else if let Err(error) = toml::from_str::<toml::Value>(content) {
+                diagnostics.push(ContractDiagnostic {
+                    code: "malformed_canonical_contract",
+                    message: format!(
+                        "{} canonical path '{}' is malformed TOML: {error}",
+                        authority.logical_name,
+                        canonical_path.display()
+                    ),
+                });
+            }
+        }
+        let canonical_sha256 = canonical_content
+            .as_deref()
+            .map_or_else(String::new, |content| sha256_hex(content.as_bytes()));
+
+        let root_path = workspace_root.join(authority.inert_root_path);
+        let root_content = match fs::read_to_string(&root_path) {
+            Ok(content) => Some(content),
+            Err(error) => {
+                diagnostics.push(ContractDiagnostic {
+                    code: "missing_inert_root_pointer",
+                    message: format!(
+                        "{} root path '{}' is unreadable: {error}",
+                        authority.logical_name,
+                        root_path.display()
+                    ),
+                });
+                None
+            }
+        };
+        let inert_root_sha256 = root_content
+            .as_deref()
+            .map_or_else(String::new, |content| sha256_hex(content.as_bytes()));
+        let pointer = match root_content.as_deref() {
+            Some(content) if content.trim().is_empty() => {
+                diagnostics.push(ContractDiagnostic {
+                    code: "invalid_inert_root_pointer",
+                    message: format!(
+                        "{} root path '{}' is empty",
+                        authority.logical_name,
+                        root_path.display()
+                    ),
+                });
+                None
+            }
+            Some(content) => match toml::from_str::<InertContractPointerDocument>(content) {
+                Ok(document) => Some(document.inert_contract_pointer),
+                Err(error) => {
+                    diagnostics.push(ContractDiagnostic {
+                        code: "invalid_inert_root_pointer",
+                        message: format!(
+                            "{} root path '{}' is not an inert pointer: {error}",
+                            authority.logical_name,
+                            root_path.display()
+                        ),
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
+        let pointer_schema = pointer
+            .as_ref()
+            .map_or_else(String::new, |value| value.schema_version.clone());
+        let pointer_path = pointer
+            .as_ref()
+            .map_or_else(String::new, |value| value.canonical_path.clone());
+        let pointer_hash = pointer
+            .as_ref()
+            .map_or_else(String::new, |value| value.canonical_sha256.clone());
+        let root_disposition = pointer
+            .as_ref()
+            .map_or_else(String::new, |value| value.disposition.clone());
+        if let Some(pointer) = pointer {
+            for (code, field, actual, expected) in [
+                (
+                    "inert_pointer_schema_mismatch",
+                    "schema_version",
+                    pointer.schema_version.as_str(),
+                    INERT_CONTRACT_POINTER_SCHEMA_VERSION,
+                ),
+                (
+                    "inert_pointer_path_mismatch",
+                    "canonical_path",
+                    pointer.canonical_path.as_str(),
+                    authority.canonical_path,
+                ),
+                (
+                    "inert_pointer_hash_mismatch",
+                    "canonical_sha256",
+                    pointer.canonical_sha256.as_str(),
+                    canonical_sha256.as_str(),
+                ),
+                (
+                    "inert_pointer_disposition_mismatch",
+                    "disposition",
+                    pointer.disposition.as_str(),
+                    INERT_ROOT_DISPOSITION,
+                ),
+            ] {
+                if actual != expected {
+                    diagnostics.push(ContractDiagnostic {
+                        code,
+                        message: format!(
+                            "{} inert pointer {field} '{}' does not match '{}'",
+                            authority.logical_name, actual, expected
+                        ),
+                    });
+                }
+            }
+            if pointer.legacy_payload.trim().is_empty() {
+                diagnostics.push(ContractDiagnostic {
+                    code: "inert_pointer_missing_legacy_payload",
+                    message: format!(
+                        "{} inert pointer does not preserve its historical payload",
+                        authority.logical_name
+                    ),
+                });
+            }
+        }
+
+        authorities.push(ContractAuthorityEvidence {
+            logical_name: authority.logical_name.to_owned(),
+            canonical_path: authority.canonical_path.to_owned(),
+            canonical_sha256,
+            inert_root_path: authority.inert_root_path.to_owned(),
+            inert_root_sha256,
+            inert_pointer_schema_version: pointer_schema,
+            inert_pointer_canonical_path: pointer_path,
+            inert_pointer_canonical_sha256: pointer_hash,
+            root_disposition,
+        });
+    }
+
+    let specialized_constants = [
+        (
+            "canonical_parity_contract::SQLITE_VERSION_CONTRACT_PATH",
+            "sqlite_version_contract",
+            SQLITE_VERSION_CONTRACT_PATH,
+        ),
+        (
+            "canonical_parity_contract::SUPPORTED_SURFACE_MATRIX_PATH",
+            "supported_surface_matrix",
+            SUPPORTED_SURFACE_MATRIX_PATH,
+        ),
+        (
+            "canonical_parity_contract::FEATURE_UNIVERSE_LEDGER_PATH",
+            "feature_universe_ledger",
+            FEATURE_UNIVERSE_LEDGER_PATH,
+        ),
+        (
+            "parity_taxonomy::PARITY_TAXONOMY_CONTRACT_PATH",
+            "parity_taxonomy",
+            crate::parity_taxonomy::PARITY_TAXONOMY_CONTRACT_PATH,
+        ),
+        (
+            "fixture_root_contract::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH",
+            "corpus_manifest",
+            crate::fixture_root_contract::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH,
+        ),
+    ]
+    .into_iter()
+    .map(|(owner, logical_name, path)| {
+        if canonical_contract_path(logical_name) != Some(path) {
+            diagnostics.push(ContractDiagnostic {
+                code: "specialized_constant_path_mismatch",
+                message: format!(
+                    "specialized constant {owner} path '{path}' does not match registry logical name '{logical_name}'"
+                ),
+            });
+        }
+        SpecializedContractConstantEvidence {
+            owner: owner.to_owned(),
+            logical_name: logical_name.to_owned(),
+            path: path.to_owned(),
+        }
+    })
+    .collect();
+
+    CanonicalContractAuthorityReport {
+        schema_version: CONTRACT_AUTHORITY_REGISTRY_SCHEMA_VERSION.to_owned(),
+        authorities,
+        specialized_constants,
+        diagnostics,
+    }
+}
+
+impl CanonicalContractAuthorityReport {
+    /// Emit one bounded summary; per-contract evidence stays in the report.
+    pub fn emit_diagnostic(&self) {
+        if self.is_valid() {
+            tracing::info!(
+                target: "fsqlite.contract_authority",
+                registry_schema_version = %self.schema_version,
+                authority_count = self.authorities.len(),
+                diagnostic_count = 0,
+                "canonical contract authorities validated"
+            );
+        } else {
+            let first_failure = self
+                .diagnostics
+                .first()
+                .map_or("unknown contract-authority failure", |value| {
+                    value.message.as_str()
+                });
+            tracing::error!(
+                target: "fsqlite.contract_authority",
+                registry_schema_version = %self.schema_version,
+                authority_count = self.authorities.len(),
+                diagnostic_count = self.diagnostics.len(),
+                first_failure,
+                "canonical contract authority validation failed"
+            );
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    crate::bytes_to_lower_hex(Sha256::digest(bytes))
+}
+
 fn load_toml<T>(
     workspace_root: &Path,
     relative_path: &str,
@@ -495,12 +855,17 @@ fn validate_reference_exists(
         return;
     };
     let root_candidate = workspace_root.join(path_text);
-    let contract_candidate = workspace_root.join("docs/contracts").join(path_text);
-    let candidate = if root_candidate.exists() || Path::new(path_text).components().count() != 1 {
-        root_candidate
-    } else {
-        contract_candidate
-    };
+    let candidate = canonical_path_for_bare_reference(path_text).map_or_else(
+        || {
+            let contract_candidate = workspace_root.join("docs/contracts").join(path_text);
+            if root_candidate.exists() || Path::new(path_text).components().count() != 1 {
+                root_candidate
+            } else {
+                contract_candidate
+            }
+        },
+        |canonical| workspace_root.join(canonical),
+    );
     if !candidate.exists() {
         diagnostics.push(ContractDiagnostic {
             code: "missing_reference_path",
@@ -511,6 +876,21 @@ fn validate_reference_exists(
             ),
         });
     }
+}
+
+fn canonical_path_for_bare_reference(reference: &str) -> Option<&'static str> {
+    if Path::new(reference).components().count() != 1 {
+        return None;
+    }
+    CANONICAL_CONTRACT_AUTHORITIES
+        .iter()
+        .find(|authority| {
+            Path::new(authority.canonical_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(reference)
+        })
+        .map(|authority| authority.canonical_path)
 }
 
 fn reference_target_path(reference: &str) -> Option<&str> {
@@ -543,6 +923,42 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
+    fn write_authority_layout(
+        root: &Path,
+        missing_canonical_index: Option<usize>,
+        malformed_canonical_index: Option<usize>,
+        wrong_pointer_index: Option<usize>,
+    ) {
+        fs::create_dir_all(root.join("docs/contracts")).expect("create contract directory");
+        for (index, authority) in CANONICAL_CONTRACT_AUTHORITIES.iter().enumerate() {
+            let canonical_content = if malformed_canonical_index == Some(index) {
+                "not = [valid"
+            } else {
+                "[meta]\nschema_version = \"test\"\n"
+            };
+            if missing_canonical_index != Some(index) {
+                fs::write(root.join(authority.canonical_path), canonical_content)
+                    .expect("write canonical contract");
+            }
+            let canonical_hash = sha256_hex(canonical_content.as_bytes());
+            let pointer_path = if wrong_pointer_index == Some(index) {
+                "docs/contracts/wrong.toml"
+            } else {
+                authority.canonical_path
+            };
+            let pointer = format!(
+                "[inert_contract_pointer]\n\
+                 schema_version = \"{INERT_CONTRACT_POINTER_SCHEMA_VERSION}\"\n\
+                 canonical_path = \"{pointer_path}\"\n\
+                 canonical_sha256 = \"{canonical_hash}\"\n\
+                 disposition = \"{INERT_ROOT_DISPOSITION}\"\n\
+                 legacy_payload = '''historical contract payload'''\n"
+            );
+            fs::write(root.join(authority.inert_root_path), pointer)
+                .expect("write inert root pointer");
+        }
+    }
+
     #[test]
     fn workspace_bundle_loads_and_validates() {
         let root = workspace_root();
@@ -553,6 +969,168 @@ mod tests {
             "expected workspace contract bundle to validate: {:?}",
             validation.diagnostics
         );
+    }
+
+    #[test]
+    fn authority_registry_is_stable_complete_and_delegated() {
+        assert_eq!(CANONICAL_CONTRACT_AUTHORITIES.len(), 5);
+        let logical_names = CANONICAL_CONTRACT_AUTHORITIES
+            .iter()
+            .map(|authority| authority.logical_name)
+            .collect::<BTreeSet<_>>();
+        let canonical_paths = CANONICAL_CONTRACT_AUTHORITIES
+            .iter()
+            .map(|authority| authority.canonical_path)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(logical_names.len(), 5);
+        assert_eq!(canonical_paths.len(), 5);
+        assert!(
+            CANONICAL_CONTRACT_AUTHORITIES
+                .iter()
+                .all(|authority| authority.canonical_path.starts_with("docs/contracts/"))
+        );
+        assert_eq!(
+            canonical_contract_path("corpus_manifest"),
+            Some(CORPUS_MANIFEST_PATH)
+        );
+        assert_eq!(
+            crate::fixture_root_contract::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH,
+            CORPUS_MANIFEST_PATH
+        );
+        assert_eq!(
+            crate::parity_taxonomy::PARITY_TAXONOMY_CONTRACT_PATH,
+            PARITY_TAXONOMY_PATH
+        );
+    }
+
+    #[test]
+    fn workspace_authority_report_is_valid_stable_and_machine_readable() {
+        let report = canonical_contract_authority_report(&workspace_root());
+        assert!(report.is_valid(), "{:?}", report.diagnostics);
+        assert_eq!(report.authorities.len(), 5);
+        assert!(report.authorities.iter().all(|authority| {
+            authority.canonical_sha256 == authority.inert_pointer_canonical_sha256
+                && authority.canonical_path == authority.inert_pointer_canonical_path
+                && authority.root_disposition == INERT_ROOT_DISPOSITION
+                && authority.inert_root_sha256.len() == 64
+        }));
+        let first = serde_json::to_string(&report).expect("serialize authority report");
+        let second = serde_json::to_string(&report).expect("reserialize authority report");
+        assert_eq!(first, second);
+        println!("FSQLITE_CONTRACT_AUTHORITY_REPORT={first}");
+        report.emit_diagnostic();
+    }
+
+    #[test]
+    fn bare_contract_references_never_resolve_to_root_pointers() {
+        for authority in CANONICAL_CONTRACT_AUTHORITIES {
+            let file_name = Path::new(authority.canonical_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("canonical contract file name");
+            assert_eq!(
+                canonical_path_for_bare_reference(file_name),
+                Some(authority.canonical_path)
+            );
+        }
+        assert_eq!(canonical_path_for_bare_reference("README.md"), None);
+    }
+
+    #[test]
+    fn authority_report_rejects_missing_malformed_and_wrong_path_contracts() {
+        let missing = tempfile::tempdir().expect("missing layout");
+        write_authority_layout(missing.path(), Some(0), None, None);
+        let report = canonical_contract_authority_report(missing.path());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "missing_canonical_contract"
+                && diagnostic.message.contains("supported_surface_matrix")
+        }));
+        let mut reference_diagnostics = Vec::new();
+        validate_reference_exists(
+            "supported_surface_matrix.toml#SURF-SQL-CORE-001",
+            missing.path(),
+            &mut reference_diagnostics,
+        );
+        assert!(reference_diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "missing_reference_path"
+                && diagnostic
+                    .message
+                    .contains("docs/contracts/supported_surface_matrix.toml")
+        }));
+
+        let malformed = tempfile::tempdir().expect("malformed layout");
+        write_authority_layout(malformed.path(), None, Some(1), None);
+        let report = canonical_contract_authority_report(malformed.path());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "malformed_canonical_contract"
+                && diagnostic.message.contains("feature_universe_ledger")
+        }));
+
+        let empty = tempfile::tempdir().expect("empty layout");
+        write_authority_layout(empty.path(), None, None, None);
+        let surface_authority = CANONICAL_CONTRACT_AUTHORITIES
+            .first()
+            .copied()
+            .expect("supported surface authority");
+        fs::write(empty.path().join(surface_authority.canonical_path), "")
+            .expect("empty canonical contract");
+        let report = canonical_contract_authority_report(empty.path());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "empty_canonical_contract"
+                && diagnostic.message.contains("supported_surface_matrix")
+        }));
+        fs::write(empty.path().join(surface_authority.inert_root_path), "")
+            .expect("empty inert root pointer");
+        let report = canonical_contract_authority_report(empty.path());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "invalid_inert_root_pointer"
+                && diagnostic.message.contains("supported_surface_matrix")
+        }));
+
+        let wrong_path = tempfile::tempdir().expect("wrong-path layout");
+        write_authority_layout(wrong_path.path(), None, None, Some(2));
+        let report = canonical_contract_authority_report(wrong_path.path());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "inert_pointer_path_mismatch"
+                && diagnostic.message.contains("parity_taxonomy")
+        }));
+
+        let drifted = tempfile::tempdir().expect("drifted layout");
+        write_authority_layout(drifted.path(), None, None, None);
+        let authority = CANONICAL_CONTRACT_AUTHORITIES
+            .get(3)
+            .copied()
+            .expect("SQLite version authority");
+        let pointer_path = drifted.path().join(authority.inert_root_path);
+        let pointer = fs::read_to_string(&pointer_path)
+            .expect("read pointer")
+            .replace(
+                &sha256_hex(b"[meta]\nschema_version = \"test\"\n"),
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            );
+        fs::write(&pointer_path, pointer).expect("write drifted pointer");
+        let report = canonical_contract_authority_report(drifted.path());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "inert_pointer_hash_mismatch"
+                && diagnostic.message.contains("sqlite_version_contract")
+        }));
+
+        let malformed_pointer = tempfile::tempdir().expect("malformed-pointer layout");
+        write_authority_layout(malformed_pointer.path(), None, None, None);
+        let authority = CANONICAL_CONTRACT_AUTHORITIES
+            .get(4)
+            .copied()
+            .expect("corpus manifest authority");
+        fs::write(
+            malformed_pointer.path().join(authority.inert_root_path),
+            "[inert_contract_pointer]\nunknown = true\n",
+        )
+        .expect("write malformed root pointer");
+        let report = canonical_contract_authority_report(malformed_pointer.path());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "invalid_inert_root_pointer"
+                && diagnostic.message.contains("corpus_manifest")
+        }));
     }
 
     #[test]

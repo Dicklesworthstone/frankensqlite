@@ -1,3 +1,9 @@
+[inert_contract_pointer]
+schema_version = "fsqlite.inert_contract_pointer.v1"
+canonical_path = "docs/contracts/feature_universe_ledger.toml"
+canonical_sha256 = "55b5ac49dc88506c4a179693de8299791da715ee6218404ad15820cc3091f387"
+disposition = "historical_payload_inert; docs/contracts path is the sole authority"
+legacy_payload = '''
 # Canonical Feature Universe Ledger v1.0.0
 #
 # Bead: bd-2yqp6.1.2
@@ -252,3 +258,4 @@ lifecycle_state = "declared"
 owner = "track-b-harness-integrity"
 test_links = ["crates/fsqlite-harness/tests/bd_3plop_7_tcl_conformance.rs", "README.md"]
 evidence_links = ["supported_surface_matrix.toml#SURF-CONFORMANCE-TCL-020", "README.md"]
+'''

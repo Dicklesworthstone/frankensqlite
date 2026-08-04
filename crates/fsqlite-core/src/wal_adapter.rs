@@ -840,7 +840,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// staged horizon, or when the WAL does not yet report the staged commit.
     /// Callers must leave the pending state untouched on refusal so a later sync
     /// can retry the same batch.
-    fn assert_publish_safe(&mut self, cx: &Cx, last_commit_frame: usize) -> Result<()> {
+    fn assert_pending_horizon_matches_wal(
+        &mut self,
+        cx: &Cx,
+        last_commit_frame: usize,
+    ) -> Result<()> {
         let generation = self.wal.generation_identity();
         if self
             .pending_publication_generation
@@ -861,8 +865,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             });
         }
 
-        let durable_last_commit = self.wal.last_commit_frame(cx)?;
-        if durable_last_commit.is_none_or(|durable| durable < last_commit_frame) {
+        let live_last_commit = self.wal.last_commit_frame(cx)?;
+        if live_last_commit.is_none_or(|live| live < last_commit_frame) {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
                     "WAL does not report staged commit horizon {last_commit_frame} as committed"
@@ -882,6 +886,12 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             });
         }
 
+        Ok(())
+    }
+
+    fn assert_publish_safe(&mut self, cx: &Cx, last_commit_frame: usize) -> Result<()> {
+        self.assert_pending_horizon_matches_wal(cx, last_commit_frame)?;
+
         // Delegate to the WAL's own durability tracker rather than duplicating
         // it: only it knows how far a successful fsync actually reached.
         let publish_frame_count =
@@ -893,6 +903,23 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 })?;
         self.wal.assert_publish_safe(publish_frame_count)?;
 
+        Ok(())
+    }
+
+    /// Publish a logically authorized `synchronous=NORMAL` commit without
+    /// claiming that an fsync occurred.
+    ///
+    /// The pager calls this only after the parallel-WAL certificate and both
+    /// tracked write completions are terminal. A failed-sync path never reaches
+    /// this hook, so its pending horizon remains fail-closed for a later retry.
+    fn publish_authorized_deferred_commit(&mut self, cx: &Cx) -> Result<()> {
+        let Some(last_commit_frame) = self.pending_publication_commit else {
+            return Ok(());
+        };
+        self.assert_pending_horizon_matches_wal(cx, last_commit_frame)?;
+        self.publish_pending_commit_snapshot(cx, last_commit_frame, "authorized_deferred_commit");
+        self.pending_publication_commit = None;
+        self.pending_publication_generation = None;
         Ok(())
     }
 
@@ -1095,6 +1122,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         cx: &'a Cx,
     ) -> WalFuture<'a, Option<WalPublicationSnapshot>> {
         Box::pin(async move { Self::refresh_published_snapshot(self, cx).await.map(Some) })
+    }
+
+    fn publish_authorized_deferred_commit<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move { Self::publish_authorized_deferred_commit(self, cx) })
     }
 
     fn append_frame<'a>(
@@ -3211,6 +3242,10 @@ where
             self.ensure_current_wal_path(cx).await?;
             self.inner.refresh_published_snapshot(cx).await.map(Some)
         })
+    }
+
+    fn publish_authorized_deferred_commit<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move { self.inner.publish_authorized_deferred_commit(cx) })
     }
 
     fn append_frame<'a>(
@@ -6819,6 +6854,44 @@ mod tests {
             Some(1),
             "sync must publish once the staged batch is durable"
         );
+    }
+
+    #[test]
+    fn test_authorized_deferred_commit_publishes_without_claiming_fsync() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+        let fsynced_before = adapter.wal.last_fsynced_frame_count();
+
+        adapter
+            .publish_authorized_deferred_commit(&cx)
+            .expect("parallel-WAL authorization must publish the deferred commit");
+
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "the authorized commit marker must become visible"
+        );
+        assert_eq!(
+            adapter.published_snapshot.commit_count, 1,
+            "the authorized batch must publish exactly one commit"
+        );
+        assert!(
+            !adapter.has_pending_publication(),
+            "authorization must drain the staged publication horizon"
+        );
+        assert_eq!(
+            adapter.wal.last_fsynced_frame_count(),
+            fsynced_before,
+            "deferred authorization must not claim or force an fsync"
+        );
+        adapter
+            .begin_transaction(&cx)
+            .expect("the next transaction must not see a stale Busy");
     }
 
     #[test]

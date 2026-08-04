@@ -16,14 +16,44 @@ The machine-readable sources of truth are:
    Supported vs partial vs excluded surface.
 3. [`docs/contracts/feature_universe_ledger.toml`](contracts/feature_universe_ledger.toml)
    Per-component feature decomposition, lifecycle, and evidence links.
-4. [`docs/contracts/parity_score_contract.toml`](contracts/parity_score_contract.toml)
+4. [`docs/contracts/parity_taxonomy.toml`](contracts/parity_taxonomy.toml)
+   Weighted feature taxonomy and intentional exclusions.
+5. [`docs/contracts/corpus_manifest.toml`](contracts/corpus_manifest.toml)
+   Canonical fixture roots, content hashes, and corpus cardinality floors.
+6. [`docs/contracts/parity_score_contract.toml`](contracts/parity_score_contract.toml)
    Exact meaning of a "100% parity" claim.
-5. [`crates/fsqlite-harness/src/canonical_parity_contract.rs`](../crates/fsqlite-harness/src/canonical_parity_contract.rs)  
-   Executable bundle loader and drift validator for the four Track A authority files.
+7. [`crates/fsqlite-harness/src/canonical_parity_contract.rs`](../crates/fsqlite-harness/src/canonical_parity_contract.rs)
+   Sole five-contract path registry, executable bundle loader, and authority
+   drift validator. The parity-score contract remains an additional Track A
+   input, but it is not one of the five formerly duplicated root contracts.
 
 If this document and those files diverge, the repo is in contract drift and the
 drift must be fixed. The correct response is to reconcile the files, not to
 reinterpret the contract ad hoc.
+
+### Root Copies Are Inert
+
+The five same-named TOML files at the repository root are not contract mirrors
+or fallback locations. Each is an `fsqlite.inert_contract_pointer.v1` document
+whose historical payload is retained as an inert literal string. Its pointer
+names the sole `docs/contracts/` authority and pins that file's SHA-256. A
+consumer must never parse the historical payload as a live contract.
+
+| Logical contract | Canonical authority | Inert root pointer |
+| --- | --- | --- |
+| Supported surface | `docs/contracts/supported_surface_matrix.toml` | `supported_surface_matrix.toml` |
+| Feature universe | `docs/contracts/feature_universe_ledger.toml` | `feature_universe_ledger.toml` |
+| Parity taxonomy | `docs/contracts/parity_taxonomy.toml` | `parity_taxonomy.toml` |
+| SQLite version | `docs/contracts/sqlite_version_contract.toml` | `sqlite_version_contract.toml` |
+| Corpus roots | `docs/contracts/corpus_manifest.toml` | `corpus_manifest.toml` |
+
+Run `scripts/verify_canonical_contract_authority.sh --json` to validate the
+registry, specialized constants, canonical TOML, root-pointer hashes, and all
+bare references in code, tests, scripts, and workflows. The report classifies
+the non-read references inventoried in
+`docs/contracts/turso_test_adaptation_inventory.toml`, including synthetic
+temporary-workspace paths, report artifact names, serialized fixtures, and
+workflow triggers. An unregistered live root read fails the guard.
 
 ## Validation Surface
 

@@ -1253,6 +1253,7 @@ impl UnixFile {
             .expect("open UnixFile must retain its canonical descriptor")
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn canonical_file(&self) -> Result<Arc<File>> {
         self.file
             .as_ref()
@@ -4026,7 +4027,8 @@ mod tests {
         let vfs = UnixVfs::new();
 
         let abs = vfs.full_pathname(&cx, Path::new("/tmp/test.db")).unwrap();
-        assert_eq!(abs, Path::new("/tmp/test.db"));
+        let expected = Path::new("/tmp").canonicalize().unwrap().join("test.db");
+        assert_eq!(abs, expected);
 
         let rel = vfs.full_pathname(&cx, Path::new("test.db")).unwrap();
         assert!(rel.is_absolute());
