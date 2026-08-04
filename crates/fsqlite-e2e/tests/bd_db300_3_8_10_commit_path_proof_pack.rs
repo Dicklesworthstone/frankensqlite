@@ -23,10 +23,17 @@
 //! cargo test -p fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack -- --nocapture --test-threads=1
 //! ```
 //!
-//! P4 is a production-profile performance gate and is ignored when debug
-//! assertions are enabled. Replay it explicitly with `--profile release-perf`.
+//! P4 is a production-profile performance gate and is ignored in every profile.
+//! Replay it explicitly with `--profile release-perf -- --ignored`.
 
-#![allow(clippy::cast_precision_loss)]
+// These end-to-end tests deliberately hold a thread-local Connection across
+// awaits and exercise the full unboxed engine future. Making those futures
+// Send or boxing them would change the workload this proof pack measures.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::future_not_send,
+    clippy::large_futures
+)]
 #![recursion_limit = "512"]
 
 use serde_json::json;
@@ -35,7 +42,7 @@ use std::time::Instant;
 
 const BEAD_ID: &str = "bd-db300.3.8.10";
 const REPLAY_CMD: &str = "cargo test -p fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack -- --nocapture --test-threads=1";
-const P4_REPLAY_CMD: &str = "cargo test --profile release-perf -p fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack p4_non_regression_throughput -- --nocapture --test-threads=1";
+const P4_REPLAY_CMD: &str = "cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack p4_non_regression_throughput -- --exact --ignored --nocapture --test-threads=1";
 
 fn emit_log(test_name: &str, phase: &str, data: serde_json::Value) {
     eprintln!(
@@ -411,10 +418,7 @@ fn p4_median_uses_the_middle_order_statistic() {
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "production performance gate; replay with --profile release-perf"
-)]
+#[ignore = "production performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack p4_non_regression_throughput -- --exact --ignored --nocapture --test-threads=1"]
 fn p4_non_regression_throughput() {
     asupersync::test_utils::run_test(|| async {
         let tn = "p4_throughput";

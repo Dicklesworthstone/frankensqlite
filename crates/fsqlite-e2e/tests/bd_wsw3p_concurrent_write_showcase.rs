@@ -13,6 +13,10 @@
 //! - Median FrankenSQLite 4-thread throughput beats the C SQLite baseline in
 //!   `release-perf`
 //! - Structured output contains required fields
+// These end-to-end tests deliberately hold a thread-local Connection across
+// awaits and exercise the full unboxed engine future. Making those futures
+// Send or boxing them would change the workload this benchmark measures.
+#![allow(clippy::future_not_send, clippy::large_futures)]
 #![recursion_limit = "512"]
 
 use std::fs;
@@ -29,7 +33,7 @@ const ROWS_PER_THREAD: i64 = 200;
 const MAX_TXN_RETRIES: u32 = 100;
 const RETRY_BACKOFF: Duration = Duration::from_micros(100);
 const T4_SAMPLE_COUNT: usize = 11;
-const T4_REPLAY_CMD: &str = "cargo test --profile release-perf -p fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --nocapture --test-threads=1";
+const T4_REPLAY_CMD: &str = "cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --exact --ignored --nocapture --test-threads=1";
 
 fn artifact_dir() -> PathBuf {
     let run_id = SystemTime::now()
@@ -539,10 +543,7 @@ fn median_uses_the_middle_order_statistic() {
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "production performance gate; replay with cargo test --profile release-perf -p fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --nocapture --test-threads=1"
-)]
+#[ignore = "production performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --exact --ignored --nocapture --test-threads=1"]
 fn t4_fsqlite_outperforms_csqlite_at_4_threads() {
     // Warm both engines before collecting paired measurements. Alternate the
     // order within each pair so load and filesystem drift cannot

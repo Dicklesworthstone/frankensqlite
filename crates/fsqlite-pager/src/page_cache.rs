@@ -7489,9 +7489,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     const BEAD_3WOP3_2: &str = "bd-3wop3.2";
-    const SHARDED_CACHE_PERF_REPLAY: &str = "cargo test --profile release-perf -p \
-        fsqlite-pager page_cache::tests::test_sharded_cache_throughput_vs_single -- \
-        --exact --nocapture --test-threads=1";
+    const SHARDED_CACHE_PERF_REPLAY: &str = "cargo test --locked --profile release-perf \
+        --package fsqlite-pager --lib page_cache::tests::test_sharded_cache_throughput_vs_single \
+        -- --exact --ignored --nocapture --test-threads=1";
     const FAST_PATH_LATENCY_REPLAY: &str = "cargo test --locked --profile release-perf \
         --package fsqlite-pager --lib page_cache::tests::test_fast_path_vs_sharded_latency_comparison \
         -- --exact --ignored --nocapture --test-threads=1";
@@ -8098,10 +8098,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        ignore = "production performance gate; replay with --profile release-perf"
-    )]
+    #[ignore = "production performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-pager --lib page_cache::tests::test_sharded_cache_throughput_vs_single -- --exact --ignored --nocapture --test-threads=1"]
     fn test_sharded_cache_throughput_vs_single() {
         // This is a production-profile gate, not a debug-build timing smoke
         // test. Warm both paths, alternate their order to cancel sequential

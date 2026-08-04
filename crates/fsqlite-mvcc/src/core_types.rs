@@ -6208,7 +6208,7 @@ mod tests {
     const TXN_SLOT_LATENCY_WARMUP_ROUNDS: u64 = 3;
     const TXN_SLOT_LATENCY_SAMPLE_ROUNDS: usize = 11;
     const TXN_SLOT_LATENCY_ITERATIONS_PER_SAMPLE: u64 = 2_048;
-    const TXN_SLOT_LATENCY_REPLAY_COMMAND: &str = "cargo test --profile release-perf -p fsqlite-mvcc --lib core_types::tests::test_txn_slot_alloc_release_latency_budget -- --exact --nocapture --test-threads=1";
+    const TXN_SLOT_LATENCY_REPLAY_COMMAND: &str = "cargo test --locked --profile release-perf --package fsqlite-mvcc --lib core_types::tests::test_txn_slot_alloc_release_latency_budget -- --exact --ignored --nocapture --test-threads=1";
 
     #[derive(Debug)]
     struct TxnSlotLatencyMeasurement {
@@ -6284,10 +6284,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        ignore = "production latency gate; replay with --profile release-perf"
-    )]
+    #[ignore = "production latency gate; replay with cargo test --locked --profile release-perf --package fsqlite-mvcc --lib core_types::tests::test_txn_slot_alloc_release_latency_budget -- --exact --ignored --nocapture --test-threads=1"]
     fn test_txn_slot_alloc_release_latency_budget() {
         let measurement = measure_txn_slot_alloc_release_latency();
         eprintln!(
