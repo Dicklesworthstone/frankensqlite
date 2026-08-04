@@ -18875,6 +18875,9 @@ where
                                     GLOBAL_CONSOLIDATION_METRICS
                                         .fsyncs_total
                                         .fetch_add(1, AtomicOrdering::Relaxed);
+                                } else {
+                                    wal.publish_authorized_deferred_commit(&durability_cx)
+                                        .await?;
                                 }
                                 drop(wal_guard);
                                 recovery.complete_authorized(&durability_cx)?;

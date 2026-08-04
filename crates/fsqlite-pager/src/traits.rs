@@ -223,6 +223,17 @@ pub trait WalBackend: Send + Sync {
         Box::pin(async { Ok(self.published_snapshot()) })
     }
 
+    /// Publish a commit batch that the pager's parallel-WAL protocol has
+    /// already authorized after every tracked write completed.
+    ///
+    /// This is distinct from [`Self::sync`]: `PRAGMA synchronous=NORMAL` may
+    /// make a completed WAL commit visible without forcing an fsync. Backends
+    /// that stage visibility until explicit authorization can override this
+    /// hook; backends without such staging need no action.
+    fn publish_authorized_deferred_commit<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Append a single frame to the WAL.
     ///
     /// `page_number` is the 1-based database page.
