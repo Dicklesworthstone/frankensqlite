@@ -59,5 +59,6 @@ pub use thompson_partitioner::{BetaArm, RESAMPLE_INTERVAL, ThompsonPartitioner};
 pub use traits::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MemoryMockMvccPager,
     MemoryMockTransaction, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,
-    TransactionHandle, TransactionKind, TransactionMode, WalBackend, WalPublicationSnapshot,
+    ParallelWalCommitReconciliation, TransactionHandle, TransactionKind, TransactionMode,
+    WalBackend, WalPublicationSnapshot,
 };

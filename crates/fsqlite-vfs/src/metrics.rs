@@ -29,7 +29,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 
 use crate::shm::ShmRegion;
-use crate::traits::{FileIdentity, VfsFile};
+use crate::traits::{FileIdentity, VfsFile, VfsWriteCompletion};
 
 // ---------------------------------------------------------------------------
 // Global metrics counters
@@ -290,6 +290,16 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         buf: &'a [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
+    }
+
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async move {
             GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
             let bytes = buf.len() as u64;
@@ -297,7 +307,7 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
                 "write_async",
                 &*self.path,
                 bytes,
-                self.inner.write(cx, buf, offset).await
+                self.inner.write_tracked(cx, buf, offset, completion).await
             );
             if result.is_ok() {
                 GLOBAL_VFS_METRICS

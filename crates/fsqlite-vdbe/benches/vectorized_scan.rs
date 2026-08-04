@@ -1,7 +1,9 @@
 use std::cell::RefCell;
+use std::future::Future;
 use std::hint::black_box;
 use std::rc::Rc;
 
+use asupersync::runtime::RuntimeBuilder;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter};
 use fsqlite_types::record::serialize_record;
@@ -27,28 +29,41 @@ impl SharedMemPageIo {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl PageReader for SharedMemPageIo {
-    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> fsqlite_error::Result<Vec<u8>> {
-        self.store.borrow().read_page(cx, page_no)
+    fn read_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = fsqlite_error::Result<Vec<u8>>> + 'a {
+        async move { self.store.borrow().read_page(cx, page_no).await }
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl PageWriter for SharedMemPageIo {
-    fn write_page(
-        &mut self,
-        cx: &Cx,
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
         page_no: PageNumber,
-        data: &[u8],
-    ) -> fsqlite_error::Result<()> {
-        self.store.borrow_mut().write_page(cx, page_no, data)
+        data: &'a [u8],
+    ) -> impl Future<Output = fsqlite_error::Result<()>> + 'a {
+        async move { self.store.borrow_mut().write_page(cx, page_no, data).await }
     }
 
-    fn allocate_page(&mut self, cx: &Cx) -> fsqlite_error::Result<PageNumber> {
-        self.store.borrow_mut().allocate_page(cx)
+    fn allocate_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = fsqlite_error::Result<PageNumber>> + 'a {
+        async move { self.store.borrow_mut().allocate_page(cx).await }
     }
 
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> fsqlite_error::Result<()> {
-        self.store.borrow_mut().free_page(cx, page_no)
+    fn free_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = fsqlite_error::Result<()>> + 'a {
+        async move { self.store.borrow_mut().free_page(cx, page_no).await }
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -88,7 +103,7 @@ fn row_for_rowid(rowid: i64) -> Vec<SqliteValue> {
     ]
 }
 
-fn build_fixture(row_count: usize) -> ScanFixture {
+async fn build_fixture(row_count: usize) -> ScanFixture {
     let root_page = PageNumber::new(2).expect("root page should be non-zero");
     let io = SharedMemPageIo::new(PAGE_SIZE, root_page);
     let mut writer = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
@@ -102,6 +117,7 @@ fn build_fixture(row_count: usize) -> ScanFixture {
         payload_bytes = payload_bytes.saturating_add(payload.len());
         writer
             .table_insert(&cx, rowid, &payload)
+            .await
             .expect("table_insert should succeed");
     }
 
@@ -114,10 +130,14 @@ fn build_fixture(row_count: usize) -> ScanFixture {
 }
 
 fn bench_vectorized_scan_throughput(c: &mut Criterion) {
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("vectorized-scan benchmark runtime should build");
     let mut group = c.benchmark_group("vectorized_scan_throughput");
 
     for row_count in [4_096_usize, 16_384_usize] {
-        let fixture = build_fixture(row_count);
+        let fixture = runtime.block_on(build_fixture(row_count));
         let bytes = u64::try_from(fixture.payload_bytes).unwrap_or(u64::MAX);
         group.throughput(Throughput::Bytes(bytes));
         group.bench_with_input(
@@ -125,23 +145,27 @@ fn bench_vectorized_scan_throughput(c: &mut Criterion) {
             &fixture,
             |b, fixture| {
                 b.iter(|| {
-                    let cx = Cx::new();
-                    let cursor =
-                        BtCursor::new(fixture.io.clone(), fixture.root_page, PAGE_SIZE, true);
-                    let mut scan = VectorizedTableScan::try_new(
-                        &cx,
-                        cursor,
-                        fixture.specs.clone(),
-                        DEFAULT_BATCH_ROW_CAPACITY,
-                    )
-                    .expect("scan should initialize");
+                    runtime.block_on(async {
+                        let cx = Cx::new();
+                        let cursor =
+                            BtCursor::new(fixture.io.clone(), fixture.root_page, PAGE_SIZE, true);
+                        let mut scan = VectorizedTableScan::try_new(
+                            &cx,
+                            cursor,
+                            fixture.specs.clone(),
+                            DEFAULT_BATCH_ROW_CAPACITY,
+                        )
+                        .expect("scan should initialize");
 
-                    let mut scanned_rows = 0usize;
-                    while let Some(batch) = scan.next_batch().expect("scan should succeed") {
-                        scanned_rows = scanned_rows.saturating_add(batch.stats.rows_scanned);
-                    }
+                        let mut scanned_rows = 0usize;
+                        while let Some(batch) =
+                            scan.next_batch().await.expect("scan should succeed")
+                        {
+                            scanned_rows = scanned_rows.saturating_add(batch.stats.rows_scanned);
+                        }
 
-                    black_box(scanned_rows);
+                        black_box(scanned_rows);
+                    });
                 });
             },
         );

@@ -22,7 +22,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageData, PageNumber, PageSize};
 #[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::IoUringVfs;
-use fsqlite_vfs::MemoryVfs;
+use fsqlite_vfs::{MemoryVfs, VfsWriteCompletion};
 #[cfg(all(feature = "native", unix))]
 use fsqlite_vfs::UnixVfs;
 #[cfg(all(feature = "native", target_os = "windows"))]
@@ -140,6 +140,16 @@ impl WalPublicationSnapshot {
     }
 }
 
+/// Durable recovery verdict for one exact certificate/WAL interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelWalCommitReconciliation {
+    /// The live WAL generation contains the complete interval and its matching
+    /// commit marker, and the supplied certificate is the authorizing record.
+    Authorized,
+    /// Recovery proved that the interval has no matching committed marker.
+    NotCommitted,
+}
+
 /// Backend interface for WAL operations consumed by the pager.
 ///
 /// This trait breaks the `pager ↔ wal` circular dependency: it is defined
@@ -149,6 +159,30 @@ impl WalPublicationSnapshot {
 /// The pager calls into this trait during WAL-mode commits and page lookups
 /// instead of writing a rollback journal.
 pub type WalFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Source guard for the conservative tracked-WAL defaults.
+///
+/// Constructing the guard before the async block is returned is intentional:
+/// dropping an unpolled future must still make the caller-retained completion
+/// token terminal. `VfsWriteCompletion` has sticky terminal states, so the
+/// guard's final `Error` cannot overwrite an explicitly recorded `Success`.
+struct WalTrackedCompletionGuard(VfsWriteCompletion);
+
+impl WalTrackedCompletionGuard {
+    fn complete_success(&self) {
+        self.0.complete_success();
+    }
+
+    fn complete_error(&self) {
+        self.0.complete_error();
+    }
+}
+
+impl Drop for WalTrackedCompletionGuard {
+    fn drop(&mut self) {
+        self.0.complete_error();
+    }
+}
 
 pub trait WalBackend: Send + Sync {
     /// Prepare WAL state for a newly-started transaction.
@@ -226,6 +260,32 @@ pub trait WalBackend: Send + Sync {
         })
     }
 
+    /// Append a batch while retaining a source-level completion observation.
+    ///
+    /// A backend whose physical write can outlive this returned future must
+    /// override this method and complete `completion` at that source. The
+    /// conservative default records `Error` when the returned future is
+    /// dropped, including before its first poll. That terminal state means
+    /// "the wrapper did not observe success", not "zero bytes reached storage";
+    /// exact reconciliation must still classify the live WAL boundary.
+    fn append_frames_tracked<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        frames: &'a [WalFrameRef<'a>],
+        completion: VfsWriteCompletion,
+    ) -> WalFuture<'a, ()> {
+        let completion = WalTrackedCompletionGuard(completion);
+        Box::pin(async move {
+            let result = self.append_frames(cx, frames).await;
+            if result.is_ok() {
+                completion.complete_success();
+            } else {
+                completion.complete_error();
+            }
+            result
+        })
+    }
+
     /// Prepare a batch of frames for a later append.
     ///
     /// Implementations may use this to move pure serialization and copy work
@@ -277,6 +337,25 @@ pub trait WalBackend: Send + Sync {
         })
     }
 
+    /// Append a prepared batch with a caller-retained completion token.
+    fn append_prepared_frames_tracked<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        prepared: &'a mut PreparedWalFrameBatch,
+        completion: VfsWriteCompletion,
+    ) -> WalFuture<'a, ()> {
+        let completion = WalTrackedCompletionGuard(completion);
+        Box::pin(async move {
+            let result = self.append_prepared_frames(cx, prepared).await;
+            if result.is_ok() {
+                completion.complete_success();
+            } else {
+                completion.complete_error();
+            }
+            result
+        })
+    }
+
     /// Append the certificate proof that authorizes the next WAL frame
     /// interval. Implementations must bind the record to their current WAL
     /// generation and make it durable when `sync` is true.
@@ -299,6 +378,58 @@ pub trait WalBackend: Send + Sync {
         _wal_frame_end: u64,
         _sync: bool,
     ) -> WalFuture<'a, ()> {
+        Box::pin(async { Err(FrankenError::Unsupported) })
+    }
+
+    /// Persist the certificate sidecar write with source-level completion
+    /// evidence retained independently of this future.
+    fn persist_parallel_wal_commit_certificate_tracked<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        certificate: &'a ParallelWalCommitCertificate,
+        wal_frame_start: u64,
+        wal_frame_end: u64,
+        sync: bool,
+        completion: VfsWriteCompletion,
+    ) -> WalFuture<'a, ()> {
+        let completion = WalTrackedCompletionGuard(completion);
+        Box::pin(async move {
+            let result = self
+                .persist_parallel_wal_commit_certificate(
+                    cx,
+                    certificate,
+                    wal_frame_start,
+                    wal_frame_end,
+                    sync,
+                )
+                .await;
+            if result.is_ok() {
+                completion.complete_success();
+            } else {
+                completion.complete_error();
+            }
+            result
+        })
+    }
+
+    /// Reconcile one exact in-doubt certificate and WAL interval while the
+    /// caller retains the external writer gate.
+    ///
+    /// Implementations must validate the live WAL generation, complete frame
+    /// boundaries, the interval's commit marker, and the exact certificate.
+    /// `Error` completion tokens are not evidence of zero bytes. On
+    /// [`ParallelWalCommitReconciliation::Authorized`], a synchronous policy
+    /// must re-establish the required sidecar, WAL, and directory durability
+    /// fences before returning. On `NotCommitted`, any incomplete tail must be
+    /// repaired before the ordered combiner residue may be aborted.
+    fn reconcile_parallel_wal_commit<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _certificate: &'a ParallelWalCommitCertificate,
+        _wal_frame_start: u64,
+        _wal_frame_end: u64,
+        _sync: bool,
+    ) -> WalFuture<'a, ParallelWalCommitReconciliation> {
         Box::pin(async { Err(FrankenError::Unsupported) })
     }
 
@@ -1677,6 +1808,8 @@ impl CheckpointPageWriter for MockCheckpointPageWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_vfs::VfsWriteCompletionState;
+    use std::task::Poll;
 
     // -- Unit tests --
 
@@ -1685,6 +1818,66 @@ mod tests {
             checkpoint_seq: 0,
             salts: fsqlite_wal::checksum::WalSalts { salt1: 0, salt2: 0 },
         }
+    }
+
+    struct PendingTrackedWalBackend;
+
+    impl WalBackend for PendingTrackedWalBackend {
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _page_number: u32,
+            _page_data: &'a [u8],
+            _db_size_if_commit: u32,
+        ) -> WalFuture<'a, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[test]
+    fn tracked_default_marks_unpolled_drop_terminal_error() {
+        let cx = Cx::new();
+        let data = [0_u8; 16];
+        let frames = [WalFrameRef {
+            page_number: 1,
+            page_data: &data,
+            db_size_if_commit: 1,
+        }];
+        let completion = VfsWriteCompletion::new();
+        let mut backend = PendingTrackedWalBackend;
+
+        let future = backend.append_frames_tracked(&cx, &frames, completion.clone());
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        drop(future);
+        assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+    }
+
+    #[test]
+    fn tracked_default_marks_polled_drop_terminal_error() {
+        let cx = Cx::new();
+        let data = [0_u8; 16];
+        let frames = [WalFrameRef {
+            page_number: 1,
+            page_data: &data,
+            db_size_if_commit: 1,
+        }];
+        let completion = VfsWriteCompletion::new();
+        let mut backend = PendingTrackedWalBackend;
+        let mut future =
+            Box::pin(backend.append_frames_tracked(&cx, &frames, completion.clone()));
+
+        let polled = std::future::poll_fn(|poll_cx| {
+            assert!(future.as_mut().poll(poll_cx).is_pending());
+            Poll::Ready(())
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("tracked-default test runtime should build");
+        runtime.block_on(polled);
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        drop(future);
+        assert_eq!(completion.state(), VfsWriteCompletionState::Error);
     }
 
     #[test]

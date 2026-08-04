@@ -27,7 +27,7 @@ use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
     WAL_CKPT_LOCK, WAL_TOTAL_LOCKS, WAL_WRITE_LOCK,
 };
-use crate::traits::{FileIdentity, Vfs, VfsFile};
+use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource};
 
 /// SQLite I/O capability bit indicating files cannot be deleted while open.
 const SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN: u32 = 0x0000_0800;
@@ -98,6 +98,21 @@ fn write_owned_at(file: File, data: Vec<u8>, offset: u64) -> std::io::Result<()>
         }
     }
     Ok(())
+}
+
+fn write_owned_at_tracked(
+    file: File,
+    data: Vec<u8>,
+    offset: u64,
+    mut completion: VfsWriteCompletionSource,
+) -> std::io::Result<()> {
+    let result = write_owned_at(file, data, offset);
+    if result.is_ok() {
+        completion.complete_success();
+    } else {
+        completion.complete_error();
+    }
+    result
 }
 
 /// Layout-compatible subset of Win32 `OVERLAPPED` used for byte-range locks.
@@ -1774,13 +1789,34 @@ impl VfsFile for WindowsFile {
         buf: &'a [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
+    }
+
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async move {
-            checkpoint_or_abort(cx)?;
-            let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+            let file = match (|| {
+                checkpoint_or_abort(cx)?;
+                self.file_ref()?.try_clone().map_err(FrankenError::Io)
+            })() {
+                Ok(file) => file,
+                Err(error) => {
+                    completion.complete_error();
+                    return Err(error);
+                }
+            };
             let data = buf.to_vec();
-            spawn_blocking_io(move || write_owned_at(file, data, offset))
-                .await
-                .map_err(FrankenError::Io)?;
+            let source_completion = VfsWriteCompletionSource::new(completion.clone());
+            spawn_blocking_io(move || {
+                write_owned_at_tracked(file, data, offset, source_completion)
+            })
+            .await
+            .map_err(FrankenError::Io)?;
             checkpoint_or_abort(cx)
         }
     }

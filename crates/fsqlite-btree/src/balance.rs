@@ -1,3 +1,4 @@
+#![allow(clippy::future_not_send)]
 //! B-tree page balancing algorithms (§11, bd-2kvo).
 //!
 //! When a page overflows (cell insertion causes it to exceed capacity) or
@@ -249,14 +250,14 @@ fn leaf_table_split_policy_for_page(
 ///
 /// Returns the page number of the new child.
 #[allow(clippy::too_many_lines)]
-pub fn balance_deeper<W: PageWriter>(
+pub async fn balance_deeper<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     root_page_no: PageNumber,
     usable_size: u32,
     page_size: u32,
 ) -> Result<PageNumber> {
-    let root_data = writer.read_page_data(cx, root_page_no)?;
+    let root_data = writer.read_page_data(cx, root_page_no).await?;
     let root_offset = header_offset_for_page(root_page_no);
     let root_header = parse_page_header(root_data.as_bytes(), root_page_no)?;
 
@@ -280,7 +281,7 @@ pub fn balance_deeper<W: PageWriter>(
     }
 
     // Allocate a new child page.
-    let child_pgno = writer.allocate_page(cx)?;
+    let child_pgno = writer.allocate_page(cx).await?;
     let child_offset = header_offset_for_page(child_pgno);
 
     // Build the child page using the extracted cells.
@@ -294,13 +295,16 @@ pub fn balance_deeper<W: PageWriter>(
     ) {
         Ok(page) => page,
         Err(err) => {
-            let _ = writer.free_page(cx, child_pgno);
+            let _ = writer.free_page(cx, child_pgno).await;
             return Err(err);
         }
     };
 
-    if let Err(err) = writer.write_page_data(cx, child_pgno, PageData::from_vec(child_data)) {
-        let _ = writer.free_page(cx, child_pgno);
+    if let Err(err) = writer
+        .write_page_data(cx, child_pgno, PageData::from_vec(child_data))
+        .await
+    {
+        let _ = writer.free_page(cx, child_pgno).await;
         return Err(err);
     }
 
@@ -327,8 +331,11 @@ pub fn balance_deeper<W: PageWriter>(
         new_root[..root_offset].copy_from_slice(&root_data.as_bytes()[..root_offset]);
     }
 
-    if let Err(err) = writer.write_page_data(cx, root_page_no, PageData::from_vec(new_root)) {
-        let _ = writer.free_page(cx, child_pgno);
+    if let Err(err) = writer
+        .write_page_data(cx, root_page_no, PageData::from_vec(new_root))
+        .await
+    {
+        let _ = writer.free_page(cx, child_pgno).await;
         return Err(err);
     }
 
@@ -360,7 +367,7 @@ pub fn balance_deeper<W: PageWriter>(
     clippy::too_many_arguments,
     reason = "quick-balance operates on explicit B-tree state rather than an aggregate config"
 )]
-pub fn balance_quick<W: PageWriter>(
+pub async fn balance_quick<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     parent_page_no: PageNumber,
@@ -371,7 +378,7 @@ pub fn balance_quick<W: PageWriter>(
     page_size: u32,
 ) -> Result<Option<PageNumber>> {
     let divider_rowid =
-        quick_balance_divider_rowid(cx, writer, leaf_page_no, overflow_rowid, usable_size)?;
+        quick_balance_divider_rowid(cx, writer, leaf_page_no, overflow_rowid, usable_size).await?;
     Ok(balance_quick_known_divider_rowid(
         cx,
         writer,
@@ -381,12 +388,13 @@ pub fn balance_quick<W: PageWriter>(
         divider_rowid,
         usable_size,
         page_size,
-    )?
+    )
+    .await?
     .map(|result| result.new_pgno))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
+pub(crate) async fn balance_quick_known_divider_rowid<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     parent_page_no: PageNumber,
@@ -400,7 +408,7 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
     // update in-memory. This hot path is only used when the split lands on the
     // rightmost child, so the parent update is always an append, not a general
     // insertion.
-    let mut parent_data = writer.read_page_data(cx, parent_page_no)?;
+    let mut parent_data = writer.read_page_data(cx, parent_page_no).await?;
     let parent_offset = header_offset_for_page(parent_page_no);
     let parent_header = parse_page_header(parent_data.as_bytes(), parent_page_no)?;
 
@@ -427,18 +435,18 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
     }
 
     // Allocate new sibling page.
-    let new_pgno = writer.allocate_page(cx)?;
+    let new_pgno = writer.allocate_page(cx).await?;
     let mut new_page = vec![0u8; page_size as usize];
     let new_offset = header_offset_for_page(new_pgno);
 
     // Initialize as leaf table page with one cell.
     let cell_size = overflow_cell.len();
     let Some(content_start) = (usable_size as usize).checked_sub(cell_size) else {
-        writer.free_page(cx, new_pgno)?;
+        writer.free_page(cx, new_pgno).await?;
         return Ok(None);
     };
     if content_start < new_offset + BTREE_LEAF_HEADER_SIZE as usize + 2 {
-        writer.free_page(cx, new_pgno)?;
+        writer.free_page(cx, new_pgno).await?;
         return Ok(None); // Cell too large, falls back to standard balance.
     }
 
@@ -463,8 +471,11 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
     new_page[content_start..content_start + cell_size].copy_from_slice(overflow_cell);
 
     let new_page_data = PageData::from_vec(new_page);
-    if let Err(err) = writer.write_page_data(cx, new_pgno, new_page_data.clone()) {
-        let _ = writer.free_page(cx, new_pgno);
+    if let Err(err) = writer
+        .write_page_data(cx, new_pgno, new_page_data.clone())
+        .await
+    {
+        let _ = writer.free_page(cx, new_pgno).await;
         return Err(err);
     }
 
@@ -476,7 +487,7 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
         + usize::from(parent_header.page_type.header_size())
         + (usize::from(parent_header.cell_count) * usize::from(CELL_POINTER_SIZE));
     if parent_ptr_write_offset + usize::from(CELL_POINTER_SIZE) > new_parent_content_offset {
-        let _ = writer.free_page(cx, new_pgno);
+        let _ = writer.free_page(cx, new_pgno).await;
         return Ok(None);
     }
 
@@ -500,8 +511,11 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
         updated_parent_header.write(page_bytes, parent_offset);
     }
 
-    if let Err(err) = writer.write_page_data(cx, parent_page_no, parent_data) {
-        let _ = writer.free_page(cx, new_pgno);
+    if let Err(err) = writer
+        .write_page_data(cx, parent_page_no, parent_data)
+        .await
+    {
+        let _ = writer.free_page(cx, new_pgno).await;
         return Err(err);
     }
 
@@ -513,14 +527,14 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
     }))
 }
 
-fn quick_balance_divider_rowid<W: PageWriter>(
+async fn quick_balance_divider_rowid<W: PageWriter>(
     cx: &Cx,
     writer: &W,
     leaf_page_no: PageNumber,
     overflow_rowid: i64,
     usable_size: u32,
 ) -> Result<i64> {
-    let leaf_data = writer.read_page_data(cx, leaf_page_no)?;
+    let leaf_data = writer.read_page_data(cx, leaf_page_no).await?;
     let leaf_offset = header_offset_for_page(leaf_page_no);
     let leaf_header = parse_page_header(leaf_data.as_bytes(), leaf_page_no)?;
     if leaf_header.cell_count == 0 {
@@ -551,7 +565,7 @@ fn quick_balance_divider_rowid<W: PageWriter>(
 /// This gathers all cells from up to 3 sibling pages plus divider cells
 /// from the parent, computes a new distribution, and writes the result.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub(crate) fn balance_nonroot<W: PageWriter>(
+pub(crate) async fn balance_nonroot<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     parent_page_no: PageNumber,
@@ -562,7 +576,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     page_size: u32,
     parent_is_root: bool,
 ) -> Result<BalanceResult> {
-    let parent_data = writer.read_page_data(cx, parent_page_no)?;
+    let parent_data = writer.read_page_data(cx, parent_page_no).await?;
     let parent_offset = header_offset_for_page(parent_page_no);
     let parent_header = parse_page_header(parent_data.as_bytes(), parent_page_no)?;
     let parent_ptrs = read_cell_pointers(parent_data.as_bytes(), &parent_header, parent_offset)?;
@@ -612,7 +626,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     let mut original_sibling_pages: Vec<(PageNumber, PageData)> = Vec::with_capacity(sibling_count);
 
     for (sib_idx, &pgno) in sibling_pgnos.iter().enumerate() {
-        let page_data = writer.read_page_data(cx, pgno)?;
+        let page_data = writer.read_page_data(cx, pgno).await?;
         original_sibling_pages.push((pgno, page_data.clone()));
         let page_offset = header_offset_for_page(pgno);
         let page_header = parse_page_header(page_data.as_bytes(), pgno)?;
@@ -732,13 +746,13 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
         if i < sibling_pgnos.len() {
             new_pgnos.push(sibling_pgnos[i]);
         } else {
-            match writer.allocate_page(cx) {
+            match writer.allocate_page(cx).await {
                 Ok(pgno) => {
                     newly_allocated_pgnos.push(pgno);
                     new_pgnos.push(pgno);
                 }
                 Err(err) => {
-                    free_pages_best_effort(cx, writer, &newly_allocated_pgnos);
+                    free_pages_best_effort(cx, writer, &newly_allocated_pgnos).await;
                     return Err(err);
                 }
             }
@@ -746,15 +760,17 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     }
     let pages_to_free_after_success: Vec<PageNumber> =
         sibling_pgnos.iter().skip(new_page_count).copied().collect();
-    let original_parent_page = writer.read_page_data(cx, parent_page_no)?;
+    let original_parent_page = writer.read_page_data(cx, parent_page_no).await?;
 
     // Inline rollback helper — avoids closure capturing `writer` which would
     // conflict with the mutable borrows needed inside the loop.
     macro_rules! do_rollback {
         ($err:expr) => {{
-            let _ = writer.write_page_data(cx, parent_page_no, original_parent_page.clone());
-            restore_pages_best_effort(cx, writer, &original_sibling_pages);
-            free_pages_best_effort(cx, writer, &newly_allocated_pgnos);
+            let _ = writer
+                .write_page_data(cx, parent_page_no, original_parent_page.clone())
+                .await;
+            restore_pages_best_effort(cx, writer, &original_sibling_pages).await;
+            free_pages_best_effort(cx, writer, &newly_allocated_pgnos).await;
             $err
         }};
     }
@@ -876,7 +892,9 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
             pgno,
             page_data,
             original_page.as_ref().map(PageData::as_bytes),
-        ) {
+        )
+        .await
+        {
             return Err(do_rollback!(err));
         }
     }
@@ -893,13 +911,15 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
         &new_pgnos,
         &new_dividers,
         parent_is_root,
-    ) {
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(err) => return Err(do_rollback!(err)),
     };
 
     for pgno in pages_to_free_after_success {
-        writer.free_page(cx, pgno)?;
+        writer.free_page(cx, pgno).await?;
     }
 
     Ok(outcome)
@@ -988,31 +1008,33 @@ fn cell_on_page_size_from_ref(cell: &CellRef, cell_start: usize) -> usize {
     size
 }
 
-fn restore_pages_best_effort<W: PageWriter>(
+async fn restore_pages_best_effort<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     pages: &[(PageNumber, PageData)],
 ) {
     for (pgno, data) in pages {
-        restore_page_best_effort(cx, writer, *pgno, data);
+        restore_page_best_effort(cx, writer, *pgno, data).await;
     }
 }
 
-fn restore_page_best_effort<W: PageWriter>(
+async fn restore_page_best_effort<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     page_no: PageNumber,
     original_page: &PageData,
 ) {
-    if let Ok(current_page) = writer.read_page_data(cx, page_no) {
+    if let Ok(current_page) = writer.read_page_data(cx, page_no).await {
         if current_page.as_bytes() == original_page.as_bytes() {
             return;
         }
     }
-    let _ = writer.write_page_data(cx, page_no, original_page.clone());
+    let _ = writer
+        .write_page_data(cx, page_no, original_page.clone())
+        .await;
 }
 
-fn write_page_if_changed<W: PageWriter>(
+async fn write_page_if_changed<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     page_no: PageNumber,
@@ -1024,16 +1046,18 @@ fn write_page_if_changed<W: PageWriter>(
             return Ok(());
         }
     }
-    writer.write_page_data(cx, page_no, PageData::from_vec(page_data))
+    writer
+        .write_page_data(cx, page_no, PageData::from_vec(page_data))
+        .await
 }
 
-fn parent_has_room_for_table_leaf_split<R: crate::cursor::PageReader>(
+async fn parent_has_room_for_table_leaf_split<R: crate::cursor::PageReader>(
     cx: &Cx,
     reader: &R,
     parent_page_no: PageNumber,
     usable_size: u32,
 ) -> Result<bool> {
-    let parent_page = reader.read_page_data(cx, parent_page_no)?;
+    let parent_page = reader.read_page_data(cx, parent_page_no).await?;
     let parent_offset = header_offset_for_page(parent_page_no);
     let parent_header = parse_page_header(parent_page.as_bytes(), parent_page_no)?;
     let parent_used = parent_offset
@@ -1156,7 +1180,7 @@ fn table_leaf_divider_bytes(
     Ok(divider[..4 + divider_len].to_vec())
 }
 
-fn rollback_prepared_leaf_table_local_split_best_effort<W: PageWriter>(
+async fn rollback_prepared_leaf_table_local_split_best_effort<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     prepared: &PreparedLeafTableLocalSplit,
@@ -1166,11 +1190,12 @@ fn rollback_prepared_leaf_table_local_split_best_effort<W: PageWriter>(
         writer,
         prepared.new_pgnos[0],
         &prepared.original_leaf_page,
-    );
-    let _ = writer.free_page(cx, prepared.new_sibling_pgno);
+    )
+    .await;
+    let _ = writer.free_page(cx, prepared.new_sibling_pgno).await;
 }
 
-fn prepare_leaf_table_local_split<W: PageWriter>(
+async fn prepare_leaf_table_local_split<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     leaf_page_no: PageNumber,
@@ -1179,7 +1204,7 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
     usable_size: u32,
     page_size: u32,
 ) -> Result<Option<PreparedLeafTableLocalSplit>> {
-    let leaf_page = writer.read_page_data(cx, leaf_page_no)?;
+    let leaf_page = writer.read_page_data(cx, leaf_page_no).await?;
     let leaf_offset = header_offset_for_page(leaf_page_no);
     let leaf_header = parse_page_header(leaf_page.as_bytes(), leaf_page_no)?;
     if leaf_header.page_type != BtreePageType::LeafTable {
@@ -1272,10 +1297,7 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         "contention-aware leaf table split policy"
     );
 
-    let new_sibling_pgno = writer.allocate_page(cx)?;
-    let rollback_allocation = |writer: &mut W| {
-        let _ = writer.free_page(cx, new_sibling_pgno);
-    };
+    let new_sibling_pgno = writer.allocate_page(cx).await?;
 
     let left_page = match build_page(
         &all_cells[..split_idx],
@@ -1287,7 +1309,7 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
     ) {
         Ok(page) => page,
         Err(err) => {
-            rollback_allocation(writer);
+            let _ = writer.free_page(cx, new_sibling_pgno).await;
             return Err(err);
         }
     };
@@ -1301,7 +1323,7 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
     ) {
         Ok(page) => page,
         Err(err) => {
-            rollback_allocation(writer);
+            let _ = writer.free_page(cx, new_sibling_pgno).await;
             return Err(err);
         }
     };
@@ -1317,8 +1339,8 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         match table_leaf_divider_bytes(leaf_page_no, &all_cells[split_idx - 1], usable_size) {
             Ok(divider) => divider,
             Err(err) => {
-                restore_page_best_effort(cx, writer, leaf_page_no, &original_leaf_page);
-                let _ = writer.free_page(cx, new_sibling_pgno);
+                restore_page_best_effort(cx, writer, leaf_page_no, &original_leaf_page).await;
+                let _ = writer.free_page(cx, new_sibling_pgno).await;
                 return Err(err);
             }
         };
@@ -1333,7 +1355,7 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
+pub(crate) async fn balance_table_leaf_local_split<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     parent_page_no: PageNumber,
@@ -1345,7 +1367,7 @@ pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
     page_size: u32,
     parent_is_root: bool,
 ) -> Result<Option<BalanceResult>> {
-    if !parent_has_room_for_table_leaf_split(cx, writer, parent_page_no, usable_size)? {
+    if !parent_has_room_for_table_leaf_split(cx, writer, parent_page_no, usable_size).await? {
         return Ok(None);
     }
 
@@ -1357,7 +1379,8 @@ pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
         overflow_insert_idx,
         usable_size,
         page_size,
-    )?
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1369,8 +1392,10 @@ pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
             *page_no,
             page_data.clone(),
             original_page.as_ref().map(PageData::as_bytes),
-        ) {
-            rollback_prepared_leaf_table_local_split_best_effort(cx, writer, &prepared);
+        )
+        .await
+        {
+            rollback_prepared_leaf_table_local_split_best_effort(cx, writer, &prepared).await;
             return Err(err);
         }
     }
@@ -1386,18 +1411,20 @@ pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
         &prepared.new_pgnos,
         &prepared.new_dividers,
         parent_is_root,
-    ) {
+    )
+    .await
+    {
         Ok(outcome) => Ok(Some(outcome)),
         Err(err) => {
-            rollback_prepared_leaf_table_local_split_best_effort(cx, writer, &prepared);
+            rollback_prepared_leaf_table_local_split_best_effort(cx, writer, &prepared).await;
             Err(err)
         }
     }
 }
 
-fn free_pages_best_effort<W: PageWriter>(cx: &Cx, writer: &mut W, pages: &[PageNumber]) {
+async fn free_pages_best_effort<W: PageWriter>(cx: &Cx, writer: &mut W, pages: &[PageNumber]) {
     for &pgno in pages {
-        let _ = writer.free_page(cx, pgno);
+        let _ = writer.free_page(cx, pgno).await;
     }
 }
 
@@ -1822,14 +1849,14 @@ fn build_page(
 ///
 /// This is used for inserting divider cells into the parent page.
 #[cfg(test)]
-fn insert_cell_into_page<W: PageWriter>(
+async fn insert_cell_into_page<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     page_no: PageNumber,
     _usable_size: u32,
     cell_data: &[u8],
 ) -> Result<()> {
-    let mut page_data = writer.read_page_data(cx, page_no)?;
+    let mut page_data = writer.read_page_data(cx, page_no).await?;
     let offset = header_offset_for_page(page_no);
     let mut header = parse_page_header(page_data.as_bytes(), page_no)?;
     let mut ptrs = read_cell_pointers(page_data.as_bytes(), &header, offset)?;
@@ -1868,7 +1895,7 @@ fn insert_cell_into_page<W: PageWriter>(
         write_cell_pointers(page_bytes, offset, &header, &ptrs);
     }
 
-    writer.write_page_data(cx, page_no, page_data)
+    writer.write_page_data(cx, page_no, page_data).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,7 +1906,7 @@ fn insert_cell_into_page<W: PageWriter>(
 ///
 /// Removes old divider cells and inserts new ones.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub(crate) fn apply_child_replacement<W: PageWriter>(
+pub(crate) async fn apply_child_replacement<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     parent_page_no: PageNumber,
@@ -1891,7 +1918,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     new_dividers: &[(PageNumber, Vec<u8>)],
     parent_is_root: bool,
 ) -> Result<BalanceResult> {
-    let page_data = writer.read_page_data(cx, parent_page_no)?;
+    let page_data = writer.read_page_data(cx, parent_page_no).await?;
     let offset = header_offset_for_page(parent_page_no);
     let header = parse_page_header(page_data.as_bytes(), parent_page_no)?;
     let ptrs = read_cell_pointers(page_data.as_bytes(), &header, offset)?;
@@ -1998,7 +2025,8 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
                 page_data.as_bytes(),
                 &final_cells,
                 right_child,
-            )?;
+            )
+            .await?;
             return Ok(BalanceResult::Split {
                 new_pgnos,
                 new_dividers,
@@ -2016,7 +2044,8 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
             &page_data.as_bytes()[..offset],
             &final_cells,
             right_child,
-        )?;
+        )
+        .await?;
         return Ok(BalanceResult::Done);
     }
 
@@ -2042,7 +2071,8 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
         parent_page_no,
         final_page,
         Some(page_data.as_bytes()),
-    )?;
+    )
+    .await?;
 
     // Balance-shallower: when the root page has zero cells after merging
     // children, copy the single right-child's content into the root and
@@ -2058,7 +2088,8 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
                 child_pgno,
                 usable_size,
                 page_size,
-            )?;
+            )
+            .await?;
         }
     }
 
@@ -2081,7 +2112,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
 /// also an interior page with zero cells, the caller is responsible for
 /// repeating the collapse (handled by the cursor's upward propagation
 /// loop).
-fn balance_shallower<W: PageWriter>(
+async fn balance_shallower<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     root_page_no: PageNumber,
@@ -2089,7 +2120,7 @@ fn balance_shallower<W: PageWriter>(
     usable_size: u32,
     page_size: u32,
 ) -> Result<()> {
-    let child_data = writer.read_page_data(cx, child_pgno)?;
+    let child_data = writer.read_page_data(cx, child_pgno).await?;
     let root_offset = header_offset_for_page(root_page_no);
     let child_offset = header_offset_for_page(child_pgno);
     let child_header = parse_page_header(child_data.as_bytes(), child_pgno)?;
@@ -2136,12 +2167,14 @@ fn balance_shallower<W: PageWriter>(
 
     // Preserve the database file header on page 1.
     if root_offset > 0 {
-        let original_root = writer.read_page_data(cx, root_page_no)?;
+        let original_root = writer.read_page_data(cx, root_page_no).await?;
         new_root[..root_offset].copy_from_slice(&original_root.as_bytes()[..root_offset]);
     }
 
-    writer.write_page_data(cx, root_page_no, PageData::from_vec(new_root))?;
-    writer.free_page(cx, child_pgno)?;
+    writer
+        .write_page_data(cx, root_page_no, PageData::from_vec(new_root))
+        .await?;
+    writer.free_page(cx, child_pgno).await?;
 
     Ok(())
 }
@@ -2174,7 +2207,7 @@ fn page_required_bytes(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn split_overflowing_root<W: PageWriter>(
+async fn split_overflowing_root<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     root_page_no: PageNumber,
@@ -2298,10 +2331,10 @@ fn split_overflowing_root<W: PageWriter>(
     let child_count = ranges.len();
     let mut child_pgnos: Vec<PageNumber> = Vec::with_capacity(child_count);
     for _ in 0..child_count {
-        match writer.allocate_page(cx) {
+        match writer.allocate_page(cx).await {
             Ok(pgno) => child_pgnos.push(pgno),
             Err(err) => {
-                free_pages_best_effort(cx, writer, &child_pgnos);
+                free_pages_best_effort(cx, writer, &child_pgnos).await;
                 return Err(err);
             }
         }
@@ -2311,7 +2344,7 @@ fn split_overflowing_root<W: PageWriter>(
         let child_offset = header_offset_for_page(child_pgnos[i]);
         let child_cells = &final_cells[start..end];
         if !page_fits(child_cells, page_type, child_offset, usable_size) {
-            free_pages_best_effort(cx, writer, &child_pgnos);
+            free_pages_best_effort(cx, writer, &child_pgnos).await;
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "overflowing root {} split child {} does not fit",
@@ -2332,7 +2365,7 @@ fn split_overflowing_root<W: PageWriter>(
         })
         .collect();
     if !page_fits(&root_cells, page_type, root_offset, usable_size) {
-        free_pages_best_effort(cx, writer, &child_pgnos);
+        free_pages_best_effort(cx, writer, &child_pgnos).await;
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
                 "overflowing root {} cannot fit {} promoted dividers",
@@ -2355,12 +2388,15 @@ fn split_overflowing_root<W: PageWriter>(
         ) {
             Ok(page) => page,
             Err(err) => {
-                free_pages_best_effort(cx, writer, &child_pgnos);
+                free_pages_best_effort(cx, writer, &child_pgnos).await;
                 return Err(err);
             }
         };
-        if let Err(err) = writer.write_page_data(cx, child_pgnos[i], PageData::from_vec(page)) {
-            free_pages_best_effort(cx, writer, &child_pgnos);
+        if let Err(err) = writer
+            .write_page_data(cx, child_pgnos[i], PageData::from_vec(page))
+            .await
+        {
+            free_pages_best_effort(cx, writer, &child_pgnos).await;
             return Err(err);
         }
     }
@@ -2385,17 +2421,20 @@ fn split_overflowing_root<W: PageWriter>(
     if root_offset > 0 {
         new_root[..root_offset].copy_from_slice(root_prefix);
     }
-    match writer.write_page_data(cx, root_page_no, PageData::from_vec(new_root)) {
+    match writer
+        .write_page_data(cx, root_page_no, PageData::from_vec(new_root))
+        .await
+    {
         Ok(()) => Ok(()),
         Err(err) => {
-            free_pages_best_effort(cx, writer, &child_pgnos);
+            free_pages_best_effort(cx, writer, &child_pgnos).await;
             Err(err)
         }
     }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn split_overflowing_nonroot_interior_page<W: PageWriter>(
+async fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     page_no: PageNumber,
@@ -2541,10 +2580,10 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     let mut child_pgnos: Vec<PageNumber> = Vec::with_capacity(child_count);
     child_pgnos.push(page_no);
     for _ in 1..child_count {
-        match writer.allocate_page(cx) {
+        match writer.allocate_page(cx).await {
             Ok(pgno) => child_pgnos.push(pgno),
             Err(err) => {
-                free_pages_best_effort(cx, writer, &child_pgnos[1..]);
+                free_pages_best_effort(cx, writer, &child_pgnos[1..]).await;
                 return Err(err);
             }
         }
@@ -2552,8 +2591,8 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
 
     macro_rules! do_rollback2 {
         ($err:expr) => {{
-            let _ = writer.write_page(cx, page_no, original_page);
-            free_pages_best_effort(cx, writer, &child_pgnos[1..]);
+            let _ = writer.write_page(cx, page_no, original_page).await;
+            free_pages_best_effort(cx, writer, &child_pgnos[1..]).await;
             $err
         }};
     }
@@ -2603,7 +2642,9 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
             } else {
                 None
             },
-        ) {
+        )
+        .await
+        {
             return Err(do_rollback2!(err));
         }
     }
@@ -2618,12 +2659,23 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation, clippy::similar_names)]
 mod tests {
+    use std::future::Future;
+
+    use asupersync::runtime::RuntimeBuilder;
+
     use super::*;
     use fsqlite_types::WitnessKey;
     use fsqlite_types::serial_type::write_varint;
     use std::collections::HashMap;
 
     const USABLE: u32 = 4096;
+
+    fn run_async<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build B-tree balance test runtime")
+            .block_on(future)
+    }
 
     /// A simple in-memory page store implementing PageReader + PageWriter.
     #[derive(Debug, Clone, Default)]
@@ -2641,28 +2693,56 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl crate::cursor::PageReader for MemPageStore {
-        fn read_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            self.pages
-                .get(&page_no.get())
-                .cloned()
-                .ok_or_else(|| FrankenError::internal(format!("page {} not found", page_no)))
+        fn read_page<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move {
+                self.pages
+                    .get(&page_no.get())
+                    .cloned()
+                    .ok_or_else(|| FrankenError::internal(format!("page {} not found", page_no)))
+            }
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for MemPageStore {
-        fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.pages.insert(page_no.get(), data.to_vec());
-            Ok(())
+        fn write_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                self.pages.insert(page_no.get(), data.to_vec());
+                Ok(())
+            }
         }
-        fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
-            let pgno = self.next_page;
-            self.next_page += 1;
-            PageNumber::new(pgno).ok_or(FrankenError::DatabaseFull)
+
+        fn allocate_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move {
+                let pgno = self.next_page;
+                self.next_page += 1;
+                PageNumber::new(pgno).ok_or(FrankenError::DatabaseFull)
+            }
         }
-        fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.pages.remove(&page_no.get());
-            Ok(())
+
+        fn free_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                self.pages.remove(&page_no.get());
+                Ok(())
+            }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -2685,30 +2765,50 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl crate::cursor::PageReader for FailingMemPageStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            self.inner.read_page(cx, page_no)
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move { self.inner.read_page(cx, page_no).await }
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for FailingMemPageStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.write_calls = self.write_calls.saturating_add(1);
-            if self.write_calls == self.fail_on_write {
-                return Err(FrankenError::internal(format!(
-                    "injected write failure on page {}",
-                    page_no.get()
-                )));
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                self.write_calls = self.write_calls.saturating_add(1);
+                if self.write_calls == self.fail_on_write {
+                    return Err(FrankenError::internal(format!(
+                        "injected write failure on page {}",
+                        page_no.get()
+                    )));
+                }
+                self.inner.write_page(cx, page_no, data).await
             }
-            self.inner.write_page(cx, page_no, data)
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.inner.free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -2736,24 +2836,44 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl crate::cursor::PageReader for RecordingMemPageStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            self.inner.read_page(cx, page_no)
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move { self.inner.read_page(cx, page_no).await }
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for RecordingMemPageStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            *self.writes_by_page.entry(page_no.get()).or_default() += 1;
-            self.inner.write_page(cx, page_no, data)
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                *self.writes_by_page.entry(page_no.get()).or_default() += 1;
+                self.inner.write_page(cx, page_no, data).await
+            }
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.inner.free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.free_page(cx, page_no).await }
         }
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
     }
@@ -2969,313 +3089,342 @@ mod tests {
 
     #[test]
     fn test_balance_deeper_basic() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(10);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(10);
 
-        // Create a leaf table root page (page 2) with some cells.
-        let root = build_leaf_table(&[(1, b"aaa"), (2, b"bbb"), (3, b"ccc")]);
-        store.pages.insert(2, root);
+            // Create a leaf table root page (page 2) with some cells.
+            let root = build_leaf_table(&[(1, b"aaa"), (2, b"bbb"), (3, b"ccc")]);
+            store.pages.insert(2, root);
 
-        let child_pgno = balance_deeper(&cx, &mut store, pn(2), USABLE, USABLE).unwrap();
+            let child_pgno = balance_deeper(&cx, &mut store, pn(2), USABLE, USABLE)
+                .await
+                .unwrap();
 
-        // Root should now be an interior page with 0 cells.
-        let root_data = store.pages.get(&2).unwrap();
-        let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
-        assert_eq!(root_header.page_type, BtreePageType::InteriorTable);
-        assert_eq!(root_header.cell_count, 0);
-        assert_eq!(root_header.right_child, Some(child_pgno));
+            // Root should now be an interior page with 0 cells.
+            let root_data = store.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
+            assert_eq!(root_header.page_type, BtreePageType::InteriorTable);
+            assert_eq!(root_header.cell_count, 0);
+            assert_eq!(root_header.right_child, Some(child_pgno));
 
-        // Child should have all 3 cells.
-        let child_data = store.pages.get(&child_pgno.get()).unwrap();
-        let child_header = BtreePageHeader::parse(child_data, 0).unwrap();
-        assert_eq!(child_header.page_type, BtreePageType::LeafTable);
-        assert_eq!(child_header.cell_count, 3);
+            // Child should have all 3 cells.
+            let child_data = store.pages.get(&child_pgno.get()).unwrap();
+            let child_header = BtreePageHeader::parse(child_data, 0).unwrap();
+            assert_eq!(child_header.page_type, BtreePageType::LeafTable);
+            assert_eq!(child_header.cell_count, 3);
 
-        // Verify cells are intact.
-        let child_ptrs = read_cell_pointers(child_data, &child_header, 0).unwrap();
-        for &ptr in &child_ptrs {
-            let cell =
-                CellRef::parse(child_data, ptr as usize, BtreePageType::LeafTable, USABLE).unwrap();
-            assert!(cell.rowid.is_some());
-        }
+            // Verify cells are intact.
+            let child_ptrs = read_cell_pointers(child_data, &child_header, 0).unwrap();
+            for &ptr in &child_ptrs {
+                let cell =
+                    CellRef::parse(child_data, ptr as usize, BtreePageType::LeafTable, USABLE)
+                        .unwrap();
+                assert!(cell.rowid.is_some());
+            }
+        });
     }
 
     #[test]
     fn test_balance_deeper_preserves_cell_order() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(10);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(10);
 
-        let entries: Vec<(i64, &[u8])> = (1..=10).map(|i| (i, b"data" as &[u8])).collect();
-        let root = build_leaf_table(&entries);
-        store.pages.insert(3, root);
+            let entries: Vec<(i64, &[u8])> = (1..=10).map(|i| (i, b"data" as &[u8])).collect();
+            let root = build_leaf_table(&entries);
+            store.pages.insert(3, root);
 
-        let child_pgno = balance_deeper(&cx, &mut store, pn(3), USABLE, USABLE).unwrap();
+            let child_pgno = balance_deeper(&cx, &mut store, pn(3), USABLE, USABLE)
+                .await
+                .unwrap();
 
-        let child_data = store.pages.get(&child_pgno.get()).unwrap();
-        let child_header = BtreePageHeader::parse(child_data, 0).unwrap();
-        let child_ptrs = read_cell_pointers(child_data, &child_header, 0).unwrap();
+            let child_data = store.pages.get(&child_pgno.get()).unwrap();
+            let child_header = BtreePageHeader::parse(child_data, 0).unwrap();
+            let child_ptrs = read_cell_pointers(child_data, &child_header, 0).unwrap();
 
-        // Verify rowid ordering.
-        let mut prev_rowid = 0i64;
-        for &ptr in &child_ptrs {
-            let cell =
-                CellRef::parse(child_data, ptr as usize, BtreePageType::LeafTable, USABLE).unwrap();
-            let rowid = cell.rowid.unwrap();
-            assert!(rowid > prev_rowid, "rowids should be ascending");
-            prev_rowid = rowid;
-        }
+            // Verify rowid ordering.
+            let mut prev_rowid = 0i64;
+            for &ptr in &child_ptrs {
+                let cell =
+                    CellRef::parse(child_data, ptr as usize, BtreePageType::LeafTable, USABLE)
+                        .unwrap();
+                let rowid = cell.rowid.unwrap();
+                assert!(rowid > prev_rowid, "rowids should be ascending");
+                prev_rowid = rowid;
+            }
+        });
     }
 
     #[test]
     fn test_balance_deeper_interior_page() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(20);
 
-        // Create an interior root page (page 5) with 2 divider cells.
-        let root = build_interior_table(&[(pn(6), 10), (pn(7), 20)], pn(8));
-        store.pages.insert(5, root);
+            // Create an interior root page (page 5) with 2 divider cells.
+            let root = build_interior_table(&[(pn(6), 10), (pn(7), 20)], pn(8));
+            store.pages.insert(5, root);
 
-        let child_pgno = balance_deeper(&cx, &mut store, pn(5), USABLE, USABLE).unwrap();
+            let child_pgno = balance_deeper(&cx, &mut store, pn(5), USABLE, USABLE)
+                .await
+                .unwrap();
 
-        // Root should be interior with 0 cells.
-        let root_data = store.pages.get(&5).unwrap();
-        let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
-        assert_eq!(root_header.page_type, BtreePageType::InteriorTable);
-        assert_eq!(root_header.cell_count, 0);
-        assert_eq!(root_header.right_child, Some(child_pgno));
+            // Root should be interior with 0 cells.
+            let root_data = store.pages.get(&5).unwrap();
+            let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
+            assert_eq!(root_header.page_type, BtreePageType::InteriorTable);
+            assert_eq!(root_header.cell_count, 0);
+            assert_eq!(root_header.right_child, Some(child_pgno));
+        });
     }
 
     // -- balance_quick tests --
 
     #[test]
     fn test_balance_quick_basic() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(20);
 
-        // Set up parent (page 2) with one cell pointing to leaf (page 3).
-        // Right-child of parent is page 3 (the leaf).
-        let parent = build_interior_table(&[(pn(4), 5)], pn(3));
-        store.pages.insert(2, parent);
+            // Set up parent (page 2) with one cell pointing to leaf (page 3).
+            // Right-child of parent is page 3 (the leaf).
+            let parent = build_interior_table(&[(pn(4), 5)], pn(3));
+            store.pages.insert(2, parent);
 
-        // Set up leaf (page 3) with some entries.
-        let leaf = build_leaf_table(&[(10, b"ten"), (20, b"twenty")]);
-        store.pages.insert(3, leaf);
+            // Set up leaf (page 3) with some entries.
+            let leaf = build_leaf_table(&[(10, b"ten"), (20, b"twenty")]);
+            store.pages.insert(3, leaf);
 
-        // Build an overflow cell for rowid 30.
-        let mut overflow_cell = [0u8; 64];
-        let mut pos = 0;
-        pos += write_varint(&mut overflow_cell[pos..], 5); // payload size
-        pos += write_varint(&mut overflow_cell[pos..], 30); // rowid
-        overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
-        pos += 5;
+            // Build an overflow cell for rowid 30.
+            let mut overflow_cell = [0u8; 64];
+            let mut pos = 0;
+            pos += write_varint(&mut overflow_cell[pos..], 5); // payload size
+            pos += write_varint(&mut overflow_cell[pos..], 30); // rowid
+            overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
+            pos += 5;
 
-        let new_pgno = balance_quick(
-            &cx,
-            &mut store,
-            pn(2),
-            pn(3),
-            &overflow_cell[..pos],
-            30,
-            USABLE,
-            USABLE,
-        )
-        .unwrap()
-        .expect("balance_quick should succeed");
+            let new_pgno = balance_quick(
+                &cx,
+                &mut store,
+                pn(2),
+                pn(3),
+                &overflow_cell[..pos],
+                30,
+                USABLE,
+                USABLE,
+            )
+            .await
+            .unwrap()
+            .expect("balance_quick should succeed");
 
-        // New sibling should have the overflow cell.
-        let new_data = store.pages.get(&new_pgno.get()).unwrap();
-        let new_header = BtreePageHeader::parse(new_data, 0).unwrap();
-        assert_eq!(new_header.cell_count, 1);
-        assert_eq!(new_header.page_type, BtreePageType::LeafTable);
+            // New sibling should have the overflow cell.
+            let new_data = store.pages.get(&new_pgno.get()).unwrap();
+            let new_header = BtreePageHeader::parse(new_data, 0).unwrap();
+            assert_eq!(new_header.cell_count, 1);
+            assert_eq!(new_header.page_type, BtreePageType::LeafTable);
 
-        // Verify the cell on the new page.
-        let new_ptrs = read_cell_pointers(new_data, &new_header, 0).unwrap();
-        let new_cell = CellRef::parse(
-            new_data,
-            new_ptrs[0] as usize,
-            BtreePageType::LeafTable,
-            USABLE,
-        )
-        .unwrap();
-        assert_eq!(new_cell.rowid, Some(30));
+            // Verify the cell on the new page.
+            let new_ptrs = read_cell_pointers(new_data, &new_header, 0).unwrap();
+            let new_cell = CellRef::parse(
+                new_data,
+                new_ptrs[0] as usize,
+                BtreePageType::LeafTable,
+                USABLE,
+            )
+            .unwrap();
+            assert_eq!(new_cell.rowid, Some(30));
 
-        // Parent should now have 2 cells and right_child = new_pgno.
-        let parent_data = store.pages.get(&2).unwrap();
-        let parent_header = BtreePageHeader::parse(parent_data, 0).unwrap();
-        assert_eq!(parent_header.cell_count, 2);
-        assert_eq!(parent_header.right_child, Some(new_pgno));
+            // Parent should now have 2 cells and right_child = new_pgno.
+            let parent_data = store.pages.get(&2).unwrap();
+            let parent_header = BtreePageHeader::parse(parent_data, 0).unwrap();
+            assert_eq!(parent_header.cell_count, 2);
+            assert_eq!(parent_header.right_child, Some(new_pgno));
+        });
     }
 
     #[test]
     fn test_balance_quick_parent_full_returns_none() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(20);
 
-        // Create a parent page that is almost full.
-        // With one existing pointer, cell_content_offset = 20 leaves 6 bytes
-        // of pointer/content gap. Even the smallest divider needs 7 bytes, so
-        // balance_quick should fail.
-        let mut full_parent = vec![0u8; USABLE as usize];
-        let header = BtreePageHeader {
-            page_type: BtreePageType::InteriorTable,
-            first_freeblock: 0,
-            cell_count: 1, // must be > 0 for content_offset to use cell_content_offset
-            cell_content_offset: 20, // artificially low
-            fragmented_free_bytes: 0,
-            right_child: Some(pn(3)),
-        };
-        header.write(&mut full_parent, 0);
-        store.pages.insert(2, full_parent);
+            // Create a parent page that is almost full.
+            // With one existing pointer, cell_content_offset = 20 leaves 6 bytes
+            // of pointer/content gap. Even the smallest divider needs 7 bytes, so
+            // balance_quick should fail.
+            let mut full_parent = vec![0u8; USABLE as usize];
+            let header = BtreePageHeader {
+                page_type: BtreePageType::InteriorTable,
+                first_freeblock: 0,
+                cell_count: 1, // must be > 0 for content_offset to use cell_content_offset
+                cell_content_offset: 20, // artificially low
+                fragmented_free_bytes: 0,
+                right_child: Some(pn(3)),
+            };
+            header.write(&mut full_parent, 0);
+            store.pages.insert(2, full_parent);
 
-        store.pages.insert(3, build_leaf_table(&[(10, b"ten")]));
+            store.pages.insert(3, build_leaf_table(&[(10, b"ten")]));
 
-        let result = balance_quick(
-            &cx,
-            &mut store,
-            pn(2),
-            pn(3),
-            b"overflow",
-            30,
-            USABLE,
-            USABLE,
-        )
-        .unwrap();
+            let result = balance_quick(
+                &cx,
+                &mut store,
+                pn(2),
+                pn(3),
+                b"overflow",
+                30,
+                USABLE,
+                USABLE,
+            )
+            .await
+            .unwrap();
 
-        assert!(
-            result.is_none(),
-            "balance_quick should return None when parent is full"
-        );
+            assert!(
+                result.is_none(),
+                "balance_quick should return None when parent is full"
+            );
+        });
     }
 
     #[test]
     fn test_balance_quick_uses_exact_divider_space() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(20);
 
-        // One existing pointer plus cell_content_offset = 22 leaves 8 bytes
-        // for the new pointer and divider. The old worst-case gate required
-        // 15 bytes, but rowid 10 has a one-byte varint, so the actual divider
-        // update needs only 7 bytes.
-        let mut parent = vec![0u8; USABLE as usize];
-        let header = BtreePageHeader {
-            page_type: BtreePageType::InteriorTable,
-            first_freeblock: 0,
-            cell_count: 1,
-            cell_content_offset: 22,
-            fragmented_free_bytes: 0,
-            right_child: Some(pn(3)),
-        };
-        header.write(&mut parent, 0);
-        store.pages.insert(2, parent);
-        store.pages.insert(3, build_leaf_table(&[(10, b"ten")]));
+            // One existing pointer plus cell_content_offset = 22 leaves 8 bytes
+            // for the new pointer and divider. The old worst-case gate required
+            // 15 bytes, but rowid 10 has a one-byte varint, so the actual divider
+            // update needs only 7 bytes.
+            let mut parent = vec![0u8; USABLE as usize];
+            let header = BtreePageHeader {
+                page_type: BtreePageType::InteriorTable,
+                first_freeblock: 0,
+                cell_count: 1,
+                cell_content_offset: 22,
+                fragmented_free_bytes: 0,
+                right_child: Some(pn(3)),
+            };
+            header.write(&mut parent, 0);
+            store.pages.insert(2, parent);
+            store.pages.insert(3, build_leaf_table(&[(10, b"ten")]));
 
-        let mut overflow_cell = [0u8; 64];
-        let mut pos = 0;
-        pos += write_varint(&mut overflow_cell[pos..], 5);
-        pos += write_varint(&mut overflow_cell[pos..], 30);
-        overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
-        pos += 5;
+            let mut overflow_cell = [0u8; 64];
+            let mut pos = 0;
+            pos += write_varint(&mut overflow_cell[pos..], 5);
+            pos += write_varint(&mut overflow_cell[pos..], 30);
+            overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
+            pos += 5;
 
-        let new_pgno = balance_quick(
-            &cx,
-            &mut store,
-            pn(2),
-            pn(3),
-            &overflow_cell[..pos],
-            30,
-            USABLE,
-            USABLE,
-        )
-        .expect("quick balance should not fail")
-        .expect("exact divider space should allow quick balance");
+            let new_pgno = balance_quick(
+                &cx,
+                &mut store,
+                pn(2),
+                pn(3),
+                &overflow_cell[..pos],
+                30,
+                USABLE,
+                USABLE,
+            )
+            .await
+            .expect("quick balance should not fail")
+            .expect("exact divider space should allow quick balance");
 
-        let parent_data = store.pages.get(&2).unwrap();
-        let parent_header = BtreePageHeader::parse(parent_data, 0).unwrap();
-        assert_eq!(parent_header.cell_count, 2);
-        assert_eq!(parent_header.cell_content_offset, 17);
-        assert_eq!(parent_header.right_child, Some(new_pgno));
+            let parent_data = store.pages.get(&2).unwrap();
+            let parent_header = BtreePageHeader::parse(parent_data, 0).unwrap();
+            assert_eq!(parent_header.cell_count, 2);
+            assert_eq!(parent_header.cell_content_offset, 17);
+            assert_eq!(parent_header.right_child, Some(new_pgno));
+        });
     }
 
     #[test]
     fn test_balance_quick_parent_write_failure_frees_new_page_and_preserves_parent() {
-        let cx = Cx::new();
-        let mut store = FailingMemPageStore::new(MemPageStore::new(20), 2);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = FailingMemPageStore::new(MemPageStore::new(20), 2);
 
-        let original_parent = build_interior_table(&[(pn(4), 5)], pn(3));
-        store.inner.pages.insert(2, original_parent.clone());
-        store
-            .inner
-            .pages
-            .insert(3, build_leaf_table(&[(10, b"ten")]));
+            let original_parent = build_interior_table(&[(pn(4), 5)], pn(3));
+            store.inner.pages.insert(2, original_parent.clone());
+            store
+                .inner
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"ten")]));
 
-        let mut overflow_cell = [0u8; 64];
-        let mut pos = 0;
-        pos += write_varint(&mut overflow_cell[pos..], 5);
-        pos += write_varint(&mut overflow_cell[pos..], 30);
-        overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
-        pos += 5;
+            let mut overflow_cell = [0u8; 64];
+            let mut pos = 0;
+            pos += write_varint(&mut overflow_cell[pos..], 5);
+            pos += write_varint(&mut overflow_cell[pos..], 30);
+            overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
+            pos += 5;
 
-        let err = balance_quick(
-            &cx,
-            &mut store,
-            pn(2),
-            pn(3),
-            &overflow_cell[..pos],
-            30,
-            USABLE,
-            USABLE,
-        )
-        .expect_err("injected parent insert failure should propagate");
-        assert!(err.to_string().contains("injected write failure"));
-        assert_eq!(store.inner.pages.get(&2), Some(&original_parent));
-        assert!(
-            !store.inner.pages.contains_key(&20),
-            "failed quick balance must free the allocated sibling page"
-        );
+            let err = balance_quick(
+                &cx,
+                &mut store,
+                pn(2),
+                pn(3),
+                &overflow_cell[..pos],
+                30,
+                USABLE,
+                USABLE,
+            )
+            .await
+            .expect_err("injected parent insert failure should propagate");
+            assert!(err.to_string().contains("injected write failure"));
+            assert_eq!(store.inner.pages.get(&2), Some(&original_parent));
+            assert!(
+                !store.inner.pages.contains_key(&20),
+                "failed quick balance must free the allocated sibling page"
+            );
+        });
     }
 
     #[test]
     fn test_balance_quick_writes_parent_once() {
-        let cx = Cx::new();
-        let mut store = RecordingMemPageStore::new(MemPageStore::new(20));
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = RecordingMemPageStore::new(MemPageStore::new(20));
 
-        let original_parent = build_interior_table(&[(pn(4), 5)], pn(3));
-        store.inner.pages.insert(2, original_parent);
-        store
-            .inner
-            .pages
-            .insert(3, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
+            let original_parent = build_interior_table(&[(pn(4), 5)], pn(3));
+            store.inner.pages.insert(2, original_parent);
+            store
+                .inner
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
 
-        let mut overflow_cell = [0u8; 64];
-        let mut pos = 0;
-        pos += write_varint(&mut overflow_cell[pos..], 5);
-        pos += write_varint(&mut overflow_cell[pos..], 30);
-        overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
-        pos += 5;
+            let mut overflow_cell = [0u8; 64];
+            let mut pos = 0;
+            pos += write_varint(&mut overflow_cell[pos..], 5);
+            pos += write_varint(&mut overflow_cell[pos..], 30);
+            overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
+            pos += 5;
 
-        let new_pgno = balance_quick(
-            &cx,
-            &mut store,
-            pn(2),
-            pn(3),
-            &overflow_cell[..pos],
-            30,
-            USABLE,
-            USABLE,
-        )
-        .expect("quick balance should succeed")
-        .expect("quick balance should allocate a sibling");
+            let new_pgno = balance_quick(
+                &cx,
+                &mut store,
+                pn(2),
+                pn(3),
+                &overflow_cell[..pos],
+                30,
+                USABLE,
+                USABLE,
+            )
+            .await
+            .expect("quick balance should succeed")
+            .expect("quick balance should allocate a sibling");
 
-        assert_eq!(
-            store.write_count(pn(2)),
-            1,
-            "quick balance should write the parent once"
-        );
-        assert_eq!(
-            store.write_count(new_pgno),
-            1,
-            "quick balance should write the new sibling once"
-        );
+            assert_eq!(
+                store.write_count(pn(2)),
+                1,
+                "quick balance should write the parent once"
+            );
+            assert_eq!(
+                store.write_count(new_pgno),
+                1,
+                "quick balance should write the new sibling once"
+            );
+        });
     }
 
     #[test]
@@ -3712,170 +3861,179 @@ mod tests {
 
     #[test]
     fn test_apply_child_replacement_noop_skips_parent_rewrite() {
-        let cx = Cx::new();
-        let mut store = RecordingMemPageStore::new(MemPageStore::new(20));
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = RecordingMemPageStore::new(MemPageStore::new(20));
 
-        let parent = build_interior_table(&[(pn(3), 40), (pn(4), 80)], pn(5));
-        store.inner.pages.insert(2, parent.clone());
+            let parent = build_interior_table(&[(pn(3), 40), (pn(4), 80)], pn(5));
+            store.inner.pages.insert(2, parent.clone());
 
-        let outcome = apply_child_replacement(
-            &cx,
-            &mut store,
-            pn(2),
-            USABLE,
-            USABLE,
-            1,
-            1,
-            &[pn(4)],
-            &[],
-            false,
-        )
-        .expect("no-op replacement should succeed");
+            let outcome = apply_child_replacement(
+                &cx,
+                &mut store,
+                pn(2),
+                USABLE,
+                USABLE,
+                1,
+                1,
+                &[pn(4)],
+                &[],
+                false,
+            )
+            .await
+            .expect("no-op replacement should succeed");
 
-        assert!(matches!(outcome, BalanceResult::Done));
-        assert_eq!(
-            store.write_count(pn(2)),
-            0,
-            "identical parent image should not be rewritten"
-        );
-        assert_eq!(store.inner.pages.get(&2), Some(&parent));
+            assert!(matches!(outcome, BalanceResult::Done));
+            assert_eq!(
+                store.write_count(pn(2)),
+                0,
+                "identical parent image should not be rewritten"
+            );
+            assert_eq!(store.inner.pages.get(&2), Some(&parent));
+        });
     }
 
     #[test]
     fn test_balance_table_leaf_local_split_only_touches_target_leaf_parent_and_new_sibling() {
-        let cx = Cx::new();
-        let mut base = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
 
-        let payload = vec![b'm'; 240];
-        let left_entries: Vec<(i64, &[u8])> = (10_i64..=12)
-            .map(|rowid| (rowid, b"left" as &[u8]))
-            .collect();
-        let middle_entries: Vec<(i64, &[u8])> = (100_i64..=115)
-            .map(|rowid| (rowid, payload.as_slice()))
-            .collect();
-        let right_entries: Vec<(i64, &[u8])> = (200_i64..=202)
-            .map(|rowid| (rowid, b"right" as &[u8]))
-            .collect();
+            let payload = vec![b'm'; 240];
+            let left_entries: Vec<(i64, &[u8])> = (10_i64..=12)
+                .map(|rowid| (rowid, b"left" as &[u8]))
+                .collect();
+            let middle_entries: Vec<(i64, &[u8])> = (100_i64..=115)
+                .map(|rowid| (rowid, payload.as_slice()))
+                .collect();
+            let right_entries: Vec<(i64, &[u8])> = (200_i64..=202)
+                .map(|rowid| (rowid, b"right" as &[u8]))
+                .collect();
 
-        let parent = build_interior_table(&[(pn(3), 40), (pn(4), 150)], pn(5));
-        let left_leaf = build_leaf_table(&left_entries);
-        let middle_leaf = build_leaf_table(&middle_entries);
-        let right_leaf = build_leaf_table(&right_entries);
-        let original_middle_leaf = middle_leaf.clone();
+            let parent = build_interior_table(&[(pn(3), 40), (pn(4), 150)], pn(5));
+            let left_leaf = build_leaf_table(&left_entries);
+            let middle_leaf = build_leaf_table(&middle_entries);
+            let right_leaf = build_leaf_table(&right_entries);
+            let original_middle_leaf = middle_leaf.clone();
 
-        base.pages.insert(2, parent);
-        base.pages.insert(3, left_leaf.clone());
-        base.pages.insert(4, middle_leaf);
-        base.pages.insert(5, right_leaf.clone());
+            base.pages.insert(2, parent);
+            base.pages.insert(3, left_leaf.clone());
+            base.pages.insert(4, middle_leaf);
+            base.pages.insert(5, right_leaf.clone());
 
-        let mut store = RecordingMemPageStore::new(base);
-        let overflow_cell = build_leaf_table_cell(50, payload.as_slice());
+            let mut store = RecordingMemPageStore::new(base);
+            let overflow_cell = build_leaf_table_cell(50, payload.as_slice());
 
-        let outcome = balance_table_leaf_local_split(
-            &cx,
-            &mut store,
-            pn(2),
-            1,
-            pn(4),
-            &overflow_cell,
-            0,
-            USABLE,
-            USABLE,
-            true,
-        )
-        .expect("local split should succeed")
-        .expect("leaf table split should take the local fast path");
+            let outcome = balance_table_leaf_local_split(
+                &cx,
+                &mut store,
+                pn(2),
+                1,
+                pn(4),
+                &overflow_cell,
+                0,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .expect("local split should succeed")
+            .expect("leaf table split should take the local fast path");
 
-        assert!(matches!(outcome, BalanceResult::Done));
-        assert_eq!(
-            store.write_count(pn(2)),
-            1,
-            "parent should be updated exactly once"
-        );
-        assert_eq!(
-            store.write_count(pn(4)),
-            1,
-            "target leaf should be rewritten exactly once"
-        );
-        assert_eq!(
-            store.write_count(pn(20)),
-            1,
-            "local split should allocate and write exactly one new sibling"
-        );
-        assert_eq!(
-            store.write_count(pn(3)),
-            0,
-            "left neighbor must remain untouched"
-        );
-        assert_eq!(
-            store.write_count(pn(5)),
-            0,
-            "right neighbor must remain untouched"
-        );
-        assert_eq!(store.inner.pages.get(&3), Some(&left_leaf));
-        assert_eq!(store.inner.pages.get(&5), Some(&right_leaf));
-        assert_ne!(
-            store.inner.pages.get(&4),
-            Some(&original_middle_leaf),
-            "target leaf should actually change when the split fires"
-        );
+            assert!(matches!(outcome, BalanceResult::Done));
+            assert_eq!(
+                store.write_count(pn(2)),
+                1,
+                "parent should be updated exactly once"
+            );
+            assert_eq!(
+                store.write_count(pn(4)),
+                1,
+                "target leaf should be rewritten exactly once"
+            );
+            assert_eq!(
+                store.write_count(pn(20)),
+                1,
+                "local split should allocate and write exactly one new sibling"
+            );
+            assert_eq!(
+                store.write_count(pn(3)),
+                0,
+                "left neighbor must remain untouched"
+            );
+            assert_eq!(
+                store.write_count(pn(5)),
+                0,
+                "right neighbor must remain untouched"
+            );
+            assert_eq!(store.inner.pages.get(&3), Some(&left_leaf));
+            assert_eq!(store.inner.pages.get(&5), Some(&right_leaf));
+            assert_ne!(
+                store.inner.pages.get(&4),
+                Some(&original_middle_leaf),
+                "target leaf should actually change when the split fires"
+            );
+        });
     }
 
     #[test]
     fn test_balance_table_leaf_local_split_bails_when_parent_is_full() {
-        let cx = Cx::new();
-        let mut base = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
 
-        let mut full_parent = vec![0u8; USABLE as usize];
-        let header = BtreePageHeader {
-            page_type: BtreePageType::InteriorTable,
-            first_freeblock: 0,
-            cell_count: 1,
-            cell_content_offset: 20,
-            fragmented_free_bytes: 0,
-            right_child: Some(pn(5)),
-        };
-        header.write(&mut full_parent, 0);
+            let mut full_parent = vec![0u8; USABLE as usize];
+            let header = BtreePageHeader {
+                page_type: BtreePageType::InteriorTable,
+                first_freeblock: 0,
+                cell_count: 1,
+                cell_content_offset: 20,
+                fragmented_free_bytes: 0,
+                right_child: Some(pn(5)),
+            };
+            header.write(&mut full_parent, 0);
 
-        let payload = vec![b'm'; 240];
-        let leaf_entries: Vec<(i64, &[u8])> = (100_i64..=115)
-            .map(|rowid| (rowid, payload.as_slice()))
-            .collect();
-        let leaf = build_leaf_table(&leaf_entries);
-        let original_leaf = leaf.clone();
+            let payload = vec![b'm'; 240];
+            let leaf_entries: Vec<(i64, &[u8])> = (100_i64..=115)
+                .map(|rowid| (rowid, payload.as_slice()))
+                .collect();
+            let leaf = build_leaf_table(&leaf_entries);
+            let original_leaf = leaf.clone();
 
-        base.pages.insert(2, full_parent.clone());
-        base.pages.insert(5, leaf);
+            base.pages.insert(2, full_parent.clone());
+            base.pages.insert(5, leaf);
 
-        let mut store = RecordingMemPageStore::new(base);
-        let overflow_cell = build_leaf_table_cell(50, payload.as_slice());
+            let mut store = RecordingMemPageStore::new(base);
+            let overflow_cell = build_leaf_table_cell(50, payload.as_slice());
 
-        let outcome = balance_table_leaf_local_split(
-            &cx,
-            &mut store,
-            pn(2),
-            1,
-            pn(5),
-            &overflow_cell,
-            0,
-            USABLE,
-            USABLE,
-            true,
-        )
-        .expect("parent-space gate should not error");
+            let outcome = balance_table_leaf_local_split(
+                &cx,
+                &mut store,
+                pn(2),
+                1,
+                pn(5),
+                &overflow_cell,
+                0,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .expect("parent-space gate should not error");
 
-        assert!(
-            outcome.is_none(),
-            "local split should decline when parent lacks room for the divider"
-        );
-        assert_eq!(store.write_count(pn(2)), 0);
-        assert_eq!(store.write_count(pn(5)), 0);
-        assert_eq!(store.inner.pages.get(&2), Some(&full_parent));
-        assert_eq!(store.inner.pages.get(&5), Some(&original_leaf));
-        assert!(
-            !store.inner.pages.contains_key(&20),
-            "declined local split must not allocate a sibling page"
-        );
+            assert!(
+                outcome.is_none(),
+                "local split should decline when parent lacks room for the divider"
+            );
+            assert_eq!(store.write_count(pn(2)), 0);
+            assert_eq!(store.write_count(pn(5)), 0);
+            assert_eq!(store.inner.pages.get(&2), Some(&full_parent));
+            assert_eq!(store.inner.pages.get(&5), Some(&original_leaf));
+            assert!(
+                !store.inner.pages.contains_key(&20),
+                "declined local split must not allocate a sibling page"
+            );
+        });
     }
 
     // -- page_required_bytes / page_fits tests --
@@ -4131,302 +4289,326 @@ mod tests {
 
     #[test]
     fn test_balance_nonroot_two_siblings_merge() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(20);
 
-        // Parent (page 2): 1 divider cell pointing to left=page 3, right=page 4.
-        let parent = build_interior_table(&[(pn(3), 50)], pn(4));
-        store.pages.insert(2, parent);
+            // Parent (page 2): 1 divider cell pointing to left=page 3, right=page 4.
+            let parent = build_interior_table(&[(pn(3), 50)], pn(4));
+            store.pages.insert(2, parent);
 
-        // Left child (page 3): 2 entries.
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(10, b"ten"), (50, b"fifty")]));
+            // Left child (page 3): 2 entries.
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"ten"), (50, b"fifty")]));
 
-        // Right child (page 4): 2 entries.
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
+            // Right child (page 4): 2 entries.
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
 
-        // Balance around child 0 (left child), no overflow.
-        let outcome =
-            balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true).unwrap();
-        assert!(matches!(outcome, BalanceResult::Done));
+            // Balance around child 0 (left child), no overflow.
+            let outcome = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, BalanceResult::Done));
 
-        // All four leaf-table cells fit on one page, so balance_shallower
-        // collapses the root to a leaf. The parent divider key is not an
-        // extra table row; it is only a separator copied from the left child.
-        let root_data = store.pages.get(&2).unwrap();
-        let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
-        assert!(
-            root_header.page_type.is_leaf(),
-            "root should collapse to leaf after small-cell merge with overflow"
-        );
-        // Original: 4 leaf rows total.
-        assert_eq!(
-            root_header.cell_count, 4,
-            "all leaf-table rows should be preserved after merge"
-        );
+            // All four leaf-table cells fit on one page, so balance_shallower
+            // collapses the root to a leaf. The parent divider key is not an
+            // extra table row; it is only a separator copied from the left child.
+            let root_data = store.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
+            assert!(
+                root_header.page_type.is_leaf(),
+                "root should collapse to leaf after small-cell merge with overflow"
+            );
+            // Original: 4 leaf rows total.
+            assert_eq!(
+                root_header.cell_count, 4,
+                "all leaf-table rows should be preserved after merge"
+            );
+        });
     }
 
     #[test]
     fn test_balance_nonroot_leaf_index_preserves_exact_cell_multiset_and_order() {
-        fn key(ordinal: u16) -> Vec<u8> {
-            let mut key = vec![0u8; 480];
-            key[..2].copy_from_slice(&ordinal.to_be_bytes());
-            for (index, byte) in key[2..].iter_mut().enumerate() {
-                *byte = ordinal
-                    .wrapping_mul(31)
-                    .wrapping_add(u16::try_from(index).expect("fixture index fits in u16"))
-                    as u8;
+        run_async(async {
+            fn key(ordinal: u16) -> Vec<u8> {
+                let mut key = vec![0u8; 480];
+                key[..2].copy_from_slice(&ordinal.to_be_bytes());
+                for (index, byte) in key[2..].iter_mut().enumerate() {
+                    *byte = ordinal
+                        .wrapping_mul(31)
+                        .wrapping_add(u16::try_from(index).expect("fixture index fits in u16"))
+                        as u8;
+                }
+                key
             }
-            key
-        }
 
-        let base_ordinals: Vec<u16> = (1_u16..=26).map(|value| value * 10).collect();
-        let cases = [
-            (0usize, 0usize, 5u16),
-            (1usize, 4usize, 135u16),
-            (2usize, 8usize, 270u16),
-        ];
+            let base_ordinals: Vec<u16> = (1_u16..=26).map(|value| value * 10).collect();
+            let cases = [
+                (0usize, 0usize, 5u16),
+                (1usize, 4usize, 135u16),
+                (2usize, 8usize, 270u16),
+            ];
+            let cx = Cx::new();
 
-        for (child_idx, insert_idx, inserted_ordinal) in cases {
-            let keys: Vec<Vec<u8>> = base_ordinals.iter().copied().map(key).collect();
-            let mut store = MemPageStore::new(20);
-            store.pages.insert(
-                2,
-                build_interior_index(
-                    &[(pn(3), keys[8].clone()), (pn(4), keys[17].clone())],
-                    pn(5),
-                ),
-            );
-            store.pages.insert(3, build_leaf_index(&keys[0..8]));
-            store.pages.insert(4, build_leaf_index(&keys[9..17]));
-            store.pages.insert(5, build_leaf_index(&keys[18..26]));
-            for page_no in 3_u32..=5 {
-                let page = store.pages.get(&page_no).expect("packed leaf exists");
-                let header = BtreePageHeader::parse(page, 0).expect("parse packed leaf");
-                let pointer_end = usize::from(header.page_type.header_size())
-                    + usize::from(header.cell_count) * usize::from(CELL_POINTER_SIZE);
-                let free_space = header.content_offset(USABLE).saturating_sub(pointer_end);
+            for (child_idx, insert_idx, inserted_ordinal) in cases {
+                let keys: Vec<Vec<u8>> = base_ordinals.iter().copied().map(key).collect();
+                let mut store = MemPageStore::new(20);
+                store.pages.insert(
+                    2,
+                    build_interior_index(
+                        &[(pn(3), keys[8].clone()), (pn(4), keys[17].clone())],
+                        pn(5),
+                    ),
+                );
+                store.pages.insert(3, build_leaf_index(&keys[0..8]));
+                store.pages.insert(4, build_leaf_index(&keys[9..17]));
+                store.pages.insert(5, build_leaf_index(&keys[18..26]));
+                for page_no in 3_u32..=5 {
+                    let page = store.pages.get(&page_no).expect("packed leaf exists");
+                    let header = BtreePageHeader::parse(page, 0).expect("parse packed leaf");
+                    let pointer_end = usize::from(header.page_type.header_size())
+                        + usize::from(header.cell_count) * usize::from(CELL_POINTER_SIZE);
+                    let free_space = header.content_offset(USABLE).saturating_sub(pointer_end);
+                    assert!(
+                        free_space < 256,
+                        "fixture leaf {page_no} must be at least 15/16 packed, free={free_space}"
+                    );
+                }
+
+                let overflow_cell = build_leaf_index_cell(&key(inserted_ordinal));
+                balance_nonroot(
+                    &cx,
+                    &mut store,
+                    pn(2),
+                    child_idx,
+                    std::slice::from_ref(&overflow_cell),
+                    insert_idx,
+                    USABLE,
+                    USABLE,
+                    true,
+                )
+                .await
+                .expect("leaf-index balance should succeed");
+
+                let mut expected: Vec<Vec<u8>> = keys
+                    .iter()
+                    .map(|value| build_leaf_index_cell(value))
+                    .collect();
+                expected.push(overflow_cell);
+                expected.sort();
+
+                let actual = logical_index_cells(&store, pn(2));
+                assert_eq!(actual, expected, "insert ordinal {inserted_ordinal}");
                 assert!(
-                    free_space < 256,
-                    "fixture leaf {page_no} must be at least 15/16 packed, free={free_space}"
+                    actual.windows(2).all(|pair| pair[0] < pair[1]),
+                    "balanced index must stay strictly ordered without duplicates"
                 );
             }
-
-            let overflow_cell = build_leaf_index_cell(&key(inserted_ordinal));
-            balance_nonroot(
-                &Cx::new(),
-                &mut store,
-                pn(2),
-                child_idx,
-                std::slice::from_ref(&overflow_cell),
-                insert_idx,
-                USABLE,
-                USABLE,
-                true,
-            )
-            .expect("leaf-index balance should succeed");
-
-            let mut expected: Vec<Vec<u8>> = keys
-                .iter()
-                .map(|value| build_leaf_index_cell(value))
-                .collect();
-            expected.push(overflow_cell);
-            expected.sort();
-
-            let actual = logical_index_cells(&store, pn(2));
-            assert_eq!(actual, expected, "insert ordinal {inserted_ordinal}");
-            assert!(
-                actual.windows(2).all(|pair| pair[0] < pair[1]),
-                "balanced index must stay strictly ordered without duplicates"
-            );
-        }
+        });
     }
 
     #[test]
     fn test_balance_shallower_page1_skips_when_child_cannot_fit() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(10);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(10);
 
-        // Build a child leaf page whose payload fits offset=0 pages but not
-        // page-1 offset=100 pages.
-        let child_data = {
-            let mut selected: Option<Vec<u8>> = None;
-            'search: for payload_len in [96usize, 112, 128, 144, 160] {
-                for entry_count in 16usize..64usize {
-                    let payload = vec![b'x'; payload_len];
-                    let mut entries: Vec<(i64, &[u8])> = Vec::with_capacity(entry_count);
-                    for rowid in 1..=entry_count {
-                        let rowid_i64 = i64::try_from(rowid).expect("rowid fits in i64");
-                        entries.push((rowid_i64, payload.as_slice()));
-                    }
-                    let candidate = build_leaf_table(&entries);
-                    let header = BtreePageHeader::parse(&candidate, 0).expect("parse child header");
-                    let ptrs =
-                        read_cell_pointers(&candidate, &header, 0).expect("read child pointers");
-                    let mut cells: Vec<GatheredCell> = Vec::with_capacity(ptrs.len());
-                    for ptr in ptrs {
-                        let cell_offset = usize::from(ptr);
-                        let cell_ref =
-                            CellRef::parse(&candidate, cell_offset, header.page_type, USABLE)
-                                .expect("cell ref");
-                        let cell_end =
-                            cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
-                        let data = candidate[cell_offset..cell_end].to_vec();
-                        let size = u16::try_from(data.len()).expect("cell size");
-                        cells.push(GatheredCell { data, size });
-                    }
-                    if page_fits(&cells, header.page_type, 0, USABLE)
-                        && !page_fits(&cells, header.page_type, 100, USABLE)
-                    {
-                        selected = Some(candidate);
-                        break 'search;
+            // Build a child leaf page whose payload fits offset=0 pages but not
+            // page-1 offset=100 pages.
+            let child_data = {
+                let mut selected: Option<Vec<u8>> = None;
+                'search: for payload_len in [96usize, 112, 128, 144, 160] {
+                    for entry_count in 16usize..64usize {
+                        let payload = vec![b'x'; payload_len];
+                        let mut entries: Vec<(i64, &[u8])> = Vec::with_capacity(entry_count);
+                        for rowid in 1..=entry_count {
+                            let rowid_i64 = i64::try_from(rowid).expect("rowid fits in i64");
+                            entries.push((rowid_i64, payload.as_slice()));
+                        }
+                        let candidate = build_leaf_table(&entries);
+                        let header =
+                            BtreePageHeader::parse(&candidate, 0).expect("parse child header");
+                        let ptrs = read_cell_pointers(&candidate, &header, 0)
+                            .expect("read child pointers");
+                        let mut cells: Vec<GatheredCell> = Vec::with_capacity(ptrs.len());
+                        for ptr in ptrs {
+                            let cell_offset = usize::from(ptr);
+                            let cell_ref =
+                                CellRef::parse(&candidate, cell_offset, header.page_type, USABLE)
+                                    .expect("cell ref");
+                            let cell_end =
+                                cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
+                            let data = candidate[cell_offset..cell_end].to_vec();
+                            let size = u16::try_from(data.len()).expect("cell size");
+                            cells.push(GatheredCell { data, size });
+                        }
+                        if page_fits(&cells, header.page_type, 0, USABLE)
+                            && !page_fits(&cells, header.page_type, 100, USABLE)
+                        {
+                            selected = Some(candidate);
+                            break 'search;
+                        }
                     }
                 }
-            }
-            selected.expect("find child page that only fits non-page1 offset")
-        };
+                selected.expect("find child page that only fits non-page1 offset")
+            };
 
-        let db_header = vec![0xAB; 100];
-        let mut root_page = vec![0u8; USABLE as usize];
-        root_page[..100].copy_from_slice(&db_header);
-        let root_header = BtreePageHeader {
-            page_type: BtreePageType::InteriorTable,
-            first_freeblock: 0,
-            cell_count: 0,
-            cell_content_offset: USABLE,
-            fragmented_free_bytes: 0,
-            right_child: Some(pn(2)),
-        };
-        root_header.write(&mut root_page, 100);
+            let db_header = vec![0xAB; 100];
+            let mut root_page = vec![0u8; USABLE as usize];
+            root_page[..100].copy_from_slice(&db_header);
+            let root_header = BtreePageHeader {
+                page_type: BtreePageType::InteriorTable,
+                first_freeblock: 0,
+                cell_count: 0,
+                cell_content_offset: USABLE,
+                fragmented_free_bytes: 0,
+                right_child: Some(pn(2)),
+            };
+            root_header.write(&mut root_page, 100);
 
-        store.pages.insert(1, root_page.clone());
-        store.pages.insert(2, child_data);
+            store.pages.insert(1, root_page.clone());
+            store.pages.insert(2, child_data);
 
-        balance_shallower(&cx, &mut store, pn(1), pn(2), USABLE, USABLE)
-            .expect("balance shallower");
+            balance_shallower(&cx, &mut store, pn(1), pn(2), USABLE, USABLE)
+                .await
+                .expect("balance shallower");
 
-        // Root remains unchanged interior page with right-child pointer.
-        let updated_root = store.pages.get(&1).expect("root page exists");
-        assert_eq!(&updated_root[..100], db_header.as_slice());
-        let updated_header = BtreePageHeader::parse(updated_root, 100).expect("root header");
-        assert_eq!(updated_header.page_type, BtreePageType::InteriorTable);
-        assert_eq!(updated_header.cell_count, 0);
-        assert_eq!(updated_header.right_child, Some(pn(2)));
+            // Root remains unchanged interior page with right-child pointer.
+            let updated_root = store.pages.get(&1).expect("root page exists");
+            assert_eq!(&updated_root[..100], db_header.as_slice());
+            let updated_header = BtreePageHeader::parse(updated_root, 100).expect("root header");
+            assert_eq!(updated_header.page_type, BtreePageType::InteriorTable);
+            assert_eq!(updated_header.cell_count, 0);
+            assert_eq!(updated_header.right_child, Some(pn(2)));
+        });
     }
 
     // -- insert_cell_into_page test --
 
     #[test]
     fn test_insert_cell_into_page() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(20);
 
-        // Start with an interior page with 1 cell.
-        let page = build_interior_table(&[(pn(3), 10)], pn(4));
-        store.pages.insert(2, page);
+            // Start with an interior page with 1 cell.
+            let page = build_interior_table(&[(pn(3), 10)], pn(4));
+            store.pages.insert(2, page);
 
-        // Build a new divider cell: [child_ptr=5] [rowid=20].
-        let mut cell_buf = [0u8; 13];
-        cell_buf[0..4].copy_from_slice(&5u32.to_be_bytes());
-        let vlen = write_varint(&mut cell_buf[4..], 20);
-        let cell_size = 4 + vlen;
+            // Build a new divider cell: [child_ptr=5] [rowid=20].
+            let mut cell_buf = [0u8; 13];
+            cell_buf[0..4].copy_from_slice(&5u32.to_be_bytes());
+            let vlen = write_varint(&mut cell_buf[4..], 20);
+            let cell_size = 4 + vlen;
 
-        insert_cell_into_page(&cx, &mut store, pn(2), USABLE, &cell_buf[..cell_size]).unwrap();
+            insert_cell_into_page(&cx, &mut store, pn(2), USABLE, &cell_buf[..cell_size])
+                .await
+                .unwrap();
 
-        let page_data = store.pages.get(&2).unwrap();
-        let header = BtreePageHeader::parse(page_data, 0).unwrap();
-        assert_eq!(header.cell_count, 2);
+            let page_data = store.pages.get(&2).unwrap();
+            let header = BtreePageHeader::parse(page_data, 0).unwrap();
+            assert_eq!(header.cell_count, 2);
+        });
     }
 
     #[test]
     fn test_balance_nonroot_restores_siblings_when_rewrite_fails() {
-        let cx = Cx::new();
-        let mut base = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
 
-        let parent = build_interior_table(&[(pn(3), 50)], pn(4));
-        base.pages.insert(2, parent);
-        base.pages
-            .insert(3, build_leaf_table(&[(10, b"ten"), (50, b"fifty")]));
-        base.pages
-            .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
+            let parent = build_interior_table(&[(pn(3), 50)], pn(4));
+            base.pages.insert(2, parent);
+            base.pages
+                .insert(3, build_leaf_table(&[(10, b"ten"), (50, b"fifty")]));
+            base.pages
+                .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
 
-        let original_left = base.pages.get(&3).cloned().unwrap();
-        let original_right = base.pages.get(&4).cloned().unwrap();
+            let original_left = base.pages.get(&3).cloned().unwrap();
+            let original_right = base.pages.get(&4).cloned().unwrap();
 
-        let mut store = FailingMemPageStore::new(base, 1);
-        let result = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true);
-        assert!(result.is_err(), "injected write failure should surface");
-        assert_eq!(store.inner.pages.get(&3), Some(&original_left));
-        assert_eq!(store.inner.pages.get(&4), Some(&original_right));
+            let mut store = FailingMemPageStore::new(base, 1);
+            let result =
+                balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true).await;
+            assert!(result.is_err(), "injected write failure should surface");
+            assert_eq!(store.inner.pages.get(&3), Some(&original_left));
+            assert_eq!(store.inner.pages.get(&4), Some(&original_right));
+        });
     }
 
     #[test]
     fn test_balance_nonroot_restores_parent_when_root_collapse_fails() {
-        let cx = Cx::new();
-        let mut base = MemPageStore::new(20);
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
 
-        let parent = build_interior_table(&[(pn(3), 50)], pn(4));
-        base.pages.insert(2, parent.clone());
-        base.pages
-            .insert(3, build_leaf_table(&[(10, b"ten"), (50, b"fifty")]));
-        base.pages
-            .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
+            let parent = build_interior_table(&[(pn(3), 50)], pn(4));
+            base.pages.insert(2, parent.clone());
+            base.pages
+                .insert(3, build_leaf_table(&[(10, b"ten"), (50, b"fifty")]));
+            base.pages
+                .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
 
-        let original_left = base.pages.get(&3).cloned().unwrap();
-        let original_right = base.pages.get(&4).cloned().unwrap();
+            let original_left = base.pages.get(&3).cloned().unwrap();
+            let original_right = base.pages.get(&4).cloned().unwrap();
 
-        let mut store = FailingMemPageStore::new(base, 3);
-        let result = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true);
-        assert!(
-            result.is_err(),
-            "injected root-collapse failure should surface"
-        );
-        assert_eq!(store.inner.pages.get(&2), Some(&parent));
-        assert_eq!(store.inner.pages.get(&3), Some(&original_left));
-        assert_eq!(store.inner.pages.get(&4), Some(&original_right));
+            let mut store = FailingMemPageStore::new(base, 3);
+            let result =
+                balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true).await;
+            assert!(
+                result.is_err(),
+                "injected root-collapse failure should surface"
+            );
+            assert_eq!(store.inner.pages.get(&2), Some(&parent));
+            assert_eq!(store.inner.pages.get(&3), Some(&original_left));
+            assert_eq!(store.inner.pages.get(&4), Some(&original_right));
+        });
     }
 
     #[test]
     fn test_split_overflowing_nonroot_interior_restores_original_page_on_failure() {
-        let cx = Cx::new();
-        let mut base = MemPageStore::new(20);
-        let original_page = build_interior_table(&[(pn(10), 50), (pn(20), 100)], pn(30));
-        base.pages.insert(2, original_page.clone());
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
+            let original_page = build_interior_table(&[(pn(10), 50), (pn(20), 100)], pn(30));
+            base.pages.insert(2, original_page.clone());
 
-        let final_cells: Vec<GatheredCell> = (0_u32..1_500)
-            .map(|i| {
-                let left_child = pn(1_000 + i);
-                let rowid = i64::from(i + 1);
-                let data = build_interior_table_cell(left_child, rowid);
-                GatheredCell {
-                    size: u16::try_from(data.len()).unwrap_or(u16::MAX),
-                    data,
-                }
-            })
-            .collect();
+            let final_cells: Vec<GatheredCell> = (0_u32..1_500)
+                .map(|i| {
+                    let left_child = pn(1_000 + i);
+                    let rowid = i64::from(i + 1);
+                    let data = build_interior_table_cell(left_child, rowid);
+                    GatheredCell {
+                        size: u16::try_from(data.len()).unwrap_or(u16::MAX),
+                        data,
+                    }
+                })
+                .collect();
 
-        let mut store = FailingMemPageStore::new(base, 3);
-        let result = split_overflowing_nonroot_interior_page(
-            &cx,
-            &mut store,
-            pn(2),
-            USABLE,
-            USABLE,
-            0,
-            BtreePageType::InteriorTable,
-            &original_page,
-            &final_cells,
-            Some(pn(9_999)),
-        );
-        assert!(result.is_err(), "injected write failure should surface");
-        assert_eq!(
-            store.inner.pages.len(),
-            1,
-            "new siblings should be cleaned up"
-        );
-        assert_eq!(store.inner.pages.get(&2), Some(&original_page));
+            let mut store = FailingMemPageStore::new(base, 3);
+            let result = split_overflowing_nonroot_interior_page(
+                &cx,
+                &mut store,
+                pn(2),
+                USABLE,
+                USABLE,
+                0,
+                BtreePageType::InteriorTable,
+                &original_page,
+                &final_cells,
+                Some(pn(9_999)),
+            )
+            .await;
+            assert!(result.is_err(), "injected write failure should surface");
+            assert_eq!(
+                store.inner.pages.len(),
+                1,
+                "new siblings should be cleaned up"
+            );
+            assert_eq!(store.inner.pages.get(&2), Some(&original_page));
+        });
     }
 }

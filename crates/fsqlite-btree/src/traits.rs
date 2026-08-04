@@ -1,3 +1,4 @@
+#![allow(clippy::future_not_send)]
 //! B-tree cursor operations trait (sealed).
 //!
 //! This module defines `BtreeCursorOps`, the internal interface used by
@@ -16,6 +17,7 @@
 //! - **Index B-trees (blobkey):** Keyed by arbitrary byte sequences, leaves are key-only.
 
 use std::borrow::Cow;
+use std::future::Future;
 
 use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;
@@ -82,7 +84,11 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// Returns [`SeekResult::Found`] if the exact key exists, or
     /// [`SeekResult::NotFound`] if the cursor is positioned at the
     /// entry that would follow the key in sort order.
-    fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult>;
+    fn index_move_to<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        key: &'a [u8],
+    ) -> impl Future<Output = Result<SeekResult>> + 'a;
 
     /// Position the cursor at the strict upper bound of an index key.
     ///
@@ -90,46 +96,60 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// position after every stored key whose leading fields compare equal to
     /// that prefix. Raw-byte implementations use the ordinary strict byte
     /// upper bound. The cursor is at EOF when no greater key exists.
-    fn index_move_to_upper_bound(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
-        self.index_move_to(cx, key)?;
-        while !self.eof() {
-            if self.payload(cx)?.as_slice() != key {
-                break;
+    fn index_move_to_upper_bound<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        key: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.index_move_to(cx, key).await?;
+            while !self.eof() {
+                if self.payload(cx).await?.as_slice() != key {
+                    break;
+                }
+                if !self.next(cx).await? {
+                    break;
+                }
             }
-            if !self.next(cx)? {
-                break;
-            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// Position the cursor at the given rowid in a table B-tree.
-    fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult>;
+    fn table_move_to<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        rowid: i64,
+    ) -> impl Future<Output = Result<SeekResult>> + 'a;
 
     // -- Navigation --
 
     /// Move the cursor to the first entry. Returns `false` if the tree
     /// is empty.
-    fn first(&mut self, cx: &Cx) -> Result<bool>;
+    fn first<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a;
 
     /// Move the cursor to the last entry. Returns `false` if the tree
     /// is empty.
-    fn last(&mut self, cx: &Cx) -> Result<bool>;
+    fn last<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a;
 
     /// Advance the cursor to the next entry. Returns `false` if there
     /// is no next entry (cursor is now at EOF).
-    fn next(&mut self, cx: &Cx) -> Result<bool>;
+    fn next<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a;
 
     /// Move the cursor to the previous entry. Returns `false` if there
     /// is no previous entry.
-    fn prev(&mut self, cx: &Cx) -> Result<bool>;
+    fn prev<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a;
 
     // -- Mutation --
 
     /// Insert a key into an index B-tree.
     ///
     /// If the key already exists, it is replaced.
-    fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()>;
+    fn index_insert<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        key: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Insert a key into a UNIQUE index B-tree.
     ///
@@ -140,28 +160,35 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// permitted (SQLite semantics).
     ///
     /// `columns_label` is used in the error message.
-    fn index_insert_unique(
-        &mut self,
-        cx: &Cx,
-        key: &[u8],
+    fn index_insert_unique<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        key: &'a [u8],
         n_unique_cols: usize,
-        columns_label: &str,
-    ) -> Result<()> {
-        // Default: fall back to non-unique insert (MockBtreeCursor etc.).
-        let _ = (n_unique_cols, columns_label);
-        self.index_insert(cx, key)
+        columns_label: &'a str,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            // Default: fall back to non-unique insert (MockBtreeCursor etc.).
+            let _ = (n_unique_cols, columns_label);
+            self.index_insert(cx, key).await
+        }
     }
 
     /// Insert a row into a table B-tree.
     ///
     /// `rowid` is the integer key. `data` is the serialized record payload.
-    fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()>;
+    fn table_insert<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        rowid: i64,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Delete the entry at the current cursor position.
     ///
     /// The cursor is positioned at the next entry after deletion (or EOF
     /// if the deleted entry was the last one).
-    fn delete(&mut self, cx: &Cx) -> Result<()>;
+    fn delete<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a;
 
     // -- Access --
 
@@ -169,20 +196,30 @@ pub trait BtreeCursorOps: sealed::Sealed {
     ///
     /// For table B-trees, this is the serialized record. For index
     /// B-trees, this is the key bytes.
-    fn payload(&self, cx: &Cx) -> Result<Vec<u8>>;
+    fn payload<'a>(&'a self, cx: &'a Cx) -> impl Future<Output = Result<Vec<u8>>> + 'a;
 
     /// Read the payload at the current cursor position into the provided buffer,
     /// clearing it first. This avoids allocations when repeatedly reading payloads.
-    fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()>;
+    fn payload_into<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut Vec<u8>,
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Read the rowid and payload at the current cursor position.
     ///
     /// The default preserves the historical two-call behavior for mock cursors.
     /// Real table cursors can override this to parse the current cell once.
-    fn rowid_and_payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<i64> {
-        let rowid = self.rowid(cx)?;
-        self.payload_into(cx, buf)?;
-        Ok(rowid)
+    fn rowid_and_payload_into<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut Vec<u8>,
+    ) -> impl Future<Output = Result<i64>> + 'a {
+        async move {
+            let rowid = self.rowid(cx).await?;
+            self.payload_into(cx, buf).await?;
+            Ok(rowid)
+        }
     }
 
     /// Read the rowid and payload at the current cursor position, returning a
@@ -191,25 +228,30 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// The default keeps mock and non-specialized cursors correct by owning the
     /// payload bytes. Real table cursors override this to borrow local page
     /// payloads and allocate only for overflow chains.
-    fn rowid_and_payload_cow<'a>(&'a self, cx: &Cx) -> Result<(i64, Cow<'a, [u8]>)> {
-        let rowid = self.rowid(cx)?;
-        Ok((rowid, Cow::Owned(self.payload(cx)?)))
+    fn rowid_and_payload_cow<'a>(
+        &'a self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<(i64, Cow<'a, [u8]>)>> + 'a {
+        async move {
+            let rowid = self.rowid(cx).await?;
+            Ok((rowid, Cow::Owned(self.payload(cx).await?)))
+        }
     }
 
     /// Read only a prefix of the payload at the current cursor position into
     /// the provided buffer, clearing it first.
-    fn payload_prefix_into(
-        &self,
-        cx: &Cx,
+    fn payload_prefix_into<'a>(
+        &'a self,
+        cx: &'a Cx,
         max_prefix_bytes: usize,
-        buf: &mut Vec<u8>,
-    ) -> Result<()>;
+        buf: &'a mut Vec<u8>,
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Read the rowid at the current cursor position.
     ///
     /// For table B-trees this is the integer key. For index B-trees this is
     /// extracted from the trailing field of the serialized key record.
-    fn rowid(&self, cx: &Cx) -> Result<i64>;
+    fn rowid<'a>(&'a self, cx: &'a Cx) -> impl Future<Output = Result<i64>> + 'a;
 
     /// Whether the cursor is at EOF (past the last entry).
     fn eof(&self) -> bool;
@@ -243,9 +285,11 @@ impl MockBtreeCursor {
 
 impl sealed::Sealed for MockBtreeCursor {}
 
-#[allow(clippy::missing_errors_doc)]
+// This in-memory test backend deliberately returns immediately-ready futures:
+// none of its operations perform I/O or need to suspend.
+#[allow(clippy::missing_errors_doc, clippy::unused_async_trait_impl)]
 impl BtreeCursorOps for MockBtreeCursor {
-    fn index_move_to(&mut self, _cx: &Cx, key: &[u8]) -> Result<SeekResult> {
+    async fn index_move_to(&mut self, _cx: &Cx, key: &[u8]) -> Result<SeekResult> {
         // Linear scan for exact match, then find successor position if not found.
         // Per SeekResult::NotFound contract: cursor must point to the entry that
         // would follow the key in sort order (or be at EOF if no such entry exists).
@@ -275,7 +319,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(SeekResult::NotFound)
     }
 
-    fn table_move_to(&mut self, _cx: &Cx, rowid: i64) -> Result<SeekResult> {
+    async fn table_move_to(&mut self, _cx: &Cx, rowid: i64) -> Result<SeekResult> {
         // Linear scan for exact match, then find successor position if not found.
         // Per SeekResult::NotFound contract: cursor must point to the entry that
         // would follow the rowid in sort order (or be at EOF if no such entry exists).
@@ -302,7 +346,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(SeekResult::NotFound)
     }
 
-    fn first(&mut self, _cx: &Cx) -> Result<bool> {
+    async fn first(&mut self, _cx: &Cx) -> Result<bool> {
         if self.entries.is_empty() {
             self.at_eof = true;
             return Ok(false);
@@ -313,7 +357,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(true)
     }
 
-    fn last(&mut self, _cx: &Cx) -> Result<bool> {
+    async fn last(&mut self, _cx: &Cx) -> Result<bool> {
         if self.entries.is_empty() {
             self.at_eof = true;
             return Ok(false);
@@ -324,7 +368,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(true)
     }
 
-    fn next(&mut self, _cx: &Cx) -> Result<bool> {
+    async fn next(&mut self, _cx: &Cx) -> Result<bool> {
         if self.pos + 1 >= self.entries.len() {
             self.at_eof = true;
             return Ok(false);
@@ -334,7 +378,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(true)
     }
 
-    fn prev(&mut self, _cx: &Cx) -> Result<bool> {
+    async fn prev(&mut self, _cx: &Cx) -> Result<bool> {
         if self.entries.is_empty() {
             return Ok(false);
         }
@@ -353,7 +397,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(true)
     }
 
-    fn index_insert(&mut self, _cx: &Cx, key: &[u8]) -> Result<()> {
+    async fn index_insert(&mut self, _cx: &Cx, key: &[u8]) -> Result<()> {
         let next_rowid = self.entries.iter().map(|e| e.0).max().unwrap_or(0) + 1;
         let pos = self
             .entries
@@ -371,7 +415,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(())
     }
 
-    fn table_insert(&mut self, _cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
+    async fn table_insert(&mut self, _cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         let pos = self
             .entries
             .binary_search_by_key(&rowid, |e| e.0)
@@ -387,7 +431,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(())
     }
 
-    fn delete(&mut self, _cx: &Cx) -> Result<()> {
+    async fn delete(&mut self, _cx: &Cx) -> Result<()> {
         if !self.at_eof && self.pos < self.entries.len() {
             self.entries.remove(self.pos);
             if self.pos >= self.entries.len() {
@@ -399,14 +443,14 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(())
     }
 
-    fn payload(&self, _cx: &Cx) -> Result<Vec<u8>> {
+    async fn payload(&self, _cx: &Cx) -> Result<Vec<u8>> {
         if self.at_eof {
             return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
         }
         Ok(self.entries[self.pos].1.clone())
     }
 
-    fn payload_into(&self, _cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
+    async fn payload_into(&self, _cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
         if self.at_eof {
             return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
         }
@@ -415,7 +459,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(())
     }
 
-    fn payload_prefix_into(
+    async fn payload_prefix_into(
         &self,
         _cx: &Cx,
         max_prefix_bytes: usize,
@@ -430,7 +474,7 @@ impl BtreeCursorOps for MockBtreeCursor {
         Ok(())
     }
 
-    fn rowid(&self, _cx: &Cx) -> Result<i64> {
+    async fn rowid(&self, _cx: &Cx) -> Result<i64> {
         if self.at_eof {
             return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
         }
@@ -448,124 +492,157 @@ impl BtreeCursorOps for MockBtreeCursor {
 
 #[cfg(test)]
 mod tests {
+    use asupersync::runtime::RuntimeBuilder;
+
     use super::*;
+
+    fn run_async<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build B-tree traits test runtime")
+            .block_on(future)
+    }
 
     #[test]
     fn test_btree_cursor_ops_sealed_mock() -> Result<()> {
-        let entries = vec![
-            (1, b"alice".to_vec()),
-            (2, b"bob".to_vec()),
-            (3, b"charlie".to_vec()),
-        ];
-        let mut cursor = MockBtreeCursor::new(entries);
-        let cx = Cx::new();
+        run_async(async {
+            let entries = vec![
+                (1, b"alice".to_vec()),
+                (2, b"bob".to_vec()),
+                (3, b"charlie".to_vec()),
+            ];
+            let mut cursor = MockBtreeCursor::new(entries);
+            let cx = Cx::new();
 
-        // Navigate forward.
-        assert!(cursor.first(&cx)?);
-        assert_eq!(cursor.rowid(&cx)?, 1);
-        assert_eq!(cursor.payload(&cx)?, b"alice");
-        let mut payload = Vec::new();
-        assert_eq!(cursor.rowid_and_payload_into(&cx, &mut payload)?, 1);
-        assert_eq!(payload, b"alice");
+            // Navigate forward.
+            assert!(cursor.first(&cx).await?);
+            assert_eq!(cursor.rowid(&cx).await?, 1);
+            assert_eq!(cursor.payload(&cx).await?, b"alice");
+            let mut payload = Vec::new();
+            assert_eq!(cursor.rowid_and_payload_into(&cx, &mut payload).await?, 1);
+            assert_eq!(payload, b"alice");
 
-        assert!(cursor.next(&cx)?);
-        assert_eq!(cursor.rowid(&cx)?, 2);
+            assert!(cursor.next(&cx).await?);
+            assert_eq!(cursor.rowid(&cx).await?, 2);
 
-        assert!(cursor.next(&cx)?);
-        assert_eq!(cursor.rowid(&cx)?, 3);
+            assert!(cursor.next(&cx).await?);
+            assert_eq!(cursor.rowid(&cx).await?, 3);
 
-        assert!(!cursor.next(&cx)?);
-        assert!(cursor.eof());
-        Ok(())
+            assert!(!cursor.next(&cx).await?);
+            assert!(cursor.eof());
+            Ok(())
+        })
     }
 
     #[test]
     fn test_btree_cursor_seek() {
-        let entries = vec![
-            (10, b"ten".to_vec()),
-            (20, b"twenty".to_vec()),
-            (30, b"thirty".to_vec()),
-        ];
-        let mut cursor = MockBtreeCursor::new(entries);
-        let cx = Cx::new();
+        run_async(async {
+            let entries = vec![
+                (10, b"ten".to_vec()),
+                (20, b"twenty".to_vec()),
+                (30, b"thirty".to_vec()),
+            ];
+            let mut cursor = MockBtreeCursor::new(entries);
+            let cx = Cx::new();
 
-        assert!(cursor.table_move_to(&cx, 20).unwrap().is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 20);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"twenty");
+            assert!(cursor.table_move_to(&cx, 20).await.unwrap().is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 20);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"twenty");
 
-        assert!(!cursor.table_move_to(&cx, 99).unwrap().is_found());
+            assert!(!cursor.table_move_to(&cx, 99).await.unwrap().is_found());
+        });
     }
 
     #[test]
     fn test_btree_cursor_insert_delete() {
-        let mut cursor = MockBtreeCursor::new(vec![]);
-        let cx = Cx::new();
+        run_async(async {
+            let mut cursor = MockBtreeCursor::new(vec![]);
+            let cx = Cx::new();
 
-        assert!(!cursor.first(&cx).unwrap());
-        assert!(cursor.eof());
+            assert!(!cursor.first(&cx).await.unwrap());
+            assert!(cursor.eof());
 
-        cursor.table_insert(&cx, 1, b"hello").unwrap();
-        cursor.table_insert(&cx, 2, b"world").unwrap();
+            cursor.table_insert(&cx, 1, b"hello").await.unwrap();
+            cursor.table_insert(&cx, 2, b"world").await.unwrap();
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"hello");
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"hello");
 
-        cursor.delete(&cx).unwrap();
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+            cursor.delete(&cx).await.unwrap();
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+        });
     }
 
     #[test]
     fn test_btree_cursor_navigate_backward() {
-        let entries = vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (3, b"c".to_vec())];
-        let mut cursor = MockBtreeCursor::new(entries);
-        let cx = Cx::new();
+        run_async(async {
+            let entries = vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (3, b"c".to_vec())];
+            let mut cursor = MockBtreeCursor::new(entries);
+            let cx = Cx::new();
 
-        assert!(cursor.last(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+            assert!(cursor.last(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
 
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
 
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
 
-        assert!(!cursor.prev(&cx).unwrap());
+            assert!(!cursor.prev(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_btree_cursor_index_seek() {
-        let entries = vec![
-            (1, b"alpha".to_vec()),
-            (2, b"beta".to_vec()),
-            (3, b"gamma".to_vec()),
-        ];
-        let mut cursor = MockBtreeCursor::new(entries);
-        let cx = Cx::new();
+        run_async(async {
+            let entries = vec![
+                (1, b"alpha".to_vec()),
+                (2, b"beta".to_vec()),
+                (3, b"gamma".to_vec()),
+            ];
+            let mut cursor = MockBtreeCursor::new(entries);
+            let cx = Cx::new();
 
-        assert!(cursor.index_move_to(&cx, b"beta").unwrap().is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+            assert!(cursor.index_move_to(&cx, b"beta").await.unwrap().is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
 
-        assert!(!cursor.index_move_to(&cx, b"delta").unwrap().is_found());
+            assert!(
+                !cursor
+                    .index_move_to(&cx, b"delta")
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+        });
     }
 
     #[test]
     fn test_mock_cursor_index_upper_bound_skips_equal_keys() {
-        let entries = vec![
-            (1, b"alpha".to_vec()),
-            (2, b"beta".to_vec()),
-            (3, b"beta".to_vec()),
-            (4, b"gamma".to_vec()),
-        ];
-        let mut cursor = MockBtreeCursor::new(entries);
-        let cx = Cx::new();
+        run_async(async {
+            let entries = vec![
+                (1, b"alpha".to_vec()),
+                (2, b"beta".to_vec()),
+                (3, b"beta".to_vec()),
+                (4, b"gamma".to_vec()),
+            ];
+            let mut cursor = MockBtreeCursor::new(entries);
+            let cx = Cx::new();
 
-        cursor.index_move_to_upper_bound(&cx, b"beta").unwrap();
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 4);
+            cursor
+                .index_move_to_upper_bound(&cx, b"beta")
+                .await
+                .unwrap();
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 4);
 
-        cursor.index_move_to_upper_bound(&cx, b"gamma").unwrap();
-        assert!(cursor.eof());
+            cursor
+                .index_move_to_upper_bound(&cx, b"gamma")
+                .await
+                .unwrap();
+            assert!(cursor.eof());
+        });
     }
 
     #[test]
@@ -576,89 +653,95 @@ mod tests {
 
     #[test]
     fn test_mock_cursor_prev_from_eof_revives() {
-        let entries = vec![(1, b"one".to_vec()), (2, b"two".to_vec())];
-        let mut cursor = MockBtreeCursor::new(entries);
-        let cx = Cx::new();
+        run_async(async {
+            let entries = vec![(1, b"one".to_vec()), (2, b"two".to_vec())];
+            let mut cursor = MockBtreeCursor::new(entries);
+            let cx = Cx::new();
 
-        assert!(cursor.first(&cx).unwrap());
-        assert!(cursor.next(&cx).unwrap());
-        assert!(!cursor.next(&cx).unwrap());
-        assert!(cursor.eof());
+            assert!(cursor.first(&cx).await.unwrap());
+            assert!(cursor.next(&cx).await.unwrap());
+            assert!(!cursor.next(&cx).await.unwrap());
+            assert!(cursor.eof());
 
-        // The real cursor revives from EOF, so the mock should too.
-        assert!(cursor.prev(&cx).unwrap());
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+            // The real cursor revives from EOF, so the mock should too.
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+        });
     }
 
     /// bd-hpa5: Verify MockBtreeCursor seek positions at successor on NotFound.
     /// This mirrors real cursor semantics per SeekResult::NotFound contract.
     #[test]
     fn test_mock_cursor_seek_positions_at_successor() {
-        // Entries sorted by rowid.
-        let entries = vec![
-            (10, b"ten".to_vec()),
-            (20, b"twenty".to_vec()),
-            (30, b"thirty".to_vec()),
-        ];
-        let mut cursor = MockBtreeCursor::new(entries);
-        let cx = Cx::new();
+        run_async(async {
+            // Entries sorted by rowid.
+            let entries = vec![
+                (10, b"ten".to_vec()),
+                (20, b"twenty".to_vec()),
+                (30, b"thirty".to_vec()),
+            ];
+            let mut cursor = MockBtreeCursor::new(entries);
+            let cx = Cx::new();
 
-        // Seek for rowid 15 (not found) should position at successor (rowid 20).
-        let result = cursor.table_move_to(&cx, 15).unwrap();
-        assert!(!result.is_found());
-        assert!(
-            !cursor.eof(),
-            "cursor should not be at EOF when successor exists"
-        );
-        assert_eq!(
-            cursor.rowid(&cx).unwrap(),
-            20,
-            "cursor should be at successor"
-        );
+            // Seek for rowid 15 (not found) should position at successor (rowid 20).
+            let result = cursor.table_move_to(&cx, 15).await.unwrap();
+            assert!(!result.is_found());
+            assert!(
+                !cursor.eof(),
+                "cursor should not be at EOF when successor exists"
+            );
+            assert_eq!(
+                cursor.rowid(&cx).await.unwrap(),
+                20,
+                "cursor should be at successor"
+            );
 
-        // Seek for rowid 5 (not found) should position at successor (rowid 10).
-        let result = cursor.table_move_to(&cx, 5).unwrap();
-        assert!(!result.is_found());
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
+            // Seek for rowid 5 (not found) should position at successor (rowid 10).
+            let result = cursor.table_move_to(&cx, 5).await.unwrap();
+            assert!(!result.is_found());
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 10);
 
-        // Seek for rowid 35 (not found, no successor) should position at EOF.
-        let result = cursor.table_move_to(&cx, 35).unwrap();
-        assert!(!result.is_found());
-        assert!(
-            cursor.eof(),
-            "cursor should be at EOF when no successor exists"
-        );
+            // Seek for rowid 35 (not found, no successor) should position at EOF.
+            let result = cursor.table_move_to(&cx, 35).await.unwrap();
+            assert!(!result.is_found());
+            assert!(
+                cursor.eof(),
+                "cursor should be at EOF when no successor exists"
+            );
+        });
     }
 
     /// bd-hpa5: Verify index_move_to positions at successor on NotFound.
     #[test]
     fn test_mock_cursor_index_seek_positions_at_successor() {
-        // Entries sorted by key.
-        let entries = vec![
-            (1, b"alpha".to_vec()),
-            (2, b"beta".to_vec()),
-            (3, b"gamma".to_vec()),
-        ];
-        let mut cursor = MockBtreeCursor::new(entries);
-        let cx = Cx::new();
+        run_async(async {
+            // Entries sorted by key.
+            let entries = vec![
+                (1, b"alpha".to_vec()),
+                (2, b"beta".to_vec()),
+                (3, b"gamma".to_vec()),
+            ];
+            let mut cursor = MockBtreeCursor::new(entries);
+            let cx = Cx::new();
 
-        // Seek for "aaa" (before "alpha") should position at "alpha".
-        let result = cursor.index_move_to(&cx, b"aaa").unwrap();
-        assert!(!result.is_found());
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+            // Seek for "aaa" (before "alpha") should position at "alpha".
+            let result = cursor.index_move_to(&cx, b"aaa").await.unwrap();
+            assert!(!result.is_found());
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
 
-        // Seek for "cat" (between "beta" and "gamma") should position at "gamma".
-        let result = cursor.index_move_to(&cx, b"cat").unwrap();
-        assert!(!result.is_found());
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+            // Seek for "cat" (between "beta" and "gamma") should position at "gamma".
+            let result = cursor.index_move_to(&cx, b"cat").await.unwrap();
+            assert!(!result.is_found());
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
 
-        // Seek for "zzz" (after all) should position at EOF.
-        let result = cursor.index_move_to(&cx, b"zzz").unwrap();
-        assert!(!result.is_found());
-        assert!(cursor.eof());
+            // Seek for "zzz" (after all) should position at EOF.
+            let result = cursor.index_move_to(&cx, b"zzz").await.unwrap();
+            assert!(!result.is_found());
+            assert!(cursor.eof());
+        });
     }
 }

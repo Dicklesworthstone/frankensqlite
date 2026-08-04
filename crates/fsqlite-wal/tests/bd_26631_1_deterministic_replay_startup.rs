@@ -114,7 +114,7 @@ fn truncate_wal(vfs: &MemoryVfs, cx: &Cx, cut_at: usize) {
 }
 
 fn flip_byte(vfs: &MemoryVfs, cx: &Cx, offset: usize, xor_mask: u8) {
-    let mut file = open_wal_file(vfs, cx);
+    let file = open_wal_file(vfs, cx);
     let offset_u64 = u64::try_from(offset).expect("offset fits u64");
     let mut byte = [0_u8; 1];
     block_on_test(file.read(cx, &mut byte, offset_u64)).expect("read byte");

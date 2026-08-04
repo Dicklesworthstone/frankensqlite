@@ -35,7 +35,7 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use tracing::{info, trace, warn};
 
 use crate::shm::ShmRegion;
-use crate::traits::{FileIdentity, Vfs, VfsFile};
+use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource};
 use crate::unix::{UnixFile, UnixVfs};
 
 #[cfg(feature = "linux-uring-fs")]
@@ -165,16 +165,30 @@ struct DriverRequest {
     offset: u64,
     kind: DriverRequestKind,
     completion: SendPermit<DriverCompletion>,
+    write_completion: Option<VfsWriteCompletionSource>,
 }
 
 #[cfg(feature = "linux-asupersync-uring")]
 impl DriverRequest {
-    fn complete(self, result: i32) {
+    fn complete(mut self, result: i32) {
         let operation = self.kind.operation();
         let completion_event = match &self.kind {
             DriverRequestKind::Read(_) => "read_at_complete",
             DriverRequestKind::Write(_) => "write_at_complete",
         };
+        if let Some(write_completion) = &mut self.write_completion {
+            let write_succeeded = result >= 0
+                && matches!(
+                    &self.kind,
+                    DriverRequestKind::Write(data)
+                        if usize::try_from(result).ok() == Some(data.len())
+                );
+            if write_succeeded {
+                write_completion.complete_success();
+            } else {
+                write_completion.complete_error();
+            }
+        }
         let completion = if result == -libc::ECANCELED {
             DriverCompletion::Cancelled
         } else if result < 0 {
@@ -211,7 +225,10 @@ impl DriverRequest {
         let _ = self.completion.send(completion);
     }
 
-    fn fail(self, kind: io::ErrorKind, message: &str) {
+    fn fail(mut self, kind: io::ErrorKind, message: &str) {
+        if let Some(write_completion) = &mut self.write_completion {
+            write_completion.complete_error();
+        }
         let _ = self
             .completion
             .send(DriverCompletion::Failed(io::Error::new(
@@ -220,7 +237,10 @@ impl DriverRequest {
             )));
     }
 
-    fn cancel(self) {
+    fn cancel(mut self) {
+        if let Some(write_completion) = &mut self.write_completion {
+            write_completion.complete_error();
+        }
         let _ = self.completion.send(DriverCompletion::Cancelled);
     }
 }
@@ -455,6 +475,7 @@ impl IoUringRuntime {
             file,
             offset,
             DriverRequestKind::Read(vec![0_u8; len]),
+            None,
         )
     }
 
@@ -466,8 +487,16 @@ impl IoUringRuntime {
         file: Arc<File>,
         data: Vec<u8>,
         offset: u64,
+        write_completion: Option<VfsWriteCompletion>,
     ) -> Result<(u64, Receiver<DriverCompletion>)> {
-        self.enqueue(cx, native_cx, file, offset, DriverRequestKind::Write(data))
+        self.enqueue(
+            cx,
+            native_cx,
+            file,
+            offset,
+            DriverRequestKind::Write(data),
+            write_completion,
+        )
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
@@ -478,6 +507,7 @@ impl IoUringRuntime {
         file: Arc<File>,
         offset: u64,
         kind: DriverRequestKind,
+        write_completion: Option<VfsWriteCompletion>,
     ) -> Result<(u64, Receiver<DriverCompletion>)> {
         checkpoint_or_abort(cx)?;
         if !self.is_available() {
@@ -506,6 +536,7 @@ impl IoUringRuntime {
                 offset,
                 kind,
                 completion,
+                write_completion: write_completion.map(VfsWriteCompletionSource::new),
             });
             id
         };
@@ -957,6 +988,16 @@ impl VfsFile for IoUringFile {
         self.write_data_path(cx, buf, offset)
     }
 
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_data_path_tracked(cx, buf, offset, completion)
+    }
+
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
         self.inner.truncate(cx, size)
     }
@@ -1182,6 +1223,7 @@ impl IoUringFile {
                 Arc::clone(&file),
                 buf[total..chunk_end].to_vec(),
                 off,
+                None,
             )?;
             let mut cancel_guard =
                 RequestCancellationGuard::new(Arc::clone(&self.runtime), request_id);
@@ -1239,6 +1281,141 @@ impl IoUringFile {
             let remaining = chunk_end - total;
             total += advanced.min(remaining);
         }
+
+        let elapsed = start.elapsed();
+        if record_io_uring_write_latency(elapsed) {
+            let snapshot = io_uring_latency_snapshot();
+            enforce_conformal_breach_policy(
+                &self.runtime,
+                "write",
+                elapsed,
+                snapshot.write_conformal_upper_bound_us,
+                IO_URING_WRITE_CONFORMAL_BREACH_MSG,
+            );
+        }
+        Ok(())
+    }
+
+    async fn write_data_path_tracked(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        if let Err(error) = checkpoint_or_abort(cx) {
+            completion.complete_error();
+            return Err(error);
+        }
+        if buf.is_empty() {
+            completion.complete_success();
+            return Ok(());
+        }
+        if !self.runtime.is_available() {
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_tracked(cx, buf, offset, completion).await;
+        }
+        let Some(native_cx) = cx.attached_native_cx() else {
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_tracked(cx, buf, offset, completion).await;
+        };
+        if u32::try_from(buf.len()).is_err() {
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_tracked(cx, buf, offset, completion).await;
+        }
+        let write_range_is_valid = u64::try_from(buf.len())
+            .ok()
+            .and_then(|len| offset.checked_add(len))
+            .is_some();
+        if !write_range_is_valid {
+            completion.complete_error();
+            return Err(FrankenError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offset overflow during tracked async io_uring write",
+            )));
+        }
+        let file = match self.inner.canonical_file() {
+            Ok(file) => file,
+            Err(error) => {
+                completion.complete_error();
+                return Err(error);
+            }
+        };
+
+        #[cfg(test)]
+        if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
+            completion.complete_error();
+            return Err(FrankenError::Abort);
+        }
+
+        #[cfg(test)]
+        if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
+            self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_tracked(cx, buf, offset, completion).await;
+        }
+
+        let start = Instant::now();
+        let enqueue_result = self.runtime.enqueue_write(
+            cx,
+            &native_cx,
+            file,
+            buf.to_vec(),
+            offset,
+            Some(completion.clone()),
+        );
+        let (request_id, mut receiver) = match enqueue_result {
+            Ok(request) => request,
+            Err(error) => {
+                completion.complete_error();
+                return Err(error);
+            }
+        };
+        let mut cancel_guard = RequestCancellationGuard::new(Arc::clone(&self.runtime), request_id);
+        asupersync::runtime::yield_now().await;
+        if let Err(error) = self.runtime.ensure_driver(&native_cx) {
+            drop(cancel_guard);
+            return Err(FrankenError::Io(io::Error::other(format!(
+                "cannot start tracked shared io_uring write: {error}"
+            ))));
+        }
+
+        let driver_completion = receiver
+            .recv(&native_cx)
+            .await
+            .map_err(|error| match error {
+                oneshot::RecvError::Cancelled => FrankenError::Abort,
+                oneshot::RecvError::Closed | oneshot::RecvError::PolledAfterCompletion => {
+                    FrankenError::Io(io::Error::other(format!(
+                        "tracked shared io_uring response channel failed: {error}"
+                    )))
+                }
+            })?;
+        cancel_guard.disarm();
+
+        match driver_completion {
+            DriverCompletion::Write { bytes_written } if bytes_written == buf.len() => {}
+            DriverCompletion::Write { bytes_written } => {
+                return Err(FrankenError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "tracked async io_uring write completed only {bytes_written} of {} bytes",
+                        buf.len()
+                    ),
+                )));
+            }
+            DriverCompletion::Cancelled => return Err(FrankenError::Abort),
+            DriverCompletion::Failed(error) => return Err(FrankenError::Io(error)),
+            DriverCompletion::Read { .. } => {
+                return Err(FrankenError::Io(io::Error::other(
+                    "shared io_uring returned a read completion for a tracked write request",
+                )));
+            }
+        }
+
+        // The CQE driver has already set Success. A cancellation observed here
+        // must not erase proof that the bytes reached the completion source.
+        checkpoint_or_abort(cx)?;
 
         let elapsed = start.elapsed();
         if record_io_uring_write_latency(elapsed) {
@@ -1330,6 +1507,50 @@ mod tests {
         assert_eq!(queue.allocate_request_id(), IO_URING_CANCEL_TAG - 1);
         assert_eq!(queue.allocate_request_id(), 2);
         assert!(!queue.live.contains(&IO_URING_CANCEL_TAG));
+    }
+
+    #[test]
+    fn tracked_write_completion_cqe_survives_observer_drop() {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        let cx = Cx::new();
+        let directory = tempfile::tempdir().expect("create io_uring CQE tempdir");
+        let path = directory.path().join("tracked-cqe.db");
+        let file = Arc::new(File::create(path).expect("create io_uring CQE file"));
+        let completion = VfsWriteCompletion::new();
+        let source_completion = completion.clone();
+
+        block_on_test(&cx, async {
+            let native_cx = NativeCx::current().expect("runtime must install native Cx");
+            let (sender, mut receiver) = oneshot::channel();
+            let permit = sender
+                .reserve(&native_cx)
+                .expect("reserve CQE completion permit");
+            let mut observer = Box::pin(receiver.recv(&native_cx));
+            poll_fn(|task_cx| match observer.as_mut().poll(task_cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("CQE observer cannot complete before the source"),
+            })
+            .await;
+            drop(observer);
+            drop(receiver);
+
+            DriverRequest {
+                id: 7,
+                file,
+                offset: 0,
+                kind: DriverRequestKind::Write(vec![1, 2, 3, 4]),
+                completion: permit,
+                write_completion: Some(VfsWriteCompletionSource::new(source_completion)),
+            }
+            .complete(4);
+
+            assert_eq!(
+                completion.wait().await,
+                crate::traits::VfsWriteCompletionState::Success
+            );
+        });
     }
 
     #[test]
@@ -1666,6 +1887,7 @@ mod tests {
 
     #[test]
     fn test_runtime_disable_is_sticky() {
+        let _guard = io_uring_test_guard();
         let runtime = IoUringRuntime::new();
         assert!(!runtime.is_disabled());
         assert_eq!(runtime.disable_reason(), None);
@@ -1694,6 +1916,7 @@ mod tests {
 
     #[test]
     fn test_conformal_breach_policy_disables_runtime() {
+        let _guard = io_uring_test_guard();
         let runtime = IoUringRuntime::new();
         assert!(!runtime.is_disabled());
 
@@ -1718,6 +1941,7 @@ mod tests {
 
     #[test]
     fn test_vfs_status_snapshot_reflects_disable_reason() {
+        let _guard = io_uring_test_guard();
         let vfs = IoUringVfs::new();
         let initial = vfs.status_snapshot();
         assert_eq!(initial.backend, "asupersync-shared-uring");
@@ -2098,6 +2322,7 @@ mod tests {
 
     #[test]
     fn io_uring_vfs_status_snapshot_fresh_fields() {
+        let _guard = io_uring_test_guard();
         let vfs = IoUringVfs::new();
         let snap = vfs.status_snapshot();
         assert!(!snap.backend.is_empty());

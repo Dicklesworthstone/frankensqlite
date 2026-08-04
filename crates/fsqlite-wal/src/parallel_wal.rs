@@ -26,7 +26,7 @@ use std::hash::BuildHasher;
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -153,14 +153,75 @@ pub const PARALLEL_WAL_FLUSH_SCENARIO_ID: &str = "parallel_wal_lane_flush";
 /// Structured-log scenario id for the ordered durability/publication residue.
 pub const PARALLEL_WAL_PUBLICATION_SCENARIO_ID: &str = "parallel_wal_publication";
 /// Stable on-disk schema version for commit-certificate canonical bytes.
-pub const PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION: u16 = 1;
+pub const PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION: u16 = 2;
 /// Stable envelope version for append-only durable certificate records.
-pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 2;
+pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 3;
 /// Magic prefix for one record in the `-wal-cert` sidecar.
 pub const PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC: [u8; 8] = *b"FSQLCERT";
+const PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN: &str =
+    "FrankenSQLite parallel WAL ordered frame payload digest v1";
+const PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_SIZE: usize = 32;
 /// Lane ids and commit-certificate lane counts are stored as `u16`, so keep
 /// both the count and every generated id representable.
 const MAX_PARALLEL_WAL_LANE_COUNT: usize = 65_535;
+/// Largest valid encoded commit-certificate sidecar record.
+///
+/// The fixed envelope is 136 bytes and each representable lane contributes
+/// one four-byte record count. Readers and writers share this bound so no
+/// successfully persisted record can become unreadable during recovery.
+pub const PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE: usize =
+    ParallelWalDurableCertificateRecord::MIN_ENCODED_SIZE + MAX_PARALLEL_WAL_LANE_COUNT * 4;
+
+/// Incrementally binds a certificate to its ordered WAL frame contents.
+///
+/// Each [`Self::update`] hashes a zero-based `u64` frame ordinal, the `u32`
+/// page number, the `u32` commit database size, the `u64` payload length, and
+/// the payload bytes, all in little-endian field order. BLAKE3 derive-key mode
+/// domain-separates this digest from every other hash protocol.
+#[derive(Debug, Clone)]
+pub struct ParallelWalFramePayloadDigestBuilder {
+    hasher: blake3::Hasher,
+    next_ordinal: u64,
+}
+
+impl ParallelWalFramePayloadDigestBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            hasher: blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN),
+            next_ordinal: 0,
+        }
+    }
+
+    /// Add the next frame in its exact ordered-WAL position.
+    pub fn update(&mut self, page_number: PageNumber, db_size_if_commit: u32, payload: &[u8]) {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = ordinal
+            .checked_add(1)
+            .expect("parallel WAL frame ordinal overflow");
+        let payload_len =
+            u64::try_from(payload.len()).expect("parallel WAL frame payload length exceeds u64");
+
+        self.hasher.update(&ordinal.to_le_bytes());
+        self.hasher.update(&page_number.get().to_le_bytes());
+        self.hasher.update(&db_size_if_commit.to_le_bytes());
+        self.hasher.update(&payload_len.to_le_bytes());
+        self.hasher.update(payload);
+    }
+
+    /// Finish the ordered-frame digest, consuming the builder so a completed
+    /// certificate cannot accidentally be extended with later frames.
+    #[must_use]
+    pub fn finalize(self) -> [u8; 32] {
+        *self.hasher.finalize().as_bytes()
+    }
+}
+
+impl Default for ParallelWalFramePayloadDigestBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Verdict emitted by shadow-compare lane validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -491,8 +552,9 @@ pub fn resolve_parallel_wal_control_surface_from_env() -> ParallelWalControlSurf
 ///
 /// A commit becomes externally publishable only after the certificate is
 /// durably written. The certificate covers a contiguous commit-sequence range,
-/// the lanes that contributed to that range, and the pager-visible metadata
-/// that must be published once the ordered residue completes.
+/// the lanes that contributed to that range, the exact ordered WAL frame
+/// contents, and the pager-visible metadata that must be published once the
+/// ordered residue completes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParallelWalCommitCertificate {
     pub format_version: u16,
@@ -505,6 +567,8 @@ pub struct ParallelWalCommitCertificate {
     pub lane_record_counts: Vec<u32>,
     pub db_size_pages: u32,
     pub page_set_size: u32,
+    /// BLAKE3 digest of the exact ordered WAL frame headers and payloads.
+    pub wal_frame_payload_digest: [u8; 32],
     pub certificate_crc32c: u32,
     pub fallback_active: bool,
 }
@@ -518,7 +582,14 @@ impl ParallelWalCommitCertificate {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(
-            2 + 1 + 8 * 4 + 2 + 4 + self.lane_record_counts.len() * 4 + 4 * 2 + 1,
+            2 + 1
+                + 8 * 4
+                + 2
+                + 4
+                + self.lane_record_counts.len() * 4
+                + 4 * 2
+                + PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_SIZE
+                + 1,
         );
         bytes.extend_from_slice(&self.format_version.to_le_bytes());
         bytes.push(match self.residue {
@@ -539,6 +610,7 @@ impl ParallelWalCommitCertificate {
         }
         bytes.extend_from_slice(&self.db_size_pages.to_le_bytes());
         bytes.extend_from_slice(&self.page_set_size.to_le_bytes());
+        bytes.extend_from_slice(&self.wal_frame_payload_digest);
         bytes.push(u8::from(self.fallback_active));
         bytes
     }
@@ -573,8 +645,17 @@ pub struct ParallelWalDurableCertificateRecord {
 
 impl ParallelWalDurableCertificateRecord {
     const FIXED_PREFIX_SIZE: usize = 8 + 2 + 4 + 4 + 4 + 4 + 8 + 8;
-    const MIN_CERTIFICATE_SIZE: usize = 2 + 1 + 8 * 4 + 2 + 4 + 4 + 4 + 1 + 4;
+    const MIN_CERTIFICATE_SIZE: usize =
+        2 + 1 + 8 * 4 + 2 + 4 + 4 + 4 + PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_SIZE + 1 + 4;
     const ENVELOPE_CRC_SIZE: usize = 4;
+    /// Smallest valid encoded sidecar record, with zero contributing lanes.
+    ///
+    /// Recovery readers use this shared bound rather than duplicating the
+    /// version-sensitive envelope calculation.
+    pub const MIN_ENCODED_SIZE: usize = Self::FIXED_PREFIX_SIZE
+        + Self::MIN_CERTIFICATE_SIZE
+        + Self::ENVELOPE_CRC_SIZE
+        + Self::LENGTH_FOOTER_SIZE;
     /// Duplicate record length stored at the tail for bounded latest-record
     /// lookup without scanning the append-only sidecar.
     pub const LENGTH_FOOTER_SIZE: usize = 4;
@@ -603,17 +684,20 @@ impl ParallelWalDurableCertificateRecord {
 
     /// Decide whether this proof record may authorize a reconstructed WAL
     /// boundary. The caller supplies the already-validated WAL generation,
-    /// valid frame count, and one-based final commit-marker frame.
+    /// valid frame count, one-based final commit-marker frame, and digest
+    /// independently reconstructed from those ordered frames.
     #[must_use]
     pub fn authorizes_wal_boundary(
         &self,
         wal_generation: WalGenerationIdentity,
         valid_frame_count: u64,
         commit_marker_frame: u64,
+        actual_wal_frame_payload_digest: [u8; 32],
     ) -> bool {
         self.wal_generation == wal_generation
             && self.wal_frame_end <= valid_frame_count
             && self.wal_frame_end == commit_marker_frame
+            && self.certificate.wal_frame_payload_digest == actual_wal_frame_payload_digest
     }
 
     /// Encode one self-delimiting sidecar record.
@@ -644,10 +728,7 @@ impl ParallelWalDurableCertificateRecord {
 
     /// Strictly decode exactly one sidecar record.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let min_size = Self::FIXED_PREFIX_SIZE
-            .saturating_add(Self::MIN_CERTIFICATE_SIZE)
-            .saturating_add(Self::ENVELOPE_CRC_SIZE)
-            .saturating_add(Self::LENGTH_FOOTER_SIZE);
+        let min_size = Self::MIN_ENCODED_SIZE;
         if bytes.len() < min_size {
             return Err(format!(
                 "durable certificate record too short: expected at least {min_size}, got {}",
@@ -768,6 +849,13 @@ impl ParallelWalDurableCertificateRecord {
         }
         let db_size_pages = read_record_u32(bytes, &mut offset, "database size pages")?;
         let page_set_size = read_record_u32(bytes, &mut offset, "page set size")?;
+        let mut wal_frame_payload_digest = [0_u8; 32];
+        wal_frame_payload_digest.copy_from_slice(read_record_bytes(
+            bytes,
+            &mut offset,
+            PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_SIZE,
+            "WAL frame payload digest",
+        )?);
         let fallback_active = match read_record_bytes(bytes, &mut offset, 1, "fallback flag")?[0] {
             0 => false,
             1 => true,
@@ -791,6 +879,7 @@ impl ParallelWalDurableCertificateRecord {
             lane_record_counts,
             db_size_pages,
             page_set_size,
+            wal_frame_payload_digest,
             certificate_crc32c,
             fallback_active,
         };
@@ -879,6 +968,8 @@ pub struct ParallelWalDurabilityRequest {
     pub lane_record_counts: Vec<u32>,
     pub db_size_pages: u32,
     pub page_set_size: u32,
+    /// Digest of the exact ordered WAL frame headers and payloads.
+    pub wal_frame_payload_digest: [u8; 32],
     pub control_mode: ParallelWalOperatingMode,
     pub fallback_reason: Option<ParallelWalFallbackReason>,
     pub checkpoint_active: bool,
@@ -899,6 +990,7 @@ pub struct ParallelWalConservativeShadowEvidence {
     pub lane_record_counts: Vec<u32>,
     pub db_size_pages: u32,
     pub page_set_size: u32,
+    pub wal_frame_payload_digest: [u8; 32],
     pub control_mode: ParallelWalOperatingMode,
     pub fallback_reason: Option<ParallelWalFallbackReason>,
     pub checkpoint_active: bool,
@@ -952,9 +1044,44 @@ pub struct ParallelWalDurabilityReceipt {
     pub fallback_reason: Option<ParallelWalFallbackReason>,
 }
 
+/// Opaque identity for a prepared parallel-WAL publication whose durability
+/// outcome has not yet been reconciled.
+///
+/// Preparing a publication retains the combiner's ordered residue. The exact
+/// handle must subsequently be passed to
+/// [`ParallelWalDurabilityCombiner::finalize_pending_publication`] after the
+/// durable certificate and WAL interval are proven committed, or to
+/// [`ParallelWalDurabilityCombiner::abort_pending_publication`] after they are
+/// proven not committed. Merely receiving an I/O error is not proof of either
+/// outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalPendingPublication {
+    combiner_id: u64,
+    pending_id: u64,
+    certificate: ParallelWalCommitCertificate,
+}
+
+impl ParallelWalPendingPublication {
+    /// Monotonic identity within the originating combiner.
+    ///
+    /// Exact reconciliation also validates the handle's opaque combiner
+    /// identity; this value alone does not authorize finalize or abort.
+    #[must_use]
+    pub const fn pending_id(&self) -> u64 {
+        self.pending_id
+    }
+
+    /// Certificate bytes that must precede the matching WAL commit interval.
+    #[must_use]
+    pub const fn certificate(&self) -> &ParallelWalCommitCertificate {
+        &self.certificate
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParallelWalCombinerError {
     OrderedResidueBusy,
+    Cancelled,
     EmptyBatch,
     BatchIdentityCountMismatch {
         batch_size: u32,
@@ -990,6 +1117,18 @@ pub enum ParallelWalCombinerError {
     ShadowCertificateMismatch,
     MissingConservativeShadowEvidence,
     DurabilityWriteFailed(String),
+    PendingPublicationIdOverflow,
+    PendingPublicationMissing {
+        pending_id: u64,
+    },
+    PendingPublicationOwnerMismatch {
+        expected_combiner_id: u64,
+        actual_combiner_id: u64,
+    },
+    PendingPublicationMismatch {
+        expected_pending_id: u64,
+        actual_pending_id: u64,
+    },
 }
 
 impl std::fmt::Display for ParallelWalCombinerError {
@@ -998,6 +1137,7 @@ impl std::fmt::Display for ParallelWalCombinerError {
             Self::OrderedResidueBusy => {
                 f.write_str("parallel WAL ordered durability residue is already active")
             }
+            Self::Cancelled => f.write_str("parallel WAL ordered durability residue was cancelled"),
             Self::EmptyBatch => f.write_str("parallel WAL certificate cannot cover zero commits"),
             Self::BatchIdentityCountMismatch {
                 batch_size,
@@ -1060,6 +1200,27 @@ impl std::fmt::Display for ParallelWalCombinerError {
                     "parallel WAL certificate durability write failed: {detail}"
                 )
             }
+            Self::PendingPublicationIdOverflow => {
+                f.write_str("parallel WAL pending-publication identity overflow")
+            }
+            Self::PendingPublicationMissing { pending_id } => write!(
+                f,
+                "parallel WAL pending publication {pending_id} no longer exists"
+            ),
+            Self::PendingPublicationOwnerMismatch {
+                expected_combiner_id,
+                actual_combiner_id,
+            } => write!(
+                f,
+                "parallel WAL pending publication belongs to combiner {actual_combiner_id}, expected combiner {expected_combiner_id}"
+            ),
+            Self::PendingPublicationMismatch {
+                expected_pending_id,
+                actual_pending_id,
+            } => write!(
+                f,
+                "parallel WAL pending publication mismatch: expected {expected_pending_id}, got {actual_pending_id}"
+            ),
         }
     }
 }
@@ -1085,6 +1246,17 @@ struct ParallelWalCombinerState {
     metrics: ParallelWalCombinerMetricsSnapshot,
 }
 
+static NEXT_PARALLEL_WAL_COMBINER_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_parallel_wal_combiner_id() -> u64 {
+    NEXT_PARALLEL_WAL_COMBINER_ID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .expect("parallel WAL combiner identity space exhausted")
+}
+
 /// Tiny serialized residue joining already-parallel lane staging to durable,
 /// authoritative visibility publication.
 ///
@@ -1092,19 +1264,55 @@ struct ParallelWalCombinerState {
 /// after it returns success. Callers must write or prove the certificate's
 /// durable equivalent in that callback; page-plane work and structured logging
 /// stay outside this lock.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ParallelWalDurabilityCombiner {
+    combiner_id: u64,
     ordered_residue_claimed: AtomicBool,
+    ordered_residue_wait_lock: Mutex<()>,
+    ordered_residue_wait: Condvar,
+    #[cfg(test)]
+    ordered_residue_blocking_waiters: std::sync::atomic::AtomicUsize,
+    next_pending_publication_id: AtomicU64,
+    pending_publication: Mutex<Option<PendingParallelWalPublicationState>>,
     state: Mutex<ParallelWalCombinerState>,
 }
 
 struct ParallelWalOrderedResidueGuard<'a> {
     claimed: &'a AtomicBool,
+    wait_lock: &'a Mutex<()>,
+    wait: &'a Condvar,
+    release_claim_on_drop: bool,
+}
+
+#[cfg(test)]
+struct ParallelWalBlockingWaiterGuard<'a> {
+    waiters: &'a std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Drop for ParallelWalBlockingWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Drop for ParallelWalOrderedResidueGuard<'_> {
     fn drop(&mut self) {
+        if !self.release_claim_on_drop {
+            return;
+        }
+        let _wait_guard = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.claimed.store(false, Ordering::Release);
+        self.wait.notify_all();
+    }
+}
+
+impl ParallelWalOrderedResidueGuard<'_> {
+    fn retain_claim_on_drop(&mut self) {
+        self.release_claim_on_drop = false;
     }
 }
 
@@ -1118,11 +1326,28 @@ struct PreparedParallelWalPublication {
     lookup_mode: ParallelWalLookupMode,
 }
 
+#[derive(Debug)]
+struct PendingParallelWalPublicationState {
+    combiner_id: u64,
+    pending_id: u64,
+    request: ParallelWalDurabilityRequest,
+    staged_state: ParallelWalCombinerState,
+    prepared: PreparedParallelWalPublication,
+    ordered_start: Instant,
+}
+
 impl ParallelWalDurabilityCombiner {
     #[must_use]
     pub fn new(initial_visibility: ParallelWalVisibilitySnapshot) -> Self {
         Self {
+            combiner_id: next_parallel_wal_combiner_id(),
             ordered_residue_claimed: AtomicBool::new(false),
+            ordered_residue_wait_lock: Mutex::new(()),
+            ordered_residue_wait: Condvar::new(),
+            #[cfg(test)]
+            ordered_residue_blocking_waiters: std::sync::atomic::AtomicUsize::new(0),
+            next_pending_publication_id: AtomicU64::new(0),
+            pending_publication: Mutex::new(None),
             state: Mutex::new(ParallelWalCombinerState {
                 durable_segment_epoch: initial_visibility.certificate_epoch,
                 visibility: initial_visibility,
@@ -1142,7 +1367,7 @@ impl ParallelWalDurabilityCombiner {
         &self,
         certificate: &ParallelWalCommitCertificate,
     ) -> Result<(), ParallelWalCombinerError> {
-        let _ordered_residue = self.try_claim_ordered_residue()?;
+        let _ordered_residue = self.claim_ordered_residue_blocking();
         if !certificate.checksum_is_valid() {
             return Err(ParallelWalCombinerError::CertificateChecksumMismatch);
         }
@@ -1234,7 +1459,39 @@ impl ParallelWalDurabilityCombiner {
             .map_err(|_| ParallelWalCombinerError::OrderedResidueBusy)?;
         Ok(ParallelWalOrderedResidueGuard {
             claimed: &self.ordered_residue_claimed,
+            wait_lock: &self.ordered_residue_wait_lock,
+            wait: &self.ordered_residue_wait,
+            release_claim_on_drop: true,
         })
+    }
+
+    fn claim_ordered_residue_blocking(&self) -> ParallelWalOrderedResidueGuard<'_> {
+        if let Ok(guard) = self.try_claim_ordered_residue() {
+            return guard;
+        }
+
+        #[cfg(test)]
+        let _waiter_guard = {
+            self.ordered_residue_blocking_waiters
+                .fetch_add(1, Ordering::AcqRel);
+            ParallelWalBlockingWaiterGuard {
+                waiters: &self.ordered_residue_blocking_waiters,
+            }
+        };
+        let mut wait_guard = self
+            .ordered_residue_wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Ok(guard) = self.try_claim_ordered_residue() {
+                drop(wait_guard);
+                return guard;
+            }
+            wait_guard = self
+                .ordered_residue_wait
+                .wait(wait_guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 
     async fn claim_ordered_residue(
@@ -1242,9 +1499,8 @@ impl ParallelWalDurabilityCombiner {
         cx: &Cx,
     ) -> Result<ParallelWalOrderedResidueGuard<'_>, ParallelWalCombinerError> {
         loop {
-            cx.checkpoint().map_err(|error| {
-                ParallelWalCombinerError::DurabilityWriteFailed(error.to_string())
-            })?;
+            cx.checkpoint()
+                .map_err(|_| ParallelWalCombinerError::Cancelled)?;
             match self.try_claim_ordered_residue() {
                 Ok(guard) => return Ok(guard),
                 Err(ParallelWalCombinerError::OrderedResidueBusy) => {
@@ -1253,6 +1509,256 @@ impl ParallelWalDurabilityCombiner {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn next_pending_publication_id(&self) -> Result<u64, ParallelWalCombinerError> {
+        self.next_pending_publication_id
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| ParallelWalCombinerError::PendingPublicationIdOverflow)
+    }
+
+    fn prepare_pending_publication_from_claim<S>(
+        &self,
+        mut ordered_residue: ParallelWalOrderedResidueGuard<'_>,
+        request: ParallelWalDurabilityRequest,
+        shadow_certificate: Option<S>,
+        conservative_shadow_evidence: Option<ParallelWalConservativeShadowEvidence>,
+    ) -> Result<ParallelWalPendingPublication, ParallelWalCombinerError>
+    where
+        S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ordered_start = Instant::now();
+        let mut staged_state = state.clone();
+        let prepared = match prepare_parallel_wal_publication(
+            &mut staged_state,
+            &request,
+            shadow_certificate,
+            conservative_shadow_evidence.as_ref(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                preserve_shadow_failure_metrics(&mut state, &staged_state);
+                return Err(error);
+            }
+        };
+        drop(state);
+
+        let pending_id = self.next_pending_publication_id()?;
+        let pending = ParallelWalPendingPublication {
+            combiner_id: self.combiner_id,
+            pending_id,
+            certificate: prepared.certificate.clone(),
+        };
+        let mut slot = self
+            .pending_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(
+            slot.is_none(),
+            "an ordered-residue claim cannot coexist with another pending publication"
+        );
+        if slot.is_some() {
+            return Err(ParallelWalCombinerError::OrderedResidueBusy);
+        }
+        *slot = Some(PendingParallelWalPublicationState {
+            combiner_id: self.combiner_id,
+            pending_id,
+            request,
+            staged_state,
+            prepared,
+            ordered_start,
+        });
+        ordered_residue.retain_claim_on_drop();
+        drop(slot);
+        Ok(pending)
+    }
+
+    fn prepare_pending_publication_blocking<S>(
+        &self,
+        request: ParallelWalDurabilityRequest,
+        shadow_certificate: Option<S>,
+        conservative_shadow_evidence: Option<ParallelWalConservativeShadowEvidence>,
+    ) -> Result<ParallelWalPendingPublication, ParallelWalCombinerError>
+    where
+        S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
+    {
+        let ordered_residue = self.claim_ordered_residue_blocking();
+        self.prepare_pending_publication_from_claim(
+            ordered_residue,
+            request,
+            shadow_certificate,
+            conservative_shadow_evidence,
+        )
+    }
+
+    async fn prepare_pending_publication_async_inner<S>(
+        &self,
+        cx: &Cx,
+        request: ParallelWalDurabilityRequest,
+        shadow_certificate: Option<S>,
+        conservative_shadow_evidence: Option<ParallelWalConservativeShadowEvidence>,
+    ) -> Result<ParallelWalPendingPublication, ParallelWalCombinerError>
+    where
+        S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
+    {
+        let ordered_residue = self.claim_ordered_residue(cx).await?;
+        // No durable side effect exists yet, so cancellation can release the
+        // claim and leave the interval available for ordinary retry.
+        cx.checkpoint()
+            .map_err(|_| ParallelWalCombinerError::Cancelled)?;
+        self.prepare_pending_publication_from_claim(
+            ordered_residue,
+            request,
+            shadow_certificate,
+            conservative_shadow_evidence,
+        )
+    }
+
+    /// Prepare and retain the exact ordered publication that a caller will
+    /// make durable.
+    ///
+    /// The returned handle owns no resources itself; the combiner retains the
+    /// ordered residue even if the handle or calling future is dropped.
+    /// Recovery must prove the physical outcome before finalizing or aborting
+    /// the handle.
+    pub async fn prepare_pending_publication(
+        &self,
+        cx: &Cx,
+        request: ParallelWalDurabilityRequest,
+    ) -> Result<ParallelWalPendingPublication, ParallelWalCombinerError> {
+        self.prepare_pending_publication_async_inner(
+            cx,
+            request,
+            Option::<fn(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate>::None,
+            None,
+        )
+        .await
+    }
+
+    /// Prepare an ordered publication with independently reconstructed
+    /// conservative shadow evidence.
+    pub async fn prepare_pending_publication_with_conservative_shadow(
+        &self,
+        cx: &Cx,
+        request: ParallelWalDurabilityRequest,
+        shadow_evidence: ParallelWalConservativeShadowEvidence,
+    ) -> Result<ParallelWalPendingPublication, ParallelWalCombinerError> {
+        self.prepare_pending_publication_async_inner(
+            cx,
+            request,
+            Option::<fn(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate>::None,
+            Some(shadow_evidence),
+        )
+        .await
+    }
+
+    /// Return the currently retained publication, if any.
+    ///
+    /// This is a recovery lookup, not an authorization verdict. The caller
+    /// must still inspect lower-layer completion and durable WAL evidence.
+    #[must_use]
+    pub fn pending_publication(&self) -> Option<ParallelWalPendingPublication> {
+        self.pending_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|pending| ParallelWalPendingPublication {
+                combiner_id: pending.combiner_id,
+                pending_id: pending.pending_id,
+                certificate: pending.prepared.certificate.clone(),
+            })
+    }
+
+    fn take_exact_pending_publication(
+        &self,
+        pending: &ParallelWalPendingPublication,
+    ) -> Result<PendingParallelWalPublicationState, ParallelWalCombinerError> {
+        let mut slot = self
+            .pending_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = slot.as_ref() else {
+            return Err(ParallelWalCombinerError::PendingPublicationMissing {
+                pending_id: pending.pending_id,
+            });
+        };
+        if pending.combiner_id != self.combiner_id || current.combiner_id != pending.combiner_id {
+            return Err(ParallelWalCombinerError::PendingPublicationOwnerMismatch {
+                expected_combiner_id: self.combiner_id,
+                actual_combiner_id: pending.combiner_id,
+            });
+        }
+        if current.pending_id != pending.pending_id
+            || current.prepared.certificate != pending.certificate
+        {
+            return Err(ParallelWalCombinerError::PendingPublicationMismatch {
+                expected_pending_id: current.pending_id,
+                actual_pending_id: pending.pending_id,
+            });
+        }
+        Ok(slot
+            .take()
+            .expect("pending publication was present after exact validation"))
+    }
+
+    fn release_retained_ordered_residue(&self) {
+        let _wait_guard = self
+            .ordered_residue_wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_claimed = self.ordered_residue_claimed.swap(false, Ordering::Release);
+        debug_assert!(
+            was_claimed,
+            "a retained publication must own the ordered residue"
+        );
+        self.ordered_residue_wait.notify_all();
+    }
+
+    /// Publish an exact pending interval after durable recovery evidence
+    /// authorizes its certificate and matching commit marker.
+    pub fn finalize_pending_publication(
+        &self,
+        pending: &ParallelWalPendingPublication,
+    ) -> Result<ParallelWalDurabilityReceipt, ParallelWalCombinerError> {
+        let PendingParallelWalPublicationState {
+            request,
+            mut staged_state,
+            prepared,
+            ordered_start,
+            ..
+        } = self.take_exact_pending_publication(pending)?;
+        let receipt =
+            finalize_parallel_wal_publication(&mut staged_state, &request, prepared, ordered_start);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = staged_state;
+        drop(state);
+        self.release_retained_ordered_residue();
+        trace_parallel_wal_publication(&request, &receipt);
+        Ok(receipt)
+    }
+
+    /// Release an exact pending interval after recovery proves that no matching
+    /// commit marker was authorized.
+    ///
+    /// An I/O error alone is insufficient. The caller must also prove all
+    /// started lower-layer writes terminal before invoking this method.
+    pub fn abort_pending_publication(
+        &self,
+        pending: &ParallelWalPendingPublication,
+    ) -> Result<(), ParallelWalCombinerError> {
+        let _discarded = self.take_exact_pending_publication(pending)?;
+        self.release_retained_ordered_residue();
+        Ok(())
     }
 
     pub fn certify_and_publish<F>(
@@ -1274,9 +1780,11 @@ impl ParallelWalDurabilityCombiner {
     /// Asynchronously persist a commit certificate and publish it atomically.
     ///
     /// The combiner's visibility, clocks, checksum, and metrics remain exactly
-    /// unchanged until `durable_write` resolves successfully. A durability
-    /// error or cancellation while the callback is pending discards all staged
-    /// state, leaving the same certificate interval available for retry.
+    /// unchanged until `durable_write` resolves successfully. Cancellation
+    /// before preparation leaves the interval available for ordinary retry.
+    /// Once a pending publication exists, success advances it and every other
+    /// outcome retains it for explicit physical reconciliation; an I/O error
+    /// does not prove whether the commit marker reached its destination.
     pub async fn certify_and_publish_async<F, Fut>(
         &self,
         cx: &Cx,
@@ -1366,41 +1874,20 @@ impl ParallelWalDurabilityCombiner {
         F: FnOnce(&ParallelWalCommitCertificate) -> Result<(), String>,
         S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
     {
-        let _ordered_residue = self.try_claim_ordered_residue()?;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ordered_start = Instant::now();
-        let mut staged_state = state.clone();
-        let prepared = match prepare_parallel_wal_publication(
-            &mut staged_state,
-            &request,
+        let pending = self.prepare_pending_publication_blocking(
+            request,
             shadow_certificate,
-            conservative_shadow_evidence.as_ref(),
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                preserve_shadow_failure_metrics(&mut state, &staged_state);
-                return Err(error);
-            }
-        };
-
-        durable_write(&prepared.certificate)
+            conservative_shadow_evidence,
+        )?;
+        durable_write(pending.certificate())
             .map_err(ParallelWalCombinerError::DurabilityWriteFailed)?;
-
-        let receipt =
-            finalize_parallel_wal_publication(&mut staged_state, &request, prepared, ordered_start);
-        *state = staged_state;
-        drop(state);
-        trace_parallel_wal_publication(&request, &receipt);
-        Ok(receipt)
+        self.finalize_pending_publication(&pending)
     }
 
-    // The atomic claim spans the durability await, but the state mutex does
-    // not. Contenders cooperatively yield, while synchronous visibility and
-    // metrics readers can still inspect the last published snapshot without
-    // blocking an executor thread on disk I/O.
+    // The retained pending state spans the durability await, but the state
+    // mutex does not. Contenders cooperatively yield, while synchronous
+    // visibility and metrics readers can still inspect the last published
+    // snapshot without blocking an executor thread on disk I/O.
     async fn certify_and_publish_inner_async<F, Fut, S>(
         &self,
         cx: &Cx,
@@ -1414,41 +1901,26 @@ impl ParallelWalDurabilityCombiner {
         Fut: Future<Output = Result<(), String>>,
         S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
     {
-        let _ordered_residue = self.claim_ordered_residue(cx).await?;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ordered_start = Instant::now();
-        let mut staged_state = state.clone();
-        let prepared = match prepare_parallel_wal_publication(
-            &mut staged_state,
-            &request,
-            shadow_certificate,
-            conservative_shadow_evidence.as_ref(),
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                preserve_shadow_failure_metrics(&mut state, &staged_state);
-                return Err(error);
-            }
+        let pending = self
+            .prepare_pending_publication_async_inner(
+                cx,
+                request,
+                shadow_certificate,
+                conservative_shadow_evidence,
+            )
+            .await?;
+
+        // Once a lower-layer write begins, neither cancellation nor an I/O
+        // error proves whether bytes reached the OS or stable media. The
+        // pending publication therefore remains retained unless this callback
+        // succeeds. Callers that receive an error must reconcile the exact
+        // handle exposed by `pending_publication()`.
+        let durability_result = {
+            let _durability_mask = cx.masked();
+            durable_write(pending.certificate.clone()).await
         };
-        drop(state);
-
-        durable_write(prepared.certificate.clone())
-            .await
-            .map_err(ParallelWalCombinerError::DurabilityWriteFailed)?;
-
-        let receipt =
-            finalize_parallel_wal_publication(&mut staged_state, &request, prepared, ordered_start);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = staged_state;
-        drop(state);
-        trace_parallel_wal_publication(&request, &receipt);
-        Ok(receipt)
+        durability_result.map_err(ParallelWalCombinerError::DurabilityWriteFailed)?;
+        self.finalize_pending_publication(&pending)
     }
 
     /// Validate a receipt proposed for publication by an external transport.
@@ -1494,6 +1966,12 @@ impl ParallelWalDurabilityCombiner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .metrics
+    }
+}
+
+impl Default for ParallelWalDurabilityCombiner {
+    fn default() -> Self {
+        Self::new(ParallelWalVisibilitySnapshot::default())
     }
 }
 
@@ -1788,6 +2266,7 @@ fn build_commit_certificate(
             lane_record_counts: request.lane_record_counts.clone(),
             db_size_pages: request.db_size_pages,
             page_set_size: request.page_set_size,
+            wal_frame_payload_digest: request.wal_frame_payload_digest,
             certificate_crc32c: 0,
             fallback_active,
         },
@@ -1911,6 +2390,7 @@ fn build_conservative_shadow_certificate(
             lane_record_counts: evidence.lane_record_counts.clone(),
             db_size_pages: evidence.db_size_pages,
             page_set_size: evidence.page_set_size,
+            wal_frame_payload_digest: evidence.wal_frame_payload_digest,
             certificate_crc32c: 0,
             fallback_active: fallback_reason.is_some(),
         },
@@ -4556,7 +5036,7 @@ mod tests {
     #[test]
     fn commit_certificate_clone_eq_debug() {
         let cert = ParallelWalCommitCertificate {
-            format_version: 1,
+            format_version: PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION,
             residue: ParallelWalOrderedResidue::default(),
             certificate_epoch: 10,
             commit_seq_lo: CommitSeq::new(1),
@@ -4566,6 +5046,7 @@ mod tests {
             lane_record_counts: vec![2, 3, 0, 1],
             db_size_pages: 100,
             page_set_size: 6,
+            wal_frame_payload_digest: [0xA5; 32],
             certificate_crc32c: 0,
             fallback_active: false,
         };
@@ -4575,6 +5056,89 @@ mod tests {
         assert_eq!(cert.lane_record_counts.len(), 4);
         let dbg = format!("{cert:?}");
         assert!(dbg.contains("ParallelWalCommitCertificate"));
+    }
+
+    fn frame_payload_digest(frames: &[(u32, u32, &[u8])]) -> [u8; 32] {
+        let mut builder = ParallelWalFramePayloadDigestBuilder::new();
+        for &(page_number, db_size_if_commit, payload) in frames {
+            builder.update(
+                PageNumber::new(page_number).expect("test page number should be valid"),
+                db_size_if_commit,
+                payload,
+            );
+        }
+        builder.finalize()
+    }
+
+    fn test_wal_frame_payload_digest() -> [u8; 32] {
+        frame_payload_digest(&[
+            (2, 0, b"frame-a"),
+            (3, 0, b"frame-b"),
+            (4, 0, b"frame-c"),
+            (5, 0, b"frame-d"),
+            (6, 17, b"frame-e"),
+        ])
+    }
+
+    #[test]
+    fn frame_payload_digest_builder_binds_ordered_metadata_length_and_bytes() {
+        let baseline = frame_payload_digest(&[(2, 0, b"abc"), (3, 17, b"defg")]);
+
+        let mut expected = blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN);
+        expected.update(&0_u64.to_le_bytes());
+        expected.update(&2_u32.to_le_bytes());
+        expected.update(&0_u32.to_le_bytes());
+        expected.update(&3_u64.to_le_bytes());
+        expected.update(b"abc");
+        expected.update(&1_u64.to_le_bytes());
+        expected.update(&3_u32.to_le_bytes());
+        expected.update(&17_u32.to_le_bytes());
+        expected.update(&4_u64.to_le_bytes());
+        expected.update(b"defg");
+        assert_eq!(baseline, *expected.finalize().as_bytes());
+
+        let mut unkeyed = blake3::Hasher::new();
+        unkeyed.update(&0_u64.to_le_bytes());
+        unkeyed.update(&2_u32.to_le_bytes());
+        unkeyed.update(&0_u32.to_le_bytes());
+        unkeyed.update(&3_u64.to_le_bytes());
+        unkeyed.update(b"abc");
+        unkeyed.update(&1_u64.to_le_bytes());
+        unkeyed.update(&3_u32.to_le_bytes());
+        unkeyed.update(&17_u32.to_le_bytes());
+        unkeyed.update(&4_u64.to_le_bytes());
+        unkeyed.update(b"defg");
+        assert_ne!(
+            baseline,
+            *unkeyed.finalize().as_bytes(),
+            "derive-key domain separation must affect the digest"
+        );
+
+        assert_ne!(
+            baseline,
+            frame_payload_digest(&[(3, 17, b"defg"), (2, 0, b"abc")]),
+            "ordered frame position must affect the digest"
+        );
+        assert_ne!(
+            baseline,
+            frame_payload_digest(&[(4, 0, b"abc"), (3, 17, b"defg")]),
+            "page number must affect the digest"
+        );
+        assert_ne!(
+            baseline,
+            frame_payload_digest(&[(2, 0, b"abc"), (3, 18, b"defg")]),
+            "commit database size must affect the digest"
+        );
+        assert_ne!(
+            baseline,
+            frame_payload_digest(&[(2, 0, b"abc"), (3, 17, b"defh")]),
+            "payload bytes must affect the digest"
+        );
+        assert_ne!(
+            baseline,
+            frame_payload_digest(&[(2, 0, b"abc"), (3, 17, b"defg\0")]),
+            "payload length must affect the digest"
+        );
     }
 
     fn durability_request(mode: ParallelWalOperatingMode) -> ParallelWalDurabilityRequest {
@@ -4588,6 +5152,7 @@ mod tests {
             lane_record_counts: vec![3, 2],
             db_size_pages: 17,
             page_set_size: 5,
+            wal_frame_payload_digest: test_wal_frame_payload_digest(),
             control_mode: mode,
             fallback_reason: None,
             checkpoint_active: false,
@@ -4635,6 +5200,22 @@ mod tests {
     }
 
     #[test]
+    fn commit_certificate_crc_is_sensitive_to_frame_payload_digest() {
+        let certificate = ParallelWalDurabilityCombiner::default()
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("certificate should publish")
+            .certificate;
+        let mut altered = certificate.clone();
+        altered.wal_frame_payload_digest[0] ^= 1;
+
+        assert_ne!(altered.canonical_bytes(), certificate.canonical_bytes());
+        assert_ne!(altered.computed_crc32c(), certificate.certificate_crc32c);
+        assert!(!altered.checksum_is_valid());
+    }
+
+    #[test]
     fn authorized_tail_seeds_fresh_process_certificate_clocks() {
         let first = ParallelWalDurabilityCombiner::default()
             .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
@@ -4665,7 +5246,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_certificate_record_roundtrips_generation_interval_and_checksum() {
+    fn durable_certificate_record_roundtrips_frame_payload_digest_and_checksum() {
         let receipt = ParallelWalDurabilityCombiner::default()
             .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
                 Ok(())
@@ -4684,7 +5265,19 @@ mod tests {
             receipt.certificate,
         )
         .expect("durable record should validate");
+        let expected_frame_payload_digest = record.certificate.wal_frame_payload_digest;
         let encoded = record.to_bytes();
+        assert_eq!(
+            encoded.len(),
+            ParallelWalDurableCertificateRecord::MIN_ENCODED_SIZE
+                + record.certificate.lane_record_counts.len() * 4,
+            "fixed record envelope must include the 32-byte frame payload digest"
+        );
+        assert_eq!(
+            ParallelWalDurableCertificateRecord::MIN_ENCODED_SIZE,
+            136,
+            "recovery readers must share the version-3 minimum envelope size"
+        );
         let footer_offset = encoded.len() - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
         assert_eq!(
             usize::try_from(u32::from_le_bytes(
@@ -4696,11 +5289,13 @@ mod tests {
             encoded.len(),
             "tail footer must support bounded latest-record lookup"
         );
+        let decoded = ParallelWalDurableCertificateRecord::from_bytes(&encoded)
+            .expect("durable record should decode");
         assert_eq!(
-            ParallelWalDurableCertificateRecord::from_bytes(&encoded)
-                .expect("durable record should decode"),
-            record
+            decoded.certificate.wal_frame_payload_digest,
+            expected_frame_payload_digest
         );
+        assert_eq!(decoded, record);
 
         let mut damaged = encoded.clone();
         damaged[20] ^= 1;
@@ -4723,7 +5318,31 @@ mod tests {
     }
 
     #[test]
-    fn durability_failure_does_not_advance_visibility() {
+    fn durable_certificate_authorization_rejects_wrong_frame_payload_digest() {
+        let request = durability_request(ParallelWalOperatingMode::Auto);
+        let actual_frame_payload_digest = request.wal_frame_payload_digest;
+        let receipt = ParallelWalDurabilityCombiner::default()
+            .certify_and_publish(request, |_| Ok(()))
+            .expect("certificate should publish");
+        let wal_generation = WalGenerationIdentity {
+            checkpoint_seq: 9,
+            salts: crate::checksum::WalSalts {
+                salt1: 0x1122_3344,
+                salt2: 0x5566_7788,
+            },
+        };
+        let record =
+            ParallelWalDurableCertificateRecord::new(wal_generation, 1, 5, receipt.certificate)
+                .expect("durable record should validate");
+
+        assert!(record.authorizes_wal_boundary(wal_generation, 5, 5, actual_frame_payload_digest));
+        let mut wrong_frame_payload_digest = actual_frame_payload_digest;
+        wrong_frame_payload_digest[0] ^= 1;
+        assert!(!record.authorizes_wal_boundary(wal_generation, 5, 5, wrong_frame_payload_digest));
+    }
+
+    #[test]
+    fn durability_failure_retains_exact_publication_until_not_committed_is_proven() {
         let combiner = ParallelWalDurabilityCombiner::default();
         let error = combiner
             .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
@@ -4738,13 +5357,138 @@ mod tests {
             combiner.visibility_snapshot(),
             ParallelWalVisibilitySnapshot::default()
         );
+        let pending = combiner
+            .pending_publication()
+            .expect("ambiguous I/O failure must retain its exact publication");
+        assert_eq!(pending.certificate().commit_seq_lo, CommitSeq::new(1));
+        assert!(matches!(
+            combiner.try_claim_ordered_residue(),
+            Err(ParallelWalCombinerError::OrderedResidueBusy)
+        ));
 
+        combiner
+            .abort_pending_publication(&pending)
+            .expect("recovery proved the failed write did not commit");
         let receipt = combiner
             .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
                 Ok(())
             })
-            .expect("same interval should remain available after failed durability");
+            .expect("an explicitly aborted interval should remain available");
         assert_eq!(receipt.certificate.commit_seq_lo, CommitSeq::new(1));
+    }
+
+    #[test]
+    fn synchronous_combiner_waits_for_the_active_ordered_residue() {
+        let combiner = Arc::new(ParallelWalDurabilityCombiner::default());
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+
+        let first_combiner = Arc::clone(&combiner);
+        let first = std::thread::spawn(move || {
+            first_combiner.certify_and_publish(
+                durability_request(ParallelWalOperatingMode::Auto),
+                |_| {
+                    first_entered_tx
+                        .send(())
+                        .expect("test should observe the active ordered residue");
+                    release_first_rx
+                        .recv()
+                        .expect("test should release the active ordered residue");
+                    Ok(())
+                },
+            )
+        });
+        first_entered_rx
+            .recv()
+            .expect("first combiner worker should enter durability");
+
+        let second_combiner = Arc::clone(&combiner);
+        let second = std::thread::spawn(move || {
+            let mut request = durability_request(ParallelWalOperatingMode::Auto);
+            request.batch_ids = vec![201, 202];
+            second_combiner.certify_and_publish(request, |_| Ok(()))
+        });
+
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        while combiner
+            .ordered_residue_blocking_waiters
+            .load(Ordering::Acquire)
+            == 0
+        {
+            assert!(
+                Instant::now() < wait_deadline,
+                "second combiner worker never attempted the contended residue"
+            );
+            std::thread::yield_now();
+        }
+        release_first_tx
+            .send(())
+            .expect("first combiner worker should still be waiting");
+        let first_receipt = first
+            .join()
+            .expect("first combiner worker should not panic")
+            .expect("first combiner worker should publish");
+        let second_receipt = second
+            .join()
+            .expect("second combiner worker should not panic")
+            .expect("second combiner worker should wait and then publish");
+
+        assert_eq!(
+            first_receipt.certificate.commit_seq_hi.get() + 1,
+            second_receipt.certificate.commit_seq_lo.get()
+        );
+        assert_eq!(
+            combiner.visibility_snapshot().visible_commit_seq,
+            second_receipt.certificate.commit_seq_hi
+        );
+    }
+
+    #[test]
+    fn cancellation_before_async_durability_skips_callback_and_retry_is_unique() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let runtime = test_runtime();
+        let cancelled_cx = test_cx();
+        cancelled_cx.cancel();
+        runtime.block_on(async {
+            let combiner = ParallelWalDurabilityCombiner::default();
+            let durable_side_effects = Arc::new(AtomicUsize::new(0));
+            let cancelled_side_effects = Arc::clone(&durable_side_effects);
+            let error = combiner
+                .certify_and_publish_async(
+                    &cancelled_cx,
+                    durability_request(ParallelWalOperatingMode::Auto),
+                    move |_| {
+                        cancelled_side_effects.fetch_add(1, AtomicOrdering::AcqRel);
+                        async { Ok(()) }
+                    },
+                )
+                .await
+                .expect_err("pre-callback cancellation must abort the interval");
+            assert_eq!(error, ParallelWalCombinerError::Cancelled);
+            assert_eq!(durable_side_effects.load(AtomicOrdering::Acquire), 0);
+            assert_eq!(
+                combiner.visibility_snapshot(),
+                ParallelWalVisibilitySnapshot::default()
+            );
+
+            let retry_cx = test_cx();
+            let retry_side_effects = Arc::clone(&durable_side_effects);
+            let receipt = combiner
+                .certify_and_publish_async(
+                    &retry_cx,
+                    durability_request(ParallelWalOperatingMode::Auto),
+                    move |_| {
+                        retry_side_effects.fetch_add(1, AtomicOrdering::AcqRel);
+                        async { Ok(()) }
+                    },
+                )
+                .await
+                .expect("retry should retain the uncommitted first interval");
+            assert_eq!(receipt.certificate.commit_seq_lo, CommitSeq::new(1));
+            assert_eq!(receipt.certificate.commit_seq_hi, CommitSeq::new(2));
+            assert_eq!(durable_side_effects.load(AtomicOrdering::Acquire), 1);
+        });
     }
 
     #[test]
@@ -4782,6 +5526,256 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_async_durability_commits_once_without_interval_reuse() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let runtime = test_runtime();
+        let cx = test_cx();
+        runtime.block_on(async {
+            let combiner = ParallelWalDurabilityCombiner::default();
+            let durable_side_effects = Arc::new(AtomicUsize::new(0));
+            let callback_side_effects = Arc::clone(&durable_side_effects);
+            let callback_cx = cx.clone();
+            let first = combiner
+                .certify_and_publish_async(
+                    &cx,
+                    durability_request(ParallelWalOperatingMode::Auto),
+                    move |_| async move {
+                        callback_side_effects.fetch_add(1, AtomicOrdering::AcqRel);
+                        callback_cx.cancel();
+                        asupersync::runtime::yield_now().await;
+                        callback_cx
+                            .checkpoint()
+                            .map_err(|error| error.to_string())?;
+                        Ok(())
+                    },
+                )
+                .await
+                .expect("durability commit section should mask mid-write cancellation");
+            assert_eq!(durable_side_effects.load(AtomicOrdering::Acquire), 1);
+            assert_eq!(first.certificate.commit_seq_lo, CommitSeq::new(1));
+            assert_eq!(
+                combiner.visibility_snapshot().visible_commit_seq,
+                first.certificate.commit_seq_hi
+            );
+            assert!(
+                cx.checkpoint().is_err(),
+                "cancellation must become observable after the commit section"
+            );
+
+            let retry_cx = test_cx();
+            let retry_side_effects = Arc::clone(&durable_side_effects);
+            let mut next_request = durability_request(ParallelWalOperatingMode::Auto);
+            next_request.batch_ids = vec![201, 202];
+            let next = combiner
+                .certify_and_publish_async(&retry_cx, next_request, move |_| async move {
+                    retry_side_effects.fetch_add(1, AtomicOrdering::AcqRel);
+                    Ok(())
+                })
+                .await
+                .expect("completed interval must advance rather than be retried");
+            assert_eq!(
+                next.certificate.commit_seq_lo.get(),
+                first.certificate.commit_seq_hi.get() + 1
+            );
+            assert_ne!(
+                next.certificate.certificate_crc32c,
+                first.certificate.certificate_crc32c
+            );
+            assert_eq!(durable_side_effects.load(AtomicOrdering::Acquire), 2);
+        });
+    }
+
+    #[test]
+    fn dropped_async_durability_retains_the_ordered_residue() {
+        use std::task::Poll;
+
+        let runtime = test_runtime();
+        let cx = test_cx();
+        runtime.block_on(async {
+            let combiner = ParallelWalDurabilityCombiner::default();
+            let mut operation = Box::pin(combiner.certify_and_publish_async(
+                &cx,
+                durability_request(ParallelWalOperatingMode::Auto),
+                |_| async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                },
+            ));
+            std::future::poll_fn(|task_cx| match operation.as_mut().poll(task_cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => {
+                    panic!("durability callback unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+            drop(operation);
+
+            assert!(
+                combiner.ordered_residue_claimed.load(Ordering::Acquire),
+                "dropping an in-flight durability callback must retain serialization until recovery"
+            );
+            let pending = combiner
+                .pending_publication()
+                .expect("dropped durability must retain exact recovery state");
+            assert_eq!(
+                combiner.visibility_snapshot(),
+                ParallelWalVisibilitySnapshot::default()
+            );
+            let receipt = combiner
+                .finalize_pending_publication(&pending)
+                .expect("authorized recovery should publish the retained interval");
+            assert_eq!(receipt.certificate, *pending.certificate());
+            assert!(!combiner.ordered_residue_claimed.load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn pending_publication_reconciliation_is_exact_and_single_use() {
+        let runtime = test_runtime();
+        let cx = test_cx();
+        runtime.block_on(async {
+            let combiner = ParallelWalDurabilityCombiner::default();
+            let pending = combiner
+                .prepare_pending_publication(
+                    &cx,
+                    durability_request(ParallelWalOperatingMode::Auto),
+                )
+                .await
+                .expect("publication should prepare");
+
+            let mut wrong_id = pending.clone();
+            wrong_id.pending_id = wrong_id.pending_id.saturating_add(1);
+            assert!(matches!(
+                combiner.finalize_pending_publication(&wrong_id),
+                Err(ParallelWalCombinerError::PendingPublicationMismatch { .. })
+            ));
+            let mut wrong_certificate = pending.clone();
+            wrong_certificate.certificate.db_size_pages = wrong_certificate
+                .certificate
+                .db_size_pages
+                .saturating_add(1);
+            assert!(matches!(
+                combiner.abort_pending_publication(&wrong_certificate),
+                Err(ParallelWalCombinerError::PendingPublicationMismatch { .. })
+            ));
+            assert_eq!(
+                combiner.visibility_snapshot(),
+                ParallelWalVisibilitySnapshot::default()
+            );
+
+            let receipt = combiner
+                .finalize_pending_publication(&pending)
+                .expect("exact authorized publication should finalize once");
+            assert_eq!(receipt.certificate, *pending.certificate());
+            assert!(matches!(
+                combiner.finalize_pending_publication(&pending),
+                Err(ParallelWalCombinerError::PendingPublicationMissing { .. })
+            ));
+
+            let visibility_after_commit = combiner.visibility_snapshot();
+            let mut next_request = durability_request(ParallelWalOperatingMode::Auto);
+            next_request.batch_ids = vec![301, 302];
+            let not_committed = combiner
+                .prepare_pending_publication(&cx, next_request)
+                .await
+                .expect("next interval should prepare after exact finalization");
+            combiner
+                .abort_pending_publication(&not_committed)
+                .expect("exact not-committed publication should abort once");
+            assert_eq!(combiner.visibility_snapshot(), visibility_after_commit);
+            assert!(matches!(
+                combiner.abort_pending_publication(&not_committed),
+                Err(ParallelWalCombinerError::PendingPublicationMissing { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn pending_publication_rejects_foreign_combiner_finalize_handle() {
+        let runtime = test_runtime();
+        let cx = test_cx();
+        runtime.block_on(async {
+            let first = ParallelWalDurabilityCombiner::default();
+            let second = ParallelWalDurabilityCombiner::default();
+            let request = durability_request(ParallelWalOperatingMode::Auto);
+            let first_pending = first
+                .prepare_pending_publication(&cx, request.clone())
+                .await
+                .expect("first publication should prepare");
+            let second_pending = second
+                .prepare_pending_publication(&cx, request)
+                .await
+                .expect("second publication should prepare");
+
+            assert_eq!(first_pending.pending_id, second_pending.pending_id);
+            assert_eq!(first_pending.certificate, second_pending.certificate);
+            assert_ne!(first_pending.combiner_id, second_pending.combiner_id);
+            assert_eq!(
+                first.finalize_pending_publication(&second_pending),
+                Err(ParallelWalCombinerError::PendingPublicationOwnerMismatch {
+                    expected_combiner_id: first_pending.combiner_id,
+                    actual_combiner_id: second_pending.combiner_id,
+                })
+            );
+            assert_eq!(
+                first.pending_publication(),
+                Some(first_pending.clone()),
+                "foreign finalize must not consume the owner's pending publication"
+            );
+
+            first
+                .finalize_pending_publication(&first_pending)
+                .expect("owner should still finalize its exact publication");
+            second
+                .abort_pending_publication(&second_pending)
+                .expect("second owner should clean up its publication");
+        });
+    }
+
+    #[test]
+    fn pending_publication_rejects_foreign_combiner_abort_handle() {
+        let runtime = test_runtime();
+        let cx = test_cx();
+        runtime.block_on(async {
+            let first = ParallelWalDurabilityCombiner::default();
+            let second = ParallelWalDurabilityCombiner::default();
+            let request = durability_request(ParallelWalOperatingMode::Auto);
+            let first_pending = first
+                .prepare_pending_publication(&cx, request.clone())
+                .await
+                .expect("first publication should prepare");
+            let second_pending = second
+                .prepare_pending_publication(&cx, request)
+                .await
+                .expect("second publication should prepare");
+
+            assert_eq!(first_pending.pending_id, second_pending.pending_id);
+            assert_eq!(first_pending.certificate, second_pending.certificate);
+            assert_ne!(first_pending.combiner_id, second_pending.combiner_id);
+            assert_eq!(
+                second.abort_pending_publication(&first_pending),
+                Err(ParallelWalCombinerError::PendingPublicationOwnerMismatch {
+                    expected_combiner_id: second_pending.combiner_id,
+                    actual_combiner_id: first_pending.combiner_id,
+                })
+            );
+            assert_eq!(
+                second.pending_publication(),
+                Some(second_pending.clone()),
+                "foreign abort must not consume the owner's pending publication"
+            );
+
+            first
+                .abort_pending_publication(&first_pending)
+                .expect("first owner should clean up its publication");
+            second
+                .finalize_pending_publication(&second_pending)
+                .expect("second owner should still finalize its exact publication");
+        });
+    }
+
+    #[test]
     fn async_conservative_shadow_durability_failure_leaves_state_unchanged() {
         let runtime = test_runtime();
         let cx = test_cx();
@@ -4795,6 +5789,7 @@ mod tests {
                 lane_record_counts: request.lane_record_counts.clone(),
                 db_size_pages: request.db_size_pages,
                 page_set_size: request.page_set_size,
+                wal_frame_payload_digest: request.wal_frame_payload_digest,
                 control_mode: request.control_mode,
                 fallback_reason: request.fallback_reason,
                 checkpoint_active: request.checkpoint_active,
@@ -4825,12 +5820,18 @@ mod tests {
             assert_eq!(combiner.visibility_snapshot(), visibility_before);
             assert_eq!(combiner.metrics_snapshot(), metrics_before);
 
+            let pending = combiner
+                .pending_publication()
+                .expect("async I/O failure must retain exact recovery state");
+            combiner
+                .abort_pending_publication(&pending)
+                .expect("test recovery proves the injected callback wrote nothing");
             let receipt = combiner
                 .certify_and_publish_with_conservative_shadow_async(&cx, request, evidence, |_| {
                     Box::pin(async { Ok(()) })
                 })
                 .await
-                .expect("failed interval should remain available for retry");
+                .expect("proven-uncommitted interval should remain available for retry");
             assert_eq!(receipt.certificate.commit_seq_lo, CommitSeq::new(1));
             assert_eq!(
                 receipt.shadow_certificate_verdict,
@@ -4952,6 +5953,7 @@ mod tests {
             lane_record_counts: production_request.lane_record_counts.clone(),
             db_size_pages: production_request.db_size_pages,
             page_set_size: production_request.page_set_size,
+            wal_frame_payload_digest: production_request.wal_frame_payload_digest,
             control_mode: production_request.control_mode,
             fallback_reason: production_request.fallback_reason,
             checkpoint_active: production_request.checkpoint_active,

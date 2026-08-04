@@ -186,7 +186,7 @@ pub fn is_sqlite_format(path: &Path) -> bool {
 /// insertion (e.g. duplicate rowid in sqlite_master).
 #[allow(clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub fn persist_to_sqlite(
+pub async fn persist_to_sqlite(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
@@ -204,7 +204,7 @@ pub fn persist_to_sqlite(
     header.change_counter = effective_counter;
     header.schema_cookie = header.schema_cookie.max(1);
     header.version_valid_for = effective_counter;
-    persist_to_sqlite_with_header(cx, path, schema, db, &header)
+    persist_to_sqlite_with_header(cx, path, schema, db, &header).await
 }
 
 /// Persist `schema` + `db` using the provided database header template.
@@ -213,7 +213,7 @@ pub fn persist_to_sqlite(
 /// metadata that must survive rebuild flows like `VACUUM`.
 #[allow(clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub fn persist_to_sqlite_with_header(
+pub async fn persist_to_sqlite_with_header(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
@@ -229,13 +229,14 @@ pub fn persist_to_sqlite_with_header(
         &[],
         &HashMap::new(),
     )
+    .await
 }
 
 /// Persist `schema` + `db` plus additional sqlite_master rows using the
 /// provided database header template.
 #[allow(clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
+pub async fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
@@ -254,6 +255,7 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
         original_ddl,
         None,
     )
+    .await
 }
 
 /// Persist into an atomically caller-reserved empty file.
@@ -263,7 +265,7 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
 /// rejected before any database byte is initialized.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildHasher>(
+pub async fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildHasher>(
     cx: &Cx,
     path: &Path,
     expected_identity: FileIdentity,
@@ -283,11 +285,12 @@ pub fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildHasher>
         original_ddl,
         Some(expected_identity),
     )
+    .await
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
+async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
@@ -312,11 +315,12 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             header_template.page_size,
             expected_identity,
             None,
-        )?
+        )
+        .await?
     } else {
-        SimplePager::open_with_cx(cx, vfs, path, header_template.page_size)?
+        SimplePager::open_with_cx(cx, vfs, path, header_template.page_size).await?
     };
-    let mut txn = pager.begin(cx, TransactionMode::Immediate)?;
+    let mut txn = pager.begin(cx, TransactionMode::Immediate).await?;
 
     let page_size = header_template.page_size;
     let page_size_usize = page_size.as_usize();
@@ -336,10 +340,10 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
         };
 
         // Allocate a fresh root page for this table in the on-disk file.
-        let root_page = txn.allocate_page(cx)?;
+        let root_page = txn.allocate_page(cx).await?;
 
         // Initialize the root page as an empty leaf table B-tree.
-        init_leaf_table_page(cx, &mut txn, root_page, page_size_usize, usable_size)?;
+        init_leaf_table_page(cx, &mut txn, root_page, page_size_usize, usable_size).await?;
 
         // Insert all rows.
         {
@@ -352,7 +356,7 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
             for (rowid, values) in mem_table.iter_rows() {
                 let payload = serialize_record(values);
-                cursor.table_insert(cx, rowid, &payload)?;
+                cursor.table_insert(cx, rowid, &payload).await?;
             }
         }
 
@@ -414,8 +418,8 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 Vec::new()
             };
             // Allocate and initialize root page as leaf index page (0x0A).
-            let idx_root = txn.allocate_page(cx)?;
-            init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size)?;
+            let idx_root = txn.allocate_page(cx).await?;
+            init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size).await?;
 
             // Parse the partial index WHERE clause (if any) so we can skip
             // rows that don't satisfy the predicate.
@@ -472,7 +476,7 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         }
                         key_values.push(SqliteValue::Integer(rowid));
                         let key = serialize_record(&key_values);
-                        idx_cursor.index_insert(cx, &key)?;
+                        idx_cursor.index_insert(cx, &key).await?;
                     }
                 }
             }
@@ -534,7 +538,7 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     // Write sqlite_master entries into page 1's B-tree.
     // sqlite_master columns: type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT
     {
-        let mut page1 = txn.get_page(cx, PageNumber::ONE)?.into_vec();
+        let mut page1 = txn.get_page(cx, PageNumber::ONE).await?.into_vec();
         if page1.len() < DATABASE_HEADER_SIZE + 8 {
             return Err(FrankenError::internal(format!(
                 "page 1 too short for sqlite_master root header: {} bytes",
@@ -555,7 +559,7 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
         };
         page1[DATABASE_HEADER_SIZE + 5..DATABASE_HEADER_SIZE + 7]
             .copy_from_slice(&master_content_start.to_be_bytes());
-        txn.write_page(cx, PageNumber::ONE, &page1)?;
+        txn.write_page(cx, PageNumber::ONE, &page1).await?;
 
         let master_root = PageNumber::ONE;
         let mut cursor = fsqlite_btree::BtCursor::new(
@@ -582,21 +586,21 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             ]);
             #[allow(clippy::cast_possible_wrap)]
             let rid = (rowid as i64) + 1;
-            cursor.table_insert(cx, rid, &record)?;
+            cursor.table_insert(cx, rid, &record).await?;
         }
     }
 
     // Fix up the database header on page 1: update page_count,
     // change_counter, and schema_cookie so sqlite3 validates the file.
     {
-        let mut hdr_page = txn.get_page(cx, PageNumber::ONE)?.into_vec();
+        let mut hdr_page = txn.get_page(cx, PageNumber::ONE).await?.into_vec();
 
         // Discover the current page count by allocating one more page.
         // The extra page is included in the commit (the pager does not
         // support free_page), so the exported file has one trailing empty
         // page. This is benign: SQLite tolerates pages beyond the last
         // B-tree node, and the page_count header excludes it.
-        let next_page = txn.allocate_page(cx)?.get();
+        let next_page = txn.allocate_page(cx).await?.get();
         let max_page = next_page.saturating_sub(1).max(1);
 
         let mut final_header = header_template.clone();
@@ -612,10 +616,10 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
         })?;
         hdr_page[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded_header);
 
-        txn.write_page(cx, PageNumber::ONE, &hdr_page)?;
+        txn.write_page(cx, PageNumber::ONE, &hdr_page).await?;
     }
 
-    txn.commit(cx)?;
+    txn.commit(cx).await?;
     Ok(())
 }
 
@@ -632,12 +636,12 @@ fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
 /// I/O / B-tree navigation failures.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
+pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreCompatPersist);
     let vfs = PlatformVfs::new();
-    let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
-    let mut txn = pager.begin(cx, TransactionMode::ReadOnly)?;
-    let page1 = txn.get_page(cx, PageNumber::ONE)?;
+    let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE).await?;
+    let mut txn = pager.begin(cx, TransactionMode::ReadOnly).await?;
+    let page1 = txn.get_page(cx, PageNumber::ONE).await?;
     let (usable_size, page_size) = load_sqlite_cursor_sizes_from_page1(page1.as_ref())?;
 
     // Read sqlite_master entries from page 1.
@@ -652,7 +656,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         );
         configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             let mut payload_buf: Vec<u8> = Vec::new();
             loop {
                 // bd-9e3xf.6: fuse rowid+payload via the cursor accessor
@@ -660,7 +664,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 // the schema replay path, where N can be the full count of
                 // sqlite_master rows in the database.
                 payload_buf.clear();
-                let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf)?;
+                let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf).await?;
                 let values =
                     parse_record(&payload_buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -668,7 +672,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         ),
                     })?;
                 entries.push(values);
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -835,13 +839,13 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             for (group, collations) in unique_groups {
                 mem_table.add_unique_column_group_with_collations(group, collations);
             }
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 if without_rowid {
                     let mut synthetic_rowid = 1_i64;
                     let mut payload_buf: Vec<u8> = Vec::new();
                     loop {
                         payload_buf.clear();
-                        cursor.payload_into(cx, &mut payload_buf)?;
+                        cursor.payload_into(cx, &mut payload_buf).await?;
                         let mut values = parse_record(&payload_buf).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -858,7 +862,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         )?;
                         mem_table.insert_row(synthetic_rowid, values);
                         synthetic_rowid = synthetic_rowid.saturating_add(1);
-                        if !cursor.next(cx)? {
+                        if !cursor.next(cx).await? {
                             break;
                         }
                     }
@@ -870,7 +874,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     // parse_cell_at on every row of the legacy table-replay
                     // hot path used by file-backed schema hydration.
                     payload_buf.clear();
-                    let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf)?;
+                    let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf).await?;
                     let mut values = parse_record(&payload_buf).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -886,7 +890,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         &table_name_for_err,
                     )?;
                     mem_table.insert_row(rowid, values);
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
@@ -955,7 +959,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
     // Read schema_cookie and change_counter from the database header (page 1).
     let (schema_cookie, change_counter) = {
-        let header_buf = txn.get_page(cx, PageNumber::ONE)?;
+        let header_buf = txn.get_page(cx, PageNumber::ONE).await?;
         let hdr = header_buf.as_ref();
         let cookie = if hdr.len() >= 44 {
             u32::from_be_bytes([hdr[40], hdr[41], hdr[42], hdr[43]])
@@ -985,7 +989,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
 /// Initialize a page as an empty leaf table B-tree page (type 0x0D).
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-fn init_leaf_table_page(
+async fn init_leaf_table_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,
     page_no: PageNumber,
@@ -1009,11 +1013,11 @@ fn init_leaf_table_page(
         })?
     };
     page[5..7].copy_from_slice(&content_start.to_be_bytes());
-    txn.write_page(cx, page_no, &page)
+    txn.write_page(cx, page_no, &page).await
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-fn init_leaf_index_page(
+async fn init_leaf_index_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,
     page_no: PageNumber,
@@ -1033,7 +1037,7 @@ fn init_leaf_index_page(
         })?
     };
     page[5..7].copy_from_slice(&content_start.to_be_bytes());
-    txn.write_page(cx, page_no, &page)
+    txn.write_page(cx, page_no, &page).await
 }
 
 /// Parse a `CREATE INDEX` SQL string into an `IndexSchema`.

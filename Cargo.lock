@@ -1050,6 +1050,7 @@ dependencies = [
 name = "fsqlite-btree"
 version = "0.1.19"
 dependencies = [
+ "asupersync",
  "foldhash",
  "fsqlite-error",
  "fsqlite-func",
@@ -1181,6 +1182,7 @@ dependencies = [
 name = "fsqlite-ext-fts5"
 version = "0.1.19"
 dependencies = [
+ "asupersync",
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-types",

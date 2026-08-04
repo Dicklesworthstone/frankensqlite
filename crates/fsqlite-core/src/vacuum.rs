@@ -206,7 +206,7 @@ impl VacuumTargetReservation {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub(crate) fn persist_compacted_database(
+pub(crate) async fn persist_compacted_database(
     cx: &Cx,
     target: &VacuumTargetReservation,
     schema: &[TableSchema],
@@ -225,10 +225,12 @@ pub(crate) fn persist_compacted_database(
         extra_master_entries,
         original_ddl,
     )
+    .await
 }
 
 #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
-pub(crate) fn persist_compacted_database(
+#[allow(clippy::unused_async)]
+pub(crate) async fn persist_compacted_database(
     _cx: &Cx,
     _target: &VacuumTargetReservation,
     _schema: &[TableSchema],
@@ -592,39 +594,42 @@ mod tests {
 
     #[test]
     fn test_reserved_persistence_rejects_path_swap_before_mutation() {
-        let cx = Cx::new();
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source.db");
-        let target_path = dir.path().join("output.db");
-        let target = resolve_vacuum_into_target(
-            &cx,
-            source.to_str().unwrap(),
-            &SqliteValue::Text(target_path.to_string_lossy().into_owned().into()),
-        )
-        .unwrap();
-        let moved_path = dir.path().join("moved-output-reservation.db");
-        host_fs::rename(&target_path, &moved_path).unwrap();
-        host_fs::write(&target_path, b"replacement-sentinel").unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.db");
+            let target_path = dir.path().join("output.db");
+            let target = resolve_vacuum_into_target(
+                &cx,
+                source.to_str().unwrap(),
+                &SqliteValue::Text(target_path.to_string_lossy().into_owned().into()),
+            )
+            .unwrap();
+            let moved_path = dir.path().join("moved-output-reservation.db");
+            host_fs::rename(&target_path, &moved_path).unwrap();
+            host_fs::write(&target_path, b"replacement-sentinel").unwrap();
 
-        let error = persist_compacted_database(
-            &cx,
-            &target,
-            &[],
-            &MemDatabase::new(),
-            &DatabaseHeader::default(),
-            &[],
-            &HashMap::new(),
-        )
-        .expect_err("a replaced reserved output path must fail before mutation");
-        assert!(
-            matches!(error, fsqlite_error::FrankenError::CannotOpen { .. }),
-            "unexpected reservation mismatch error: {error}"
-        );
-        assert_eq!(
-            host_fs::read(&target_path).unwrap(),
-            b"replacement-sentinel"
-        );
-        assert!(moved_path.exists());
+            let error = persist_compacted_database(
+                &cx,
+                &target,
+                &[],
+                &MemDatabase::new(),
+                &DatabaseHeader::default(),
+                &[],
+                &HashMap::new(),
+            )
+            .await
+            .expect_err("a replaced reserved output path must fail before mutation");
+            assert!(
+                matches!(error, fsqlite_error::FrankenError::CannotOpen { .. }),
+                "unexpected reservation mismatch error: {error}"
+            );
+            assert_eq!(
+                host_fs::read(&target_path).unwrap(),
+                b"replacement-sentinel"
+            );
+            assert!(moved_path.exists());
+        });
     }
 
     #[test]
