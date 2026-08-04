@@ -76,8 +76,23 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140)). The
   namespace-sidecar rewrite reported in
   [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294) is fixed
-  for previously opened databases; its remaining first-contact case is tracked
-  in #140.
+  and verified for explicit read-only opens of a database FrankenSQLite has
+  opened before: regression coverage snapshots every directory entry and
+  modification time across an open plus a WAL-backed query and requires full
+  byte equality. The default-open and first-contact paths are not covered by
+  that proof, and the first-contact case remains tracked in #140.
+- **Windows WAL lock interoperability does not yet extend to shared-memory
+  contents.** FrankenSQLite mirrors ordinary WAL lock slots onto stock
+  SQLite's real `-shm` lock bytes, but its shared-memory region contents remain
+  heap-backed. Do not concurrently mix FrankenSQLite and stock SQLite WAL
+  connections to the same database on Windows
+  ([#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139)).
+- **AUTOINCREMENT rowids may skip values after savepoint rollback in concurrent
+  mode.** In the verified sequence, rolling back the second insert leaves a
+  gap: FrankenSQLite commits rowids 1 and 3, whereas stock SQLite commits 1 and
+  2. Values remain unique and increasing; applications must not depend on
+  rowid contiguity
+  ([#147](https://github.com/Dicklesworthstone/frankensqlite/issues/147)).
 - **Database text encoding is UTF-8-only in v0.2.0.** The database-header
   codec recognizes all three valid SQLite encoding values, but the runtime
   admits only encoding 1 (UTF-8). Databases declaring encoding 2 (UTF-16le) or
@@ -104,6 +119,28 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   The current insertion-based `VACUUM` rebuild can itself retain freed or
   trailing pages, so v0.2.0 does not promise a zero-freelist or fixed-point
   compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
+- **`PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not persisted.** The mode
+  currently changes connection-local readback only and returns to `NONE` after
+  reopen. FrankenSQLite does not yet write the pointer-map pages required to
+  enable either mode safely, so applications must not rely on these settings
+  for file compaction ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)).
+- **FrankenSQLite-created FTS5 databases are not yet integrity-clean when
+  reopened by stock SQLite.** Stock SQLite's `integrity_check` reports a
+  malformed inverted index on the verified FrankenSQLite-created FTS5 fixture
+  even when FrankenSQLite queries appear healthy. The exact on-disk cause is
+  still unresolved ([#300](https://github.com/Dicklesworthstone/frankensqlite/issues/300)).
+- **Renaming the content table of an external-content FTS5 table can make the
+  database unavailable through FrankenSQLite after the renaming connection
+  closes.** The established connection can also return stale `MATCH` rows.
+  Rename the table back on that same connection before closing it; otherwise,
+  stock SQLite can rename it back because the database file remains intact.
+  Do not rename an external-content FTS5 content table in this release
+  ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)).
+- **TEMP schema catalog queries are not partitioned correctly.** On current
+  main, `temp.sqlite_master` exposes main-schema objects while omitting TEMP
+  objects, and `sqlite_temp_master` is not recognized. Do not use these catalog
+  spellings for TEMP-schema introspection in this release
+  ([#238](https://github.com/Dicklesworthstone/frankensqlite/issues/238)).
 - **Cancelling an `AsyncConnection` call after dispatch stops the caller's
   wait, not the already-running worker operation.** Dropping that connection
   joins the worker and can therefore block until the in-flight operation
@@ -164,10 +201,9 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   rowids, explicit-rowid appends reject duplicates and add bounded incremental
   segments, and each in-memory delta is discarded after durable persistence.
   This removes the multi-million-message registration OOM observed by CASS.
-- FrankenSQLite-created FTS5 shadow tables now use stock SQLite's canonical
-  schema, including `WITHOUT ROWID` `_idx`/`_config` tables and the
-  contentless-delete `_docsize.origin` column. Cross-engine regressions reopen
-  the resulting image with stock SQLite and verify integrity and MATCH results.
+- FTS5 contentless-delete tables now persist the `_docsize.origin` column used
+  by their deletion contract. Full cross-engine schema compatibility remains
+  blocked by the stock-integrity limitation documented above.
 - Schema reload now preserves the authoritative contentless FTS5 definition
   when a legacy database also contains a stale same-name implicit-content
   schema row whose required `_content` shadow is absent. Inserts after repair
@@ -183,10 +219,9 @@ semantic and crates.io predecessor, but it is not an ancestor of current
 - `WITHOUT ROWID` index locators are preserved across schema reload.
 - `REPLACE` now removes victim rows from *all* indexes, not just the one that
   detected the conflict.
-- `VACUUM INTO` preserves `UNIQUE` constraints for quiescent source and target
-  databases. It does not yet provide a receipt-bound single-generation source
-  snapshot or candidate-content compare-and-swap under cooperating concurrent
-  writers ([#141](https://github.com/Dicklesworthstone/frankensqlite/issues/141)).
+- `VACUUM INTO` preserves `UNIQUE` constraints and validates receipt-bound
+  source and candidate generations under cooperating concurrent writers
+  ([#141](https://github.com/Dicklesworthstone/frankensqlite/issues/141)).
 - An invalid WAL header is treated as an empty WAL, matching stock SQLite
   ([#292](https://github.com/Dicklesworthstone/frankensqlite/issues/292)).
 - Explicit `INDEXED BY` is honored in the composite prefix-range seek
