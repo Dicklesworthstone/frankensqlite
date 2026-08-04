@@ -9817,6 +9817,75 @@ type CustomAggregateArities = HashMap<(String, i32), FunctionArity>;
 /// identity.
 const TEMP_MEMDB_ROOT_START: i32 = i32::MAX - 1;
 
+const MAX_FALLBACK_DECISION_EVIDENCE: usize = 64;
+
+/// One distinct fallback routing decision captured by a [`Connection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackDecisionRecord {
+    pub statement_kind: String,
+    pub fallback_boundary: String,
+    pub decision_reason: String,
+    pub decision_outcome: String,
+    pub source_touchpoint: String,
+    pub first_failure_diagnostic: String,
+    pub occurrences: u64,
+}
+
+impl FallbackDecisionRecord {
+    fn has_same_identity(&self, other: &Self) -> bool {
+        self.statement_kind == other.statement_kind
+            && self.fallback_boundary == other.fallback_boundary
+            && self.decision_reason == other.decision_reason
+            && self.decision_outcome == other.decision_outcome
+            && self.source_touchpoint == other.source_touchpoint
+            && self.first_failure_diagnostic == other.first_failure_diagnostic
+    }
+}
+
+/// Bounded snapshot of fallback routing decisions observed by a connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FallbackDecisionSnapshot {
+    pub decisions: Vec<FallbackDecisionRecord>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Default)]
+struct FallbackDecisionCapture {
+    decisions: Vec<FallbackDecisionRecord>,
+    truncated: bool,
+}
+
+impl FallbackDecisionCapture {
+    fn record(&mut self, mut decision: FallbackDecisionRecord) {
+        if let Some(existing) = self
+            .decisions
+            .iter_mut()
+            .find(|existing| existing.has_same_identity(&decision))
+        {
+            existing.occurrences = existing.occurrences.saturating_add(1);
+            return;
+        }
+        if self.decisions.len() >= MAX_FALLBACK_DECISION_EVIDENCE {
+            self.truncated = true;
+            return;
+        }
+        decision.occurrences = 1;
+        self.decisions.push(decision);
+    }
+
+    fn snapshot(&self) -> FallbackDecisionSnapshot {
+        FallbackDecisionSnapshot {
+            decisions: self.decisions.clone(),
+            truncated: self.truncated,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.decisions.clear();
+        self.truncated = false;
+    }
+}
+
 pub struct Connection {
     path: String,
     /// In-memory execution image shared with the VDBE engine.
@@ -10477,6 +10546,9 @@ pub struct Connection {
     /// certifying runs to fail fast on unsupported fallback paths without
     /// changing default developer ergonomics.
     reject_mem_fallback_strict: RefCell<bool>,
+    /// Bounded structured evidence emitted from the authoritative fallback
+    /// decision point. This remains active even when tracing is disabled.
+    fallback_decision_capture: RefCell<FallbackDecisionCapture>,
     // ── Virtual table module registry (bd-196x4) ────────────────────────────
     /// Registered virtual-table module factories, keyed by module name
     /// (uppercased).  Used by `CREATE VIRTUAL TABLE ... USING module(args)`.
@@ -11750,6 +11822,7 @@ impl Connection {
             defer_fts5_hydration,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
+            fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
             dropped_vtab_instances: RefCell::new(HashMap::new()),
@@ -12213,6 +12286,7 @@ impl Connection {
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
+            fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
             // Virtual table module registry (bd-196x4)
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
@@ -15330,6 +15404,18 @@ impl Connection {
         *self.reject_mem_fallback_strict.borrow_mut() = strict;
     }
 
+    /// Return the bounded fallback-decision evidence observed since open or
+    /// the most recent reset.
+    #[must_use]
+    pub fn fallback_decision_snapshot(&self) -> FallbackDecisionSnapshot {
+        self.fallback_decision_capture.borrow().snapshot()
+    }
+
+    /// Clear all connection-local fallback-decision evidence.
+    pub fn reset_fallback_decision_evidence(&self) {
+        self.fallback_decision_capture.borrow_mut().reset();
+    }
+
     #[must_use]
     fn backend_mode_label(&self) -> &'static str {
         if *self.reject_mem_fallback.borrow() {
@@ -15518,6 +15604,17 @@ impl Connection {
         );
         let statement_fingerprint =
             Self::fallback_statement_fingerprint(statement_kind, decision_reason);
+        self.fallback_decision_capture
+            .borrow_mut()
+            .record(FallbackDecisionRecord {
+                statement_kind: statement_kind.to_owned(),
+                fallback_boundary: fallback_boundary.clone(),
+                decision_reason: decision_reason.to_owned(),
+                decision_outcome: decision_outcome.to_owned(),
+                source_touchpoint: source_touchpoint.clone(),
+                first_failure_diagnostic: first_failure_diag.clone(),
+                occurrences: 1,
+            });
         let backend_identity = self.backend_identity();
         let (run_id, scenario_id) = statement_reuse_log_context_from_env();
         if decision_outcome == "denied" {
@@ -184325,6 +184422,85 @@ mod pager_routing_tests {
             conn.set_reject_mem_fallback(true);
             assert!(*conn.reject_mem_fallback.borrow());
         });
+    }
+
+    #[test]
+    fn test_fallback_decision_snapshot_aggregates_and_resets() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.expect("open db");
+            for _ in 0..2 {
+                conn.log_fallback_decision_event(
+                    "select",
+                    "with_clause_materialization",
+                    "execute_statement_dispatch",
+                );
+            }
+
+            let snapshot = conn.fallback_decision_snapshot();
+            assert!(!snapshot.truncated);
+            assert_eq!(snapshot.decisions.len(), 1);
+            assert_eq!(
+                snapshot.decisions[0],
+                FallbackDecisionRecord {
+                    statement_kind: "select".to_owned(),
+                    fallback_boundary: "conn.select.with_clause_materialization".to_owned(),
+                    decision_reason: "with_clause_materialization".to_owned(),
+                    decision_outcome: "allowed_compatibility_fallback".to_owned(),
+                    source_touchpoint:
+                        "execute_statement_dispatch:select:with_clause_materialization".to_owned(),
+                    first_failure_diagnostic: "statement_kind=select; \
+                        fallback_boundary=conn.select.with_clause_materialization; \
+                        source_touchpoint=execute_statement_dispatch:select:with_clause_materialization; \
+                        decision_reason=with_clause_materialization"
+                        .to_owned(),
+                    occurrences: 2,
+                }
+            );
+
+            conn.reset_fallback_decision_evidence();
+            assert_eq!(
+                conn.fallback_decision_snapshot(),
+                FallbackDecisionSnapshot::default()
+            );
+        });
+    }
+
+    #[test]
+    fn test_fallback_decision_capture_is_bounded_and_counts_known_keys_after_truncation() {
+        let mut capture = FallbackDecisionCapture::default();
+        for index in 0..=MAX_FALLBACK_DECISION_EVIDENCE {
+            let decision_reason = format!("reason-{index}");
+            capture.record(FallbackDecisionRecord {
+                statement_kind: "select".to_owned(),
+                fallback_boundary: format!("conn.select.{decision_reason}"),
+                decision_reason,
+                decision_outcome: "allowed_compatibility_fallback".to_owned(),
+                source_touchpoint: format!("test:select:reason-{index}"),
+                first_failure_diagnostic: format!("reason-{index}"),
+                occurrences: u64::MAX,
+            });
+        }
+
+        let truncated = capture.snapshot();
+        assert!(truncated.truncated);
+        assert_eq!(truncated.decisions.len(), MAX_FALLBACK_DECISION_EVIDENCE);
+        assert!(
+            truncated
+                .decisions
+                .iter()
+                .all(|decision| decision.occurrences == 1)
+        );
+
+        capture.record(FallbackDecisionRecord {
+            statement_kind: "select".to_owned(),
+            fallback_boundary: "conn.select.reason-0".to_owned(),
+            decision_reason: "reason-0".to_owned(),
+            decision_outcome: "allowed_compatibility_fallback".to_owned(),
+            source_touchpoint: "test:select:reason-0".to_owned(),
+            first_failure_diagnostic: "reason-0".to_owned(),
+            occurrences: 1,
+        });
+        assert_eq!(capture.snapshot().decisions[0].occurrences, 2);
     }
 
     #[test]
