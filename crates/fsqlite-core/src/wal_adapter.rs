@@ -253,6 +253,17 @@ pub struct WalBackendAdapter<F: VfsFile> {
     read_snapshot: Option<WalPublishedSnapshot>,
     /// Frames appended after the last published commit horizon.
     pending_publication_frames: Vec<PendingPublicationFrame>,
+    /// Highest commit frame staged by the append path but not yet published.
+    ///
+    /// Appends only stage this horizon; publication is deferred until
+    /// [`WalBackend::sync`] durably persists the frames. Preserved verbatim when
+    /// a sync fails so the next successful sync republishes the same batch.
+    pending_publication_commit: Option<usize>,
+    /// WAL generation observed when the pending frames were staged.
+    ///
+    /// Publication is refused if the generation moves before the sync lands,
+    /// because a checkpoint or restart invalidates the staged frame indices.
+    pending_publication_generation: Option<WalGenerationIdentity>,
     /// Optional FEC commit hook for encoding repair symbols on commit.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fec_hook: Option<FecCommitHook>,
@@ -277,6 +288,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             next_publication_seq: 1,
             read_snapshot: None,
             pending_publication_frames: Vec::new(),
+            pending_publication_commit: None,
+            pending_publication_generation: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             fec_hook: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -297,16 +310,42 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             next_publication_seq: 1,
             read_snapshot: None,
             pending_publication_frames: Vec::new(),
+            pending_publication_commit: None,
+            pending_publication_generation: None,
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
         }
     }
 
-    /// Consume the adapter and return the inner [`WalFile`].
+    /// Whether staged, unpublished frames remain.
+    ///
+    /// Staged frames may already be durable — an intermediate sync makes them so
+    /// without committing them — but they are not yet part of the published
+    /// visibility plane. Callers that would discard, consume, or replace this
+    /// adapter must check this first: dropping the staged metadata loses the
+    /// batch, and a freshly wrapped adapter would republish those frames
+    /// straight from the WAL with no knowledge of their publication state
+    /// (GH #187).
     #[must_use]
-    pub fn into_inner(self) -> WalFile<F> {
-        self.wal
+    pub fn has_pending_publication(&self) -> bool {
+        self.pending_publication_commit.is_some() || !self.pending_publication_frames.is_empty()
+    }
+
+    /// Consume the adapter and return the inner [`WalFile`].
+    ///
+    /// Fails closed while staged, unpublished frames remain: consuming the
+    /// adapter discards the staged publication metadata, and the `WalFile` can
+    /// be rewrapped by an adapter that would then publish those frames without
+    /// knowing whether they were ever published or fsynced (GH #187). Drain the
+    /// batch with a successful commit sync first.
+    /// Returns [`FrankenError::Busy`]: this is a retryable ordering condition,
+    /// not database corruption.
+    pub fn into_inner(self) -> Result<WalFile<F>> {
+        if self.has_pending_publication() {
+            return Err(FrankenError::Busy);
+        }
+        Ok(self.wal)
     }
 
     /// Borrow the inner [`WalFile`].
@@ -315,12 +354,20 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         &self.wal
     }
 
-    /// Mutably borrow the inner [`WalFile`].
+    /// Mutably borrow the inner [`WalFile`] for explicit external mutation.
     ///
-    /// Invalidates the publication plane since the caller may mutate WAL state.
-    pub fn inner_mut(&mut self) -> &mut WalFile<F> {
+    /// Invalidates the publication plane, since the caller may mutate WAL state
+    /// arbitrarily. That invalidation discards any staged batch, so this fails
+    /// closed while one exists rather than silently dropping the commit horizon
+    /// (GH #187): after the discard, a later publish would see no pending state
+    /// and could expose frames that were never fsynced. Drain the batch with a
+    /// successful sync first.
+    pub fn inner_mut(&mut self) -> Result<&mut WalFile<F>> {
+        if self.has_pending_publication() {
+            return Err(FrankenError::Busy);
+        }
         self.invalidate_publication();
-        &mut self.wal
+        Ok(&mut self.wal)
     }
 
     /// Capture the currently published WAL visibility summary for this handle.
@@ -353,7 +400,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Discard published and pinned snapshots after external WAL mutation.
     fn invalidate_publication(&mut self) {
         self.read_snapshot = None;
-        self.pending_publication_frames.clear();
+        self.discard_pending_publication();
         self.published_snapshot = WalPublishedSnapshot::empty(
             self.published_snapshot.publication_seq,
             self.published_snapshot.generation,
@@ -712,6 +759,21 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         scenario_id: &'static str,
     ) -> Result<()> {
         let last_commit_frame = self.wal.last_commit_frame(cx)?;
+        // While a local batch is staged, the WAL's own commit horizon includes
+        // frames this handle appended but has not yet fsynced. Refresh and
+        // unpinned read paths must not expose them, so clamp to the durable
+        // prefix. With nothing staged the horizon is used unchanged, preserving
+        // publication of commits made durable elsewhere.
+        let last_commit_frame = if self.pending_publication_commit.is_some() {
+            let durable_frames = self.wal.last_fsynced_frame_count();
+            last_commit_frame.filter(|frame| {
+                frame
+                    .checked_add(1)
+                    .is_some_and(|frame_count| frame_count <= durable_frames)
+            })
+        } else {
+            last_commit_frame
+        };
         self.publish_visible_snapshot(cx, last_commit_frame, scenario_id)
             .await
     }
@@ -721,10 +783,134 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         cx: &Cx,
         scenario_id: &'static str,
     ) -> Result<()> {
+        // Fail closed. A non-empty staged batch means a durability barrier has
+        // not completed: either no sync has run, or one failed. Discarding it
+        // here would silently drop the horizon, and republishing straight from
+        // the WAL would expose frames that were never fsynced. Any path that
+        // sets `refresh_before_append` while a batch is staged — a failed sync
+        // followed by `begin_transaction`, or by `checkpoint` — funnels through
+        // here, so guarding this single choke point covers all of them.
+        if self.has_pending_publication() {
+            return Err(FrankenError::Busy);
+        }
         self.wal.refresh(cx).await?;
-        self.pending_publication_frames.clear();
+        self.discard_pending_publication();
         self.publish_latest_committed_snapshot(cx, scenario_id)
             .await
+    }
+
+    /// Drop every staged frame and the horizon that would have published it.
+    fn discard_pending_publication(&mut self) {
+        self.pending_publication_frames.clear();
+        self.pending_publication_commit = None;
+        self.pending_publication_generation = None;
+    }
+
+    /// Stage a commit horizon for publication without advancing visibility.
+    ///
+    /// Appends never publish directly: the frames may sit in the host page cache
+    /// with no durable backing, so exposing them to readers would surface a
+    /// commit that a crash could still erase. The horizon is retained until
+    /// [`WalBackend::sync`] persists the batch.
+    fn stage_pending_commit_publication(&mut self, last_commit_frame: usize) -> Result<()> {
+        let generation = self.wal.generation_identity();
+        // Fail closed rather than silently overwriting: staged frame indices are
+        // only meaningful within one generation, so a mixed-generation batch
+        // must never be merged into a single publishable horizon.
+        if self
+            .pending_publication_generation
+            .is_some_and(|staged| staged != generation)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "cannot stage a commit horizon across differing WAL generations".to_owned(),
+            });
+        }
+        let staged = self
+            .pending_publication_commit
+            .map_or(last_commit_frame, |staged| staged.max(last_commit_frame));
+        self.pending_publication_commit = Some(staged);
+        self.pending_publication_generation = Some(generation);
+        Ok(())
+    }
+
+    /// Confirm the staged horizon is still publishable against the live WAL.
+    ///
+    /// Refuses when the generation moved (a checkpoint or restart reindexes the
+    /// WAL, invalidating staged frame indices), when the WAL is shorter than the
+    /// staged horizon, or when the WAL does not yet report the staged commit.
+    /// Callers must leave the pending state untouched on refusal so a later sync
+    /// can retry the same batch.
+    fn assert_publish_safe(&mut self, cx: &Cx, last_commit_frame: usize) -> Result<()> {
+        let generation = self.wal.generation_identity();
+        if self
+            .pending_publication_generation
+            .is_some_and(|staged| staged != generation)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL generation changed before the staged commit horizon was published"
+                    .to_owned(),
+            });
+        }
+
+        let frame_count = self.wal.frame_count();
+        if last_commit_frame >= frame_count {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "staged commit horizon {last_commit_frame} exceeds WAL frame count {frame_count}"
+                ),
+            });
+        }
+
+        let durable_last_commit = self.wal.last_commit_frame(cx)?;
+        if durable_last_commit.is_none_or(|durable| durable < last_commit_frame) {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL does not report staged commit horizon {last_commit_frame} as committed"
+                ),
+            });
+        }
+
+        if self
+            .pending_publication_frames
+            .iter()
+            .any(|frame| frame.frame_index >= frame_count)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "a staged publication frame lies beyond WAL frame count {frame_count}"
+                ),
+            });
+        }
+
+        // Delegate to the WAL's own durability tracker rather than duplicating
+        // it: only it knows how far a successful fsync actually reached.
+        let publish_frame_count =
+            last_commit_frame
+                .checked_add(1)
+                .ok_or_else(|| FrankenError::WalCorrupt {
+                    detail: "staged commit horizon overflows the publishable frame count"
+                        .to_owned(),
+                })?;
+        self.wal.assert_publish_safe(publish_frame_count)?;
+
+        Ok(())
+    }
+
+    /// Publish the staged commit horizon after a successful durability barrier.
+    ///
+    /// Fully synchronous: the staged frames already carry every page/frame pair
+    /// the snapshot needs, so no WAL scan — and therefore no async I/O — is
+    /// required. On refusal or failure the pending state is preserved verbatim
+    /// so the next successful sync retries the identical batch.
+    fn publish_pending_after_sync(&mut self, cx: &Cx) -> Result<()> {
+        let Some(last_commit_frame) = self.pending_publication_commit else {
+            return Ok(());
+        };
+        self.assert_publish_safe(cx, last_commit_frame)?;
+        self.publish_pending_commit_snapshot(cx, last_commit_frame, "sync_publish_commit");
+        self.pending_publication_commit = None;
+        self.pending_publication_generation = None;
+        Ok(())
     }
 
     fn record_appended_frames<I>(&mut self, start_frame_index: usize, frames: I) -> Option<usize>
@@ -747,12 +933,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         last_commit_frame
     }
 
-    async fn publish_pending_commit_snapshot(
+    /// Install a published snapshot from staged frames alone.
+    ///
+    /// Deliberately synchronous. Every page/frame pair needed for the delta is
+    /// already staged by `record_appended_frames`, so this never scans the WAL
+    /// and never performs I/O; that keeps it callable from the synchronous
+    /// [`WalBackend::sync`] path without a runtime or `block_on`.
+    fn publish_pending_commit_snapshot(
         &mut self,
         cx: &Cx,
         last_commit_frame: usize,
         scenario_id: &'static str,
-    ) -> Result<()> {
+    ) {
         let generation = self.wal.generation_identity();
         let previous_last_commit = self.published_snapshot.last_commit_frame;
         let can_extend_previous = self.published_snapshot.generation == generation
@@ -809,10 +1001,17 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         }
 
         if frame_delta_count == 0 {
+            // No staged frame advances the horizon, which can only happen when
+            // the published plane already covers `last_commit_frame` (an
+            // extendable plane always contains the staged commit frame itself).
+            // Rebuilding here would need a WAL scan, and this path must stay
+            // synchronous, so leave visibility untouched. External refresh paths
+            // retain the async rebuild for the cases that genuinely need it.
+            if can_extend_previous {
+                self.published_snapshot.page_index = page_index;
+            }
             self.pending_publication_frames.clear();
-            return self
-                .publish_visible_snapshot(cx, Some(last_commit_frame), scenario_id)
-                .await;
+            return;
         }
 
         let publication_seq = self.next_publication_seq;
@@ -848,8 +1047,6 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             },
             "published WAL visibility snapshot from commit path"
         );
-
-        Ok(())
     }
 }
 
@@ -866,6 +1063,14 @@ fn to_wal_mode(mode: CheckpointMode) -> WalCheckpointMode {
 impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     fn begin_transaction<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
+            // Reject at the earliest illegal transition: before `wal.refresh`,
+            // before pinning `read_snapshot`, and before re-arming
+            // `refresh_before_append`. Beginning a transaction on top of staged,
+            // unpublished frames would otherwise leave a half-transition whose
+            // only symptom is a later append failure.
+            if self.has_pending_publication() {
+                return Err(FrankenError::Busy);
+            }
             // Establish a transaction-bounded snapshot once, instead of doing an
             // expensive refresh for every page read.
             self.wal.refresh(cx).await?;
@@ -938,8 +1143,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
 
             if let Some(last_commit_frame) = last_commit_frame {
-                self.publish_pending_commit_snapshot(cx, last_commit_frame, "append_frame_commit")
-                    .await?;
+                // Stage only: the frames are not durable until `sync`, so
+                // publishing here would expose a commit a crash could erase.
+                self.stage_pending_commit_publication(last_commit_frame)?;
             }
 
             Ok(())
@@ -1009,8 +1215,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
 
             if let Some(last_commit_frame) = last_commit_frame {
-                self.publish_pending_commit_snapshot(cx, last_commit_frame, "append_frames_commit")
-                    .await?;
+                // Stage only: publication is deferred to the durability barrier.
+                self.stage_pending_commit_publication(last_commit_frame)?;
             }
 
             Ok(())
@@ -1088,8 +1294,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
 
             if let Some(last_commit_frame) = last_commit_frame {
-                self.publish_pending_commit_snapshot(cx, last_commit_frame, "append_frames_commit")
-                    .await?;
+                // Stage only: publication is deferred to the durability barrier.
+                self.stage_pending_commit_publication(last_commit_frame)?;
             }
 
             Ok(())
@@ -1222,12 +1428,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
 
             if let Some(last_commit_frame) = last_commit_frame {
-                self.publish_pending_commit_snapshot(
-                    cx,
-                    last_commit_frame,
-                    "append_prepared_frames_commit",
-                )
-                .await?;
+                // Stage only: publication is deferred to the durability barrier.
+                self.stage_pending_commit_publication(last_commit_frame)?;
             }
 
             Ok(())
@@ -1313,12 +1515,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
 
             if let Some(last_commit_frame) = last_commit_frame {
-                self.publish_pending_commit_snapshot(
-                    cx,
-                    last_commit_frame,
-                    "append_prepared_frames_commit",
-                )
-                .await?;
+                // Stage only: publication is deferred to the durability barrier.
+                self.stage_pending_commit_publication(last_commit_frame)?;
             }
 
             Ok(())
@@ -1618,9 +1816,30 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn sync(&mut self, cx: &Cx) -> Result<()> {
-        let result = self.wal.sync(cx, SyncFlags::NORMAL);
-        self.refresh_before_append = true;
-        result
+        // Durability first. Only once the frames are on stable storage may the
+        // staged commit horizon become visible to readers.
+        //
+        // `refresh_before_append` is deliberately NOT set on the failure paths.
+        // Setting it would let the next append run
+        // `synchronize_publication_before_append`, which discards the preserved
+        // batch and republishes straight from the WAL — reinstating exactly the
+        // publish-before-fsync hazard this guard exists to prevent. Leaving it
+        // clear keeps the staged batch intact for a later retry.
+        self.wal.sync(cx, SyncFlags::NORMAL)?;
+        self.publish_pending_after_sync(cx)?;
+        // Re-arm the pre-append resynchronization only when nothing is staged.
+        //
+        // Syncing mid-transaction makes the appended frames durable but does not
+        // commit them: with no commit marker yet, `publish_pending_after_sync`
+        // correctly publishes nothing and the frames stay staged for the commit
+        // still to come. Re-arming here would send the next append through
+        // `synchronize_publication_before_append`, whose fail-closed guard would
+        // then reject every further append — including the commit marker — and
+        // strand the transaction permanently.
+        if !self.has_pending_publication() {
+            self.refresh_before_append = true;
+        }
+        Ok(())
     }
 
     fn frame_count(&self) -> usize {
@@ -1636,6 +1855,19 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         oldest_reader_frame: Option<u32>,
     ) -> WalFuture<'a, CheckpointResult> {
         Box::pin(async move {
+            // Fail closed BEFORE `wal.refresh` or any writer mutation. Checkpoint
+            // backfills and may reset the WAL, and its inner paths can call
+            // `invalidate_publication`, which discards the staged batch. Running
+            // any of that against frames that were never fsynced would both lose
+            // the staged horizon and risk backfilling non-durable frames, so the
+            // batch must be drained by a successful sync first.
+            if self.has_pending_publication() {
+                return Err(FrankenError::CheckpointFailed {
+                    detail: "staged, unpublished frames remain; a successful commit sync must \
+                             drain them before checkpointing"
+                        .to_owned(),
+                });
+            }
             // Refresh so planner state reflects the latest on-disk WAL shape.
             self.wal.refresh(cx).await?;
             self.refresh_before_append = true;
@@ -1884,10 +2116,24 @@ where
         self.inner
     }
 
-    fn replace_inner(&mut self, cx: &Cx, wal: WalFile<V::File>) {
+    /// Swap in a replacement WAL, discarding the previous adapter.
+    ///
+    /// Fails closed while the outgoing adapter still holds a staged batch: the
+    /// replacement would consume away the pending metadata, and the freshly
+    /// wrapped adapter would republish those frames from the WAL without knowing
+    /// they were never fsynced (GH #187). A successful sync must drain the batch
+    /// before a path-visible replacement can proceed.
+    fn replace_inner(&mut self, cx: &Cx, wal: WalFile<V::File>) -> Result<()> {
+        if self.inner.has_pending_publication() {
+            let cleanup_cx = cx.create_child();
+            let _cleanup_mask = cleanup_cx.masked();
+            let _ = wal.close(&cleanup_cx);
+            return Err(FrankenError::Busy);
+        }
         let old = std::mem::replace(&mut self.inner, WalBackendAdapter::new(wal));
-        let old_wal = old.into_inner();
+        let old_wal = old.into_inner()?;
         let _ = old_wal.close(cx);
+        Ok(())
     }
 
     async fn create_replacement_wal(&self, cx: &Cx) -> Result<WalFile<V::File>> {
@@ -1907,8 +2153,7 @@ where
 
     async fn replace_with_created_wal(&mut self, cx: &Cx) -> Result<()> {
         let wal = self.create_replacement_wal(cx).await?;
-        self.replace_inner(cx, wal);
-        Ok(())
+        self.replace_inner(cx, wal)
     }
 
     async fn open_replacement_wal(&self, cx: &Cx, path_file: V::File) -> Result<WalFile<V::File>> {
@@ -2111,7 +2356,7 @@ where
         };
         if !path_matches_current {
             let wal = self.open_replacement_wal(cx, path_file).await?;
-            self.replace_inner(cx, wal);
+            self.replace_inner(cx, wal)?;
         } else {
             let _ = path_file.close(cx);
         }
@@ -3392,6 +3637,8 @@ mod tests {
     struct CheckpointHandoffFaultState {
         next_write: Option<CheckpointHandoffWriteFault>,
         fail_next_sync: bool,
+        /// Fail the next sync on a non-handoff (i.e. WAL) file.
+        fail_next_wal_sync: bool,
         sync_observations: Vec<CertificateSyncObservation>,
     }
 
@@ -3428,6 +3675,14 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .fail_next_sync = true;
+        }
+
+        /// Arm a one-shot sync failure on the WAL file itself.
+        fn fail_next_wal_sync(&self) {
+            self.faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fail_next_wal_sync = true;
         }
 
         fn take_sync_observations(&self) -> Vec<CertificateSyncObservation> {
@@ -3573,10 +3828,16 @@ mod tests {
                     .push(CertificateSyncObservation::Ordinary(path.clone()));
             }
             let fail = self.is_checkpoint_handoff && std::mem::take(&mut faults.fail_next_sync);
+            let fail_wal =
+                !self.is_checkpoint_handoff && std::mem::take(&mut faults.fail_next_wal_sync);
             drop(faults);
             if fail {
                 Err(FrankenError::Io(std::io::Error::other(
                     "injected checkpoint handoff sync failure",
+                )))
+            } else if fail_wal {
+                Err(FrankenError::Io(std::io::Error::other(
+                    "injected WAL sync failure",
                 )))
             } else {
                 self.inner.sync(cx, flags)
@@ -4027,6 +4288,7 @@ mod tests {
         adapter.sync(cx).expect("sync replacement WAL page");
         adapter
             .into_inner()
+            .expect("sync drained the staged frames")
             .close(cx)
             .expect("close replacement WAL");
     }
@@ -4918,6 +5180,19 @@ mod tests {
         WalBackendAdapter::new(wal)
     }
 
+    /// Adapter backed by the fault VFS so WAL `sync` failures can be injected.
+    fn make_fault_adapter(
+        vfs: &CheckpointHandoffFaultVfs,
+        cx: &Cx,
+    ) -> WalBackendAdapter<<CheckpointHandoffFaultVfs as Vfs>::File> {
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs
+            .open(cx, Some(std::path::Path::new("test.db-wal")), flags)
+            .expect("open fault WAL file");
+        let wal = WalFile::create(cx, file, PAGE_SIZE, 0, test_salts()).expect("create fault WAL");
+        WalBackendAdapter::new(wal)
+    }
+
     // -- WalBackendAdapter tests --
 
     #[test]
@@ -5667,7 +5942,9 @@ mod tests {
 
         assert_eq!(adapter.inner().frame_count(), 1);
 
-        let wal = adapter.into_inner();
+        let wal = adapter
+            .into_inner()
+            .expect("no staged frames block consuming the adapter");
         assert_eq!(wal.frame_count(), 1);
     }
 
@@ -5807,6 +6084,7 @@ mod tests {
         };
         adapter
             .inner_mut()
+            .expect("no staged batch blocks inner access")
             .reset(&cx, 1, new_salts, false)
             .expect("WAL reset");
 
@@ -5854,6 +6132,7 @@ mod tests {
 
         adapter
             .inner_mut()
+            .expect("no staged batch blocks inner access")
             .reset(&cx, 1, reused_salts, false)
             .expect("reset with same salts");
         let new_data = sample_page(0x22);
@@ -5957,6 +6236,589 @@ mod tests {
         assert_eq!(adapter.read_page(&cx, 2).expect("read page 2"), Some(page2));
     }
 
+    /// Frames for a two-page commit batch, the second frame carrying the commit.
+    fn commit_batch_pages() -> (Vec<u8>, Vec<u8>) {
+        (sample_page(0x71), sample_page(0x72))
+    }
+
+    /// Assert no commit horizon has been published yet.
+    fn assert_publication_unchanged(adapter: &WalBackendAdapter<impl VfsFile>, context: &str) {
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame, None,
+            "{context}: publication must not advance before a successful sync"
+        );
+        assert_eq!(
+            adapter.published_snapshot.commit_count, 0,
+            "{context}: commit count must not advance before a successful sync"
+        );
+        assert!(
+            adapter.published_snapshot.page_index.is_empty(),
+            "{context}: no page may be visible before a successful sync"
+        );
+    }
+
+    #[test]
+    fn test_append_frame_without_sync_leaves_publication_unchanged() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+
+        assert_publication_unchanged(&adapter, "append_frame");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "append_frame must stage the commit horizon for a later sync"
+        );
+    }
+
+    #[test]
+    fn test_append_frames_without_sync_leaves_publication_unchanged() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        let frames = [
+            WalFrameRef {
+                page_number: 1,
+                page_data: &p1,
+                db_size_if_commit: 0,
+            },
+            WalFrameRef {
+                page_number: 2,
+                page_data: &p2,
+                db_size_if_commit: 2,
+            },
+        ];
+        adapter
+            .append_frames(&cx, &frames)
+            .expect("append frames batch");
+
+        assert_publication_unchanged(&adapter, "append_frames");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "append_frames must stage the commit horizon for a later sync"
+        );
+    }
+
+    #[test]
+    fn test_append_frames_tracked_without_sync_leaves_publication_unchanged() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        let frames = [
+            WalFrameRef {
+                page_number: 1,
+                page_data: &p1,
+                db_size_if_commit: 0,
+            },
+            WalFrameRef {
+                page_number: 2,
+                page_data: &p2,
+                db_size_if_commit: 2,
+            },
+        ];
+        adapter
+            .append_frames_tracked(&cx, &frames, VfsWriteCompletion::new())
+            .expect("append tracked frames batch");
+
+        assert_publication_unchanged(&adapter, "append_frames_tracked");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "append_frames_tracked must stage the commit horizon for a later sync"
+        );
+    }
+
+    #[test]
+    fn test_append_prepared_frames_without_sync_leaves_publication_unchanged() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        let frames = [
+            WalFrameRef {
+                page_number: 1,
+                page_data: &p1,
+                db_size_if_commit: 0,
+            },
+            WalFrameRef {
+                page_number: 2,
+                page_data: &p2,
+                db_size_if_commit: 2,
+            },
+        ];
+        let mut prepared = adapter
+            .prepare_append_frames(&frames)
+            .expect("prepare append")
+            .expect("prepared batch");
+        adapter
+            .append_prepared_frames(&cx, &mut prepared)
+            .expect("append prepared");
+
+        assert_publication_unchanged(&adapter, "append_prepared_frames");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "append_prepared_frames must stage the commit horizon for a later sync"
+        );
+    }
+
+    #[test]
+    fn test_append_prepared_frames_tracked_without_sync_leaves_publication_unchanged() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        let frames = [
+            WalFrameRef {
+                page_number: 1,
+                page_data: &p1,
+                db_size_if_commit: 0,
+            },
+            WalFrameRef {
+                page_number: 2,
+                page_data: &p2,
+                db_size_if_commit: 2,
+            },
+        ];
+        let mut prepared = adapter
+            .prepare_append_frames(&frames)
+            .expect("prepare append")
+            .expect("prepared batch");
+        adapter
+            .append_prepared_frames_tracked(&cx, &mut prepared, VfsWriteCompletion::new())
+            .expect("append prepared tracked");
+
+        assert_publication_unchanged(&adapter, "append_prepared_frames_tracked");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "append_prepared_frames_tracked must stage the commit horizon for a later sync"
+        );
+    }
+
+    #[test]
+    fn test_successful_sync_publishes_staged_commit_horizon() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+        assert_publication_unchanged(&adapter, "before sync");
+
+        adapter.sync(&cx).expect("sync must succeed");
+
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "a successful sync must publish the staged commit horizon"
+        );
+        assert_eq!(
+            adapter.published_snapshot.commit_count, 1,
+            "a successful sync must publish the staged commit count"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.len(),
+            2,
+            "a successful sync must publish every staged page"
+        );
+        assert_eq!(
+            adapter.pending_publication_commit, None,
+            "a published batch must no longer be staged"
+        );
+        assert!(
+            adapter.pending_publication_frames.is_empty(),
+            "a published batch must drain its staged frames"
+        );
+    }
+
+    #[test]
+    fn test_failed_sync_advances_no_publication_and_retry_publishes() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut adapter = make_fault_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+
+        vfs.fail_next_wal_sync();
+        let failure = adapter
+            .sync(&cx)
+            .expect_err("injected WAL sync failure must surface");
+        assert!(
+            failure.to_string().contains("injected WAL sync failure"),
+            "sync must report the injected durability failure, got: {failure}"
+        );
+
+        assert_publication_unchanged(&adapter, "after failed sync");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "a failed sync must preserve the staged horizon for retry"
+        );
+        assert!(
+            !adapter.pending_publication_frames.is_empty(),
+            "a failed sync must preserve staged frames for retry"
+        );
+
+        // Retry: the same staged batch publishes once durability succeeds.
+        adapter.sync(&cx).expect("retry sync must succeed");
+
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "retrying sync must publish the preserved commit horizon"
+        );
+        assert_eq!(
+            adapter.published_snapshot.commit_count, 1,
+            "retrying sync must publish the preserved commit count"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.len(),
+            2,
+            "retrying sync must publish every preserved page"
+        );
+        assert_eq!(
+            adapter.pending_publication_commit, None,
+            "a retried publication must clear the staged horizon"
+        );
+    }
+
+    #[test]
+    fn test_failed_sync_then_append_cannot_drop_or_publish_pending() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut adapter = make_fault_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+
+        vfs.fail_next_wal_sync();
+        adapter
+            .sync(&cx)
+            .expect_err("injected WAL sync failure must surface");
+
+        let staged_after_failure = adapter.pending_publication_commit;
+        let staged_frames_after_failure = adapter.pending_publication_frames.len();
+        assert_eq!(
+            staged_after_failure,
+            Some(1),
+            "failed sync must preserve the staged horizon"
+        );
+
+        // A further append must not run the pre-append resynchronization, which
+        // would discard the preserved batch and republish the unsynced horizon.
+        let p3 = sample_page(0x73);
+        adapter
+            .append_frame(&cx, 3, &p3, 3)
+            .expect("append after failed sync");
+
+        assert_publication_unchanged(&adapter, "append after failed sync");
+        assert!(
+            adapter.pending_publication_frames.len() > staged_frames_after_failure,
+            "append after a failed sync must extend, never discard, the staged batch"
+        );
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(2),
+            "append after a failed sync must carry the staged horizon forward"
+        );
+
+        // Durability finally succeeds: the whole preserved batch publishes.
+        adapter.sync(&cx).expect("sync after failed attempt");
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(2),
+            "recovered sync must publish the full preserved horizon"
+        );
+        assert_eq!(
+            adapter.pending_publication_commit, None,
+            "recovered sync must clear the staged horizon"
+        );
+    }
+
+    #[test]
+    fn test_failed_sync_then_begin_transaction_then_append_fails_closed() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut adapter = make_fault_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+
+        vfs.fail_next_wal_sync();
+        adapter
+            .sync(&cx)
+            .expect_err("injected WAL sync failure must surface");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "failed sync must preserve the staged horizon"
+        );
+
+        // `begin_transaction` must reject at the earliest illegal transition,
+        // before refreshing, pinning a read snapshot, or re-arming the
+        // pre-append guard — and it must be a retryable Busy, not corruption.
+        let begin_error = adapter
+            .begin_transaction(&cx)
+            .expect_err("begin_transaction must fail closed while frames are staged");
+        assert!(
+            matches!(begin_error, FrankenError::Busy),
+            "staged-state rejection must be retryable Busy, not corruption: {begin_error:?}"
+        );
+        assert_publication_unchanged(&adapter, "begin_transaction refused after failed sync");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "a refused begin_transaction must not drop the staged horizon"
+        );
+        assert!(
+            adapter.pinned_read_snapshot().is_none(),
+            "a refused begin_transaction must not pin a read snapshot"
+        );
+
+        // Defense in depth: the pre-append choke guard still refuses for any
+        // other path that re-arms `refresh_before_append`.
+        adapter.refresh_before_append = true;
+        let p3 = sample_page(0x74);
+        let append_error = adapter
+            .append_frame(&cx, 3, &p3, 3)
+            .expect_err("append must fail closed while frames are staged");
+        assert!(
+            matches!(append_error, FrankenError::Busy),
+            "append rejection must be retryable Busy: {append_error:?}"
+        );
+        assert_publication_unchanged(&adapter, "append refused after failed sync");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "a refused append must leave the staged horizon intact"
+        );
+        assert!(
+            !adapter.pending_publication_frames.is_empty(),
+            "a refused append must leave the staged frames intact"
+        );
+        adapter.refresh_before_append = false;
+
+        // The batch is still recoverable: a successful sync publishes it.
+        adapter.sync(&cx).expect("sync after failed attempt");
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "recovered sync must publish the preserved horizon"
+        );
+    }
+
+    #[test]
+    fn test_failed_sync_then_checkpoint_fails_closed_and_preserves_state() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut adapter = make_fault_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+
+        vfs.fail_next_wal_sync();
+        adapter
+            .sync(&cx)
+            .expect_err("injected WAL sync failure must surface");
+
+        let frames_before = adapter.frame_count();
+        let staged_before = adapter.pending_publication_commit;
+        let staged_frame_count_before = adapter.pending_publication_frames.len();
+
+        // Checkpoint must refuse before touching the WAL: it backfills, may
+        // reset, and can invalidate the publication plane, all of which would
+        // destroy the staged batch.
+        let mut writer = MockCheckpointPageWriter;
+        let checkpoint_error = adapter
+            .checkpoint(&cx, CheckpointMode::Passive, &mut writer, 0, None)
+            .expect_err("checkpoint must fail closed while frames are staged");
+        assert!(
+            matches!(checkpoint_error, FrankenError::CheckpointFailed { .. }),
+            "checkpoint rejection must be CheckpointFailed, not corruption: {checkpoint_error:?}"
+        );
+
+        assert_eq!(
+            adapter.frame_count(),
+            frames_before,
+            "a refused checkpoint must not mutate WAL bytes"
+        );
+        assert_publication_unchanged(&adapter, "checkpoint refused");
+        assert_eq!(
+            adapter.pending_publication_commit, staged_before,
+            "a refused checkpoint must preserve the staged horizon"
+        );
+        assert_eq!(
+            adapter.pending_publication_frames.len(),
+            staged_frame_count_before,
+            "a refused checkpoint must preserve the staged frames"
+        );
+
+        // Retry: durability succeeds and the preserved batch publishes.
+        adapter.sync(&cx).expect("retry sync must succeed");
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "retry sync must publish the preserved horizon"
+        );
+        assert_eq!(
+            adapter.pending_publication_commit, None,
+            "a published batch must no longer be staged"
+        );
+    }
+
+    #[test]
+    fn test_midtransaction_sync_preserves_uncommitted_frames_and_allows_continuation() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+
+        // Append a non-commit frame, then sync. The frame becomes durable but is
+        // not committed, so nothing may be published.
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        assert_eq!(
+            adapter.pending_publication_commit, None,
+            "a non-commit append stages no commit horizon"
+        );
+        adapter
+            .sync(&cx)
+            .expect("mid-transaction sync must succeed");
+
+        assert_publication_unchanged(&adapter, "sync of uncommitted frames");
+        assert!(
+            !adapter.pending_publication_frames.is_empty(),
+            "a mid-transaction sync must preserve durable-but-uncommitted frames"
+        );
+
+        // Continuation must remain possible: the commit marker still lands.
+        adapter
+            .append_frame(&cx, 2, &p2, 2)
+            .expect("commit append after mid-transaction sync must be allowed");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "the commit append must stage the horizon for the whole batch"
+        );
+        assert_publication_unchanged(&adapter, "commit staged but not yet synced");
+
+        adapter.sync(&cx).expect("commit sync must succeed");
+
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "the commit sync must publish the whole batch"
+        );
+        assert_eq!(
+            adapter.published_snapshot.commit_count, 1,
+            "the batch must publish exactly one commit"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.len(),
+            2,
+            "both pages must be published exactly once"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.get(&1),
+            Some(&0),
+            "page 1 must map to its frame from before the mid-transaction sync"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.get(&2),
+            Some(&1),
+            "page 2 must map to the commit frame"
+        );
+        assert!(
+            !adapter.has_pending_publication(),
+            "a published batch must leave nothing staged"
+        );
+    }
+
+    #[test]
+    fn test_inner_mut_fails_closed_while_batch_is_staged() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut adapter = make_fault_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+
+        assert!(
+            adapter.has_pending_publication(),
+            "an appended-but-unsynced batch must report as pending"
+        );
+        // `expect_err` would require `WalFile: Debug`, which the fault-VFS file
+        // type does not implement, so assert on the pattern directly.
+        assert!(
+            matches!(adapter.inner_mut(), Err(FrankenError::Busy)),
+            "inner_mut must fail closed with retryable Busy while frames are staged"
+        );
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "a refused inner_mut must preserve the staged horizon"
+        );
+
+        // Once drained, the escape hatch opens again.
+        adapter.sync(&cx).expect("sync staged batch");
+        assert!(
+            !adapter.has_pending_publication(),
+            "a published batch must clear the pending flag"
+        );
+        adapter
+            .inner_mut()
+            .expect("inner_mut must succeed once the batch is drained");
+    }
+
+    #[test]
+    fn test_unpinned_refresh_does_not_expose_staged_horizon_before_sync() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let (p1, p2) = commit_batch_pages();
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+
+        // An explicit refresh must not publish frames this handle has staged but
+        // not yet made durable.
+        adapter
+            .refresh_published_snapshot(&cx)
+            .expect("refresh published snapshot");
+        assert_publication_unchanged(&adapter, "refresh with staged frames");
+        assert_eq!(
+            adapter.pending_publication_commit,
+            Some(1),
+            "refresh must leave the staged horizon intact"
+        );
+
+        adapter.sync(&cx).expect("sync staged batch");
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "sync must publish once the staged batch is durable"
+        );
+    }
+
     #[test]
     fn test_commit_append_publishes_visibility_snapshot() {
         init_wal_publication_test_tracing();
@@ -5968,15 +6830,18 @@ mod tests {
         let p2 = sample_page(0x42);
         adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
         adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+        // Publication is deferred to the durability barrier (#187); the commit
+        // horizon only becomes visible once `sync` persists the frames.
+        adapter.sync(&cx).expect("sync commit batch");
 
         assert_eq!(
             adapter.published_snapshot.last_commit_frame,
             Some(1),
-            "commit append should publish the visible commit horizon"
+            "synced commit should publish the visible commit horizon"
         );
         assert_eq!(
             adapter.published_snapshot.commit_count, 1,
-            "commit append should track the visible WAL commit count"
+            "synced commit should track the visible WAL commit count"
         );
         assert_eq!(
             adapter.published_snapshot.page_index.len(),
@@ -6018,20 +6883,22 @@ mod tests {
         adapter
             .append_prepared_frames(&cx, &mut prepared)
             .expect("append prepared");
+        // Publication is deferred to the durability barrier (#187).
+        adapter.sync(&cx).expect("sync prepared commit batch");
 
         assert_eq!(
             adapter.published_snapshot.last_commit_frame,
             Some(1),
-            "prepared commit append should publish the visible commit horizon"
+            "synced prepared commit should publish the visible commit horizon"
         );
         assert_eq!(
             adapter.published_snapshot.commit_count, 1,
-            "prepared commit append should track the visible WAL commit count"
+            "synced prepared commit should track the visible WAL commit count"
         );
         assert_eq!(
             adapter.published_snapshot.page_index.len(),
             2,
-            "prepared commit append should publish all committed pages"
+            "synced prepared commit should publish all committed pages"
         );
         assert_eq!(
             adapter.published_snapshot.page_index.get(&2),
@@ -6111,6 +6978,10 @@ mod tests {
         adapter
             .append_frame(&cx, 1, &sample_page(0x61), 1)
             .expect("append committed frame");
+        // Publication is deferred to the durability barrier (#187), and
+        // checkpoint now fails closed while a batch is staged, so the batch must
+        // be drained before checkpointing.
+        adapter.sync(&cx).expect("sync committed frame");
         let before = adapter.published_snapshot();
         assert_eq!(before.last_commit_frame, Some(0));
         assert_eq!(before.commit_count, 1);
@@ -6262,6 +7133,7 @@ mod tests {
 
         let last_commit = adapter
             .inner_mut()
+            .expect("no staged batch blocks inner access")
             .last_commit_frame(&cx)
             .expect("last commit")
             .expect("commit exists");
@@ -6305,6 +7177,7 @@ mod tests {
 
         let last_commit = adapter
             .inner_mut()
+            .expect("no staged batch blocks inner access")
             .last_commit_frame(&cx)
             .expect("last commit")
             .expect("commit exists");
