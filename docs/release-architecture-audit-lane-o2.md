@@ -145,13 +145,15 @@ a versioned name, a compatibility name, and architecture aliases that spell
 `amd64` as `x86_64` and `arm64` as `aarch64` — and it also emits a per-asset
 `.sha256` one-liner for every name it publishes.
 
-For the supported matrix that means roughly two dozen staged files expanding to
-roughly forty published assets: five archives become ten published names, each
-with its own `.sha256`, alongside the per-archive signatures and provenance,
-both checksum manifests, the build manifest, the dependency inventory, and a
-signature for each of those. Verify the staged directory against the intended
-staging list and the published release against the expected asset list; a
-mismatch between the two counts is expected, not a defect.
+For v0.2.0 the closed published surface is 43 assets, matching v0.1.17's shape:
+five primary archives, five architecture aliases, ten per-name `.sha256`
+sidecars, five primary-archive signatures, five primary-archive provenance
+files and their five signatures, `SHA256SUMS` and `SHA256SUMS.txt` plus both
+signatures, one SPDX SBOM plus its signature, and one build manifest plus its
+signature. Verify the staged directory against its intended staging list and
+the draft release against that exact 43-name list; a mismatch between staged
+and published counts is expected, but a mismatch against either closed list is
+a defect.
 
 Per-archive signatures and provenance cover the primary names only. Alias names
 are byte-identical to their primaries and are already bound by the signed
@@ -162,36 +164,40 @@ pre-enumerated asset plan and an exact-count gate that aborts the upload on any
 mismatch. Under that mode every intended sidecar must be enumerated in the plan
 itself; nothing is discovered from disk.
 
+The current DSR strict contract enumerates only the five primary archives and
+their `.sha256` sidecars. It therefore proves a ten-asset draft and correctly
+rejects the other 33 assets as extras. The v0.2.0 operator must either extend
+that contract before release or use DSR for the ten-asset draft, attach the
+remaining pre-enumerated assets while the release is still a draft, and replace
+DSR's final verifier with an independent exact-43 verifier. After supplements
+are attached, a failing DSR strict verification is expected and must never be
+misreported as end-to-end DSR proof.
+
 SBOM generation is a standalone step, not part of build or release. Generated
 documents are named from a truncated archive basename and carry no license
 field, so a release that requires license provenance must record it separately.
 
-### Unresolved decisions for the next release
+### v0.2.0 artifact decisions
 
 The prior release line published per-archive provenance, per-archive
-signatures, and a single dependency inventory in SPDX form. Reproducing that
-surface is not automatic, and each of the following is an open decision rather
-than a settled contract:
+signatures, and a single dependency inventory in SPDX form. v0.2.0 preserves
+that surface, but producing it is not automatic:
 
-- **Provenance generation is not wired.** Attestation is a standalone command,
-  not a build or release stage, and no observed artifact directory has
-  contained one. Whether the next release reproduces per-archive provenance,
-  and by what step, is undecided.
-- **SPDX output is unverified.** The prior release published an SPDX
-  inventory, and the release notes for that line promise SPDX specifically.
-  Only the CycloneDX path has been exercised; the SPDX path and its naming
-  have not.
+- **Provenance generation is a required standalone stage.** Attestation is not
+  part of build or release; generate one source/tag-bound provenance file for
+  each primary archive and verify all five before upload.
+- **SPDX output is required and must be rehearsed.** The prior release
+  published an SPDX inventory, so v0.2.0 must prove the SPDX generator and the
+  exact `frankensqlite-0.2.0.sbom.spdx.json` name before upload.
 - **Non-archive files are not signed automatically.** Automatic signing
   matches files by tool-name prefix, so checksum manifests, the build
   manifest, the dependency inventory, and provenance files fall outside it.
   Every one of those was signed in the prior release, so each needs an
   explicit signing step or it ships unsigned.
-- **Asset name prefix is inconsistent in the prior release.** Archives used
-  one prefix while the build manifest and dependency inventory used the longer
-  project name. Current tooling would emit the short prefix for all of them,
-  which silently breaks any consumer matching the older names. Choose the
-  prefix deliberately and state it, rather than inheriting whichever the
-  tooling happens to produce.
+- **The historical prefix split is preserved deliberately.** Archives,
+  aliases, provenance, and per-name checksums use `fsqlite`; the build manifest
+  and SPDX inventory use `frankensqlite`, matching v0.1.17 rather than silently
+  changing consumer-visible names.
 
 ## Current release gate
 
