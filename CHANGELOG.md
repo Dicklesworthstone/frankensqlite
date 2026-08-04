@@ -173,6 +173,22 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   rejects the same assignment correctly, so only `UPDATE` is affected
   ([#165](https://github.com/Dicklesworthstone/frankensqlite/issues/165),
   [#166](https://github.com/Dicklesworthstone/frankensqlite/issues/166)).
+- **Foreign-key constraint deferral is not implemented.** `DEFERRABLE
+  INITIALLY DEFERRED` is accepted, but checks still run at statement time, and
+  `PRAGMA defer_foreign_keys` does not enable deferral. A transaction that
+  temporarily violates a constraint and repairs it before `COMMIT` therefore
+  fails at the first violating statement. Writes are refused rather than
+  mis-applied; order statements so no intermediate state violates a constraint
+  ([#149](https://github.com/Dicklesworthstone/frankensqlite/issues/149),
+  [#161](https://github.com/Dicklesworthstone/frankensqlite/issues/161)).
+- **`INSERT OR REPLACE` does not run delete-side foreign-key actions for the
+  replaced parent row.** Stock SQLite treats the replacement as a delete
+  followed by an insert and fires `ON DELETE CASCADE` on dependent rows;
+  FrankenSQLite leaves those rows in place. Because the replacement carries
+  the same key, this retains logically stale dependent data rather than
+  creating an orphan. Delete the parent explicitly before re-inserting it when
+  dependent rows must be cascaded
+  ([#142](https://github.com/Dicklesworthstone/frankensqlite/issues/142)).
 
 ### Added
 

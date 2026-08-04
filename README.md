@@ -2759,6 +2759,20 @@ still serves as an authoritative reference.
   rejects the same assignment correctly, so only `UPDATE` is affected
   ([#165](https://github.com/Dicklesworthstone/frankensqlite/issues/165),
   [#166](https://github.com/Dicklesworthstone/frankensqlite/issues/166)).
+- **Foreign-key deferral is not implemented.** `DEFERRABLE INITIALLY DEFERRED`
+  is accepted but checks still run at statement time, and `PRAGMA
+  defer_foreign_keys` does not enable deferral. Transactions that temporarily
+  violate a constraint and repair it before `COMMIT` fail at the first
+  violating statement. Writes are refused, not mis-applied; order statements
+  so no intermediate state violates a constraint
+  ([#149](https://github.com/Dicklesworthstone/frankensqlite/issues/149),
+  [#161](https://github.com/Dicklesworthstone/frankensqlite/issues/161)).
+- **`INSERT OR REPLACE` skips delete-side foreign-key actions.** Replacing a
+  parent row does not fire `ON DELETE CASCADE` on its dependents as stock
+  SQLite does. The replacement keeps the same key, so dependent rows are
+  retained rather than orphaned. Delete the parent explicitly first when a
+  cascade is required
+  ([#142](https://github.com/Dicklesworthstone/frankensqlite/issues/142)).
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
