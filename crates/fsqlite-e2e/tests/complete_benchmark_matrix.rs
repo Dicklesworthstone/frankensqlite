@@ -16,14 +16,96 @@ use fsqlite_e2e::fixture_select::{
 };
 use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta};
 use fsqlite_e2e::overlay_honesty_gate::{
-    MatrixRegressionThresholds, OVERLAY_C1_SCORECARD_JSON_ENV, OVERLAY_ENFORCE_HONESTY_GATE_ENV,
-    OVERLAY_PERSISTENT_SCORECARD_JSON_ENV, evaluate_matrix_regression_gate_from_paths,
+    MatrixRegressionThresholds, evaluate_matrix_regression_gate_from_paths,
     evaluate_overlay_honesty_gate_from_paths, load_benchmark_summaries,
 };
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-const MATRIX_BASELINE_JSONL_ENV: &str = "FSQLITE_MATRIX_BASELINE_JSONL";
+
+/// Environment variables that can weaken or subset a matrix run.
+///
+/// A signed receipt binds `argv` but not environment, so any of these set
+/// during a release run would silently change what was measured while the
+/// receipt still validated. The release test therefore refuses to run when any
+/// is present, rather than trusting that none were used.
+///
+/// Grouped by bypass class: fixture/workload/concurrency subsetting, duration
+/// and iteration shortening, mode reduction, and comparator threshold
+/// relaxation.
+const RELEASE_FORBIDDEN_MATRIX_ENV: &[&str] = &[
+    // Subsetting: silently measure fewer cells than the canonical matrix.
+    "FSQLITE_MATRIX_DB",
+    "FSQLITE_MATRIX_WORKLOAD",
+    "FSQLITE_MATRIX_CONCURRENCY",
+    // Duration/iteration: shorten the measurement until noise dominates.
+    "FSQLITE_MATRIX_WARMUP",
+    "FSQLITE_MATRIX_REPEAT",
+    "FSQLITE_MATRIX_MIN_ITERS",
+    "FSQLITE_MATRIX_TIME_SECS",
+    // Mode: run something other than the full canonical matrix.
+    "FSQLITE_MATRIX_MODE",
+    // Thresholds: relax the comparator until any result passes.
+    "FSQLITE_MATRIX_MAX_P95_RATIO",
+    "FSQLITE_MATRIX_MIN_THROUGHPUT_RATIO",
+    // Baseline: point the historical comparison at an arbitrary file, or omit
+    // it and skip the comparison silently. Refused outright at v0.2.0 because
+    // no canonical historical baseline exists to select.
+    "FSQLITE_MATRIX_BASELINE_JSONL",
+];
+
+/// Manifest status recorded when no canonical historical baseline exists.
+///
+/// The v0.2.0 release is the bootstrap: it publishes the first immutable
+/// complete-matrix baseline instead of comparing against one.
+const MATRIX_REGRESSION_STATUS_BOOTSTRAP: &str = "unavailable_bootstrap_v0_2_0";
+
+/// The single package version permitted to skip historical regression.
+const MATRIX_BOOTSTRAP_PKG_VERSION: &str = "0.2.0";
+
+/// Refuse the bootstrap escape at any version other than [`MATRIX_BOOTSTRAP_PKG_VERSION`].
+///
+/// Bootstrap is a one-time concession: v0.2.0 publishes the first immutable
+/// complete-matrix baseline. Once that baseline exists, a later release that
+/// still skipped historical regression would be silently unguarded, so this
+/// fails closed and forces the successor to wire the real comparison.
+fn bootstrap_allowed_for_version(pkg_version: &str) -> Result<(), String> {
+    if pkg_version == MATRIX_BOOTSTRAP_PKG_VERSION {
+        return Ok(());
+    }
+    Err(format!(
+        "historical-regression bootstrap is permitted only at package version \
+         {MATRIX_BOOTSTRAP_PKG_VERSION}, found `{pkg_version}`; v{MATRIX_BOOTSTRAP_PKG_VERSION} \
+         published the first immutable baseline, so this release must compare against it"
+    ))
+}
+
+/// Names from [`RELEASE_FORBIDDEN_MATRIX_ENV`] that `is_set` reports as present.
+///
+/// Pure: the caller supplies the lookup, so keepers can exercise every bypass
+/// class without mutating process-global environment state.
+fn forbidden_matrix_env_present(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    RELEASE_FORBIDDEN_MATRIX_ENV
+        .iter()
+        .copied()
+        .filter(|name| is_set(name))
+        .collect()
+}
+
+/// Root of the offline verifier's evidence namespace.
+///
+/// Mirrors `EVIDENCE_PATH_PREFIX` in the phase-five release guard, which
+/// requires every evidence path to be canonically spelled and stored below this
+/// prefix.
+const RELEASE_EVIDENCE_PREFIX: &str = "tests/artifacts/release-evidence";
+
+/// Suffix identifying the c1 overlay scorecard within one commit's evidence.
+const RELEASE_C1_SCORECARD_SUFFIX: &str = "performance/c1/c1_scorecard.json";
+
+/// Suffix identifying the persistent overlay scorecard within one commit's
+/// evidence.
+const RELEASE_PERSISTENT_SCORECARD_SUFFIX: &str =
+    "performance/persistent/persistent_scorecard.json";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -261,17 +343,6 @@ fn git_head_revision(repo_root: &Path) -> Result<String, Box<dyn Error>> {
 fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
     let bytes = fs::read(path)?;
     Ok(fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(bytes)))
-}
-
-fn resolve_repo_relative_env_path(repo_root: &Path, key: &str) -> Option<PathBuf> {
-    std::env::var_os(key).map(|raw| {
-        let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            path
-        } else {
-            repo_root.join(path)
-        }
-    })
 }
 
 fn benchmark_mode_from_engine(engine: &str) -> Result<BenchmarkMode, Box<dyn Error>> {
@@ -911,9 +982,315 @@ fn rewrite_jsonl_with_canonical_records(
     Ok(enriched)
 }
 
+/// Repo-relative evidence path for one scorecard at one tested commit.
+///
+/// Keyed by `source_revision` so each release writes a *new* directory and
+/// never mutates a previous release's evidence. That is required, not
+/// cosmetic: the phase-five guard demands `tested_commit..HEAD` be an exact
+/// evidence-only delta and validates artifacts by BLAKE3, so an unversioned
+/// shared path would rewrite immutable evidence on the next release and would
+/// also let a stale scorecard from an unrelated commit satisfy the gate.
+fn release_evidence_relpath(source_revision: &str, suffix: &str) -> String {
+    format!("{RELEASE_EVIDENCE_PREFIX}/{source_revision}/{suffix}")
+}
+
+/// Absolute paths to the two release scorecards the overlay honesty gate
+/// requires, resolved from the validated tested commit.
+///
+/// Takes no environment: the release guard binds `receipt.execution.argv` but
+/// does not attest a run's environment, so an env-selected scorecard path would
+/// let a receipt carrying the exact canonical argv aim the gate at an arbitrary
+/// file — or at nothing — undetectably.
+///
+/// `source_revision` must be a 40-digit lowercase hex object name, matching the
+/// guard's own commit spelling rule. Rejecting anything else also rejects path
+/// traversal by construction: no accepted value can contain `/`, `.` or `..`.
+/// Whether the files exist is the gate's business — a missing scorecard must
+/// fail the gate, never silently disable it.
+fn release_scorecard_paths(
+    repo_root: &Path,
+    source_revision: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    if source_revision.len() != 40
+        || !source_revision
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(format!(
+            "release evidence requires a 40-digit lowercase hexadecimal source revision, found `{source_revision}`"
+        ));
+    }
+    Ok((
+        repo_root.join(release_evidence_relpath(
+            source_revision,
+            RELEASE_C1_SCORECARD_SUFFIX,
+        )),
+        repo_root.join(release_evidence_relpath(
+            source_revision,
+            RELEASE_PERSISTENT_SCORECARD_SUFFIX,
+        )),
+    ))
+}
+
+/// Build the overlay honesty gate configuration for this release test.
+///
+/// Unconditionally strict: both the c1 and persistent packs are required and
+/// warnings are fatal. There is deliberately no relaxation path and no
+/// environment input.
+///
+/// The release guard binds `receipt.execution.argv` but does **not** attest the
+/// environment of a run. Any env-selected relaxation would therefore be a
+/// machine-invisible bypass: a receipt carrying the exact canonical argv could
+/// be produced by a run that had silently switched the pack requirements off,
+/// and the guard could not tell the difference. Since this test exists solely
+/// to be replayed under the canonical `run_for_release` argv, the only honest
+/// configuration is the one that cannot be weakened from outside.
+fn overlay_gate_config(
+    matrix_thresholds: MatrixRegressionThresholds,
+) -> fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig {
+    fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig {
+        matrix_thresholds,
+        ..fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig::strict_overlay()
+    }
+}
+
+/// Keeper: the release scorecards are read from fixed canonical repo-relative
+/// paths, with no environment input.
+///
+/// Pinning the literal strings is the point — if either constant is changed or
+/// made configurable, this fails, because the guard cannot detect a run that
+/// silently pointed the gate somewhere else.
+#[test]
+fn release_scorecard_paths_are_fixed_and_canonical() {
+    let revision = "0123456789abcdef0123456789abcdef01234567";
+    let root = Path::new("/repo");
+
+    assert_eq!(
+        release_evidence_relpath(revision, RELEASE_C1_SCORECARD_SUFFIX),
+        format!("tests/artifacts/release-evidence/{revision}/performance/c1/c1_scorecard.json")
+    );
+    assert_eq!(
+        release_evidence_relpath(revision, RELEASE_PERSISTENT_SCORECARD_SUFFIX),
+        format!(
+            "tests/artifacts/release-evidence/{revision}/performance/persistent/persistent_scorecard.json"
+        )
+    );
+
+    let (c1, persistent) =
+        release_scorecard_paths(root, revision).expect("40-hex revision must resolve");
+    assert_eq!(
+        c1,
+        root.join(release_evidence_relpath(
+            revision,
+            RELEASE_C1_SCORECARD_SUFFIX
+        ))
+    );
+    assert_eq!(
+        persistent,
+        root.join(release_evidence_relpath(
+            revision,
+            RELEASE_PERSISTENT_SCORECARD_SUFFIX
+        ))
+    );
+    assert_ne!(c1, persistent, "the two scorecards must be distinct files");
+    assert!(
+        c1.starts_with(root) && persistent.starts_with(root),
+        "scorecards must resolve inside the repository"
+    );
+
+    // Evidence is append-only: a different commit must never resolve to a path
+    // that could overwrite or reuse another commit's scorecards.
+    let other = "89abcdef0123456789abcdef0123456789abcdef";
+    let (other_c1, _) = release_scorecard_paths(root, other).expect("second revision resolves");
+    assert_ne!(
+        c1, other_c1,
+        "scorecard paths must be keyed by the tested commit"
+    );
+
+    // Only a 40-digit lowercase hex revision is accepted, which rejects
+    // traversal and uppercase/short/empty spellings by construction.
+    for bad in [
+        "",
+        "0123456789abcdef",
+        "0123456789ABCDEF0123456789ABCDEF01234567",
+        "../../../etc/passwd",
+        "0123456789abcdef0123456789abcdef0123456/",
+        "g123456789abcdef0123456789abcdef01234567",
+    ] {
+        assert!(
+            release_scorecard_paths(root, bad).is_err(),
+            "`{bad}` must be rejected as a source revision"
+        );
+    }
+}
+
+/// Keeper: the v0.2.0 historical-regression bootstrap contract.
+///
+/// No canonical historical complete-matrix baseline exists — not in-tree, and
+/// not in the v0.1.17/v0.1.18/v0.1.19 tags, which do not contain this file at
+/// all. So the release must not invent a predecessor, must not accept an
+/// env-selected baseline, and must record the absence explicitly rather than
+/// letting the comparison be silently skipped.
+#[test]
+fn matrix_regression_is_explicit_bootstrap_with_no_env_baseline() {
+    assert_eq!(
+        MATRIX_REGRESSION_STATUS_BOOTSTRAP, "unavailable_bootstrap_v0_2_0",
+        "the bootstrap status is part of the manifest contract"
+    );
+
+    // The baseline env var is refused like every other weakening input, so a
+    // canonical-argv receipt cannot smuggle in an arbitrary comparison target
+    // nor silently omit the comparison.
+    assert_eq!(
+        forbidden_matrix_env_present(|name| name == "FSQLITE_MATRIX_BASELINE_JSONL"),
+        vec!["FSQLITE_MATRIX_BASELINE_JSONL"],
+        "an env-selected baseline must be refused at v0.2.0"
+    );
+    assert!(
+        RELEASE_FORBIDDEN_MATRIX_ENV.contains(&"FSQLITE_MATRIX_BASELINE_JSONL"),
+        "the baseline variable belongs in the forbidden set, not the allowed set"
+    );
+
+    // The release remains hard-gated by the commit-keyed scorecards even though
+    // historical regression is unavailable.
+    let config = overlay_gate_config(MatrixRegressionThresholds::default());
+    assert!(
+        config.require_c1_pack && config.require_persistent_pack,
+        "bootstrap must not relax the scorecard gate that still applies"
+    );
+
+    // The escape expires with the version: it is valid only at 0.2.0, and the
+    // crate this test ships in must actually be that version today.
+    assert!(bootstrap_allowed_for_version(MATRIX_BOOTSTRAP_PKG_VERSION).is_ok());
+    assert!(
+        bootstrap_allowed_for_version(env!("CARGO_PKG_VERSION")).is_ok(),
+        "this crate is past the bootstrap version; wire the real historical comparison"
+    );
+    for later in ["0.2.1", "0.3.0", "1.0.0", "0.2.0-rc.1", "0.20.0", ""] {
+        assert!(
+            bootstrap_allowed_for_version(later).is_err(),
+            "`{later}` must not inherit the v0.2.0 bootstrap escape"
+        );
+    }
+}
+
+/// Negative keepers: every weakening bypass class must be refused.
+///
+/// Pure — the lookup is injected, so no process-global environment is mutated
+/// and the test is order-independent.
+#[test]
+fn release_matrix_refuses_every_weakening_env_bypass() {
+    assert!(
+        forbidden_matrix_env_present(|_| false).is_empty(),
+        "a clean environment must be accepted"
+    );
+
+    // One representative per bypass class named in the review: subsetting,
+    // duration, mode, and threshold relaxation.
+    for (class, name) in [
+        ("subset", "FSQLITE_MATRIX_DB"),
+        ("subset", "FSQLITE_MATRIX_WORKLOAD"),
+        ("subset", "FSQLITE_MATRIX_CONCURRENCY"),
+        ("duration", "FSQLITE_MATRIX_WARMUP"),
+        ("duration", "FSQLITE_MATRIX_REPEAT"),
+        ("duration", "FSQLITE_MATRIX_MIN_ITERS"),
+        ("duration", "FSQLITE_MATRIX_TIME_SECS"),
+        ("mode", "FSQLITE_MATRIX_MODE"),
+        ("threshold", "FSQLITE_MATRIX_MAX_P95_RATIO"),
+        ("threshold", "FSQLITE_MATRIX_MIN_THROUGHPUT_RATIO"),
+    ] {
+        assert_eq!(
+            forbidden_matrix_env_present(|candidate| candidate == name),
+            vec![name],
+            "{class} bypass via {name} must be refused"
+        );
+    }
+
+    // All at once must report all of them, not just the first.
+    assert_eq!(
+        forbidden_matrix_env_present(|_| true).len(),
+        RELEASE_FORBIDDEN_MATRIX_ENV.len()
+    );
+
+    // Output-location variables cannot weaken a result, so they are not
+    // refused; they are recorded in the manifest instead.
+    for allowed in ["FSQLITE_MATRIX_OUTPUT_STEM", "FSQLITE_MATRIX_ARTIFACT_DIR"] {
+        assert!(
+            forbidden_matrix_env_present(|candidate| candidate == allowed).is_empty(),
+            "{allowed} only relocates output and must remain permitted"
+        );
+    }
+}
+
+/// Keeper: the overlay honesty gate config is strict with no way to weaken it.
+///
+/// `overlay_gate_config` is pure and takes no environment, so this asserts
+/// without mutating process-global state — mutating it would make the test
+/// order-dependent, the hazard frankensqlite#299 was filed about.
+#[test]
+fn overlay_honesty_gate_config_is_unconditionally_strict() {
+    let config = overlay_gate_config(MatrixRegressionThresholds::default());
+
+    // Thresholds are the pinned defaults, never environment-derived.
+    assert!(
+        (config.matrix_thresholds.max_p95_ratio
+            - fsqlite_e2e::overlay_honesty_gate::DEFAULT_MAX_P95_RATIO)
+            .abs()
+            < f64::EPSILON,
+        "release max_p95_ratio must be the pinned default"
+    );
+    assert!(
+        (config.matrix_thresholds.min_throughput_ratio
+            - fsqlite_e2e::overlay_honesty_gate::DEFAULT_MIN_THROUGHPUT_RATIO)
+            .abs()
+            < f64::EPSILON,
+        "release min_throughput_ratio must be the pinned default"
+    );
+
+    assert!(
+        config.require_c1_pack,
+        "release matrix must require the c1 pack"
+    );
+    assert!(
+        config.require_persistent_pack,
+        "release matrix must require the persistent pack"
+    );
+    assert!(
+        config.fail_on_warning,
+        "release matrix must treat gate warnings as failures"
+    );
+    assert_eq!(
+        config,
+        fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig {
+            matrix_thresholds: MatrixRegressionThresholds::default(),
+            ..fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig::strict_overlay()
+        },
+        "the only permitted config is strict_overlay with the supplied thresholds"
+    );
+}
+
 #[test]
 #[ignore = "Runs the complete canonical benchmark matrix and writes artifact bundles."]
 fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
+    // First gate, before every other check and before any workload or artifact
+    // work: the bootstrap concession is valid at exactly one version. A later
+    // release reaching this test at all means the historical comparison was
+    // never wired, so refuse immediately rather than after spending a matrix
+    // run and writing a pack that would look citable.
+    bootstrap_allowed_for_version(env!("CARGO_PKG_VERSION"))?;
+
+    // Fail closed before doing any work: the receipt cannot attest environment,
+    // so a weakening variable must abort the run rather than silently produce a
+    // receipt for a reduced measurement.
+    let forbidden = forbidden_matrix_env_present(|name| std::env::var_os(name).is_some());
+    if !forbidden.is_empty() {
+        return Err(format!(
+            "release matrix refuses to run with weakening environment set: {forbidden:?}; \
+             the release receipt binds argv but not environment, so these cannot be trusted"
+        )
+        .into());
+    }
+
     let repo_root = repo_root();
     let campaign = load_beads_benchmark_campaign(&repo_root)
         .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
@@ -947,7 +1324,6 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     let single_md = artifact_dir.join(format!("{stem}_single_writer.md"));
     let full_jsonl = artifact_dir.join(format!("{stem}_full.jsonl"));
     let manifest_json = artifact_dir.join(format!("{stem}.manifest.json"));
-    let regression_summary_json = artifact_dir.join(format!("{stem}.regression_summary.json"));
     let overlay_honesty_gate_json = artifact_dir.join(format!("{stem}.overlay_honesty_gate.json"));
 
     let mut ran_both = false;
@@ -1066,59 +1442,40 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     }
     fs::write(&full_jsonl, combined)?;
 
-    let baseline_jsonl = resolve_repo_relative_env_path(&repo_root, MATRIX_BASELINE_JSONL_ENV);
-    let matrix_thresholds =
-        MatrixRegressionThresholds::from_env().map_err(std::io::Error::other)?;
-    let regression_gate_report = if let Some(baseline_jsonl) = baseline_jsonl.as_ref() {
-        let report = evaluate_matrix_regression_gate_from_paths(
-            baseline_jsonl,
-            &full_jsonl,
-            matrix_thresholds,
-        )?;
-        fs::write(
-            &regression_summary_json,
-            serde_json::to_vec_pretty(&report)?,
-        )?;
-        if let Some(summary) = report.failure_summary() {
-            return Err(format!(
-                "matrix regression gate failed against {}: {summary}",
-                baseline_jsonl.display()
-            )
-            .into());
-        }
-        Some(report)
-    } else {
-        None
-    };
+    // v0.2.0 bootstrap: there is no canonical historical complete-matrix
+    // baseline. A repo/release audit found none in the tree and none in the
+    // v0.1.17/v0.1.18/v0.1.19 tags — those tags do not even contain this file,
+    // and the v0.1.17 GitHub release carries only binaries, SBOM, provenance,
+    // and checksums. An env-selected baseline is therefore refused (see
+    // RELEASE_FORBIDDEN_MATRIX_ENV): the receipt binds argv but not
+    // environment, so a caller could otherwise point the historical comparison
+    // at any file, or omit it and skip the comparison silently.
+    //
+    // The historical regression report is consequently recorded as explicitly
+    // UNAVAILABLE/bootstrap in the manifest rather than being quietly absent,
+    // and this run's full JSONL is marked as the immutable baseline for the
+    // next release. The current release stays hard-gated by the commit-keyed
+    // c1 + persistent scorecards, which are required unconditionally.
+    // Version gate already cleared at the top of this test.
+    let matrix_regression_status = MATRIX_REGRESSION_STATUS_BOOTSTRAP;
+    // Release thresholds are pinned, never read from the environment: the
+    // receipt binds argv but not env, so `from_env()` here would let
+    // FSQLITE_MATRIX_MAX_P95_RATIO=1e300 (or a tiny min-throughput) pass the
+    // gate under the exact canonical argv, undetectably.
+    let matrix_thresholds = MatrixRegressionThresholds::default();
 
-    let overlay_c1_scorecard_json =
-        resolve_repo_relative_env_path(&repo_root, OVERLAY_C1_SCORECARD_JSON_ENV);
-    let overlay_persistent_scorecard_json =
-        resolve_repo_relative_env_path(&repo_root, OVERLAY_PERSISTENT_SCORECARD_JSON_ENV);
-    let enforce_overlay_honesty_gate =
-        std::env::var_os(OVERLAY_ENFORCE_HONESTY_GATE_ENV).is_some_and(|value| value != "0");
-    let overlay_honesty_gate_report = if enforce_overlay_honesty_gate
-        || overlay_c1_scorecard_json.is_some()
-        || overlay_persistent_scorecard_json.is_some()
-    {
+    let (overlay_c1_scorecard_json, overlay_persistent_scorecard_json) =
+        release_scorecard_paths(&repo_root, &source_revision)?;
+    let overlay_honesty_gate_report = {
         let report = evaluate_overlay_honesty_gate_from_paths(
             &full_jsonl,
-            baseline_jsonl.as_deref(),
-            overlay_c1_scorecard_json.as_deref(),
-            overlay_persistent_scorecard_json.as_deref(),
-            if enforce_overlay_honesty_gate {
-                fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig {
-                    matrix_thresholds,
-                    ..fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig::strict_overlay()
-                }
-            } else {
-                fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig {
-                    matrix_thresholds,
-                    require_c1_pack: false,
-                    require_persistent_pack: false,
-                    fail_on_warning: true,
-                }
-            },
+            // No historical baseline at v0.2.0 bootstrap; see
+            // MATRIX_REGRESSION_STATUS_BOOTSTRAP. Passing None explicitly
+            // rather than an env-selected path is the whole point.
+            None,
+            Some(overlay_c1_scorecard_json.as_path()),
+            Some(overlay_persistent_scorecard_json.as_path()),
+            overlay_gate_config(matrix_thresholds),
         )?;
         fs::write(
             &overlay_honesty_gate_json,
@@ -1128,8 +1485,6 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
             return Err(format!("overlay honesty gate failed: {summary}").into());
         }
         Some(report)
-    } else {
-        None
     };
 
     let manifest = serde_json::json!({
@@ -1149,15 +1504,28 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
         "matrix_single_writer_jsonl": ran_single.then_some(single_jsonl),
         "matrix_single_writer_md": ran_single.then_some(single_md),
         "matrix_full_jsonl": full_jsonl,
-        "matrix_baseline_jsonl": baseline_jsonl,
-        "matrix_regression_summary_json": regression_gate_report.as_ref().map(|_| regression_summary_json.clone()),
-        "matrix_regression_thresholds": regression_gate_report.as_ref().map(|report| report.thresholds),
-        "matrix_regression_compared_cells": regression_gate_report.as_ref().map(|report| report.compared_cells),
-        "matrix_regression_missing_baseline_cells": regression_gate_report.as_ref().map(|report| report.missing_baseline_cells.clone()),
-        "matrix_regression_failing_cells": regression_gate_report.as_ref().map(|report| report.failing_cells.clone()),
+        // Historical regression is explicitly unavailable at v0.2.0 bootstrap —
+        // recorded as a status, never as a silently-absent field.
+        "matrix_regression_status": matrix_regression_status,
+        "matrix_regression_unavailable_reason":
+            "no canonical historical complete-matrix baseline exists in-tree or in the \
+             v0.1.17/v0.1.18/v0.1.19 tags; env-selected baselines are refused because the \
+             release receipt binds argv but not environment",
+        // This run's full JSONL is the immutable baseline for the next release.
+        "matrix_baseline_for_next_release_jsonl": full_jsonl,
+        "matrix_baseline_jsonl": serde_json::Value::Null,
+        "matrix_regression_summary_json": serde_json::Value::Null,
+        "matrix_regression_thresholds": matrix_thresholds,
         "overlay_honesty_gate_json": overlay_honesty_gate_report.as_ref().map(|_| overlay_honesty_gate_json.clone()),
         "overlay_honesty_gate_c1_scorecard_json": overlay_c1_scorecard_json,
         "overlay_honesty_gate_persistent_scorecard_json": overlay_persistent_scorecard_json,
+        // Fixed repo-relative locations, recorded so a manifest reader can
+        // confirm which scorecards the gate consumed without trusting the
+        // absolute paths of the machine that produced it.
+        "overlay_honesty_gate_c1_scorecard_relpath":
+            release_evidence_relpath(&source_revision, RELEASE_C1_SCORECARD_SUFFIX),
+        "overlay_honesty_gate_persistent_scorecard_relpath":
+            release_evidence_relpath(&source_revision, RELEASE_PERSISTENT_SCORECARD_SUFFIX),
         "overlay_honesty_gate_overall_verdict": overlay_honesty_gate_report.as_ref().map(|report| report.overall_verdict),
         "overlay_honesty_gate_blocking_findings": overlay_honesty_gate_report.as_ref().map(|report| report.blocking_findings.clone()),
         "generated_bundle_count": generated_bundles.len(),
