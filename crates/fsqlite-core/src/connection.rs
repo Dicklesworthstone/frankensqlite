@@ -146951,7 +146951,10 @@ mod tests {
             .await
             .expect("RAISE predicate with scalar subquery must evaluate, not error");
 
-            let journal_count = conn.query("SELECT COUNT(*) FROM mutation_journal;").await.unwrap();
+            let journal_count = conn
+                .query("SELECT COUNT(*) FROM mutation_journal;")
+                .await
+                .unwrap();
             assert_eq!(row_values(&journal_count[0])[0], SqliteValue::Integer(1));
             let guard_count = conn
                 .query("SELECT COUNT(*) FROM projection_journal_guards;")
