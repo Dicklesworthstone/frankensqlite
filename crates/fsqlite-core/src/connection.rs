@@ -15196,6 +15196,7 @@ impl Connection {
             changes,
             last_insert_rowid,
             rollback_visible_total_changes: 0,
+            force_statement_rollback: false,
         });
     }
 
@@ -15209,7 +15210,33 @@ impl Connection {
             changes,
             last_insert_rowid,
             rollback_visible_total_changes,
+            force_statement_rollback: true,
         });
+    }
+
+    fn retain_rollback_visible_total_changes(&self, changes: usize) {
+        if changes == 0 {
+            return;
+        }
+        let mut error_state = self.last_table_program_error_state.borrow_mut();
+        if let Some(state) = error_state.as_mut() {
+            state.rollback_visible_total_changes =
+                state.rollback_visible_total_changes.saturating_add(changes);
+        } else {
+            *error_state = Some(TableProgramErrorState {
+                changes: self.last_changes.get(),
+                last_insert_rowid: None,
+                rollback_visible_total_changes: changes,
+                force_statement_rollback: false,
+            });
+        }
+    }
+
+    fn constraint_error_state_can_preserve_rows(&self) -> bool {
+        self.last_table_program_error_state
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| !state.force_statement_rollback)
     }
 
     fn take_table_program_error_state(&self) -> Option<TableProgramErrorState> {
@@ -15222,18 +15249,24 @@ impl Connection {
         error: &FrankenError,
         previous_total_changes: usize,
         previous_last_insert_rowid: i64,
-    ) {
-        let mut error_state = self.take_table_program_error_state();
+    ) -> bool {
+        let error_state = self.take_table_program_error_state();
         if preserve_prior_changes_on_constraint_violation && error_is_constraint_violation(error) {
-            if let Some(state) = error_state.take() {
+            if let Some(state) = error_state
+                .as_ref()
+                .copied()
+                .filter(|state| !state.force_statement_rollback)
+            {
                 self.restore_change_tracking_state(
                     state.changes,
-                    previous_total_changes.saturating_add(state.changes),
+                    previous_total_changes
+                        .saturating_add(state.changes)
+                        .saturating_add(state.rollback_visible_total_changes),
                     state
                         .last_insert_rowid
                         .unwrap_or(previous_last_insert_rowid),
                 );
-                return;
+                return true;
             }
         }
         let rollback_visible_total_changes = error_state
@@ -15247,6 +15280,7 @@ impl Connection {
             previous_total_changes.saturating_add(rollback_visible_total_changes),
             failed_last_insert_rowid,
         );
+        false
     }
 
     fn record_last_insert_rowid(&self, rowid: i64) {
@@ -22341,15 +22375,13 @@ impl Connection {
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         self.txn_metrics_note_write();
         let use_statement_savepoint = !skip_statement_savepoint_in_explicit_txn
-            && self.should_use_statement_savepoint(
-                was_auto,
-                preserve_prior_changes_on_constraint_violation,
-            );
+            && self.should_use_statement_savepoint(was_auto);
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(
                 execution_cx,
                 statement_kind,
+                preserve_prior_changes_on_constraint_violation,
                 async || {
                     self.with_statement_fk_validation_scope(
                         preserve_prior_changes_on_constraint_violation,
@@ -22367,10 +22399,11 @@ impl Connection {
             .await
         };
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+        let mut preserved_constraint_failure_rows = false;
         let result = match result {
             Ok(affected) => Ok(affected),
             Err(error) => {
-                self.restore_failed_statement_tracking(
+                preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
                     preserve_prior_changes_on_constraint_violation,
                     &error,
                     previous_total_changes,
@@ -22389,12 +22422,7 @@ impl Connection {
                 }
             }
         };
-        let commit_autocommit_on_error = was_auto
-            && preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+        let commit_autocommit_on_error = was_auto && preserved_constraint_failure_rows;
         let execution_ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start =
             (direct_insert_autocommit_candidate && was_auto).then(Instant::now);
@@ -26842,7 +26870,7 @@ impl Connection {
         F: std::ops::AsyncFnOnce() -> Result<T>,
     {
         let cx = self.op_cx()?;
-        self.with_internal_statement_savepoint_and_cx(&cx, purpose, body)
+        self.with_internal_statement_savepoint_and_cx(&cx, purpose, false, body)
             .await
     }
 
@@ -26850,6 +26878,7 @@ impl Connection {
         &self,
         cx: &Cx,
         purpose: &str,
+        preserve_constraint_failure_rows: bool,
         body: F,
     ) -> Result<T>
     where
@@ -26968,10 +26997,15 @@ impl Connection {
                 Ok(value)
             }
             Err(statement_error) => {
-                // RAISE(FAIL): the statement fails but its already-applied rows
-                // are KEPT. Release the savepoint exactly as on success (instead
-                // of rolling back to it), then propagate the error.
-                if matches!(statement_error, FrankenError::RaiseFail(_)) {
+                // FAIL keeps already-applied rows. Release the savepoint exactly
+                // as on success unless final-image FK validation upgraded the
+                // failure to SQLite's statement-rollback FK semantics.
+                let preserve_constraint_failure = preserve_constraint_failure_rows
+                    && error_is_constraint_violation(&statement_error)
+                    && self.constraint_error_state_can_preserve_rows();
+                if matches!(statement_error, FrankenError::RaiseFail(_))
+                    || preserve_constraint_failure
+                {
                     let pager_release_result = {
                         let mut active_txn = self.active_txn.borrow_mut();
                         active_txn
@@ -26983,7 +27017,7 @@ impl Connection {
                             .rollback_after_savepoint_boundary_failure(
                                 cx,
                                 &format!(
-                                    "RAISE(FAIL) statement pager release failed after {purpose}"
+                                    "FAIL-preserving statement pager release failed after {purpose}"
                                 ),
                                 error,
                             )
@@ -26994,7 +27028,7 @@ impl Connection {
                             .rollback_after_savepoint_boundary_failure(
                                 cx,
                                 &format!(
-                                    "RAISE(FAIL) virtual-table release failed after {purpose}"
+                                    "FAIL-preserving virtual-table release failed after {purpose}"
                                 ),
                                 error,
                             )
@@ -27538,14 +27572,9 @@ impl Connection {
         true
     }
 
-    fn should_use_statement_savepoint(
-        &self,
-        was_auto: bool,
-        preserve_prior_changes_on_constraint_violation: bool,
-    ) -> bool {
+    fn should_use_statement_savepoint(&self, was_auto: bool) -> bool {
         self.active_txn_is_open_or_borrowed()
             && self.internal_statement_savepoint_depth.get() == 0
-            && !preserve_prior_changes_on_constraint_violation
             && (!was_auto || self.retained_autocommit_batch_active())
     }
 
@@ -27892,37 +27921,40 @@ impl Connection {
                     }
                 }
             }
-            let use_statement_savepoint = self.should_use_statement_savepoint(
-                was_auto,
-                statement_preserves_prior_changes_on_constraint(statement.as_ref()),
-            ) && matches!(
-                statement.as_ref(),
-                Statement::Insert(_)
-                    | Statement::Update(_)
-                    | Statement::Delete(_)
-                    | Statement::CreateVirtualTable(_)
-                    | Statement::Drop(_)
-                    | Statement::CreateIndex(_)
-                    | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
-                        action: AlterTableAction::DropColumn(_),
-                        ..
-                    })
-                    | Statement::Reindex(_)
-            );
+            let use_statement_savepoint = self.should_use_statement_savepoint(was_auto)
+                && matches!(
+                    statement.as_ref(),
+                    Statement::Insert(_)
+                        | Statement::Update(_)
+                        | Statement::Delete(_)
+                        | Statement::CreateVirtualTable(_)
+                        | Statement::Drop(_)
+                        | Statement::CreateIndex(_)
+                        | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
+                            action: AlterTableAction::DropColumn(_),
+                            ..
+                        })
+                        | Statement::Reindex(_)
+                );
             let rollback_on_constraint_violation =
                 statement_rolls_back_transaction_on_constraint(statement.as_ref());
             let execute_body_start = hot_path_profile_enabled().then(Instant::now);
             let result = if use_statement_savepoint {
-                self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, async || {
-                    self.execute_statement_dispatch_with_fk_scope(
-                        &op_cx,
-                        statement.as_ref(),
-                        params,
-                        precompiled,
-                        derived_storage_log_select.as_ref(),
-                    )
-                    .await
-                })
+                self.with_internal_statement_savepoint_and_cx(
+                    &op_cx,
+                    statement_kind,
+                    statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                    async || {
+                        self.execute_statement_dispatch_with_fk_scope(
+                            &op_cx,
+                            statement.as_ref(),
+                            params,
+                            precompiled,
+                            derived_storage_log_select.as_ref(),
+                        )
+                        .await
+                    },
+                )
                 .await
             } else {
                 self.execute_statement_dispatch_with_fk_scope(
@@ -27935,6 +27967,7 @@ impl Connection {
                 .await
             };
             record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+            let mut preserved_constraint_failure_rows = false;
             let result = match result {
                 Ok(rows) => Ok(rows),
                 Err(error) => {
@@ -27942,7 +27975,7 @@ impl Connection {
                         statement.as_ref(),
                         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
                     ) {
-                        self.restore_failed_statement_tracking(
+                        preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
                             statement_preserves_prior_changes_on_constraint(statement.as_ref()),
                             &error,
                             previous_total_changes,
@@ -27963,11 +27996,7 @@ impl Connection {
                 }
             };
             let commit_autocommit_on_error = was_auto
-                && ((statement_preserves_prior_changes_on_constraint(statement.as_ref())
-                && matches!(
-                    result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
-                ))
+                && (preserved_constraint_failure_rows
                 // RAISE(FAIL) keeps the statement's already-applied rows, so an
                 // autocommit statement must commit them rather than roll back.
                 || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
@@ -49470,6 +49499,10 @@ impl Connection {
 
         if !outermost {
             return result;
+        }
+
+        if result.is_err() {
+            self.retain_rollback_visible_total_changes(self.statement_fk_set_default_changes.get());
         }
 
         let validate_retained_rows = match result.as_ref() {
@@ -102230,6 +102263,7 @@ struct TableProgramErrorState {
     changes: usize,
     last_insert_rowid: Option<i64>,
     rollback_visible_total_changes: usize,
+    force_statement_rollback: bool,
 }
 
 #[derive(Debug)]

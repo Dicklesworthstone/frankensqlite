@@ -35526,6 +35526,14 @@ fn test_conformance_fk_set_default_requires_valid_parent_s76q_default() {
             "CREATE TABLE c_repair (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_repair(id) ON UPDATE SET DEFAULT)",
             "INSERT INTO p_repair VALUES (1), (2)",
             "INSERT INTO c_repair VALUES (1, 1)",
+            "CREATE TABLE p_update_fail (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_update_fail (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_update_fail(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_update_fail VALUES (1)",
+            "INSERT INTO c_update_fail VALUES (1, 1)",
+            "CREATE TABLE p_late_error (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c_late_error (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_late_error(id) ON UPDATE SET DEFAULT)",
+            "INSERT INTO p_late_error VALUES (0), (1), (2)",
+            "INSERT INTO c_late_error VALUES (1, 1), (2, 2)",
         ];
         apply_fsqlite_statements(&fconn, &setup).await;
         apply_rusqlite_statements(&rconn, &setup);
@@ -35572,6 +35580,64 @@ fn test_conformance_fk_set_default_requires_valid_parent_s76q_default() {
             &["SELECT changes(), total_changes(), last_insert_rowid()"],
         )
         .await;
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE OR FAIL p_update_fail SET id = 2 WHERE id = 1",
+            "set_default_update_or_fail_missing_parent",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_update_or_fail_failure_counters",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_update_fail ORDER BY id",
+                "SELECT id, parent_id FROM c_update_fail ORDER BY id",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        )
+        .await;
+        fconn.execute("BEGIN").await.unwrap();
+        rconn.execute_batch("BEGIN").unwrap();
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE OR FAIL p_update_fail SET id = 2 WHERE id = 1",
+            "set_default_update_or_fail_explicit_txn",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_update_or_fail_explicit_txn_counters",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_update_fail ORDER BY id",
+                "SELECT id, parent_id FROM c_update_fail ORDER BY id",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        )
+        .await;
+        fconn.execute("ROLLBACK").await.unwrap();
+        rconn.execute_batch("ROLLBACK").unwrap();
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            "UPDATE p_late_error SET id = 3 WHERE id IN (1, 2)",
+            "set_default_action_before_late_unique_error",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "set_default_late_error_failure_counters",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id FROM p_late_error ORDER BY id",
+                "SELECT id, parent_id FROM c_late_error ORDER BY id",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        )
+        .await;
 
         let repair_sql = "UPDATE p_repair SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 0 END";
         assert_eq!(fconn.execute(repair_sql).await.unwrap(), 2);
@@ -35590,6 +35656,10 @@ fn test_conformance_fk_set_default_requires_valid_parent_s76q_default() {
                 "SELECT id, parent_id FROM c_replace ORDER BY id",
                 "SELECT id FROM p_repair ORDER BY id",
                 "SELECT id, parent_id FROM c_repair ORDER BY id",
+                "SELECT id FROM p_update_fail ORDER BY id",
+                "SELECT id, parent_id FROM c_update_fail ORDER BY id",
+                "SELECT id FROM p_late_error ORDER BY id",
+                "SELECT id, parent_id FROM c_late_error ORDER BY id",
                 "PRAGMA foreign_key_check",
                 "SELECT changes(), total_changes(), last_insert_rowid()",
             ],
