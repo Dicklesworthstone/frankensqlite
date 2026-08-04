@@ -820,6 +820,57 @@ fn open_with_flags_read_only_opens_stock_database_without_touching_it() {
     }
 }
 
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn open_with_flags_read_only_rebinds_quiescent_stale_namespace_identity() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let source = dir.path().join("readonly_namespace_source.db");
+    let source_str = source.to_str().unwrap();
+    let source_connection = Connection::open(source_str).expect("create source database");
+    source_connection
+        .execute_batch(
+            "CREATE TABLE recovery_probe(value INTEGER NOT NULL);
+             INSERT INTO recovery_probe VALUES (17);",
+        )
+        .expect("seed source database");
+    source_connection
+        .close()
+        .expect("close source before copying its namespace state");
+
+    let source_namespace = std::fs::read(suffixed_path(&source, "-fsqlite-ns-use"))
+        .expect("snapshot source namespace identity");
+    let target = dir.path().join("readonly_namespace_target.db");
+    std::fs::copy(&source, &target).expect("copy database to a distinct file identity");
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        std::fs::copy(
+            suffixed_path(&source, suffix),
+            suffixed_path(&target, suffix),
+        )
+        .expect("copy stale namespace sidecar");
+    }
+    let target_bytes_before = std::fs::read(&target).expect("snapshot target database bytes");
+
+    let readonly = open_with_flags(target.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("quiescent stale namespace identity must be rebound");
+    let row = readonly
+        .query_row("SELECT value FROM recovery_probe")
+        .expect("query through rebound namespace");
+    assert_eq!(row.get(0), Some(&SqliteValue::Integer(17)));
+    drop(readonly);
+
+    assert_eq!(
+        std::fs::read(&target).expect("re-read target database"),
+        target_bytes_before,
+        "namespace rebind must not modify the read-only main database"
+    );
+    assert_ne!(
+        std::fs::read(suffixed_path(&target, "-fsqlite-ns-use"))
+            .expect("read rebound target namespace identity"),
+        source_namespace,
+        "the copied source identity must be replaced with the target identity"
+    );
+}
+
 #[test]
 fn open_with_flags_accepts_common_sqlite_ancillary_flags_like_rusqlite() {
     let dir = tempfile::TempDir::new().unwrap();

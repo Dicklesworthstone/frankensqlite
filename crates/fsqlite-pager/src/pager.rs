@@ -7723,7 +7723,7 @@ where
         let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
         let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
-        let pending_namespace = if vfs.is_memory() {
+        let mut pending_namespace = if vfs.is_memory() {
             None
         } else {
             let intent = if disposition == ReadWriteOpenDisposition::ReservedEmpty {
@@ -8304,6 +8304,42 @@ where
         #[cfg(not(all(feature = "native", any(unix, windows))))]
         let effective_expected_identity = expected_identity;
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let (mut db_file, _actual_flags) = {
+            let initial_open = if let Some(identity) = effective_expected_identity {
+                vfs.open_with_expected_identity(cx, &db_path, flags, identity)
+            } else {
+                vfs.open(cx, Some(&db_path), flags)
+            };
+            match initial_open {
+                Ok(opened) => opened,
+                Err(FrankenError::CannotOpen { .. })
+                    if expected_identity.is_none() && namespace_expected_identity.is_some() =>
+                {
+                    // Namespace identities are machine-local runtime state.
+                    // Across a reboot (or after a database copy), the durable
+                    // record can name a file identity that no longer matches
+                    // the current pathname even though no live connection
+                    // owns that generation. Release the read-only join and
+                    // retry through Shared admission. A quiescent namespace
+                    // is then rebound during `bind`; a live namespace still
+                    // supplies an exact identity and remains fail-closed.
+                    drop(pending_namespace.take());
+                    let replacement_pending =
+                        PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::Shared)?;
+                    let replacement_expected = replacement_pending.expected_identity();
+                    let opened = if let Some(identity) = replacement_expected {
+                        vfs.open_with_expected_identity(cx, &db_path, flags, identity)?
+                    } else {
+                        vfs.open(cx, Some(&db_path), flags)?
+                    };
+                    pending_namespace = Some(replacement_pending);
+                    opened
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
         let (mut db_file, _actual_flags) =
             if let Some(expected_identity) = effective_expected_identity {
                 vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
