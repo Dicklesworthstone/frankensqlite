@@ -35667,3 +35667,67 @@ fn test_conformance_fk_set_default_requires_valid_parent_s76q_default() {
         .await;
     });
 }
+
+/// GH #145 (FSQL-BUG-004): an UPSERT conflict target that carries a
+/// partial-index predicate resolves to the matching partial UNIQUE index. The
+/// probe must be skipped when the attempted row is outside that predicate, and
+/// a genuinely mismatched target must fail instead of falling back to rowid.
+#[test]
+fn test_conformance_upsert_partial_unique_index_conflict_target_gh145() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, active INTEGER)",
+            "CREATE UNIQUE INDEX uq ON t(email) WHERE active = 1",
+            "INSERT INTO t VALUES (1, 'a@example.com', 1)",
+            "INSERT INTO t VALUES (2, 'a@example.com', 0)",
+        ];
+        apply_fsqlite_statements(&fconn, &setup).await;
+        apply_rusqlite_statements(&rconn, &setup);
+
+        let matching_upsert = "INSERT INTO t VALUES (3, 'a@example.com', 1) \
+                               ON CONFLICT(email) WHERE active = 1 \
+                               DO UPDATE SET id = excluded.id";
+        assert!(fconn.execute(matching_upsert).await.is_ok());
+        assert!(rconn.execute_batch(matching_upsert).is_ok());
+        assert_logged_atomic_oracle_snapshot(
+            "gh145_matching_partial_unique_target",
+            &fconn,
+            &rconn,
+            &["SELECT id, email, active FROM t ORDER BY id"],
+        )
+        .await;
+
+        let outside_predicate = "INSERT INTO t VALUES (4, 'a@example.com', 0) \
+                                 ON CONFLICT(email) WHERE active = 1 \
+                                 DO UPDATE SET id = excluded.id";
+        assert!(fconn.execute(outside_predicate).await.is_ok());
+        assert!(rconn.execute_batch(outside_predicate).is_ok());
+        assert_logged_atomic_oracle_snapshot(
+            "gh145_partial_probe_skips_inactive_row",
+            &fconn,
+            &rconn,
+            &["SELECT id, email, active FROM t ORDER BY id"],
+        )
+        .await;
+
+        let mismatched_target = "INSERT INTO t VALUES (5, 'a@example.com', 1) \
+                                 ON CONFLICT(email) WHERE active = 0 \
+                                 DO UPDATE SET id = excluded.id";
+        assert_both_execute_error(
+            &fconn,
+            &rconn,
+            mismatched_target,
+            "gh145_mismatched_partial_unique_target",
+        )
+        .await;
+        assert_logged_atomic_oracle_snapshot(
+            "gh145_mismatched_target_is_atomic",
+            &fconn,
+            &rconn,
+            &["SELECT id, email, active FROM t ORDER BY id"],
+        )
+        .await;
+    });
+}
