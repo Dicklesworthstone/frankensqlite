@@ -76,7 +76,8 @@ fn selected_profile_from_out_dir() -> String {
         .and_then(|out_dir| {
             out_dir
                 .ancestors()
-                .nth(3)
+                .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "build"))
+                .and_then(Path::parent)
                 .and_then(Path::file_name)
                 .map(|profile| profile.to_string_lossy().into_owned())
         })
