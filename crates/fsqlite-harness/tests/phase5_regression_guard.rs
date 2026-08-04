@@ -101,6 +101,12 @@ const AUDITED_COVERED_PARENT_CONTRACT: &[(&str, &[&str])] = &[
             "crates/fsqlite-e2e/tests/recovery_data_loss.rs::two_process_sigkill_recovery_loses_no_committed_writes",
         ],
     ),
+    (
+        "crates/fsqlite-pager/src/pager.rs::tests::test_16t_throughput_exceeds_sqlite",
+        &[
+            "crates/fsqlite-e2e/tests/bd_wsw3p_concurrent_write_showcase.rs::t16_fsqlite_outperforms_csqlite_at_16_threads",
+        ],
+    ),
 ];
 const UNINSPECTED_RUST_SOURCE_PATHS: &[&str] = &["crates/fsqlite-core/src/connection.rs"];
 /// Library sources reached through a `#[path = "..."]` module declaration.
@@ -1465,7 +1471,16 @@ impl IgnoreKind {
 
     const fn allows_policy(self, policy: IgnorePolicy) -> bool {
         match self {
-            Self::KnownBug | Self::Placeholder => matches!(policy, IgnorePolicy::BlockRelease),
+            Self::KnownBug => matches!(policy, IgnorePolicy::BlockRelease),
+            // A placeholder sentinel either blocks on its own, or defers to a
+            // real parent gate that must itself supply run-for-release
+            // evidence. The audited parent contract keeps the placeholder
+            // closed until current-run execution evidence proves that exact
+            // parent passed.
+            Self::Placeholder => matches!(
+                policy,
+                IgnorePolicy::BlockRelease | IgnorePolicy::CoveredByParent
+            ),
             Self::Performance => {
                 matches!(policy, IgnorePolicy::RunForRelease | IgnorePolicy::Exempt)
             }
@@ -8209,7 +8224,10 @@ fn test_regression_guard_ignore_taxonomy_kind_policy_matrix_is_closed() {
     ];
     let cases: &[(IgnoreKind, &[IgnorePolicy])] = &[
         (IgnoreKind::KnownBug, &[IgnorePolicy::BlockRelease]),
-        (IgnoreKind::Placeholder, &[IgnorePolicy::BlockRelease]),
+        (
+            IgnoreKind::Placeholder,
+            &[IgnorePolicy::BlockRelease, IgnorePolicy::CoveredByParent],
+        ),
         (
             IgnoreKind::Performance,
             &[IgnorePolicy::RunForRelease, IgnorePolicy::Exempt],

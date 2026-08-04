@@ -19,8 +19,11 @@
 #![allow(clippy::future_not_send, clippy::large_futures)]
 #![recursion_limit = "512"]
 
+use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -28,12 +31,32 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite::SqliteValue;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const ROWS_PER_THREAD: i64 = 200;
 const MAX_TXN_RETRIES: u32 = 100;
 const RETRY_BACKOFF: Duration = Duration::from_micros(100);
 const T4_SAMPLE_COUNT: usize = 11;
 const T4_REPLAY_CMD: &str = "cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --exact --ignored --nocapture --test-threads=1";
+
+/// Writer count for the 16-thread cross-engine release gate.
+const T16_THREADS: usize = 16;
+/// Even, fixed paired-sample count so each engine runs first exactly half of
+/// the time. The distribution-free lower bound below remains an order
+/// statistic; the descriptive median is the mean of the two central ratios.
+const T16_SAMPLE_COUNT: usize = 22;
+/// One-sided error budget for the distribution-free median bound, as an exact
+/// rational so the order statistic is derived by integer arithmetic only.
+const T16_ALPHA_NUM: u128 = 5;
+const T16_ALPHA_DEN: u128 = 100;
+const T16_CONFIDENCE_PERCENT: u8 = 95;
+/// Declared acceptance threshold: the lower confidence bound on the paired
+/// FrankenSQLite-to-C-SQLite throughput ratio must exceed this value.
+const T16_MIN_RATIO_LOWER_BOUND: f64 = 1.0;
+/// The only build profile whose numbers may satisfy the run-for-release
+/// contract. A debug or plain release build must fail closed.
+const T16_REQUIRED_SELECTED_PROFILE: &str = "release-perf";
+const T16_REPLAY_CMD: &str = "cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t16_fsqlite_outperforms_csqlite_at_16_threads -- --exact --ignored --nocapture --test-threads=1";
 
 fn artifact_dir() -> PathBuf {
     let run_id = SystemTime::now()
@@ -461,7 +484,12 @@ fn write_report(dir: &Path, report: &ShowcaseReport) {
 fn median(values: &mut [f64]) -> f64 {
     assert!(!values.is_empty(), "median requires at least one sample");
     values.sort_by(f64::total_cmp);
-    values[values.len() / 2]
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        f64::midpoint(values[middle - 1], values[middle])
+    } else {
+        values[middle]
+    }
 }
 
 #[derive(Debug)]
@@ -471,6 +499,159 @@ struct PairedThroughputSample {
     csqlite_ops_per_sec: f64,
     fsqlite_ops_per_sec: f64,
     ratio: f64,
+}
+
+/// One counterbalanced 16-thread pair, carrying the per-sample correctness
+/// evidence alongside the throughput measurement. A sample is only admissible
+/// when both engines committed exactly the expected row count.
+#[derive(Debug)]
+struct PairedCorrectnessSample {
+    sample: usize,
+    order: &'static str,
+    csqlite_ops_per_sec: f64,
+    fsqlite_ops_per_sec: f64,
+    ratio: f64,
+    csqlite_total_rows: i64,
+    fsqlite_total_rows: i64,
+    expected_total_rows: i64,
+}
+
+impl PairedCorrectnessSample {
+    const fn rows_agree(&self) -> bool {
+        self.csqlite_total_rows == self.expected_total_rows
+            && self.fsqlite_total_rows == self.expected_total_rows
+    }
+}
+
+/// One-based order statistic of the ascending paired ratios that is a
+/// distribution-free lower confidence bound for the true median at confidence
+/// `1 - alpha`.
+///
+/// This is the sign-test bound: the `k`-th smallest of `n` exchangeable
+/// samples bounds the median from below with confidence
+/// `1 - P(Binomial(n, 1/2) <= k - 1)`. The cumulative mass is accumulated as
+/// exact integers scaled by `2^n`, so the returned index is deterministic and
+/// free of floating-point drift. Returns `None` when no order statistic
+/// achieves the requested confidence at this sample count.
+fn median_lower_bound_order_statistic(n: usize, alpha_num: u128, alpha_den: u128) -> Option<usize> {
+    assert!(n > 0 && n < 100, "sample count out of supported range");
+    assert!(
+        alpha_den > 0 && alpha_num < alpha_den,
+        "alpha must be a proper fraction in [0, 1)"
+    );
+    let total: u128 = 1u128 << n;
+    let mut cumulative: u128 = 0;
+    let mut coefficient: u128 = 1;
+    let mut best: Option<usize> = None;
+    for i in 0..=n {
+        cumulative += coefficient;
+        if cumulative * alpha_den <= alpha_num * total {
+            best = Some(i + 1);
+        } else {
+            break;
+        }
+        let n_u128 = u128::try_from(n).expect("supported sample count fits u128");
+        let i_u128 = u128::try_from(i).expect("sample index fits u128");
+        coefficient = coefficient * (n_u128 - i_u128) / (i_u128 + 1);
+    }
+    best
+}
+
+/// Absolute path and streaming SHA-256 digest of the test binary executing now.
+///
+/// The digest is computed in-process from the workspace `sha2` dependency so
+/// identity is portable across platforms and needs no external tool. Fails
+/// closed: a gate that cannot name the exact binary it measured is not
+/// admissible evidence, so an unresolvable path or any read error panics
+/// rather than degrading to an unidentified run.
+fn running_binary_identity() -> (PathBuf, String) {
+    let exe = std::env::current_exe().expect("running test binary path must be resolvable");
+    let mut file = fs::File::open(&exe).unwrap_or_else(|error| {
+        panic!(
+            "running test binary {} must be readable for identity: {error}",
+            exe.display()
+        )
+    });
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).unwrap_or_else(|error| {
+            panic!(
+                "running test binary {} must stream cleanly for identity: {error}",
+                exe.display()
+            )
+        });
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let mut digest = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    assert_eq!(
+        digest.len(),
+        64,
+        "running-binary SHA-256 must be 64 hexadecimal digits, found `{digest}`"
+    );
+    (exe, digest)
+}
+
+/// Machine identity of the host actually executing the measurement.
+///
+/// The Rust `HOST`/`TARGET` triples describe the build, not the machine, so a
+/// bundle carrying only those cannot distinguish two runs on different hosts.
+/// Prefer the process environment, then the standard Unix hostname file, then
+/// the platform `hostname` command. Fails closed when none provides a non-empty
+/// value, because an unattributable measurement is not admissible evidence.
+fn runtime_machine_identity() -> String {
+    for name in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+    }
+    if let Ok(value) = fs::read_to_string("/etc/hostname") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    if let Ok(output) = Command::new("hostname").output()
+        && output.status.success()
+        && let Ok(value) = String::from_utf8(output.stdout)
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    panic!(
+        "16-thread evidence requires runtime machine identity: HOSTNAME, \
+         COMPUTERNAME, /etc/hostname, and the hostname command were unavailable \
+         or empty"
+    );
+}
+
+/// Assert that a build-provenance value is present and resolved.
+fn require_resolved_provenance(name: &str, value: &str) {
+    assert!(
+        !value.is_empty() && value != "unknown",
+        "16-thread evidence requires resolved build provenance: {name}=`{value}`"
+    );
+}
+
+/// Assert that a hex-encoded provenance value is well formed. An empty value is
+/// admissible and meaningful: it records that the corresponding environment was
+/// genuinely unset at build time.
+fn require_hex_provenance(name: &str, value: &str) {
+    assert!(
+        value.len() % 2 == 0 && value.chars().all(|c| c.is_ascii_hexdigit()),
+        "build provenance {name} must be even-length hexadecimal, found `{value}`"
+    );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -537,9 +718,12 @@ fn t3_structured_json_has_required_fields() {
 }
 
 #[test]
-fn median_uses_the_middle_order_statistic() {
-    let mut values = [9.0, 1.0, 7.0, 3.0, 5.0];
-    assert_eq!(median(&mut values), 5.0);
+fn median_handles_odd_and_even_sample_counts() {
+    let mut odd = [9.0, 1.0, 7.0, 3.0, 5.0];
+    assert_eq!(median(&mut odd), 5.0);
+
+    let mut even = [9.0, 1.0, 7.0, 3.0];
+    assert_eq!(median(&mut even), 5.0);
 }
 
 #[test]
@@ -607,6 +791,239 @@ fn t4_fsqlite_outperforms_csqlite_at_4_threads() {
             ratio_median > 1.0,
             "median FrankenSQLite 4-thread throughput must exceed C SQLite: \
              F/C={ratio_median:.2}x, wins={winning_samples}/{T4_SAMPLE_COUNT}, samples={samples:?}"
+        );
+    });
+}
+
+#[test]
+fn t16_order_statistic_bound_is_the_sign_test_index() {
+    // 22 samples, alpha = 5/100: cumulative Binomial(22, 1/2) mass through
+    // i = 6 is 110056/4194304 < 0.05, and through i = 7 is 280600/4194304 > 0.05,
+    // so the 7th smallest ratio is the lower bound.
+    assert_eq!(
+        median_lower_bound_order_statistic(22, 5, 100),
+        Some(7),
+        "sign-test order statistic must be derived, not assumed"
+    );
+    assert_eq!(median_lower_bound_order_statistic(1, 5, 100), None);
+}
+
+#[test]
+#[ignore = "production 16-thread cross-engine performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t16_fsqlite_outperforms_csqlite_at_16_threads -- --exact --ignored --nocapture --test-threads=1"]
+fn t16_fsqlite_outperforms_csqlite_at_16_threads() {
+    // Identity first: a gate that cannot name the exact source and binary it
+    // measured is not admissible evidence, so resolve provenance before any
+    // measurement and fail closed when it is incomplete.
+    let source_sha = env!("FSQLITE_BENCH_BUILD_GIT_SHA");
+    let source_branch = env!("FSQLITE_BENCH_BUILD_GIT_BRANCH");
+    let source_dirty = env!("FSQLITE_BENCH_BUILD_GIT_DIRTY");
+    let build_features = env!("FSQLITE_BENCH_BUILD_FEATURES");
+    let build_host = env!("FSQLITE_BENCH_BUILD_HOST");
+    let build_target = env!("FSQLITE_BENCH_BUILD_TARGET");
+    let build_profile = env!("FSQLITE_BENCH_BUILD_PROFILE");
+    let build_selected_profile = env!("FSQLITE_BENCH_BUILD_SELECTED_PROFILE");
+    let rustc_version = env!("FSQLITE_BENCH_BUILD_RUSTC_VERSION");
+    let cargo_version = env!("FSQLITE_BENCH_BUILD_CARGO_VERSION");
+    let rustflags_hex = env!("FSQLITE_BENCH_BUILD_RUSTFLAGS_HEX");
+    let encoded_rustflags_present = env!("FSQLITE_BENCH_BUILD_ENCODED_RUSTFLAGS_PRESENT");
+    let profile_overrides_hex = env!("FSQLITE_BENCH_BUILD_PROFILE_OVERRIDES_HEX");
+    let native_overrides_hex = env!("FSQLITE_BENCH_BUILD_NATIVE_OVERRIDES_HEX");
+    let feature_graph_sha256 = env!("FSQLITE_BENCH_BUILD_RESOLVED_DEPENDENCY_FEATURE_GRAPH_SHA256");
+    let input_tracking = env!("FSQLITE_BENCH_BUILD_INPUT_TRACKING");
+
+    assert_eq!(
+        source_sha.len(),
+        40,
+        "current-source identity requires a full 40-digit commit, found `{source_sha}`"
+    );
+    assert!(
+        source_sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "current-source identity must be hexadecimal, found `{source_sha}`"
+    );
+    assert_eq!(
+        source_dirty, "false",
+        "16-thread evidence requires a clean worktree at build time \
+         (FSQLITE_BENCH_BUILD_GIT_DIRTY=`{source_dirty}`)"
+    );
+    require_resolved_provenance("FSQLITE_BENCH_BUILD_HOST", build_host);
+    require_resolved_provenance("FSQLITE_BENCH_BUILD_TARGET", build_target);
+    require_resolved_provenance("FSQLITE_BENCH_BUILD_PROFILE", build_profile);
+    // The run_for_release contract is a release-perf contract. A debug or
+    // plain release build must not be able to satisfy it, so pin the selected
+    // profile exactly rather than merely requiring it to be resolved.
+    assert_eq!(
+        build_selected_profile, T16_REQUIRED_SELECTED_PROFILE,
+        "16-thread evidence must come from a `{T16_REQUIRED_SELECTED_PROFILE}` build \
+         (FSQLITE_BENCH_BUILD_SELECTED_PROFILE=`{build_selected_profile}`)"
+    );
+    require_resolved_provenance("FSQLITE_BENCH_BUILD_RUSTC_VERSION", rustc_version);
+    require_resolved_provenance("FSQLITE_BENCH_BUILD_CARGO_VERSION", cargo_version);
+    require_hex_provenance("FSQLITE_BENCH_BUILD_RUSTFLAGS_HEX", rustflags_hex);
+    require_hex_provenance(
+        "FSQLITE_BENCH_BUILD_PROFILE_OVERRIDES_HEX",
+        profile_overrides_hex,
+    );
+    require_hex_provenance(
+        "FSQLITE_BENCH_BUILD_NATIVE_OVERRIDES_HEX",
+        native_overrides_hex,
+    );
+    assert!(
+        matches!(encoded_rustflags_present, "true" | "false"),
+        "FSQLITE_BENCH_BUILD_ENCODED_RUSTFLAGS_PRESENT must be a boolean flag, \
+         found `{encoded_rustflags_present}`"
+    );
+    assert!(
+        feature_graph_sha256.len() == 64
+            && feature_graph_sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "resolved dependency feature-graph digest must be 64 lowercase \
+         hexadecimal digits, found `{feature_graph_sha256}`"
+    );
+    assert_eq!(
+        input_tracking, "complete",
+        "16-thread evidence requires complete tracked-source rerun directives \
+         (FSQLITE_BENCH_BUILD_INPUT_TRACKING=`{input_tracking}`)"
+    );
+    let (binary_path, binary_sha256) = running_binary_identity();
+    let runtime_machine = runtime_machine_identity();
+
+    let bound_index =
+        median_lower_bound_order_statistic(T16_SAMPLE_COUNT, T16_ALPHA_NUM, T16_ALPHA_DEN)
+            .expect("sample count must admit a distribution-free median bound");
+
+    asupersync::test_utils::run_test(|| async move {
+        let expected_total_rows =
+            i64::try_from(T16_THREADS).expect("thread count fits i64") * ROWS_PER_THREAD;
+
+        // Warm both engines before collecting paired measurements.
+        drop(run_fsqlite_concurrent(T16_THREADS, TransactionShape::PerWorker).await);
+        drop(run_csqlite_concurrent(
+            T16_THREADS,
+            TransactionShape::PerWorker,
+        ));
+
+        let mut samples = Vec::with_capacity(T16_SAMPLE_COUNT);
+        let mut ratios = Vec::with_capacity(T16_SAMPLE_COUNT);
+
+        for sample in 0..T16_SAMPLE_COUNT {
+            // Alternate order within each pair so load and filesystem drift
+            // cannot systematically benefit the engine that always runs second.
+            let (csqlite, fsqlite, order) = if sample % 2 == 0 {
+                let fsqlite =
+                    run_fsqlite_concurrent(T16_THREADS, TransactionShape::PerWorker).await;
+                let csqlite = run_csqlite_concurrent(T16_THREADS, TransactionShape::PerWorker);
+                (csqlite, fsqlite, "fsqlite_first")
+            } else {
+                let csqlite = run_csqlite_concurrent(T16_THREADS, TransactionShape::PerWorker);
+                let fsqlite =
+                    run_fsqlite_concurrent(T16_THREADS, TransactionShape::PerWorker).await;
+                (csqlite, fsqlite, "csqlite_first")
+            };
+            assert!(
+                csqlite.throughput_ops_per_sec.is_finite() && csqlite.throughput_ops_per_sec > 0.0,
+                "sample {sample} produced inadmissible C SQLite throughput: {}",
+                csqlite.throughput_ops_per_sec
+            );
+            assert!(
+                fsqlite.throughput_ops_per_sec.is_finite() && fsqlite.throughput_ops_per_sec > 0.0,
+                "sample {sample} produced inadmissible FrankenSQLite throughput: {}",
+                fsqlite.throughput_ops_per_sec
+            );
+            let ratio = fsqlite.throughput_ops_per_sec / csqlite.throughput_ops_per_sec;
+            assert!(
+                ratio.is_finite() && ratio > 0.0,
+                "sample {sample} produced inadmissible F/C throughput ratio: {ratio}"
+            );
+            ratios.push(ratio);
+            samples.push(PairedCorrectnessSample {
+                sample,
+                order,
+                csqlite_ops_per_sec: csqlite.throughput_ops_per_sec,
+                fsqlite_ops_per_sec: fsqlite.throughput_ops_per_sec,
+                ratio,
+                csqlite_total_rows: csqlite.total_rows,
+                fsqlite_total_rows: fsqlite.total_rows,
+                expected_total_rows,
+            });
+        }
+
+        // Correctness gates the measurement: a throughput number taken from a
+        // diverged database is not evidence, so every sample must agree with
+        // the expected committed row count on both engines.
+        for sample in &samples {
+            assert!(
+                sample.rows_agree(),
+                "sample {} ({}) failed the per-sample correctness oracle: \
+                 csqlite_rows={}, fsqlite_rows={}, expected={}",
+                sample.sample,
+                sample.order,
+                sample.csqlite_total_rows,
+                sample.fsqlite_total_rows,
+                sample.expected_total_rows
+            );
+        }
+
+        let mut sorted_ratios = ratios.clone();
+        sorted_ratios.sort_by(f64::total_cmp);
+        let ratio_lower_bound = sorted_ratios[bound_index - 1];
+        let ratio_median = median(&mut ratios);
+        let winning_samples = samples.iter().filter(|sample| sample.ratio > 1.0).count();
+        eprintln!("canonical replay: {T16_REPLAY_CMD}");
+        eprintln!(
+            "provenance/source: sha={source_sha} branch={source_branch} \
+             dirty={source_dirty} features={build_features} \
+             input_tracking={input_tracking}"
+        );
+        eprintln!(
+            "provenance/toolchain: host={build_host} target={build_target} \
+             profile={build_profile} selected_profile={build_selected_profile} \
+             rustc={rustc_version:?} cargo={cargo_version:?}"
+        );
+        eprintln!(
+            "provenance/flags: rustflags_hex={rustflags_hex} \
+             encoded_rustflags_present={encoded_rustflags_present} \
+             profile_overrides_hex={profile_overrides_hex} \
+             native_overrides_hex={native_overrides_hex} \
+             feature_graph_sha256={feature_graph_sha256}"
+        );
+        eprintln!(
+            "provenance/binary: path={} sha256={binary_sha256}",
+            binary_path.display()
+        );
+        // Build triples describe the compiler's view; this names the machine
+        // that produced these numbers. RCH transcript worker identity stays
+        // separate outer evidence and is not asserted here.
+        eprintln!("provenance/runtime: machine={runtime_machine}");
+        eprintln!(
+            "16-thread per-worker-transaction: median F/C={ratio_median:.4}x, \
+             lower bound (order statistic {bound_index} of {T16_SAMPLE_COUNT}, \
+             >={T16_CONFIDENCE_PERCENT}% confidence)={ratio_lower_bound:.4}x, \
+             threshold={T16_MIN_RATIO_LOWER_BOUND:.4}x, \
+             wins={winning_samples}/{T16_SAMPLE_COUNT}, \
+             expected_rows_per_sample={expected_total_rows}"
+        );
+        for sample in &samples {
+            eprintln!(
+                "sample {} ({}): csqlite={:.0} ops/s, fsqlite={:.0} ops/s, \
+                 F/C={:.4}x, rows={}/{}",
+                sample.sample,
+                sample.order,
+                sample.csqlite_ops_per_sec,
+                sample.fsqlite_ops_per_sec,
+                sample.ratio,
+                sample.csqlite_total_rows,
+                sample.fsqlite_total_rows
+            );
+        }
+
+        assert!(
+            ratio_lower_bound > T16_MIN_RATIO_LOWER_BOUND,
+            "the {T16_CONFIDENCE_PERCENT}% distribution-free lower bound on the paired \
+             16-thread FrankenSQLite-to-C-SQLite throughput ratio must exceed \
+             {T16_MIN_RATIO_LOWER_BOUND:.4}x: bound={ratio_lower_bound:.4}x, \
+             median={ratio_median:.4}x, wins={winning_samples}/{T16_SAMPLE_COUNT}, \
+             samples={samples:?}"
         );
     });
 }

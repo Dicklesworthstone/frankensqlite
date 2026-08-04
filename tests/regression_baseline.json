@@ -678,6 +678,18 @@
     },
     {
       "source_path": "crates/fsqlite-e2e/tests/bd_wsw3p_concurrent_write_showcase.rs",
+      "test_name": "t16_fsqlite_outperforms_csqlite_at_16_threads",
+      "reason": "production 16-thread cross-engine performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t16_fsqlite_outperforms_csqlite_at_16_threads -- --exact --ignored --nocapture --test-threads=1",
+      "cfg_condition": null,
+      "kind": "performance",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact release-perf run exits 0 after 22 order-counterbalanced paired sixteen-writer samples, each admitted only when both engines commit the expected row count and both throughputs and their ratio are finite and positive; the 95% distribution-free sign-test lower bound on the paired FrankenSQLite-to-C-SQLite throughput ratio must exceed the declared 1.0 threshold. The run fails closed unless it records a 40-digit clean-worktree source commit, the running test-binary path and SHA-256, a resolved dependency feature-graph SHA-256, and retains every sample with full toolchain, host, and RUSTFLAGS provenance.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/bd_wsw3p_concurrent_write_showcase.rs",
       "test_name": "t4_fsqlite_outperforms_csqlite_at_4_threads",
       "reason": "production performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --exact --ignored --nocapture --test-threads=1",
       "cfg_condition": null,
@@ -1390,9 +1402,15 @@
       "reason": "release blocker: current-source 16-thread cross-engine evidence must come from the e2e benchmark gate",
       "cfg_condition": "test",
       "kind": "placeholder",
-      "policy": "block_release",
+      "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/bd_wsw3p_concurrent_write_showcase.rs",
+          "test_name": "t16_fsqlite_outperforms_csqlite_at_16_threads"
+        }
+      ],
       "evidence": {
-        "requirement": "This exact sentinel must fail closed until a reproducible 16-thread file-backed FrankenSQLite-versus-C-SQLite e2e benchmark supplies current-source and running-binary identity, correctness oracles, counterbalanced repetitions, a declared confidence-bound acceptance gate, and an independently verified immutable artifact.",
+        "requirement": "This exact sentinel must fail closed until a reproducible 16-thread file-backed FrankenSQLite-versus-C-SQLite e2e benchmark supplies current-source and running-binary identity, correctness oracles, counterbalanced repetitions, a declared confidence-bound acceptance gate, and an independently verified immutable artifact. The designated parent carries that contract under run_for_release, so this sentinel stays blocked until current-run execution evidence proves the parent passed.",
         "receipt": null
       }
     },

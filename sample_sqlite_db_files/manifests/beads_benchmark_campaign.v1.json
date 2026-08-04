@@ -517,6 +517,87 @@
       "retry_policy_id": "instrumented_busy_retry_v1",
       "build_profile_id": "release_perf",
       "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "commutative_inserts_disjoint_keys_c16",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "commutative_inserts_disjoint_keys",
+      "concurrency": 16,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "hot_page_contention_c16",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "hot_page_contention",
+      "concurrency": 16,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "mixed_read_write_c16",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "mixed_read_write",
+      "concurrency": 16,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
     }
   ],
   "artifact_contract": {

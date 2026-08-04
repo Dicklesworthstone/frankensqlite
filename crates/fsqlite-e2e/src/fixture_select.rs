@@ -3355,7 +3355,7 @@ mod tests {
         }
 
         assert_eq!(campaign.campaign_id, "bd-db300.1.2");
-        assert_eq!(campaign.matrix_rows.len(), 9);
+        assert_eq!(campaign.matrix_rows.len(), 12);
 
         let mut fixture_ids: Vec<_> = campaign
             .fixtures
@@ -3369,7 +3369,65 @@ mod tests {
         );
 
         let cells = expand_beads_benchmark_campaign(&campaign);
-        assert_eq!(cells.len(), 216);
+        assert_eq!(cells.len(), 297);
+
+        // The 16-way cross-engine slice must be present and fully expanded:
+        // three workloads, each crossing three fixtures, three modes, and
+        // three placement variants.
+        let mut c16_row_ids: Vec<_> = campaign
+            .matrix_rows
+            .iter()
+            .filter(|row| row.concurrency == 16)
+            .map(|row| row.row_id.as_str())
+            .collect();
+        c16_row_ids.sort_unstable();
+        assert_eq!(
+            c16_row_ids,
+            vec![
+                "commutative_inserts_disjoint_keys_c16",
+                "hot_page_contention_c16",
+                "mixed_read_write_c16",
+            ]
+        );
+        for row_id in &c16_row_ids {
+            let row_cells: Vec<_> = cells.iter().filter(|cell| cell.row_id == *row_id).collect();
+            assert_eq!(
+                row_cells.len(),
+                27,
+                "{row_id} must expand to 3 fixtures x 3 modes x 3 placements"
+            );
+            let mut fixtures: Vec<_> = row_cells
+                .iter()
+                .map(|cell| cell.fixture_id.as_str())
+                .collect();
+            fixtures.sort_unstable();
+            fixtures.dedup();
+            assert_eq!(
+                fixtures,
+                vec!["frankensearch", "frankensqlite", "frankentui"]
+            );
+            let mut modes: Vec<_> = row_cells.iter().map(|cell| cell.mode.as_str()).collect();
+            modes.sort_unstable();
+            modes.dedup();
+            assert_eq!(
+                modes,
+                vec!["fsqlite_mvcc", "fsqlite_single_writer", "sqlite_reference"]
+            );
+            let mut placements: Vec<_> = row_cells
+                .iter()
+                .map(|cell| cell.placement_profile_id.as_str())
+                .collect();
+            placements.sort_unstable();
+            placements.dedup();
+            assert_eq!(
+                placements,
+                vec![
+                    "adversarial_cross_node",
+                    "baseline_unpinned",
+                    "recommended_pinned"
+                ]
+            );
+        }
     }
 
     #[test]
