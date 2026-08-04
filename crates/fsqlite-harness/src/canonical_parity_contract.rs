@@ -196,7 +196,7 @@ pub struct SqliteVersionContractDocument {
     pub references: SqliteVersionContractReferences,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SupportState {
     Supported,
@@ -233,7 +233,7 @@ pub struct SupportedSurfaceMatrix {
     pub surface: Vec<SurfaceEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleState {
     Declared,
@@ -271,6 +271,56 @@ pub struct FeatureUniverseLedger {
     pub features: Vec<LedgerFeature>,
 }
 
+/// Canonical status vocabulary from `docs/contracts/parity_taxonomy.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParityTaxonomyStatus {
+    Pass,
+    Fail,
+    Partial,
+    Excluded,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParityTaxonomyMeta {
+    pub version: String,
+    pub sqlite_target: String,
+    pub generated_by: String,
+    pub generated_at: String,
+    pub total_weight: u64,
+    pub bead_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParityTaxonomyFeature {
+    pub id: String,
+    pub family: String,
+    pub title: String,
+    pub weight: u64,
+    pub status: ParityTaxonomyStatus,
+    pub observability: Vec<String>,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParityTaxonomyExclusion {
+    pub id: String,
+    pub title: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParityTaxonomyDocument {
+    pub meta: ParityTaxonomyMeta,
+    pub features: Vec<ParityTaxonomyFeature>,
+    #[serde(default)]
+    pub exclusions: Vec<ParityTaxonomyExclusion>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParityScoreFormula {
     pub source_taxonomy: String,
@@ -297,6 +347,7 @@ pub struct CanonicalParityContractBundle {
     pub version_contract: SqliteVersionContractDocument,
     pub surface_matrix: SupportedSurfaceMatrix,
     pub feature_ledger: FeatureUniverseLedger,
+    pub parity_taxonomy: ParityTaxonomyDocument,
     pub parity_score_contract: ParityScoreContractDocument,
 }
 
@@ -306,6 +357,7 @@ impl CanonicalParityContractBundle {
             version_contract: load_toml(workspace_root, SQLITE_VERSION_CONTRACT_PATH)?,
             surface_matrix: load_toml(workspace_root, SUPPORTED_SURFACE_MATRIX_PATH)?,
             feature_ledger: load_toml(workspace_root, FEATURE_UNIVERSE_LEDGER_PATH)?,
+            parity_taxonomy: load_toml(workspace_root, PARITY_TAXONOMY_PATH)?,
             parity_score_contract: load_toml(workspace_root, PARITY_SCORE_CONTRACT_PATH)?,
         })
     }
@@ -317,6 +369,7 @@ impl CanonicalParityContractBundle {
         self.validate_version_alignment(&mut diagnostics);
         self.validate_surface_matrix(&mut diagnostics);
         self.validate_feature_ledger(&mut diagnostics);
+        self.validate_parity_taxonomy(&mut diagnostics);
         self.validate_reference_paths(workspace_root, &mut diagnostics);
         diagnostics.extend(canonical_contract_authority_report(workspace_root).diagnostics);
         CanonicalParityContractValidation { diagnostics }
@@ -375,6 +428,17 @@ impl CanonicalParityContractBundle {
                 message: format!(
                     "feature_ledger sqlite_target '{}' does not match version contract '{}'",
                     self.feature_ledger.meta.sqlite_target, version.sqlite_target
+                ),
+            });
+        }
+        if self.parity_taxonomy.meta.sqlite_target != version.sqlite_target {
+            diagnostics.push(ContractDiagnostic {
+                code: "parity_taxonomy_sqlite_target_mismatch",
+                message: format!(
+                    "{} sqlite_target '{}' does not match version contract '{}'",
+                    PARITY_TAXONOMY_PATH,
+                    self.parity_taxonomy.meta.sqlite_target,
+                    version.sqlite_target
                 ),
             });
         }
@@ -456,6 +520,25 @@ impl CanonicalParityContractBundle {
                 ),
             });
         }
+        for (field, reference) in [
+            (
+                "formula.source_taxonomy",
+                self.parity_score_contract.formula.source_taxonomy.as_str(),
+            ),
+            (
+                "references.taxonomy",
+                self.parity_score_contract.references.taxonomy.as_str(),
+            ),
+        ] {
+            if normalize_contract_reference(reference) != PARITY_TAXONOMY_PATH {
+                diagnostics.push(ContractDiagnostic {
+                    code: "parity_taxonomy_path_mismatch",
+                    message: format!(
+                        "parity score {field} '{reference}' does not resolve to canonical '{PARITY_TAXONOMY_PATH}'"
+                    ),
+                });
+            }
+        }
     }
 
     fn validate_surface_matrix(&self, diagnostics: &mut Vec<ContractDiagnostic>) {
@@ -492,6 +575,75 @@ impl CanonicalParityContractBundle {
                     message: format!(
                         "ledger feature '{}' references unknown surface_id '{}'",
                         feature.feature_id, feature.surface_id
+                    ),
+                });
+            }
+        }
+    }
+
+    fn validate_parity_taxonomy(&self, diagnostics: &mut Vec<ContractDiagnostic>) {
+        let mut feature_ids = BTreeSet::new();
+        let mut included_weight = 0_u64;
+
+        for feature in &self.parity_taxonomy.features {
+            if !feature_ids.insert(feature.id.as_str()) {
+                diagnostics.push(ContractDiagnostic {
+                    code: "duplicate_taxonomy_feature_id",
+                    message: format!(
+                        "{} contains duplicate feature id '{}'",
+                        PARITY_TAXONOMY_PATH, feature.id
+                    ),
+                });
+            }
+            let expected_family = taxonomy_family_from_id(&feature.id);
+            if expected_family != Some(feature.family.as_str()) {
+                diagnostics.push(ContractDiagnostic {
+                    code: "taxonomy_feature_family_mismatch",
+                    message: format!(
+                        "{} feature '{}' declares family '{}' but its id encodes '{}'",
+                        PARITY_TAXONOMY_PATH,
+                        feature.id,
+                        feature.family,
+                        expected_family.unwrap_or("invalid")
+                    ),
+                });
+            }
+            if feature.weight == 0 {
+                diagnostics.push(ContractDiagnostic {
+                    code: "taxonomy_feature_zero_weight",
+                    message: format!(
+                        "{} feature '{}' has non-positive weight 0",
+                        PARITY_TAXONOMY_PATH, feature.id
+                    ),
+                });
+            }
+            if feature.status != ParityTaxonomyStatus::Excluded {
+                included_weight = included_weight.saturating_add(feature.weight);
+            }
+        }
+
+        if included_weight != self.parity_taxonomy.meta.total_weight {
+            diagnostics.push(ContractDiagnostic {
+                code: "taxonomy_total_weight_mismatch",
+                message: format!(
+                    "{} meta.total_weight {} does not equal non-excluded feature weight {}",
+                    PARITY_TAXONOMY_PATH, self.parity_taxonomy.meta.total_weight, included_weight
+                ),
+            });
+        }
+
+        let mut exclusion_ids = BTreeSet::new();
+        for exclusion in &self.parity_taxonomy.exclusions {
+            if exclusion.id.trim().is_empty()
+                || exclusion.title.trim().is_empty()
+                || exclusion.rationale.trim().is_empty()
+                || !exclusion_ids.insert(exclusion.id.as_str())
+            {
+                diagnostics.push(ContractDiagnostic {
+                    code: "invalid_taxonomy_exclusion",
+                    message: format!(
+                        "{} exclusion '{}' must have a unique non-empty id, title, and rationale",
+                        PARITY_TAXONOMY_PATH, exclusion.id
                     ),
                 });
             }
@@ -915,6 +1067,18 @@ fn normalize_contract_reference(reference: &str) -> String {
     }
 }
 
+fn taxonomy_family_from_id(feature_id: &str) -> Option<&str> {
+    let (family, ordinal) = feature_id.strip_prefix("F-")?.split_once('.')?;
+    if family.is_empty()
+        || !family.chars().all(|ch| ch.is_ascii_uppercase())
+        || ordinal.len() < 2
+        || !ordinal.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(family)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,6 +1127,10 @@ mod tests {
     fn workspace_bundle_loads_and_validates() {
         let root = workspace_root();
         let bundle = CanonicalParityContractBundle::load(&root).expect("load bundle");
+        assert_eq!(bundle.parity_taxonomy.meta.sqlite_target, "3.52.0");
+        assert_eq!(bundle.parity_taxonomy.meta.total_weight, 947);
+        assert_eq!(bundle.parity_taxonomy.features.len(), 129);
+        assert_eq!(bundle.parity_taxonomy.exclusions.len(), 10);
         let validation = bundle.validate(&root);
         assert!(
             validation.is_valid(),
@@ -1147,6 +1315,79 @@ mod tests {
             "expected unknown_surface_id diagnostic, got {:?}",
             validation.diagnostics
         );
+    }
+
+    #[test]
+    fn validation_reports_every_taxonomy_drift_class() {
+        let root = workspace_root();
+        let bundle = CanonicalParityContractBundle::load(&root).expect("load bundle");
+        let assert_code = |candidate: &CanonicalParityContractBundle, code: &str| {
+            let validation = candidate.validate(&root);
+            assert!(
+                validation
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
+                "expected {code} diagnostic, got {:?}",
+                validation.diagnostics
+            );
+        };
+
+        let mut duplicate = bundle.clone();
+        duplicate.parity_taxonomy.features[1].id = duplicate.parity_taxonomy.features[0].id.clone();
+        assert_code(&duplicate, "duplicate_taxonomy_feature_id");
+
+        let mut target = bundle.clone();
+        target.parity_taxonomy.meta.sqlite_target = "3.51.0".to_owned();
+        assert_code(&target, "parity_taxonomy_sqlite_target_mismatch");
+
+        let mut family = bundle.clone();
+        family.parity_taxonomy.features[0].family = "PLN".to_owned();
+        assert_code(&family, "taxonomy_feature_family_mismatch");
+
+        let mut zero_weight = bundle.clone();
+        zero_weight.parity_taxonomy.features[0].weight = 0;
+        assert_code(&zero_weight, "taxonomy_feature_zero_weight");
+
+        let mut total_weight = bundle.clone();
+        total_weight.parity_taxonomy.meta.total_weight += 1;
+        assert_code(&total_weight, "taxonomy_total_weight_mismatch");
+
+        let mut path = bundle;
+        path.parity_score_contract.references.taxonomy = "parity_taxonomy-root.toml".to_owned();
+        path.parity_score_contract.formula.source_taxonomy = "parity_taxonomy-root.toml".to_owned();
+        assert_code(&path, "parity_taxonomy_path_mismatch");
+    }
+
+    #[test]
+    fn malformed_canonical_taxonomy_fails_at_the_canonical_path() {
+        let source_root = workspace_root();
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(workspace.path().join("docs/contracts"))
+            .expect("create contract directory");
+        for path in [
+            SQLITE_VERSION_CONTRACT_PATH,
+            SUPPORTED_SURFACE_MATRIX_PATH,
+            FEATURE_UNIVERSE_LEDGER_PATH,
+            PARITY_SCORE_CONTRACT_PATH,
+        ] {
+            fs::copy(source_root.join(path), workspace.path().join(path))
+                .expect("copy canonical contract");
+        }
+        fs::write(
+            workspace.path().join(PARITY_TAXONOMY_PATH),
+            "[meta]\nversion = [invalid\n",
+        )
+        .expect("write malformed taxonomy");
+
+        let error = CanonicalParityContractBundle::load(workspace.path())
+            .expect_err("malformed canonical taxonomy must fail closed");
+        match error {
+            CanonicalParityContractError::Parse { path, .. } => {
+                assert!(path.ends_with(PARITY_TAXONOMY_PATH));
+            }
+            other => panic!("expected parse error, got {other}"),
+        }
     }
 
     #[test]

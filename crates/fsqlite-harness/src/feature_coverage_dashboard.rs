@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::fixture_root_contract::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH;
+use crate::test_inventory::ExecutionLane;
+use crate::typed_sql_generator::{
+    CANONICAL_PROFILE_SCHEMA_VERSION, Construct, GeneratedCase, StatementRole, TraceOutcome,
+    validate_canonical_profile_evidence,
+};
 
 /// Bead identifier for the feature coverage dashboard.
 pub const FEATURE_COVERAGE_DASHBOARD_BEAD_ID: &str = "bd-2yqp6.3.3";
@@ -23,6 +28,9 @@ pub const COVERAGE_ACCOUNTING_SCHEMA_VERSION: &str = "1.0.0";
 pub const COVERAGE_RELEASE_GATE_POLICY: &str = "missing_required_features_block";
 /// Default canonical corpus manifest path relative to the workspace root.
 pub const DEFAULT_FEATURE_COVERAGE_MANIFEST_PATH: &str = DEFAULT_FIXTURE_ROOT_MANIFEST_PATH;
+/// Coverage schema for canonical typed-generator profiles.
+pub const PROFILE_GENERATION_COVERAGE_SCHEMA_VERSION: &str =
+    "fsqlite.generator_profile_coverage.v1";
 
 /// Run metadata embedded in generated dashboard artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +223,61 @@ pub struct FeatureCoverageDashboard {
     pub release_gate: FeatureCoverageReleaseGate,
 }
 
+/// Explicit unsupported request accounted outside the generator trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsupportedProfileAttempt {
+    pub role: StatementRole,
+    pub construct: Construct,
+    pub feature_id: String,
+    pub count: u64,
+    pub reason: String,
+}
+
+/// Conservation counters for one exact role/construct/feature binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileGenerationCoverageRow {
+    pub role: StatementRole,
+    pub construct: Construct,
+    pub feature_id: String,
+    pub surface_id: String,
+    pub requested: u64,
+    pub generated: u64,
+    pub executed: u64,
+    pub unsupported: u64,
+    pub invalid: u64,
+}
+
+/// Aggregate counters with the same conservation law as every row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileGenerationCoverageTotals {
+    pub requested: u64,
+    pub generated: u64,
+    pub executed: u64,
+    pub unsupported: u64,
+    pub invalid: u64,
+}
+
+/// Contract-bound coverage artifact for one generated case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileGenerationCoverageReport {
+    pub schema_version: String,
+    pub profile_schema_version: String,
+    pub profile_name: String,
+    pub profile_version: String,
+    pub profile_sha256: String,
+    pub sqlite_target: String,
+    pub taxonomy_version: String,
+    pub version_contract_sha256: String,
+    pub surface_matrix_sha256: String,
+    pub feature_ledger_sha256: String,
+    pub parity_taxonomy_sha256: String,
+    pub required_lanes: Vec<ExecutionLane>,
+    pub observed_lanes: Vec<ExecutionLane>,
+    pub rows: Vec<ProfileGenerationCoverageRow>,
+    pub totals: ProfileGenerationCoverageTotals,
+    pub coverage_sha256: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct CorpusManifestDocument {
     meta: CorpusManifestMeta,
@@ -281,6 +344,13 @@ struct FamilyAccumulator {
     none_count: usize,
     partial_count: usize,
     full_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TraceTerminalCounts {
+    proposed: u64,
+    accepted: u64,
+    rejected: u64,
 }
 
 #[derive(Serialize)]
@@ -447,6 +517,257 @@ pub fn build_feature_coverage_dashboard(
         features,
         release_gate,
     })
+}
+
+/// Build conservation-based coverage for one canonical typed-generator case.
+///
+/// # Errors
+///
+/// Fails closed when contract evidence, feature lineage, terminal trace events,
+/// execution ordinals, lane evidence, or conservation accounting is incomplete.
+pub fn build_profile_generation_coverage(
+    generated: &GeneratedCase,
+    executed_ordinals: &BTreeSet<u32>,
+    observed_lanes: &BTreeSet<ExecutionLane>,
+    unsupported_attempts: &[UnsupportedProfileAttempt],
+) -> Result<ProfileGenerationCoverageReport, String> {
+    let evidence = generated
+        .canonical_profile_evidence
+        .as_ref()
+        .ok_or_else(|| "profile_coverage_missing_canonical_evidence".to_owned())?;
+    if evidence.schema_version != CANONICAL_PROFILE_SCHEMA_VERSION {
+        return Err(format!(
+            "profile_coverage_schema_mismatch expected={} observed={}",
+            CANONICAL_PROFILE_SCHEMA_VERSION, evidence.schema_version
+        ));
+    }
+    validate_canonical_profile_evidence(evidence).map_err(|error| {
+        format!(
+            "profile_coverage_invalid_canonical_evidence constraint={} error={error}",
+            error.constraint
+        )
+    })?;
+    if generated.profile_name != evidence.profile_name
+        || generated.profile_version != evidence.profile_version
+    {
+        return Err("profile_coverage_profile_identity_mismatch".to_owned());
+    }
+    let missing_lanes = evidence
+        .required_lanes
+        .iter()
+        .filter(|lane| !observed_lanes.contains(lane))
+        .map(|lane| lane.label())
+        .collect::<Vec<_>>();
+    if !missing_lanes.is_empty() {
+        return Err(format!(
+            "profile_coverage_missing_required_lanes lanes={}",
+            missing_lanes.join(",")
+        ));
+    }
+
+    type CoverageKey = (StatementRole, Construct, String);
+    let mut rows = BTreeMap::<CoverageKey, ProfileGenerationCoverageRow>::new();
+    for binding in &evidence.bindings {
+        let key = (binding.role, binding.construct, binding.feature_id.clone());
+        if rows
+            .insert(
+                key,
+                ProfileGenerationCoverageRow {
+                    role: binding.role,
+                    construct: binding.construct,
+                    feature_id: binding.feature_id.clone(),
+                    surface_id: binding.surface_id.clone(),
+                    requested: 0,
+                    generated: 0,
+                    executed: 0,
+                    unsupported: 0,
+                    invalid: 0,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "profile_coverage_duplicate_binding role={} construct={:?} feature_id={}",
+                binding.role.label(),
+                binding.construct,
+                binding.feature_id
+            ));
+        }
+    }
+
+    let mut terminal_counts = BTreeMap::<u32, TraceTerminalCounts>::new();
+    for event in &generated.trace {
+        let feature_id = event.profile_feature_id.as_ref().ok_or_else(|| {
+            format!(
+                "profile_coverage_trace_missing_feature ordinal={} role={} construct={:?}",
+                event.ordinal,
+                event.role.label(),
+                event.construct
+            )
+        })?;
+        let key = (event.role, event.construct, feature_id.clone());
+        let row = rows.get_mut(&key).ok_or_else(|| {
+            format!(
+                "profile_coverage_trace_unknown_binding ordinal={} role={} construct={:?} feature_id={feature_id}",
+                event.ordinal,
+                event.role.label(),
+                event.construct
+            )
+        })?;
+        let counts = terminal_counts.entry(event.ordinal).or_default();
+        match event.outcome {
+            TraceOutcome::Proposed => {
+                row.requested = row.requested.saturating_add(1);
+                counts.proposed = counts.proposed.saturating_add(1);
+            }
+            TraceOutcome::Accepted => {
+                row.generated = row.generated.saturating_add(1);
+                counts.accepted = counts.accepted.saturating_add(1);
+            }
+            TraceOutcome::Rejected => {
+                row.invalid = row.invalid.saturating_add(1);
+                counts.rejected = counts.rejected.saturating_add(1);
+            }
+        }
+    }
+    for (ordinal, counts) in &terminal_counts {
+        if counts.proposed != 1 || counts.accepted.saturating_add(counts.rejected) != 1 {
+            return Err(format!(
+                "profile_coverage_invalid_trace_terminal ordinal={ordinal} proposed={} accepted={} rejected={}",
+                counts.proposed, counts.accepted, counts.rejected
+            ));
+        }
+    }
+    for statement in &generated.statements {
+        if terminal_counts.get(&statement.ordinal)
+            != Some(&TraceTerminalCounts {
+                proposed: 1,
+                accepted: 1,
+                rejected: 0,
+            })
+        {
+            return Err(format!(
+                "profile_coverage_statement_missing_accepted_trace ordinal={}",
+                statement.ordinal
+            ));
+        }
+    }
+    let accepted_trace_count = terminal_counts
+        .values()
+        .filter(|counts| counts.accepted == 1)
+        .count();
+    if accepted_trace_count != generated.statements.len() {
+        return Err(format!(
+            "profile_coverage_statement_trace_count_mismatch statements={} accepted_traces={accepted_trace_count}",
+            generated.statements.len()
+        ));
+    }
+
+    for attempt in unsupported_attempts {
+        if attempt.count == 0 || attempt.reason.trim().is_empty() {
+            return Err(format!(
+                "profile_coverage_invalid_unsupported_attempt feature_id={} count={} reason_empty={}",
+                attempt.feature_id,
+                attempt.count,
+                attempt.reason.trim().is_empty()
+            ));
+        }
+        let key = (attempt.role, attempt.construct, attempt.feature_id.clone());
+        let row = rows.get_mut(&key).ok_or_else(|| {
+            format!(
+                "profile_coverage_unsupported_unknown_binding role={} construct={:?} feature_id={}",
+                attempt.role.label(),
+                attempt.construct,
+                attempt.feature_id
+            )
+        })?;
+        row.requested = row.requested.saturating_add(attempt.count);
+        row.unsupported = row.unsupported.saturating_add(attempt.count);
+    }
+
+    for ordinal in executed_ordinals {
+        let statement = generated
+            .statements
+            .iter()
+            .find(|statement| statement.ordinal == *ordinal)
+            .ok_or_else(|| {
+                format!("profile_coverage_unknown_executed_ordinal ordinal={ordinal}")
+            })?;
+        let feature_id = statement.profile_feature_id.as_ref().ok_or_else(|| {
+            format!("profile_coverage_executed_missing_feature ordinal={ordinal}")
+        })?;
+        let key = (statement.role, statement.construct, feature_id.clone());
+        let row = rows.get_mut(&key).ok_or_else(|| {
+            format!(
+                "profile_coverage_executed_unknown_binding ordinal={ordinal} feature_id={feature_id}"
+            )
+        })?;
+        row.executed = row.executed.saturating_add(1);
+    }
+
+    let rows = rows.into_values().collect::<Vec<_>>();
+    let mut totals = ProfileGenerationCoverageTotals::default();
+    for row in &rows {
+        if row.requested
+            != row
+                .generated
+                .saturating_add(row.unsupported)
+                .saturating_add(row.invalid)
+            || row.executed > row.generated
+        {
+            return Err(format!(
+                "profile_coverage_conservation_failed role={} construct={:?} feature_id={} requested={} generated={} executed={} unsupported={} invalid={}",
+                row.role.label(),
+                row.construct,
+                row.feature_id,
+                row.requested,
+                row.generated,
+                row.executed,
+                row.unsupported,
+                row.invalid
+            ));
+        }
+        totals.requested = totals.requested.saturating_add(row.requested);
+        totals.generated = totals.generated.saturating_add(row.generated);
+        totals.executed = totals.executed.saturating_add(row.executed);
+        totals.unsupported = totals.unsupported.saturating_add(row.unsupported);
+        totals.invalid = totals.invalid.saturating_add(row.invalid);
+    }
+
+    let mut report = ProfileGenerationCoverageReport {
+        schema_version: PROFILE_GENERATION_COVERAGE_SCHEMA_VERSION.to_owned(),
+        profile_schema_version: evidence.schema_version.clone(),
+        profile_name: evidence.profile_name.clone(),
+        profile_version: evidence.profile_version.clone(),
+        profile_sha256: evidence.profile_sha256.clone(),
+        sqlite_target: evidence.sqlite_target.clone(),
+        taxonomy_version: evidence.taxonomy_version.clone(),
+        version_contract_sha256: evidence.version_contract_sha256.clone(),
+        surface_matrix_sha256: evidence.surface_matrix_sha256.clone(),
+        feature_ledger_sha256: evidence.feature_ledger_sha256.clone(),
+        parity_taxonomy_sha256: evidence.parity_taxonomy_sha256.clone(),
+        required_lanes: evidence.required_lanes.clone(),
+        observed_lanes: observed_lanes.iter().copied().collect(),
+        rows,
+        totals,
+        coverage_sha256: String::new(),
+    };
+    let signature = serde_json::to_vec(&report)
+        .map_err(|error| format!("profile_coverage_signature_failed error={error}"))?;
+    report.coverage_sha256 = sha256_hex(&signature);
+    tracing::info!(
+        target: "fsqlite.profile_generation_coverage",
+        profile = %report.profile_name,
+        profile_sha256 = %report.profile_sha256,
+        requested = report.totals.requested,
+        generated = report.totals.generated,
+        executed = report.totals.executed,
+        unsupported = report.totals.unsupported,
+        invalid = report.totals.invalid,
+        row_count = report.rows.len(),
+        "canonical generator profile coverage accounted"
+    );
+    Ok(report)
 }
 
 /// Write a dashboard artifact as pretty JSON.
@@ -770,7 +1091,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::differential_v2::{CsqliteExecutor, FsqliteExecutor, SqlExecutor, StmtOutcome};
+    use crate::typed_sql_generator::{
+        GenerationBudget, GenerationSession, GeneratorConfig, NamedGeneratorProfile, ProfileMode,
+        derive_named_profile, generate_case,
+    };
     use tempfile::TempDir;
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
 
     fn write_manifest(workspace: &Path, body: &str) -> PathBuf {
         let path = workspace.join("corpus_manifest.toml");
@@ -870,5 +1200,181 @@ replay_command = "cargo test -p fsqlite-harness synthetic"
 
         assert!(error.contains("feature_coverage_entry_feature_not_required"));
         assert!(error.contains("F-SQL.02"));
+    }
+
+    #[test]
+    fn profile_coverage_conserves_rejected_unsupported_and_executed_counts() {
+        let profile = derive_named_profile(&workspace_root(), NamedGeneratorProfile::Dml).unwrap();
+        let requested_statements = u32::try_from(profile.setup.len() + 5).unwrap();
+        let mut session = GenerationSession::new(GeneratorConfig {
+            root_seed: 0xC0FE_2026,
+            requested_statements,
+            profile,
+            budget: GenerationBudget::default(),
+        })
+        .unwrap();
+        let rejected = session.propose_next().unwrap();
+        session
+            .reject(rejected.proposal_id, "synthetic invalid proposal")
+            .unwrap();
+        while session.counters().accepted < requested_statements {
+            let proposal = session.propose_next().unwrap();
+            session.accept(proposal.proposal_id).unwrap();
+        }
+        let generated = session.finish().unwrap();
+        let executed = generated
+            .statements
+            .iter()
+            .take(3)
+            .map(|statement| statement.ordinal)
+            .collect::<BTreeSet<_>>();
+        let evidence = generated
+            .canonical_profile_evidence
+            .as_ref()
+            .expect("canonical evidence");
+        let unsupported_binding = evidence
+            .bindings
+            .iter()
+            .find(|binding| binding.role == StatementRole::Subject)
+            .expect("subject binding");
+        let unsupported = UnsupportedProfileAttempt {
+            role: unsupported_binding.role,
+            construct: unsupported_binding.construct,
+            feature_id: unsupported_binding.feature_id.clone(),
+            count: 2,
+            reason: "synthetic capability refusal".to_owned(),
+        };
+        let observed = BTreeSet::from([ExecutionLane::SqlResultOnly]);
+
+        let report =
+            build_profile_generation_coverage(&generated, &executed, &observed, &[unsupported])
+                .unwrap();
+        assert_eq!(report.totals.generated, u64::from(requested_statements));
+        assert_eq!(report.totals.invalid, 1);
+        assert_eq!(report.totals.unsupported, 2);
+        assert_eq!(report.totals.executed, 3);
+        assert_eq!(
+            report.totals.requested,
+            report
+                .totals
+                .generated
+                .saturating_add(report.totals.invalid)
+                .saturating_add(report.totals.unsupported)
+        );
+        assert!(report.rows.iter().all(|row| {
+            row.requested
+                == row
+                    .generated
+                    .saturating_add(row.invalid)
+                    .saturating_add(row.unsupported)
+                && row.executed <= row.generated
+        }));
+        assert_eq!(report.coverage_sha256.len(), 64);
+    }
+
+    #[test]
+    fn profile_coverage_rejects_missing_evidence_lanes_and_ordinals() {
+        let bootstrap = generate_case(GeneratorConfig::bootstrap(7, 8)).unwrap();
+        assert!(
+            build_profile_generation_coverage(&bootstrap, &BTreeSet::new(), &BTreeSet::new(), &[],)
+                .unwrap_err()
+                .contains("missing_canonical_evidence")
+        );
+
+        let profile =
+            derive_named_profile(&workspace_root(), NamedGeneratorProfile::ReadOnly).unwrap();
+        let generated = generate_case(GeneratorConfig {
+            root_seed: 8,
+            requested_statements: u32::try_from(profile.setup.len() + 2).unwrap(),
+            profile,
+            budget: GenerationBudget::default(),
+        })
+        .unwrap();
+        assert!(
+            build_profile_generation_coverage(&generated, &BTreeSet::new(), &BTreeSet::new(), &[],)
+                .unwrap_err()
+                .contains("missing_required_lanes")
+        );
+        assert!(
+            build_profile_generation_coverage(
+                &generated,
+                &BTreeSet::from([u32::MAX]),
+                &BTreeSet::from([ExecutionLane::SqlResultOnly]),
+                &[],
+            )
+            .unwrap_err()
+            .contains("unknown_executed_ordinal")
+        );
+
+        let mut corrupted = generated;
+        corrupted
+            .canonical_profile_evidence
+            .as_mut()
+            .expect("canonical evidence")
+            .taxonomy_version
+            .push_str("-altered");
+        assert!(
+            build_profile_generation_coverage(
+                &corrupted,
+                &BTreeSet::new(),
+                &BTreeSet::from([ExecutionLane::SqlResultOnly]),
+                &[],
+            )
+            .unwrap_err()
+            .contains("invalid_canonical_evidence")
+        );
+    }
+
+    #[test]
+    fn fixed_seed_profile_executes_on_both_engines_and_reports_exact_lineage() {
+        let profile =
+            derive_named_profile(&workspace_root(), NamedGeneratorProfile::ReadOnly).unwrap();
+        let generated = generate_case(GeneratorConfig {
+            root_seed: 0xF17E_D5EE,
+            requested_statements: u32::try_from(profile.setup.len() + 8).unwrap(),
+            profile,
+            budget: GenerationBudget::default(),
+        })
+        .unwrap();
+        let fsqlite = FsqliteExecutor::open_in_memory().unwrap();
+        let sqlite = CsqliteExecutor::open_in_memory().unwrap();
+        for statement in &generated.statements {
+            let outcomes = (
+                fsqlite.run_stmt(&statement.sql),
+                sqlite.run_stmt(&statement.sql),
+            );
+            match outcomes {
+                (StmtOutcome::Rows(left), StmtOutcome::Rows(right)) => assert_eq!(left, right),
+                (StmtOutcome::Execute(left), StmtOutcome::Execute(right)) => {
+                    assert_eq!(left, right);
+                }
+                other => panic!("paired outcome mismatch for {}: {other:?}", statement.sql),
+            }
+        }
+        let executed = generated
+            .statements
+            .iter()
+            .map(|statement| statement.ordinal)
+            .collect::<BTreeSet<_>>();
+        let report = build_profile_generation_coverage(
+            &generated,
+            &executed,
+            &BTreeSet::from([ExecutionLane::SqlResultOnly]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(report.totals.generated, report.totals.executed);
+        assert_eq!(report.totals.unsupported, 0);
+        assert_eq!(report.totals.invalid, 0);
+        assert!(report.rows.iter().any(|row| {
+            row.role == StatementRole::Subject && row.generated > 0 && row.executed > 0
+        }));
+        let evidence = generated.canonical_profile_evidence.unwrap();
+        assert_eq!(evidence.mode, ProfileMode::Required);
+        assert!(evidence.bindings.iter().all(|binding| {
+            binding.taxonomy_status == crate::canonical_parity_contract::ParityTaxonomyStatus::Pass
+                && binding.surface_state
+                    == crate::canonical_parity_contract::SupportState::Supported
+        }));
     }
 }

@@ -6,22 +6,33 @@
 //! profiles, and execution against both engines are layered on top by the
 //! dependent Turso-adaptation beads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::canonical_parity_contract::{
+    CONTRACT_AUTHORITY_REGISTRY_SCHEMA_VERSION, CanonicalParityContractBundle, LifecycleState,
+    ParityTaxonomyStatus, SupportState, canonical_contract_authority_report,
+};
+use crate::test_inventory::ExecutionLane;
+
 /// Stable artifact schema for generated cases.
-pub const GENERATOR_SCHEMA_VERSION: u32 = 1;
+pub const GENERATOR_SCHEMA_VERSION: u32 = 2;
 /// Generator implementation version. Seed compatibility is scoped to this value.
-pub const GENERATOR_VERSION: &str = "1.0.0";
-/// The test-local profile used before canonical capability mapping is added by `.4`.
+pub const GENERATOR_VERSION: &str = "2.0.0";
+/// The test-local profile retained for generator-core tests.
 pub const BOOTSTRAP_PROFILE_NAME: &str = "supported_core_bootstrap";
 /// Version of the test-local bootstrap profile.
 pub const BOOTSTRAP_PROFILE_VERSION: &str = "1.0.0";
+/// Canonical named-profile schema.
+pub const CANONICAL_PROFILE_SCHEMA_VERSION: &str = "fsqlite.generator_profile.v1";
+/// Exact normalized weight total for every canonical profile.
+pub const CANONICAL_PROFILE_WEIGHT_TOTAL: u32 = 10_000;
 
 const SEED_DOMAIN: &[u8] = b"fsqlite.typed-sql-generator.v1";
 
@@ -812,6 +823,194 @@ pub enum Construct {
     Transaction,
 }
 
+/// Whether a statement prepares a case or exercises the requested subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatementRole {
+    Setup,
+    Subject,
+}
+
+impl StatementRole {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Subject => "subject",
+        }
+    }
+}
+
+/// Admission policy for canonical contract bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileMode {
+    Required,
+    Partial,
+    FeatureDevelopment,
+}
+
+/// Stable built-in profile names derived from the canonical contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamedGeneratorProfile {
+    SupportedCore,
+    ReadOnly,
+    Dml,
+    Planner,
+    Vdbe,
+    Transaction,
+    Mvcc,
+    PlannerPartial,
+    VdbePartial,
+}
+
+impl NamedGeneratorProfile {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SupportedCore => "supported_core",
+            Self::ReadOnly => "read_only",
+            Self::Dml => "dml",
+            Self::Planner => "planner",
+            Self::Vdbe => "vdbe",
+            Self::Transaction => "transaction",
+            Self::Mvcc => "mvcc",
+            Self::PlannerPartial => "planner_partial",
+            Self::VdbePartial => "vdbe_partial",
+        }
+    }
+}
+
+/// One requested binding with explicit expected contract state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileFeatureRequest {
+    pub role: StatementRole,
+    pub construct: Construct,
+    pub feature_id: String,
+    pub surface_id: String,
+    pub ledger_feature_id: String,
+    pub component: String,
+    pub expected_taxonomy_status: ParityTaxonomyStatus,
+    pub expected_surface_state: SupportState,
+    pub expected_lifecycle_state: LifecycleState,
+}
+
+/// Full fail-closed request used to derive a generator profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalProfileRequest {
+    pub name: String,
+    pub version: String,
+    pub mode: ProfileMode,
+    pub expected_gap_policy: Option<String>,
+    pub authorization_bead: Option<String>,
+    pub setup: Vec<Construct>,
+    pub features: Vec<ProfileFeatureRequest>,
+    pub required_lanes: Vec<ExecutionLane>,
+}
+
+/// Actual canonical binding retained in generated-case evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileBinding {
+    pub role: StatementRole,
+    pub construct: Construct,
+    pub feature_id: String,
+    pub taxonomy_status: ParityTaxonomyStatus,
+    pub taxonomy_weight: u64,
+    pub surface_id: String,
+    pub surface_state: SupportState,
+    pub ledger_feature_id: String,
+    pub component: String,
+    pub lifecycle_state: LifecycleState,
+}
+
+/// Normalized subject weight for one exact canonical feature binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileFeatureWeight {
+    pub feature_id: String,
+    pub construct: Construct,
+    pub weight: u32,
+}
+
+/// Canonical hashes and verified bindings that make profile derivation replayable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalProfileEvidence {
+    pub schema_version: String,
+    pub registry_schema_version: String,
+    pub profile_name: String,
+    pub profile_version: String,
+    pub setup: Vec<Construct>,
+    pub sqlite_target: String,
+    pub taxonomy_version: String,
+    pub version_contract_sha256: String,
+    pub surface_matrix_sha256: String,
+    pub feature_ledger_sha256: String,
+    pub parity_taxonomy_sha256: String,
+    pub mode: ProfileMode,
+    pub expected_gap_policy: Option<String>,
+    pub authorization_bead: Option<String>,
+    pub required_lanes: Vec<ExecutionLane>,
+    pub bindings: Vec<ProfileBinding>,
+    pub feature_weights: Vec<ProfileFeatureWeight>,
+    pub profile_sha256: String,
+}
+
+/// Verify the schema identifiers and every digest retained in canonical
+/// profile evidence.
+///
+/// # Errors
+///
+/// Returns an invalid-input error when an authority digest is malformed or
+/// when the profile digest does not cover the exact retained evidence.
+pub fn validate_canonical_profile_evidence(
+    evidence: &CanonicalProfileEvidence,
+) -> Result<(), GenerationError> {
+    if evidence.schema_version != CANONICAL_PROFILE_SCHEMA_VERSION
+        || evidence.registry_schema_version != CONTRACT_AUTHORITY_REGISTRY_SCHEMA_VERSION
+    {
+        return Err(GenerationError::invalid_input(
+            "profile.canonical_evidence.schema",
+            "canonical profile evidence schema identifiers do not match this generator",
+        ));
+    }
+    for (field, digest) in [
+        (
+            "version_contract_sha256",
+            evidence.version_contract_sha256.as_str(),
+        ),
+        (
+            "surface_matrix_sha256",
+            evidence.surface_matrix_sha256.as_str(),
+        ),
+        (
+            "feature_ledger_sha256",
+            evidence.feature_ledger_sha256.as_str(),
+        ),
+        (
+            "parity_taxonomy_sha256",
+            evidence.parity_taxonomy_sha256.as_str(),
+        ),
+        ("profile_sha256", evidence.profile_sha256.as_str()),
+    ] {
+        if !is_lower_sha256(digest) {
+            return Err(GenerationError::invalid_input(
+                format!("profile.canonical_evidence.{field}"),
+                "digest must be 64 lowercase hexadecimal characters",
+            ));
+        }
+    }
+
+    let mut unhashed = evidence.clone();
+    unhashed.profile_sha256.clear();
+    let expected = sha256_hex(canonical_json(&unhashed)?.as_bytes());
+    if evidence.profile_sha256 != expected {
+        return Err(GenerationError::invalid_input(
+            "profile.canonical_evidence.profile_sha256",
+            "profile digest does not match the retained canonical evidence",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstructWeight {
     pub construct: Construct,
@@ -822,7 +1021,11 @@ pub struct ConstructWeight {
 pub struct GeneratorProfile {
     pub name: String,
     pub version: String,
+    pub setup: Vec<Construct>,
+    pub require_subject: bool,
     pub weights: Vec<ConstructWeight>,
+    pub feature_weights: Vec<ProfileFeatureWeight>,
+    pub canonical_evidence: Option<CanonicalProfileEvidence>,
 }
 
 impl GeneratorProfile {
@@ -831,6 +1034,17 @@ impl GeneratorProfile {
         Self {
             name: BOOTSTRAP_PROFILE_NAME.to_owned(),
             version: BOOTSTRAP_PROFILE_VERSION.to_owned(),
+            setup: vec![
+                Construct::CreateTable,
+                Construct::CreateTable,
+                Construct::CreateIndex,
+                Construct::Insert,
+                Construct::Insert,
+                Construct::Transaction,
+                Construct::Update,
+                Construct::Transaction,
+            ],
+            require_subject: false,
             weights: vec![
                 ConstructWeight {
                     construct: Construct::Select,
@@ -869,6 +1083,8 @@ impl GeneratorProfile {
                     weight: 8,
                 },
             ],
+            feature_weights: Vec::new(),
+            canonical_evidence: None,
         }
     }
 
@@ -891,6 +1107,12 @@ impl GeneratorProfile {
                 "profile must contain at least one positive weight",
             ));
         }
+        if self.require_subject && self.canonical_evidence.is_none() {
+            return Err(GenerationError::invalid_input(
+                "profile.canonical_evidence",
+                "subject-required profiles must retain canonical contract evidence",
+            ));
+        }
         let mut constructs = BTreeSet::new();
         for entry in &self.weights {
             if !constructs.insert(entry.construct) {
@@ -900,7 +1122,1089 @@ impl GeneratorProfile {
                 ));
             }
         }
+        if let Some(evidence) = &self.canonical_evidence {
+            validate_canonical_profile_evidence(evidence)?;
+            if self.feature_weights.is_empty()
+                || self.feature_weights.iter().any(|entry| entry.weight == 0)
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.feature_weights",
+                    "canonical profiles require positive per-feature weights",
+                ));
+            }
+            let mut feature_ids = BTreeSet::new();
+            if self
+                .feature_weights
+                .iter()
+                .any(|entry| !feature_ids.insert(entry.feature_id.as_str()))
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.feature_weights",
+                    "canonical profile contains a duplicate weighted feature",
+                ));
+            }
+            let total = self
+                .feature_weights
+                .iter()
+                .fold(0_u32, |sum, entry| sum.saturating_add(entry.weight));
+            if total != CANONICAL_PROFILE_WEIGHT_TOTAL
+                || aggregate_construct_weights(&self.feature_weights) != self.weights
+                || evidence.feature_weights != self.feature_weights
+                || evidence.setup != self.setup
+                || evidence.profile_name != self.name
+                || evidence.profile_version != self.version
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.canonical_evidence",
+                    "canonical profile weights or identity drifted from retained evidence",
+                ));
+            }
+        } else if !self.feature_weights.is_empty() {
+            return Err(GenerationError::invalid_input(
+                "profile.feature_weights",
+                "per-feature weights require canonical profile evidence",
+            ));
+        }
         Ok(())
+    }
+}
+
+/// Build the reviewed request behind one stable named profile.
+#[must_use]
+pub fn named_profile_request(kind: NamedGeneratorProfile) -> CanonicalProfileRequest {
+    let standard_setup = vec![
+        Construct::CreateTable,
+        Construct::CreateTable,
+        Construct::CreateIndex,
+        Construct::Insert,
+        Construct::Insert,
+    ];
+    let transaction_setup = vec![Construct::CreateTable, Construct::Insert];
+    let setup_features = || {
+        vec![
+            profile_feature(
+                StatementRole::Setup,
+                Construct::CreateTable,
+                "F-SQL.16",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0001",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Setup,
+                Construct::CreateIndex,
+                "F-SQL.22",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0001",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Setup,
+                Construct::Insert,
+                "F-SQL.10",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0002",
+                "parser",
+                PASS_TESTED,
+            ),
+        ]
+    };
+    let transaction_setup_features = || {
+        vec![
+            profile_feature(
+                StatementRole::Setup,
+                Construct::CreateTable,
+                "F-SQL.16",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0001",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Setup,
+                Construct::Insert,
+                "F-SQL.10",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0002",
+                "parser",
+                PASS_TESTED,
+            ),
+        ]
+    };
+    let read_only_subjects = || {
+        vec![
+            profile_feature(
+                StatementRole::Subject,
+                Construct::Select,
+                "F-SQL.01",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0001",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Subject,
+                Construct::Join,
+                "F-SQL.02",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0001",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Subject,
+                Construct::CompoundSelect,
+                "F-SQL.03",
+                "SURF-SQL-COMPOUND-002",
+                "LEDGER-0003",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Subject,
+                Construct::Subquery,
+                "F-SQL.06",
+                "SURF-SQL-COMPOUND-002",
+                "LEDGER-0003",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Subject,
+                Construct::Aggregate,
+                "F-SQL.08",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0001",
+                "parser",
+                PASS_TESTED,
+            ),
+        ]
+    };
+    let dml_subjects = || {
+        vec![
+            profile_feature(
+                StatementRole::Subject,
+                Construct::Insert,
+                "F-SQL.10",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0002",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Subject,
+                Construct::Update,
+                "F-SQL.14",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0002",
+                "parser",
+                PASS_TESTED,
+            ),
+            profile_feature(
+                StatementRole::Subject,
+                Construct::Delete,
+                "F-SQL.15",
+                "SURF-SQL-CORE-001",
+                "LEDGER-0002",
+                "parser",
+                PASS_TESTED,
+            ),
+        ]
+    };
+
+    let (mode, expected_gap_policy, setup, mut features, required_lanes) = match kind {
+        NamedGeneratorProfile::SupportedCore => {
+            let mut features = setup_features();
+            features.extend(read_only_subjects());
+            features.extend(dml_subjects());
+            features.push(profile_feature(
+                StatementRole::Subject,
+                Construct::Transaction,
+                "F-TXN.02",
+                "SURF-TXN-MVCC-CONCURRENT-006",
+                "LEDGER-0013",
+                "core",
+                PASS_DIFFERENTIALLY_VERIFIED,
+            ));
+            (
+                ProfileMode::Required,
+                None,
+                standard_setup.clone(),
+                features,
+                vec![ExecutionLane::SqlResultOnly],
+            )
+        }
+        NamedGeneratorProfile::ReadOnly => {
+            let mut features = setup_features();
+            features.extend(read_only_subjects());
+            (
+                ProfileMode::Required,
+                None,
+                standard_setup.clone(),
+                features,
+                vec![ExecutionLane::SqlResultOnly],
+            )
+        }
+        NamedGeneratorProfile::Dml => {
+            let mut features = setup_features();
+            features.extend(dml_subjects());
+            (
+                ProfileMode::Required,
+                None,
+                standard_setup.clone(),
+                features,
+                vec![ExecutionLane::SqlResultOnly],
+            )
+        }
+        NamedGeneratorProfile::Planner => {
+            let mut features = setup_features();
+            features.extend([
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Select,
+                    "F-PLN.01",
+                    "SURF-SQL-CORE-001",
+                    "LEDGER-0005",
+                    "planner",
+                    PASS_DIFFERENTIALLY_VERIFIED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Select,
+                    "F-PLN.02",
+                    "SURF-SQL-CORE-001",
+                    "LEDGER-0006",
+                    "planner",
+                    PASS_TESTED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Join,
+                    "F-PLN.11",
+                    "SURF-SQL-CORE-001",
+                    "LEDGER-0006",
+                    "planner",
+                    PASS_TESTED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Select,
+                    "F-PLN.12",
+                    "SURF-SQL-CORE-001",
+                    "LEDGER-0006",
+                    "planner",
+                    PASS_TESTED,
+                ),
+            ]);
+            (
+                ProfileMode::Required,
+                None,
+                standard_setup.clone(),
+                features,
+                vec![ExecutionLane::PlannerRequired],
+            )
+        }
+        NamedGeneratorProfile::Vdbe => {
+            let mut features = setup_features();
+            features.extend([
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Select,
+                    "F-VDB.01",
+                    "SURF-SQL-CORE-001",
+                    "LEDGER-0009",
+                    "vdbe",
+                    PASS_TESTED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Select,
+                    "F-VDB.02",
+                    "SURF-SQL-CORE-001",
+                    "LEDGER-0010",
+                    "vdbe",
+                    PASS_TESTED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Select,
+                    "F-VDB.03",
+                    "SURF-SQL-CORE-001",
+                    "LEDGER-0010",
+                    "vdbe",
+                    PASS_TESTED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Transaction,
+                    "F-VDB.08",
+                    "SURF-SQL-CORE-001",
+                    "LEDGER-0011",
+                    "vdbe",
+                    PASS_IMPLEMENTED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::CompoundSelect,
+                    "F-VDB.14",
+                    "SURF-SQL-COMPOUND-002",
+                    "LEDGER-0012",
+                    "vdbe",
+                    PASS_IMPLEMENTED,
+                ),
+            ]);
+            (
+                ProfileMode::Required,
+                None,
+                standard_setup.clone(),
+                features,
+                vec![ExecutionLane::VdbeRequired],
+            )
+        }
+        NamedGeneratorProfile::Transaction | NamedGeneratorProfile::Mvcc => {
+            let mut features = transaction_setup_features();
+            features.extend([
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Transaction,
+                    "F-TXN.01",
+                    "SURF-TXN-MVCC-CONCURRENT-006",
+                    "LEDGER-0014",
+                    "core",
+                    PASS_TESTED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Transaction,
+                    "F-TXN.02",
+                    "SURF-TXN-MVCC-CONCURRENT-006",
+                    "LEDGER-0013",
+                    "core",
+                    PASS_DIFFERENTIALLY_VERIFIED,
+                ),
+                profile_feature(
+                    StatementRole::Subject,
+                    Construct::Transaction,
+                    "F-TXN.03",
+                    "SURF-TXN-MVCC-CONCURRENT-006",
+                    "LEDGER-0014",
+                    "core",
+                    PASS_TESTED,
+                ),
+            ]);
+            let lane = if kind == NamedGeneratorProfile::Mvcc {
+                ExecutionLane::MvccRequired
+            } else {
+                ExecutionLane::PagerBackedRequired
+            };
+            (
+                ProfileMode::Required,
+                None,
+                transaction_setup.clone(),
+                features,
+                vec![lane],
+            )
+        }
+        NamedGeneratorProfile::PlannerPartial => {
+            let mut features = setup_features();
+            for (construct, feature_id, ledger_id, lifecycle) in [
+                (
+                    Construct::Select,
+                    "F-PLN.03",
+                    "LEDGER-0008",
+                    LifecycleState::Implemented,
+                ),
+                (
+                    Construct::Join,
+                    "F-PLN.04",
+                    "LEDGER-0008",
+                    LifecycleState::Implemented,
+                ),
+                (
+                    Construct::Select,
+                    "F-PLN.05",
+                    "LEDGER-0008",
+                    LifecycleState::Implemented,
+                ),
+                (
+                    Construct::Subquery,
+                    "F-PLN.07",
+                    "LEDGER-0007",
+                    LifecycleState::Tested,
+                ),
+                (
+                    Construct::Select,
+                    "F-PLN.09",
+                    "LEDGER-0008",
+                    LifecycleState::Implemented,
+                ),
+            ] {
+                let surface_id = if feature_id == "F-PLN.07" {
+                    "SURF-SQL-COMPOUND-002"
+                } else {
+                    "SURF-SQL-CORE-001"
+                };
+                features.push(profile_feature(
+                    StatementRole::Subject,
+                    construct,
+                    feature_id,
+                    surface_id,
+                    ledger_id,
+                    "planner",
+                    ExpectedProfileStates {
+                        taxonomy: ParityTaxonomyStatus::Partial,
+                        lifecycle,
+                    },
+                ));
+            }
+            (
+                ProfileMode::Partial,
+                Some("exercise documented planner gaps without promotion claims".to_owned()),
+                standard_setup.clone(),
+                features,
+                vec![ExecutionLane::PlannerRequired],
+            )
+        }
+        NamedGeneratorProfile::VdbePartial => {
+            let mut features = setup_features();
+            features.push(profile_feature(
+                StatementRole::Subject,
+                Construct::Select,
+                "F-VDB.15",
+                "SURF-SQL-COMPOUND-002",
+                "LEDGER-0012",
+                "vdbe",
+                PARTIAL_IMPLEMENTED,
+            ));
+            (
+                ProfileMode::Partial,
+                Some(
+                    "exercise documented remaining-opcode gaps without promotion claims".to_owned(),
+                ),
+                standard_setup,
+                features,
+                vec![ExecutionLane::VdbeRequired],
+            )
+        }
+    };
+
+    features.sort_by(|left, right| {
+        (left.role, left.construct, left.feature_id.as_str()).cmp(&(
+            right.role,
+            right.construct,
+            right.feature_id.as_str(),
+        ))
+    });
+    CanonicalProfileRequest {
+        name: kind.label().to_owned(),
+        version: "1.0.0".to_owned(),
+        mode,
+        expected_gap_policy,
+        authorization_bead: None,
+        setup,
+        features,
+        required_lanes,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedProfileStates {
+    taxonomy: ParityTaxonomyStatus,
+    lifecycle: LifecycleState,
+}
+
+const PASS_TESTED: ExpectedProfileStates = ExpectedProfileStates {
+    taxonomy: ParityTaxonomyStatus::Pass,
+    lifecycle: LifecycleState::Tested,
+};
+const PASS_IMPLEMENTED: ExpectedProfileStates = ExpectedProfileStates {
+    taxonomy: ParityTaxonomyStatus::Pass,
+    lifecycle: LifecycleState::Implemented,
+};
+const PASS_DIFFERENTIALLY_VERIFIED: ExpectedProfileStates = ExpectedProfileStates {
+    taxonomy: ParityTaxonomyStatus::Pass,
+    lifecycle: LifecycleState::DifferentiallyVerified,
+};
+const PARTIAL_IMPLEMENTED: ExpectedProfileStates = ExpectedProfileStates {
+    taxonomy: ParityTaxonomyStatus::Partial,
+    lifecycle: LifecycleState::Implemented,
+};
+
+fn profile_feature(
+    role: StatementRole,
+    construct: Construct,
+    feature_id: &str,
+    surface_id: &str,
+    ledger_feature_id: &str,
+    component: &str,
+    expected: ExpectedProfileStates,
+) -> ProfileFeatureRequest {
+    ProfileFeatureRequest {
+        role,
+        construct,
+        feature_id: feature_id.to_owned(),
+        surface_id: surface_id.to_owned(),
+        ledger_feature_id: ledger_feature_id.to_owned(),
+        component: component.to_owned(),
+        expected_taxonomy_status: expected.taxonomy,
+        expected_surface_state: SupportState::Supported,
+        expected_lifecycle_state: expected.lifecycle,
+    }
+}
+
+/// Derive a built-in profile from the canonical contracts and their content hashes.
+pub fn derive_named_profile(
+    workspace_root: &Path,
+    kind: NamedGeneratorProfile,
+) -> Result<GeneratorProfile, GenerationError> {
+    derive_canonical_profile(workspace_root, &named_profile_request(kind))
+}
+
+/// Derive a custom profile while enforcing the same fail-closed contract policy.
+pub fn derive_canonical_profile(
+    workspace_root: &Path,
+    request: &CanonicalProfileRequest,
+) -> Result<GeneratorProfile, GenerationError> {
+    validate_profile_request(request)?;
+    let bundle = CanonicalParityContractBundle::load(workspace_root).map_err(|error| {
+        GenerationError::invalid_input(
+            "canonical_contract_bundle",
+            format!("failed to load canonical profile contracts: {error}"),
+        )
+    })?;
+    let validation = bundle.validate(workspace_root);
+    if let Some(diagnostic) = validation.diagnostics.first() {
+        return Err(GenerationError::invalid_input(
+            "canonical_contract_bundle",
+            format!(
+                "canonical contract validation failed code={} diagnostic={}",
+                diagnostic.code, diagnostic.message
+            ),
+        ));
+    }
+
+    let authority_report = canonical_contract_authority_report(workspace_root);
+    if let Some(diagnostic) = authority_report.diagnostics.first() {
+        return Err(GenerationError::invalid_input(
+            "canonical_contract_authority",
+            format!(
+                "canonical authority validation failed code={} diagnostic={}",
+                diagnostic.code, diagnostic.message
+            ),
+        ));
+    }
+    let authority_hash = |logical_name: &str| -> Result<String, GenerationError> {
+        authority_report
+            .authorities
+            .iter()
+            .find(|authority| authority.logical_name == logical_name)
+            .map(|authority| authority.canonical_sha256.clone())
+            .filter(|hash| hash.len() == 64)
+            .ok_or_else(|| {
+                GenerationError::invalid_input(
+                    "canonical_contract_authority",
+                    format!("missing canonical SHA-256 for {logical_name}"),
+                )
+            })
+    };
+
+    let mut seen_features = BTreeSet::new();
+    let mut bindings = Vec::with_capacity(request.features.len());
+    for requested in &request.features {
+        if !seen_features.insert((requested.role, requested.feature_id.as_str())) {
+            return Err(GenerationError::invalid_input(
+                "profile.features",
+                format!(
+                    "duplicate {:?} feature request for {}",
+                    requested.role, requested.feature_id
+                ),
+            ));
+        }
+        let taxonomy = bundle
+            .parity_taxonomy
+            .features
+            .iter()
+            .find(|feature| feature.id == requested.feature_id)
+            .ok_or_else(|| {
+                GenerationError::invalid_input(
+                    "profile.feature_id",
+                    format!(
+                        "unknown taxonomy feature '{}' in canonical profile '{}'",
+                        requested.feature_id, request.name
+                    ),
+                )
+            })?;
+        let surface = bundle
+            .surface_matrix
+            .surface
+            .iter()
+            .find(|entry| entry.feature_id == requested.surface_id)
+            .ok_or_else(|| {
+                GenerationError::invalid_input(
+                    "profile.surface_id",
+                    format!(
+                        "unknown surface '{}' for taxonomy feature '{}'",
+                        requested.surface_id, requested.feature_id
+                    ),
+                )
+            })?;
+        let ledger = bundle
+            .feature_ledger
+            .features
+            .iter()
+            .find(|feature| feature.feature_id == requested.ledger_feature_id)
+            .ok_or_else(|| {
+                GenerationError::invalid_input(
+                    "profile.ledger_feature_id",
+                    format!(
+                        "unknown ledger feature '{}' for taxonomy feature '{}'",
+                        requested.ledger_feature_id, requested.feature_id
+                    ),
+                )
+            })?;
+
+        if taxonomy.status != requested.expected_taxonomy_status {
+            return Err(stale_profile_state(
+                &requested.feature_id,
+                "taxonomy_status",
+                requested.expected_taxonomy_status,
+                taxonomy.status,
+            ));
+        }
+        if surface.support_state != requested.expected_surface_state {
+            return Err(stale_profile_state(
+                &requested.feature_id,
+                "surface_state",
+                requested.expected_surface_state,
+                surface.support_state,
+            ));
+        }
+        if ledger.lifecycle_state != requested.expected_lifecycle_state {
+            return Err(stale_profile_state(
+                &requested.feature_id,
+                "lifecycle_state",
+                requested.expected_lifecycle_state,
+                ledger.lifecycle_state,
+            ));
+        }
+        if ledger.surface_id != requested.surface_id {
+            return Err(GenerationError::invalid_input(
+                "profile.contract_contradiction",
+                format!(
+                    "taxonomy feature '{}' expects surface '{}' but ledger '{}' binds '{}'",
+                    requested.feature_id,
+                    requested.surface_id,
+                    requested.ledger_feature_id,
+                    ledger.surface_id
+                ),
+            ));
+        }
+        if ledger.component != requested.component {
+            return Err(GenerationError::invalid_input(
+                "profile.contract_contradiction",
+                format!(
+                    "taxonomy feature '{}' expects component '{}' but ledger '{}' binds '{}'",
+                    requested.feature_id,
+                    requested.component,
+                    requested.ledger_feature_id,
+                    ledger.component
+                ),
+            ));
+        }
+        let family = taxonomy_family(&requested.feature_id).ok_or_else(|| {
+            GenerationError::invalid_input(
+                "profile.feature_id",
+                format!("invalid taxonomy feature id '{}'", requested.feature_id),
+            )
+        })?;
+        if expected_component_for_family(family) != Some(requested.component.as_str()) {
+            return Err(GenerationError::invalid_input(
+                "profile.component_family",
+                format!(
+                    "taxonomy feature '{}' family '{}' cannot bind component '{}'",
+                    requested.feature_id, family, requested.component
+                ),
+            ));
+        }
+
+        enforce_profile_admission(
+            request,
+            requested.role,
+            taxonomy.status,
+            surface.support_state,
+            ledger.lifecycle_state,
+        )?;
+        bindings.push(ProfileBinding {
+            role: requested.role,
+            construct: requested.construct,
+            feature_id: requested.feature_id.clone(),
+            taxonomy_status: taxonomy.status,
+            taxonomy_weight: taxonomy.weight,
+            surface_id: requested.surface_id.clone(),
+            surface_state: surface.support_state,
+            ledger_feature_id: requested.ledger_feature_id.clone(),
+            component: requested.component.clone(),
+            lifecycle_state: ledger.lifecycle_state,
+        });
+    }
+
+    bindings.sort_by(|left, right| {
+        (
+            left.role,
+            left.construct,
+            left.feature_id.as_str(),
+            left.ledger_feature_id.as_str(),
+        )
+            .cmp(&(
+                right.role,
+                right.construct,
+                right.feature_id.as_str(),
+                right.ledger_feature_id.as_str(),
+            ))
+    });
+    validate_binding_roles(request, &bindings)?;
+    let feature_weights = normalize_subject_feature_weights(&bindings)?;
+    let weights = aggregate_construct_weights(&feature_weights);
+    let mut evidence = CanonicalProfileEvidence {
+        schema_version: CANONICAL_PROFILE_SCHEMA_VERSION.to_owned(),
+        registry_schema_version: CONTRACT_AUTHORITY_REGISTRY_SCHEMA_VERSION.to_owned(),
+        profile_name: request.name.clone(),
+        profile_version: request.version.clone(),
+        setup: request.setup.clone(),
+        sqlite_target: bundle.version_contract.contract.sqlite_target,
+        taxonomy_version: bundle.parity_taxonomy.meta.version,
+        version_contract_sha256: authority_hash("sqlite_version_contract")?,
+        surface_matrix_sha256: authority_hash("supported_surface_matrix")?,
+        feature_ledger_sha256: authority_hash("feature_universe_ledger")?,
+        parity_taxonomy_sha256: authority_hash("parity_taxonomy")?,
+        mode: request.mode,
+        expected_gap_policy: request.expected_gap_policy.clone(),
+        authorization_bead: request.authorization_bead.clone(),
+        required_lanes: request.required_lanes.clone(),
+        bindings,
+        feature_weights: feature_weights.clone(),
+        profile_sha256: String::new(),
+    };
+    evidence.profile_sha256 = sha256_hex(canonical_json(&evidence)?.as_bytes());
+
+    Ok(GeneratorProfile {
+        name: request.name.clone(),
+        version: request.version.clone(),
+        setup: request.setup.clone(),
+        require_subject: true,
+        weights,
+        feature_weights,
+        canonical_evidence: Some(evidence),
+    })
+}
+
+fn validate_profile_request(request: &CanonicalProfileRequest) -> Result<(), GenerationError> {
+    for (field, value) in [
+        ("profile.name", request.name.as_str()),
+        ("profile.version", request.version.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(GenerationError::invalid_input(field, "must not be empty"));
+        }
+    }
+    if request.setup.is_empty() {
+        return Err(GenerationError::invalid_input(
+            "profile.setup",
+            "canonical profiles require explicit setup constructs",
+        ));
+    }
+    if request.features.is_empty() {
+        return Err(GenerationError::invalid_input(
+            "profile.features",
+            "canonical profiles require feature bindings",
+        ));
+    }
+    if request.required_lanes.is_empty() {
+        return Err(GenerationError::invalid_input(
+            "profile.required_lanes",
+            "canonical profiles require at least one execution lane",
+        ));
+    }
+    let mut lanes = BTreeSet::new();
+    if request
+        .required_lanes
+        .iter()
+        .any(|lane| !lanes.insert(*lane))
+    {
+        return Err(GenerationError::invalid_input(
+            "profile.required_lanes",
+            "duplicate execution lane",
+        ));
+    }
+    match request.mode {
+        ProfileMode::Required => {
+            if request
+                .expected_gap_policy
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.expected_gap_policy",
+                    "required profiles cannot carry a gap policy",
+                ));
+            }
+        }
+        ProfileMode::Partial => {
+            if request
+                .expected_gap_policy
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.expected_gap_policy",
+                    "partial profiles require a non-empty expected-gap policy",
+                ));
+            }
+        }
+        ProfileMode::FeatureDevelopment => {
+            if request
+                .authorization_bead
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.authorization_bead",
+                    "feature-development profiles require an authorization bead",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enforce_profile_admission(
+    request: &CanonicalProfileRequest,
+    role: StatementRole,
+    taxonomy_status: ParityTaxonomyStatus,
+    surface_state: SupportState,
+    lifecycle_state: LifecycleState,
+) -> Result<(), GenerationError> {
+    if lifecycle_state == LifecycleState::Declared
+        && request.mode != ProfileMode::FeatureDevelopment
+    {
+        return Err(GenerationError::invalid_input(
+            "profile.lifecycle_state",
+            "declared-only ledger features require feature-development authorization",
+        ));
+    }
+    match request.mode {
+        ProfileMode::Required => {
+            if taxonomy_status != ParityTaxonomyStatus::Pass
+                || surface_state != SupportState::Supported
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.required_admission",
+                    "required profiles admit only pass taxonomy features on supported surfaces",
+                ));
+            }
+        }
+        ProfileMode::Partial => {
+            if role == StatementRole::Setup
+                && (taxonomy_status != ParityTaxonomyStatus::Pass
+                    || surface_state != SupportState::Supported)
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.partial_setup",
+                    "partial profiles still require pass/supported setup features",
+                ));
+            }
+            if matches!(
+                taxonomy_status,
+                ParityTaxonomyStatus::Fail | ParityTaxonomyStatus::Excluded
+            ) || surface_state == SupportState::Excluded
+            {
+                return Err(GenerationError::invalid_input(
+                    "profile.partial_admission",
+                    "fail or excluded features require feature-development authorization",
+                ));
+            }
+        }
+        ProfileMode::FeatureDevelopment => {}
+    }
+    Ok(())
+}
+
+fn validate_binding_roles(
+    request: &CanonicalProfileRequest,
+    bindings: &[ProfileBinding],
+) -> Result<(), GenerationError> {
+    let setup_constructs = bindings
+        .iter()
+        .filter(|binding| binding.role == StatementRole::Setup)
+        .map(|binding| binding.construct)
+        .collect::<BTreeSet<_>>();
+    let setup_binding_count = bindings
+        .iter()
+        .filter(|binding| binding.role == StatementRole::Setup)
+        .count();
+    if setup_binding_count != setup_constructs.len() {
+        return Err(GenerationError::invalid_input(
+            "profile.setup",
+            "each setup construct must map to exactly one canonical feature",
+        ));
+    }
+    for construct in &request.setup {
+        if !setup_constructs.contains(construct) {
+            return Err(GenerationError::invalid_input(
+                "profile.setup",
+                format!("setup construct {construct:?} has no setup feature binding"),
+            ));
+        }
+    }
+    let subject_bindings = bindings
+        .iter()
+        .filter(|binding| binding.role == StatementRole::Subject)
+        .collect::<Vec<_>>();
+    if subject_bindings.is_empty() {
+        return Err(GenerationError::invalid_input(
+            "profile.subject",
+            "canonical profiles require at least one subject feature binding",
+        ));
+    }
+    if request.mode == ProfileMode::Partial
+        && !subject_bindings
+            .iter()
+            .any(|binding| binding.taxonomy_status == ParityTaxonomyStatus::Partial)
+    {
+        return Err(GenerationError::invalid_input(
+            "profile.expected_gap_policy",
+            "partial profiles must bind at least one partial subject feature",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_subject_feature_weights(
+    bindings: &[ProfileBinding],
+) -> Result<Vec<ProfileFeatureWeight>, GenerationError> {
+    let mut raw_by_feature = BTreeMap::<(String, Construct), u64>::new();
+    for binding in bindings
+        .iter()
+        .filter(|binding| binding.role == StatementRole::Subject)
+    {
+        let weight = raw_by_feature
+            .entry((binding.feature_id.clone(), binding.construct))
+            .or_default();
+        *weight = weight.saturating_add(binding.taxonomy_weight);
+    }
+    let total = raw_by_feature
+        .values()
+        .copied()
+        .fold(0_u64, u64::saturating_add);
+    if total == 0 {
+        return Err(GenerationError::exhausted_choices(
+            "profile.weights",
+            "subject taxonomy weights sum to zero",
+        ));
+    }
+
+    let target = u64::from(CANONICAL_PROFILE_WEIGHT_TOTAL);
+    let mut normalized = BTreeMap::<(String, Construct), u32>::new();
+    let mut remainders = Vec::with_capacity(raw_by_feature.len());
+    let mut assigned = 0_u64;
+    for ((feature_id, construct), raw) in raw_by_feature {
+        let scaled = raw.saturating_mul(target);
+        let base = scaled / total;
+        let remainder = scaled % total;
+        assigned = assigned.saturating_add(base);
+        normalized.insert(
+            (feature_id.clone(), construct),
+            u32::try_from(base).unwrap_or(u32::MAX),
+        );
+        remainders.push((feature_id, construct, remainder));
+    }
+    remainders.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    for (feature_id, construct, _) in remainders
+        .into_iter()
+        .take(usize::try_from(target.saturating_sub(assigned)).unwrap_or(usize::MAX))
+    {
+        let Some(value) = normalized.get_mut(&(feature_id, construct)) else {
+            return Err(GenerationError::invalid_input(
+                "profile.weights",
+                "normalized feature remainder lost its source binding",
+            ));
+        };
+        *value = value.saturating_add(1);
+    }
+    let weights = normalized
+        .into_iter()
+        .map(|((feature_id, construct), weight)| ProfileFeatureWeight {
+            feature_id,
+            construct,
+            weight,
+        })
+        .collect::<Vec<_>>();
+    let normalized_total = weights
+        .iter()
+        .fold(0_u32, |sum, entry| sum.saturating_add(entry.weight));
+    if normalized_total != CANONICAL_PROFILE_WEIGHT_TOTAL {
+        return Err(GenerationError::invalid_input(
+            "profile.weights",
+            format!(
+                "normalized subject weights total {normalized_total}, expected {CANONICAL_PROFILE_WEIGHT_TOTAL}"
+            ),
+        ));
+    }
+    Ok(weights)
+}
+
+fn aggregate_construct_weights(feature_weights: &[ProfileFeatureWeight]) -> Vec<ConstructWeight> {
+    let mut by_construct = BTreeMap::<Construct, u32>::new();
+    for feature in feature_weights {
+        let weight = by_construct.entry(feature.construct).or_default();
+        *weight = weight.saturating_add(feature.weight);
+    }
+    by_construct
+        .into_iter()
+        .map(|(construct, weight)| ConstructWeight { construct, weight })
+        .collect()
+}
+
+fn stale_profile_state(
+    feature_id: &str,
+    field: &str,
+    expected: impl fmt::Debug,
+    observed: impl fmt::Debug,
+) -> GenerationError {
+    GenerationError::invalid_input(
+        "profile.stale_contract_state",
+        format!("feature '{feature_id}' expected {field}={expected:?}, observed {observed:?}"),
+    )
+}
+
+fn taxonomy_family(feature_id: &str) -> Option<&str> {
+    let (family, ordinal) = feature_id.strip_prefix("F-")?.split_once('.')?;
+    if family.is_empty()
+        || !family.chars().all(|ch| ch.is_ascii_uppercase())
+        || ordinal.len() < 2
+        || !ordinal.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(family)
+}
+
+fn expected_component_for_family(family: &str) -> Option<&'static str> {
+    match family {
+        "SQL" => Some("parser"),
+        "PLN" => Some("planner"),
+        "VDB" => Some("vdbe"),
+        "TXN" | "PGM" => Some("core"),
+        "EXT" => Some("extension"),
+        _ => None,
     }
 }
 
@@ -995,6 +2299,16 @@ impl GeneratorConfig {
                 ),
             ));
         }
+        let setup_count = u32::try_from(self.profile.setup.len()).unwrap_or(u32::MAX);
+        if self.profile.require_subject && self.requested_statements <= setup_count {
+            return Err(GenerationError::invalid_input(
+                "requested_statements",
+                format!(
+                    "canonical profile '{}' requires more than {setup_count} statements so at least one subject is generated",
+                    self.profile.name
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -1023,7 +2337,9 @@ pub struct GenerationTraceEvent {
     pub ordinal: u32,
     pub seed_path: String,
     pub derived_seed: u64,
+    pub role: StatementRole,
     pub construct: Construct,
+    pub profile_feature_id: Option<String>,
     pub outcome: TraceOutcome,
     pub detail: String,
 }
@@ -1033,7 +2349,9 @@ pub struct GeneratedStatement {
     pub ordinal: u32,
     pub seed_path: String,
     pub derived_seed: u64,
+    pub role: StatementRole,
     pub construct: Construct,
+    pub profile_feature_id: Option<String>,
     pub ast: Statement,
     pub sql: String,
 }
@@ -1050,6 +2368,7 @@ pub struct GeneratedCase {
     pub generator_version: String,
     pub profile_name: String,
     pub profile_version: String,
+    pub canonical_profile_evidence: Option<CanonicalProfileEvidence>,
     pub root_seed: u64,
     pub statements: Vec<GeneratedStatement>,
     pub final_schema: SchemaState,
@@ -1181,14 +2500,54 @@ impl GenerationSession {
     }
 
     pub fn propose_next(&mut self) -> Result<StatementProposal, GenerationError> {
-        let construct =
-            self.bootstrap_construct(self.counters.accepted, self.counters.proposals)?;
-        self.propose_construct(construct)
+        let (role, construct, profile_feature_id) =
+            self.next_profile_construct(self.counters.accepted, self.counters.proposals)?;
+        self.propose_construct_with_role(role, construct, profile_feature_id)
     }
 
     pub fn propose_construct(
         &mut self,
         construct: Construct,
+    ) -> Result<StatementProposal, GenerationError> {
+        let profile_feature_id = if let Some(evidence) = &self.config.profile.canonical_evidence {
+            let matches = evidence
+                .bindings
+                .iter()
+                .filter(|binding| {
+                    binding.role == StatementRole::Subject && binding.construct == construct
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [binding] => Some(binding.feature_id.clone()),
+                [] => {
+                    return Err(GenerationError::invalid_input(
+                        "profile.subject",
+                        format!(
+                            "construct {construct:?} is not admitted by canonical profile '{}'",
+                            self.config.profile.name
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(GenerationError::invalid_input(
+                        "profile.subject",
+                        format!(
+                            "construct {construct:?} maps to multiple canonical features; use propose_next for weighted feature lineage"
+                        ),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        self.propose_construct_with_role(StatementRole::Subject, construct, profile_feature_id)
+    }
+
+    fn propose_construct_with_role(
+        &mut self,
+        role: StatementRole,
+        construct: Construct,
+        profile_feature_id: Option<String>,
     ) -> Result<StatementProposal, GenerationError> {
         if self.pending.is_some() {
             return Err(GenerationError::new(
@@ -1205,7 +2564,12 @@ impl GenerationSession {
         }
 
         let ordinal = self.counters.proposals;
-        let seed_path = format!("statement/{ordinal}/{construct:?}").to_ascii_lowercase();
+        let feature_seed_path = profile_feature_id.as_deref().unwrap_or("unbound");
+        let seed_path = format!(
+            "statement/{ordinal}/{}/{feature_seed_path}/{construct:?}",
+            role.label()
+        )
+        .to_ascii_lowercase();
         let derived_seed = derive_seed(self.config.root_seed, &seed_path);
         let mut rng = StableRng::new(derived_seed);
         let ast = self.generate_statement(construct, &mut rng)?;
@@ -1216,7 +2580,9 @@ impl GenerationSession {
             ordinal,
             seed_path: seed_path.clone(),
             derived_seed,
+            role,
             construct,
+            profile_feature_id: profile_feature_id.clone(),
             ast,
             sql,
         };
@@ -1230,7 +2596,9 @@ impl GenerationSession {
             ordinal,
             seed_path,
             derived_seed,
+            role,
             construct,
+            profile_feature_id: profile_feature_id.clone(),
             outcome: TraceOutcome::Proposed,
             detail: "candidate generated without mutating schema".to_owned(),
         });
@@ -1238,7 +2606,9 @@ impl GenerationSession {
             root_seed = self.config.root_seed,
             derived_seed,
             ordinal,
+            role = %role.label(),
             construct = ?construct,
+            profile_feature_id = ?profile_feature_id,
             "typed SQL statement proposed"
         );
         self.pending = Some(proposal.clone());
@@ -1254,7 +2624,9 @@ impl GenerationSession {
             ordinal: proposal.statement.ordinal,
             seed_path: proposal.statement.seed_path.clone(),
             derived_seed: proposal.statement.derived_seed,
+            role: proposal.statement.role,
             construct: proposal.statement.construct,
+            profile_feature_id: proposal.statement.profile_feature_id.clone(),
             outcome: TraceOutcome::Accepted,
             detail: "caller accepted proposal after engine validation".to_owned(),
         });
@@ -1279,7 +2651,9 @@ impl GenerationSession {
             ordinal: proposal.statement.ordinal,
             seed_path: proposal.statement.seed_path,
             derived_seed: proposal.statement.derived_seed,
+            role: proposal.statement.role,
             construct: proposal.statement.construct,
+            profile_feature_id: proposal.statement.profile_feature_id,
             outcome: TraceOutcome::Rejected,
             detail: reason.into(),
         });
@@ -1303,6 +2677,34 @@ impl GenerationSession {
                 ),
             ));
         }
+        if let Some(evidence) = &self.config.profile.canonical_evidence {
+            for statement in &self.statements {
+                let Some(feature_id) = statement.profile_feature_id.as_deref() else {
+                    return Err(GenerationError::invalid_input(
+                        "profile.feature_lineage",
+                        format!(
+                            "canonical statement ordinal {} is missing its feature id",
+                            statement.ordinal
+                        ),
+                    ));
+                };
+                if !evidence.bindings.iter().any(|binding| {
+                    binding.role == statement.role
+                        && binding.construct == statement.construct
+                        && binding.feature_id == feature_id
+                }) {
+                    return Err(GenerationError::invalid_input(
+                        "profile.feature_lineage",
+                        format!(
+                            "canonical statement ordinal {} has unknown binding role={} construct={:?} feature_id={feature_id}",
+                            statement.ordinal,
+                            statement.role.label(),
+                            statement.construct
+                        ),
+                    ));
+                }
+            }
+        }
 
         let sql_script = self
             .statements
@@ -1317,6 +2719,7 @@ impl GenerationSession {
             generator_version: GENERATOR_VERSION.to_owned(),
             profile_name: self.config.profile.name,
             profile_version: self.config.profile.version,
+            canonical_profile_evidence: self.config.profile.canonical_evidence,
             root_seed: self.config.root_seed,
             statements: self.statements,
             final_schema: self.schema,
@@ -1340,29 +2743,49 @@ impl GenerationSession {
         Ok(generated)
     }
 
-    fn bootstrap_construct(
+    fn next_profile_construct(
         &self,
         accepted_ordinal: u32,
         proposal_ordinal: u32,
-    ) -> Result<Construct, GenerationError> {
-        let mandatory = [
-            Construct::CreateTable,
-            Construct::CreateTable,
-            Construct::CreateIndex,
-            Construct::Insert,
-            Construct::Insert,
-            Construct::Transaction,
-            Construct::Update,
-            Construct::Transaction,
-        ];
-        if let Some(construct) =
-            mandatory.get(usize::try_from(accepted_ordinal).unwrap_or(usize::MAX))
+    ) -> Result<(StatementRole, Construct, Option<String>), GenerationError> {
+        if let Some(construct) = self
+            .config
+            .profile
+            .setup
+            .get(usize::try_from(accepted_ordinal).unwrap_or(usize::MAX))
         {
-            return Ok(*construct);
+            let feature_id = self
+                .config
+                .profile
+                .canonical_evidence
+                .as_ref()
+                .and_then(|evidence| {
+                    evidence.bindings.iter().find(|binding| {
+                        binding.role == StatementRole::Setup && binding.construct == *construct
+                    })
+                })
+                .map(|binding| binding.feature_id.clone());
+            if self.config.profile.canonical_evidence.is_some() && feature_id.is_none() {
+                return Err(GenerationError::invalid_input(
+                    "profile.setup",
+                    format!("setup construct {construct:?} lost its canonical feature binding"),
+                ));
+            }
+            return Ok((StatementRole::Setup, *construct, feature_id));
         }
         let seed_path = format!("statement/{proposal_ordinal}/weighted_construct");
         let seed = derive_seed(self.config.root_seed, &seed_path);
-        choose_weighted(&self.config.profile.weights, seed)
+        if self.config.profile.feature_weights.is_empty() {
+            return choose_weighted(&self.config.profile.weights, seed)
+                .map(|construct| (StatementRole::Subject, construct, None));
+        }
+        choose_weighted_feature(&self.config.profile.feature_weights, seed).map(|feature| {
+            (
+                StatementRole::Subject,
+                feature.construct,
+                Some(feature.feature_id.clone()),
+            )
+        })
     }
 
     fn take_matching_proposal(
@@ -1982,6 +3405,33 @@ fn choose_weighted(
     ))
 }
 
+fn choose_weighted_feature(
+    choices: &[ProfileFeatureWeight],
+    random_value: u64,
+) -> Result<&ProfileFeatureWeight, GenerationError> {
+    let total = choices.iter().fold(0_u64, |sum, entry| {
+        sum.saturating_add(u64::from(entry.weight))
+    });
+    if total == 0 {
+        return Err(GenerationError::exhausted_choices(
+            "profile.feature_weights",
+            "weighted feature choice has no positive entries",
+        ));
+    }
+    let mut target = random_value % total;
+    for entry in choices {
+        let weight = u64::from(entry.weight);
+        if target < weight {
+            return Ok(entry);
+        }
+        target -= weight;
+    }
+    Err(GenerationError::exhausted_choices(
+        "profile.feature_weights",
+        "weighted feature choice traversal exhausted unexpectedly",
+    ))
+}
+
 fn ident(value: impl Into<String>) -> Result<Identifier, GenerationError> {
     Identifier::new(value)
 }
@@ -2057,6 +3507,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 /// SplitMix64 is specified here rather than delegated to a dependency whose
 /// stream may change between releases.
 struct StableRng {
@@ -2094,6 +3551,7 @@ impl StableRng {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -2137,6 +3595,375 @@ mod tests {
             (fsqlite_outcome, sqlite_outcome) => Err(format!(
                 "SQL {sql:?}: FrankenSQLite={fsqlite_outcome:?}, C SQLite={sqlite_outcome:?}"
             )),
+        }
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    #[cfg(unix)]
+    fn copy_profile_contract_fixture(source_root: &Path, fixture_root: &Path) {
+        use std::os::unix::fs::symlink;
+
+        use crate::canonical_parity_contract::{
+            CANONICAL_CONTRACT_AUTHORITIES, PARITY_SCORE_CONTRACT_PATH,
+        };
+
+        fs::create_dir_all(fixture_root.join("docs/contracts"))
+            .expect("create fixture contract directory");
+        for authority in CANONICAL_CONTRACT_AUTHORITIES {
+            fs::copy(
+                source_root.join(authority.canonical_path),
+                fixture_root.join(authority.canonical_path),
+            )
+            .expect("copy canonical contract");
+            fs::copy(
+                source_root.join(authority.inert_root_path),
+                fixture_root.join(authority.inert_root_path),
+            )
+            .expect("copy inert root pointer");
+        }
+        fs::copy(
+            source_root.join(PARITY_SCORE_CONTRACT_PATH),
+            fixture_root.join(PARITY_SCORE_CONTRACT_PATH),
+        )
+        .expect("copy parity score contract");
+        for path in ["AGENTS.md", "README.md"] {
+            fs::copy(source_root.join(path), fixture_root.join(path))
+                .expect("copy root evidence file");
+        }
+        symlink(source_root.join("crates"), fixture_root.join("crates"))
+            .expect("link contract evidence tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_registry_fixture_derives_and_contract_drift_fails_closed() {
+        use crate::canonical_parity_contract::PARITY_TAXONOMY_PATH;
+
+        let root = workspace_root();
+        let fixture = tempfile::tempdir().expect("temporary canonical fixture");
+        copy_profile_contract_fixture(&root, fixture.path());
+
+        let profile = derive_named_profile(fixture.path(), NamedGeneratorProfile::ReadOnly)
+            .expect("temporary canonical registry should derive profile");
+        validate_canonical_profile_evidence(
+            profile
+                .canonical_evidence
+                .as_ref()
+                .expect("canonical profile evidence"),
+        )
+        .unwrap();
+
+        let taxonomy_path = fixture.path().join(PARITY_TAXONOMY_PATH);
+        let taxonomy = fs::read_to_string(&taxonomy_path).expect("read fixture taxonomy");
+        let drifted = taxonomy.replacen("id = \"F-SQL.02\"", "id = \"F-SQL.01\"", 1);
+        assert_ne!(
+            taxonomy, drifted,
+            "fixture must contain the pinned feature ID"
+        );
+        fs::write(&taxonomy_path, drifted).expect("write duplicate feature fixture");
+        let error = derive_named_profile(fixture.path(), NamedGeneratorProfile::ReadOnly)
+            .expect_err("duplicate canonical feature ID must fail closed");
+        assert_eq!(error.constraint, "canonical_contract_bundle");
+        assert!(error.message.contains("duplicate_taxonomy_feature_id"));
+        assert!(error.message.contains(PARITY_TAXONOMY_PATH));
+    }
+
+    #[test]
+    fn every_named_profile_derives_with_exact_contract_and_weight_evidence() {
+        let root = workspace_root();
+        for kind in [
+            NamedGeneratorProfile::SupportedCore,
+            NamedGeneratorProfile::ReadOnly,
+            NamedGeneratorProfile::Dml,
+            NamedGeneratorProfile::Planner,
+            NamedGeneratorProfile::Vdbe,
+            NamedGeneratorProfile::Transaction,
+            NamedGeneratorProfile::Mvcc,
+            NamedGeneratorProfile::PlannerPartial,
+            NamedGeneratorProfile::VdbePartial,
+        ] {
+            let profile = derive_named_profile(&root, kind)
+                .unwrap_or_else(|error| panic!("profile {kind:?} failed: {error}"));
+            assert_eq!(
+                profile
+                    .weights
+                    .iter()
+                    .map(|entry| entry.weight)
+                    .sum::<u32>(),
+                CANONICAL_PROFILE_WEIGHT_TOTAL
+            );
+            assert!(profile.require_subject);
+            let evidence = profile
+                .canonical_evidence
+                .as_ref()
+                .expect("named profile evidence");
+            assert_eq!(evidence.profile_name, kind.label());
+            assert_eq!(evidence.sqlite_target, "3.52.0");
+            assert_eq!(evidence.taxonomy_version, "1.0.0");
+            assert_eq!(evidence.profile_sha256.len(), 64);
+            assert_eq!(evidence.version_contract_sha256.len(), 64);
+            assert_eq!(evidence.surface_matrix_sha256.len(), 64);
+            assert_eq!(evidence.feature_ledger_sha256.len(), 64);
+            assert_eq!(evidence.parity_taxonomy_sha256.len(), 64);
+            validate_canonical_profile_evidence(evidence).unwrap();
+            assert!(!evidence.required_lanes.is_empty());
+            assert!(evidence.bindings.iter().any(|binding| {
+                binding.role == StatementRole::Setup
+                    && binding.taxonomy_status == ParityTaxonomyStatus::Pass
+                    && binding.surface_state == SupportState::Supported
+            }));
+            assert!(evidence.bindings.iter().any(|binding| {
+                binding.role == StatementRole::Subject
+                    && (evidence.mode == ProfileMode::Partial
+                        || binding.taxonomy_status == ParityTaxonomyStatus::Pass)
+            }));
+        }
+    }
+
+    #[test]
+    fn profile_derivation_is_deterministic_and_hash_covers_evidence() {
+        let root = workspace_root();
+        let first = derive_named_profile(&root, NamedGeneratorProfile::SupportedCore).unwrap();
+        let second = derive_named_profile(&root, NamedGeneratorProfile::SupportedCore).unwrap();
+        assert_eq!(first, second);
+        let mut evidence = first.canonical_evidence.expect("canonical evidence");
+        let expected_hash = evidence.profile_sha256.clone();
+        evidence.profile_sha256.clear();
+        assert_eq!(
+            sha256_hex(canonical_json(&evidence).unwrap().as_bytes()),
+            expected_hash
+        );
+        evidence.profile_sha256 = expected_hash;
+        evidence.taxonomy_version.push_str("-altered");
+        assert_eq!(
+            validate_canonical_profile_evidence(&evidence)
+                .unwrap_err()
+                .constraint,
+            "profile.canonical_evidence.profile_sha256"
+        );
+    }
+
+    #[test]
+    fn canonical_setup_and_subject_roles_do_not_leak() {
+        let root = workspace_root();
+        let profile = derive_named_profile(&root, NamedGeneratorProfile::ReadOnly).unwrap();
+        let setup_len = profile.setup.len();
+        let mut too_short = GeneratorConfig::bootstrap(
+            TEST_SEED,
+            u32::try_from(setup_len).expect("bounded setup length"),
+        );
+        too_short.profile = profile.clone();
+        assert_eq!(
+            generate_case(too_short).unwrap_err().constraint,
+            "requested_statements"
+        );
+
+        let requested = u32::try_from(setup_len + 8).unwrap();
+        let generated = generate_case(GeneratorConfig {
+            root_seed: TEST_SEED,
+            requested_statements: requested,
+            profile: profile.clone(),
+            budget: GenerationBudget::default(),
+        })
+        .unwrap();
+        assert!(
+            generated.statements[..setup_len]
+                .iter()
+                .all(|statement| statement.role == StatementRole::Setup)
+        );
+        assert!(
+            generated.statements[setup_len..]
+                .iter()
+                .all(|statement| statement.role == StatementRole::Subject)
+        );
+        let subject_constructs = profile
+            .weights
+            .iter()
+            .map(|weight| weight.construct)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            generated.statements[setup_len..]
+                .iter()
+                .all(|statement| subject_constructs.contains(&statement.construct))
+        );
+        assert!(generated.trace.iter().all(|event| {
+            generated.statements.iter().any(|statement| {
+                event.ordinal == statement.ordinal
+                    && event.role == statement.role
+                    && event.construct == statement.construct
+            })
+        }));
+    }
+
+    #[test]
+    fn stale_unknown_duplicate_and_partial_profile_requests_fail_closed() {
+        let root = workspace_root();
+
+        let mut unknown = named_profile_request(NamedGeneratorProfile::ReadOnly);
+        unknown.features[0].feature_id = "F-SQL.999".to_owned();
+        assert_eq!(
+            derive_canonical_profile(&root, &unknown)
+                .unwrap_err()
+                .constraint,
+            "profile.feature_id"
+        );
+
+        let mut duplicate = named_profile_request(NamedGeneratorProfile::ReadOnly);
+        duplicate.features.push(duplicate.features[0].clone());
+        assert_eq!(
+            derive_canonical_profile(&root, &duplicate)
+                .unwrap_err()
+                .constraint,
+            "profile.features"
+        );
+
+        let mut stale = named_profile_request(NamedGeneratorProfile::ReadOnly);
+        stale.features[0].expected_taxonomy_status = ParityTaxonomyStatus::Partial;
+        assert_eq!(
+            derive_canonical_profile(&root, &stale)
+                .unwrap_err()
+                .constraint,
+            "profile.stale_contract_state"
+        );
+
+        let mut contradiction = named_profile_request(NamedGeneratorProfile::ReadOnly);
+        contradiction.features[0].component = "planner".to_owned();
+        assert_eq!(
+            derive_canonical_profile(&root, &contradiction)
+                .unwrap_err()
+                .constraint,
+            "profile.contract_contradiction"
+        );
+
+        let mut partial = named_profile_request(NamedGeneratorProfile::PlannerPartial);
+        partial.expected_gap_policy = None;
+        assert_eq!(
+            derive_canonical_profile(&root, &partial)
+                .unwrap_err()
+                .constraint,
+            "profile.expected_gap_policy"
+        );
+    }
+
+    #[test]
+    fn excluded_declared_features_require_explicit_development_authorization() {
+        let root = workspace_root();
+        let mut request = named_profile_request(NamedGeneratorProfile::Dml);
+        request.mode = ProfileMode::FeatureDevelopment;
+        request.name = "fts3_feature_development".to_owned();
+        request
+            .features
+            .retain(|feature| feature.role == StatementRole::Setup);
+        request.features.push(ProfileFeatureRequest {
+            role: StatementRole::Subject,
+            construct: Construct::Select,
+            feature_id: "F-EXT.01".to_owned(),
+            surface_id: "SURF-EXT-FTS3-014".to_owned(),
+            ledger_feature_id: "LEDGER-0019".to_owned(),
+            component: "extension".to_owned(),
+            expected_taxonomy_status: ParityTaxonomyStatus::Partial,
+            expected_surface_state: SupportState::Excluded,
+            expected_lifecycle_state: LifecycleState::Declared,
+        });
+        request.authorization_bead = None;
+        assert_eq!(
+            derive_canonical_profile(&root, &request)
+                .unwrap_err()
+                .constraint,
+            "profile.authorization_bead"
+        );
+        request.authorization_bead = Some("bd-feature-development-review".to_owned());
+        let profile = derive_canonical_profile(&root, &request).unwrap();
+        assert_eq!(
+            profile
+                .canonical_evidence
+                .expect("development evidence")
+                .authorization_bead
+                .as_deref(),
+            Some("bd-feature-development-review")
+        );
+    }
+
+    #[test]
+    fn fixed_seed_canonical_profile_executes_on_paired_engines() {
+        let root = workspace_root();
+        let profile = derive_named_profile(&root, NamedGeneratorProfile::ReadOnly).unwrap();
+        let generated = generate_case(GeneratorConfig {
+            root_seed: TEST_SEED,
+            requested_statements: u32::try_from(profile.setup.len() + 8).unwrap(),
+            profile,
+            budget: GenerationBudget::default(),
+        })
+        .unwrap();
+        let fsqlite = FsqliteExecutor::open_in_memory().unwrap();
+        let sqlite = CsqliteExecutor::open_in_memory().unwrap();
+        for statement in &generated.statements {
+            compare_paired_statement_outcome(&fsqlite, &sqlite, &statement.sql)
+                .unwrap_or_else(|error| panic!("paired engine mismatch: {error}"));
+        }
+        assert!(generated.canonical_profile_evidence.is_some());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(18))]
+
+        #[test]
+        fn canonical_profile_generation_preserves_exact_binding_lineage(
+            root_seed in any::<u64>(),
+            profile_index in 0_usize..9,
+            subject_count in 1_usize..=8,
+        ) {
+            let kinds = [
+                NamedGeneratorProfile::SupportedCore,
+                NamedGeneratorProfile::ReadOnly,
+                NamedGeneratorProfile::Dml,
+                NamedGeneratorProfile::Planner,
+                NamedGeneratorProfile::Vdbe,
+                NamedGeneratorProfile::Transaction,
+                NamedGeneratorProfile::Mvcc,
+                NamedGeneratorProfile::PlannerPartial,
+                NamedGeneratorProfile::VdbePartial,
+            ];
+            let kind = kinds
+                .get(profile_index)
+                .copied()
+                .expect("generated profile index is bounded");
+            let profile = derive_named_profile(&workspace_root(), kind)
+                .expect("named profile must derive");
+            let requested_statements = u32::try_from(profile.setup.len() + subject_count)
+                .expect("bounded statement count");
+            let generated = generate_case(GeneratorConfig {
+                root_seed,
+                requested_statements,
+                profile,
+                budget: GenerationBudget::default(),
+            })
+            .expect("canonical profile must generate");
+            let evidence = generated
+                .canonical_profile_evidence
+                .as_ref()
+                .expect("canonical evidence");
+            prop_assert_eq!(
+                evidence
+                    .feature_weights
+                    .iter()
+                    .map(|weight| weight.weight)
+                    .sum::<u32>(),
+                CANONICAL_PROFILE_WEIGHT_TOTAL
+            );
+            let lineage_is_exact = generated.statements.iter().all(|statement| {
+                statement.profile_feature_id.as_deref().is_some_and(|feature_id| {
+                    evidence.bindings.iter().any(|binding| {
+                        binding.role == statement.role
+                            && binding.construct == statement.construct
+                            && binding.feature_id == feature_id
+                    })
+                })
+            });
+            prop_assert!(lineage_is_exact);
         }
     }
 
