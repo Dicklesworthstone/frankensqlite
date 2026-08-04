@@ -17,12 +17,15 @@
 //! Run: `cargo test -p fsqlite --features fts5 --test fts5_update_idx_shadow_repro -- --nocapture`
 
 #![cfg(feature = "fts5")]
-// Every test here drives full-stack engine operations through a non-`Send`
-// `Connection`, which produces large futures held across awaits. `Box::pin` at
-// each site would add an allocation to the exact paths these regressions
-// measure without changing what they prove, so the lints are allowed at crate
-// level — the same rationale, and the same pair of lints, as
-// `fsqlite-e2e/tests/am152_allocator_race_repro.rs`.
+// Every test in this file drives full-stack engine operations through a
+// non-`Send` `Connection`, so each `.await` holds a large, non-`Send` future by
+// construction. Under the workspace's denied pedantic + nursery lint set that
+// makes `clippy::large_futures` and `clippy::future_not_send` fire at every
+// `Connection::open(..).await` here. `Box::pin` at each site would add an
+// allocation to the exact code paths these regressions measure without changing
+// anything they prove, so both lints are allowed at crate level instead. Both
+// are required: a strict run of this target reported 6 `large_futures` and 2
+// `future_not_send` errors.
 #![allow(clippy::future_not_send, clippy::large_futures)]
 
 use fsqlite::Connection;
