@@ -268,18 +268,22 @@ The generator contract should include:
   `docs/contracts/feature_universe_ledger.toml`, and
   `docs/contracts/parity_taxonomy.toml`. Warning: stale divergent duplicates
   of these files (and of `sqlite_version_contract.toml` and
-  `corpus_manifest.toml`) exist at the repository root, and some code paths
-  still resolve the root copies (`fixture_root_contract.rs:627`,
-  `feature_coverage_dashboard.rs:776`). Authority is currently distributed:
+  `corpus_manifest.toml`) exist at the repository root. The Phase-0 executable
+  inventory found no live repository-root consumer: the apparent joins in
+  `fixture_root_contract.rs:627` and `feature_coverage_dashboard.rs:776` are
+  `cfg(test)` temporary-workspace fixtures, and the remaining bare-name
+  references are report metadata or links resolved relative to the canonical
+  `docs/contracts/` directory. Authority is nevertheless distributed:
   `canonical_parity_contract.rs` declares the `docs/contracts/` paths for the
   SQLite-version, supported-surface, and feature-universe contracts;
   `fixture_root_contract.rs::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH` declares the
   corpus manifest; and `parity_taxonomy_test.rs` plus
   `scripts/verify_parity_taxonomy.sh` enforce the taxonomy path. The two
   `corpus_manifest.toml` copies already disagree on `content_hash`. Phase 0
-  must consolidate this authority, remove every live root-path read, and add a
-  drift guard before capability mapping is allowed to start. A decision record
-  or follow-up link alone does not satisfy that gate.
+  must consolidate this authority, make every root duplicate inert, reject any
+  future live root-path read, and add a drift guard before capability mapping
+  is allowed to start. A decision record or follow-up link alone does not
+  satisfy that gate.
 - Required execution lane and forbidden fallbacks.
 - Strict result/error/transaction comparison policy.
 
@@ -542,7 +546,8 @@ Deliverables:
   `fallback_boundary_inventory.toml`) and demonstrate the finer lanes the
   dispatcher must additionally expose.
 - Inventory the distributed contract-path authorities and hand the exact
-  root-path consumer list to a dedicated canonicalization task.
+  root-path reference list, including the reason each non-live reference is a
+  temporary fixture or metadata value, to a dedicated canonicalization task.
 - Consolidate the canonical contract path set under `docs/contracts/`, remove
   every live root-path read, and resolve or quarantine the divergent root-level
   duplicates of
