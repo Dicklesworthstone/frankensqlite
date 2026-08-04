@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::LazyLock;
 
+use crate::differential_v2::ResultOrdering;
 use crate::test_inventory::ExecutionLane;
 
 #[allow(dead_code)]
@@ -680,6 +681,112 @@ pub struct ArtifactEntry {
     pub size_bytes: u64,
 }
 
+/// Engine build identity retained by typed differential bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedEngineProvenance {
+    pub identity: String,
+    pub version: String,
+    pub git_sha: String,
+    pub dirty: bool,
+}
+
+/// Canonical generator/differential provenance attached to the existing
+/// failure bundle rather than introducing a typed-only bundle format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedDifferentialEvidence {
+    pub schema_version: String,
+    pub adapter_version: String,
+    pub generator_version: String,
+    pub profile_name: String,
+    pub profile_version: String,
+    pub profile_sha256: String,
+    pub case_sha256: String,
+    pub contract_sha256: BTreeMap<String, String>,
+    pub feature_ids: Vec<String>,
+    pub required_lanes: Vec<ExecutionLane>,
+    pub ordering: Vec<ResultOrdering>,
+    pub seed_lineage: Vec<String>,
+    pub subject: TypedEngineProvenance,
+    pub reference: TypedEngineProvenance,
+    pub differential_result_sha256: String,
+}
+
+impl TypedDifferentialEvidence {
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.schema_version != "fsqlite.typed-differential-evidence.v1" {
+            errors.push("typed_differential.schema_version is unsupported".to_owned());
+        }
+        for (field, value) in [
+            ("adapter_version", self.adapter_version.as_str()),
+            ("generator_version", self.generator_version.as_str()),
+            ("profile_name", self.profile_name.as_str()),
+            ("profile_version", self.profile_version.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                errors.push(format!("typed_differential.{field} must be non-empty"));
+            }
+        }
+        if !is_sha256_hex_64(&self.profile_sha256) {
+            errors.push("typed_differential.profile_sha256 must be lowercase SHA-256".to_owned());
+        }
+        if !is_sha256_hex_64(&self.case_sha256) {
+            errors.push("typed_differential.case_sha256 must be lowercase SHA-256".to_owned());
+        }
+        if self.contract_sha256.is_empty()
+            || self
+                .contract_sha256
+                .iter()
+                .any(|(name, digest)| name.trim().is_empty() || !is_sha256_hex_64(digest))
+        {
+            errors.push(
+                "typed_differential.contract_sha256 must contain named lowercase SHA-256 digests"
+                    .to_owned(),
+            );
+        }
+        if self.feature_ids.is_empty()
+            || self
+                .feature_ids
+                .iter()
+                .any(|feature| feature.trim().is_empty())
+        {
+            errors.push("typed_differential.feature_ids must be non-empty".to_owned());
+        }
+        if self.required_lanes.is_empty() {
+            errors.push("typed_differential.required_lanes must be non-empty".to_owned());
+        }
+        if self.ordering.is_empty() {
+            errors.push("typed_differential.ordering must be non-empty".to_owned());
+        }
+        if self.seed_lineage.is_empty()
+            || self
+                .seed_lineage
+                .iter()
+                .any(|entry| entry.trim().is_empty())
+        {
+            errors.push("typed_differential.seed_lineage must be non-empty".to_owned());
+        }
+        for (label, engine) in [("subject", &self.subject), ("reference", &self.reference)] {
+            if engine.identity.trim().is_empty()
+                || engine.version.trim().is_empty()
+                || engine.git_sha.trim().is_empty()
+            {
+                errors.push(format!(
+                    "typed_differential.{label} identity/version/git_sha must be non-empty"
+                ));
+            }
+        }
+        if !is_sha256_hex_64(&self.differential_result_sha256) {
+            errors.push(
+                "typed_differential.differential_result_sha256 must be lowercase SHA-256"
+                    .to_owned(),
+            );
+        }
+        errors
+    }
+}
+
 // ─── Failure Bundle ─────────────────────────────────────────────────────
 
 /// A complete failure triage package.
@@ -710,6 +817,10 @@ pub struct FailureBundle {
     pub artifacts: Vec<ArtifactEntry>,
     /// State snapshots as key-value pairs (compact representations).
     pub state_snapshots: BTreeMap<String, String>,
+    /// Typed generator/differential provenance when this failure came from
+    /// the canonical typed campaign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_differential: Option<TypedDifferentialEvidence>,
     /// Triage tags for automated classification.
     pub triage_tags: Vec<String>,
     /// Deterministic content hash over canonical payload (excludes human labels).
@@ -754,6 +865,7 @@ impl FailureBundle {
             environment: &'a EnvironmentInfo,
             artifacts: &'a [ArtifactEntry],
             state_snapshots: &'a BTreeMap<String, String>,
+            typed_differential: &'a Option<TypedDifferentialEvidence>,
             triage_tags: &'a [String],
         }
 
@@ -775,6 +887,7 @@ impl FailureBundle {
             environment: &self.environment,
             artifacts: &self.artifacts,
             state_snapshots: &self.state_snapshots,
+            typed_differential: &self.typed_differential,
             triage_tags: &self.triage_tags,
         };
         let payload = serde_json::to_string(&canonical)
@@ -838,6 +951,9 @@ impl FailureBundle {
         if self.environment.git_sha.trim().is_empty() {
             errors.push("environment.git_sha is empty".to_owned());
         }
+        if let Some(typed) = &self.typed_differential {
+            errors.extend(typed.validate());
+        }
         if !is_sha256_hex_64(&self.content_hash) {
             errors.push("content_hash must be 64 lowercase hex chars".to_owned());
         }
@@ -859,6 +975,40 @@ impl FailureBundle {
         }
 
         errors
+    }
+
+    /// Serialize a validated bundle for artifact publication.
+    pub fn to_json(&self) -> Result<String, String> {
+        let errors = self.validate();
+        if !errors.is_empty() {
+            return Err(format!(
+                "failure bundle validation failed: {}",
+                errors.join("; ")
+            ));
+        }
+        serde_json::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+
+    /// Decode and validate a bundle, rejecting truncation, corruption, or
+    /// unsupported schema identifiers.
+    pub fn from_json_strict(json: &str) -> Result<Self, String> {
+        let bundle: Self =
+            serde_json::from_str(json).map_err(|error| format!("decode error: {error}"))?;
+        if bundle.schema_version != BUNDLE_SCHEMA_VERSION {
+            return Err(format!(
+                "schema mismatch: expected {BUNDLE_SCHEMA_VERSION}, got {}",
+                bundle.schema_version
+            ));
+        }
+        let errors = bundle.validate();
+        if errors.is_empty() {
+            Ok(bundle)
+        } else {
+            Err(format!(
+                "failure bundle validation failed: {}",
+                errors.join("; ")
+            ))
+        }
     }
 
     /// Compact one-line summary for log output and index listings.
@@ -895,6 +1045,7 @@ pub struct FailureBundleBuilder {
     environment: Option<EnvironmentInfo>,
     artifacts: Vec<ArtifactEntry>,
     state_snapshots: BTreeMap<String, String>,
+    typed_differential: Option<TypedDifferentialEvidence>,
     triage_tags: Vec<String>,
 }
 
@@ -913,6 +1064,7 @@ impl FailureBundleBuilder {
             environment: None,
             artifacts: Vec::new(),
             state_snapshots: BTreeMap::new(),
+            typed_differential: None,
             triage_tags: Vec::new(),
         }
     }
@@ -988,6 +1140,13 @@ impl FailureBundleBuilder {
         self
     }
 
+    /// Attach canonical typed generator/differential provenance.
+    #[must_use]
+    pub fn typed_differential(mut self, evidence: TypedDifferentialEvidence) -> Self {
+        self.typed_differential = Some(evidence);
+        self
+    }
+
     /// Add a triage tag.
     #[must_use]
     pub fn triage_tag(mut self, tag: &str) -> Self {
@@ -1028,6 +1187,7 @@ impl FailureBundleBuilder {
             environment,
             artifacts: self.artifacts,
             state_snapshots: self.state_snapshots,
+            typed_differential: self.typed_differential,
             triage_tags: self.triage_tags,
             content_hash: String::new(),
         };

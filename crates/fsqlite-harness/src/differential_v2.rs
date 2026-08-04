@@ -93,6 +93,13 @@ pub struct ExecutionEnvelope {
     pub workload: Vec<String>,
     /// Rules governing how outputs are normalized before comparison.
     pub canonicalization: CanonicalizationRules,
+    /// Per-statement row-order semantics, aligned to `schema + workload`.
+    ///
+    /// An empty vector retains the legacy envelope-wide canonicalization
+    /// behavior. Typed campaigns must populate every entry so an `ORDER BY`
+    /// result can never be silently treated as an unordered multiset.
+    #[serde(default)]
+    pub statement_ordering: Vec<ResultOrdering>,
 }
 
 /// Engine version strings for reproducibility pinning.
@@ -170,6 +177,18 @@ impl Default for CanonicalizationRules {
     }
 }
 
+/// SQL-derived row-order semantics for one statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultOrdering {
+    /// The statement does not return rows.
+    NotApplicable,
+    /// SQL semantics require row order to be preserved exactly.
+    Ordered,
+    /// SQL leaves row order unspecified, so rows compare as a multiset.
+    UnorderedMultiset,
+}
+
 impl ExecutionEnvelope {
     /// Compute the deterministic artifact ID for this envelope.
     ///
@@ -192,6 +211,7 @@ impl ExecutionEnvelope {
             schema: &self.schema,
             workload: &self.workload,
             canonicalization: &self.canonicalization,
+            statement_ordering: &self.statement_ordering,
         };
         let json = serde_json::to_string(&canonical).expect("envelope serialization must not fail");
         sha256_hex(json.as_bytes())
@@ -214,6 +234,7 @@ impl ExecutionEnvelope {
             schema: Vec::new(),
             workload: Vec::new(),
             canonicalization: CanonicalizationRules::default(),
+            statement_ordering: Vec::new(),
         }
     }
 
@@ -276,6 +297,13 @@ impl ExecutionEnvelope {
             errors
                 .push("envelope must include at least one schema or workload statement".to_owned());
         }
+        let statement_count = self.schema.len().saturating_add(self.workload.len());
+        if !self.statement_ordering.is_empty() && self.statement_ordering.len() != statement_count {
+            errors.push(format!(
+                "envelope.statement_ordering must be empty or contain exactly {statement_count} entries, got {}",
+                self.statement_ordering.len()
+            ));
+        }
 
         errors
     }
@@ -292,6 +320,7 @@ struct CanonicalEnvelope<'a> {
     schema: &'a [String],
     workload: &'a [String],
     canonicalization: &'a CanonicalizationRules,
+    statement_ordering: &'a [ResultOrdering],
 }
 
 /// Fluent builder for `ExecutionEnvelope`.
@@ -304,6 +333,7 @@ pub struct EnvelopeBuilder {
     schema: Vec<String>,
     workload: Vec<String>,
     canonicalization: CanonicalizationRules,
+    statement_ordering: Vec<ResultOrdering>,
 }
 
 impl EnvelopeBuilder {
@@ -369,6 +399,16 @@ impl EnvelopeBuilder {
         self
     }
 
+    /// Set SQL-derived order semantics for every schema/workload statement.
+    #[must_use]
+    pub fn statement_ordering(
+        mut self,
+        ordering: impl IntoIterator<Item = ResultOrdering>,
+    ) -> Self {
+        self.statement_ordering = ordering.into_iter().collect();
+        self
+    }
+
     /// Build the envelope.
     #[must_use]
     pub fn build(self) -> ExecutionEnvelope {
@@ -382,6 +422,7 @@ impl EnvelopeBuilder {
             schema: self.schema,
             workload: self.workload,
             canonicalization: self.canonicalization,
+            statement_ordering: self.statement_ordering,
         }
     }
 }
@@ -442,6 +483,21 @@ pub struct StatementDivergence {
     pub fsqlite_outcome: StmtOutcome,
 }
 
+/// Complete comparison evidence for one executed statement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatementComparison {
+    pub index: usize,
+    pub sql: String,
+    pub ordering: ResultOrdering,
+    pub csqlite_outcome: StmtOutcome,
+    pub fsqlite_outcome: StmtOutcome,
+    pub csqlite_category: StatementOutcomeCategory,
+    pub fsqlite_category: StatementOutcomeCategory,
+    pub csqlite_transaction: TransactionOutcomeCategory,
+    pub fsqlite_transaction: TransactionOutcomeCategory,
+    pub matched: bool,
+}
+
 /// Hashes of all artifacts produced by a differential run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactHashes {
@@ -476,6 +532,9 @@ pub struct DifferentialResult {
     pub first_divergence_index: Option<usize>,
     /// All divergences.
     pub divergences: Vec<StatementDivergence>,
+    /// Both engine outcomes and semantic categories for every statement.
+    #[serde(default)]
+    pub comparisons: Vec<StatementComparison>,
     /// Logical state hash from FrankenSQLite.
     pub logical_state_hash_fsqlite: String,
     /// Logical state hash from C SQLite.
@@ -679,6 +738,7 @@ impl DifferentialResult {
             statements_matched: self.statements_matched,
             statements_mismatched: self.statements_mismatched,
             first_divergence_index: self.first_divergence_index,
+            comparisons: &self.comparisons,
             logical_state_hash_fsqlite: &self.logical_state_hash_fsqlite,
             logical_state_hash_csqlite: &self.logical_state_hash_csqlite,
             logical_state_matched: self.logical_state_matched,
@@ -696,6 +756,7 @@ struct ResultHashable<'a> {
     statements_matched: usize,
     statements_mismatched: usize,
     first_divergence_index: Option<usize>,
+    comparisons: &'a [StatementComparison],
     logical_state_hash_fsqlite: &'a str,
     logical_state_hash_csqlite: &'a str,
     logical_state_matched: bool,
@@ -1085,13 +1146,35 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
     let mut matched = 0usize;
     let mut mismatched = 0usize;
     let mut divergences = Vec::new();
+    let mut comparisons = Vec::with_capacity(statements.len());
     let mut first_divergence_index: Option<usize> = None;
 
     for (i, &sql) in statements.iter().enumerate() {
         let f_out = fsqlite_exec.run_stmt(sql);
         let c_out = csqlite_exec.run_stmt(sql);
+        let mut statement_rules = envelope.canonicalization.clone();
+        if let Some(ordering) = envelope.statement_ordering.get(i) {
+            statement_rules.unordered_results_as_multiset =
+                matches!(ordering, ResultOrdering::UnorderedMultiset);
+        }
+        let default_ordering =
+            if matches!(&f_out, StmtOutcome::Rows(_)) || matches!(&c_out, StmtOutcome::Rows(_)) {
+                if statement_rules.unordered_results_as_multiset {
+                    ResultOrdering::UnorderedMultiset
+                } else {
+                    ResultOrdering::Ordered
+                }
+            } else {
+                ResultOrdering::NotApplicable
+            };
+        let ordering = envelope
+            .statement_ordering
+            .get(i)
+            .copied()
+            .unwrap_or(default_ordering);
+        let statement_matched = outcomes_match(&f_out, &c_out, &statement_rules);
 
-        if outcomes_match(&f_out, &c_out, &envelope.canonicalization) {
+        if statement_matched {
             matched += 1;
         } else {
             mismatched += 1;
@@ -1101,10 +1184,22 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
             divergences.push(StatementDivergence {
                 index: i,
                 sql: sql.to_owned(),
-                csqlite_outcome: c_out,
-                fsqlite_outcome: f_out,
+                csqlite_outcome: c_out.clone(),
+                fsqlite_outcome: f_out.clone(),
             });
         }
+        comparisons.push(StatementComparison {
+            index: i,
+            sql: sql.to_owned(),
+            ordering,
+            csqlite_category: classify_statement_outcome(&c_out),
+            fsqlite_category: classify_statement_outcome(&f_out),
+            csqlite_transaction: classify_transaction_outcome(sql, &c_out),
+            fsqlite_transaction: classify_transaction_outcome(sql, &f_out),
+            csqlite_outcome: c_out,
+            fsqlite_outcome: f_out,
+            matched: statement_matched,
+        });
     }
 
     // Compare logical state.
@@ -1164,6 +1259,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
         statements_mismatched: mismatched,
         first_divergence_index,
         divergences,
+        comparisons,
         logical_state_hash_fsqlite: f_hash,
         logical_state_hash_csqlite: c_hash,
         logical_state_matched: state_matched,
@@ -1283,6 +1379,7 @@ fn parity_contract_error_result(
         statements_mismatched: 0,
         first_divergence_index: None,
         divergences: Vec::new(),
+        comparisons: Vec::new(),
         logical_state_hash_fsqlite: error_state_hash.clone(),
         logical_state_hash_csqlite: error_state_hash,
         logical_state_matched: false,
@@ -1657,8 +1754,10 @@ fn has_divergence(result: &DifferentialResult) -> bool {
 
 // ─── Outcome comparison with canonicalization ────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ErrorCategory {
+/// Stable semantic category for a cross-engine SQL error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCategory {
     MissingTable,
     MissingColumn,
     Syntax,
@@ -1671,10 +1770,16 @@ enum ErrorCategory {
     Io,
     Corrupt,
     Permission,
+    Timeout,
+    Cancelled,
+    Unsupported,
     Other,
 }
 
-fn error_messages_match_by_category(left: &str, right: &str) -> bool {
+/// Compare errors by known semantic category while keeping unknown errors
+/// strict. Two unrelated `Other` messages are never considered equivalent.
+#[must_use]
+pub fn error_messages_match_by_category(left: &str, right: &str) -> bool {
     let left_category = classify_error_category(left);
     let right_category = classify_error_category(right);
     if left_category != right_category {
@@ -1687,8 +1792,30 @@ fn error_messages_match_by_category(left: &str, right: &str) -> bool {
     }
 }
 
-fn classify_error_category(message: &str) -> ErrorCategory {
+/// Classify an engine error into the explicit differential taxonomy.
+#[must_use]
+pub fn classify_error_category(message: &str) -> ErrorCategory {
     let normalized = normalize_error_message(message);
+    if contains_any(&normalized, &["cancelled", "canceled", "cancellation"]) {
+        return ErrorCategory::Cancelled;
+    }
+    if contains_any(
+        &normalized,
+        &["timed out", "timeout", "deadline exceeded", "time limit"],
+    ) {
+        return ErrorCategory::Timeout;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "unsupported",
+            "not supported",
+            "not implemented",
+            "feature disabled",
+        ],
+    ) {
+        return ErrorCategory::Unsupported;
+    }
     if contains_any(&normalized, &["no such table"]) {
         return ErrorCategory::MissingTable;
     }
@@ -1775,6 +1902,68 @@ fn classify_error_category(message: &str) -> ErrorCategory {
         return ErrorCategory::Permission;
     }
     ErrorCategory::Other
+}
+
+/// Explicit result category retained by typed differential artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatementOutcomeCategory {
+    Rows,
+    Execute,
+    Error(ErrorCategory),
+}
+
+/// Classify a statement outcome without erasing its concrete values.
+#[must_use]
+pub fn classify_statement_outcome(outcome: &StmtOutcome) -> StatementOutcomeCategory {
+    match outcome {
+        StmtOutcome::Rows(_) => StatementOutcomeCategory::Rows,
+        StmtOutcome::Execute(_) => StatementOutcomeCategory::Execute,
+        StmtOutcome::Error(message) => {
+            StatementOutcomeCategory::Error(classify_error_category(message))
+        }
+    }
+}
+
+/// Explicit transaction-control result for replay and corpus evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionOutcomeCategory {
+    NotTransaction,
+    Began,
+    Committed,
+    RolledBack,
+    SavepointChanged,
+    UnexpectedRows,
+    Error(ErrorCategory),
+}
+
+/// Classify a transaction-control statement and its outcome.
+#[must_use]
+pub fn classify_transaction_outcome(
+    sql: &str,
+    outcome: &StmtOutcome,
+) -> TransactionOutcomeCategory {
+    let mut parser = Parser::from_sql(sql);
+    let Ok(statement) = parser.parse_statement() else {
+        return TransactionOutcomeCategory::NotTransaction;
+    };
+    let transaction_kind = match statement {
+        Statement::Begin(_) => TransactionOutcomeCategory::Began,
+        Statement::Commit => TransactionOutcomeCategory::Committed,
+        Statement::Rollback(_) => TransactionOutcomeCategory::RolledBack,
+        Statement::Savepoint(_) | Statement::Release(_) => {
+            TransactionOutcomeCategory::SavepointChanged
+        }
+        _ => return TransactionOutcomeCategory::NotTransaction,
+    };
+    match outcome {
+        StmtOutcome::Execute(_) => transaction_kind,
+        StmtOutcome::Rows(_) => TransactionOutcomeCategory::UnexpectedRows,
+        StmtOutcome::Error(message) => {
+            TransactionOutcomeCategory::Error(classify_error_category(message))
+        }
+    }
 }
 
 fn normalize_error_message(message: &str) -> String {
@@ -1920,10 +2109,17 @@ fn fixture_manifest_hash(envelope: &ExecutionEnvelope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[derive(Debug, Clone, Copy)]
     struct NoopExecutor {
         identity: EngineIdentity,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RowsExecutor {
+        identity: EngineIdentity,
+        rows: Vec<Vec<NormalizedValue>>,
     }
 
     impl SqlExecutor for NoopExecutor {
@@ -1933,6 +2129,20 @@ mod tests {
 
         fn query(&self, _sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
             Ok(Vec::new())
+        }
+
+        fn engine_identity(&self) -> EngineIdentity {
+            self.identity
+        }
+    }
+
+    impl SqlExecutor for RowsExecutor {
+        fn execute(&self, _sql: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+
+        fn query(&self, _sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
+            Ok(self.rows.clone())
         }
 
         fn engine_identity(&self) -> EngineIdentity {
@@ -1961,6 +2171,128 @@ mod tests {
                 .any(|error| error.contains("envelope.schema[0]")),
             "bead_id={BEAD_ID} case=parity_validate_empty_schema errors={errors:?}"
         );
+    }
+
+    #[test]
+    fn parity_contract_rejects_partial_statement_ordering() {
+        let envelope = ExecutionEnvelope::builder(7)
+            .schema(["CREATE TABLE t(id INTEGER)"])
+            .workload(["SELECT id FROM t"])
+            .statement_ordering([ResultOrdering::NotApplicable])
+            .build();
+
+        assert!(
+            envelope
+                .validate_parity_contract()
+                .iter()
+                .any(|error| error.contains("statement_ordering"))
+        );
+    }
+
+    #[test]
+    fn per_statement_ordering_preserves_order_by_and_relaxes_only_unordered_sql() {
+        let ascending = RowsExecutor {
+            identity: EngineIdentity::FrankenSqlite,
+            rows: vec![
+                vec![NormalizedValue::Integer(1)],
+                vec![NormalizedValue::Integer(2)],
+            ],
+        };
+        let descending = RowsExecutor {
+            identity: EngineIdentity::CSqliteOracle,
+            rows: vec![
+                vec![NormalizedValue::Integer(2)],
+                vec![NormalizedValue::Integer(1)],
+            ],
+        };
+        let ordered = ExecutionEnvelope::builder(9)
+            .workload(["SELECT id FROM t ORDER BY id"])
+            .statement_ordering([ResultOrdering::Ordered])
+            .build();
+        let unordered = ExecutionEnvelope::builder(9)
+            .workload(["SELECT id FROM t"])
+            .statement_ordering([ResultOrdering::UnorderedMultiset])
+            .build();
+
+        assert_eq!(
+            run_differential(&ordered, &ascending, &descending).outcome,
+            Outcome::Divergence
+        );
+        assert_eq!(
+            run_differential(&unordered, &ascending, &descending).outcome,
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn outcome_taxonomy_keeps_unknown_errors_strict_and_classifies_terminal_states() {
+        assert!(!error_messages_match_by_category(
+            "arbitrary left failure",
+            "arbitrary right failure"
+        ));
+        assert_eq!(
+            classify_statement_outcome(&StmtOutcome::Error("deadline exceeded".to_owned())),
+            StatementOutcomeCategory::Error(ErrorCategory::Timeout)
+        );
+        assert_eq!(
+            classify_statement_outcome(&StmtOutcome::Error("operation cancelled".to_owned())),
+            StatementOutcomeCategory::Error(ErrorCategory::Cancelled)
+        );
+        assert_eq!(
+            classify_statement_outcome(&StmtOutcome::Error("feature not supported".to_owned())),
+            StatementOutcomeCategory::Error(ErrorCategory::Unsupported)
+        );
+        assert_eq!(
+            classify_transaction_outcome("COMMIT", &StmtOutcome::Execute(0)),
+            TransactionOutcomeCategory::Committed
+        );
+        assert_eq!(
+            classify_transaction_outcome(
+                "ROLLBACK",
+                &StmtOutcome::Error("transaction cancelled".to_owned())
+            ),
+            TransactionOutcomeCategory::Error(ErrorCategory::Cancelled)
+        );
+    }
+
+    #[test]
+    fn typed_normalized_value_categories_round_trip_without_cross_type_collapse() {
+        let values = vec![
+            NormalizedValue::Null,
+            NormalizedValue::Integer(i64::MIN),
+            NormalizedValue::Real(1.25),
+            NormalizedValue::Text("text with spaces".to_owned()),
+            NormalizedValue::Blob(vec![0, 1, 0xfe, 0xff]),
+        ];
+        let json = serde_json::to_string(&values).expect("serialize normalized values");
+        let decoded: Vec<NormalizedValue> =
+            serde_json::from_str(&json).expect("deserialize normalized values");
+        assert_eq!(decoded, values);
+        assert!(!value_match(
+            &NormalizedValue::Text("1".to_owned()),
+            &NormalizedValue::Integer(1),
+            &CanonicalizationRules::default(),
+        ));
+        assert!(!value_match(
+            &NormalizedValue::Blob(vec![0x31]),
+            &NormalizedValue::Text("1".to_owned()),
+            &CanonicalizationRules::default(),
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_unknown_errors_never_collapse_into_equivalence(
+            left in "[a-z]{1,32}",
+            right in "[a-z]{1,32}",
+        ) {
+            prop_assume!(left != right);
+            let left = format!("opaque-left-{left}");
+            let right = format!("opaque-right-{right}");
+            prop_assert_eq!(classify_error_category(&left), ErrorCategory::Other);
+            prop_assert_eq!(classify_error_category(&right), ErrorCategory::Other);
+            prop_assert!(!error_messages_match_by_category(&left, &right));
+        }
     }
 
     #[test]

@@ -36,7 +36,13 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::differential_v2::{DifferentialResult, Outcome};
+use crate::corpus_ingest::{CorpusBuilder, CorpusSource, TypedPromotionMetadata};
+use crate::differential_runner::{
+    TypedAdapterError, TypedAdapterErrorKind, TypedDifferentialCase, TypedDifferentialRun,
+    run_typed_differential_case, typed_case_to_corpus_entry,
+};
+use crate::differential_v2::{DifferentialResult, Outcome, SqlExecutor};
+use crate::failure_bundle::{ExecutionLaneEvidence, FailureBundle};
 use crate::mismatch_minimizer::{
     MinimalReproduction, MinimizerConfig, ReproducibilityTest, Subsystem, minimize_workload,
 };
@@ -53,6 +59,327 @@ pub const REPLAY_MINIMIZATION_SCHEMA_VERSION: u32 = 1;
 pub const REPLAY_MINIMIZATION_BEAD_ID: &str = "bd-mblr.2.3.2";
 /// Schema version for bisect-ready replay manifest contracts.
 pub const BISECT_REPLAY_MANIFEST_SCHEMA_VERSION: &str = "1.0.0";
+/// Schema identifier for typed differential replay artifacts.
+pub const TYPED_DIFFERENTIAL_REPLAY_SCHEMA_VERSION: &str = "fsqlite.typed-differential-replay.v1";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn is_sha256_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+// ===========================================================================
+// Typed Differential Replay
+// ===========================================================================
+
+/// Self-contained typed case, expected result identity, lane evidence, and
+/// optional canonical failure bundle used by one-command replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypedDifferentialReplayArtifact {
+    pub schema_version: String,
+    pub case: TypedDifferentialCase,
+    pub lane_evidence: Vec<ExecutionLaneEvidence>,
+    pub expected_result_sha256: String,
+    pub expected_outcome: Outcome,
+    pub failure_bundle: Option<FailureBundle>,
+    pub content_hash: String,
+}
+
+impl TypedDifferentialReplayArtifact {
+    /// Build and validate an exact replay artifact from a completed run.
+    pub fn from_run(
+        case: TypedDifferentialCase,
+        run: &TypedDifferentialRun,
+        failure_bundle: Option<FailureBundle>,
+    ) -> Result<Self, String> {
+        let run_provenance = (
+            run.case_id.as_str(),
+            run.case_hash.as_str(),
+            run.profile_sha256.as_str(),
+            run.feature_ids.as_slice(),
+            run.required_lanes.as_slice(),
+        );
+        let case_provenance = (
+            case.case_id.as_str(),
+            case.content_hash.as_str(),
+            case.profile_sha256.as_str(),
+            case.feature_ids.as_slice(),
+            case.required_lanes.as_slice(),
+        );
+        if run_provenance != case_provenance {
+            return Err("typed replay run provenance does not match case".to_owned());
+        }
+        let mut artifact = Self {
+            schema_version: TYPED_DIFFERENTIAL_REPLAY_SCHEMA_VERSION.to_owned(),
+            case,
+            lane_evidence: run.lane_evidence.clone(),
+            expected_result_sha256: run.result.artifact_hashes.result_hash.clone(),
+            expected_outcome: run.result.outcome,
+            failure_bundle,
+            content_hash: String::new(),
+        };
+        artifact.content_hash = artifact.deterministic_hash();
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    /// Hash the replay-relevant payload while excluding the hash field itself.
+    #[must_use]
+    pub fn deterministic_hash(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.content_hash.clear();
+        let encoded = serde_json::to_vec(&canonical)
+            .expect("typed replay artifact serialization must succeed");
+        sha256_hex(&encoded)
+    }
+
+    /// Validate every cross-artifact identity and hash link.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != TYPED_DIFFERENTIAL_REPLAY_SCHEMA_VERSION {
+            return Err(format!(
+                "typed replay schema mismatch: expected {TYPED_DIFFERENTIAL_REPLAY_SCHEMA_VERSION}, got {}",
+                self.schema_version
+            ));
+        }
+        self.case
+            .validate()
+            .map_err(|error| format!("typed replay case invalid: {error:?}"))?;
+        if !is_sha256_hex_64(&self.expected_result_sha256) {
+            return Err("typed replay expected_result_sha256 is invalid".to_owned());
+        }
+        if self.lane_evidence.is_empty() {
+            return Err("typed replay lane_evidence is empty".to_owned());
+        }
+        for evidence in &self.lane_evidence {
+            let errors = evidence.validate();
+            if !errors.is_empty() {
+                return Err(format!(
+                    "typed replay lane evidence invalid: {}",
+                    errors.join("; ")
+                ));
+            }
+            if evidence.run_id != self.case.run_id
+                || evidence.trace_id != self.case.trace_id
+                || evidence.scenario_id != self.case.scenario_id
+            {
+                return Err("typed replay lane evidence identity mismatch".to_owned());
+            }
+        }
+        for required in &self.case.required_lanes {
+            if !self.lane_evidence.iter().any(|evidence| {
+                evidence.required_lane == *required && evidence.requirement_satisfied
+            }) {
+                return Err(format!(
+                    "typed replay required lane {} was not positively observed",
+                    required.label()
+                ));
+            }
+        }
+        match (&self.failure_bundle, self.expected_outcome) {
+            (Some(bundle), Outcome::Divergence) => {
+                let errors = bundle.validate();
+                if !errors.is_empty() {
+                    return Err(format!(
+                        "typed replay failure bundle invalid: {}",
+                        errors.join("; ")
+                    ));
+                }
+                let typed = bundle.typed_differential.as_ref().ok_or_else(|| {
+                    "typed replay divergence bundle lacks typed evidence".to_owned()
+                })?;
+                if bundle.run_id != self.case.run_id
+                    || bundle.scenario.scenario_id != self.case.scenario_id
+                    || typed.case_sha256 != self.case.content_hash
+                    || typed.differential_result_sha256 != self.expected_result_sha256
+                {
+                    return Err("typed replay failure bundle provenance mismatch".to_owned());
+                }
+                let snapshot = bundle
+                    .state_snapshots
+                    .get("typed_case_json")
+                    .ok_or_else(|| "typed replay bundle lacks typed_case_json".to_owned())?;
+                let snapshotted = TypedDifferentialCase::from_json_strict(snapshot)
+                    .map_err(|error| format!("typed replay case snapshot invalid: {error:?}"))?;
+                if snapshotted != self.case {
+                    return Err("typed replay case snapshot does not match artifact".to_owned());
+                }
+            }
+            (None, Outcome::Divergence) => {
+                return Err("typed replay divergence requires a failure bundle".to_owned());
+            }
+            (Some(_), Outcome::Pass | Outcome::Error) => {
+                return Err(
+                    "typed replay non-divergence must not carry a failure bundle".to_owned(),
+                );
+            }
+            (None, Outcome::Pass | Outcome::Error) => {}
+        }
+        if self.content_hash != self.deterministic_hash() {
+            return Err("typed replay content_hash mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Serialize a validated replay artifact.
+    pub fn to_json(&self) -> Result<String, String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+
+    /// Decode a replay artifact and reject truncation, corruption, or drift.
+    pub fn from_json_strict(json: &str) -> Result<Self, String> {
+        let artifact: Self = serde_json::from_str(json)
+            .map_err(|error| format!("typed replay decode failed: {error}"))?;
+        artifact.validate()?;
+        Ok(artifact)
+    }
+}
+
+/// Proof that replay observed the exact expected deterministic result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedReplayVerification {
+    pub replay_artifact_sha256: String,
+    pub expected_result_sha256: String,
+    pub observed_result_sha256: String,
+    pub expected_outcome: Outcome,
+    pub observed_outcome: Outcome,
+    pub exact_match: bool,
+}
+
+/// Evidence returned when a replay-verified typed mismatch is admitted to the
+/// normalized regression corpus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedCorpusPromotion {
+    pub entry_id: String,
+    pub entry_content_sha256: String,
+    pub mismatch_signature: String,
+    pub replay_artifact_sha256: String,
+    pub reviewed_by: String,
+}
+
+/// Replay a typed artifact through supplied public executors and require exact
+/// result and outcome identity before returning verification evidence.
+pub fn replay_typed_differential<F: SqlExecutor, C: SqlExecutor>(
+    artifact: &TypedDifferentialReplayArtifact,
+    fsqlite: &F,
+    csqlite: &C,
+) -> Result<(TypedDifferentialRun, TypedReplayVerification), TypedAdapterError> {
+    artifact
+        .validate()
+        .map_err(|error| TypedAdapterError::artifact("typed_replay.artifact", error))?;
+    let run = run_typed_differential_case(
+        &artifact.case,
+        artifact.lane_evidence.clone(),
+        fsqlite,
+        csqlite,
+    )?;
+    let verification = TypedReplayVerification {
+        replay_artifact_sha256: artifact.content_hash.clone(),
+        expected_result_sha256: artifact.expected_result_sha256.clone(),
+        observed_result_sha256: run.result.artifact_hashes.result_hash.clone(),
+        expected_outcome: artifact.expected_outcome,
+        observed_outcome: run.result.outcome,
+        exact_match: artifact.expected_result_sha256 == run.result.artifact_hashes.result_hash
+            && artifact.expected_outcome == run.result.outcome,
+    };
+    if !verification.exact_match {
+        return Err(TypedAdapterError::new(
+            TypedAdapterErrorKind::Artifact,
+            "typed_replay.result",
+            format!(
+                "replay drift: expected {} {:?}, observed {} {:?}",
+                verification.expected_result_sha256,
+                verification.expected_outcome,
+                verification.observed_result_sha256,
+                verification.observed_outcome
+            ),
+        ));
+    }
+    Ok((run, verification))
+}
+
+/// Promote a minimized typed divergence only after exact replay and explicit
+/// human review evidence are both present.
+pub fn promote_typed_divergence(
+    builder: &mut CorpusBuilder,
+    artifact: &TypedDifferentialReplayArtifact,
+    verification: &TypedReplayVerification,
+    minimal: &MinimalReproduction,
+    reviewed_by: &str,
+) -> Result<TypedCorpusPromotion, String> {
+    artifact.validate()?;
+    let observed = (
+        verification.exact_match,
+        verification.replay_artifact_sha256.as_str(),
+        verification.expected_result_sha256.as_str(),
+        verification.observed_result_sha256.as_str(),
+        verification.expected_outcome,
+        verification.observed_outcome,
+    );
+    let expected = (
+        true,
+        artifact.content_hash.as_str(),
+        artifact.expected_result_sha256.as_str(),
+        artifact.expected_result_sha256.as_str(),
+        artifact.expected_outcome,
+        artifact.expected_outcome,
+    );
+    if observed != expected {
+        return Err("typed corpus promotion requires exact replay verification".to_owned());
+    }
+    if artifact.expected_outcome != Outcome::Divergence || artifact.failure_bundle.is_none() {
+        return Err("typed corpus promotion requires a bundled divergence".to_owned());
+    }
+    let reviewed_by = reviewed_by.trim();
+    if reviewed_by.is_empty() || reviewed_by.contains('\n') || reviewed_by.contains('\r') {
+        return Err("typed corpus promotion requires a single-line reviewer identity".to_owned());
+    }
+    if minimal.original_seed != artifact.case.generated.root_seed
+        || minimal.minimal_workload.is_empty()
+        || minimal.divergences.is_empty()
+        || minimal.signature.hash.trim().is_empty()
+    {
+        return Err("typed corpus promotion minimization evidence is incomplete".to_owned());
+    }
+
+    let mut entry = typed_case_to_corpus_entry(&artifact.case);
+    entry.id = format!("typed-regression-{}", minimal.signature.hash);
+    entry.statements = artifact
+        .case
+        .envelope
+        .schema
+        .iter()
+        .chain(minimal.minimal_workload.iter())
+        .cloned()
+        .collect();
+    entry.description = format!(
+        "reviewed typed differential regression {} from {}",
+        minimal.signature.hash, artifact.case.case_id
+    );
+    let CorpusSource::TypedGenerated { promotion, .. } = &mut entry.source else {
+        return Err("typed corpus promotion produced a non-typed source".to_owned());
+    };
+    *promotion = Some(TypedPromotionMetadata {
+        mismatch_signature: minimal.signature.hash.clone(),
+        replay_artifact_sha256: artifact.content_hash.clone(),
+        reviewed_by: reviewed_by.to_owned(),
+    });
+    let report = TypedCorpusPromotion {
+        entry_id: entry.id.clone(),
+        entry_content_sha256: entry.content_hash(),
+        mismatch_signature: minimal.signature.hash.clone(),
+        replay_artifact_sha256: artifact.content_hash.clone(),
+        reviewed_by: reviewed_by.to_owned(),
+    };
+    builder.add_entry(entry);
+    Ok(report)
+}
 
 // ===========================================================================
 // Regime Classification

@@ -1,6 +1,7 @@
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -13,15 +14,23 @@ use fsqlite_harness::corpus_ingest::{
     ingest_conformance_fixtures_with_report, ingest_slt_files_with_report,
 };
 use fsqlite_harness::differential_runner::{
-    CaseResult, DifferentialRunReport, DivergenceSource, RunConfig, run_metamorphic_differential,
+    CaseResult, DifferentialRunReport, DivergenceSource, RunConfig, TypedCampaignTier,
+    TypedDifferentialRun, TypedSeedRange, TypedSeedShard, adapt_generated_case,
+    build_typed_failure_bundle, run_metamorphic_differential, run_typed_differential_case,
+    semantic_lane_evidence,
 };
 use fsqlite_harness::differential_v2::{CsqliteExecutor, FsqliteExecutor};
+use fsqlite_harness::failure_bundle::{EnvironmentInfo, TypedEngineProvenance};
 use fsqlite_harness::fixture_root_contract::{
     DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, enforce_fixture_contract_alignment,
     load_fixture_root_contract,
 };
 use fsqlite_harness::metamorphic::MismatchClassification;
 use fsqlite_harness::mismatch_minimizer::Subsystem;
+use fsqlite_harness::replay_harness::{TypedDifferentialReplayArtifact, replay_typed_differential};
+use fsqlite_harness::typed_sql_generator::{
+    GenerationBudget, GeneratorConfig, NamedGeneratorProfile, derive_named_profile, generate_case,
+};
 
 const BEAD_ID: &str = "bd-mblr.7.1.2";
 const DEFAULT_SCENARIO_ID: &str = "DIFF-712";
@@ -58,6 +67,12 @@ struct Config {
     generated_unix_ms: u128,
     skip_fixtures: bool,
     skip_slt: bool,
+    typed_profiles: Vec<NamedGeneratorProfile>,
+    typed_tier: TypedCampaignTier,
+    typed_seed_count: Option<u32>,
+    typed_shard_index: u32,
+    typed_shard_count: u32,
+    typed_replay: Option<PathBuf>,
 }
 
 impl Config {
@@ -85,6 +100,12 @@ impl Config {
         let mut generated_unix_ms = now_unix_ms();
         let mut skip_fixtures = false;
         let mut skip_slt = true;
+        let mut typed_profiles = Vec::new();
+        let mut typed_tier = TypedCampaignTier::Presubmit;
+        let mut typed_seed_count = None;
+        let mut typed_shard_index = 0_u32;
+        let mut typed_shard_count = 1_u32;
+        let mut typed_replay = None;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut index = 0_usize;
@@ -260,6 +281,57 @@ impl Config {
                 "--enable-slt" => {
                     skip_slt = false;
                 }
+                "--typed-profile" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --typed-profile".to_owned())?;
+                    let profile = parse_typed_profile(value)?;
+                    if !typed_profiles.contains(&profile) {
+                        typed_profiles.push(profile);
+                    }
+                }
+                "--typed-tier" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --typed-tier".to_owned())?;
+                    typed_tier = parse_typed_tier(value)?;
+                }
+                "--typed-seed-count" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --typed-seed-count".to_owned())?;
+                    typed_seed_count = Some(value.parse::<u32>().map_err(|error| {
+                        format!("invalid --typed-seed-count value={value}: {error}")
+                    })?);
+                }
+                "--typed-shard-index" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --typed-shard-index".to_owned())?;
+                    typed_shard_index = value.parse::<u32>().map_err(|error| {
+                        format!("invalid --typed-shard-index value={value}: {error}")
+                    })?;
+                }
+                "--typed-shard-count" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --typed-shard-count".to_owned())?;
+                    typed_shard_count = value.parse::<u32>().map_err(|error| {
+                        format!("invalid --typed-shard-count value={value}: {error}")
+                    })?;
+                }
+                "--typed-replay" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --typed-replay".to_owned())?;
+                    typed_replay = Some(PathBuf::from(value));
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -277,6 +349,37 @@ impl Config {
         }
         if let Some(max_entries) = max_entries {
             require_positive("--max-entries", max_entries)?;
+        }
+        if typed_replay.is_some() && !typed_profiles.is_empty() {
+            return Err("--typed-replay cannot be combined with --typed-profile".to_owned());
+        }
+        if !typed_profiles.is_empty() {
+            let typed_count = typed_seed_count.unwrap_or_else(|| typed_tier.default_case_count());
+            if typed_count == 0 || typed_count > typed_tier.default_case_count() {
+                return Err(format!(
+                    "--typed-seed-count must be within 1..={} for {:?}",
+                    typed_tier.default_case_count(),
+                    typed_tier
+                ));
+            }
+            TypedSeedShard {
+                range: TypedSeedRange {
+                    tier: typed_tier,
+                    start: root_seed,
+                    count: typed_count,
+                },
+                shard_index: typed_shard_index,
+                shard_count: typed_shard_count,
+            }
+            .validate()
+            .map_err(|error| format!("invalid typed shard: {error:?}"))?;
+        } else if typed_replay.is_none()
+            && (typed_seed_count.is_some()
+                || typed_tier != TypedCampaignTier::Presubmit
+                || typed_shard_index != 0
+                || typed_shard_count != 1)
+        {
+            return Err("typed campaign controls require --typed-profile".to_owned());
         }
 
         let fixture_root_manifest_path = fixture_root_manifest_path
@@ -361,6 +464,12 @@ impl Config {
             generated_unix_ms,
             skip_fixtures,
             skip_slt,
+            typed_profiles,
+            typed_tier,
+            typed_seed_count,
+            typed_shard_index,
+            typed_shard_count,
+            typed_replay,
         })
     }
 }
@@ -427,6 +536,42 @@ struct SampledPassingReplay {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct TypedCaseManifestEntry {
+    profile: String,
+    seed: u64,
+    case_id: String,
+    case_sha256: String,
+    result_sha256: String,
+    outcome: String,
+    replay_artifact_sha256: String,
+    replay_artifact_path: String,
+    replay_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TypedCampaignManifest {
+    tier: TypedCampaignTier,
+    seed_range: TypedSeedRange,
+    shard: TypedSeedShard,
+    profiles: Vec<String>,
+    requested_cases: usize,
+    assigned_cases: usize,
+    attempted_cases: usize,
+    passed_cases: usize,
+    divergent_cases: usize,
+    error_cases: usize,
+    targets_accounted: bool,
+    cases: Vec<TypedCaseManifestEntry>,
+    errors: Vec<String>,
+}
+
+impl TypedCampaignManifest {
+    const fn passed(&self) -> bool {
+        self.targets_accounted && self.divergent_cases == 0 && self.error_cases == 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct DifferentialManifest {
     schema_version: u32,
     bead_id: String,
@@ -455,6 +600,8 @@ struct DifferentialManifest {
     run_report: DifferentialRunReport,
     first_failure: Option<FirstFailureReplay>,
     sampled_passing_replays: Vec<SampledPassingReplay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    typed_campaign: Option<TypedCampaignManifest>,
     replay: ReplayCommand,
 }
 
@@ -499,9 +646,50 @@ OPTIONS:
   --max-cases-per-entry <N>      Metamorphic cases per corpus entry (default: 8)
   --max-entries <N>              Optional cap on corpus entries for faster deterministic runs (must be > 0)
   --generated-unix-ms <U128>     Deterministic timestamp for manifest fields
+  --typed-profile <NAME>         Add supported_core, read_only, or dml typed campaign profile
+  --typed-tier <TIER>            presubmit (100/profile) or nightly (10000/profile)
+  --typed-seed-count <N>         Optional bounded prefix of the tier seed budget
+  --typed-shard-index <N>        Zero-based interleaved typed seed shard (default: 0)
+  --typed-shard-count <N>        Number of typed seed shards (default: 1)
+  --typed-replay <PATH>          Replay one typed artifact instead of running a campaign
   -h, --help                     Show help
 "
     );
+}
+
+fn parse_typed_profile(value: &str) -> Result<NamedGeneratorProfile, String> {
+    match value {
+        "supported_core" | "supported-core" => Ok(NamedGeneratorProfile::SupportedCore),
+        "read_only" | "read-only" => Ok(NamedGeneratorProfile::ReadOnly),
+        "dml" => Ok(NamedGeneratorProfile::Dml),
+        _ => Err(format!(
+            "unsupported --typed-profile {value}; expected supported_core, read_only, or dml"
+        )),
+    }
+}
+
+fn typed_profile_label(profile: NamedGeneratorProfile) -> &'static str {
+    match profile {
+        NamedGeneratorProfile::SupportedCore => "supported_core",
+        NamedGeneratorProfile::ReadOnly => "read_only",
+        NamedGeneratorProfile::Dml => "dml",
+        NamedGeneratorProfile::Planner => "planner",
+        NamedGeneratorProfile::Vdbe => "vdbe",
+        NamedGeneratorProfile::Transaction => "transaction",
+        NamedGeneratorProfile::Mvcc => "mvcc",
+        NamedGeneratorProfile::PlannerPartial => "planner_partial",
+        NamedGeneratorProfile::VdbePartial => "vdbe_partial",
+    }
+}
+
+fn parse_typed_tier(value: &str) -> Result<TypedCampaignTier, String> {
+    match value {
+        "presubmit" => Ok(TypedCampaignTier::Presubmit),
+        "nightly" => Ok(TypedCampaignTier::Nightly),
+        _ => Err(format!(
+            "unsupported --typed-tier {value}; expected presubmit or nightly"
+        )),
+    }
 }
 
 fn require_positive(name: &str, value: usize) -> Result<(), String> {
@@ -565,8 +753,43 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
             )
         })?;
     }
-    fs::write(path, content)
-        .map_err(|error| format!("output_write_failed path={} error={error}", path.display()))
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("output_path_has_no_utf8_filename path={}", path.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| {
+            format!(
+                "output_temp_create_failed path={} error={error}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(content.as_bytes()).map_err(|error| {
+        format!(
+            "output_temp_write_failed path={} error={error}",
+            temporary.display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "output_temp_sync_failed path={} error={error}",
+            temporary.display()
+        )
+    })?;
+    fs::rename(&temporary, path).map_err(|error| {
+        format!(
+            "output_publish_failed temporary={} target={} error={error}",
+            temporary.display(),
+            path.display()
+        )
+    })
 }
 
 fn maybe_stream_rch_artifacts(json: &str, human: &str) {
@@ -929,6 +1152,23 @@ fn build_replay_command(config: &Config) -> String {
             config.min_slt_files, config.min_slt_entries, config.min_slt_sql_statements,
         );
     }
+    for profile in &config.typed_profiles {
+        let _ = write!(replay, " --typed-profile {}", typed_profile_label(*profile));
+    }
+    if !config.typed_profiles.is_empty() {
+        let tier = match config.typed_tier {
+            TypedCampaignTier::Presubmit => "presubmit",
+            TypedCampaignTier::Nightly => "nightly",
+        };
+        let _ = write!(
+            replay,
+            " --typed-tier {tier} --typed-shard-index {} --typed-shard-count {}",
+            config.typed_shard_index, config.typed_shard_count,
+        );
+        if let Some(count) = config.typed_seed_count {
+            let _ = write!(replay, " --typed-seed-count {count}");
+        }
+    }
     replay
 }
 
@@ -999,6 +1239,34 @@ fn validate_manifest_replay_contract(manifest: &DifferentialManifest) -> Result<
             &sample.artifact_entries,
             "sampled_passing_replay.artifact_entries",
         )?;
+    }
+
+    if let Some(campaign) = &manifest.typed_campaign {
+        if campaign.profiles.is_empty()
+            || campaign.requested_cases == 0
+            || campaign.assigned_cases == 0
+            || !campaign.targets_accounted
+            || campaign.attempted_cases != campaign.assigned_cases
+            || campaign
+                .passed_cases
+                .saturating_add(campaign.divergent_cases)
+                .saturating_add(campaign.error_cases)
+                != campaign.attempted_cases
+        {
+            return Err("typed_campaign target accounting is incomplete".to_owned());
+        }
+        for entry in &campaign.cases {
+            if entry.profile.trim().is_empty()
+                || entry.case_id.trim().is_empty()
+                || entry.case_sha256.len() != 64
+                || entry.result_sha256.len() != 64
+                || entry.replay_artifact_sha256.len() != 64
+                || entry.replay_artifact_path.trim().is_empty()
+            {
+                return Err("typed_campaign case provenance is incomplete".to_owned());
+            }
+            ensure_one_command(&entry.replay_command, "typed_campaign.replay_command")?;
+        }
     }
 
     Ok(())
@@ -1078,6 +1346,41 @@ fn build_human_summary(manifest: &DifferentialManifest) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let typed_campaign_section = manifest.typed_campaign.as_ref().map_or_else(
+        || "none".to_owned(),
+        |campaign| {
+            let cases = campaign
+                .cases
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "- profile=`{}` seed=`{}` outcome=`{}` case=`{}` result=`{}` artifact=`{}`\n  replay=`{}`",
+                        entry.profile,
+                        entry.seed,
+                        entry.outcome,
+                        entry.case_id,
+                        entry.result_sha256,
+                        entry.replay_artifact_path,
+                        entry.replay_command,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "tier: `{:?}`\nprofiles: `{}`\nrequested_cases: `{}`\nassigned_cases: `{}`\nattempted_cases: `{}`\npassed_cases: `{}`\ndivergent_cases: `{}`\nerror_cases: `{}`\ntargets_accounted: `{}`\n{}",
+                campaign.tier,
+                campaign.profiles.join(","),
+                campaign.requested_cases,
+                campaign.assigned_cases,
+                campaign.attempted_cases,
+                campaign.passed_cases,
+                campaign.divergent_cases,
+                campaign.error_cases,
+                campaign.targets_accounted,
+                cases,
+            )
+        },
+    );
 
     format!(
         "# Differential Manifest ({BEAD_ID})\n\n\
@@ -1119,6 +1422,8 @@ first_failure_root_cause_domain: `{}`\n\n\
 ## First Failure Remediation\n\n\
 {}\n\n\
 ## Sampled Passing Replays\n\n\
+{}\n\n\
+## Typed Campaign\n\n\
 {}\n",
         manifest.run_id,
         manifest.trace_id,
@@ -1155,6 +1460,7 @@ first_failure_root_cause_domain: `{}`\n\n\
         first_failure_replay,
         first_failure_remediation,
         sampled_passing_section,
+        typed_campaign_section,
     )
 }
 
@@ -1204,9 +1510,288 @@ fn differential_manifest_written_log_line(
     )
 }
 
+fn repository_is_dirty(workspace_root: &Path) -> bool {
+    Command::new("git")
+        .args([
+            "-C",
+            &workspace_root.display().to_string(),
+            "status",
+            "--porcelain",
+        ])
+        .output()
+        .map_or(true, |output| {
+            !output.status.success() || !output.stdout.is_empty()
+        })
+}
+
+fn typed_environment(config: &Config, commit_sha: &str) -> EnvironmentInfo {
+    let platform = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
+    let mut environment = EnvironmentInfo::new(commit_sha, "rust-toolchain.toml", &platform);
+    environment.extra.insert(
+        "generated_unix_ms".to_owned(),
+        config.generated_unix_ms.to_string(),
+    );
+    environment
+}
+
+fn typed_replay_artifact_path(config: &Config, case_id: &str) -> PathBuf {
+    config
+        .output_json
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("typed-replays")
+        .join(format!("{case_id}.json"))
+}
+
+fn typed_replay_command(config: &Config, artifact_path: &Path) -> Result<String, String> {
+    let verification_json = artifact_path.with_extension("verification.json");
+    let verification_human = artifact_path.with_extension("verification.md");
+    ensure_one_command(
+        &format!(
+            "cargo run --locked -p fsqlite-harness --bin differential_manifest_runner -- --workspace-root {} --fixture-root-manifest {} --typed-replay {} --output-json {} --output-human {} --generated-unix-ms {}",
+            shell_single_quote(&path_to_utf8(&config.workspace_root)),
+            shell_single_quote(&path_to_utf8(&config.fixture_root_manifest_path)),
+            shell_single_quote(&path_to_utf8(artifact_path)),
+            shell_single_quote(&path_to_utf8(&verification_json)),
+            shell_single_quote(&path_to_utf8(&verification_human)),
+            config.generated_unix_ms,
+        ),
+        "typed_replay.command",
+    )
+}
+
+fn run_typed_replay_mode(config: &Config, artifact_path: &Path) -> Result<bool, String> {
+    let json = fs::read_to_string(artifact_path).map_err(|error| {
+        format!(
+            "typed_replay_read_failed path={} error={error}",
+            artifact_path.display()
+        )
+    })?;
+    let artifact = TypedDifferentialReplayArtifact::from_json_strict(&json)?;
+    let fsqlite = FsqliteExecutor::open_in_memory()?;
+    let csqlite = CsqliteExecutor::open_in_memory()?;
+    let (_, verification) = replay_typed_differential(&artifact, &fsqlite, &csqlite)
+        .map_err(|error| format!("typed_replay_failed: {error:?}"))?;
+    let verification_json = serde_json::to_string_pretty(&verification)
+        .map_err(|error| format!("typed_replay_serialize_failed: {error}"))?;
+    let human = format!(
+        "# Typed Differential Replay\n\n- artifact: `{}`\n- case: `{}`\n- expected: `{}`\n- observed: `{}`\n- exact_match: `{}`\n",
+        artifact_path.display(),
+        artifact.case.case_id,
+        verification.expected_result_sha256,
+        verification.observed_result_sha256,
+        verification.exact_match,
+    );
+    write_text(&config.output_json, &verification_json)?;
+    write_text(&config.output_human, &human)?;
+    maybe_stream_rch_artifacts(&verification_json, &human);
+    println!(
+        "INFO typed_differential_replay_completed artifact={} case_id={} seed={} exact_match={} expected_hash={} observed_hash={}",
+        artifact_path.display(),
+        artifact.case.case_id,
+        artifact.case.generated.root_seed,
+        verification.exact_match,
+        verification.expected_result_sha256,
+        verification.observed_result_sha256,
+    );
+    Ok(verification.exact_match)
+}
+
+fn typed_failure_bundle(
+    config: &Config,
+    case: &fsqlite_harness::differential_runner::TypedDifferentialCase,
+    run: &TypedDifferentialRun,
+    replay_command: &str,
+    commit_sha: &str,
+    dirty: bool,
+) -> Result<fsqlite_harness::failure_bundle::FailureBundle, String> {
+    build_typed_failure_bundle(
+        case,
+        run,
+        &format!("generated_unix_ms={}", config.generated_unix_ms),
+        replay_command,
+        typed_environment(config, commit_sha),
+        TypedEngineProvenance {
+            identity: case.envelope.engines.subject_identity.clone(),
+            version: case.envelope.engines.fsqlite.clone(),
+            git_sha: commit_sha.to_owned(),
+            dirty,
+        },
+        TypedEngineProvenance {
+            identity: case.envelope.engines.reference_identity.clone(),
+            version: case.envelope.engines.csqlite.clone(),
+            git_sha: format!("sqlite-{}", case.envelope.engines.csqlite),
+            dirty: false,
+        },
+    )
+    .map_err(|error| format!("typed_failure_bundle_failed: {error:?}"))
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_typed_campaign(config: &Config) -> Result<Option<TypedCampaignManifest>, String> {
+    if config.typed_profiles.is_empty() {
+        return Ok(None);
+    }
+    let seed_range = TypedSeedRange {
+        tier: config.typed_tier,
+        start: config.root_seed,
+        count: config
+            .typed_seed_count
+            .unwrap_or_else(|| config.typed_tier.default_case_count()),
+    };
+    let shard = TypedSeedShard {
+        range: seed_range,
+        shard_index: config.typed_shard_index,
+        shard_count: config.typed_shard_count,
+    };
+    let seeds = shard
+        .seeds()
+        .map_err(|error| format!("typed_seed_shard_failed: {error:?}"))?;
+    let requested_cases = usize::try_from(seed_range.count)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(config.typed_profiles.len());
+    let assigned_cases = seeds.len().saturating_mul(config.typed_profiles.len());
+    let commit_sha = resolve_commit_sha(&config.workspace_root);
+    let dirty = repository_is_dirty(&config.workspace_root);
+    let mut report = TypedCampaignManifest {
+        tier: config.typed_tier,
+        seed_range,
+        shard,
+        profiles: config
+            .typed_profiles
+            .iter()
+            .map(|profile| typed_profile_label(*profile).to_owned())
+            .collect(),
+        requested_cases,
+        assigned_cases,
+        attempted_cases: 0,
+        passed_cases: 0,
+        divergent_cases: 0,
+        error_cases: 0,
+        targets_accounted: false,
+        cases: Vec::with_capacity(assigned_cases),
+        errors: Vec::new(),
+    };
+
+    for profile_kind in &config.typed_profiles {
+        let profile_label = typed_profile_label(*profile_kind);
+        let profile = match derive_named_profile(&config.workspace_root, *profile_kind) {
+            Ok(profile) => profile,
+            Err(error) => {
+                report.attempted_cases += seeds.len();
+                report.error_cases += seeds.len();
+                report.errors.push(format!(
+                    "profile={profile_label} assigned={} derivation_error={error:?}",
+                    seeds.len()
+                ));
+                continue;
+            }
+        };
+        let requested_statements = u32::try_from(profile.setup.len().saturating_add(8))
+            .map_err(|_| "typed requested statement count overflowed u32".to_owned())?;
+        for seed in &seeds {
+            report.attempted_cases += 1;
+            let generated = match generate_case(GeneratorConfig {
+                root_seed: *seed,
+                requested_statements,
+                profile: profile.clone(),
+                budget: GenerationBudget::default(),
+            }) {
+                Ok(generated) => generated,
+                Err(error) => {
+                    report.error_cases += 1;
+                    report.errors.push(format!(
+                        "profile={profile_label} seed={seed} generation_error={error:?}"
+                    ));
+                    continue;
+                }
+            };
+            let case_run_id = format!("{}-typed-{profile_label}-{seed}", config.run_id);
+            let case =
+                match adapt_generated_case(generated, case_run_id, config.scenario_id.clone()) {
+                    Ok(case) => case,
+                    Err(error) => {
+                        report.error_cases += 1;
+                        report.errors.push(format!(
+                            "profile={profile_label} seed={seed} adapter_error={error:?}"
+                        ));
+                        continue;
+                    }
+                };
+            let lane_evidence = match semantic_lane_evidence(&case) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    report.error_cases += 1;
+                    report.errors.push(format!(
+                        "profile={profile_label} seed={seed} lane_error={error:?}"
+                    ));
+                    continue;
+                }
+            };
+            let fsqlite = FsqliteExecutor::open_in_memory()?;
+            let csqlite = CsqliteExecutor::open_in_memory()?;
+            let run = match run_typed_differential_case(&case, lane_evidence, &fsqlite, &csqlite) {
+                Ok(run) => run,
+                Err(error) => {
+                    report.error_cases += 1;
+                    report.errors.push(format!(
+                        "profile={profile_label} seed={seed} execution_error={error:?}"
+                    ));
+                    continue;
+                }
+            };
+            let artifact_path = typed_replay_artifact_path(config, &case.case_id);
+            let replay_command = typed_replay_command(config, &artifact_path)?;
+            let bundle =
+                if run.result.outcome == fsqlite_harness::differential_v2::Outcome::Divergence {
+                    Some(typed_failure_bundle(
+                        config,
+                        &case,
+                        &run,
+                        &replay_command,
+                        &commit_sha,
+                        dirty,
+                    )?)
+                } else {
+                    None
+                };
+            let artifact = TypedDifferentialReplayArtifact::from_run(case.clone(), &run, bundle)?;
+            write_text(&artifact_path, &artifact.to_json()?)?;
+            match run.result.outcome {
+                fsqlite_harness::differential_v2::Outcome::Pass => report.passed_cases += 1,
+                fsqlite_harness::differential_v2::Outcome::Divergence => {
+                    report.divergent_cases += 1;
+                }
+                fsqlite_harness::differential_v2::Outcome::Error => report.error_cases += 1,
+            }
+            report.cases.push(TypedCaseManifestEntry {
+                profile: profile_label.to_owned(),
+                seed: *seed,
+                case_id: case.case_id.clone(),
+                case_sha256: case.content_hash.clone(),
+                result_sha256: run.result.artifact_hashes.result_hash.clone(),
+                outcome: run.result.outcome.to_string(),
+                replay_artifact_sha256: artifact.content_hash,
+                replay_artifact_path: path_to_utf8(&artifact_path),
+                replay_command,
+            });
+        }
+    }
+    report.targets_accounted = report.attempted_cases == report.assigned_cases
+        && report
+            .passed_cases
+            .saturating_add(report.divergent_cases)
+            .saturating_add(report.error_cases)
+            == report.attempted_cases;
+    Ok(Some(report))
+}
+
 fn run() -> Result<bool, String> {
     let run_started = Instant::now();
     let config = Config::parse()?;
+    if let Some(artifact_path) = &config.typed_replay {
+        return run_typed_replay_mode(&config, artifact_path);
+    }
 
     let mut builder = CorpusBuilder::new(config.root_seed);
     generate_seed_corpus(&mut builder);
@@ -1270,6 +1855,10 @@ fn run() -> Result<bool, String> {
     )?;
     let first_failure = first_failure_replay(&run_report, &replay_command)?;
     let sampled_passing_replays = sampled_passing_replays(&run_report, &replay_command)?;
+    let typed_campaign = run_typed_campaign(&config)?;
+    let typed_campaign_pass = typed_campaign
+        .as_ref()
+        .is_none_or(TypedCampaignManifest::passed);
 
     let manifest = DifferentialManifest {
         schema_version: 1,
@@ -1295,10 +1884,11 @@ fn run() -> Result<bool, String> {
         min_slt_entries: config.min_slt_entries,
         min_slt_sql_statements: config.min_slt_sql_statements,
         corpus_entries: entries.len(),
-        overall_pass: run_report.diverged == 0,
+        overall_pass: run_report.diverged == 0 && typed_campaign_pass,
         run_report,
         first_failure,
         sampled_passing_replays,
+        typed_campaign,
         replay: ReplayCommand {
             command: replay_command,
         },
@@ -1326,6 +1916,26 @@ fn run() -> Result<bool, String> {
         "INFO differential_manifest_replay command=\"{}\"",
         manifest.replay.command
     );
+    if let Some(campaign) = &manifest.typed_campaign {
+        println!(
+            "INFO typed_differential_campaign_completed tier={:?} profiles={} requested={} assigned={} attempted={} passed={} divergent={} errors={} targets_accounted={}",
+            campaign.tier,
+            campaign.profiles.join(","),
+            campaign.requested_cases,
+            campaign.assigned_cases,
+            campaign.attempted_cases,
+            campaign.passed_cases,
+            campaign.divergent_cases,
+            campaign.error_cases,
+            campaign.targets_accounted,
+        );
+        if let Some(first_error) = campaign.errors.first() {
+            eprintln!(
+                "ERROR typed_differential_campaign_first_failure error={first_error} additional_errors={}",
+                campaign.errors.len().saturating_sub(1)
+            );
+        }
+    }
 
     Ok(manifest.overall_pass)
 }
@@ -1478,6 +2088,12 @@ mod tests {
             generated_unix_ms: 1_700_000_000_000,
             skip_fixtures: true,
             skip_slt: true,
+            typed_profiles: Vec::new(),
+            typed_tier: TypedCampaignTier::Presubmit,
+            typed_seed_count: None,
+            typed_shard_index: 0,
+            typed_shard_count: 1,
+            typed_replay: None,
         }
     }
 
@@ -1537,6 +2153,7 @@ mod tests {
             run_report,
             first_failure,
             sampled_passing_replays,
+            typed_campaign: None,
             replay: ReplayCommand { command: replay },
         }
     }
@@ -1657,6 +2274,94 @@ mod tests {
         assert!(replay.contains("--skip-slt"));
         assert!(!replay.contains("--output-json"));
         assert!(!replay.contains("--output-human"));
+    }
+
+    #[test]
+    fn replay_command_preserves_typed_campaign_controls() {
+        let mut config = test_config();
+        config.typed_profiles = vec![
+            NamedGeneratorProfile::SupportedCore,
+            NamedGeneratorProfile::ReadOnly,
+            NamedGeneratorProfile::Dml,
+        ];
+        config.typed_tier = TypedCampaignTier::Nightly;
+        config.typed_seed_count = Some(37);
+        config.typed_shard_index = 2;
+        config.typed_shard_count = 5;
+        let replay = build_replay_command(&config);
+        assert!(replay.contains("--typed-profile supported_core"));
+        assert!(replay.contains("--typed-profile read_only"));
+        assert!(replay.contains("--typed-profile dml"));
+        assert!(replay.contains("--typed-tier nightly"));
+        assert!(replay.contains("--typed-seed-count 37"));
+        assert!(replay.contains("--typed-shard-index 2"));
+        assert!(replay.contains("--typed-shard-count 5"));
+    }
+
+    #[test]
+    fn typed_campaign_smoke_is_target_accounted_and_cleanly_replayable() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("harness crate must live under workspace/crates")
+            .to_path_buf();
+        let temp = tempfile::tempdir().expect("temporary typed campaign output");
+        let mut config = test_config();
+        config.workspace_root = workspace_root.clone();
+        config.fixture_root_manifest_path =
+            workspace_root.join("docs/contracts/corpus_manifest.toml");
+        config.output_json = temp.path().join("manifest.json");
+        config.output_human = temp.path().join("manifest.md");
+        config.typed_profiles = vec![NamedGeneratorProfile::ReadOnly];
+        config.typed_seed_count = Some(1);
+        let campaign = run_typed_campaign(&config)
+            .expect("typed campaign execution")
+            .expect("typed campaign requested");
+        assert!(campaign.targets_accounted);
+        assert_eq!(campaign.requested_cases, 1);
+        assert_eq!(campaign.assigned_cases, 1);
+        assert_eq!(campaign.attempted_cases, 1);
+        assert_eq!(campaign.passed_cases, 1, "errors={:?}", campaign.errors);
+        assert_eq!(campaign.cases.len(), 1);
+
+        let mut manifest =
+            manifest_for_validation(empty_run_report(0, 0, Vec::new()), None, Vec::new());
+        manifest.typed_campaign = Some(campaign.clone());
+        validate_manifest_replay_contract(&manifest).expect("complete target accounting");
+        manifest
+            .typed_campaign
+            .as_mut()
+            .expect("typed campaign")
+            .attempted_cases = 0;
+        assert_eq!(
+            validate_manifest_replay_contract(&manifest).unwrap_err(),
+            "typed_campaign target accounting is incomplete"
+        );
+
+        let artifact_path = PathBuf::from(&campaign.cases[0].replay_artifact_path);
+        config.output_json = temp.path().join("verification.json");
+        config.output_human = temp.path().join("verification.md");
+        assert!(run_typed_replay_mode(&config, &artifact_path).expect("clean typed replay"));
+        assert!(config.output_json.exists());
+        assert!(config.output_human.exists());
+    }
+
+    #[test]
+    fn typed_artifact_publication_replaces_complete_files_and_fails_before_partial_target() {
+        let temp = tempfile::tempdir().expect("temporary publication directory");
+        let target = temp.path().join("manifest.json");
+        write_text(&target, "old-complete").expect("publish initial artifact");
+        write_text(&target, "new-complete").expect("atomically replace artifact");
+        assert_eq!(
+            fs::read_to_string(&target).expect("read published artifact"),
+            "new-complete"
+        );
+
+        let blocking_parent = temp.path().join("not-a-directory");
+        fs::write(&blocking_parent, "blocker").expect("create blocking file");
+        let impossible_target = blocking_parent.join("manifest.json");
+        assert!(write_text(&impossible_target, "partial-must-not-appear").is_err());
+        assert!(!impossible_target.exists());
     }
 
     #[test]
@@ -1955,6 +2660,7 @@ mod tests {
                 diagnostic_json_pointer: "/run_report/sampled_passing_cases/0".to_owned(),
                 artifact_entries: replay_artifact_entries(),
             }],
+            typed_campaign: None,
             replay: ReplayCommand {
                 command: replay.clone(),
             },
@@ -2105,6 +2811,7 @@ mod tests {
             run_report,
             first_failure: None,
             sampled_passing_replays: Vec::new(),
+            typed_campaign: None,
             replay: ReplayCommand { command: replay },
         };
 

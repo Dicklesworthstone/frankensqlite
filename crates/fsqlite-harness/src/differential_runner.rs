@@ -31,15 +31,21 @@
 //! factories. The report's `data_hash` fingerprints the input corpus for
 //! traceability.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::corpus_ingest::CorpusEntry;
+use crate::corpus_ingest::{CorpusEntry, CorpusSource, Family};
 use crate::differential_v2::{
     CanonicalizationRules, DifferentialResult, ExecutionEnvelope, Outcome, PragmaConfig,
-    SqlExecutor, StatementDivergence,
+    ResultOrdering, SqlExecutor, StatementDivergence,
+};
+use crate::failure_bundle::{
+    EnvironmentInfo, ExecutionLaneEvidence, FailureBundle, FailureBundleBuilder, FailureInfo,
+    FailureType, FirstDivergence, ReproducibilityInfo, ScenarioInfo, TypedDifferentialEvidence,
+    TypedEngineProvenance,
 };
 use crate::metamorphic::{
     EquivalenceExpectation, MetamorphicTestCase, MismatchClassification, TransformRegistry,
@@ -49,12 +55,995 @@ use crate::mismatch_minimizer::{
     DeduplicatedFailures, MinimalReproduction, MinimizerConfig, attribute_subsystem, deduplicate,
     minimize_workload,
 };
+use crate::test_inventory::ExecutionLane;
+use crate::typed_sql_generator::{
+    GENERATOR_SCHEMA_VERSION, GENERATOR_VERSION, GeneratedCase, GeneratedStatement,
+    Statement as GeneratedAstStatement, StatementRole, derive_seed,
+    validate_canonical_profile_evidence,
+};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-mblr.7.1.2";
 const DEFAULT_BASE_SEED: u64 = u64::from_be_bytes(*b"\0FRANKEN");
 const PASSING_REPLAY_SAMPLE_LIMIT: usize = 3;
+/// Stable schema for typed generator-to-differential adapter artifacts.
+pub const TYPED_DIFFERENTIAL_SCHEMA_VERSION: &str = "fsqlite.typed-differential.v1";
+/// Adapter implementation version included in replay evidence.
+pub const TYPED_DIFFERENTIAL_ADAPTER_VERSION: &str = "1.0.0";
+/// Fixed presubmit cases per profile required by the Phase-1 pilot.
+pub const TYPED_PRESUBMIT_CASES_PER_PROFILE: u32 = 100;
+/// Bounded nightly cases per profile.
+pub const TYPED_NIGHTLY_CASES_PER_PROFILE: u32 = 10_000;
+
+/// Campaign tier with a fixed, reviewable seed budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedCampaignTier {
+    Presubmit,
+    Nightly,
+}
+
+impl TypedCampaignTier {
+    #[must_use]
+    pub const fn default_case_count(self) -> u32 {
+        match self {
+            Self::Presubmit => TYPED_PRESUBMIT_CASES_PER_PROFILE,
+            Self::Nightly => TYPED_NIGHTLY_CASES_PER_PROFILE,
+        }
+    }
+}
+
+/// Contiguous deterministic seed range before CI sharding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedSeedRange {
+    pub tier: TypedCampaignTier,
+    pub start: u64,
+    pub count: u32,
+}
+
+impl TypedSeedRange {
+    #[must_use]
+    pub const fn for_tier(tier: TypedCampaignTier, start: u64) -> Self {
+        Self {
+            tier,
+            start,
+            count: tier.default_case_count(),
+        }
+    }
+
+    /// Validate non-empty, non-overflowing range bounds.
+    pub fn validate(self) -> Result<(), TypedAdapterError> {
+        if self.count == 0 {
+            return Err(TypedAdapterError::invalid(
+                "seed_range.count",
+                "seed range must contain at least one seed",
+            ));
+        }
+        self.start
+            .checked_add(u64::from(self.count - 1))
+            .ok_or_else(|| TypedAdapterError::invalid("seed_range", "seed range overflows u64"))?;
+        Ok(())
+    }
+
+    /// Materialize the range in stable ascending order.
+    pub fn seeds(self) -> Result<Vec<u64>, TypedAdapterError> {
+        self.validate()?;
+        Ok((0..self.count)
+            .map(|offset| self.start + u64::from(offset))
+            .collect())
+    }
+}
+
+/// Interleaved shard of one seed range. Shards are disjoint and their union is
+/// exactly the source range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedSeedShard {
+    pub range: TypedSeedRange,
+    pub shard_index: u32,
+    pub shard_count: u32,
+}
+
+impl TypedSeedShard {
+    pub fn validate(self) -> Result<(), TypedAdapterError> {
+        self.range.validate()?;
+        if self.shard_count == 0 || self.shard_index >= self.shard_count {
+            return Err(TypedAdapterError::invalid(
+                "seed_shard",
+                format!(
+                    "shard_index={} must be less than non-zero shard_count={}",
+                    self.shard_index, self.shard_count
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn seeds(self) -> Result<Vec<u64>, TypedAdapterError> {
+        self.validate()?;
+        Ok((self.shard_index..self.range.count)
+            .step_by(usize::try_from(self.shard_count).unwrap_or(usize::MAX))
+            .map(|offset| self.range.start + u64::from(offset))
+            .collect())
+    }
+}
+
+/// Prove a complete shard set has neither gaps nor overlap.
+pub fn validate_typed_seed_shards(
+    range: TypedSeedRange,
+    shards: &[TypedSeedShard],
+) -> Result<(), TypedAdapterError> {
+    range.validate()?;
+    if shards.is_empty() {
+        return Err(TypedAdapterError::invalid(
+            "seed_shards",
+            "at least one shard is required",
+        ));
+    }
+    let expected_count = shards[0].shard_count;
+    if usize::try_from(expected_count).ok() != Some(shards.len()) {
+        return Err(TypedAdapterError::invalid(
+            "seed_shards",
+            "complete shard set must contain exactly shard_count entries",
+        ));
+    }
+    let mut indexes = BTreeSet::new();
+    let mut observed = BTreeSet::new();
+    for shard in shards {
+        shard.validate()?;
+        if shard.range != range || shard.shard_count != expected_count {
+            return Err(TypedAdapterError::invalid(
+                "seed_shards",
+                "all shards must reference the same range and shard count",
+            ));
+        }
+        if !indexes.insert(shard.shard_index) {
+            return Err(TypedAdapterError::invalid(
+                "seed_shards",
+                "duplicate shard index",
+            ));
+        }
+        for seed in shard.seeds()? {
+            if !observed.insert(seed) {
+                return Err(TypedAdapterError::invalid(
+                    "seed_shards",
+                    "seed assigned to more than one shard",
+                ));
+            }
+        }
+    }
+    let expected = range.seeds()?.into_iter().collect::<BTreeSet<_>>();
+    if observed != expected {
+        return Err(TypedAdapterError::invalid(
+            "seed_shards",
+            "shard union does not exactly cover the source range",
+        ));
+    }
+    Ok(())
+}
+
+/// Stable seed derivation retained for every generated statement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedSeedLineage {
+    pub ordinal: u32,
+    pub seed_path: String,
+    pub derived_seed: u64,
+}
+
+/// Canonical adapter artifact joining generator, comparator, replay, and
+/// corpus provenance without introducing another case format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedDifferentialCase {
+    pub schema_version: String,
+    pub adapter_version: String,
+    pub case_id: String,
+    pub run_id: String,
+    pub trace_id: String,
+    pub scenario_id: String,
+    pub profile_sha256: String,
+    pub feature_ids: Vec<String>,
+    pub required_lanes: Vec<ExecutionLane>,
+    pub ordering: Vec<ResultOrdering>,
+    pub seed_lineage: Vec<TypedSeedLineage>,
+    pub generated: GeneratedCase,
+    pub envelope: ExecutionEnvelope,
+    pub content_hash: String,
+}
+
+impl TypedDifferentialCase {
+    #[must_use]
+    pub fn deterministic_hash(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.content_hash.clear();
+        let encoded = serde_json::to_vec(&canonical)
+            .expect("typed differential case serialization must succeed");
+        sha256_hex(&encoded)
+    }
+
+    pub fn validate(&self) -> Result<(), TypedAdapterError> {
+        if self.schema_version != TYPED_DIFFERENTIAL_SCHEMA_VERSION
+            || self.adapter_version != TYPED_DIFFERENTIAL_ADAPTER_VERSION
+        {
+            return Err(TypedAdapterError::invalid(
+                "typed_case.schema",
+                "typed adapter schema/version mismatch",
+            ));
+        }
+        let evidence = self
+            .generated
+            .canonical_profile_evidence
+            .as_ref()
+            .ok_or_else(|| {
+                TypedAdapterError::unsupported(
+                    "typed_case.profile",
+                    "typed differential execution requires canonical profile evidence",
+                )
+            })?;
+        validate_canonical_profile_evidence(evidence)
+            .map_err(|error| TypedAdapterError::invalid(error.constraint, error.message))?;
+        let projection = project_generated_case(&self.generated)?;
+        if self.profile_sha256 != evidence.profile_sha256
+            || self.required_lanes != evidence.required_lanes
+            || self.case_id != projection.case_id
+            || self.trace_id != self.generated.trace_hash
+            || self.feature_ids != projection.feature_ids
+            || self.ordering != projection.ordering
+            || self.seed_lineage != projection.seed_lineage
+            || self.envelope.schema != projection.schema
+            || self.envelope.workload != projection.workload
+            || self.envelope.seed != self.generated.root_seed
+            || self.envelope.run_id.as_deref() != Some(self.run_id.as_str())
+            || self.envelope.scenario_id != self.scenario_id
+            || self.envelope.statement_ordering != self.ordering
+        {
+            return Err(TypedAdapterError::invalid(
+                "typed_case.provenance",
+                "generator, profile, lane, ordering, seed, or envelope provenance drifted",
+            ));
+        }
+        let envelope_errors = self.envelope.validate_parity_contract();
+        if !envelope_errors.is_empty() {
+            return Err(TypedAdapterError::invalid(
+                "typed_case.envelope",
+                envelope_errors.join("; "),
+            ));
+        }
+        if self.content_hash != self.deterministic_hash() {
+            return Err(TypedAdapterError::invalid(
+                "typed_case.content_hash",
+                "typed case content hash mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn to_canonical_json(&self) -> Result<String, TypedAdapterError> {
+        self.validate()?;
+        serde_json::to_string_pretty(self)
+            .map_err(|error| TypedAdapterError::artifact("typed_case_json", error.to_string()))
+    }
+
+    pub fn from_json_strict(json: &str) -> Result<Self, TypedAdapterError> {
+        let case: Self = serde_json::from_str(json).map_err(|error| {
+            TypedAdapterError::artifact("typed_case_json", format!("decode failed: {error}"))
+        })?;
+        case.validate()?;
+        Ok(case)
+    }
+}
+
+/// Typed adapter error category; unsupported input, cancellation, timeout, and
+/// artifact failures remain distinct from invalid generator evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedAdapterErrorKind {
+    InvalidInput,
+    Unsupported,
+    Cancelled,
+    Timeout,
+    LaneViolation,
+    Artifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAdapterError {
+    pub kind: TypedAdapterErrorKind,
+    pub constraint: String,
+    pub message: String,
+}
+
+impl TypedAdapterError {
+    pub(crate) fn new(
+        kind: TypedAdapterErrorKind,
+        constraint: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            constraint: constraint.into(),
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn invalid(constraint: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(TypedAdapterErrorKind::InvalidInput, constraint, message)
+    }
+
+    pub(crate) fn unsupported(constraint: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(TypedAdapterErrorKind::Unsupported, constraint, message)
+    }
+
+    pub(crate) fn artifact(constraint: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(TypedAdapterErrorKind::Artifact, constraint, message)
+    }
+}
+
+fn typed_statement_ordering(statement: &GeneratedStatement) -> ResultOrdering {
+    match &statement.ast {
+        GeneratedAstStatement::Select { select } if select.order_by.is_empty() => {
+            ResultOrdering::UnorderedMultiset
+        }
+        GeneratedAstStatement::Select { .. } => ResultOrdering::Ordered,
+        _ => ResultOrdering::NotApplicable,
+    }
+}
+
+struct TypedCaseProjection {
+    case_id: String,
+    schema: Vec<String>,
+    workload: Vec<String>,
+    ordering: Vec<ResultOrdering>,
+    feature_ids: Vec<String>,
+    seed_lineage: Vec<TypedSeedLineage>,
+}
+
+fn project_generated_case(
+    generated: &GeneratedCase,
+) -> Result<TypedCaseProjection, TypedAdapterError> {
+    if generated.schema_version != GENERATOR_SCHEMA_VERSION
+        || generated.generator_version != GENERATOR_VERSION
+    {
+        return Err(TypedAdapterError::unsupported(
+            "typed_case.generator_version",
+            "generated case schema/version is unsupported",
+        ));
+    }
+    let evidence = generated
+        .canonical_profile_evidence
+        .as_ref()
+        .ok_or_else(|| {
+            TypedAdapterError::unsupported(
+                "typed_case.profile",
+                "typed differential execution requires canonical profile evidence",
+            )
+        })?;
+    validate_canonical_profile_evidence(evidence)
+        .map_err(|error| TypedAdapterError::invalid(error.constraint, error.message))?;
+    if generated.profile_name != evidence.profile_name
+        || generated.profile_version != evidence.profile_version
+    {
+        return Err(TypedAdapterError::invalid(
+            "typed_case.profile_identity",
+            "generated profile name/version does not match canonical evidence",
+        ));
+    }
+    if generated.statements.is_empty() {
+        return Err(TypedAdapterError::invalid(
+            "typed_case.statements",
+            "generated case contains no statements",
+        ));
+    }
+
+    let sql_script = generated
+        .statements
+        .iter()
+        .map(|statement| statement.sql.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trace_json = serde_json::to_string(&generated.trace).map_err(|error| {
+        TypedAdapterError::artifact("typed_case.trace", format!("encode failed: {error}"))
+    })?;
+    let schema_json = serde_json::to_string(&generated.final_schema).map_err(|error| {
+        TypedAdapterError::artifact("typed_case.schema", format!("encode failed: {error}"))
+    })?;
+    if generated.sql_hash != sha256_hex(sql_script.as_bytes())
+        || generated.trace_hash != sha256_hex(trace_json.as_bytes())
+        || generated.schema_hash != sha256_hex(schema_json.as_bytes())
+    {
+        return Err(TypedAdapterError::invalid(
+            "typed_case.generator_hashes",
+            "generated SQL, trace, or schema hash does not match its payload",
+        ));
+    }
+
+    let mut schema = Vec::new();
+    let mut workload = Vec::new();
+    let mut ordering = Vec::with_capacity(generated.statements.len());
+    let mut feature_ids = BTreeSet::new();
+    let mut seed_lineage = Vec::with_capacity(generated.statements.len());
+    let mut subject_seen = false;
+    for statement in &generated.statements {
+        if statement.sql != statement.ast.to_sql() {
+            return Err(TypedAdapterError::invalid(
+                "typed_case.statement_sql",
+                format!(
+                    "statement ordinal {} SQL does not match its typed AST",
+                    statement.ordinal
+                ),
+            ));
+        }
+        if statement.seed_path.trim().is_empty()
+            || statement.derived_seed != derive_seed(generated.root_seed, &statement.seed_path)
+        {
+            return Err(TypedAdapterError::invalid(
+                "typed_case.seed_lineage",
+                format!(
+                    "statement ordinal {} has invalid seed lineage",
+                    statement.ordinal
+                ),
+            ));
+        }
+        let feature_id = statement.profile_feature_id.as_deref().ok_or_else(|| {
+            TypedAdapterError::invalid(
+                "typed_case.feature_id",
+                format!(
+                    "statement ordinal {} lacks canonical feature lineage",
+                    statement.ordinal
+                ),
+            )
+        })?;
+        if !evidence.bindings.iter().any(|binding| {
+            binding.role == statement.role
+                && binding.construct == statement.construct
+                && binding.feature_id == feature_id
+        }) {
+            return Err(TypedAdapterError::invalid(
+                "typed_case.feature_binding",
+                format!(
+                    "statement ordinal {} has no matching canonical feature binding",
+                    statement.ordinal
+                ),
+            ));
+        }
+        feature_ids.insert(feature_id.to_owned());
+        ordering.push(typed_statement_ordering(statement));
+        seed_lineage.push(TypedSeedLineage {
+            ordinal: statement.ordinal,
+            seed_path: statement.seed_path.clone(),
+            derived_seed: statement.derived_seed,
+        });
+        match statement.role {
+            StatementRole::Setup if subject_seen => {
+                return Err(TypedAdapterError::invalid(
+                    "typed_case.statement_order",
+                    "setup statement appeared after the first subject statement",
+                ));
+            }
+            StatementRole::Setup => schema.push(statement.sql.clone()),
+            StatementRole::Subject => {
+                subject_seen = true;
+                workload.push(statement.sql.clone());
+            }
+        }
+    }
+    if workload.is_empty() {
+        return Err(TypedAdapterError::invalid(
+            "typed_case.workload",
+            "canonical case must contain at least one subject statement",
+        ));
+    }
+    let sql_hash_prefix = generated.sql_hash.get(..12).ok_or_else(|| {
+        TypedAdapterError::invalid(
+            "typed_case.sql_hash",
+            "generated SQL hash is shorter than 12 bytes",
+        )
+    })?;
+    Ok(TypedCaseProjection {
+        case_id: format!(
+            "typed-{}-{:016x}-{sql_hash_prefix}",
+            generated.profile_name.replace('_', "-"),
+            generated.root_seed,
+        ),
+        schema,
+        workload,
+        ordering,
+        feature_ids: feature_ids.into_iter().collect(),
+        seed_lineage,
+    })
+}
+
+/// Adapt one canonical generated case into the existing strict differential
+/// envelope without reparsing or heuristically repartitioning its SQL.
+pub fn adapt_generated_case(
+    generated: GeneratedCase,
+    run_id: impl Into<String>,
+    scenario_id: impl Into<String>,
+) -> Result<TypedDifferentialCase, TypedAdapterError> {
+    let run_id = run_id.into();
+    let scenario_id = scenario_id.into();
+    if run_id.trim().is_empty() || scenario_id.trim().is_empty() {
+        return Err(TypedAdapterError::invalid(
+            "typed_case.identity",
+            "run_id and scenario_id must be non-empty",
+        ));
+    }
+    let evidence = generated
+        .canonical_profile_evidence
+        .as_ref()
+        .ok_or_else(|| {
+            TypedAdapterError::unsupported(
+                "typed_case.profile",
+                "bootstrap/non-canonical generated cases cannot enter parity campaigns",
+            )
+        })?;
+    validate_canonical_profile_evidence(evidence)
+        .map_err(|error| TypedAdapterError::invalid(error.constraint, error.message))?;
+    let projection = project_generated_case(&generated)?;
+
+    let envelope = ExecutionEnvelope::builder(generated.root_seed)
+        .run_id(run_id.clone())
+        .scenario_id(scenario_id.clone())
+        .schema(projection.schema)
+        .workload(projection.workload)
+        .statement_ordering(projection.ordering.clone())
+        .build();
+    let mut case = TypedDifferentialCase {
+        schema_version: TYPED_DIFFERENTIAL_SCHEMA_VERSION.to_owned(),
+        adapter_version: TYPED_DIFFERENTIAL_ADAPTER_VERSION.to_owned(),
+        case_id: projection.case_id,
+        run_id,
+        trace_id: generated.trace_hash.clone(),
+        scenario_id,
+        profile_sha256: evidence.profile_sha256.clone(),
+        feature_ids: projection.feature_ids,
+        required_lanes: evidence.required_lanes.clone(),
+        ordering: projection.ordering,
+        seed_lineage: projection.seed_lineage,
+        generated,
+        envelope,
+        content_hash: String::new(),
+    };
+    case.content_hash = case.deterministic_hash();
+    case.validate()?;
+    Ok(case)
+}
+
+/// Convert a typed adapter artifact into the existing normalized corpus.
+#[must_use]
+pub fn typed_case_to_corpus_entry(case: &TypedDifferentialCase) -> CorpusEntry {
+    let statements = case
+        .envelope
+        .schema
+        .iter()
+        .chain(case.envelope.workload.iter())
+        .cloned()
+        .collect();
+    CorpusEntry {
+        id: case.case_id.clone(),
+        family: Family::SQL,
+        secondary_families: Vec::new(),
+        source: CorpusSource::TypedGenerated {
+            generator_version: case.generated.generator_version.clone(),
+            profile_name: case.generated.profile_name.clone(),
+            profile_sha256: case.profile_sha256.clone(),
+            trace_hash: case.generated.trace_hash.clone(),
+            case_hash: case.content_hash.clone(),
+            seed: case.generated.root_seed,
+            promotion: None,
+        },
+        statements,
+        seed: case.generated.root_seed,
+        skip: None,
+        taxonomy_features: case.feature_ids.clone(),
+        description: format!(
+            "canonical typed differential case for profile {}",
+            case.generated.profile_name
+        ),
+    }
+}
+
+/// One public-path typed differential result with lane evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypedDifferentialRun {
+    pub schema_version: String,
+    pub case_id: String,
+    pub case_hash: String,
+    pub profile_sha256: String,
+    pub feature_ids: Vec<String>,
+    pub required_lanes: Vec<ExecutionLane>,
+    pub lane_evidence: Vec<ExecutionLaneEvidence>,
+    pub result: DifferentialResult,
+}
+
+fn validate_typed_lane_evidence(
+    case: &TypedDifferentialCase,
+    lane_evidence: &[ExecutionLaneEvidence],
+) -> Result<(), TypedAdapterError> {
+    for evidence in lane_evidence {
+        let errors = evidence.validate();
+        if !errors.is_empty() {
+            return Err(TypedAdapterError::new(
+                TypedAdapterErrorKind::LaneViolation,
+                "typed_case.lane_evidence",
+                errors.join("; "),
+            ));
+        }
+        if evidence.run_id != case.run_id
+            || evidence.trace_id != case.trace_id
+            || evidence.scenario_id != case.scenario_id
+        {
+            return Err(TypedAdapterError::new(
+                TypedAdapterErrorKind::LaneViolation,
+                "typed_case.lane_evidence",
+                "lane evidence identity does not match the typed case",
+            ));
+        }
+    }
+    for required in &case.required_lanes {
+        if !lane_evidence
+            .iter()
+            .any(|evidence| evidence.required_lane == *required && evidence.requirement_satisfied)
+        {
+            return Err(TypedAdapterError::new(
+                TypedAdapterErrorKind::LaneViolation,
+                "typed_case.required_lanes",
+                format!(
+                    "required lane {} was not positively observed",
+                    required.label()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build honest semantic-lane evidence for supported-core/read-only/DML
+/// campaigns. Stronger profiles must supply observations from their existing
+/// instrumented E2E lane and fail closed here otherwise.
+pub fn semantic_lane_evidence(
+    case: &TypedDifferentialCase,
+) -> Result<Vec<ExecutionLaneEvidence>, TypedAdapterError> {
+    if case.required_lanes != [ExecutionLane::SqlResultOnly] {
+        return Err(TypedAdapterError::unsupported(
+            "typed_case.required_lanes",
+            "semantic adapter cannot certify pager/planner/VDBE/MVCC/recovery lanes",
+        ));
+    }
+    Ok(vec![ExecutionLaneEvidence::semantic_only(
+        case.trace_id.clone(),
+        case.run_id.clone(),
+        case.scenario_id.clone(),
+        "typed_sql_case",
+    )])
+}
+
+/// Run one adapted case through the existing strict comparator.
+pub fn run_typed_differential_case<F: SqlExecutor, C: SqlExecutor>(
+    case: &TypedDifferentialCase,
+    lane_evidence: Vec<ExecutionLaneEvidence>,
+    fsqlite: &F,
+    csqlite: &C,
+) -> Result<TypedDifferentialRun, TypedAdapterError> {
+    case.validate()?;
+    validate_typed_lane_evidence(case, &lane_evidence)?;
+    let result = crate::differential_v2::run_differential(&case.envelope, fsqlite, csqlite);
+    if result.outcome != Outcome::Error && result.comparisons.len() != result.statements_total {
+        return Err(TypedAdapterError::invalid(
+            "typed_case.comparisons",
+            "strict differential result omitted statement outcome evidence",
+        ));
+    }
+    tracing::info!(
+        bead_id = "bd-turso-test-adaptation-zu081.5",
+        run_id = %case.run_id,
+        trace_id = %case.trace_id,
+        scenario_id = %case.scenario_id,
+        seed = case.generated.root_seed,
+        profile = %case.generated.profile_name,
+        profile_sha256 = %case.profile_sha256,
+        feature_count = case.feature_ids.len(),
+        lane_required = %case.required_lanes.iter().map(|lane| lane.label()).collect::<Vec<_>>().join(","),
+        outcome = %result.outcome,
+        mismatched = result.statements_mismatched,
+        "typed differential case completed"
+    );
+    Ok(TypedDifferentialRun {
+        schema_version: TYPED_DIFFERENTIAL_SCHEMA_VERSION.to_owned(),
+        case_id: case.case_id.clone(),
+        case_hash: case.content_hash.clone(),
+        profile_sha256: case.profile_sha256.clone(),
+        feature_ids: case.feature_ids.clone(),
+        required_lanes: case.required_lanes.clone(),
+        lane_evidence,
+        result,
+    })
+}
+
+/// Execute with explicit orchestration state so cancellation and timeout are
+/// not collapsed into generic SQL errors.
+pub fn run_typed_differential_case_with_control<F: SqlExecutor, C: SqlExecutor>(
+    case: &TypedDifferentialCase,
+    lane_evidence: Vec<ExecutionLaneEvidence>,
+    cancelled: bool,
+    timed_out: bool,
+    fsqlite: &F,
+    csqlite: &C,
+) -> Result<TypedDifferentialRun, TypedAdapterError> {
+    if cancelled {
+        return Err(TypedAdapterError::new(
+            TypedAdapterErrorKind::Cancelled,
+            "typed_case.execution",
+            "typed differential execution cancelled before dispatch",
+        ));
+    }
+    if timed_out {
+        return Err(TypedAdapterError::new(
+            TypedAdapterErrorKind::Timeout,
+            "typed_case.execution",
+            "typed differential execution exceeded its orchestration budget",
+        ));
+    }
+    run_typed_differential_case(case, lane_evidence, fsqlite, csqlite)
+}
+
+/// Build the canonical failure bundle for one typed differential divergence.
+///
+/// The bundle embeds the exact generated case and differential result, while
+/// its typed evidence binds engine identities, canonical contract hashes,
+/// seed lineage, ordering policy, required lanes, and the result hash.
+pub fn build_typed_failure_bundle(
+    case: &TypedDifferentialCase,
+    run: &TypedDifferentialRun,
+    created_at: &str,
+    repro_command: &str,
+    environment: EnvironmentInfo,
+    subject: TypedEngineProvenance,
+    reference: TypedEngineProvenance,
+) -> Result<FailureBundle, TypedAdapterError> {
+    case.validate()?;
+    let run_provenance = (
+        run.case_id.as_str(),
+        run.case_hash.as_str(),
+        run.profile_sha256.as_str(),
+        run.feature_ids.as_slice(),
+        run.required_lanes.as_slice(),
+    );
+    let case_provenance = (
+        case.case_id.as_str(),
+        case.content_hash.as_str(),
+        case.profile_sha256.as_str(),
+        case.feature_ids.as_slice(),
+        case.required_lanes.as_slice(),
+    );
+    if run_provenance != case_provenance {
+        return Err(TypedAdapterError::invalid(
+            "typed_bundle.run",
+            "typed run provenance does not match the generated case",
+        ));
+    }
+    if run.result.outcome != Outcome::Divergence || run.result.divergences.is_empty() {
+        return Err(TypedAdapterError::invalid(
+            "typed_bundle.outcome",
+            "failure bundles require a statement-level differential divergence",
+        ));
+    }
+    validate_typed_lane_evidence(case, &run.lane_evidence)?;
+    let primary_evidence = case
+        .required_lanes
+        .first()
+        .and_then(|required| {
+            run.lane_evidence.iter().find(|evidence| {
+                evidence.required_lane == *required && evidence.requirement_satisfied
+            })
+        })
+        .cloned()
+        .ok_or_else(|| {
+            TypedAdapterError::new(
+                TypedAdapterErrorKind::LaneViolation,
+                "typed_bundle.execution_lane",
+                "no positively observed primary execution lane is available",
+            )
+        })?;
+    let profile = case
+        .generated
+        .canonical_profile_evidence
+        .as_ref()
+        .ok_or_else(|| {
+            TypedAdapterError::unsupported(
+                "typed_bundle.profile",
+                "canonical profile evidence is required for failure publication",
+            )
+        })?;
+    let contract_sha256 = BTreeMap::from([
+        (
+            "feature_universe_ledger".to_owned(),
+            profile.feature_ledger_sha256.clone(),
+        ),
+        (
+            "parity_taxonomy".to_owned(),
+            profile.parity_taxonomy_sha256.clone(),
+        ),
+        (
+            "sqlite_version_contract".to_owned(),
+            profile.version_contract_sha256.clone(),
+        ),
+        (
+            "supported_surface_matrix".to_owned(),
+            profile.surface_matrix_sha256.clone(),
+        ),
+    ]);
+    let first = &run.result.divergences[0];
+    let expected = serde_json::to_string(&first.csqlite_outcome)
+        .map_err(|error| TypedAdapterError::artifact("typed_bundle.expected", error.to_string()))?;
+    let actual = serde_json::to_string(&first.fsqlite_outcome)
+        .map_err(|error| TypedAdapterError::artifact("typed_bundle.actual", error.to_string()))?;
+    let typed_case_json = case.to_canonical_json()?;
+    let result_json = serde_json::to_string_pretty(&run.result)
+        .map_err(|error| TypedAdapterError::artifact("typed_bundle.result", error.to_string()))?;
+    let phase = if first.index < case.envelope.schema.len() {
+        "schema"
+    } else {
+        "workload"
+    };
+    let typed_evidence = TypedDifferentialEvidence {
+        schema_version: "fsqlite.typed-differential-evidence.v1".to_owned(),
+        adapter_version: case.adapter_version.clone(),
+        generator_version: case.generated.generator_version.clone(),
+        profile_name: case.generated.profile_name.clone(),
+        profile_version: case.generated.profile_version.clone(),
+        profile_sha256: case.profile_sha256.clone(),
+        case_sha256: case.content_hash.clone(),
+        contract_sha256,
+        feature_ids: case.feature_ids.clone(),
+        required_lanes: case.required_lanes.clone(),
+        ordering: case.ordering.clone(),
+        seed_lineage: case
+            .seed_lineage
+            .iter()
+            .map(|seed| {
+                format!(
+                    "ordinal={};path={};seed={}",
+                    seed.ordinal, seed.seed_path, seed.derived_seed
+                )
+            })
+            .collect(),
+        subject,
+        reference,
+        differential_result_sha256: run.result.artifact_hashes.result_hash.clone(),
+    };
+    let suffix = run
+        .result
+        .artifact_hashes
+        .result_hash
+        .get(..12)
+        .ok_or_else(|| {
+            TypedAdapterError::artifact(
+                "typed_bundle.result_hash",
+                "differential result hash is shorter than 12 bytes",
+            )
+        })?;
+    FailureBundleBuilder::new()
+        .bundle_id(&format!("fb-{}-{suffix}", case.run_id))
+        .created_at(created_at)
+        .run_id(&case.run_id)
+        .execution_lane_evidence(primary_evidence)
+        .scenario(ScenarioInfo {
+            scenario_id: case.scenario_id.clone(),
+            bead_id: "bd-turso-test-adaptation-zu081.5".to_owned(),
+            test_name: case.case_id.clone(),
+            script_path: Some(
+                "crates/fsqlite-harness/src/bin/differential_manifest_runner.rs".to_owned(),
+            ),
+        })
+        .failure(FailureInfo {
+            failure_type: FailureType::Divergence,
+            message: format!("typed differential divergence at statement {}", first.index),
+            expected: Some(expected),
+            actual: Some(actual),
+            diff: None,
+            invariant: Some("strict C SQLite differential parity".to_owned()),
+            first_divergence: Some(FirstDivergence {
+                operation_index: u64::try_from(first.index).unwrap_or(u64::MAX),
+                sql: Some(first.sql.clone()),
+                phase: Some(phase.to_owned()),
+            }),
+        })
+        .reproducibility(ReproducibilityInfo {
+            seed: Some(case.generated.root_seed),
+            fixture_id: Some(case.case_id.clone()),
+            schedule_fingerprint: None,
+            repro_command: repro_command.to_owned(),
+            storage_mode: Some("in-memory".to_owned()),
+            concurrency_mode: Some("concurrent-writers".to_owned()),
+        })
+        .environment(environment)
+        .state_snapshot("typed_case_json", &typed_case_json)
+        .state_snapshot("differential_result_json", &result_json)
+        .typed_differential(typed_evidence)
+        .triage_tag("typed-differential")
+        .triage_tag("turso-test-adaptation")
+        .build()
+        .map_err(|error| TypedAdapterError::artifact("typed_bundle", error))
+}
+
+/// Minimize a typed divergence using a fresh subject and reference executor
+/// for every candidate workload.
+pub fn minimize_typed_divergence<F, C, FF, CF>(
+    case: &TypedDifferentialCase,
+    config: &MinimizerConfig,
+    repro_command: &str,
+    fsqlite_factory: FF,
+    csqlite_factory: CF,
+) -> Result<MinimalReproduction, TypedAdapterError>
+where
+    F: SqlExecutor,
+    C: SqlExecutor,
+    FF: Fn() -> Result<F, String> + 'static,
+    CF: Fn() -> Result<C, String> + 'static,
+{
+    case.validate()?;
+    let schema = case.envelope.schema.clone();
+    let source_workload = case.envelope.workload.clone();
+    let schema_ordering = case.ordering[..case.envelope.schema.len()].to_vec();
+    let workload_ordering = case.ordering[case.envelope.schema.len()..].to_vec();
+    let seed = case.envelope.seed;
+    let root_seed = case.generated.root_seed;
+    let run_id = case.run_id.clone();
+    let scenario_id = case.scenario_id.clone();
+    let engines = case.envelope.engines.clone();
+    let pragmas = case.envelope.pragmas.clone();
+    let canonicalization = case.envelope.canonicalization.clone();
+    let source_workload_for_test = source_workload.clone();
+    let test = move |schema: &[String], workload: &[String]| {
+        let fsqlite = fsqlite_factory().ok()?;
+        let csqlite = csqlite_factory().ok()?;
+        let mut next_index = 0;
+        let mut candidate_ordering = schema_ordering.clone();
+        for statement in workload {
+            let relative = source_workload_for_test[next_index..]
+                .iter()
+                .position(|candidate| candidate == statement)?;
+            next_index += relative;
+            candidate_ordering.push(workload_ordering[next_index]);
+            next_index += 1;
+        }
+        let envelope = ExecutionEnvelope::builder(seed)
+            .run_id(run_id.clone())
+            .scenario_id(scenario_id.clone())
+            .engines(engines.fsqlite.clone(), engines.csqlite.clone())
+            .engine_identities(
+                engines.subject_identity.clone(),
+                engines.reference_identity.clone(),
+            )
+            .pragmas(pragmas.clone())
+            .schema(schema.iter().cloned())
+            .workload(workload.iter().cloned())
+            .canonicalization(canonicalization.clone())
+            .statement_ordering(candidate_ordering)
+            .build();
+        let result = crate::differential_v2::run_differential(&envelope, &fsqlite, &csqlite);
+        (result.outcome == Outcome::Divergence).then_some(result.divergences)
+    };
+    let mut minimal =
+        minimize_workload(&schema, &source_workload, config, &test).ok_or_else(|| {
+            TypedAdapterError::invalid(
+                "typed_minimizer.reproduction",
+                "full typed workload did not reproduce a statement divergence",
+            )
+        })?;
+    if repro_command.contains('\n')
+        || repro_command.contains('\r')
+        || repro_command.trim().is_empty()
+    {
+        return Err(TypedAdapterError::invalid(
+            "typed_minimizer.repro_command",
+            "reproduction command must be non-empty and single-line",
+        ));
+    }
+    minimal.original_seed = root_seed;
+    repro_command.clone_into(&mut minimal.repro_command);
+    Ok(minimal)
+}
 
 // ===========================================================================
 // Configuration
@@ -628,10 +1617,50 @@ fn compute_corpus_hash(entries: &[CorpusEntry]) -> String {
     hex
 }
 
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::corpus_ingest::{CorpusSource, Family};
+    use crate::corpus_ingest::{CorpusBuilder, CorpusSource, Family};
+    use crate::differential_v2::{CsqliteExecutor, FsqliteExecutor, NormalizedValue, StmtOutcome};
+    use crate::replay_harness::{
+        TypedDifferentialReplayArtifact, promote_typed_divergence, replay_typed_differential,
+    };
+    use crate::typed_sql_generator::{
+        GenerationBudget, GeneratorConfig, NamedGeneratorProfile, derive_named_profile,
+        generate_case,
+    };
+    use proptest::prelude::*;
+
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("harness crate must live under workspace/crates")
+            .to_path_buf()
+    }
+
+    fn typed_case(kind: NamedGeneratorProfile, seed: u64) -> TypedDifferentialCase {
+        let profile = derive_named_profile(&workspace_root(), kind).expect("derive profile");
+        let requested_statements =
+            u32::try_from(profile.setup.len() + 8).expect("bounded statement count");
+        let generated = generate_case(GeneratorConfig {
+            root_seed: seed,
+            requested_statements,
+            profile,
+            budget: GenerationBudget::default(),
+        })
+        .expect("generate canonical case");
+        adapt_generated_case(generated, "typed-run", "TURSO-TYPED-5").expect("adapt canonical case")
+    }
 
     /// Build a minimal corpus entry for testing.
     fn make_entry(id: &str, statements: Vec<&str>) -> CorpusEntry {
@@ -672,6 +1701,11 @@ mod tests {
         fn csqlite_stub() -> Self {
             Self::new(crate::differential_v2::EngineIdentity::CSqliteOracle)
         }
+
+        fn with_result(mut self, sql: &str, outcome: StmtOutcome) -> Self {
+            self.results.insert(sql.trim().to_owned(), outcome);
+            self
+        }
     }
 
     impl SqlExecutor for StubExecutor {
@@ -709,6 +1743,340 @@ mod tests {
         assert_eq!(config.base_seed, DEFAULT_BASE_SEED);
         assert_eq!(config.max_cases_per_entry, 8);
         assert!(config.enable_minimization);
+    }
+
+    #[test]
+    fn typed_seed_shards_are_stable_disjoint_and_complete() {
+        let range = TypedSeedRange::for_tier(TypedCampaignTier::Presubmit, 4_200);
+        let shards = (0..7)
+            .map(|shard_index| TypedSeedShard {
+                range,
+                shard_index,
+                shard_count: 7,
+            })
+            .collect::<Vec<_>>();
+        validate_typed_seed_shards(range, &shards).expect("valid complete shard set");
+        assert_eq!(
+            shards
+                .iter()
+                .map(|shard| shard.seeds().unwrap().len())
+                .sum::<usize>(),
+            usize::try_from(TYPED_PRESUBMIT_CASES_PER_PROFILE).unwrap()
+        );
+        assert_eq!(shards[0].seeds().unwrap(), shards[0].seeds().unwrap());
+
+        let mut duplicate = shards.clone();
+        duplicate[1].shard_index = 0;
+        assert_eq!(
+            validate_typed_seed_shards(range, &duplicate)
+                .unwrap_err()
+                .constraint,
+            "seed_shards"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn typed_seed_shards_partition_arbitrary_bounded_ranges(
+            start in 0_u64..=u64::MAX - 512,
+            count in 1_u32..=512,
+            shard_count in 1_u32..=16,
+        ) {
+            let range = TypedSeedRange {
+                tier: TypedCampaignTier::Presubmit,
+                start,
+                count,
+            };
+            let shards = (0..shard_count)
+                .map(|shard_index| TypedSeedShard {
+                    range,
+                    shard_index,
+                    shard_count,
+                })
+                .collect::<Vec<_>>();
+            prop_assert!(validate_typed_seed_shards(range, &shards).is_ok());
+            let union = shards
+                .iter()
+                .flat_map(|shard| shard.seeds().expect("valid shard"))
+                .collect::<BTreeSet<_>>();
+            prop_assert_eq!(union, range.seeds().expect("valid range").into_iter().collect());
+        }
+    }
+
+    #[test]
+    fn typed_adapter_preserves_roles_ordering_lineage_and_corpus_metadata() {
+        let case = typed_case(NamedGeneratorProfile::ReadOnly, 0xD1FF_E2E0_2026_0804);
+        assert_eq!(
+            case.envelope.schema.len() + case.envelope.workload.len(),
+            case.generated.statements.len()
+        );
+        assert_eq!(case.ordering.len(), case.generated.statements.len());
+        assert_eq!(case.seed_lineage.len(), case.generated.statements.len());
+        assert!(
+            case.generated
+                .statements
+                .iter()
+                .zip(&case.ordering)
+                .all(|(statement, ordering)| *ordering == typed_statement_ordering(statement))
+        );
+        let json = case.to_canonical_json().expect("encode typed case");
+        let decoded = TypedDifferentialCase::from_json_strict(&json).expect("decode typed case");
+        assert_eq!(decoded, case);
+
+        let left = typed_case_to_corpus_entry(&case);
+        let right = typed_case_to_corpus_entry(&case);
+        assert_eq!(left.content_hash(), right.content_hash());
+        assert_eq!(
+            serde_json::to_string(&left.source).unwrap(),
+            serde_json::to_string(&right.source).unwrap()
+        );
+        assert_eq!(left.taxonomy_features, case.feature_ids);
+    }
+
+    #[test]
+    fn typed_adapter_runs_public_engines_and_keeps_control_states_explicit() {
+        let case = typed_case(NamedGeneratorProfile::ReadOnly, 0xD1FF_E2E0_2026_0804);
+        let fsqlite = FsqliteExecutor::open_in_memory().expect("open FrankenSQLite");
+        let csqlite = CsqliteExecutor::open_in_memory().expect("open C SQLite");
+        let lane_evidence = semantic_lane_evidence(&case).expect("semantic lane evidence");
+        let report = run_typed_differential_case(&case, lane_evidence.clone(), &fsqlite, &csqlite)
+            .expect("run typed differential");
+        assert_eq!(
+            report.result.outcome,
+            Outcome::Pass,
+            "{:#?}",
+            report.result.divergences
+        );
+        assert_eq!(
+            report.result.comparisons.len(),
+            report.result.statements_total
+        );
+        assert!(report.result.comparisons.iter().all(|row| row.matched));
+
+        assert_eq!(
+            run_typed_differential_case_with_control(
+                &case,
+                lane_evidence.clone(),
+                true,
+                false,
+                &fsqlite,
+                &csqlite,
+            )
+            .unwrap_err()
+            .kind,
+            TypedAdapterErrorKind::Cancelled
+        );
+        assert_eq!(
+            run_typed_differential_case_with_control(
+                &case,
+                lane_evidence,
+                false,
+                true,
+                &fsqlite,
+                &csqlite,
+            )
+            .unwrap_err()
+            .kind,
+            TypedAdapterErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn typed_adapter_fails_closed_on_unobserved_stronger_lane_and_corruption() {
+        let planner = typed_case(NamedGeneratorProfile::Planner, 77);
+        assert_eq!(
+            semantic_lane_evidence(&planner).unwrap_err().kind,
+            TypedAdapterErrorKind::Unsupported
+        );
+        let fallback_decision = crate::failure_bundle::FallbackDecisionEvidence {
+            statement_kind: "select".to_owned(),
+            fallback_boundary: "conn.select.with_clause_materialization".to_owned(),
+            decision_reason: "with_clause_materialization".to_owned(),
+            decision_outcome: "allowed_compatibility_fallback".to_owned(),
+            source_touchpoint: "typed-adapter-negative-test".to_owned(),
+            first_failure_diagnostic: "statement_kind=select; fallback_boundary=conn.select.with_clause_materialization; source_touchpoint=typed-adapter-negative-test; decision_reason=with_clause_materialization".to_owned(),
+            occurrences: 1,
+        };
+        let forced_fallback = ExecutionLaneEvidence::from_observations(
+            ExecutionLane::PlannerRequired,
+            vec![
+                crate::failure_bundle::ObservedExecutionLane::Planner,
+                crate::failure_bundle::ObservedExecutionLane::CompatibilityFallback,
+            ],
+            planner.trace_id.clone(),
+            planner.run_id.clone(),
+            planner.scenario_id.clone(),
+            "select",
+            "memory",
+            "fallback_allowed",
+            "memory:fallback_allowed",
+            vec![fallback_decision],
+            true,
+        );
+        assert!(forced_fallback.validate().is_empty());
+        assert!(!forced_fallback.requirement_satisfied);
+        assert_eq!(
+            run_typed_differential_case(
+                &planner,
+                vec![forced_fallback],
+                &StubExecutor::fsqlite_stub(),
+                &StubExecutor::csqlite_stub(),
+            )
+            .unwrap_err()
+            .kind,
+            TypedAdapterErrorKind::LaneViolation
+        );
+
+        let case = typed_case(NamedGeneratorProfile::Dml, 88);
+        let mut json = case.to_canonical_json().unwrap();
+        json.truncate(json.len() / 2);
+        assert_eq!(
+            TypedDifferentialCase::from_json_strict(&json)
+                .unwrap_err()
+                .kind,
+            TypedAdapterErrorKind::Artifact
+        );
+        let mut corrupted = case.clone();
+        corrupted.profile_sha256 = "0".repeat(64);
+        assert_eq!(
+            corrupted.validate().unwrap_err().constraint,
+            "typed_case.provenance"
+        );
+
+        let mut cross_link_drift = case.clone();
+        cross_link_drift.envelope.schema[0].push(' ');
+        cross_link_drift.content_hash = cross_link_drift.deterministic_hash();
+        assert_eq!(
+            cross_link_drift.validate().unwrap_err().constraint,
+            "typed_case.provenance"
+        );
+
+        let mut ast_sql_drift = case;
+        ast_sql_drift.generated.statements[0].sql.push(' ');
+        let sql_script = ast_sql_drift
+            .generated
+            .statements
+            .iter()
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        ast_sql_drift.generated.sql_hash = sha256_hex(sql_script.as_bytes());
+        ast_sql_drift.content_hash = ast_sql_drift.deterministic_hash();
+        assert_eq!(
+            ast_sql_drift.validate().unwrap_err().constraint,
+            "typed_case.statement_sql"
+        );
+    }
+
+    #[test]
+    fn typed_divergence_bundles_replays_minimizes_and_promotes_fail_closed() {
+        let case = typed_case(NamedGeneratorProfile::ReadOnly, 0xBADD_1FF5_2026_0804);
+        let divergent_sql = case.envelope.workload[0].clone();
+        let fsqlite = StubExecutor::fsqlite_stub().with_result(
+            &divergent_sql,
+            StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(1)]]),
+        );
+        let csqlite = StubExecutor::csqlite_stub().with_result(
+            &divergent_sql,
+            StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(2)]]),
+        );
+        let run = run_typed_differential_case(
+            &case,
+            semantic_lane_evidence(&case).expect("semantic evidence"),
+            &fsqlite,
+            &csqlite,
+        )
+        .expect("synthetic typed divergence");
+        assert_eq!(run.result.outcome, Outcome::Divergence);
+
+        let bundle = build_typed_failure_bundle(
+            &case,
+            &run,
+            "2026-08-04T00:00:00Z",
+            "cargo run -p fsqlite-harness --bin differential_manifest_runner -- --typed-replay artifact.json",
+            EnvironmentInfo::new("candidate-sha", "nightly", "test-platform"),
+            TypedEngineProvenance {
+                identity: "frankensqlite".to_owned(),
+                version: case.envelope.engines.fsqlite.clone(),
+                git_sha: "candidate-sha".to_owned(),
+                dirty: false,
+            },
+            TypedEngineProvenance {
+                identity: "csqlite-oracle".to_owned(),
+                version: case.envelope.engines.csqlite.clone(),
+                git_sha: "rusqlite-bundled".to_owned(),
+                dirty: false,
+            },
+        )
+        .expect("canonical typed bundle");
+        let bundle_json = bundle.to_json().expect("bundle JSON");
+        assert_eq!(
+            FailureBundle::from_json_strict(&bundle_json).expect("strict bundle"),
+            bundle
+        );
+        let mut truncated_bundle = bundle_json;
+        truncated_bundle.truncate(truncated_bundle.len() / 2);
+        assert!(FailureBundle::from_json_strict(&truncated_bundle).is_err());
+
+        let artifact = TypedDifferentialReplayArtifact::from_run(case.clone(), &run, Some(bundle))
+            .expect("typed replay artifact");
+        let artifact_json = artifact.to_json().expect("replay JSON");
+        let decoded = TypedDifferentialReplayArtifact::from_json_strict(&artifact_json)
+            .expect("strict replay artifact");
+        let (_, verification) =
+            replay_typed_differential(&decoded, &fsqlite, &csqlite).expect("exact replay");
+        assert!(verification.exact_match);
+
+        let mut truncated_artifact = artifact_json;
+        truncated_artifact.truncate(truncated_artifact.len() / 2);
+        assert!(TypedDifferentialReplayArtifact::from_json_strict(&truncated_artifact).is_err());
+        let mut corrupted = decoded.clone();
+        corrupted.expected_result_sha256 = "0".repeat(64);
+        assert!(corrupted.validate().is_err());
+        let mut missing_lane_proof = decoded.clone();
+        missing_lane_proof.lane_evidence.clear();
+        assert!(missing_lane_proof.validate().is_err());
+
+        let fsqlite_factory_value = fsqlite.clone();
+        let csqlite_factory_value = csqlite.clone();
+        let minimal = minimize_typed_divergence(
+            &case,
+            &MinimizerConfig::default(),
+            "cargo run -p fsqlite-harness --bin differential_manifest_runner -- --typed-replay artifact.json",
+            move || Ok(fsqlite_factory_value.clone()),
+            move || Ok(csqlite_factory_value.clone()),
+        )
+        .expect("typed minimizer handoff");
+        assert_eq!(minimal.original_seed, case.generated.root_seed);
+        assert!(!minimal.minimal_workload.is_empty());
+        assert!(!minimal.divergences.is_empty());
+
+        let mut builder = CorpusBuilder::new(case.generated.root_seed);
+        assert!(
+            promote_typed_divergence(&mut builder, &decoded, &verification, &minimal, "").is_err()
+        );
+        let promotion = promote_typed_divergence(
+            &mut builder,
+            &decoded,
+            &verification,
+            &minimal,
+            "reviewer@example.invalid",
+        )
+        .expect("reviewed promotion");
+        let manifest = builder.build();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].id, promotion.entry_id);
+        assert_eq!(
+            manifest.entries[0].content_hash(),
+            promotion.entry_content_sha256
+        );
+        assert!(matches!(
+            &manifest.entries[0].source,
+            CorpusSource::TypedGenerated {
+                promotion: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

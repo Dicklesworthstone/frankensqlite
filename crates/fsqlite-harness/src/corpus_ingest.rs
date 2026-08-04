@@ -103,6 +103,15 @@ impl fmt::Display for Family {
 
 // ─── Corpus Entry ────────────────────────────────────────────────────────
 
+/// Review and replay evidence retained when a typed mismatch graduates into
+/// the normalized regression corpus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedPromotionMetadata {
+    pub mismatch_signature: String,
+    pub replay_artifact_sha256: String,
+    pub reviewed_by: String,
+}
+
 /// Source of a corpus entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CorpusSource {
@@ -116,6 +125,17 @@ pub enum CorpusSource {
     Custom { author: String },
     /// Metamorphic/generated test.
     Generated { generator: String, seed: u64 },
+    /// Canonical typed generator case with replay/profile provenance.
+    TypedGenerated {
+        generator_version: String,
+        profile_name: String,
+        profile_sha256: String,
+        trace_hash: String,
+        case_hash: String,
+        seed: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        promotion: Option<TypedPromotionMetadata>,
+    },
     /// User-reported mismatch intake reduced to deterministic replay form.
     UserRepro {
         /// Deterministic fixture identifier.
@@ -985,6 +1005,7 @@ fn source_name(source: &CorpusSource) -> &'static str {
         CorpusSource::Fixture { .. } => "fixture",
         CorpusSource::Custom { .. } => "custom",
         CorpusSource::Generated { .. } => "generated",
+        CorpusSource::TypedGenerated { .. } => "typed_generated",
         CorpusSource::UserRepro { .. } => "user_repro",
     }
 }

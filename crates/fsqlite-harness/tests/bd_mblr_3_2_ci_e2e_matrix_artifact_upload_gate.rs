@@ -116,6 +116,7 @@ fn make_failure_bundle(scenario_id: &str, failure_type: FailureType, seed: u64) 
             },
         ],
         state_snapshots: std::collections::BTreeMap::new(),
+        typed_differential: None,
         triage_tags: vec!["e2e-matrix".to_owned(), failure_type.label().to_owned()],
         content_hash: String::new(),
     };
