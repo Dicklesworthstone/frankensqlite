@@ -35815,7 +35815,16 @@ impl Connection {
                 }
             }
         }
-        // INDEXED BY <name> must reference an existing index on the named table.
+        self.validate_select_index_hints(select)?;
+        Ok(())
+    }
+
+    /// `INDEXED BY <name>` must reference an existing index on the named
+    /// table. Shared by statement execution and `EXPLAIN` / `EXPLAIN QUERY
+    /// PLAN` (hfdt-3b8zl): the plan surfaces must refuse a missing forced
+    /// index exactly like execution would, instead of silently describing a
+    /// plan that ignores the hint.
+    fn validate_select_index_hints(&self, select: &SelectStatement) -> Result<()> {
         if let SelectCore::Select {
             from: Some(from), ..
         } = &select.body.select
@@ -35829,8 +35838,6 @@ impl Connection {
                     ..
                 } = tos
                 {
-                    // Only validate against a known local table; an unknown table
-                    // is reported by the normal execution path.
                     if let Some(ti) = self.schema_index_of(&name.name) {
                         let known = self.schema.borrow().get(ti).is_some_and(|t| {
                             t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx))
@@ -35840,6 +35847,28 @@ impl Connection {
                                 "no such index: {idx}"
                             )));
                         }
+                    } else if name.schema.as_deref().is_some_and(|schema| {
+                        !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+                    }) {
+                        // Attached schemas are owned by child connections and
+                        // validated by the attached-statement path.
+                    } else if select.with.as_ref().is_some_and(|with| {
+                        with.ctes
+                            .iter()
+                            .any(|cte| cte.name.eq_ignore_ascii_case(&name.name))
+                    }) || self.local_view_index_for_relation(name).is_some()
+                    {
+                        // CTEs and views are valid relations but cannot own a
+                        // persistent index selected with INDEXED BY.
+                        return Err(FrankenError::FunctionError(format!("no such index: {idx}")));
+                    } else {
+                        // EQP can deliberately fall back when bytecode
+                        // compilation is unavailable, so it cannot rely on a
+                        // later compilation failure to reject an unknown
+                        // source relation.
+                        return Err(FrankenError::NoSuchTable {
+                            name: name.name.clone(),
+                        });
                     }
                 }
             }
@@ -70809,6 +70838,22 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let _ = params; // reserved for future use
+
+        // hfdt-3b8zl: C SQLite fails `EXPLAIN [QUERY PLAN]` at prepare time
+        // when the inner SELECT names a missing `INDEXED BY` index; the plan
+        // surfaces must refuse exactly like executing the statement would
+        // instead of silently describing a plan that ignores the hint.
+        match stmt {
+            Statement::Select(select) => self.validate_select_index_hints(select)?,
+            Statement::Update(_) | Statement::Delete(_) if query_plan => {
+                // EQP renders UPDATE/DELETE from a synthetic summary rather
+                // than the compiled program. Compile once for validation so
+                // an unknown table or forced index cannot be hidden behind
+                // that summary. Plain EXPLAIN already compiles below.
+                self.try_compile_statement(stmt).await?;
+            }
+            _ => {}
+        }
 
         if query_plan {
             return Ok(self.execute_explain_query_plan(stmt).await);
@@ -218749,6 +218794,77 @@ mod pager_routing_tests {
             })
             .collect::<Vec<_>>()
             .join(";")
+    }
+
+    /// hfdt-3b8zl: `EXPLAIN` / `EXPLAIN QUERY PLAN` must refuse DML whose
+    /// `INDEXED BY` names a missing index — exactly like executing it — instead
+    /// of silently describing a plan that ignores the hint. C SQLite fails both
+    /// plan surfaces at prepare time with `no such index`; an unknown relation
+    /// remains `no such table` rather than becoming a synthetic scan.
+    #[test]
+    fn eqp_and_explain_refuse_missing_indexed_by_targets() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = bd_2dgf5_conn().await;
+
+            for (sql, expected) in [
+                (
+                    "EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY idx_missing WHERE k = 1;",
+                    "no such index: idx_missing",
+                ),
+                (
+                    "EXPLAIN SELECT id FROM t INDEXED BY idx_missing WHERE k = 1;",
+                    "no such index: idx_missing",
+                ),
+                (
+                    "EXPLAIN QUERY PLAN UPDATE t INDEXED BY idx_missing SET v = 'changed' WHERE k = 1;",
+                    "no such index: idx_missing",
+                ),
+                (
+                    "EXPLAIN QUERY PLAN DELETE FROM t INDEXED BY idx_missing WHERE k = 1;",
+                    "no such index: idx_missing",
+                ),
+                (
+                    "EXPLAIN QUERY PLAN SELECT id FROM missing_table INDEXED BY idx_missing;",
+                    "no such table: missing_table",
+                ),
+            ] {
+                let error = conn
+                    .query(sql)
+                    .await
+                    .expect_err("an invalid INDEXED BY relation must refuse on plan surfaces");
+                assert!(
+                    error.to_string().contains(expected),
+                    "unexpected error for `{sql}`: {error}"
+                );
+            }
+
+            // Positive controls: an existing forced index still plans for all
+            // three statement kinds and is named for SELECT.
+            let named = eqp_details(&conn, "SELECT id FROM t INDEXED BY idx_t_k WHERE k = 1").await;
+            assert!(
+                named.contains("idx_t_k"),
+                "EQP with an existing INDEXED BY target must name the index; got {named:?}"
+            );
+            for sql in [
+                "EXPLAIN QUERY PLAN UPDATE t INDEXED BY idx_t_k SET v = 'changed' WHERE k = 1;",
+                "EXPLAIN QUERY PLAN DELETE FROM t INDEXED BY idx_t_k WHERE k = 1;",
+            ] {
+                conn.query(sql).await.unwrap_or_else(|error| {
+                    panic!("valid forced index rejected for `{sql}`: {error}")
+                });
+            }
+
+            // Dropping the index flips the same plan query to the execution refusal.
+            conn.execute("DROP INDEX idx_t_k;").await.unwrap();
+            let dropped = conn
+                .query("EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY idx_t_k WHERE k = 1;")
+                .await
+                .expect_err("EQP naming a dropped index must refuse");
+            assert!(
+                dropped.to_string().contains("no such index: idx_t_k"),
+                "unexpected error after DROP INDEX: {dropped}"
+            );
+        });
     }
 
     /// bd-2dgf5 proof (a): `EXPLAIN QUERY PLAN` parity with C SQLite 3.x.
