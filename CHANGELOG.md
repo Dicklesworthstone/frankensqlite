@@ -63,14 +63,21 @@ semantic and crates.io predecessor, but it is not an ancestor of current
 
 ### Known limitations
 
-- **Read-only opens are not fully mutation-free in v0.2.0.** First contact with
-  a clean stock SQLite database can create FrankenSQLite namespace sidecars;
-  Windows read-only opens can create lock sidecars. Some compatibility opens
-  also update volatile SQLite header counters or metadata. Do not use this
-  release where the database directory is immutable or where main-file content
-  or modification-time stability across opens is required
-  ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140),
-  [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294)).
+- **Read-only opens are not fully mutation-free in v0.2.0.** A database that
+  FrankenSQLite has opened before joins its existing namespace without
+  rewriting the `-fsqlite-ns-gate` or `-fsqlite-ns-use` sidecar. First contact
+  with a stock SQLite database instead creates both sidecars and therefore
+  requires a writable parent directory. Windows opens also create the
+  `-lock-shared`, `-lock-reserved`, and `-lock-pending` sidecars, including for
+  read-only access. Namespace identity binds the database file's device and
+  inode, so a database copied to different media cannot be rebound read-only.
+  Do not use this release where the database directory is immutable or where a
+  copied database must open directly from read-only media
+  ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140)). The
+  namespace-sidecar rewrite reported in
+  [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294) is fixed
+  for previously opened databases; its remaining first-contact case is tracked
+  in #140.
 - **Database text encoding is UTF-8-only in v0.2.0.** The database-header
   codec recognizes all three valid SQLite encoding values, but the runtime
   admits only encoding 1 (UTF-8). Databases declaring encoding 2 (UTF-16le) or
