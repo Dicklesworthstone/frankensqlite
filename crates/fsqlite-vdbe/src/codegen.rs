@@ -200,8 +200,7 @@ const OE_REPLACE: u16 = 5;
 /// encodes conflict handling directly in `p5`, unlike SQLite's native layout.
 const OPFLAG_ISUPDATE: u16 = 0x10;
 /// Marks a WITHOUT ROWID table-row `IdxDelete` as an implicit REPLACE
-/// deletion whose exact OLD row must be reported to the connection layer for
-/// inbound foreign-key action enforcement.
+/// deletion whose exact OLD row must be reported for inbound FK actions.
 const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
 
 /// Convert AST `ConflictAction` to p5 OE_* flag value.

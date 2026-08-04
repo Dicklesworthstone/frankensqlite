@@ -7,7 +7,7 @@
 //! fsqlite-RED + oracle-OK  => fsqlite's integrity checker false-positives;
 //! fsqlite-RED + oracle-RED => fsqlite's vacuum writer emits mis-ordered leaves.
 
-use fsqlite::Connection;
+use fsqlite::{Connection, SqliteValue};
 
 const ROWS: &[(&str, &str)] = &[
     (
@@ -102,76 +102,90 @@ fn check_output(rows: &[Vec<String>]) -> String {
 
 #[test]
 fn vacuum_into_candidate_passes_own_integrity_check_with_desc_composite_index() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let src = dir.path().join("src.sqlite").to_string_lossy().into_owned();
-    let cand = dir
-        .path()
-        .join("cand.sqlite")
-        .to_string_lossy()
-        .into_owned();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src.sqlite").to_string_lossy().into_owned();
+        let cand = dir
+            .path()
+            .join("cand.sqlite")
+            .to_string_lossy()
+            .into_owned();
 
-    let conn = Connection::open(&src).expect("open source");
-    conn.execute(
-        "CREATE TABLE source_handles(provider_subject_id TEXT NOT NULL, known_at TEXT NOT NULL)",
-    )
-    .expect("create table");
-    conn.execute(
-        "CREATE INDEX idx_source_handles_provider_subject_id \
-         ON source_handles(provider_subject_id, known_at DESC)",
-    )
-    .expect("create desc composite index");
-    for (subject, known_at) in ROWS {
-        let subject_sql = subject.replace('\'', "''");
-        let known_at_sql = known_at.replace('\'', "''");
-        conn.execute(&format!(
-            "INSERT INTO source_handles VALUES ('{subject_sql}', '{known_at_sql}')"
-        ))
-        .expect("insert row");
-    }
+        let conn = Connection::open(&src).await.expect("open source");
+        conn.execute(
+            "CREATE TABLE source_handles(provider_subject_id TEXT NOT NULL, known_at TEXT NOT NULL)",
+        )
+        .await
+        .expect("create table");
+        conn.execute(
+            "CREATE INDEX idx_source_handles_provider_subject_id \
+             ON source_handles(provider_subject_id, known_at DESC)",
+        )
+        .await
+        .expect("create desc composite index");
+        for (subject, known_at) in ROWS {
+            conn.execute_with_params(
+                "INSERT INTO source_handles VALUES (?1, ?2)",
+                &[
+                    SqliteValue::Text((*subject).into()),
+                    SqliteValue::Text((*known_at).into()),
+                ],
+            )
+            .await
+            .expect("insert row");
+        }
 
-    let source_verdict = conn
-        .query("PRAGMA integrity_check")
-        .expect("source integrity_check runs")
-        .iter()
-        .map(|row| {
-            row.values()
-                .iter()
-                .map(|v| format!("{v:?}"))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        check_output(&source_verdict).contains("ok"),
-        "fsqlite-written SOURCE already fails its own integrity_check: {}",
-        check_output(&source_verdict)
-    );
+        let source_verdict = conn
+            .query("PRAGMA integrity_check")
+            .await
+            .expect("source integrity_check runs")
+            .iter()
+            .map(|row| {
+                row.values()
+                    .iter()
+                    .map(|v| format!("{v:?}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            check_output(&source_verdict).contains("ok"),
+            "fsqlite-written SOURCE already fails its own integrity_check: {}",
+            check_output(&source_verdict)
+        );
 
-    conn.execute(&format!("VACUUM INTO '{cand}'"))
-        .expect("VACUUM INTO succeeds at the statement level");
+        conn.execute_with_params("VACUUM INTO ?1", &[SqliteValue::Text(cand.as_str().into())])
+            .await
+            .expect("VACUUM INTO succeeds at the statement level");
+        conn.close().await.expect("close source");
 
-    let oracle = rusqlite::Connection::open(&cand).expect("oracle opens candidate");
-    let oracle_verdict: String = oracle
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .expect("oracle integrity_check");
+        let oracle = rusqlite::Connection::open(&cand).expect("oracle opens candidate");
+        let oracle_verdict: String = oracle
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("oracle integrity_check");
 
-    let cand_conn = Connection::open(&cand).expect("fsqlite reopens candidate");
-    let cand_verdict = cand_conn
-        .query("PRAGMA integrity_check")
-        .expect("candidate integrity_check runs")
-        .iter()
-        .map(|row| {
-            row.values()
-                .iter()
-                .map(|v| format!("{v:?}"))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+        let cand_conn = Connection::open(&cand)
+            .await
+            .expect("fsqlite reopens candidate");
+        let cand_verdict = cand_conn
+            .query("PRAGMA integrity_check")
+            .await
+            .expect("candidate integrity_check runs")
+            .iter()
+            .map(|row| {
+                row.values()
+                    .iter()
+                    .map(|v| format!("{v:?}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
-    assert!(
-        check_output(&cand_verdict).contains("ok"),
-        "DISCRIMINATOR: fsqlite verdict on its own VACUUM INTO candidate = {} ;; \
-         C-SQLite oracle verdict on the SAME bytes = {oracle_verdict:?}",
-        check_output(&cand_verdict)
-    );
-    assert_eq!(oracle_verdict, "ok", "oracle rejects candidate bytes");
+        assert!(
+            check_output(&cand_verdict).contains("ok"),
+            "DISCRIMINATOR: fsqlite verdict on its own VACUUM INTO candidate = {} ;; \
+             C-SQLite oracle verdict on the SAME bytes = {oracle_verdict:?}",
+            check_output(&cand_verdict)
+        );
+        assert_eq!(oracle_verdict, "ok", "oracle rejects candidate bytes");
+        cand_conn.close().await.expect("close candidate");
+    });
 }

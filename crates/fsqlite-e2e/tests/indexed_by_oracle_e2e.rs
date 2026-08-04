@@ -94,6 +94,33 @@ async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     );
 }
 
+async fn assert_query_error_parity(stmts: &[&str], cases: &[(&str, &str)], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
+    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+    for sql in stmts {
+        f.execute(sql).await.expect("frank setup statement");
+        r.execute_batch(sql).expect("rusqlite setup statement");
+    }
+
+    for (sql, expected) in cases {
+        let frank_error = frank_rows(&f, sql)
+            .await
+            .expect_err("FrankenSQLite must reject the invalid plan query");
+        let sqlite_error =
+            sqlite_rows(&r, sql).expect_err("C SQLite must reject the invalid plan query");
+        assert!(
+            frank_error.contains(expected),
+            "{label}: unexpected FrankenSQLite error for `{sql}`: {frank_error}"
+        );
+        assert!(
+            sqlite_error.contains(expected),
+            "{label}: unexpected C SQLite error for `{sql}`: {sqlite_error}"
+        );
+    }
+
+    f.close().await.expect("close frank");
+}
+
 const T: [&str; 3] = [
     "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
     "CREATE INDEX idx_a ON t(a)",
@@ -156,14 +183,35 @@ fn indexed_by_nonexistent_index_errors() {
 /// plan.
 #[test]
 fn explain_query_plan_missing_indexed_by_errors() {
-    scenario(
-        &T,
-        &[
-            "EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
-            "EXPLAIN SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
-        ],
-        "explain_query_plan_missing_indexed_by_errors",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_query_error_parity(
+            &T,
+            &[
+                (
+                    "EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
+                    "no such index: no_such_index",
+                ),
+                (
+                    "EXPLAIN SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
+                    "no such index: no_such_index",
+                ),
+                (
+                    "EXPLAIN QUERY PLAN UPDATE t INDEXED BY no_such_index SET b = 'changed' WHERE a = 20",
+                    "no such index: no_such_index",
+                ),
+                (
+                    "EXPLAIN QUERY PLAN DELETE FROM t INDEXED BY no_such_index WHERE a = 20",
+                    "no such index: no_such_index",
+                ),
+                (
+                    "EXPLAIN QUERY PLAN SELECT id FROM missing_table INDEXED BY no_such_index",
+                    "no such table: missing_table",
+                ),
+            ],
+            "explain_query_plan_missing_indexed_by_errors",
+        )
+        .await;
+    });
 }
 
 #[test]

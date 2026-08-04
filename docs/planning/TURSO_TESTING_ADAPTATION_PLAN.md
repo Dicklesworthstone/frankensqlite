@@ -268,18 +268,22 @@ The generator contract should include:
   `docs/contracts/feature_universe_ledger.toml`, and
   `docs/contracts/parity_taxonomy.toml`. Warning: stale divergent duplicates
   of these files (and of `sqlite_version_contract.toml` and
-  `corpus_manifest.toml`) exist at the repository root, and some code paths
-  still resolve the root copies (`fixture_root_contract.rs:627`,
-  `feature_coverage_dashboard.rs:776`). Authority is currently distributed:
+  `corpus_manifest.toml`) exist at the repository root. The Phase-0 executable
+  inventory found no live repository-root consumer: the apparent joins in
+  `fixture_root_contract.rs:627` and `feature_coverage_dashboard.rs:776` are
+  `cfg(test)` temporary-workspace fixtures, and the remaining bare-name
+  references are report metadata or links resolved relative to the canonical
+  `docs/contracts/` directory. Authority is nevertheless distributed:
   `canonical_parity_contract.rs` declares the `docs/contracts/` paths for the
   SQLite-version, supported-surface, and feature-universe contracts;
   `fixture_root_contract.rs::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH` declares the
   corpus manifest; and `parity_taxonomy_test.rs` plus
   `scripts/verify_parity_taxonomy.sh` enforce the taxonomy path. The two
   `corpus_manifest.toml` copies already disagree on `content_hash`. Phase 0
-  must consolidate this authority, remove every live root-path read, and add a
-  drift guard before capability mapping is allowed to start. A decision record
-  or follow-up link alone does not satisfy that gate.
+  must consolidate this authority, make every root duplicate inert, reject any
+  future live root-path read, and add a drift guard before capability mapping
+  is allowed to start. A decision record or follow-up link alone does not
+  satisfy that gate.
 - Required execution lane and forbidden fallbacks.
 - Strict result/error/transaction comparison policy.
 
@@ -542,7 +546,8 @@ Deliverables:
   `fallback_boundary_inventory.toml`) and demonstrate the finer lanes the
   dispatcher must additionally expose.
 - Inventory the distributed contract-path authorities and hand the exact
-  root-path consumer list to a dedicated canonicalization task.
+  root-path reference list, including the reason each non-live reference is a
+  temporary fixture or metadata value, to a dedicated canonicalization task.
 - Consolidate the canonical contract path set under `docs/contracts/`, remove
   every live root-path read, and resolve or quarantine the divergent root-level
   duplicates of
@@ -742,6 +747,23 @@ Rules:
 - Numeric performance claims remain outside this plan unless measured by a
   named benchmark artifact under the README performance-claim rules.
 
+Validation is differential until the cross-phase promotion gate:
+
+- Every implementation bead runs and records the repository-wide formatting,
+  check, strict-Clippy, and test commands required by `AGENTS.md`; focused
+  strict gates for every touched crate, target, script, and fixture must pass.
+- A failure already present on the pinned clean pre-task baseline does not make
+  an unrelated bead permanently unclosable. The completion record must name
+  the baseline and candidate SHAs, preserve both command results, prove that
+  the candidate adds no diagnostic in the failing gate, and link the owning
+  debt bead. If the baseline cannot reach that gate because of a separate
+  compile failure, cold strict runs for every touched scope supply the
+  non-regression proof and the baseline failure remains part of the record. A
+  failure in a touched surface or any new diagnostic is blocking.
+- Baseline exceptions are temporary accounting, not waivers. Bead `.17` cannot
+  promote a lane or close the program-wide CI gate until the repository-wide
+  commands pass without an exception on the promotion candidate.
+
 ## 9. Observability And Artifacts
 
 Every failure must preserve:
@@ -923,6 +945,7 @@ Epic: `bd-turso-test-adaptation-zu081`
 | 6 | `bd-turso-test-adaptation-zu081.15` | Allocator/syscall fault-gap decision |
 | 6 | `bd-turso-test-adaptation-zu081.16` | CLI/system/fixed-database gap audit |
 | cross-phase | `bd-turso-test-adaptation-zu081.17` | CI, coverage, and phase-promotion gates |
+| related quality debt | `bd-fsqlite-core-strict-clippy-debt-1u517` | Pre-existing `fsqlite-core` cold-worker strict-Clippy findings discovered during `.1` |
 
 The epic is P0 because it contains the current top triage pick. Cross-epic
 `bd-2lt76.1` is a child of `bd-2lt76`, not of this epic. The Turso epic
@@ -930,6 +953,11 @@ therefore has 20 children, and every child carries both a
 `## Acceptance` section in its description and the structured
 `acceptance_criteria` field, so tooling that reads the structured field sees
 the same criteria as human readers.
+
+The `fsqlite-core` lint-debt bead is related, not blocking, for ordinary
+implementation children because Section 8 requires differential
+non-regression evidence. It is related to `.17`, whose promotion acceptance
+still requires an actually green repository-wide gate.
 
 The plan-to-bead coverage ledger is:
 
