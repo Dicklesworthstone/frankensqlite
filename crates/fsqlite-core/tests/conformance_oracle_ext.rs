@@ -35270,6 +35270,7 @@ fn test_conformance_atomic_foreign_key_statement_boundary_s76p() {
         rconn.execute_batch("BEGIN").unwrap();
         fconn
             .execute("INSERT INTO deferred_child VALUES (2, 999)")
+            .await
             .unwrap();
         rconn
             .execute_batch("INSERT INTO deferred_child VALUES (2, 999)")
