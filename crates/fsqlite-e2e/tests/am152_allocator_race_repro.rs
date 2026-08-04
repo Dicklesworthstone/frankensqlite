@@ -39,10 +39,14 @@
 //! peer-claimed page range. These remain `#[ignore]`d heavy stress harnesses;
 //! run with `--ignored` on demand to validate that the fix holds.
 #![recursion_limit = "512"]
+// Each writer owns its non-`Send` connection on one dedicated OS thread, and
+// the deliberately full-stack engine operations produce large futures. Boxing
+// every await would change the stress workload this regression test measures.
+#![allow(clippy::future_not_send, clippy::large_futures)]
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -89,9 +93,8 @@ where
 }
 
 async fn open(path: &Path, wal: bool) -> Result<Connection, String> {
-    let conn = Connection::open(path.to_string_lossy().to_string())
-        .await
-        .map_err(|e| format!("open: {e}"))?;
+    let path = path.to_string_lossy().into_owned();
+    let conn = with_retry("open", || Connection::open(path.clone())).await?;
     // Generous busy_timeout so the engine's own retry loop has room.
     let _ = conn.execute("PRAGMA busy_timeout=10000;").await;
     if wal {
@@ -102,10 +105,9 @@ async fn open(path: &Path, wal: bool) -> Result<Connection, String> {
     }
     // concurrent_mode is ON by default; assert it stayed on (that is the
     // whole point of the repro).
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "concurrent_mode default must be ON"
-    );
+    if !conn.is_concurrent_mode_default() {
+        return Err("concurrent_mode default must be ON".to_owned());
+    }
     Ok(conn)
 }
 
@@ -331,6 +333,59 @@ const BARRIER_WRITERS: usize = 16;
 const BARRIER_ROUNDS: usize = 40;
 const BARRIER_ROWS_PER_TXN: usize = 60;
 
+/// Ensures a barrier participant cannot strand its peers by returning or
+/// unwinding before its explicit rendezvous.
+struct BarrierArrivalGuard<'a> {
+    barrier: Option<&'a Barrier>,
+}
+
+impl<'a> BarrierArrivalGuard<'a> {
+    const fn new(barrier: &'a Barrier) -> Self {
+        Self {
+            barrier: Some(barrier),
+        }
+    }
+
+    fn arrive(mut self) {
+        if let Some(barrier) = self.barrier.take() {
+            barrier.wait();
+        }
+    }
+}
+
+impl Drop for BarrierArrivalGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(barrier) = self.barrier.take() {
+            barrier.wait();
+        }
+    }
+}
+
+#[test]
+fn barrier_arrival_guard_releases_peer_on_early_return() {
+    let barrier = Arc::new(Barrier::new(2));
+    let (tx, rx) = mpsc::channel();
+
+    let early_barrier = Arc::clone(&barrier);
+    let early = thread::spawn(move || {
+        let _arrival = BarrierArrivalGuard::new(&early_barrier);
+        // Returning drops the armed guard and therefore still arrives.
+    });
+
+    let peer_barrier = Arc::clone(&barrier);
+    let peer = thread::spawn(move || {
+        BarrierArrivalGuard::new(&peer_barrier).arrive();
+        let _ = tx.send(());
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "an early-returning participant must not strand its barrier peer"
+    );
+    assert!(early.join().is_ok(), "early-returning participant panicked");
+    assert!(peer.join().is_ok(), "barrier peer panicked");
+}
+
 /// Open a BEGIN CONCURRENT txn, bulk-insert, and COMMIT as ONE retryable
 /// unit. BusySnapshot anywhere inside (eager first-committer-wins abort during
 /// INSERT, or at COMMIT) rolls back and retries the whole txn. This is the
@@ -378,14 +433,19 @@ async fn barrier_writer(
     wal: bool,
     barrier: &Barrier,
 ) -> Result<usize, String> {
-    let conn = open(path, wal).await?;
+    // Every spawned participant must arrive at the rendezvous, including one
+    // whose open ultimately fails. Returning before `wait` would strand all
+    // successful peers forever because `Barrier` has a fixed participant
+    // count. Keep the open result until after the rendezvous so a setup error
+    // becomes an ordinary scenario failure instead of a harness deadlock.
+    let arrival = BarrierArrivalGuard::new(barrier);
+    let conn = open(path, wal).await;
+    arrival.arrive();
+    let conn = conn?;
     let table = format!("bw{writer_id}");
-    // Tables are pre-created in the seed phase. One alignment barrier before
-    // the loop lines all writers up so they allocate data pages from the same
-    // committed EOF baseline at the same time. After this point we do NOT use
-    // the barrier inside the loop (a writer that errors out must not deadlock
-    // its peers); every writer just hammers retryable concurrent txns.
-    barrier.wait();
+    // Tables are pre-created in the seed phase. After this point we do NOT use
+    // the barrier inside the loop; every writer just hammers retryable
+    // concurrent transactions.
 
     let mut committed_rows = 0usize;
     for round in 0..BARRIER_ROUNDS {
@@ -452,8 +512,10 @@ fn run_barrier_scenario(wal: bool) -> Result<(), String> {
             })
         })
         .collect();
-    for h in handles {
-        let _ = h.join();
+    for handle in handles {
+        if handle.join().is_err() {
+            errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     let total_committed = committed.load(Ordering::Relaxed);
