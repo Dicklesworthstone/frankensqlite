@@ -13,7 +13,7 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -779,6 +779,7 @@ fn controlled_env(worker: &str) -> BTreeMap<String, String> {
         ("RCH_LOG_FORMAT".to_owned(), "json".to_owned()),
         ("RCH_NO_SELF_HEALING".to_owned(), "1".to_owned()),
         ("RCH_REQUIRE_REMOTE".to_owned(), "1".to_owned()),
+        ("RCH_TEST_TIMEOUT_SEC".to_owned(), "7200".to_owned()),
         ("RCH_WORKER".to_owned(), worker.to_owned()),
     ])
 }
@@ -964,6 +965,23 @@ fn adopt_active_job(
             "requested worker `{worker}` has co-resident active RCH jobs"
         )),
     }
+}
+
+fn pin_adopted_job(
+    adopted: &mut Option<AdoptedRchJob>,
+    candidate: AdoptedRchJob,
+    worker: &str,
+) -> Result<(), String> {
+    if adopted
+        .as_ref()
+        .is_some_and(|current| current != &candidate)
+    {
+        return Err(format!(
+            "requested worker `{worker}` exposed distinct active job identities"
+        ));
+    }
+    adopted.get_or_insert(candidate);
+    Ok(())
 }
 
 fn completed_status_matches(bytes: &[u8], adopted: &AdoptedRchJob) -> Result<bool, String> {
@@ -1224,6 +1242,9 @@ fn strict_cargo(root: &Path, worker: &str, argv: &[String]) -> Result<StrictOutp
     let mut stderr = Vec::new();
     let mut active_status = None;
     let mut adopted_job = None;
+    let mut last_status_poll = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
     loop {
         match receiver.recv_timeout(Duration::from_millis(25)) {
             Ok(chunk) => match chunk.kind {
@@ -1233,18 +1254,15 @@ fn strict_cargo(root: &Path, worker: &str, argv: &[String]) -> Result<StrictOutp
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        let status = rch_status(root)?;
-        if let Some(candidate) = adopt_active_job(&status, worker, argv)? {
-            if adopted_job
-                .as_ref()
-                .is_some_and(|adopted| adopted != &candidate)
-            {
-                return Err(format!(
-                    "requested worker `{worker}` exposed distinct active job identities"
-                ));
+        // Keep the worker-isolation receipt live without hammering the daemon
+        // on every 25 ms stream poll during a multi-hour workspace test.
+        if last_status_poll.elapsed() >= Duration::from_secs(1) {
+            let status = rch_status(root)?;
+            if let Some(candidate) = adopt_active_job(&status, worker, argv)? {
+                pin_adopted_job(&mut adopted_job, candidate, worker)?;
+                active_status.get_or_insert(status);
             }
-            adopted_job.get_or_insert(candidate);
-            active_status.get_or_insert(status);
+            last_status_poll = Instant::now();
         }
         if child
             .try_wait()
@@ -2377,10 +2395,12 @@ fn prepare_external_baseline_root(
 #[cfg(test)]
 mod tests {
     use super::{
-        BUILD_SHAPING_ENV_EXACT, PackKind, adopt_active_job, external_pack_source_names,
-        is_build_shaping_env, parallel_map_ordered, parse_single_worker, parse_worker_pool,
+        AdoptedRchJob, BUILD_SHAPING_ENV_EXACT, PackKind, adopt_active_job,
+        completed_status_matches, external_pack_source_names, is_build_shaping_env,
+        parallel_map_ordered, parse_single_worker, parse_worker_pool, pin_adopted_job,
         strict_rch_command, validate_persistent_citation_receipt, validate_remote_target_mapping,
     };
+    use serde_json::Value;
 
     #[test]
     fn worker_pool_parser_is_bounded_unique_and_canonical() {
@@ -2511,6 +2531,26 @@ mod tests {
     }
 
     #[test]
+    fn strict_rch_command_sets_the_long_workspace_test_timeout() {
+        let root = std::path::Path::new("/clean/ancestor/source");
+        let argv = [
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--",
+            "--test-threads=1",
+        ]
+        .map(str::to_owned);
+        let command = strict_rch_command(root, "ovh-a", &argv);
+        let timeout = command
+            .get_envs()
+            .find(|(key, _)| *key == "RCH_TEST_TIMEOUT_SEC")
+            .and_then(|(_, value)| value);
+        assert_eq!(timeout, Some(std::ffi::OsStr::new("7200")));
+    }
+
+    #[test]
     fn structured_remote_target_mapping_binds_controlled_sibling_and_worker_pool() {
         let root = std::path::Path::new("/clean/ancestor/source");
         let worker = "ovh-a";
@@ -2570,6 +2610,119 @@ mod tests {
         .expect("adopt matching active job");
         assert_eq!(adopted.id, job_id);
         assert_eq!(adopted.id.to_string(), "29960952048779266");
+    }
+
+    #[test]
+    fn daemon_adoption_rejects_ambiguous_or_foreign_active_work() {
+        let argv = ["cargo", "check", "--workspace"].map(str::to_owned);
+        let build = |id, worker: &str, command: &str| {
+            serde_json::json!({
+                "id": id,
+                "project_id": "frankensqlite-df8c83ae",
+                "worker_id": worker,
+                "command": command,
+            })
+        };
+        let status = |active: Vec<Value>| {
+            serde_json::to_vec(&serde_json::json!({
+                "api_version": "1.0",
+                "command": "status",
+                "success": true,
+                "data": {"daemon": {"active_builds": active, "recent_builds": []}},
+            }))
+            .expect("encode active status")
+        };
+
+        assert_eq!(
+            adopt_active_job(&status(Vec::new()), "ovh-a", &argv),
+            Ok(None)
+        );
+        let foreign = status(vec![build(1, "ovh-a", "cargo check -p fsqlite-core")]);
+        assert!(
+            adopt_active_job(&foreign, "ovh-a", &argv)
+                .expect_err("foreign command must fail")
+                .contains("distinct RCH command")
+        );
+        let ambiguous = status(vec![
+            build(1, "ovh-a", "cargo check --workspace"),
+            build(2, "ovh-a", "cargo check --workspace"),
+        ]);
+        assert!(
+            adopt_active_job(&ambiguous, "ovh-a", &argv)
+                .expect_err("co-resident jobs must fail")
+                .contains("co-resident")
+        );
+    }
+
+    #[test]
+    fn adopted_job_identity_stays_pinned_across_status_samples() {
+        let job = |id| AdoptedRchJob {
+            id,
+            project_id: "frankensqlite-df8c83ae".to_owned(),
+            worker_id: "ovh-a".to_owned(),
+            command: ["cargo", "check", "--workspace"]
+                .map(str::to_owned)
+                .to_vec(),
+        };
+        let mut adopted = None;
+        pin_adopted_job(&mut adopted, job(41), "ovh-a").expect("adopt first identity");
+        pin_adopted_job(&mut adopted, job(41), "ovh-a").expect("accept same identity");
+        assert_eq!(adopted.as_ref().map(|candidate| candidate.id), Some(41));
+        assert!(
+            pin_adopted_job(&mut adopted, job(42), "ovh-a")
+                .expect_err("identity drift must fail")
+                .contains("distinct active job identities")
+        );
+        assert_eq!(adopted.as_ref().map(|candidate| candidate.id), Some(41));
+    }
+
+    #[test]
+    fn completed_history_distinguishes_absent_success_and_cancellation() {
+        let adopted = AdoptedRchJob {
+            id: 42,
+            project_id: "frankensqlite-df8c83ae".to_owned(),
+            worker_id: "ovh-a".to_owned(),
+            command: ["cargo", "check", "--workspace"]
+                .map(str::to_owned)
+                .to_vec(),
+        };
+        let status = |recent_builds: Vec<Value>| {
+            serde_json::to_vec(&serde_json::json!({
+                "api_version": "1.0",
+                "command": "status",
+                "success": true,
+                "data": {"daemon": {"active_builds": [], "recent_builds": recent_builds}},
+            }))
+            .expect("encode completed status")
+        };
+        let completed = |cancellation: Value| {
+            serde_json::json!({
+                "id": 42,
+                "project_id": "frankensqlite-df8c83ae",
+                "worker_id": "ovh-a",
+                "command": "cargo check --workspace",
+                "location": "remote",
+                "exit_code": 0,
+                "cancellation": cancellation,
+            })
+        };
+
+        assert_eq!(
+            completed_status_matches(&status(Vec::new()), &adopted),
+            Ok(false)
+        );
+        assert_eq!(
+            completed_status_matches(&status(vec![completed(Value::Null)]), &adopted),
+            Ok(true)
+        );
+        assert!(
+            completed_status_matches(
+                &status(vec![completed(Value::String("cancelled".to_owned()))]),
+                &adopted,
+            )
+            .expect_err("cancelled history must fail")
+            .contains("does not match")
+        );
     }
 
     #[test]
