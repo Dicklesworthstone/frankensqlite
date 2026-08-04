@@ -11375,8 +11375,10 @@ impl Connection {
         path: impl Into<String>,
         env: ConnectionEnv,
     ) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, false, false)
-            .await
+        Self::open_schema_only_with_optional_expected_identity_and_env(
+            path, None, env, false, false,
+        )
+        .await
     }
 
     /// Open a writable, existing-only schema connection with an explicit
