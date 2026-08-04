@@ -42321,6 +42321,243 @@ mod tests {
     }
 
     #[test]
+    fn test_journal_commit_preserves_peer_growth_for_disjoint_writer() {
+        asupersync::test_utils::run_test(|| async {
+            // Both pagers capture the same two-page image. Writer A grows the
+            // database, while writer B changes only a page that already existed
+            // in its snapshot. B has no newly allocated page in A's claimed
+            // range, but its synthesized page 1 still carries the old page
+            // count. Letting B commit that stale header would orphan A's page.
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/journal_stale_page_one_after_growth.db");
+            let cx = Cx::new();
+
+            let existing_page = {
+                let seed = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .unwrap();
+                let mut txn = seed.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(0x22)).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+                page
+            };
+
+            let pager_a = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let pager_b = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let mut txn_a = pager_a
+                .begin(&cx, TransactionMode::Concurrent)
+                .await
+                .unwrap();
+            let mut txn_b = pager_b
+                .begin(&cx, TransactionMode::Concurrent)
+                .await
+                .unwrap();
+
+            let grown_page = txn_a.allocate_page(&cx).await.unwrap();
+            assert_eq!(grown_page.get(), existing_page.get() + 1);
+            txn_a
+                .write_page(&cx, grown_page, &sample_page(0xAA))
+                .await
+                .unwrap();
+            txn_b
+                .write_page(&cx, existing_page, &sample_page(0xBB))
+                .await
+                .unwrap();
+
+            txn_a.commit(&cx).await.unwrap();
+            // B touched only a page that already existed in its snapshot, so it
+            // has no page-level conflict with A and must be allowed to commit.
+            // Aborting it here would be a spurious retry against the
+            // concurrent-writer contract. What must hold is that B's commit
+            // does not regress the extent: the page-1 header it publishes is
+            // re-read at commit time and already carries A's larger page count.
+            txn_b
+                .commit(&cx)
+                .await
+                .expect("a disjoint existing-page writer must still commit after peer growth");
+
+            let verify = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let txn = verify.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                txn.snapshot_db_size(),
+                grown_page.get(),
+                "committing the disjoint writer must preserve the peer-grown extent"
+            );
+            assert_eq!(
+                txn.get_page(&cx, grown_page).await.unwrap().as_ref(),
+                &sample_page(0xAA)[..],
+                "committing the disjoint writer must preserve the peer-grown page"
+            );
+            assert_eq!(
+                txn.get_page(&cx, existing_page).await.unwrap().as_ref(),
+                &sample_page(0xBB)[..],
+                "the disjoint writer's own page must be durable"
+            );
+        });
+    }
+
+    #[test]
+    fn test_wal_commit_preserves_peer_growth_for_disjoint_writer() {
+        asupersync::test_utils::run_test(|| async {
+            // WAL commit records carry the complete database size. If a stale
+            // existing-page-only writer publishes its snapshot size after a
+            // peer grows the file, the commit marker makes the peer's new page
+            // disappear even though the writers touched disjoint data pages.
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/wal_stale_db_size_after_growth.db");
+            let cx = Cx::new();
+
+            let existing_page = {
+                let seed = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .unwrap();
+                seed.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                let mut txn = seed.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(0x22)).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+                page
+            };
+
+            let pager_a = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let pager_b = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let mut txn_a = pager_a
+                .begin(&cx, TransactionMode::Concurrent)
+                .await
+                .unwrap();
+            let mut txn_b = pager_b
+                .begin(&cx, TransactionMode::Concurrent)
+                .await
+                .unwrap();
+
+            let grown_page = txn_a.allocate_page(&cx).await.unwrap();
+            assert_eq!(grown_page.get(), existing_page.get() + 1);
+            txn_a
+                .write_page(&cx, grown_page, &sample_page(0xAA))
+                .await
+                .unwrap();
+            txn_b
+                .write_page(&cx, existing_page, &sample_page(0xBB))
+                .await
+                .unwrap();
+
+            txn_a.commit(&cx).await.unwrap();
+            // Same contract as the rollback-journal case: disjoint data pages
+            // are not a conflict, so B commits. The WAL commit marker must
+            // record the peer-grown extent rather than B's stale snapshot size.
+            txn_b
+                .commit(&cx)
+                .await
+                .expect("a disjoint existing-page writer must still commit after peer growth");
+
+            let verify = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let txn = verify.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                txn.snapshot_db_size(),
+                grown_page.get(),
+                "the WAL commit marker must preserve the peer-grown extent"
+            );
+            assert_eq!(
+                txn.get_page(&cx, grown_page).await.unwrap().as_ref(),
+                &sample_page(0xAA)[..],
+                "the WAL commit marker must preserve the peer-grown page"
+            );
+            assert_eq!(
+                txn.get_page(&cx, existing_page).await.unwrap().as_ref(),
+                &sample_page(0xBB)[..],
+                "the disjoint writer's own page must be durable"
+            );
+        });
+    }
+
+    #[test]
+    fn test_concurrent_rollback_quarantines_peer_claimed_eof_page_until_refresh() {
+        asupersync::test_utils::run_test(|| async {
+            // Keep pager B non-quiescent so its retry cannot refresh durable
+            // metadata immediately after losing a first-committer-wins race.
+            // The losing EOF page must not become locally reusable while B's
+            // PagerInner still has the stale pre-growth db_size.
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/wal_rollback_eof_quarantine.db");
+            let cx = Cx::new();
+
+            {
+                let seed = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .unwrap();
+                seed.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                let mut txn = seed.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(0x22)).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+            }
+
+            let pager_a = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let pager_b = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let mut reader_b = pager_b.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let mut txn_a = pager_a
+                .begin(&cx, TransactionMode::Concurrent)
+                .await
+                .unwrap();
+            let mut txn_b = pager_b
+                .begin(&cx, TransactionMode::Concurrent)
+                .await
+                .unwrap();
+
+            let contested_page = txn_a.allocate_page(&cx).await.unwrap();
+            assert_eq!(
+                txn_b.allocate_page(&cx).await.unwrap(),
+                contested_page,
+                "premise: independent stale allocators choose the same EOF page"
+            );
+            txn_a
+                .write_page(&cx, contested_page, &sample_page(0xAA))
+                .await
+                .unwrap();
+            txn_b
+                .write_page(&cx, contested_page, &sample_page(0xBB))
+                .await
+                .unwrap();
+            txn_a.commit(&cx).await.unwrap();
+            let error = txn_b
+                .commit(&cx)
+                .await
+                .expect_err("the second writer of the same EOF page must lose");
+            assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+            txn_b.rollback(&cx).await.unwrap();
+
+            let mut retry_b = pager_b
+                .begin(&cx, TransactionMode::Concurrent)
+                .await
+                .unwrap();
+            let retry_page = retry_b.allocate_page(&cx).await.unwrap();
+            assert_ne!(
+                retry_page, contested_page,
+                "a peer-claimed EOF page must stay quarantined until a quiescent durable refresh"
+            );
+            retry_b.rollback(&cx).await.unwrap();
+            reader_b.commit(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_concurrent_reuse_and_free_beyond_db_size_page_is_net_zero() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;
