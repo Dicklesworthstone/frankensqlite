@@ -10290,6 +10290,11 @@ pub struct Connection {
     statement_fk_validation_tables: RefCell<Vec<String>>,
     /// Prevent final-image FK rechecks from recursively queueing themselves.
     statement_fk_validation_rechecking: Cell<bool>,
+    /// SET DEFAULT child rows changed by the active logical statement.
+    ///
+    /// SQLite retains these action-row increments in `total_changes()` even
+    /// when statement-end FK validation rejects and rolls back the statement.
+    statement_fk_set_default_changes: Cell<usize>,
     /// Exact logical rows implicitly deleted by the most recent successful
     /// VDBE REPLACE execution.
     last_replace_victims: RefCell<Vec<ReplaceVictim>>,
@@ -11064,8 +11069,10 @@ impl Drop for StatementFkValidationDepthGuard<'_> {
 struct StatementFkValidationSuffixGuard<'a> {
     tables: &'a RefCell<Vec<String>>,
     deferred: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
+    set_default_changes: &'a Cell<usize>,
     table_start: usize,
     deferred_start: usize,
+    previous_set_default_changes: usize,
     armed: bool,
 }
 
@@ -11073,14 +11080,18 @@ impl<'a> StatementFkValidationSuffixGuard<'a> {
     fn new(
         tables: &'a RefCell<Vec<String>>,
         deferred: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
+        set_default_changes: &'a Cell<usize>,
     ) -> Self {
         let table_start = tables.borrow().len();
         let deferred_start = deferred.borrow().len();
+        let previous_set_default_changes = set_default_changes.replace(0);
         Self {
             tables,
             deferred,
+            set_default_changes,
             table_start,
             deferred_start,
+            previous_set_default_changes,
             armed: true,
         }
     }
@@ -11096,6 +11107,8 @@ impl<'a> StatementFkValidationSuffixGuard<'a> {
 
 impl Drop for StatementFkValidationSuffixGuard<'_> {
     fn drop(&mut self) {
+        self.set_default_changes
+            .set(self.previous_set_default_changes);
         if self.armed {
             self.tables.borrow_mut().truncate(self.table_start);
             self.deferred.borrow_mut().truncate(self.deferred_start);
@@ -11678,6 +11691,7 @@ impl Connection {
             statement_fk_validation_depth: Cell::new(0),
             statement_fk_validation_tables: RefCell::new(Vec::new()),
             statement_fk_validation_rechecking: Cell::new(false),
+            statement_fk_set_default_changes: Cell::new(0),
             last_replace_victims: RefCell::new(Vec::new()),
             fk_parent_validation_cache: RefCell::new(None),
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
@@ -12132,6 +12146,7 @@ impl Connection {
             statement_fk_validation_depth: Cell::new(0),
             statement_fk_validation_tables: RefCell::new(Vec::new()),
             statement_fk_validation_rechecking: Cell::new(false),
+            statement_fk_set_default_changes: Cell::new(0),
             last_replace_victims: RefCell::new(Vec::new()),
             fk_parent_validation_cache: RefCell::new(None),
             // MVCC conflict observability (bd-t6sv2.1)
@@ -15180,6 +15195,20 @@ impl Connection {
         *self.last_table_program_error_state.borrow_mut() = Some(TableProgramErrorState {
             changes,
             last_insert_rowid,
+            rollback_visible_total_changes: 0,
+        });
+    }
+
+    fn record_fk_validation_error_state(
+        &self,
+        changes: usize,
+        last_insert_rowid: Option<i64>,
+        rollback_visible_total_changes: usize,
+    ) {
+        *self.last_table_program_error_state.borrow_mut() = Some(TableProgramErrorState {
+            changes,
+            last_insert_rowid,
+            rollback_visible_total_changes,
         });
     }
 
@@ -15207,10 +15236,17 @@ impl Connection {
                 return;
             }
         }
+        let rollback_visible_total_changes = error_state
+            .as_ref()
+            .map_or(0, |state| state.rollback_visible_total_changes);
         let failed_last_insert_rowid = error_state
             .and_then(|state| state.last_insert_rowid)
             .unwrap_or(previous_last_insert_rowid);
-        self.restore_change_tracking_state(0, previous_total_changes, failed_last_insert_rowid);
+        self.restore_change_tracking_state(
+            0,
+            previous_total_changes.saturating_add(rollback_visible_total_changes),
+            failed_last_insert_rowid,
+        );
     }
 
     fn record_last_insert_rowid(&self, rowid: i64) {
@@ -49424,6 +49460,7 @@ impl Connection {
             StatementFkValidationSuffixGuard::new(
                 &self.statement_fk_validation_tables,
                 &self.deferred_fk_checks,
+                &self.statement_fk_set_default_changes,
             )
         });
         let depth_guard =
@@ -49475,9 +49512,10 @@ impl Connection {
         }
         .await;
         if let Err(error) = validation_result {
-            self.record_table_program_error_state(
+            self.record_fk_validation_error_state(
                 retained_changes,
                 (retained_changes > 0).then_some(retained_last_insert_rowid),
+                self.statement_fk_set_default_changes.get(),
             );
             return Err(error);
         }
@@ -49505,7 +49543,7 @@ impl Connection {
 
     /// Queue final-image validation after SET DEFAULT writes values while
     /// ordinary child-side enforcement is suppressed by `fk_cascade_depth`.
-    fn queue_set_default_fk_validation(&self, table_name: &str) -> Result<()> {
+    fn queue_set_default_fk_validation(&self, table_name: &str, changed_rows: usize) -> Result<()> {
         if self.statement_fk_validation_depth.get() == 0
             || self.statement_fk_validation_rechecking.get()
         {
@@ -49514,6 +49552,11 @@ impl Connection {
             ));
         }
 
+        self.statement_fk_set_default_changes.set(
+            self.statement_fk_set_default_changes
+                .get()
+                .saturating_add(changed_rows),
+        );
         self.queue_statement_fk_validation_table(table_name);
         Ok(())
     }
@@ -50187,8 +50230,8 @@ impl Connection {
                     let _cascade = self.enter_fk_cascade()?;
                     self.execute_with_params(&sql, parent_values).await
                 };
-                result?;
-                self.queue_set_default_fk_validation(child_table)?;
+                let changed_rows = result?;
+                self.queue_set_default_fk_validation(child_table, changed_rows)?;
                 Ok(())
             }
         }
@@ -50438,8 +50481,8 @@ impl Connection {
                     let _cascade = self.enter_fk_cascade()?;
                     self.execute_with_params(&sql, old_parent_values).await
                 };
-                result?;
-                self.queue_set_default_fk_validation(child_table)?;
+                let changed_rows = result?;
+                self.queue_set_default_fk_validation(child_table, changed_rows)?;
                 Ok(())
             }
         }
@@ -102186,6 +102229,7 @@ struct ConcurrentPageIoContext {
 struct TableProgramErrorState {
     changes: usize,
     last_insert_rowid: Option<i64>,
+    rollback_visible_total_changes: usize,
 }
 
 #[derive(Debug)]
