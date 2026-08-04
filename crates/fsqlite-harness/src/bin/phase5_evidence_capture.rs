@@ -1,0 +1,2238 @@
+//! Strict, signer-agnostic Phase-5 evidence producer.
+//!
+//! `--plan` is deliberately side-effect free. The capture path is fail closed:
+//! every Cargo invocation is a direct `rch exec -- cargo …` proof-lane request,
+//! and the generated manifest is only an input for the out-of-tree DSR signer.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+const SCHEMA_VERSION: u32 = 2;
+const DIGEST_ALGORITHM: &str = "blake3-256";
+const SHA256_ALGORITHM: &str = "sha2-256";
+const RCH_RECEIPT_SCHEMA: &str = "fsqlite.phase5.rch_execution_receipt.v1";
+const EVIDENCE_ROOT: &str = "tests/artifacts/release-evidence";
+const MANIFEST_NAME: &str = "manifest.json";
+const BASELINE: &str = "tests/regression_baseline.json";
+const GUARD_LOCATOR: &str = "crates/fsqlite-harness/tests/phase5_regression_guard.rs::phase5_regression_guard_full_workspace_against_baseline";
+const USAGE: &str = "usage: phase5_evidence_capture (--plan | --baseline-only --baseline-output-dir <absolute-external-dir> | --output <tests/artifacts/release-evidence/<commit>/manifest.json> --c1-pack-dir <absolute-external-dir> --persistent-pack-dir <absolute-external-dir>) [--tested-commit <40-hex>]";
+
+#[derive(Debug, Deserialize)]
+struct Baseline {
+    ignored_tests: Vec<IgnoredTest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IgnoredTest {
+    source_path: String,
+    test_name: String,
+    cfg_condition: Option<String>,
+    policy: String,
+    evidence: Requirement,
+}
+
+#[derive(Debug, Deserialize)]
+struct Requirement {
+    requirement: String,
+}
+
+impl IgnoredTest {
+    fn locator(&self) -> String {
+        format!("{}::{}", self.source_path, self.test_name)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Manifest {
+    schema_version: u32,
+    tested_commit: String,
+    signature_path: String,
+    signer_attestation: EvidenceLeaf,
+    cargo_lock: EvidenceLeaf,
+    rust_toolchain: EvidenceLeaf,
+    pre_capture_untracked: EvidenceLeaf,
+    compiler_inventory_attestation: EvidenceLeaf,
+    workspace: RunEvidence,
+    run_receipts: Vec<RunReceipt>,
+    auxiliary_scorecards: Scorecards,
+    evidence_pack: Vec<EvidenceLeaf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunEvidence {
+    execution: CommandEvidence,
+    runner_receipt: EvidenceLeaf,
+}
+
+#[derive(Debug, Serialize)]
+struct RunReceipt {
+    source_path: String,
+    test_name: String,
+    requirement_blake3: String,
+    evidence: RunEvidence,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct EvidenceLeaf {
+    path: String,
+    digest_algorithm: String,
+    digest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct Scorecards {
+    c1: ScorecardEvidence,
+    persistent: ScorecardEvidence,
+}
+
+#[derive(Debug, Serialize)]
+struct ScorecardEvidence {
+    scorecard: EvidenceLeaf,
+    pack_manifest: EvidenceLeaf,
+    commit_provenance: EvidenceLeaf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CommandEvidence {
+    argv: Vec<String>,
+    exit_status: i32,
+    stdout: StreamEvidence,
+    stderr: StreamEvidence,
+    transcript: EvidenceLeaf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StreamEvidence {
+    capture: String,
+    leaf: EvidenceLeaf,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RchReceipt {
+    schema_version: String,
+    inner_cargo_argv: Vec<String>,
+    job_id: String,
+    active_status: EvidenceLeaf,
+    completed_status: EvidenceLeaf,
+}
+
+#[derive(Debug, Serialize)]
+struct CompilerInventory {
+    tested_tree_blake3: String,
+    cargo_metadata_blake3: String,
+    target_mappings_blake3: String,
+    active_identities_blake3: String,
+    ignored_identities_blake3: String,
+    doctest_identities_blake3: String,
+    expanded_identities_blake3: String,
+    cfg_profile: String,
+    inventory_runs: CompilerInventoryRuns,
+    targets: Vec<CompilerTarget>,
+    inventory_leaves: Vec<InventoryLeaf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CompilerInventoryRuns {
+    all_targets: RunEvidence,
+    all_targets_ignored: RunEvidence,
+    doctests: RunEvidence,
+    doctests_ignored: RunEvidence,
+}
+
+#[derive(Debug, Serialize)]
+struct CompilerTarget {
+    target: String,
+    source_inventory_blake3: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InventoryLeaf {
+    role: String,
+    path: String,
+    sha256_algorithm: &'static str,
+    sha256: String,
+    blake3_algorithm: &'static str,
+    blake3: String,
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct InventoryIdentity {
+    target: String,
+    name: String,
+    kind: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ListedTest {
+    name: String,
+    kind: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SigningRequest {
+    attestation_kind: &'static str,
+    tested_commit: String,
+    manifest_path: String,
+    signature_path: String,
+    signer: &'static str,
+    verdict: &'static str,
+}
+
+#[derive(Debug)]
+struct Options {
+    plan: bool,
+    baseline_only: bool,
+    baseline_output_dir: Option<PathBuf>,
+    output: Option<String>,
+    tested_commit: Option<String>,
+    c1_pack_dir: Option<PathBuf>,
+    persistent_pack_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct BaselineEvidence {
+    source_commit: String,
+    workspace: RunEvidence,
+}
+
+#[derive(Debug)]
+struct ValidatedPackInputs {
+    c1_scorecard: Vec<u8>,
+    c1_manifest: Vec<u8>,
+    c1_provenance: Vec<u8>,
+    persistent_scorecard: Vec<u8>,
+    persistent_manifest: Vec<u8>,
+    persistent_provenance: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct StrictOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    job_id: String,
+    active_status: Vec<u8>,
+    completed_status: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdoptedRchJob {
+    id: u64,
+    project_id: String,
+    worker_id: String,
+    command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug)]
+struct StreamChunk {
+    kind: StreamKind,
+    bytes: Vec<u8>,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("phase5 evidence capture failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let options = parse_options(&env::args().collect::<Vec<_>>())?;
+    let root = repository_root()?;
+    let tested_commit = tested_commit(&root, options.tested_commit.as_deref())?;
+    if options.baseline_only {
+        return capture_baseline_only(
+            &root,
+            &tested_commit,
+            options
+                .baseline_output_dir
+                .as_deref()
+                .ok_or_else(|| format!("missing --baseline-output-dir; {USAGE}"))?,
+        );
+    }
+    let baseline = load_baseline(&root)?;
+    let runs = release_runs(&baseline)?;
+    let plan = plan_json(&tested_commit, &runs)?;
+    if options.plan {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
+    let output = options
+        .output
+        .ok_or_else(|| format!("missing --output; {USAGE}"))?;
+    let c1_pack_dir = options
+        .c1_pack_dir
+        .ok_or_else(|| format!("missing --c1-pack-dir; {USAGE}"))?;
+    let persistent_pack_dir = options
+        .persistent_pack_dir
+        .ok_or_else(|| format!("missing --persistent-pack-dir; {USAGE}"))?;
+    let namespace = expected_namespace(&tested_commit);
+    if output != format!("{namespace}/{MANIFEST_NAME}") {
+        return Err(format!("--output must be `{namespace}/{MANIFEST_NAME}`"));
+    }
+    require_pristine_capture_checkout(&root)?;
+    let pack_inputs =
+        validate_pack_inputs(&root, &tested_commit, &c1_pack_dir, &persistent_pack_dir)?;
+    let worker = required_worker()?;
+    let namespace_path = root.join(&namespace);
+    prepare_evidence_namespace(&namespace_path, &namespace)?;
+
+    let c1_scorecard = write_raw_new(
+        &root,
+        &format!("{namespace}/performance/c1/c1_scorecard.json"),
+        &pack_inputs.c1_scorecard,
+    )?;
+    let persistent_scorecard = write_raw_new(
+        &root,
+        &format!("{namespace}/performance/persistent/persistent_scorecard.json"),
+        &pack_inputs.persistent_scorecard,
+    )?;
+    let census = pre_capture_untracked(&root, &tested_commit)?;
+    let pre_capture_untracked = write_raw_new(
+        &root,
+        &format!("{namespace}/inputs/pre-capture-git-status.z"),
+        &census,
+    )?;
+    let c1_manifest = write_raw_new(
+        &root,
+        &format!("{namespace}/performance/c1/manifest.json"),
+        &pack_inputs.c1_manifest,
+    )?;
+    let c1_provenance = write_raw_new(
+        &root,
+        &format!("{namespace}/performance/c1/build_metadata.json"),
+        &pack_inputs.c1_provenance,
+    )?;
+    let persistent_manifest = write_raw_new(
+        &root,
+        &format!("{namespace}/performance/persistent/manifest.json"),
+        &pack_inputs.persistent_manifest,
+    )?;
+    let persistent_provenance = write_raw_new(
+        &root,
+        &format!("{namespace}/performance/persistent/provenance/citation_receipt.json"),
+        &pack_inputs.persistent_provenance,
+    )?;
+
+    let tree = tested_tree_hash(&root, &tested_commit)?;
+    let cargo_lock = write_raw_new(
+        &root,
+        &format!("{namespace}/inputs/Cargo.lock"),
+        &git_blob_at_commit(&root, &tested_commit, "Cargo.lock")?,
+    )?;
+    let rust_toolchain = write_raw_new(
+        &root,
+        &format!("{namespace}/inputs/rust-toolchain.toml"),
+        &git_blob_at_commit(&root, &tested_commit, "rust-toolchain.toml")?,
+    )?;
+
+    let all_targets = capture_run(
+        &root,
+        &root,
+        &namespace,
+        "compiler-all-targets",
+        &worker,
+        &[
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "--list",
+        ],
+    )?;
+    let all_targets_ignored = capture_run(
+        &root,
+        &root,
+        &namespace,
+        "compiler-all-targets-ignored",
+        &worker,
+        &[
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "--list",
+            "--ignored",
+        ],
+    )?;
+    let doctests = capture_run(
+        &root,
+        &root,
+        &namespace,
+        "compiler-doctests",
+        &worker,
+        &[
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--doc",
+            "--",
+            "--list",
+        ],
+    )?;
+    let doctests_ignored = capture_run(
+        &root,
+        &root,
+        &namespace,
+        "compiler-doctests-ignored",
+        &worker,
+        &[
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--doc",
+            "--",
+            "--list",
+            "--ignored",
+        ],
+    )?;
+    let compiler_runs = CompilerInventoryRuns {
+        all_targets,
+        all_targets_ignored,
+        doctests,
+        doctests_ignored,
+    };
+    let compiler = compiler_inventory(&root, &namespace, &compiler_runs, &tree)?;
+    let inventory_evidence = compiler
+        .inventory_leaves
+        .iter()
+        .map(|leaf| EvidenceLeaf {
+            path: leaf.path.clone(),
+            digest_algorithm: leaf.blake3_algorithm.to_owned(),
+            digest: leaf.blake3.clone(),
+        })
+        .collect::<Vec<_>>();
+    let compiler_path = format!("{namespace}/compiler/compiler-inventory.json");
+    let compiler_leaf = write_json_new(&root, &compiler_path, &compiler)?;
+
+    let workspace = capture_run(
+        &root,
+        &root,
+        &namespace,
+        "workspace",
+        &worker,
+        &[
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--",
+            "--test-threads=1",
+        ],
+    )?;
+    let mut receipts = Vec::new();
+    for entry in &runs {
+        let label = format!("run-{}", blake3::hash(entry.locator().as_bytes()).to_hex());
+        let evidence = capture_run(
+            &root,
+            &root,
+            &namespace,
+            &label,
+            &worker,
+            &exact_argv(entry)?,
+        )?;
+        receipts.push(RunReceipt {
+            source_path: entry.source_path.clone(),
+            test_name: entry.test_name.clone(),
+            requirement_blake3: blake3::hash(entry.evidence.requirement.as_bytes())
+                .to_hex()
+                .to_string(),
+            evidence,
+        });
+    }
+    let signing_path = format!("{namespace}/signing/signer-attestation.json");
+    let signature_path = format!("{namespace}/signing/manifest.minisig");
+    let provisional = Manifest {
+        schema_version: SCHEMA_VERSION,
+        tested_commit: tested_commit.clone(),
+        signature_path: signature_path.clone(),
+        signer_attestation: EvidenceLeaf {
+            path: signing_path.clone(),
+            digest_algorithm: DIGEST_ALGORITHM.to_owned(),
+            digest: String::new(),
+        },
+        cargo_lock,
+        rust_toolchain,
+        pre_capture_untracked,
+        compiler_inventory_attestation: compiler_leaf,
+        workspace,
+        run_receipts: receipts,
+        auxiliary_scorecards: Scorecards {
+            c1: ScorecardEvidence {
+                scorecard: c1_scorecard,
+                pack_manifest: c1_manifest,
+                commit_provenance: c1_provenance,
+            },
+            persistent: ScorecardEvidence {
+                scorecard: persistent_scorecard,
+                pack_manifest: persistent_manifest,
+                commit_provenance: persistent_provenance,
+            },
+        },
+        evidence_pack: Vec::new(),
+    };
+    let manifest_path = format!("{namespace}/{MANIFEST_NAME}");
+    let signing_leaf = write_json_new(
+        &root,
+        &signing_path,
+        &SigningRequest {
+            attestation_kind: "dsr_detached_signature_request",
+            tested_commit: tested_commit.clone(),
+            manifest_path: manifest_path.clone(),
+            signature_path,
+            signer: "DSR",
+            verdict: "unsigned_manifest_ready_for_detached_signing",
+        },
+    )?;
+    let mut manifest = provisional;
+    manifest.signer_attestation = signing_leaf;
+    manifest.evidence_pack = evidence_pack(&root, &manifest, &compiler_runs, &inventory_evidence)?;
+    write_json_new(&root, &manifest_path, &manifest)?;
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({"manifest": manifest_path, "tested_commit": tested_commit, "runs": manifest.run_receipts.len(), "signature": manifest.signature_path})).map_err(|error| error.to_string())?);
+    Ok(())
+}
+
+fn parse_options(arguments: &[String]) -> Result<Options, String> {
+    let mut plan = false;
+    let mut baseline_only = false;
+    let mut baseline_output_dir = None;
+    let mut output = None;
+    let mut tested_commit = None;
+    let mut c1_pack_dir = None;
+    let mut persistent_pack_dir = None;
+    let mut iter = arguments.iter().skip(1);
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--plan" if !plan => plan = true,
+            "--baseline-only" if !baseline_only => baseline_only = true,
+            "--baseline-output-dir" if baseline_output_dir.is_none() => {
+                baseline_output_dir = Some(PathBuf::from(iter.next().ok_or_else(|| {
+                    format!("missing value after --baseline-output-dir; {USAGE}")
+                })?));
+            }
+            "--output" if output.is_none() => {
+                output = Some(
+                    iter.next()
+                        .ok_or_else(|| format!("missing value after --output; {USAGE}"))?
+                        .to_owned(),
+                )
+            }
+            "--tested-commit" if tested_commit.is_none() => {
+                tested_commit = Some(
+                    iter.next()
+                        .ok_or_else(|| format!("missing value after --tested-commit; {USAGE}"))?
+                        .to_owned(),
+                )
+            }
+            "--c1-pack-dir" if c1_pack_dir.is_none() => {
+                c1_pack_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        format!("missing value after --c1-pack-dir; {USAGE}")
+                    })?));
+            }
+            "--persistent-pack-dir" if persistent_pack_dir.is_none() => {
+                persistent_pack_dir = Some(PathBuf::from(iter.next().ok_or_else(|| {
+                    format!("missing value after --persistent-pack-dir; {USAGE}")
+                })?));
+            }
+            _ => return Err(format!("unrecognized or duplicate `{flag}`; {USAGE}")),
+        }
+    }
+    let capture = output.is_some();
+    let modes = usize::from(plan) + usize::from(baseline_only) + usize::from(capture);
+    let baseline_shape = baseline_only
+        && baseline_output_dir.is_some()
+        && output.is_none()
+        && c1_pack_dir.is_none()
+        && persistent_pack_dir.is_none();
+    let capture_shape = capture
+        && !baseline_only
+        && baseline_output_dir.is_none()
+        && c1_pack_dir.is_some()
+        && persistent_pack_dir.is_some();
+    let plan_shape = plan
+        && !baseline_only
+        && baseline_output_dir.is_none()
+        && output.is_none()
+        && c1_pack_dir.is_none()
+        && persistent_pack_dir.is_none();
+    if modes != 1 || !(baseline_shape || capture_shape || plan_shape) {
+        return Err(USAGE.to_owned());
+    }
+    Ok(Options {
+        plan,
+        baseline_only,
+        baseline_output_dir,
+        output,
+        tested_commit,
+        c1_pack_dir,
+        persistent_pack_dir,
+    })
+}
+
+fn repository_root() -> Result<PathBuf, String> {
+    let output = local(
+        &PathBuf::from("."),
+        "git",
+        &["rev-parse", "--show-toplevel"],
+    )?;
+    PathBuf::from(text(&output)?)
+        .canonicalize()
+        .map_err(|error| error.to_string())
+}
+
+fn tested_commit(root: &Path, requested: Option<&str>) -> Result<String, String> {
+    let head = text(&local(root, "git", &["rev-parse", "--verify", "HEAD"])?)?;
+    if !full_hash(&head) {
+        return Err("HEAD is not a canonical Git commit hash".to_owned());
+    }
+    if requested.is_some_and(|value| value != head) {
+        return Err("--tested-commit must equal HEAD".to_owned());
+    }
+    Ok(head)
+}
+
+fn load_baseline(root: &Path) -> Result<Baseline, String> {
+    serde_json::from_slice(&read_regular(&root.join(BASELINE))?)
+        .map_err(|error| format!("invalid {BASELINE}: {error}"))
+}
+
+fn release_runs(baseline: &Baseline) -> Result<Vec<&IgnoredTest>, String> {
+    let mut entries = baseline
+        .ignored_tests
+        .iter()
+        .filter(|entry| entry.policy == "run_for_release" && entry.locator() != GUARD_LOCATOR)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.locator());
+    if entries.is_empty() {
+        return Err("baseline has no noncircular run_for_release entries".to_owned());
+    }
+    Ok(entries)
+}
+
+fn exact_argv(entry: &IgnoredTest) -> Result<Vec<String>, String> {
+    let components = entry.source_path.split('/').collect::<Vec<_>>();
+    if components.len() < 4 || components[0] != "crates" {
+        return Err(format!(
+            "unsupported release source `{}`",
+            entry.source_path
+        ));
+    }
+    let package = components[1];
+    let library = components[2] == "src" && components[3] != "main.rs" && components[3] != "bin";
+    let integration = components[2] == "tests" && components.len() == 4;
+    if !library && !integration {
+        return Err(format!("ambiguous Cargo target `{}`", entry.source_path));
+    }
+    let mut argv = vec![
+        "cargo".into(),
+        "test".into(),
+        "--locked".into(),
+        "--profile".into(),
+        "release-perf".into(),
+        "--package".into(),
+        package.into(),
+    ];
+    if library {
+        argv.push("--lib".into());
+    } else {
+        argv.extend([
+            "--test".into(),
+            Path::new(components[3])
+                .file_stem()
+                .and_then(|part| part.to_str())
+                .ok_or_else(|| "bad integration target".to_owned())?
+                .into(),
+        ]);
+    }
+    argv.push(runtime_name(entry, library)?);
+    argv.extend(["--".into(), "--exact".into()]);
+    match entry.cfg_condition.as_deref() {
+        None | Some("test") => argv.push("--ignored".into()),
+        Some("debug_assertions") | Some("all(debug_assertions,test)") => {}
+        Some(condition) => return Err(format!("unsupported cfg condition `{condition}`")),
+    }
+    argv.extend(["--nocapture".into(), "--test-threads=1".into()]);
+    Ok(argv)
+}
+
+fn runtime_name(entry: &IgnoredTest, library: bool) -> Result<String, String> {
+    if !library {
+        return Ok(entry.test_name.clone());
+    }
+    let parts = entry.source_path.split('/').collect::<Vec<_>>();
+    let relative = &parts[3..];
+    let mut modules = Vec::new();
+    for (index, part) in relative.iter().enumerate() {
+        if index + 1 == relative.len() {
+            let stem = part
+                .strip_suffix(".rs")
+                .ok_or_else(|| "library source is not Rust".to_owned())?;
+            if stem != "lib" {
+                modules.push(stem.to_owned());
+            }
+        } else {
+            modules.push((*part).to_owned());
+        }
+    }
+    Ok(if modules.is_empty() {
+        entry.test_name.clone()
+    } else {
+        format!("{}::{}", modules.join("::"), entry.test_name)
+    })
+}
+
+fn plan_json(tested_commit: &str, runs: &[&IgnoredTest]) -> Result<Value, String> {
+    Ok(serde_json::json!({
+        "mode": "plan", "side_effect_free": true, "tested_commit": tested_commit,
+        "manifest": format!("{}/{MANIFEST_NAME}", expected_namespace(tested_commit)),
+        "workspace": ["cargo", "test", "--locked", "--workspace", "--", "--test-threads=1"],
+        "compiler_inventory_runs": [
+            ["cargo", "test", "--locked", "--workspace", "--all-targets", "--", "--list"],
+            ["cargo", "test", "--locked", "--workspace", "--all-targets", "--", "--list", "--ignored"],
+            ["cargo", "test", "--locked", "--workspace", "--doc", "--", "--list"],
+            ["cargo", "test", "--locked", "--workspace", "--doc", "--", "--list", "--ignored"]
+        ],
+        "runs": runs.iter().map(|entry| exact_argv(entry)).collect::<Result<Vec<_>, _>>()?,
+        "required_environment": ["FSQLITE_PHASE5_RCH_WORKER", "NO_COLOR=1", "RCH_LOG_FORMAT=json"],
+        "required_capture_inputs": ["--c1-pack-dir <absolute external dir>", "--persistent-pack-dir <absolute external dir>"],
+        "signing": "DSR detached signature is intentionally not produced by this runner"
+    }))
+}
+
+fn expected_namespace(commit: &str) -> String {
+    format!("{EVIDENCE_ROOT}/{commit}")
+}
+
+fn required_worker() -> Result<String, String> {
+    let worker = env::var("FSQLITE_PHASE5_RCH_WORKER")
+        .map_err(|_| "FSQLITE_PHASE5_RCH_WORKER is required for strict capture".to_owned())?;
+    if worker.is_empty()
+        || !worker
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("FSQLITE_PHASE5_RCH_WORKER must be a canonical worker id".to_owned());
+    }
+    Ok(worker)
+}
+
+fn controlled_env(worker: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("CARGO_TERM_COLOR".to_owned(), "never".to_owned()),
+        ("NO_COLOR".to_owned(), "1".to_owned()),
+        ("RCH_LOG_FORMAT".to_owned(), "json".to_owned()),
+        ("RCH_NO_SELF_HEALING".to_owned(), "1".to_owned()),
+        ("RCH_REQUIRE_REMOTE".to_owned(), "1".to_owned()),
+        ("RCH_WORKER".to_owned(), worker.to_owned()),
+    ])
+}
+
+fn spawn_stream_reader<R: Read + Send + 'static>(
+    reader: R,
+    kind: StreamKind,
+    sender: Sender<StreamChunk>,
+) -> thread::JoinHandle<Result<(), String>> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let mut bytes = Vec::new();
+            let count = reader
+                .read_until(b'\n', &mut bytes)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                return Ok(());
+            }
+            sender
+                .send(StreamChunk { kind, bytes })
+                .map_err(|error| error.to_string())?;
+        }
+    })
+}
+
+fn append_chunks(receiver: &Receiver<StreamChunk>, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) {
+    while let Ok(chunk) = receiver.try_recv() {
+        match chunk.kind {
+            StreamKind::Stdout => stdout.extend_from_slice(&chunk.bytes),
+            StreamKind::Stderr => stderr.extend_from_slice(&chunk.bytes),
+        }
+    }
+}
+
+fn rch_status(root: &Path) -> Result<Vec<u8>, String> {
+    let output = Command::new("rch")
+        .args([
+            "--no-self-healing",
+            "status",
+            "--workers",
+            "--jobs",
+            "--json",
+            "--no-color",
+        ])
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .env("RCH_LOG_FORMAT", "json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("could not capture RCH status: {error}"))?;
+    if !output.status.success() || output.stdout.contains(&0x1b) {
+        return Err(format!(
+            "RCH status capture failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_rch_status_envelope(&output.stdout)?;
+    Ok(output.stdout)
+}
+
+fn parse_rch_status_envelope(bytes: &[u8]) -> Result<Value, String> {
+    let value = serde_json::from_slice::<Value>(bytes)
+        .map_err(|error| format!("RCH status was not JSON: {error}"))?;
+    if value.get("api_version").and_then(Value::as_str) != Some("1.0")
+        || value.get("command").and_then(Value::as_str) != Some("status")
+        || value.get("success").and_then(Value::as_bool) != Some(true)
+        || value
+            .pointer("/data/daemon/active_builds")
+            .and_then(Value::as_array)
+            .is_none()
+        || value
+            .pointer("/data/daemon/recent_builds")
+            .and_then(Value::as_array)
+            .is_none()
+    {
+        return Err(
+            "RCH status must be a successful API v1 status envelope with daemon job arrays"
+                .to_owned(),
+        );
+    }
+    Ok(value)
+}
+
+fn adopt_active_job(
+    bytes: &[u8],
+    worker: &str,
+    argv: &[String],
+) -> Result<Option<AdoptedRchJob>, String> {
+    let value = parse_rch_status_envelope(bytes)?;
+    let active = value
+        .pointer("/data/daemon/active_builds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "validated status lost active build array".to_owned())?;
+    let worker_builds = active
+        .iter()
+        .filter(|build| build.get("worker_id").and_then(Value::as_str) == Some(worker))
+        .collect::<Vec<_>>();
+    match worker_builds.as_slice() {
+        [] => Ok(None),
+        [build] => {
+            let id = build
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "active RCH job id is not an exact u64 integer".to_owned())?;
+            let project_id = build
+                .get("project_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "active RCH job has no project identity".to_owned())?;
+            let command = parse_rch_command_tokens(
+                build
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "active RCH job has no command".to_owned())?,
+            )?;
+            if command != argv {
+                return Err(format!(
+                    "requested worker `{worker}` is occupied by a distinct RCH command"
+                ));
+            }
+            Ok(Some(AdoptedRchJob {
+                id,
+                project_id: project_id.to_owned(),
+                worker_id: worker.to_owned(),
+                command,
+            }))
+        }
+        _ => Err(format!(
+            "requested worker `{worker}` has co-resident active RCH jobs"
+        )),
+    }
+}
+
+fn completed_status_matches(bytes: &[u8], adopted: &AdoptedRchJob) -> Result<bool, String> {
+    let value = parse_rch_status_envelope(bytes)?;
+    let recent = value
+        .pointer("/data/daemon/recent_builds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "validated status lost recent build array".to_owned())?;
+    let matches = recent
+        .iter()
+        .filter(|build| build.get("id").and_then(Value::as_u64) == Some(adopted.id))
+        .collect::<Vec<_>>();
+    let build = match matches.as_slice() {
+        [] => return Ok(false),
+        [build] => *build,
+        _ => return Err("completed RCH history contains a duplicate adopted job id".to_owned()),
+    };
+    let command = build
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "completed RCH job has no command".to_owned())
+        .and_then(parse_rch_command_tokens)?;
+    if build.get("project_id").and_then(Value::as_str) != Some(adopted.project_id.as_str())
+        || build.get("worker_id").and_then(Value::as_str) != Some(adopted.worker_id.as_str())
+        || command != adopted.command
+        || build.get("location").and_then(Value::as_str) != Some("remote")
+        || build.get("exit_code").and_then(Value::as_i64) != Some(0)
+        || !build.get("cancellation").is_some_and(Value::is_null)
+    {
+        return Err("completed RCH job does not match the adopted remote identity".to_owned());
+    }
+    Ok(true)
+}
+
+fn parse_rch_command_tokens(command: &str) -> Result<Vec<String>, String> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut started = false;
+    let mut token = String::new();
+    let mut tokens = Vec::new();
+    for character in command.chars() {
+        if matches!(character, '\0' | '\n' | '\r') {
+            return Err("RCH status command contains a forbidden control character".to_owned());
+        }
+        if escaped {
+            token.push(character);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                } else {
+                    token.push(character);
+                }
+                started = true;
+            }
+            Quote::Double => {
+                match character {
+                    '"' => quote = Quote::None,
+                    '\\' => escaped = true,
+                    '$' | '`' => {
+                        return Err(
+                            "RCH status command uses unsupported shell expansion syntax".to_owned()
+                        );
+                    }
+                    _ => token.push(character),
+                }
+                started = true;
+            }
+            Quote::None => match character {
+                '\'' => {
+                    quote = Quote::Single;
+                    started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    started = true;
+                }
+                '\\' => {
+                    escaped = true;
+                    started = true;
+                }
+                value if value.is_whitespace() => {
+                    if started {
+                        tokens.push(std::mem::take(&mut token));
+                        started = false;
+                    }
+                }
+                '$' | '`' | ';' | '|' | '&' | '<' | '>' => {
+                    return Err("RCH status command uses unsupported shell syntax".to_owned());
+                }
+                _ => {
+                    token.push(character);
+                    started = true;
+                }
+            },
+        }
+    }
+    if escaped || quote != Quote::None {
+        return Err("RCH status command has an incomplete escape or quote".to_owned());
+    }
+    if started {
+        tokens.push(token);
+    }
+    if tokens.is_empty() || tokens.iter().any(String::is_empty) {
+        return Err("RCH status command must contain nonempty argument tokens".to_owned());
+    }
+    Ok(tokens)
+}
+
+fn one_rch_stderr_value(stderr: &str, marker: &str) -> Result<String, String> {
+    let values = stderr
+        .lines()
+        .filter_map(|line| line.split_once(marker).map(|(_, suffix)| suffix))
+        .map(|suffix| {
+            suffix
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+                })
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [value] if !value.is_empty() => Ok(value.clone()),
+        _ => Err(format!(
+            "RCH stderr must contain exactly one nonempty `{marker}` value"
+        )),
+    }
+}
+
+fn collect_child_streams(
+    child: &mut Child,
+    receiver: &Receiver<StreamChunk>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+) -> Result<ExitStatus, String> {
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(chunk) => match chunk.kind {
+                StreamKind::Stdout => stdout.extend_from_slice(&chunk.bytes),
+                StreamKind::Stderr => stderr.extend_from_slice(&chunk.bytes),
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return child.wait().map_err(|error| error.to_string());
+            }
+        }
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            append_chunks(receiver, stdout, stderr);
+            return Ok(status);
+        }
+    }
+}
+
+fn strict_cargo(root: &Path, worker: &str, argv: &[String]) -> Result<StrictOutput, String> {
+    if argv.first().map(String::as_str) != Some("cargo") {
+        return Err("strict runner accepts direct Cargo argv only".to_owned());
+    }
+    let mut child = Command::new("rch")
+        .args(["--no-self-healing", "exec", "--no-self-healing", "--"])
+        .args(argv)
+        .current_dir(root)
+        .envs(controlled_env(worker))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not invoke strict RCH: {error}"))?;
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "missing RCH stdout".to_owned())?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "missing RCH stderr".to_owned())?;
+    let (sender, receiver) = mpsc::channel();
+    let stdout_reader = spawn_stream_reader(stdout_pipe, StreamKind::Stdout, sender.clone());
+    let stderr_reader = spawn_stream_reader(stderr_pipe, StreamKind::Stderr, sender.clone());
+    drop(sender);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut active_status = None;
+    let mut adopted_job = None;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(chunk) => match chunk.kind {
+                StreamKind::Stdout => stdout.extend_from_slice(&chunk.bytes),
+                StreamKind::Stderr => stderr.extend_from_slice(&chunk.bytes),
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        let status = rch_status(root)?;
+        if let Some(candidate) = adopt_active_job(&status, worker, argv)? {
+            if adopted_job
+                .as_ref()
+                .is_some_and(|adopted| adopted != &candidate)
+            {
+                return Err(format!(
+                    "requested worker `{worker}` exposed distinct active job identities"
+                ));
+            }
+            adopted_job.get_or_insert(candidate);
+            active_status.get_or_insert(status);
+        }
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            break;
+        }
+    }
+    let status = collect_child_streams(&mut child, &receiver, &mut stdout, &mut stderr)?;
+    stdout_reader
+        .join()
+        .map_err(|_| "RCH stdout reader panicked".to_owned())??;
+    stderr_reader
+        .join()
+        .map_err(|_| "RCH stderr reader panicked".to_owned())??;
+    append_chunks(&receiver, &mut stdout, &mut stderr);
+    let adopted_job = adopted_job.ok_or_else(|| {
+        format!("RCH command was never observed as the sole active job on `{worker}`")
+    })?;
+    let job_id = adopted_job.id.to_string();
+    let active_status = active_status
+        .ok_or_else(|| format!("RCH job {job_id} was never observed active on `{worker}`"))?;
+    if !status.success() {
+        return Err(format!(
+            "strict RCH job {job_id} failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    let mut completed_status = None;
+    for _ in 0..300 {
+        let candidate = rch_status(root)?;
+        if completed_status_matches(&candidate, &adopted_job)? {
+            completed_status = Some(candidate);
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let completed_status = completed_status
+        .ok_or_else(|| format!("RCH job {job_id} did not enter successful remote history"))?;
+    if stdout.contains(&0x1b) || stderr.contains(&0x1b) {
+        return Err(format!("strict RCH job {job_id} emitted an ANSI escape"));
+    }
+    let stderr_text = std::str::from_utf8(&stderr)
+        .map_err(|error| format!("strict RCH stderr is not UTF-8: {error}"))?;
+    if one_rch_stderr_value(stderr_text, "Selected worker: ")? != worker
+        || one_rch_stderr_value(stderr_text, "Remote command finished: exit=")? != "0"
+    {
+        return Err(format!(
+            "strict RCH job {job_id} stderr does not bind worker `{worker}` and remote exit 0"
+        ));
+    }
+    Ok(StrictOutput {
+        status,
+        stdout,
+        stderr,
+        job_id,
+        active_status,
+        completed_status,
+    })
+}
+
+fn capture_run<T: AsRef<str>>(
+    command_root: &Path,
+    storage_root: &Path,
+    namespace: &str,
+    label: &str,
+    worker: &str,
+    argv: &[T],
+) -> Result<RunEvidence, String> {
+    let argv = argv
+        .iter()
+        .map(|argument| argument.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    let result = strict_cargo(command_root, worker, &argv)?;
+    let exit_status = result
+        .status
+        .code()
+        .ok_or_else(|| "strict RCH process terminated without an exit code".to_owned())?;
+    let stdout = write_raw_new(
+        storage_root,
+        &format!("{namespace}/transcripts/{label}.stdout"),
+        &result.stdout,
+    )?;
+    let stderr = write_raw_new(
+        storage_root,
+        &format!("{namespace}/transcripts/{label}.stderr"),
+        &result.stderr,
+    )?;
+    let active_status = write_raw_new(
+        storage_root,
+        &format!("{namespace}/runner/{label}.active-status.json"),
+        &result.active_status,
+    )?;
+    let completed_status = write_raw_new(
+        storage_root,
+        &format!("{namespace}/runner/{label}.completed-status.json"),
+        &result.completed_status,
+    )?;
+    let receipt = RchReceipt {
+        schema_version: RCH_RECEIPT_SCHEMA.to_owned(),
+        inner_cargo_argv: argv.clone(),
+        job_id: result.job_id,
+        active_status,
+        completed_status,
+    };
+    let receipt_leaf = write_json_new(
+        storage_root,
+        &format!("{namespace}/runner/{label}.json"),
+        &receipt,
+    )?;
+    Ok(RunEvidence {
+        execution: CommandEvidence {
+            argv,
+            exit_status,
+            stdout: StreamEvidence {
+                capture: "observed".to_owned(),
+                leaf: stdout,
+            },
+            stderr: StreamEvidence {
+                capture: "observed".to_owned(),
+                leaf: stderr.clone(),
+            },
+            transcript: stderr,
+        },
+        runner_receipt: receipt_leaf,
+    })
+}
+
+fn compiler_inventory(
+    root: &Path,
+    namespace: &str,
+    runs: &CompilerInventoryRuns,
+    tree: &str,
+) -> Result<CompilerInventory, String> {
+    let active = identities_from_run(root, &runs.all_targets)?;
+    let ignored = identities_from_run(root, &runs.all_targets_ignored)?;
+    let doctests = identities_from_run(root, &runs.doctests)?;
+    let ignored_doctests = identities_from_run(root, &runs.doctests_ignored)?;
+    if active.is_empty() || doctests.is_empty() {
+        return Err(
+            "compiler all-target and doctest list transcripts must both be nonempty".to_owned(),
+        );
+    }
+    if ignored
+        .iter()
+        .any(|identity| active.binary_search(identity).is_err())
+        || ignored_doctests
+            .iter()
+            .any(|identity| doctests.binary_search(identity).is_err())
+    {
+        return Err("ignored compiler identities are not subsets of their full lists".to_owned());
+    }
+
+    let target_names = active
+        .iter()
+        .map(|identity| identity.target.clone())
+        .collect::<BTreeSet<_>>();
+    let mut targets = Vec::with_capacity(target_names.len());
+    let mut leaves = Vec::with_capacity(target_names.len() + 6);
+    for target in target_names {
+        let target_hash = blake3::hash(target.as_bytes()).to_hex().to_string();
+        let role_prefix = format!("target:{target}");
+        let full_entries = active
+            .iter()
+            .filter(|identity| identity.target == target)
+            .map(|identity| ListedTest {
+                name: identity.name.clone(),
+                kind: identity.kind.clone(),
+            })
+            .collect::<Vec<_>>();
+        let ignored_entries = ignored
+            .iter()
+            .filter(|identity| identity.target == target)
+            .map(|identity| ListedTest {
+                name: identity.name.clone(),
+                kind: identity.kind.clone(),
+            })
+            .collect::<Vec<_>>();
+        let source = serde_json::json!({
+            "executable": target,
+            "full_inventory": {"entries": full_entries},
+            "ignored_inventory": {"entries": ignored_entries},
+        });
+        let source_leaf = write_json_new(
+            root,
+            &format!("{namespace}/compiler/targets/{target_hash}-source-inventory.json"),
+            &source,
+        )?;
+        leaves.push(inventory_leaf(
+            root,
+            format!("{role_prefix}:source_inventory"),
+            source_leaf.clone(),
+        )?);
+        targets.push(CompilerTarget {
+            target,
+            source_inventory_blake3: source_leaf.digest,
+        });
+    }
+    let target_mappings = targets
+        .iter()
+        .map(|target| target.target.clone())
+        .collect::<Vec<_>>();
+    let expanded = serde_json::json!({
+        "derivation": "retained remote Cargo list transcripts",
+        "active_identities": &active,
+        "ignored_identities": &ignored,
+        "doctest_identities": &doctests,
+        "ignored_doctest_identities": &ignored_doctests,
+    });
+    let global_values = [
+        (
+            "cargo_metadata",
+            serde_json::json!({
+                "derivation": "remote cargo test --list",
+                "targets": &target_mappings,
+            }),
+        ),
+        (
+            "target_mappings",
+            serde_json::to_value(&target_mappings).map_err(|error| error.to_string())?,
+        ),
+        (
+            "active_identities",
+            serde_json::to_value(&active).map_err(|error| error.to_string())?,
+        ),
+        (
+            "ignored_identities",
+            serde_json::to_value(&ignored).map_err(|error| error.to_string())?,
+        ),
+        (
+            "doctest_identities",
+            serde_json::to_value(&doctests).map_err(|error| error.to_string())?,
+        ),
+        ("expanded_identities", expanded),
+    ];
+    let mut global_hashes = BTreeMap::new();
+    for (role, value) in global_values {
+        let leaf = write_json_new(root, &format!("{namespace}/compiler/{role}.json"), &value)?;
+        global_hashes.insert(role, leaf.digest.clone());
+        leaves.push(inventory_leaf(root, role.to_owned(), leaf)?);
+    }
+    leaves.sort_by(|left, right| (&left.role, &left.path).cmp(&(&right.role, &right.path)));
+    if leaves
+        .windows(2)
+        .any(|pair| pair[0].role == pair[1].role || pair[0].path == pair[1].path)
+    {
+        return Err("compiler inventory leaves must have unique roles and paths".to_owned());
+    }
+    Ok(CompilerInventory {
+        tested_tree_blake3: tree.to_owned(),
+        cargo_metadata_blake3: required_global_hash(&mut global_hashes, "cargo_metadata")?,
+        target_mappings_blake3: required_global_hash(&mut global_hashes, "target_mappings")?,
+        active_identities_blake3: required_global_hash(&mut global_hashes, "active_identities")?,
+        ignored_identities_blake3: required_global_hash(&mut global_hashes, "ignored_identities")?,
+        doctest_identities_blake3: required_global_hash(&mut global_hashes, "doctest_identities")?,
+        expanded_identities_blake3: required_global_hash(&mut global_hashes, "expanded_identities")?,
+        cfg_profile: "compiler-derived locked workspace all-target and doctest list inventories; observed remote RCH streams".to_owned(),
+        inventory_runs: CompilerInventoryRuns {
+            all_targets: runs.all_targets.clone(),
+            all_targets_ignored: runs.all_targets_ignored.clone(),
+            doctests: runs.doctests.clone(),
+            doctests_ignored: runs.doctests_ignored.clone(),
+        },
+        targets,
+        inventory_leaves: leaves,
+    })
+}
+
+fn identities_from_run(root: &Path, run: &RunEvidence) -> Result<Vec<InventoryIdentity>, String> {
+    let bytes = read_evidence_leaf(root, &run.execution.stderr.leaf)?;
+    let transcript = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("compiler list stderr is not UTF-8: {error}"))?;
+    compiler_list_identities(transcript)
+}
+
+fn cargo_target_section(line: &str) -> Option<&str> {
+    if let Some(section) = line.strip_prefix("     Running ") {
+        if !section.is_empty() && section.contains(" (") && section.ends_with(')') {
+            return Some(section);
+        }
+    }
+    let section = line.strip_prefix("   Doc-tests ")?;
+    (!section.trim().is_empty() && section == section.trim_end()).then_some(section)
+}
+
+fn compiler_list_identities(transcript: &str) -> Result<Vec<InventoryIdentity>, String> {
+    struct TargetSection {
+        target: String,
+        tests: usize,
+        benchmarks: usize,
+    }
+    fn parse_list_summary(line: &str) -> Option<(usize, usize)> {
+        fn parse_count(value: &str, singular: &str, plural: &str) -> Option<usize> {
+            let (count, used_singular) = if let Some(count) = value.strip_suffix(singular) {
+                (count, true)
+            } else {
+                (value.strip_suffix(plural)?, false)
+            };
+            let count = count.parse::<usize>().ok()?;
+            ((count == 1) == used_singular).then_some(count)
+        }
+        let (tests, benchmarks) = line.trim().split_once(", ")?;
+        Some((
+            parse_count(tests, " test", " tests")?,
+            parse_count(benchmarks, " benchmark", " benchmarks")?,
+        ))
+    }
+
+    let mut target: Option<TargetSection> = None;
+    let mut identities = Vec::new();
+    for line in transcript.lines() {
+        if let Some(section) = cargo_target_section(line) {
+            if let Some(previous) = target.take() {
+                return Err(format!(
+                    "compiler list target `{}` is missing its canonical count summary",
+                    previous.target
+                ));
+            }
+            let target_name = if line.starts_with("   Doc-tests ") {
+                format!("doc:{section}")
+            } else {
+                section
+                    .rsplit_once(" (")
+                    .and_then(|(_, path)| path.strip_suffix(')'))
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        format!("compiler list target has no canonical binary path: `{line}`")
+                    })?
+            };
+            target = Some(TargetSection {
+                target: target_name,
+                tests: 0,
+                benchmarks: 0,
+            });
+            continue;
+        }
+        if let Some((declared_tests, declared_benchmarks)) = parse_list_summary(line) {
+            let section = target.take().ok_or_else(|| {
+                "compiler list transcript contains a duplicate or unframed count summary".to_owned()
+            })?;
+            if section.tests != declared_tests || section.benchmarks != declared_benchmarks {
+                return Err(format!(
+                    "compiler list target `{}` declares {declared_tests} tests and {declared_benchmarks} benchmarks but retained {} tests and {} benchmarks",
+                    section.target, section.tests, section.benchmarks
+                ));
+            }
+            continue;
+        }
+        let Some((name, kind)) = line.rsplit_once(": ") else {
+            if target.is_some() && !line.trim().is_empty() {
+                return Err(format!(
+                    "compiler list target contains an unrecognized pre-summary line: `{line}`"
+                ));
+            }
+            continue;
+        };
+        if !matches!(kind, "test" | "benchmark") {
+            if target.is_some() {
+                return Err(format!(
+                    "compiler list target contains an unrecognized identity kind: `{line}`"
+                ));
+            }
+            continue;
+        }
+        let Some(section) = target.as_mut() else {
+            return Err(format!(
+                "compiler list identity `{name}` appeared outside a Cargo target section"
+            ));
+        };
+        if kind == "test" {
+            section.tests += 1;
+        } else {
+            section.benchmarks += 1;
+        }
+        identities.push(InventoryIdentity {
+            target: section.target.clone(),
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+        });
+    }
+    if let Some(section) = target {
+        return Err(format!(
+            "compiler list target `{}` is truncated before its canonical count summary",
+            section.target
+        ));
+    }
+    identities.sort();
+    if identities.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(
+            "compiler list transcript must contain a unique normalized identity set".to_owned(),
+        );
+    }
+    Ok(identities)
+}
+
+fn required_global_hash(
+    hashes: &mut BTreeMap<&str, String>,
+    role: &'static str,
+) -> Result<String, String> {
+    hashes
+        .remove(role)
+        .ok_or_else(|| format!("missing compiler inventory global `{role}`"))
+}
+
+fn inventory_leaf(root: &Path, role: String, leaf: EvidenceLeaf) -> Result<InventoryLeaf, String> {
+    let bytes = read_evidence_leaf(root, &leaf)?;
+    Ok(InventoryLeaf {
+        role,
+        path: leaf.path,
+        sha256_algorithm: SHA256_ALGORITHM,
+        sha256: sha256_bytes(&bytes),
+        blake3_algorithm: DIGEST_ALGORITHM,
+        blake3: leaf.digest,
+    })
+}
+
+fn evidence_pack(
+    root: &Path,
+    manifest: &Manifest,
+    compiler_runs: &CompilerInventoryRuns,
+    inventory_leaves: &[EvidenceLeaf],
+) -> Result<Vec<EvidenceLeaf>, String> {
+    let mut leaves = vec![
+        manifest.signer_attestation.clone(),
+        manifest.cargo_lock.clone(),
+        manifest.rust_toolchain.clone(),
+        manifest.pre_capture_untracked.clone(),
+        manifest.compiler_inventory_attestation.clone(),
+        manifest.auxiliary_scorecards.c1.scorecard.clone(),
+        manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
+        manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
+        manifest.auxiliary_scorecards.persistent.scorecard.clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .pack_manifest
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .commit_provenance
+            .clone(),
+    ];
+    leaves.extend(run_evidence_leaves(root, &manifest.workspace)?);
+    for receipt in &manifest.run_receipts {
+        leaves.extend(run_evidence_leaves(root, &receipt.evidence)?);
+    }
+    for run in [
+        &compiler_runs.all_targets,
+        &compiler_runs.all_targets_ignored,
+        &compiler_runs.doctests,
+        &compiler_runs.doctests_ignored,
+    ] {
+        leaves.extend(run_evidence_leaves(root, run)?);
+    }
+    leaves.extend(inventory_leaves.iter().cloned());
+    leaves.sort();
+    if leaves.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        return Err("evidence pack contains duplicate paths".to_owned());
+    }
+    Ok(leaves)
+}
+
+fn run_evidence_leaves(root: &Path, run: &RunEvidence) -> Result<Vec<EvidenceLeaf>, String> {
+    let receipt =
+        serde_json::from_slice::<RchReceipt>(&read_evidence_leaf(root, &run.runner_receipt)?)
+            .map_err(|error| format!("unable to parse retained RCH receipt: {error}"))?;
+    Ok(vec![
+        run.execution.stdout.leaf.clone(),
+        run.execution.stderr.leaf.clone(),
+        run.runner_receipt.clone(),
+        receipt.active_status,
+        receipt.completed_status,
+    ])
+}
+
+fn prepare_evidence_namespace(namespace_path: &Path, namespace: &str) -> Result<(), String> {
+    if namespace_path.exists() {
+        return Err(format!(
+            "refusing to reuse existing evidence root `{namespace}`"
+        ));
+    }
+    fs::create_dir(namespace_path)
+        .map_err(|error| format!("could not create evidence root `{namespace}`: {error}"))?;
+    for directory in [
+        "performance",
+        "performance/c1",
+        "performance/persistent",
+        "performance/persistent/provenance",
+        "inputs",
+        "transcripts",
+        "runner",
+        "compiler",
+        "compiler/targets",
+        "signing",
+    ] {
+        fs::create_dir(namespace_path.join(directory))
+            .map_err(|error| format!("could not create `{directory}` in `{namespace}`: {error}"))?;
+    }
+    Ok(())
+}
+
+fn require_pristine_capture_checkout(root: &Path) -> Result<(), String> {
+    let status = local(
+        root,
+        "git",
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+    )?;
+    if status
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .all(|record| record.starts_with(b"!! target/"))
+    {
+        Ok(())
+    } else {
+        Err(
+            "strict evidence capture requires a clean checkout; use --plan for keeper validation"
+                .to_owned(),
+        )
+    }
+}
+#[allow(dead_code)]
+fn rch_version(root: &Path) -> Result<String, String> {
+    text(&local(root, "rch", &["--version"])?)
+}
+#[allow(dead_code)]
+fn local_toolchain_identity(root: &Path) -> Result<String, String> {
+    text(&local(root, "rustc", &["--version", "--verbose"])?)
+}
+fn local(root: &Path, program: &str, args: &[&str]) -> Result<Output, String> {
+    let mut command = match program {
+        "git" => Command::new("git"),
+        "rch" => Command::new("rch"),
+        "rustc" => Command::new("rustc"),
+        _ => return Err(format!("unapproved local program `{program}`")),
+    };
+    let output = command
+        .args(args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("could not run `{program}`: {error}"))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!(
+            "`{program}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+fn text(output: &Output) -> Result<String, String> {
+    String::from_utf8(output.stdout.clone())
+        .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
+        .map_err(|error| error.to_string())
+}
+fn full_hash(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn read_regular(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("regular file required: `{}`", path.display()));
+    }
+    fs::read(path).map_err(|error| error.to_string())
+}
+fn sha256_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    let digest = hash.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn write_json_new<T: Serialize>(
+    root: &Path,
+    path: &str,
+    value: &T,
+) -> Result<EvidenceLeaf, String> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    write_raw_new(root, path, &bytes)
+}
+
+fn write_raw_new(root: &Path, path: &str, bytes: &[u8]) -> Result<EvidenceLeaf, String> {
+    let absolute = root.join(path);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&absolute)
+        .map_err(|error| format!("could not create `{path}`: {error}"))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(EvidenceLeaf {
+        path: path.to_owned(),
+        digest_algorithm: DIGEST_ALGORITHM.to_owned(),
+        digest: blake3::hash(bytes).to_hex().to_string(),
+    })
+}
+
+fn read_evidence_leaf(root: &Path, leaf: &EvidenceLeaf) -> Result<Vec<u8>, String> {
+    if leaf.digest_algorithm != DIGEST_ALGORITHM {
+        return Err(format!("unsupported digest algorithm for `{}`", leaf.path));
+    }
+    let bytes = read_regular(&root.join(&leaf.path))?;
+    if blake3::hash(&bytes).to_hex().as_str() != leaf.digest {
+        return Err(format!("evidence digest mismatch for `{}`", leaf.path));
+    }
+    Ok(bytes)
+}
+
+fn tested_tree_hash(root: &Path, commit: &str) -> Result<String, String> {
+    let output = local(root, "git", &["ls-tree", "-r", "--full-tree", commit])?;
+    Ok(blake3::hash(&output.stdout).to_hex().to_string())
+}
+
+fn git_blob_at_commit(root: &Path, commit: &str, path: &str) -> Result<Vec<u8>, String> {
+    let object = format!("{commit}:{path}");
+    let output = local(root, "git", &["show", &object])?;
+    Ok(output.stdout)
+}
+
+fn pre_capture_untracked(root: &Path, commit: &str) -> Result<Vec<u8>, String> {
+    let output = local(
+        root,
+        "git",
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let expected = format!(
+        "?? {EVIDENCE_ROOT}/{commit}/performance/c1/c1_scorecard.json\0?? {EVIDENCE_ROOT}/{commit}/performance/persistent/persistent_scorecard.json\0"
+    )
+    .into_bytes();
+    if output.stdout != expected {
+        return Err(format!(
+            "pre-capture status must contain exactly the sorted two scorecards; found {:?}",
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|record| !record.is_empty())
+                .map(|record| String::from_utf8_lossy(record).into_owned())
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackKind {
+    C1,
+    Persistent,
+}
+
+fn external_pack_source_names(kind: PackKind) -> [&'static str; 3] {
+    match kind {
+        PackKind::C1 => [
+            "c1_scorecard.json",
+            "c1_pack_manifest.json",
+            "build_metadata.json",
+        ],
+        PackKind::Persistent => [
+            "persistent_scorecard.json",
+            "persistent_pack_manifest.json",
+            "provenance/citation_receipt.json",
+        ],
+    }
+}
+
+fn read_external_pack(
+    root: &Path,
+    directory: &Path,
+    kind: PackKind,
+) -> Result<[Vec<u8>; 3], String> {
+    if !directory.is_absolute() {
+        return Err(format!(
+            "{} pack directory must be absolute",
+            pack_kind_name(kind)
+        ));
+    }
+    let metadata = fs::symlink_metadata(directory).map_err(|error| {
+        format!(
+            "unable to inspect {} pack directory `{}`: {error}",
+            pack_kind_name(kind),
+            directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{} pack directory must be a real directory",
+            pack_kind_name(kind)
+        ));
+    }
+    let canonical = directory
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if canonical.starts_with(root) {
+        return Err(format!(
+            "{} pack directory must be outside the repository",
+            pack_kind_name(kind)
+        ));
+    }
+    let [scorecard, manifest, provenance] = external_pack_source_names(kind);
+    Ok([
+        read_regular(&canonical.join(scorecard))?,
+        read_regular(&canonical.join(manifest))?,
+        read_regular(&canonical.join(provenance))?,
+    ])
+}
+
+fn pack_kind_name(kind: PackKind) -> &'static str {
+    match kind {
+        PackKind::C1 => "C1",
+        PackKind::Persistent => "persistent",
+    }
+}
+
+fn validate_persistent_citation_receipt(bytes: &[u8], tested_commit: &str) -> Result<(), String> {
+    const SCHEMA: &str = "fsqlite.release_persistent_phase_pack_citation_receipt.v2";
+
+    #[derive(Deserialize)]
+    struct Citation {
+        schema_version: String,
+        source: Source,
+        rch_scheduler_isolation: SchedulerIsolation,
+    }
+    #[derive(Deserialize)]
+    struct Source {
+        commit: String,
+        clean: bool,
+    }
+    #[derive(Deserialize)]
+    struct SchedulerIsolation {
+        build_status_trace: String,
+        build_status_trace_sha256: String,
+        build_completion_snapshot: String,
+        build_completion_snapshot_sha256: String,
+        build_job_id: String,
+        build_active_samples: u64,
+        job_id_encoding: String,
+        phase_traces: BTreeMap<String, PhaseTrace>,
+    }
+    #[derive(Deserialize)]
+    struct PhaseTrace {
+        path: String,
+        sha256: String,
+        job_id: String,
+        active_samples: u64,
+        completion: String,
+        completion_sha256: String,
+    }
+    fn canonical_job_id(value: &str) -> bool {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value.len() == 1 || !value.starts_with('0'))
+    }
+    fn canonical_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    let citation = serde_json::from_slice::<Citation>(bytes)
+        .map_err(|error| format!("invalid persistent citation receipt: {error}"))?;
+    if citation.schema_version != SCHEMA
+        || citation.source.commit != tested_commit
+        || !citation.source.clean
+    {
+        return Err(
+            "persistent citation receipt must use v2 and bind the clean tested commit".to_owned(),
+        );
+    }
+    let isolation = citation.rch_scheduler_isolation;
+    if isolation.build_status_trace != "provenance/rch_build_status.jsonl"
+        || isolation.build_completion_snapshot != "provenance/rch_build_status_completion.json"
+        || !canonical_sha256(&isolation.build_status_trace_sha256)
+        || !canonical_sha256(&isolation.build_completion_snapshot_sha256)
+        || !canonical_job_id(&isolation.build_job_id)
+        || isolation.build_active_samples == 0
+        || isolation.job_id_encoding != "decimal_string"
+        || isolation.phase_traces.len() != 3
+    {
+        return Err(
+            "persistent citation receipt lacks its canonical build scheduler binding".to_owned(),
+        );
+    }
+    for phase in ["1t", "8t", "16t"] {
+        let trace = isolation.phase_traces.get(phase).ok_or_else(|| {
+            format!("persistent citation receipt omits the {phase} scheduler binding")
+        })?;
+        if trace.path != format!("{phase}/rch_status.jsonl")
+            || trace.completion != format!("{phase}/rch_status_completion.json")
+            || !canonical_sha256(&trace.sha256)
+            || !canonical_sha256(&trace.completion_sha256)
+            || !canonical_job_id(&trace.job_id)
+            || trace.active_samples == 0
+        {
+            return Err(format!(
+                "persistent citation receipt carries a malformed {phase} scheduler binding"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pack_inputs(
+    root: &Path,
+    tested_commit: &str,
+    c1_directory: &Path,
+    persistent_directory: &Path,
+) -> Result<ValidatedPackInputs, String> {
+    const C1_SCORECARD_SCHEMA: &str = "bd-db300.c1_evidence_pack_scorecard.v1";
+    const C1_MANIFEST_SCHEMA: &str = "bd-db300.c1_evidence_pack_manifest.v1";
+    const PERSISTENT_SCORECARD_SCHEMA: &str = "bd-db300.persistent_phase_pack_scorecard.v5";
+    const PERSISTENT_MANIFEST_SCHEMA: &str = "bd-db300.persistent_phase_pack_manifest.v4";
+    #[derive(Deserialize)]
+    struct Scorecard {
+        schema_version: String,
+        run_id: String,
+        honest_gate_summary: HonestGate,
+    }
+    #[derive(Deserialize)]
+    struct HonestGate {
+        verdict: String,
+    }
+    #[derive(Deserialize)]
+    struct PackManifest {
+        schema_version: String,
+        run_id: String,
+        build_metadata_json: Option<String>,
+        build_metadata: Option<Value>,
+        citation_receipt_json: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct C1Provenance {
+        run_id: String,
+        release_mode: bool,
+        frozen_commit: Option<String>,
+        clean_checkout: bool,
+    }
+    let [c1_scorecard, c1_manifest, c1_provenance] =
+        read_external_pack(root, c1_directory, PackKind::C1)?;
+    let [
+        persistent_scorecard,
+        persistent_manifest,
+        persistent_provenance,
+    ] = read_external_pack(root, persistent_directory, PackKind::Persistent)?;
+    let c1_score: Scorecard = serde_json::from_slice(&c1_scorecard)
+        .map_err(|error| format!("invalid C1 scorecard: {error}"))?;
+    let c1_pack: PackManifest = serde_json::from_slice(&c1_manifest)
+        .map_err(|error| format!("invalid C1 pack manifest: {error}"))?;
+    let c1_source: C1Provenance = serde_json::from_slice(&c1_provenance)
+        .map_err(|error| format!("invalid C1 build metadata: {error}"))?;
+    let c1_source_value: Value = serde_json::from_slice(&c1_provenance)
+        .map_err(|error| format!("invalid C1 build metadata value: {error}"))?;
+    if c1_score.schema_version != C1_SCORECARD_SCHEMA
+        || c1_pack.schema_version != C1_MANIFEST_SCHEMA
+        || c1_score.run_id.trim().is_empty()
+        || c1_score.run_id != c1_pack.run_id
+        || c1_score.run_id != c1_source.run_id
+        || c1_score.honest_gate_summary.verdict != "pass"
+        || c1_pack.build_metadata_json.as_deref() != Some("build_metadata.json")
+        || c1_pack.build_metadata.as_ref() != Some(&c1_source_value)
+        || c1_pack.citation_receipt_json.is_some()
+        || !c1_source.release_mode
+        || !c1_source.clean_checkout
+        || c1_source.frozen_commit.as_deref() != Some(tested_commit)
+    {
+        return Err(
+            "C1 evidence pack does not bind a passing run to the clean tested commit".to_owned(),
+        );
+    }
+
+    let persistent_score: Scorecard = serde_json::from_slice(&persistent_scorecard)
+        .map_err(|error| format!("invalid persistent scorecard: {error}"))?;
+    let persistent_pack: PackManifest = serde_json::from_slice(&persistent_manifest)
+        .map_err(|error| format!("invalid persistent pack manifest: {error}"))?;
+    if persistent_score.schema_version != PERSISTENT_SCORECARD_SCHEMA
+        || persistent_pack.schema_version != PERSISTENT_MANIFEST_SCHEMA
+        || persistent_score.run_id.trim().is_empty()
+        || persistent_score.run_id != persistent_pack.run_id
+        || persistent_score.honest_gate_summary.verdict != "pass"
+        || persistent_pack.citation_receipt_json.as_deref()
+            != Some("provenance/citation_receipt.json")
+        || persistent_pack.build_metadata_json.is_some()
+        || persistent_pack.build_metadata.is_some()
+    {
+        return Err(
+            "persistent evidence pack does not bind a passing run to the clean tested commit"
+                .to_owned(),
+        );
+    }
+    validate_persistent_citation_receipt(&persistent_provenance, tested_commit)?;
+    Ok(ValidatedPackInputs {
+        c1_scorecard,
+        c1_manifest,
+        c1_provenance,
+        persistent_scorecard,
+        persistent_manifest,
+        persistent_provenance,
+    })
+}
+
+fn capture_baseline_only(
+    root: &Path,
+    source_commit: &str,
+    output_directory: &Path,
+) -> Result<(), String> {
+    require_pristine_capture_checkout(root)?;
+    let worker = required_worker()?;
+    prepare_external_baseline_root(root, output_directory, source_commit)?;
+    let namespace = format!("{EVIDENCE_ROOT}/{source_commit}/baseline");
+    let workspace = capture_run(
+        root,
+        output_directory,
+        &namespace,
+        "workspace",
+        &worker,
+        &[
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--",
+            "--test-threads=1",
+        ],
+    )?;
+    let receipt_path = format!("{namespace}/baseline-evidence.json");
+    write_json_new(
+        output_directory,
+        &receipt_path,
+        &BaselineEvidence {
+            source_commit: source_commit.to_owned(),
+            workspace,
+        },
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mode": "baseline-only",
+            "source_commit": source_commit,
+            "copy_root": output_directory.join(EVIDENCE_ROOT).join(source_commit).display().to_string(),
+            "baseline_evidence": output_directory.join(&receipt_path).display().to_string(),
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn prepare_external_baseline_root(
+    repository_root: &Path,
+    output_directory: &Path,
+    source_commit: &str,
+) -> Result<(), String> {
+    if !output_directory.is_absolute() {
+        return Err("--baseline-output-dir must be absolute".to_owned());
+    }
+    if output_directory.exists() {
+        return Err("--baseline-output-dir must not already exist".to_owned());
+    }
+    let parent = output_directory
+        .parent()
+        .ok_or_else(|| "baseline output directory has no parent".to_owned())?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|error| format!("unable to canonicalize baseline output parent: {error}"))?;
+    if parent.starts_with(repository_root) {
+        return Err("baseline output directory must be outside the repository".to_owned());
+    }
+    fs::create_dir(output_directory)
+        .map_err(|error| format!("unable to create baseline output directory: {error}"))?;
+    let namespace = output_directory
+        .join(EVIDENCE_ROOT)
+        .join(source_commit)
+        .join("baseline");
+    fs::create_dir_all(&namespace)
+        .map_err(|error| format!("unable to create baseline evidence namespace: {error}"))?;
+    for directory in ["transcripts", "runner"] {
+        fs::create_dir(namespace.join(directory)).map_err(|error| {
+            format!("unable to create baseline `{directory}` directory: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PackKind, adopt_active_job, external_pack_source_names,
+        validate_persistent_citation_receipt,
+    };
+
+    #[test]
+    fn daemon_adoption_preserves_live_u64_job_identity_above_f64_range() {
+        let job_id = 29_960_952_048_779_266_u64;
+        assert!(job_id > (1_u64 << 53));
+        let status = serde_json::json!({
+            "api_version": "1.0",
+            "command": "status",
+            "success": true,
+            "data": {"daemon": {
+                "active_builds": [{
+                    "id": job_id,
+                    "project_id": "frankensqlite-df8c83ae",
+                    "worker_id": "ovh-a",
+                    "command": "cargo test --locked --workspace -- --test-threads=1",
+                }],
+                "recent_builds": [],
+            }},
+        });
+        let argv = [
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--",
+            "--test-threads=1",
+        ]
+        .map(str::to_owned);
+        let adopted = adopt_active_job(
+            &serde_json::to_vec(&status).expect("encode live status"),
+            "ovh-a",
+            &argv,
+        )
+        .expect("accept live-shaped status")
+        .expect("adopt matching active job");
+        assert_eq!(adopted.id, job_id);
+        assert_eq!(adopted.id.to_string(), "29960952048779266");
+    }
+
+    #[test]
+    fn external_pack_manifest_source_names_match_real_producers() {
+        assert_eq!(
+            external_pack_source_names(PackKind::C1),
+            [
+                "c1_scorecard.json",
+                "c1_pack_manifest.json",
+                "build_metadata.json"
+            ]
+        );
+        assert_eq!(
+            external_pack_source_names(PackKind::Persistent),
+            [
+                "persistent_scorecard.json",
+                "persistent_pack_manifest.json",
+                "provenance/citation_receipt.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_manifest_source_name_is_refused_by_both_pack_contracts() {
+        for kind in [PackKind::C1, PackKind::Persistent] {
+            assert!(!external_pack_source_names(kind).contains(&"manifest.json"));
+        }
+    }
+
+    #[test]
+    fn persistent_citation_requires_v2_decimal_scheduler_receipts() {
+        let commit = "a".repeat(40);
+        let digest = "b".repeat(64);
+        let trace = |phase: &str, job_id: &str| {
+            serde_json::json!({
+                "path": format!("{phase}/rch_status.jsonl"),
+                "sha256": digest,
+                "job_id": job_id,
+                "active_samples": 3,
+                "completion": format!("{phase}/rch_status_completion.json"),
+                "completion_sha256": digest,
+            })
+        };
+        let mut citation = serde_json::json!({
+            "schema_version": "fsqlite.release_persistent_phase_pack_citation_receipt.v2",
+            "source": {"commit": commit, "clean": true},
+            "rch_scheduler_isolation": {
+                "build_status_trace": "provenance/rch_build_status.jsonl",
+                "build_status_trace_sha256": digest,
+                "build_completion_snapshot": "provenance/rch_build_status_completion.json",
+                "build_completion_snapshot_sha256": digest,
+                "build_job_id": "29960952048779266",
+                "build_active_samples": 3,
+                "job_id_encoding": "decimal_string",
+                "phase_traces": {
+                    "1t": trace("1t", "29960952048779267"),
+                    "8t": trace("8t", "29960952048779268"),
+                    "16t": trace("16t", "29960952048779269"),
+                },
+            },
+        });
+        assert!(
+            validate_persistent_citation_receipt(
+                &serde_json::to_vec(&citation).expect("encode v2 citation"),
+                &commit,
+            )
+            .is_ok()
+        );
+
+        citation["schema_version"] =
+            serde_json::json!("fsqlite.release_persistent_phase_pack_citation_receipt.v1");
+        assert!(
+            validate_persistent_citation_receipt(
+                &serde_json::to_vec(&citation).expect("encode v1 citation"),
+                &commit,
+            )
+            .is_err()
+        );
+
+        citation["schema_version"] =
+            serde_json::json!("fsqlite.release_persistent_phase_pack_citation_receipt.v2");
+        citation["rch_scheduler_isolation"]["build_job_id"] =
+            serde_json::json!(29_960_952_048_779_266_u64);
+        assert!(
+            validate_persistent_citation_receipt(
+                &serde_json::to_vec(&citation).expect("encode numeric job id"),
+                &commit,
+            )
+            .is_err()
+        );
+    }
+}
