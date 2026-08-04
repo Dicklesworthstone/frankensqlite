@@ -34998,9 +34998,9 @@ fn test_conformance_atomic_insert_select_without_rowid_triggers_counters_s76m() 
 
         let sql = "INSERT INTO projection_members(accession, member, ordinal) SELECT ?1, member, ?2 FROM capture_facts WHERE accession = ?3 AND enabled = ?4";
         let fparams = [
-            SqliteValue::Text("0001-26-000001".to_owned()),
+            SqliteValue::Text("0001-26-000001".to_owned().into()),
             SqliteValue::Integer(7),
-            SqliteValue::Text("0001-26-000001".to_owned()),
+            SqliteValue::Text("0001-26-000001".to_owned().into()),
             SqliteValue::Integer(1),
         ];
         let frank_affected = fconn.execute_with_params(sql, &fparams).await.unwrap();
