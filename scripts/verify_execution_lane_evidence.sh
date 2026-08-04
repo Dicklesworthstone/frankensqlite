@@ -3,6 +3,10 @@ set -euo pipefail
 
 MODE="${1:-verify}"
 
+if [[ "${FSQLITE_USE_RCH:-0}" == "1" && "${FSQLITE_LANE_GUARD_RCH_REMOTE:-0}" != "1" ]]; then
+  exec rch exec -- env FSQLITE_LANE_GUARD_RCH_REMOTE=1 bash "$0" "$@"
+fi
+
 run_lib_test() {
   local package="$1"
   local test_name="$2"
