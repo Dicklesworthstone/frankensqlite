@@ -116,11 +116,12 @@ impl FailureBundleManifest {
 pub fn read_failure_bundle_manifest(
     path: impl AsRef<Path>,
 ) -> std::io::Result<FailureBundleManifest> {
+    let path = path.as_ref();
     let bytes = std::fs::read(path)?;
     let manifest: FailureBundleManifest = serde_json::from_slice(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let mut errors = manifest.validate();
-    let bundle_dir = path.as_ref().parent().ok_or_else(|| {
+    let bundle_dir = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "manifest path has no parent",
