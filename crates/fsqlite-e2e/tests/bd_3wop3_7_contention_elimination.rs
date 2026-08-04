@@ -1,29 +1,27 @@
-//! D-TEST: historical contention-elimination suite + placeholder gates (bd-3wop3.7).
+//! D-TEST: historical contention-elimination suite (bd-3wop3.7).
 //!
 //! As of 2026-03-23 this file is **not** the canonical threshold authority for
 //! the overlay scorecard. The truthful benchmark surface lives in:
 //! - `crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs`
 //! - `artifacts/perf/2026-03-23-local/canonical_{mvcc,single_writer}.{md,jsonl}`
-//! - the still-blocked governance lane (`bd-db300.1.7.4`, `bd-db300.7.9.1`,
-//!   `bd-3wop3.1.5`) that owns final c1/4/8 and persistent 2/4/8/16 gate truth
+//! - the canonical C1 and persistent release evidence packs, which own final
+//!   c1/4/8 and persistent 2/4/8/16 gate truth
 //!
-//! The ignored throughput gates in this file therefore remain historical
-//! scaffolding only; they must not be read as current pass/fail policy.
-//! Operators should use `scripts/capture_c1_evidence_pack.sh` for the c1 truth
-//! surface and `scripts/capture_persistent_phase_pack.sh` for the persistent
-//! 8t/16t truth surface and same-pack comparator provenance.
+//! This file's manual benchmark report is a historical diagnostic, not current
+//! pass/fail policy. Operators should use `scripts/capture_c1_evidence_pack.sh`
+//! for the c1 truth surface and `scripts/capture_persistent_phase_pack.sh` for
+//! the persistent 8t/16t truth surface and same-pack comparator provenance.
 //!
 //! ## Contention Tests
 //! 1. historical_parallel_wal_segment_design_inventory (D1 future design)
 //! 2. test_page_cache_shard_distribution (D2 dependency)
 //! 3. test_combiner_reduces_atomic_ops (D3 dependency)
 //! 4. test_ebr_bounded_reclaim_work_per_cycle (D5 bounded-reclaim keeper)
-//! 5. test_scaling_curve
 //!
 //! ## Stress Tests
-//! 7. test_64_thread_no_deadlock
-//! 8. test_sustained_insert_p99_latency
-//! 9. test_contention_under_version_churn
+//! 5. test_64_thread_no_deadlock
+//! 6. test_sustained_insert_p99_latency
+//! 7. test_contention_under_version_churn
 //!
 //! ## Dependencies
 //! - D1: Lane-local preparation plus one ordered WAL backend append; independent
@@ -39,9 +37,10 @@
 //! cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination test_ebr_bounded_reclaim_work_per_cycle -- --exact
 //! ```
 //! Run each manual stress keeper by its exact name with `--ignored --exact`.
-//! Do not run every ignored test as a group: remaining explicit release-blocker
-//! stubs intentionally panic until their proof surfaces exist.
 #![recursion_limit = "512"]
+// These manual concurrency workloads intentionally retain large, non-Send
+// futures so the measured scheduling shape is not changed merely for linting.
+#![allow(clippy::future_not_send, clippy::large_futures)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -63,12 +62,6 @@ const SCALING_THREAD_COUNTS: &[usize] = &[1, 2, 4, 8, 16];
 
 /// Rows per thread for throughput tests.
 const ROWS_PER_THREAD: u64 = 10_000;
-
-/// Historical 8-thread placeholder gate from the pre-overlay contention file.
-const HISTORICAL_PLACEHOLDER_8T_SPEEDUP: f64 = 1.5;
-
-/// Historical 16-thread placeholder gate from the pre-overlay contention file.
-const HISTORICAL_PLACEHOLDER_16T_SPEEDUP: f64 = 1.0;
 
 /// A same-table concurrent insert can legitimately observe an advertised
 /// concurrent-write contention result. Retry the idempotent `INSERT OR
@@ -838,46 +831,6 @@ fn test_sustained_insert_p99_latency() {
             maximum_latency_us as f64 / 1_000.0
         );
     });
-}
-
-/// Test 6: Historical scaling-curve placeholder.
-///
-/// The real 2026-03-23 scaling story is owned by the canonical matrix and the
-/// persistent benchmark harness, not by this file's sequential control.
-#[test]
-#[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
-fn test_scaling_curve() {
-    panic!(
-        "test_scaling_curve: stale placeholder gate; use scripts/capture_c1_evidence_pack.sh and scripts/capture_persistent_phase_pack.sh instead"
-    );
-}
-
-// ===========================================================================
-// REGRESSION GATES
-// ===========================================================================
-
-/// Regression gate: 8-thread throughput >= 1.5x C SQLite.
-///
-/// Historical note only: this function is blocked because the helper below is a
-/// sequential in-memory control, not a truthful persistent concurrent benchmark.
-#[test]
-#[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
-fn test_8t_throughput_regression_gate() {
-    panic!(
-        "test_8t_throughput_regression_gate: historical {HISTORICAL_PLACEHOLDER_8T_SPEEDUP}x placeholder is non-authoritative; final 8t gate belongs to scripts/capture_persistent_phase_pack.sh with same-pack sqlite3 comparison"
-    );
-}
-
-/// Regression gate: 16-thread throughput >= 1.0x C SQLite.
-///
-/// Historical note only: persistent 16-thread truth is part of the blocked
-/// overlay contract and must not be inferred from this file's placeholder path.
-#[test]
-#[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
-fn test_16t_throughput_regression_gate() {
-    panic!(
-        "test_16t_throughput_regression_gate: historical {HISTORICAL_PLACEHOLDER_16T_SPEEDUP}x placeholder is non-authoritative; final persistent 16t gate belongs to scripts/capture_persistent_phase_pack.sh with phase-attribution evidence"
-    );
 }
 
 // ===========================================================================
