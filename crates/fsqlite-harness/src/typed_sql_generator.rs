@@ -1567,7 +1567,7 @@ impl GenerationSession {
                     table: right.name.clone(),
                     alias: Some(right_alias.clone()),
                     on: equal_expr(
-                        Expr::column(Some(left_alias), ident("id")?),
+                        Expr::column(Some(left_alias.clone()), ident("id")?),
                         Expr::column(Some(right_alias), ident("id")?),
                     ),
                 }],
@@ -1575,7 +1575,10 @@ impl GenerationSession {
                 group_by: Vec::new(),
                 having: None,
                 compound: None,
-                order_by: Vec::new(),
+                order_by: vec![OrderTerm {
+                    expr: Expr::column(Some(left_alias), ident("id")?),
+                    direction: OrderDirection::Asc,
+                }],
                 limit: Some(8),
             },
         })
@@ -1637,7 +1640,10 @@ impl GenerationSession {
                 group_by: Vec::new(),
                 having: None,
                 compound: None,
-                order_by: Vec::new(),
+                order_by: vec![OrderTerm {
+                    expr: Expr::column(None, ident("id")?),
+                    direction: OrderDirection::Asc,
+                }],
                 limit: None,
             },
         })
@@ -2584,7 +2590,7 @@ mod tests {
         rows.budget.max_rows = 1;
         assert_eq!(generate_case(rows).unwrap_err().constraint, "max_rows");
 
-        let mut values = GeneratorConfig::bootstrap(TEST_SEED, 2);
+        let mut values = GeneratorConfig::bootstrap(TEST_SEED, 4);
         values.budget.max_value_bytes = 1;
         assert_eq!(
             generate_case(values).unwrap_err().constraint,
