@@ -142,10 +142,14 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   spellings for TEMP-schema introspection in this release
   ([#238](https://github.com/Dicklesworthstone/frankensqlite/issues/238)).
 - **Cancelling an `AsyncConnection` call after dispatch stops the caller's
-  wait, not the already-running worker operation.** Dropping that connection
-  joins the worker and can therefore block until the in-flight operation
-  returns. Applications that require a hard kill deadline must currently use
-  process isolation ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
+  wait, not the already-running worker operation.** The caller receives
+  `Interrupt` while the worker runs the database operation to completion
+  against its own connection. Dropping the connection signals shutdown and
+  detaches rather than joining, so `Drop` itself does not block; the detached
+  worker still performs its terminal cleanup after the operation finishes.
+  There is no `interrupt()` or progress-handler equivalent, so applications
+  that require a hard kill deadline must currently use process isolation
+  ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
 
 ### Added
 

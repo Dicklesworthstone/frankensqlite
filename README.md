@@ -904,7 +904,7 @@ Every trait method that touches I/O, acquires locks, or could block accepts `&Cx
 
 Cx threads three capabilities through the entire call chain:
 
-- **Cancellation:** Pollable connection operations carry the caller's context, and long queries check its cancellation token at VDBE instruction boundaries (every N opcodes) and return `SQLITE_INTERRUPT` when they observe cancellation. The worker-backed `AsyncConnection` wrapper is narrower: cancellation after dispatch stops the caller's wait but does not interrupt the in-flight worker operation, and dropping the wrapper joins that worker ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
+- **Cancellation:** Pollable connection operations carry the caller's context, and long queries check its cancellation token at VDBE instruction boundaries (every N opcodes) and return `SQLITE_INTERRUPT` when they observe cancellation. The worker-backed `AsyncConnection` wrapper is narrower: cancellation after dispatch stops the caller's wait but does not interrupt the in-flight worker operation. Dropping the wrapper signals shutdown and detaches rather than joining, so `Drop` does not block; the worker finishes its terminal cleanup after the operation completes. Applications that require a hard kill deadline must use process isolation ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
 - **Deadline propagation:** Timeout budgets flow through the entire call chain. A 5-second query deadline decrements as it passes through the parser, planner, and executor.
 - **Capability narrowing:** Callers can restrict what callees are allowed to do. A read-only connection's Cx prevents write operations at the capability level.
 
