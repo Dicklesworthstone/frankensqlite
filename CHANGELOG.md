@@ -501,9 +501,13 @@ lossy values.
 - Windows rollback-mode connections and full-image maintenance now contend on
   stock SQLite's real main-file lock ranges; WAL maintenance additionally
   fences the real `-shm` write/checkpoint bytes and unwinds every acquired
-  range after partial failure. Ordinary Windows WAL `shm_lock` remains
-  process-local and is tracked separately in
-  [#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139).
+  range after partial failure. Ordinary Windows WAL `shm_lock` also mirrors
+  every lock slot onto stock SQLite's real `-shm` bytes with process-aggregated
+  ownership, reference counts, and reverse-order partial-failure unwind
+  ([#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139)).
+  Windows shared-memory region contents remain heap-backed, however, so this
+  lock interoperability does not claim that concurrently mixing FrankenSQLite
+  and stock SQLite WAL connections is safe.
 - **INSERT OR REPLACE churn rebuilds rootless cursor stacks before structural
   mutation** (bd-kwei8), preventing empty child leaves and stale parent links
   from producing a database image rejected by stock SQLite.
