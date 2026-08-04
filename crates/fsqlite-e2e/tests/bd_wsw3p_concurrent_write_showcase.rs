@@ -114,6 +114,7 @@ struct ThreadResult {
     finished_ns_since_epoch: u64,
     wall_ms: u64,
     wall_ns: u64,
+    setup_retries: u64,
     retries: u64,
 }
 
@@ -147,6 +148,7 @@ struct BenchResult {
     total_rows: i64,
     total_wall_ms: u64,
     throughput_ops_per_sec: f64,
+    total_setup_retries: u64,
     total_retries: u64,
     per_thread: Vec<ThreadResult>,
 }
@@ -293,6 +295,7 @@ fn run_csqlite_concurrent(n_threads: usize, transaction_shape: TransactionShape)
                     finished_ns_since_epoch: thread_end.as_nanos().try_into().unwrap_or(u64::MAX),
                     wall_ms: elapsed.as_millis() as u64,
                     wall_ns: elapsed.as_nanos().try_into().unwrap_or(u64::MAX),
+                    setup_retries: 0,
                     retries: local_retries,
                 }
             })
@@ -342,6 +345,7 @@ fn run_csqlite_concurrent(n_threads: usize, transaction_shape: TransactionShape)
         total_rows,
         total_wall_ms: total_wall.as_millis() as u64,
         throughput_ops_per_sec: throughput,
+        total_setup_retries: 0,
         total_retries: retry_total.load(Ordering::Relaxed),
         per_thread,
     }
@@ -363,11 +367,11 @@ async fn open_fsqlite_worker(
     thread_id: usize,
     setup_started: Instant,
     setup_deadline: Instant,
-) -> fsqlite::Connection {
+) -> (fsqlite::Connection, u64) {
     let mut attempt = 0u32;
     loop {
         match fsqlite::Connection::open(path).await {
-            Ok(connection) => return connection,
+            Ok(connection) => return (connection, u64::from(attempt)),
             Err(error) if !error.is_transient() => {
                 let open_attempt = attempt.saturating_add(1);
                 panic!(
@@ -396,11 +400,11 @@ async fn execute_fsqlite_worker_setup(
     thread_id: usize,
     setup_started: Instant,
     setup_deadline: Instant,
-) {
+) -> u64 {
     let mut attempt = 0u32;
     loop {
         match conn.execute(sql).await {
-            Ok(_) => return,
+            Ok(_) => return u64::from(attempt),
             Err(error) if !error.is_transient() => {
                 let setup_attempt = attempt.saturating_add(1);
                 panic!(
@@ -429,11 +433,11 @@ async fn prepare_fsqlite_worker<'conn>(
     thread_id: usize,
     setup_started: Instant,
     setup_deadline: Instant,
-) -> fsqlite::PreparedStatement<'conn> {
+) -> (fsqlite::PreparedStatement<'conn>, u64) {
     let mut attempt = 0u32;
     loop {
         match conn.prepare(sql).await {
-            Ok(statement) => return statement,
+            Ok(statement) => return (statement, u64::from(attempt)),
             Err(error) if !error.is_transient() => {
                 let prepare_attempt = attempt.saturating_add(1);
                 panic!(
@@ -497,43 +501,52 @@ async fn run_fsqlite_concurrent(
                 asupersync::test_utils::run_test(|| async {
                     let setup_started = Instant::now();
                     let setup_deadline = setup_started + SETUP_RETRY_BUDGET;
-                    let conn = open_fsqlite_worker(&p, tid, setup_started, setup_deadline).await;
-                    execute_fsqlite_worker_setup(
-                        &conn,
-                        "PRAGMA synchronous = NORMAL;",
-                        tid,
-                        setup_started,
-                        setup_deadline,
-                    )
-                    .await;
-                    execute_fsqlite_worker_setup(
-                        &conn,
-                        "PRAGMA cache_size = -64000;",
-                        tid,
-                        setup_started,
-                        setup_deadline,
-                    )
-                    .await;
-                    execute_fsqlite_worker_setup(
-                        &conn,
-                        "PRAGMA busy_timeout = 5000;",
-                        tid,
-                        setup_started,
-                        setup_deadline,
-                    )
-                    .await;
-                    execute_fsqlite_worker_setup(
-                        &conn,
-                        "PRAGMA fsqlite.concurrent_mode = ON;",
-                        tid,
-                        setup_started,
-                        setup_deadline,
-                    )
-                    .await;
+                    let (conn, mut setup_retries) =
+                        open_fsqlite_worker(&p, tid, setup_started, setup_deadline).await;
+                    setup_retries = setup_retries.saturating_add(
+                        execute_fsqlite_worker_setup(
+                            &conn,
+                            "PRAGMA synchronous = NORMAL;",
+                            tid,
+                            setup_started,
+                            setup_deadline,
+                        )
+                        .await,
+                    );
+                    setup_retries = setup_retries.saturating_add(
+                        execute_fsqlite_worker_setup(
+                            &conn,
+                            "PRAGMA cache_size = -64000;",
+                            tid,
+                            setup_started,
+                            setup_deadline,
+                        )
+                        .await,
+                    );
+                    setup_retries = setup_retries.saturating_add(
+                        execute_fsqlite_worker_setup(
+                            &conn,
+                            "PRAGMA busy_timeout = 5000;",
+                            tid,
+                            setup_started,
+                            setup_deadline,
+                        )
+                        .await,
+                    );
+                    setup_retries = setup_retries.saturating_add(
+                        execute_fsqlite_worker_setup(
+                            &conn,
+                            "PRAGMA fsqlite.concurrent_mode = ON;",
+                            tid,
+                            setup_started,
+                            setup_deadline,
+                        )
+                        .await,
+                    );
 
                     let insert_sql =
                         format!("INSERT INTO bench_{tid} VALUES (?1, ('t' || ?1), (?1 * 7));");
-                    let stmt = prepare_fsqlite_worker(
+                    let (stmt, prepare_retries) = prepare_fsqlite_worker(
                         &conn,
                         &insert_sql,
                         tid,
@@ -541,6 +554,7 @@ async fn run_fsqlite_concurrent(
                         setup_deadline,
                     )
                     .await;
+                    setup_retries = setup_retries.saturating_add(prepare_retries);
                     assert!(
                         setup.wait(),
                         "fsqlite worker start aborted after a peer setup failure"
@@ -656,6 +670,7 @@ async fn run_fsqlite_concurrent(
                             .unwrap_or(u64::MAX),
                         wall_ms: elapsed.as_millis() as u64,
                         wall_ns: elapsed.as_nanos().try_into().unwrap_or(u64::MAX),
+                        setup_retries,
                         retries: local_retries,
                     };
                     drop(stmt);
@@ -703,6 +718,7 @@ async fn run_fsqlite_concurrent(
     );
     #[allow(clippy::cast_precision_loss)]
     let throughput = total_rows as f64 / total_wall.as_secs_f64();
+    let total_setup_retries = per_thread.iter().map(|result| result.setup_retries).sum();
 
     BenchResult {
         engine: "fsqlite_mvcc".to_owned(),
@@ -712,6 +728,7 @@ async fn run_fsqlite_concurrent(
         total_rows,
         total_wall_ms: total_wall.as_millis() as u64,
         throughput_ops_per_sec: throughput,
+        total_setup_retries,
         total_retries: retry_total.load(Ordering::Relaxed),
         per_thread,
     }
@@ -967,12 +984,14 @@ fn t3_structured_json_has_required_fields() {
             assert_eq!(r["transaction_shape"], "per_worker");
             assert!(r["n_threads"].is_number());
             assert!(r["throughput_ops_per_sec"].is_number());
+            assert!(r["total_setup_retries"].is_number());
             assert!(r["per_thread"].is_array());
             for t in r["per_thread"].as_array().unwrap() {
                 assert!(t["thread_id"].is_number());
                 assert!(t["rows_inserted"].is_number());
                 assert!(t["wall_ms"].is_number());
                 assert!(t["wall_ns"].is_number());
+                assert!(t["setup_retries"].is_number());
                 assert!(t["retries"].is_number());
             }
         }
@@ -998,6 +1017,7 @@ fn concurrent_window_spans_earliest_start_to_latest_finish() {
             finished_ns_since_epoch: 10,
             wall_ms: 0,
             wall_ns: 10,
+            setup_retries: 0,
             retries: 0,
         },
         ThreadResult {
@@ -1007,6 +1027,7 @@ fn concurrent_window_spans_earliest_start_to_latest_finish() {
             finished_ns_since_epoch: 20,
             wall_ms: 0,
             wall_ns: 12,
+            setup_retries: 0,
             retries: 0,
         },
     ];
