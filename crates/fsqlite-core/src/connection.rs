@@ -36948,13 +36948,19 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<(Vec<String>, Vec<Vec<SqliteValue>>)>> {
         let table_name = &update.table.name.name;
-        let schema = self.schema.borrow();
-        let table = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(table_name))
-            .ok_or_else(|| FrankenError::NoSuchTable {
-                name: table_name.clone(),
-            })?;
+        let targets_shadowed_main = self.targets_shadowed_main(&update.table.name);
+        let visible_schema = self.schema.borrow();
+        let shadowed_schema = self.shadowed_main_tables.borrow();
+        let table = if targets_shadowed_main {
+            shadowed_schema.get(&table_name.to_ascii_lowercase())
+        } else {
+            visible_schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+        }
+        .ok_or_else(|| FrankenError::NoSuchTable {
+            name: table_name.clone(),
+        })?;
 
         let locator_columns = if table.without_rowid {
             let indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
@@ -36979,7 +36985,8 @@ impl Connection {
                 return Ok(None);
             }
         };
-        drop(schema);
+        drop(visible_schema);
+        drop(shadowed_schema);
 
         if locator_columns.is_empty() {
             return Ok(None);
@@ -121662,16 +121669,16 @@ mod tests {
     }
 
     struct MetadataReentrantWindowFunction {
-        name_calls: Arc<AtomicUsize>,
-        arity_calls: Arc<AtomicUsize>,
-        min_args_calls: Arc<AtomicUsize>,
-        max_args_calls: Arc<AtomicUsize>,
+        name_lookups: Arc<AtomicUsize>,
+        arity_queries: Arc<AtomicUsize>,
+        min_args_checks: Arc<AtomicUsize>,
+        max_args_reads: Arc<AtomicUsize>,
     }
 
     struct MetadataReentrantScalarFunction {
-        name_calls: Arc<AtomicUsize>,
-        arity_calls: Arc<AtomicUsize>,
-        deterministic_calls: Arc<AtomicUsize>,
+        name_lookups: Arc<AtomicUsize>,
+        arity_queries: Arc<AtomicUsize>,
+        determinism_checks: Arc<AtomicUsize>,
     }
 
     impl fsqlite_func::ScalarFunction for MetadataReentrantScalarFunction {
@@ -121680,8 +121687,7 @@ mod tests {
         }
 
         fn is_deterministic(&self) -> bool {
-            self.deterministic_calls
-                .fetch_add(1, AtomicOrdering::SeqCst);
+            self.determinism_checks.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_scalar_nested_deterministic",
@@ -121691,7 +121697,7 @@ mod tests {
         }
 
         fn num_args(&self) -> i32 {
-            self.arity_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.arity_queries.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_scalar_nested_arity",
@@ -121701,7 +121707,7 @@ mod tests {
         }
 
         fn name(&self) -> &str {
-            self.name_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.name_lookups.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_scalar_nested_name",
@@ -121779,7 +121785,7 @@ mod tests {
         }
 
         fn num_args(&self) -> i32 {
-            let callback_index = self.arity_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let callback_index = self.arity_queries.fetch_add(1, AtomicOrdering::SeqCst);
             let nested_name = if callback_index == 0 {
                 "metadata_nested_0"
             } else {
@@ -121794,7 +121800,7 @@ mod tests {
         }
 
         fn min_args(&self) -> i32 {
-            self.min_args_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.min_args_checks.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_nested_min_args",
@@ -121804,7 +121810,7 @@ mod tests {
         }
 
         fn max_args(&self) -> Option<i32> {
-            self.max_args_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.max_args_reads.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_nested_max_args",
@@ -121814,7 +121820,7 @@ mod tests {
         }
 
         fn name(&self) -> &str {
-            self.name_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.name_lookups.fetch_add(1, AtomicOrdering::SeqCst);
             "metadata_reentrant_window"
         }
     }
@@ -122320,6 +122326,10 @@ mod tests {
             })
         }
 
+        #[allow(
+            clippy::collapsible_match,
+            reason = "the explicit VT_PERMUTE arm must remain a handled no-op when fewer than two usages exist"
+        )]
         fn best_index(&self, info: &mut VtabIndexInfo) -> Result<()> {
             match self.table_name.as_str() {
                 "VT_EXTEND" => info.constraint_usage.push(Default::default()),
@@ -145795,7 +145805,7 @@ mod tests {
 
             let view_index = fconn.view_index_of("view_metadata").unwrap();
             let schema_snapshot = fconn.schema.borrow().clone();
-            let mut resolver = super::CteResultMetadataResolver::new(&fconn, &schema_snapshot);
+            let resolver = super::CteResultMetadataResolver::new(&fconn, &schema_snapshot);
             let metadata = resolver.resolve_view(view_index);
             assert_eq!(
                 metadata.names,
@@ -157113,7 +157123,7 @@ mod tests {
             assert!(
                 native_scalar_lhs
                     .iter()
-                    .all(|row| row.values() == &[SqliteValue::Integer(1)])
+                    .all(|row| row.values() == [SqliteValue::Integer(1)])
             );
             let prepared_native_scalar_lhs = conn.prepare(native_scalar_lhs_sql).await.unwrap();
             let prepared_native_scalar_lhs_rows = prepared_native_scalar_lhs.query().await.unwrap();
@@ -157121,7 +157131,7 @@ mod tests {
             assert!(
                 prepared_native_scalar_lhs_rows
                     .iter()
-                    .all(|row| row.values() == &[SqliteValue::Integer(1)])
+                    .all(|row| row.values() == [SqliteValue::Integer(1)])
             );
 
             conn.execute("CREATE TABLE rhs_collation (v TEXT);")
@@ -157171,7 +157181,7 @@ mod tests {
             assert!(
                 scalar_inner_collation_rows
                     .iter()
-                    .all(|row| row.values() == &[SqliteValue::Integer(0)])
+                    .all(|row| row.values() == [SqliteValue::Integer(0)])
             );
             let prepared_scalar_inner_collation =
                 conn.prepare(scalar_inner_collation_sql).await.unwrap();
@@ -157181,7 +157191,7 @@ mod tests {
                     .await
                     .unwrap()
                     .iter()
-                    .all(|row| row.values() == &[SqliteValue::Integer(0)])
+                    .all(|row| row.values() == [SqliteValue::Integer(0)])
             );
 
             // Native complex-IN lowering retains the representative source row
@@ -158478,10 +158488,10 @@ mod tests {
             let max_args_calls = Arc::new(AtomicUsize::new(0));
 
             connection.register_window_function(MetadataReentrantWindowFunction {
-                name_calls: Arc::clone(&name_calls),
-                arity_calls: Arc::clone(&arity_calls),
-                min_args_calls: Arc::clone(&min_args_calls),
-                max_args_calls: Arc::clone(&max_args_calls),
+                name_lookups: Arc::clone(&name_calls),
+                arity_queries: Arc::clone(&arity_calls),
+                min_args_checks: Arc::clone(&min_args_calls),
+                max_args_reads: Arc::clone(&max_args_calls),
             });
 
             assert_eq!(
@@ -158551,9 +158561,9 @@ mod tests {
             let deterministic_calls = Arc::new(AtomicUsize::new(0));
 
             connection.register_deterministic_scalar_function(MetadataReentrantScalarFunction {
-                name_calls: Arc::clone(&name_calls),
-                arity_calls: Arc::clone(&arity_calls),
-                deterministic_calls: Arc::clone(&deterministic_calls),
+                name_lookups: Arc::clone(&name_calls),
+                arity_queries: Arc::clone(&arity_calls),
+                determinism_checks: Arc::clone(&deterministic_calls),
             });
 
             assert_eq!(name_calls.load(AtomicOrdering::SeqCst), 1);
@@ -168077,17 +168087,16 @@ mod tests {
             offset: u64,
         ) -> impl std::future::Future<Output = std::result::Result<usize, FrankenError>> + Send + 'a
         {
-            async move {
-                buf.fill(0);
-                if offset >= self.size {
-                    return Ok(0);
-                }
+            buf.fill(0);
+            let bytes = if offset >= self.size {
+                0
+            } else {
                 let remaining = self.size.saturating_sub(offset);
-                let bytes = usize::try_from(remaining)
+                usize::try_from(remaining)
                     .unwrap_or(usize::MAX)
-                    .min(buf.len());
-                Ok(bytes)
-            }
+                    .min(buf.len())
+            };
+            std::future::ready(Ok(bytes))
         }
 
         fn write<'a>(
@@ -168097,11 +168106,9 @@ mod tests {
             _offset: u64,
         ) -> impl std::future::Future<Output = std::result::Result<(), FrankenError>> + Send + 'a
         {
-            async move {
-                Err(FrankenError::internal(
-                    "write is unused in read-only WAL probe test",
-                ))
-            }
+            std::future::ready(Err(FrankenError::internal(
+                "write is unused in read-only WAL probe test",
+            )))
         }
 
         fn truncate(&mut self, _cx: &Cx, _size: u64) -> std::result::Result<(), FrankenError> {
@@ -187183,12 +187190,14 @@ mod pager_routing_tests {
                 )
             }
 
+            type WorkerOutcome = (Vec<i64>, Vec<(i64, i64, u32, String)>);
+
             let thread_results = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for worker_idx in 0_i64..4 {
                     let db = db.clone();
                     handles.push(scope.spawn(move || {
-                    let mut worker_outcome: Option<(Vec<i64>, Vec<(i64, i64, u32, String)>)> = None;
+                    let mut worker_outcome: Option<WorkerOutcome> = None;
                     asupersync::test_utils::run_test(|| async {
                     let conn = open_connection_with_transient_retry(&db).await;
                     conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
