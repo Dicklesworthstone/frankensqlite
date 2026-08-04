@@ -63,6 +63,14 @@ semantic and crates.io predecessor, but it is not an ancestor of current
 
 ### Known limitations
 
+- **Read-only opens are not fully mutation-free in v0.2.0.** First contact with
+  a clean stock SQLite database can create FrankenSQLite namespace sidecars;
+  Windows read-only opens can create lock sidecars. Some compatibility opens
+  also update volatile SQLite header counters or metadata. Do not use this
+  release where the database directory is immutable or where main-file content
+  or modification-time stability across opens is required
+  ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140),
+  [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294)).
 - **Database text encoding is UTF-8-only in v0.2.0.** The database-header
   codec recognizes all three valid SQLite encoding values, but the runtime
   admits only encoding 1 (UTF-8). Databases declaring encoding 2 (UTF-16le) or

@@ -213,11 +213,11 @@ mutation. The sidecar records are machine-local runtime state: when no live
 generation owns them and their transition ledger is terminal, an open may
 rebind a copied or corrupt record to the identity of the validated current main
 file. This recovery never creates a missing main file from a nonempty stale
-record, and a read-only database open does not modify the main file. This is a
-cooperative trusted-parent protocol: native processes that bypass
-FrankenSQLite can ignore advisory locks, Unix can unlink or rename an open
-file, and the same database must not be opened through multiple hard-link
-aliases.
+record. Read-only opens are not yet fully mutation-free: see the v0.2.0
+limitation below. This is a cooperative trusted-parent protocol: native
+processes that bypass FrankenSQLite can ignore advisory locks, Unix can unlink
+or rename an open file, and the same database must not be opened through
+multiple hard-link aliases.
 
 ---
 
@@ -2672,6 +2672,14 @@ still serves as an authoritative reference.
   interpretation or durable rewriting. Convert such a database to UTF-8 with
   stock SQLite before opening it in FrankenSQLite. This restriction concerns
   SQLite TEXT encoding; arbitrary bytes stored as BLOB values are unaffected.
+- **Read-only opens are not fully mutation-free in v0.2.0.** First contact with
+  a clean stock SQLite database can create FrankenSQLite namespace sidecars;
+  Windows read-only opens can create lock sidecars. Some compatibility opens
+  also update volatile SQLite header counters or metadata. Do not use v0.2.0
+  where the database directory is immutable or where main-file content or
+  modification-time stability across opens is required
+  ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140),
+  [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294)).
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
