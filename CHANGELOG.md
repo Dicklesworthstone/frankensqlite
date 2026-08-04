@@ -234,6 +234,10 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   `MemDatabase` reload, so a prepared lookup cannot serve a stale row.
 - Prepared TEMP inserts route to the TEMP namespace
   ([#290](https://github.com/Dicklesworthstone/frankensqlite/issues/290)).
+- Explicitly `main.`-qualified `INSERT`, `UPDATE`, and `DELETE` statements now
+  keep targeting the persistent table when a same-named TEMP table shadows it,
+  including prepared statements and row-by-row replay locator materialization
+  ([#144](https://github.com/Dicklesworthstone/frankensqlite/issues/144)).
 - Cold MVCC history index lookups are bounded.
 - Storage-engine durability, read-only safety, and MVCC shared-memory handling
   were hardened following an adversarial review of the durability wave.

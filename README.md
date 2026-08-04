@@ -50,9 +50,10 @@ artifacts are fully static so the same downloads work on glibc- and musl-based
 distributions. Exact-version, air-gapped, custom-destination, source-build, and
 post-install verification controls are documented by `install.sh --help` and
 `Get-Help ./install.ps1 -Detailed`. Rust users can instead install the CLI with
-`cargo install fsqlite-cli --locked`. Prebuilt installer support begins with
-v0.1.16; when `minisign` is present, a missing or invalid signature fails
-closed rather than silently downgrading authenticity.
+`cargo install fsqlite-cli --locked`. Prebuilt installer support covers
+v0.1.16-v0.1.17 and resumes with v0.2.0; v0.1.18-v0.1.19 did not publish native
+signed artifact sets. When `minisign` is present, a missing or invalid
+signature fails closed rather than silently downgrading authenticity.
 
 ### Why FrankenSQLite?
 
