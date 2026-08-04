@@ -8075,17 +8075,26 @@ enum FkUpdateAction {
     },
 }
 
+/// Detect a trigger-body `SELECT RAISE(...) [WHERE <predicate>]` statement.
+///
+/// Returns the RAISE directive together with the (unevaluated) WHERE
+/// predicate. GH#305: the predicate must be evaluated by the caller through
+/// the connection-aware evaluator (`eval_expr_with_subqueries`), exactly like
+/// trigger `WHEN` predicates — the connectionless join-expression evaluator
+/// cannot execute scalar subqueries, so evaluating here would reject valid
+/// SQLite trigger bodies such as
+/// `SELECT RAISE(ABORT, '...') WHERE (SELECT COUNT(*) FROM t ...) <> 1;`.
 fn trigger_statement_raise_directive(
     statement: &Statement,
-) -> Result<Option<TriggerRaiseDirective>> {
+) -> Option<(TriggerRaiseDirective, Option<Expr>)> {
     let Statement::Select(select) = statement else {
-        return Ok(None);
+        return None;
     };
     if select.with.is_some() || !select.order_by.is_empty() || select.limit.is_some() {
-        return Ok(None);
+        return None;
     }
     if !select.body.compounds.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     let SelectCore::Select {
@@ -8098,13 +8107,13 @@ fn trigger_statement_raise_directive(
         ..
     } = &select.body.select
     else {
-        return Ok(None);
+        return None;
     };
     if from.is_some() || !group_by.is_empty() || having.is_some() || !windows.is_empty() {
-        return Ok(None);
+        return None;
     }
     if columns.len() != 1 {
-        return Ok(None);
+        return None;
     }
 
     let ResultColumn::Expr {
@@ -8114,22 +8123,16 @@ fn trigger_statement_raise_directive(
         ..
     } = &columns[0]
     else {
-        return Ok(None);
+        return None;
     };
 
-    if let Some(predicate) = where_clause {
-        let row: [SqliteValue; 0] = [];
-        let col_map: [(String, String, bool); 0] = [];
-        let predicate_val = eval_join_expr(predicate, &row, &col_map)?;
-        if !is_sqlite_truthy(&predicate_val) {
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(TriggerRaiseDirective {
-        action: *action,
-        message: message.clone(),
-    }))
+    Some((
+        TriggerRaiseDirective {
+            action: *action,
+            message: message.clone(),
+        },
+        where_clause.as_deref().cloned(),
+    ))
 }
 
 /// Returns true if the statement is a `SELECT RAISE(...)` (with or without a
@@ -50687,13 +50690,27 @@ impl Connection {
         &self,
         statement: Statement,
     ) -> Result<TriggerStatementOutcome> {
-        let raise_directive =
-            self.with_fallback_function_registry(|| trigger_statement_raise_directive(&statement))?;
-        if let Some(directive) = raise_directive {
-            return self.apply_trigger_raise(directive).await;
+        if let Some((directive, predicate)) = trigger_statement_raise_directive(&statement) {
+            // GH#305: evaluate the RAISE predicate with the connection-aware
+            // evaluator (parity with trigger WHEN predicates in
+            // `trigger_when_matches`) so scalar subqueries work.
+            let fire = match &predicate {
+                None => true,
+                Some(expr) => {
+                    let row: [SqliteValue; 0] = [];
+                    let col_map: [(String, String, bool); 0] = [];
+                    is_sqlite_truthy(
+                        &self
+                            .eval_expr_with_subqueries(expr, &row, &col_map, None)
+                            .await?,
+                    )
+                }
+            };
+            if fire {
+                return self.apply_trigger_raise(directive).await;
+            }
         }
-        // If trigger_statement_raise_directive returned None for a SELECT
-        // whose result column is a RAISE expression, the WHERE condition
+        // Reaching here with a RAISE-shaped SELECT means the WHERE predicate
         // evaluated to false — the RAISE was not fired.  We must NOT fall
         // through to execute_statement because the general execution path
         // cannot evaluate Expr::Raise as a value.  Just skip it (no-op).
@@ -146753,6 +146770,68 @@ mod tests {
             assert!(
                 rows.is_empty(),
                 "RAISE(IGNORE) in BEFORE trigger should skip INSERT"
+            );
+        });
+    }
+
+    #[test]
+    fn test_trigger_select_raise_where_scalar_subquery_predicate() {
+        asupersync::test_utils::run_test(|| async {
+            // GH#305 verification port.
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE mutation_journal (journal_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE projection_journal_guards (intent_id TEXT PRIMARY KEY, journal_id TEXT NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TRIGGER trg_projection_journal_insert_guard \
+                 AFTER INSERT ON mutation_journal \
+                 BEGIN \
+                     SELECT RAISE(ABORT, 'write intent has duplicate journals') \
+                     WHERE (\
+                         SELECT COUNT(*) \
+                         FROM mutation_journal AS journal \
+                         WHERE journal.intent_id = NEW.intent_id\
+                     ) <> 1; \
+                     INSERT INTO projection_journal_guards(intent_id, journal_id) \
+                     VALUES (NEW.intent_id, NEW.journal_id); \
+                 END;",
+            )
+            .await
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO mutation_journal(journal_id, intent_id) VALUES ('journal-1', 'intent-1');",
+            )
+            .await
+            .expect("RAISE predicate with scalar subquery must evaluate, not error");
+
+            let journal_count = conn.query("SELECT COUNT(*) FROM mutation_journal;").await.unwrap();
+            assert_eq!(row_values(&journal_count[0])[0], SqliteValue::Integer(1));
+            let guard_count = conn
+                .query("SELECT COUNT(*) FROM projection_journal_guards;")
+                .await
+                .unwrap();
+            assert_eq!(row_values(&guard_count[0])[0], SqliteValue::Integer(1));
+
+            let err = conn
+                .execute(
+                    "INSERT INTO mutation_journal(journal_id, intent_id) VALUES ('journal-2', 'intent-1');",
+                )
+                .await
+                .expect_err("duplicate-journal guard must RAISE(ABORT)");
+            assert!(
+                matches!(
+                    err,
+                    FrankenError::FunctionError(ref msg) if msg == "write intent has duplicate journals"
+                ),
+                "unexpected error: {err:?}"
             );
         });
     }
