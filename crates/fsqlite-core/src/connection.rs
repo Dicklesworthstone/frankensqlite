@@ -31727,11 +31727,11 @@ impl Connection {
         if insert.columns.is_empty() {
             let targets = (0..table_columns.len()).map(InsertTarget::Column).collect();
             return Ok(InsertTargetLayout {
-                explicit_rowid_source: rowid_alias_col_idx,
-                rowid_alias_col_idx,
                 table_columns,
                 default_sqls,
                 targets,
+                rowid_alias_col_idx,
+                explicit_rowid_source: rowid_alias_col_idx,
             });
         }
 
@@ -31754,10 +31754,10 @@ impl Connection {
         });
         Ok(InsertTargetLayout {
             table_columns,
+            default_sqls,
             targets,
             rowid_alias_col_idx,
             explicit_rowid_source,
-            default_sqls,
         })
     }
 
