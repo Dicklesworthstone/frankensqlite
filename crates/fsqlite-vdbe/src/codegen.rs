@@ -51981,7 +51981,7 @@ mod tests {
         )
         .expect_err("mismatched partial-index predicate must not fall back to the rowid probe");
         assert!(
-            matches!(error, CodegenError::Unsupported(message)
+            matches!(error, CodegenError::Unsupported(ref message)
                 if message.contains("does not match any PRIMARY KEY or UNIQUE constraint")),
             "unexpected unmatched-target error: {error:?}"
         );
