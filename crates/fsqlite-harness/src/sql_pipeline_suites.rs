@@ -441,7 +441,7 @@ mod parser_tests {
             ctx,
             tokens
                 .iter()
-                .any(|t| matches!(&t.kind, TokenKind::String(s) if s == "hello world")),
+                .any(|t| matches!(&t.kind, TokenKind::String(s) if s.as_str().eq("hello world"))),
             "should have String('hello world') token"
         );
     }
@@ -1043,23 +1043,65 @@ mod function_tests {
     #[test]
     fn func_coalesce() {
         let reg = full_registry();
-        // coalesce is variadic (-1 args)
-        let func = reg
-            .find_scalar("coalesce", -1)
-            .or_else(|| reg.find_scalar("coalesce", 3))
-            .expect("coalesce registered");
+        let sqlite = rusqlite::Connection::open_in_memory().expect("open C SQLite oracle");
 
-        let result = func
-            .invoke(&[
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Integer(42),
-            ])
-            .unwrap();
+        for (case, sql, args) in [
+            (
+                "minimum_arity",
+                "SELECT COALESCE(NULL, 7)",
+                vec![SqliteValue::Null, SqliteValue::Integer(7)],
+            ),
+            (
+                "variadic_null_chain",
+                "SELECT COALESCE(NULL, NULL, 42, 99)",
+                vec![
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Integer(42),
+                    SqliteValue::Integer(99),
+                ],
+            ),
+        ] {
+            let func = reg
+                .find_scalar("coalesce", i32::try_from(args.len()).unwrap())
+                .expect("coalesce registered");
+            let actual = func.invoke(&args).unwrap();
+            let reference = sqlite
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .expect("C SQLite COALESCE query");
+            let ctx = DiagContext::new(BEAD_ID)
+                .case(case)
+                .invariant("COALESCE registry result matches C SQLite");
+            diag_assert_eq!(ctx, actual, SqliteValue::Integer(reference));
+        }
+
+        let invalid = reg
+            .find_scalar("coalesce", 1)
+            .expect("known function returns wrong-arity sentinel")
+            .invoke(&[SqliteValue::Integer(1)])
+            .expect_err("one-argument COALESCE must fail");
+        let oracle_error = sqlite
+            .prepare("SELECT coalesce(1)")
+            .expect_err("C SQLite must reject one-argument COALESCE");
         let ctx = DiagContext::new(BEAD_ID)
-            .case("coalesce")
-            .invariant("coalesce(NULL, NULL, 42) = 42");
-        diag_assert_eq!(ctx, result, SqliteValue::Integer(42));
+            .case("invalid_arity")
+            .invariant("COALESCE invalid-arity diagnostic matches C SQLite");
+        let oracle_message = match oracle_error {
+            rusqlite::Error::SqliteFailure(_, Some(message)) => message,
+            rusqlite::Error::SqlInputError { msg, .. } => msg,
+            other => {
+                diag_assert!(ctx, false, "unexpected C SQLite error: {other}");
+                return;
+            }
+        };
+        let actual_message = match invalid {
+            FrankenError::FunctionError(message) => message,
+            other => {
+                diag_assert!(ctx, false, "unexpected FrankenSQLite error: {other}");
+                return;
+            }
+        };
+        diag_assert_eq!(ctx, actual_message, oracle_message);
     }
 
     #[test]
