@@ -1,3 +1,4 @@
+use fsqlite_harness::failure_bundle::ExecutionLaneEvidence;
 use fsqlite_wal::{PhasePercentiles, WakeReasonSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -464,6 +465,14 @@ pub struct WalHotPathProfile {
     pub group_commit_size_sum: u64,
     pub group_commit_latency_us_total: u64,
     #[serde(default)]
+    pub recovery_frames_total: u64,
+    #[serde(default)]
+    pub recovery_corruption_detected_total: u64,
+    #[serde(default)]
+    pub recovery_frames_repaired_total: u64,
+    #[serde(default)]
+    pub recovery_ops_total: u64,
+    #[serde(default)]
     pub commit_path: WalCommitPathProfile,
 }
 
@@ -573,6 +582,8 @@ pub struct StorageWiringReport {
     pub backend_kind: String,
     pub backend_mode: String,
     pub backend_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_lane_evidence: Option<ExecutionLaneEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -807,6 +818,7 @@ mod tests {
                 backend_kind: "unix".to_owned(),
                 backend_mode: "parity_cert_strict".to_owned(),
                 backend_identity: "unix:parity_cert_strict".to_owned(),
+                execution_lane_evidence: None,
             }),
             runtime_phase_timing: None,
             hot_path_profile: None,
@@ -978,6 +990,10 @@ mod tests {
                 group_commits_total: 1,
                 group_commit_size_sum: 2,
                 group_commit_latency_us_total: 50,
+                recovery_frames_total: 0,
+                recovery_corruption_detected_total: 0,
+                recovery_frames_repaired_total: 0,
+                recovery_ops_total: 0,
                 commit_path: WalCommitPathProfile {
                     prepare_us_total: 12,
                     consolidator_lock_wait_us_total: 8,

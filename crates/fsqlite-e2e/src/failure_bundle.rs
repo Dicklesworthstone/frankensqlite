@@ -23,19 +23,23 @@
 //!
 //! ## Schema Version
 //!
-//! The bundle format is versioned to support forward compatibility.
-//! Current version: `1.0`
+//! The bundle format is directly versioned so readers reject unknown schemas
+//! and require an explicit migration.
+//! Current version: `2.0`
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
+
+use fsqlite_harness::failure_bundle::ExecutionLaneEvidence;
 
 use crate::{FRANKEN_SEED, HarnessSettings};
 
 /// Current bundle schema version.
-pub const BUNDLE_SCHEMA_VERSION: &str = "1.0";
+pub const BUNDLE_SCHEMA_VERSION: &str = "2.0";
 const SECS_PER_DAY: u64 = 86_400;
 const SECS_PER_HOUR: u64 = 3_600;
 const SECS_PER_MIN: u64 = 60;
@@ -44,12 +48,16 @@ const SECS_PER_MIN: u64 = 60;
 
 /// The top-level manifest that describes a failure bundle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureBundleManifest {
     /// Schema version for forward compatibility.
     pub schema_version: String,
 
     /// Unique bundle identifier (typically UUID or timestamp-based).
     pub bundle_id: String,
+
+    /// Required and positively observed engine execution paths.
+    pub execution_lane_evidence: ExecutionLaneEvidence,
 
     /// When the failure occurred (ISO 8601).
     pub failure_timestamp: String,
@@ -71,6 +79,89 @@ pub struct FailureBundleManifest {
 
     /// Index of files in the bundle.
     pub files: Vec<BundleFile>,
+}
+
+impl FailureBundleManifest {
+    /// Validate the directly versioned manifest and its embedded lane proof.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.schema_version != BUNDLE_SCHEMA_VERSION {
+            errors.push(format!(
+                "schema_version must equal {BUNDLE_SCHEMA_VERSION}; direct migration required"
+            ));
+        }
+        errors.extend(self.execution_lane_evidence.validate());
+        if self.execution_lane_evidence.scenario_id != self.scenario.scenario_id {
+            errors
+                .push("execution_lane.scenario_id does not match manifest scenario_id".to_owned());
+        }
+        let mut paths = HashSet::new();
+        for file in &self.files {
+            if !is_safe_bundle_relative_path(&file.path) {
+                errors.push(format!("bundle file path is unsafe: {}", file.path));
+            }
+            if matches!(file.path.as_str(), "manifest.json" | "repro.sh") {
+                errors.push(format!("bundle file path is reserved: {}", file.path));
+            }
+            if !paths.insert(file.path.as_str()) {
+                errors.push(format!("bundle file path is duplicated: {}", file.path));
+            }
+        }
+        errors
+    }
+}
+
+/// Read and strictly validate an existing failure-bundle manifest.
+pub fn read_failure_bundle_manifest(
+    path: impl AsRef<Path>,
+) -> std::io::Result<FailureBundleManifest> {
+    let bytes = std::fs::read(path)?;
+    let manifest: FailureBundleManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut errors = manifest.validate();
+    let bundle_dir = path.as_ref().parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "manifest path has no parent",
+        )
+    })?;
+    for file in &manifest.files {
+        if !is_safe_bundle_relative_path(&file.path) {
+            continue;
+        }
+        let artifact_path = bundle_dir.join(&file.path);
+        match std::fs::read(&artifact_path) {
+            Ok(bytes) => {
+                let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if actual_size != file.size_bytes {
+                    errors.push(format!("bundle file size mismatch: {}", file.path));
+                }
+                let actual_hash = crate::bytes_to_lower_hex(sha2::Sha256::digest(&bytes));
+                if actual_hash != file.sha256 {
+                    errors.push(format!("bundle file hash mismatch: {}", file.path));
+                }
+            }
+            Err(error) => errors.push(format!("bundle file unreadable: {}: {error}", file.path)),
+        }
+    }
+    if !bundle_dir.join("repro.sh").is_file() {
+        errors.push("bundle repro.sh is missing".to_owned());
+    }
+    if !errors.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            errors.join("; "),
+        ));
+    }
+    Ok(manifest)
+}
+
+fn is_safe_bundle_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 /// Information about the scenario that failed.
@@ -237,6 +328,7 @@ pub struct FailureBundleBuilder {
     bundle_id: String,
     output_dir: PathBuf,
     scenario: Option<ScenarioInfo>,
+    execution_lane_evidence: Option<ExecutionLaneEvidence>,
     reproducibility: Option<ReproducibilityInfo>,
     environment: Option<EnvironmentInfo>,
     failure: Option<FailureInfo>,
@@ -257,6 +349,7 @@ impl FailureBundleBuilder {
             bundle_id,
             output_dir,
             scenario: None,
+            execution_lane_evidence: None,
             reproducibility: None,
             environment: None,
             failure: None,
@@ -268,6 +361,13 @@ impl FailureBundleBuilder {
     #[must_use]
     pub fn scenario(mut self, info: ScenarioInfo) -> Self {
         self.scenario = Some(info);
+        self
+    }
+
+    /// Set fail-closed execution-lane evidence for this failure.
+    #[must_use]
+    pub fn execution_lane_evidence(mut self, evidence: ExecutionLaneEvidence) -> Self {
+        self.execution_lane_evidence = Some(evidence);
         self
     }
 
@@ -388,7 +488,58 @@ impl FailureBundleBuilder {
         use std::fs;
         use std::io::Write;
 
-        // Create output directory.
+        let execution_lane_evidence = self.execution_lane_evidence.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "execution_lane_evidence is required",
+            )
+        })?;
+        let lane_errors = execution_lane_evidence.validate();
+        if !lane_errors.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid execution_lane_evidence: {}",
+                    lane_errors.join("; ")
+                ),
+            ));
+        }
+        let scenario = self.scenario.unwrap_or_else(|| ScenarioInfo {
+            scenario_id: "UNKNOWN".to_owned(),
+            scenario_name: "Unknown scenario".to_owned(),
+            category: "unknown".to_owned(),
+            test_command: String::new(),
+        });
+        if execution_lane_evidence.scenario_id != scenario.scenario_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "execution_lane.scenario_id does not match manifest scenario_id",
+            ));
+        }
+        let mut paths = HashSet::new();
+        for (path, ..) in &self.files {
+            if !is_safe_bundle_relative_path(path) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("bundle file path is unsafe: {path}"),
+                ));
+            }
+            if matches!(path.as_str(), "manifest.json" | "repro.sh") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("bundle file path is reserved: {path}"),
+                ));
+            }
+            if !paths.insert(path.as_str()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("bundle file path is duplicated: {path}"),
+                ));
+            }
+        }
+
+        // Validate all evidence before creating any artifact paths so a
+        // cancelled or rejected capture cannot leave a partial bundle.
         fs::create_dir_all(&self.output_dir)?;
 
         // Write files and collect metadata.
@@ -417,14 +568,10 @@ impl FailureBundleBuilder {
         let manifest = FailureBundleManifest {
             schema_version: BUNDLE_SCHEMA_VERSION.to_owned(),
             bundle_id: self.bundle_id.clone(),
+            execution_lane_evidence,
             failure_timestamp: now.clone(),
             bundle_timestamp: now,
-            scenario: self.scenario.unwrap_or_else(|| ScenarioInfo {
-                scenario_id: "UNKNOWN".to_owned(),
-                scenario_name: "Unknown scenario".to_owned(),
-                category: "unknown".to_owned(),
-                test_command: String::new(),
-            }),
+            scenario,
             reproducibility: self.reproducibility.unwrap_or_else(|| ReproducibilityInfo {
                 seed: FRANKEN_SEED,
                 rng_algorithm: "StdRng/ChaCha12".to_owned(),
@@ -462,15 +609,15 @@ impl FailureBundleBuilder {
             files: bundle_files,
         };
 
-        // Write manifest.
-        let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        let manifest_path = self.output_dir.join("manifest.json");
-        fs::write(&manifest_path, manifest_json)?;
-
-        // Write repro script.
+        // Write the repro script before publishing the manifest. A valid
+        // manifest is the bundle's final completion marker.
         let repro_script = generate_repro_script(&manifest);
         let repro_path = self.output_dir.join("repro.sh");
         fs::write(&repro_path, repro_script)?;
+
+        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        let manifest_path = self.output_dir.join("manifest.json");
+        fs::write(&manifest_path, manifest_json)?;
 
         Ok(self.output_dir)
     }
@@ -619,6 +766,12 @@ pub fn bundle_assertion_failure(
     settings: &HarnessSettings,
 ) -> std::io::Result<PathBuf> {
     FailureBundleBuilder::new(output_base)
+        .execution_lane_evidence(ExecutionLaneEvidence::semantic_only(
+            "unreported",
+            scenario_id,
+            scenario_id,
+            "assertion",
+        ))
         .scenario(ScenarioInfo {
             scenario_id: scenario_id.to_owned(),
             scenario_name: scenario_name.to_owned(),
@@ -647,9 +800,16 @@ pub fn bundle_divergence_failure(
     actual_hash: &str,
     settings: &HarnessSettings,
 ) -> std::io::Result<PathBuf> {
+    let scenario_id = format!("CMP-divergence-{fixture_id}");
     FailureBundleBuilder::new(output_base)
+        .execution_lane_evidence(ExecutionLaneEvidence::semantic_only(
+            "unreported",
+            fixture_id,
+            &scenario_id,
+            "differential",
+        ))
         .scenario(ScenarioInfo {
-            scenario_id: format!("CMP-divergence-{fixture_id}"),
+            scenario_id,
             scenario_name: format!("Divergence in {fixture_id}"),
             category: "compatibility".to_owned(),
             test_command: format!(
@@ -687,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_bundle_schema_version() {
-        assert_eq!(BUNDLE_SCHEMA_VERSION, "1.0");
+        assert_eq!(BUNDLE_SCHEMA_VERSION, "2.0");
     }
 
     #[test]
@@ -718,6 +878,12 @@ mod tests {
     fn test_builder_creates_bundle() {
         let tmp = tempfile::tempdir().unwrap();
         let bundle_path = FailureBundleBuilder::new(tmp.path())
+            .execution_lane_evidence(ExecutionLaneEvidence::semantic_only(
+                "trace-test",
+                "run-test",
+                "TEST-1",
+                "test",
+            ))
             .scenario(ScenarioInfo {
                 scenario_id: "TEST-1".to_owned(),
                 scenario_name: "Test scenario".to_owned(),
@@ -745,10 +911,139 @@ mod tests {
 
         // Verify manifest contents.
         let manifest_json = std::fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
-        let manifest: FailureBundleManifest = serde_json::from_str(&manifest_json).unwrap();
-        assert_eq!(manifest.schema_version, "1.0");
+        let manifest = read_failure_bundle_manifest(bundle_path.join("manifest.json")).unwrap();
+        assert_eq!(manifest.schema_version, "2.0");
         assert_eq!(manifest.scenario.scenario_id, "TEST-1");
         assert_eq!(manifest.failure.failure_type, FailureType::Assertion);
+        assert!(manifest.execution_lane_evidence.requirement_satisfied);
+
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        let decoded: FailureBundleManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(serialized, serde_json::to_string(&decoded).unwrap());
+        let legacy = serialized
+            .replace("\"schema_version\":\"2.0\",", "\"schema_version\":\"1.0\",")
+            .replace(
+                &format!(
+                    "\"execution_lane_evidence\":{},",
+                    serde_json::to_string(&manifest.execution_lane_evidence).unwrap()
+                ),
+                "",
+            );
+        assert!(serde_json::from_str::<FailureBundleManifest>(&legacy).is_err());
+        assert!(manifest_json.contains("execution_lane_evidence"));
+
+        std::fs::write(bundle_path.join("logs/test.log"), "tampered").unwrap();
+        let error = read_failure_bundle_manifest(bundle_path.join("manifest.json"))
+            .expect_err("a changed artifact must invalidate its bundle");
+        assert!(error.to_string().contains("bundle file"), "{error}");
+    }
+
+    #[test]
+    fn invalid_lane_evidence_fails_before_artifact_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut evidence =
+            ExecutionLaneEvidence::semantic_only("trace-test", "run-test", "TEST-CANCEL", "test");
+        evidence.observed_lanes.clear();
+        let result = FailureBundleBuilder::new(tmp.path())
+            .execution_lane_evidence(evidence)
+            .scenario(ScenarioInfo {
+                scenario_id: "TEST-CANCEL".to_owned(),
+                scenario_name: "Cancelled capture".to_owned(),
+                category: "test".to_owned(),
+                test_command: "cargo test".to_owned(),
+            })
+            .add_text_file("logs/partial.log", "must not be written", "partial")
+            .build();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn mismatched_lane_scenario_fails_before_artifact_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = FailureBundleBuilder::new(tmp.path())
+            .execution_lane_evidence(ExecutionLaneEvidence::semantic_only(
+                "trace-test",
+                "run-test",
+                "OTHER-SCENARIO",
+                "test",
+            ))
+            .scenario(ScenarioInfo {
+                scenario_id: "TEST-CORRELATION".to_owned(),
+                scenario_name: "Correlation mismatch".to_owned(),
+                category: "test".to_owned(),
+                test_command: "cargo test".to_owned(),
+            })
+            .add_text_file("logs/partial.log", "must not be written", "partial")
+            .build();
+        let error = result.expect_err("scenario mismatch must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("scenario_id does not match manifest scenario_id")
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn interrupted_manifest_write_is_never_accepted_as_a_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            br#"{"schema_version":"2.0","bundle_id":"interrupted""#,
+        )
+        .unwrap();
+
+        let error = read_failure_bundle_manifest(&manifest_path)
+            .expect_err("a truncated manifest must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn manifest_is_not_a_completion_marker_until_repro_exists() {
+        let source = tempfile::tempdir().unwrap();
+        let bundle_path = bundle_assertion_failure(
+            source.path(),
+            "TEST-INCOMPLETE",
+            "Incomplete publication",
+            "manifest published last",
+            None,
+            None,
+            &HarnessSettings::default(),
+        )
+        .unwrap();
+        let interrupted = tempfile::tempdir().unwrap();
+        let manifest_path = interrupted.path().join("manifest.json");
+        std::fs::copy(bundle_path.join("manifest.json"), &manifest_path).unwrap();
+
+        let error = read_failure_bundle_manifest(&manifest_path)
+            .expect_err("a manifest published before repro.sh must not be accepted");
+        assert!(error.to_string().contains("repro.sh is missing"), "{error}");
+    }
+
+    #[test]
+    fn unsafe_artifact_path_fails_before_bundle_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = FailureBundleBuilder::new(tmp.path())
+            .execution_lane_evidence(ExecutionLaneEvidence::semantic_only(
+                "trace-test",
+                "run-test",
+                "TEST-UNSAFE-PATH",
+                "test",
+            ))
+            .scenario(ScenarioInfo {
+                scenario_id: "TEST-UNSAFE-PATH".to_owned(),
+                scenario_name: "Unsafe artifact path".to_owned(),
+                category: "test".to_owned(),
+                test_command: "cargo test".to_owned(),
+            })
+            .add_text_file("../escaped.log", "must not be written", "unsafe")
+            .build();
+
+        let error = result.expect_err("parent traversal must fail closed");
+        assert!(error.to_string().contains("path is unsafe"), "{error}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[test]

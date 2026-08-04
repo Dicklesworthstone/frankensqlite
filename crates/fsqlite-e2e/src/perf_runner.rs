@@ -4850,6 +4850,7 @@ mod tests {
             backend_kind: "unix".to_owned(),
             backend_mode: "parity_cert_strict".to_owned(),
             backend_identity: "unix:parity_cert_strict".to_owned(),
+            execution_lane_evidence: None,
         };
         let engine_report = EngineRunReport {
             wall_time_ms: 42,

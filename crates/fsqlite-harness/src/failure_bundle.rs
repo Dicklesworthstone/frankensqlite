@@ -10,8 +10,9 @@
 //!
 //! # Schema Version
 //!
-//! The current bundle schema version is `1.0.0`. Bundles are self-describing:
-//! every serialized bundle includes the schema version for forward compatibility.
+//! The current bundle schema version is `2.0.0`. Bundles are self-describing:
+//! every serialized bundle includes the schema version so readers can reject
+//! unknown schemas and require an explicit migration.
 //!
 //! # Adoption Checklist
 //!
@@ -23,13 +24,497 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::LazyLock;
+
+use crate::test_inventory::ExecutionLane;
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-mblr.4.4";
 
 /// Schema version for the failure bundle format.
-pub const BUNDLE_SCHEMA_VERSION: &str = "1.0.0";
+pub const BUNDLE_SCHEMA_VERSION: &str = "2.0.0";
+/// Schema version for execution-lane evidence embedded in reports and bundles.
+pub const EXECUTION_LANE_EVIDENCE_SCHEMA_VERSION: &str = "fsqlite.execution_lane_evidence.v1";
 const FIRST_FAILURE_DIAGNOSTIC_POINTER: &str = "/failure/first_divergence";
+
+/// Runtime components whose participation was positively observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedExecutionLane {
+    /// The public SQL path produced a result or classified error.
+    SqlResult,
+    /// The run performed pager-backed storage work.
+    PagerBacked,
+    /// The query planner participated in compilation.
+    Planner,
+    /// VDBE bytecode executed.
+    Vdbe,
+    /// Concurrent page-level MVCC commit planning executed.
+    Mvcc,
+    /// WAL recovery executed.
+    Recovery,
+    /// A compatibility fallback was attempted, allowed, or denied.
+    CompatibilityFallback,
+}
+
+impl ObservedExecutionLane {
+    /// Stable serialized/test-facing identifier for this observation.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SqlResult => "sql_result",
+            Self::PagerBacked => "pager_backed",
+            Self::Planner => "planner",
+            Self::Vdbe => "vdbe",
+            Self::Mvcc => "mvcc",
+            Self::Recovery => "recovery",
+            Self::CompatibilityFallback => "compatibility_fallback",
+        }
+    }
+}
+
+/// One decision emitted by the existing `fsqlite.fallback_decision` contract.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackDecisionEvidence {
+    pub statement_kind: String,
+    pub fallback_boundary: String,
+    pub decision_reason: String,
+    pub decision_outcome: String,
+    pub source_touchpoint: String,
+    pub first_failure_diagnostic: String,
+    pub occurrences: u64,
+}
+
+impl FallbackDecisionEvidence {
+    #[must_use]
+    fn canonical_first_failure_diagnostic(&self) -> String {
+        format!(
+            "statement_kind={}; fallback_boundary={}; source_touchpoint={}; decision_reason={}",
+            self.statement_kind,
+            self.fallback_boundary,
+            self.source_touchpoint,
+            self.decision_reason,
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FallbackBoundaryInventory {
+    allowed_decision_outcomes: Vec<String>,
+    boundary: Vec<FallbackBoundaryInventoryRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FallbackBoundaryInventoryRow {
+    boundary_id: String,
+    statement_kind: String,
+    decision_reason: String,
+}
+
+static CANONICAL_FALLBACK_BOUNDARY_INVENTORY: LazyLock<Result<FallbackBoundaryInventory, String>> =
+    LazyLock::new(|| {
+        toml::from_str(include_str!(
+            "../../../docs/contracts/fallback_boundary_inventory.toml"
+        ))
+        .map_err(|error| error.to_string())
+    });
+
+/// Fail-closed proof that a run exercised its declared execution requirement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionLaneEvidence {
+    pub schema_version: String,
+    pub required_lane: ExecutionLane,
+    pub observed_lanes: Vec<ObservedExecutionLane>,
+    pub trace_id: String,
+    pub run_id: String,
+    pub scenario_id: String,
+    pub statement_kind: String,
+    pub backend_kind: String,
+    pub backend_mode: String,
+    pub backend_identity: String,
+    pub fallback_decisions: Vec<FallbackDecisionEvidence>,
+    pub fallback_capture_complete: bool,
+    pub requirement_satisfied: bool,
+    pub first_failure_diagnostic: Option<String>,
+}
+
+impl ExecutionLaneEvidence {
+    /// Construct canonical evidence and compute its satisfaction result.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_observations(
+        required_lane: ExecutionLane,
+        mut observed_lanes: Vec<ObservedExecutionLane>,
+        trace_id: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario_id: impl Into<String>,
+        statement_kind: impl Into<String>,
+        backend_kind: impl Into<String>,
+        backend_mode: impl Into<String>,
+        backend_identity: impl Into<String>,
+        mut fallback_decisions: Vec<FallbackDecisionEvidence>,
+        fallback_capture_complete: bool,
+    ) -> Self {
+        observed_lanes.sort_unstable();
+        fallback_decisions.sort_unstable();
+        let mut evidence = Self {
+            schema_version: EXECUTION_LANE_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            required_lane,
+            observed_lanes,
+            trace_id: trace_id.into(),
+            run_id: run_id.into(),
+            scenario_id: scenario_id.into(),
+            statement_kind: statement_kind.into(),
+            backend_kind: backend_kind.into(),
+            backend_mode: backend_mode.into(),
+            backend_identity: backend_identity.into(),
+            fallback_decisions,
+            fallback_capture_complete,
+            requirement_satisfied: false,
+            first_failure_diagnostic: None,
+        };
+        evidence.requirement_satisfied = evidence.computed_requirement_satisfied();
+        if !evidence.requirement_satisfied {
+            evidence.first_failure_diagnostic = Some(evidence.mismatch_diagnostic());
+        }
+        evidence
+    }
+
+    /// Minimal evidence for a semantic-only failure bundle outside an engine report.
+    #[must_use]
+    pub fn semantic_only(
+        trace_id: impl Into<String>,
+        run_id: impl Into<String>,
+        scenario_id: impl Into<String>,
+        statement_kind: impl Into<String>,
+    ) -> Self {
+        Self::from_observations(
+            ExecutionLane::SqlResultOnly,
+            vec![ObservedExecutionLane::SqlResult],
+            trace_id,
+            run_id,
+            scenario_id,
+            statement_kind,
+            "unreported",
+            "unreported",
+            "unreported:unreported",
+            Vec::new(),
+            true,
+        )
+    }
+
+    #[must_use]
+    fn required_observation(&self) -> ObservedExecutionLane {
+        match self.required_lane {
+            ExecutionLane::SqlResultOnly => ObservedExecutionLane::SqlResult,
+            ExecutionLane::PagerBackedRequired => ObservedExecutionLane::PagerBacked,
+            ExecutionLane::PlannerRequired => ObservedExecutionLane::Planner,
+            ExecutionLane::VdbeRequired => ObservedExecutionLane::Vdbe,
+            ExecutionLane::MvccRequired => ObservedExecutionLane::Mvcc,
+            ExecutionLane::RecoveryRequired => ObservedExecutionLane::Recovery,
+        }
+    }
+
+    #[must_use]
+    fn is_fallback_sensitive(&self) -> bool {
+        self.required_lane != ExecutionLane::SqlResultOnly
+    }
+
+    #[must_use]
+    fn computed_requirement_satisfied(&self) -> bool {
+        let observed = self.observed_lanes.contains(&self.required_observation());
+        let fallback_seen = self
+            .observed_lanes
+            .contains(&ObservedExecutionLane::CompatibilityFallback)
+            || !self.fallback_decisions.is_empty();
+        let backend_certifying = !self.is_fallback_sensitive()
+            || (self.backend_kind != "memory" && self.backend_mode != "fallback_allowed");
+        self.fallback_capture_complete
+            && observed
+            && backend_certifying
+            && !(self.is_fallback_sensitive() && fallback_seen)
+    }
+
+    #[must_use]
+    fn mismatch_diagnostic(&self) -> String {
+        let observed = self
+            .observed_lanes
+            .iter()
+            .map(|lane| lane.label())
+            .collect::<Vec<_>>()
+            .join(",");
+        let fallback_reason = self.fallback_decisions.first().map_or_else(
+            || {
+                if self.fallback_capture_complete {
+                    "none"
+                } else {
+                    "capture_incomplete"
+                }
+            },
+            |decision| decision.decision_reason.as_str(),
+        );
+        format!(
+            "execution_lane_mismatch: run_id={}; trace_id={}; scenario_id={}; required_lane={}; observed_lanes={observed}; backend_identity={}; fallback_reason={fallback_reason}",
+            self.run_id,
+            self.trace_id,
+            self.scenario_id,
+            self.required_lane.label(),
+            self.backend_identity,
+        )
+    }
+
+    /// Validate structural integrity and recompute the fail-closed outcome.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.schema_version != EXECUTION_LANE_EVIDENCE_SCHEMA_VERSION {
+            errors.push(format!(
+                "execution_lane.schema_version must equal {EXECUTION_LANE_EVIDENCE_SCHEMA_VERSION}"
+            ));
+        }
+        for (field, value) in [
+            ("trace_id", self.trace_id.as_str()),
+            ("run_id", self.run_id.as_str()),
+            ("scenario_id", self.scenario_id.as_str()),
+            ("statement_kind", self.statement_kind.as_str()),
+            ("backend_kind", self.backend_kind.as_str()),
+            ("backend_mode", self.backend_mode.as_str()),
+            ("backend_identity", self.backend_identity.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                errors.push(format!("execution_lane.{field} is empty"));
+            }
+        }
+        if self.backend_identity != format!("{}:{}", self.backend_kind, self.backend_mode) {
+            errors.push(
+                "execution_lane.backend_identity conflicts with backend kind/mode".to_owned(),
+            );
+        }
+        if self.observed_lanes.is_empty() {
+            errors.push("execution_lane.observed_lanes is empty".to_owned());
+        }
+        if !self
+            .observed_lanes
+            .windows(2)
+            .all(|pair| pair[0] <= pair[1])
+        {
+            errors.push("execution_lane.observed_lanes is not canonically sorted".to_owned());
+        }
+        if self
+            .observed_lanes
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            errors.push("execution_lane.observed_lanes contains duplicates".to_owned());
+        }
+
+        let fallback_observed = self
+            .observed_lanes
+            .contains(&ObservedExecutionLane::CompatibilityFallback);
+        let fallback_evidence_present = !self.fallback_decisions.is_empty();
+        if fallback_observed != fallback_evidence_present {
+            errors.push(
+                "execution_lane compatibility-fallback observation conflicts with fallback decisions"
+                    .to_owned(),
+            );
+        }
+        if !self
+            .fallback_decisions
+            .windows(2)
+            .all(|pair| pair[0] <= pair[1])
+        {
+            errors.push("execution_lane.fallback_decisions is not canonically sorted".to_owned());
+        }
+        if self
+            .fallback_decisions
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            errors.push("execution_lane.fallback_decisions contains duplicates".to_owned());
+        }
+        for (index, decision) in self.fallback_decisions.iter().enumerate() {
+            for (field, value) in [
+                ("statement_kind", decision.statement_kind.as_str()),
+                ("fallback_boundary", decision.fallback_boundary.as_str()),
+                ("decision_reason", decision.decision_reason.as_str()),
+                ("decision_outcome", decision.decision_outcome.as_str()),
+                ("source_touchpoint", decision.source_touchpoint.as_str()),
+                (
+                    "first_failure_diagnostic",
+                    decision.first_failure_diagnostic.as_str(),
+                ),
+            ] {
+                if value.trim().is_empty() {
+                    errors.push(format!(
+                        "execution_lane.fallback_decisions[{index}].{field} is empty"
+                    ));
+                }
+            }
+            if decision.occurrences == 0 {
+                errors.push(format!(
+                    "execution_lane.fallback_decisions[{index}].occurrences is zero"
+                ));
+            }
+            if decision.first_failure_diagnostic != decision.canonical_first_failure_diagnostic() {
+                errors.push(format!(
+                    "execution_lane.fallback_decisions[{index}].first_failure_diagnostic conflicts with structured fields"
+                ));
+            }
+        }
+        errors.extend(self.validate_canonical_fallback_registry());
+
+        let computed = self.computed_requirement_satisfied();
+        if self.requirement_satisfied != computed {
+            errors.push("execution_lane.requirement_satisfied is inconsistent".to_owned());
+        }
+        match (computed, self.first_failure_diagnostic.as_deref()) {
+            (true, Some(_)) => errors.push(
+                "execution_lane.first_failure_diagnostic conflicts with satisfied requirement"
+                    .to_owned(),
+            ),
+            (false, None) => errors.push(
+                "execution_lane.first_failure_diagnostic missing for lane mismatch".to_owned(),
+            ),
+            (false, Some(diagnostic)) if diagnostic != self.mismatch_diagnostic() => {
+                errors.push(
+                    "execution_lane.first_failure_diagnostic does not match canonical mismatch"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+        errors
+    }
+
+    /// Validate observed fallback tuples against the canonical registry.
+    #[must_use]
+    pub fn validate_canonical_fallback_registry(&self) -> Vec<String> {
+        if self.fallback_decisions.is_empty() {
+            return Vec::new();
+        }
+        let inventory = match CANONICAL_FALLBACK_BOUNDARY_INVENTORY.as_ref() {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                return vec![format!(
+                    "execution_lane canonical fallback registry is invalid: {error}"
+                )];
+            }
+        };
+        if inventory.boundary.is_empty() {
+            return vec!["execution_lane canonical fallback registry is empty".to_owned()];
+        }
+        self.fallback_decisions
+            .iter()
+            .filter_map(|decision| {
+                let fallback_boundary = decision.fallback_boundary.as_str();
+                let boundary_registered = inventory.boundary.iter().any(|row| {
+                    row.boundary_id == fallback_boundary
+                        && row.statement_kind == decision.statement_kind
+                        && row.decision_reason == decision.decision_reason
+                });
+                let outcome_registered = inventory
+                    .allowed_decision_outcomes
+                    .contains(&decision.decision_outcome);
+                (!(boundary_registered && outcome_registered)).then(|| {
+                    format!(
+                        "execution_lane fallback tuple is absent from canonical registry: boundary={} statement={} reason={} outcome={}",
+                        decision.fallback_boundary,
+                        decision.statement_kind,
+                        decision.decision_reason,
+                        decision.decision_outcome,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Emit one bounded aggregate diagnostic for this run.
+    pub fn emit_diagnostic(&self) {
+        let observed_lanes = self
+            .observed_lanes
+            .iter()
+            .map(|lane| lane.label())
+            .collect::<Vec<_>>()
+            .join(",");
+        let lane_count = |lane| u8::from(self.observed_lanes.contains(&lane));
+        let fallback_reason = self.fallback_decisions.first().map_or_else(
+            || {
+                if self.fallback_capture_complete {
+                    "none"
+                } else {
+                    "capture_incomplete"
+                }
+            },
+            |decision| decision.decision_reason.as_str(),
+        );
+        let fallback = self.fallback_decisions.first();
+        let fallback_decision_count = self
+            .fallback_decisions
+            .iter()
+            .fold(0_u64, |count, decision| {
+                count.saturating_add(decision.occurrences)
+            });
+        if self.requirement_satisfied {
+            tracing::info!(
+                target: "fsqlite.execution_lane",
+                run_id = %self.run_id,
+                trace_id = %self.trace_id,
+                scenario_id = %self.scenario_id,
+                statement_kind = %self.statement_kind,
+                required_lane = self.required_lane.label(),
+                observed_lanes = %observed_lanes,
+                observed_lane_count = self.observed_lanes.len(),
+                sql_result_count = lane_count(ObservedExecutionLane::SqlResult),
+                pager_backed_count = lane_count(ObservedExecutionLane::PagerBacked),
+                planner_count = lane_count(ObservedExecutionLane::Planner),
+                vdbe_count = lane_count(ObservedExecutionLane::Vdbe),
+                mvcc_count = lane_count(ObservedExecutionLane::Mvcc),
+                recovery_count = lane_count(ObservedExecutionLane::Recovery),
+                compatibility_fallback_count = lane_count(ObservedExecutionLane::CompatibilityFallback),
+                fallback_decision_count,
+                fallback_unique_decision_count = self.fallback_decisions.len(),
+                fallback_capture_complete = self.fallback_capture_complete,
+                backend_identity = %self.backend_identity,
+                backend_mode = %self.backend_mode,
+                fallback_boundary = fallback.map_or("none", |value| value.fallback_boundary.as_str()),
+                fallback_reason,
+                fallback_outcome = fallback.map_or("none", |value| value.decision_outcome.as_str()),
+                first_failure_diag = "none",
+                "execution-lane evidence aggregate"
+            );
+        } else {
+            tracing::error!(
+                target: "fsqlite.execution_lane",
+                run_id = %self.run_id,
+                trace_id = %self.trace_id,
+                scenario_id = %self.scenario_id,
+                statement_kind = %self.statement_kind,
+                required_lane = self.required_lane.label(),
+                observed_lanes = %observed_lanes,
+                observed_lane_count = self.observed_lanes.len(),
+                sql_result_count = lane_count(ObservedExecutionLane::SqlResult),
+                pager_backed_count = lane_count(ObservedExecutionLane::PagerBacked),
+                planner_count = lane_count(ObservedExecutionLane::Planner),
+                vdbe_count = lane_count(ObservedExecutionLane::Vdbe),
+                mvcc_count = lane_count(ObservedExecutionLane::Mvcc),
+                recovery_count = lane_count(ObservedExecutionLane::Recovery),
+                compatibility_fallback_count = lane_count(ObservedExecutionLane::CompatibilityFallback),
+                fallback_decision_count,
+                fallback_unique_decision_count = self.fallback_decisions.len(),
+                fallback_capture_complete = self.fallback_capture_complete,
+                backend_identity = %self.backend_identity,
+                backend_mode = %self.backend_mode,
+                fallback_boundary = fallback.map_or("none", |value| value.fallback_boundary.as_str()),
+                fallback_reason,
+                fallback_outcome = fallback.map_or("none", |value| value.decision_outcome.as_str()),
+                first_failure_diag = %self.first_failure_diagnostic.as_deref().unwrap_or("none"),
+                "execution-lane requirement mismatch"
+            );
+        }
+    }
+}
 
 // ─── Failure Types ──────────────────────────────────────────────────────
 
@@ -203,7 +688,7 @@ pub struct ArtifactEntry {
 /// failure. Designed for both human operators and automated triage tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureBundle {
-    /// Schema version for forward compatibility.
+    /// Schema version for direct, fail-closed schema evolution.
     pub schema_version: String,
     /// Unique bundle identifier (format: `fb-{run_id}-{seq}`).
     pub bundle_id: String,
@@ -211,6 +696,8 @@ pub struct FailureBundle {
     pub created_at: String,
     /// Run ID correlating with E2E log events.
     pub run_id: String,
+    /// Required and positively observed engine execution paths.
+    pub execution_lane_evidence: ExecutionLaneEvidence,
     /// Scenario and test metadata.
     pub scenario: ScenarioInfo,
     /// Failure details.
@@ -259,6 +746,7 @@ impl FailureBundle {
         struct CanonicalFailureBundle<'a> {
             schema_version: &'a str,
             run_id: &'a str,
+            execution_lane_evidence: &'a ExecutionLaneEvidence,
             scenario: &'a ScenarioInfo,
             failure: &'a FailureInfo,
             first_failure_diagnostics_pointer: Option<&'a str>,
@@ -272,6 +760,7 @@ impl FailureBundle {
         let canonical = CanonicalFailureBundle {
             schema_version: &self.schema_version,
             run_id: &self.run_id,
+            execution_lane_evidence: &self.execution_lane_evidence,
             scenario: &self.scenario,
             failure: &self.failure,
             first_failure_diagnostics_pointer: self.first_failure_diagnostics_pointer(),
@@ -311,6 +800,15 @@ impl FailureBundle {
         }
         if self.run_id.trim().is_empty() {
             errors.push("run_id is empty".to_owned());
+        }
+        errors.extend(self.execution_lane_evidence.validate());
+        if self.execution_lane_evidence.run_id != self.run_id {
+            errors.push("execution_lane.run_id does not match bundle run_id".to_owned());
+        }
+        if self.execution_lane_evidence.scenario_id != self.scenario.scenario_id {
+            errors.push(
+                "execution_lane.scenario_id does not match bundle scenario.scenario_id".to_owned(),
+            );
         }
         if self.scenario.scenario_id.trim().is_empty() {
             errors.push("scenario.scenario_id is empty".to_owned());
@@ -390,6 +888,7 @@ pub struct FailureBundleBuilder {
     bundle_id: Option<String>,
     created_at: Option<String>,
     run_id: Option<String>,
+    execution_lane_evidence: Option<ExecutionLaneEvidence>,
     scenario: Option<ScenarioInfo>,
     failure: Option<FailureInfo>,
     reproducibility: Option<ReproducibilityInfo>,
@@ -407,6 +906,7 @@ impl FailureBundleBuilder {
             bundle_id: None,
             created_at: None,
             run_id: None,
+            execution_lane_evidence: None,
             scenario: None,
             failure: None,
             reproducibility: None,
@@ -435,6 +935,13 @@ impl FailureBundleBuilder {
     #[must_use]
     pub fn run_id(mut self, rid: &str) -> Self {
         self.run_id = Some(rid.to_owned());
+        self
+    }
+
+    /// Set fail-closed execution-lane evidence for this failure.
+    #[must_use]
+    pub fn execution_lane_evidence(mut self, evidence: ExecutionLaneEvidence) -> Self {
+        self.execution_lane_evidence = Some(evidence);
         self
     }
 
@@ -497,6 +1004,9 @@ impl FailureBundleBuilder {
         let bundle_id = self.bundle_id.ok_or("bundle_id is required")?;
         let created_at = self.created_at.ok_or("created_at is required")?;
         let run_id = self.run_id.ok_or("run_id is required")?;
+        let execution_lane_evidence = self
+            .execution_lane_evidence
+            .ok_or("execution_lane_evidence is required")?;
         let scenario = self.scenario.ok_or("scenario is required")?;
         let failure = self.failure.ok_or("failure is required")?;
         let mut reproducibility = self.reproducibility.ok_or("reproducibility is required")?;
@@ -511,6 +1021,7 @@ impl FailureBundleBuilder {
             bundle_id,
             created_at,
             run_id,
+            execution_lane_evidence,
             scenario,
             failure,
             reproducibility,
@@ -521,7 +1032,12 @@ impl FailureBundleBuilder {
             content_hash: String::new(),
         };
         bundle.content_hash = bundle.deterministic_bundle_hash();
-        Ok(bundle)
+        let errors = bundle.validate();
+        if errors.is_empty() {
+            Ok(bundle)
+        } else {
+            Err(format!("invalid failure bundle: {}", errors.join("; ")))
+        }
     }
 }
 
@@ -558,6 +1074,12 @@ pub fn bundle_assertion_failure(
     FailureBundleBuilder::new()
         .bundle_id(bundle_id)
         .run_id(run_id)
+        .execution_lane_evidence(ExecutionLaneEvidence::semantic_only(
+            "unreported",
+            run_id,
+            scenario_id,
+            "assertion",
+        ))
         .created_at(created_at)
         .scenario(ScenarioInfo {
             scenario_id: scenario_id.to_owned(),
@@ -614,6 +1136,12 @@ pub fn bundle_divergence_failure(
     FailureBundleBuilder::new()
         .bundle_id(bundle_id)
         .run_id(run_id)
+        .execution_lane_evidence(ExecutionLaneEvidence::semantic_only(
+            "unreported",
+            run_id,
+            scenario_id,
+            "differential",
+        ))
         .created_at(created_at)
         .scenario(ScenarioInfo {
             scenario_id: scenario_id.to_owned(),
@@ -904,6 +1432,9 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
 
     fn sample_env() -> EnvironmentInfo {
         EnvironmentInfo::new("abc1234", "nightly-2026-02-10", "x86_64-unknown-linux-gnu")
@@ -943,11 +1474,47 @@ mod tests {
         }
     }
 
+    fn sample_lane(run_id: &str, scenario_id: &str) -> ExecutionLaneEvidence {
+        ExecutionLaneEvidence::semantic_only("trace-test", run_id, scenario_id, "test")
+    }
+
+    fn lane_evidence(
+        required: ExecutionLane,
+        observed: Vec<ObservedExecutionLane>,
+    ) -> ExecutionLaneEvidence {
+        ExecutionLaneEvidence::from_observations(
+            required,
+            observed,
+            "trace-test",
+            "run-test",
+            "scenario-test",
+            "test",
+            "unix",
+            "parity_cert_strict",
+            "unix:parity_cert_strict",
+            Vec::new(),
+            true,
+        )
+    }
+
+    fn sample_fallback() -> FallbackDecisionEvidence {
+        FallbackDecisionEvidence {
+            statement_kind: "select".to_owned(),
+            fallback_boundary: "conn.select.group_by_fallback".to_owned(),
+            decision_reason: "group_by_fallback".to_owned(),
+            decision_outcome: "denied".to_owned(),
+            source_touchpoint: "execute_statement_dispatch".to_owned(),
+            first_failure_diagnostic: "statement_kind=select; fallback_boundary=conn.select.group_by_fallback; source_touchpoint=execute_statement_dispatch; decision_reason=group_by_fallback".to_owned(),
+            occurrences: 1,
+        }
+    }
+
     fn sample_bundle_with_labels(bundle_id: &str, created_at: &str) -> FailureBundle {
         FailureBundleBuilder::new()
             .bundle_id(bundle_id)
             .created_at(created_at)
             .run_id("bd-test-20260213-1234")
+            .execution_lane_evidence(sample_lane("bd-test-20260213-1234", "MVCC-3"))
             .scenario(sample_scenario())
             .failure(sample_failure())
             .reproducibility(sample_repro())
@@ -988,6 +1555,304 @@ mod tests {
         }
     }
 
+    #[test]
+    fn execution_lane_match_matrix_is_fail_closed() {
+        let requirements = [
+            ExecutionLane::SqlResultOnly,
+            ExecutionLane::PagerBackedRequired,
+            ExecutionLane::PlannerRequired,
+            ExecutionLane::VdbeRequired,
+            ExecutionLane::MvccRequired,
+            ExecutionLane::RecoveryRequired,
+        ];
+        let observations = [
+            ObservedExecutionLane::SqlResult,
+            ObservedExecutionLane::PagerBacked,
+            ObservedExecutionLane::Planner,
+            ObservedExecutionLane::Vdbe,
+            ObservedExecutionLane::Mvcc,
+            ObservedExecutionLane::Recovery,
+        ];
+
+        for (required_index, required) in requirements.into_iter().enumerate() {
+            for (observed_index, observed) in observations.into_iter().enumerate() {
+                let evidence = lane_evidence(required, vec![observed]);
+                assert_eq!(
+                    evidence.requirement_satisfied,
+                    required_index == observed_index,
+                    "required={} observed={}",
+                    required.label(),
+                    observed.label(),
+                );
+                assert!(evidence.validate().is_empty(), "{evidence:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_requirements_reject_any_compatibility_fallback() {
+        for required in [
+            ExecutionLane::PagerBackedRequired,
+            ExecutionLane::PlannerRequired,
+            ExecutionLane::VdbeRequired,
+            ExecutionLane::MvccRequired,
+            ExecutionLane::RecoveryRequired,
+        ] {
+            let mut evidence = ExecutionLaneEvidence::from_observations(
+                required,
+                vec![
+                    match required {
+                        ExecutionLane::PagerBackedRequired => ObservedExecutionLane::PagerBacked,
+                        ExecutionLane::PlannerRequired => ObservedExecutionLane::Planner,
+                        ExecutionLane::VdbeRequired => ObservedExecutionLane::Vdbe,
+                        ExecutionLane::MvccRequired => ObservedExecutionLane::Mvcc,
+                        ExecutionLane::RecoveryRequired => ObservedExecutionLane::Recovery,
+                        ExecutionLane::SqlResultOnly => unreachable!(),
+                    },
+                    ObservedExecutionLane::CompatibilityFallback,
+                ],
+                "trace-test",
+                "run-test",
+                "scenario-test",
+                "test",
+                "unix",
+                "parity_cert_strict",
+                "unix:parity_cert_strict",
+                vec![sample_fallback()],
+                true,
+            );
+            assert!(
+                !evidence.requirement_satisfied,
+                "required={}",
+                required.label()
+            );
+            assert!(evidence.validate().is_empty(), "{evidence:?}");
+            evidence.first_failure_diagnostic = None;
+            assert!(
+                evidence
+                    .validate()
+                    .iter()
+                    .any(|error| error.contains("first_failure_diagnostic missing"))
+            );
+        }
+    }
+
+    #[test]
+    fn execution_lane_validation_rejects_duplicates_conflicts_and_registry_drift() {
+        let mut duplicate = lane_evidence(
+            ExecutionLane::VdbeRequired,
+            vec![ObservedExecutionLane::Vdbe, ObservedExecutionLane::Vdbe],
+        );
+        assert!(
+            duplicate
+                .validate()
+                .iter()
+                .any(|error| error.contains("duplicates"))
+        );
+
+        duplicate.observed_lanes = vec![ObservedExecutionLane::CompatibilityFallback];
+        assert!(
+            duplicate
+                .validate()
+                .iter()
+                .any(|error| error.contains("conflicts with fallback decisions"))
+        );
+
+        let fallback = ExecutionLaneEvidence::from_observations(
+            ExecutionLane::SqlResultOnly,
+            vec![
+                ObservedExecutionLane::SqlResult,
+                ObservedExecutionLane::CompatibilityFallback,
+            ],
+            "trace-test",
+            "run-test",
+            "scenario-test",
+            "select",
+            "unix",
+            "fallback_allowed",
+            "unix:fallback_allowed",
+            vec![sample_fallback()],
+            true,
+        );
+        assert!(fallback.validate().is_empty());
+        let mut allowed = fallback.clone();
+        allowed.fallback_decisions[0].decision_outcome =
+            "allowed_compatibility_fallback".to_owned();
+        assert!(allowed.validate().is_empty());
+        let mut drifted = fallback;
+        drifted.fallback_decisions[0].decision_outcome = "unknown_outcome".to_owned();
+        assert!(
+            drifted
+                .validate_canonical_fallback_registry()
+                .iter()
+                .any(|error| error.contains("group_by_fallback"))
+        );
+
+        let mut corrupted_diagnostic = allowed.clone();
+        corrupted_diagnostic.fallback_decisions[0].first_failure_diagnostic =
+            "statement_kind=delete".to_owned();
+        assert!(
+            corrupted_diagnostic
+                .validate()
+                .iter()
+                .any(|error| error.contains("conflicts with structured fields"))
+        );
+
+        let mut zero_occurrences = allowed;
+        zero_occurrences.fallback_decisions[0].occurrences = 0;
+        assert!(
+            zero_occurrences
+                .validate()
+                .iter()
+                .any(|error| error.contains("occurrences is zero"))
+        );
+    }
+
+    #[test]
+    fn incomplete_fallback_capture_is_a_valid_fail_closed_mismatch() {
+        let evidence = ExecutionLaneEvidence::from_observations(
+            ExecutionLane::PagerBackedRequired,
+            vec![ObservedExecutionLane::PagerBacked],
+            "trace-test",
+            "run-test",
+            "scenario-test",
+            "select",
+            "unix",
+            "parity_cert_strict",
+            "unix:parity_cert_strict",
+            Vec::new(),
+            false,
+        );
+
+        assert!(!evidence.requirement_satisfied);
+        assert!(evidence.validate().is_empty(), "{evidence:?}");
+        assert!(
+            evidence
+                .first_failure_diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("fallback_reason=capture_incomplete")),
+            "{evidence:?}"
+        );
+    }
+
+    #[test]
+    fn execution_lane_fallback_reasons_bind_to_canonical_inventory() {
+        let inventory: toml::Value = toml::from_str(include_str!(
+            "../../../docs/contracts/fallback_boundary_inventory.toml"
+        ))
+        .expect("parse canonical fallback inventory");
+        let allowed = inventory
+            .get("boundary")
+            .and_then(toml::Value::as_array)
+            .expect("fallback inventory boundary rows")
+            .iter()
+            .filter_map(|row| row.get("decision_reason"))
+            .filter_map(toml::Value::as_str)
+            .collect::<BTreeSet<_>>();
+        let evidence = ExecutionLaneEvidence::from_observations(
+            ExecutionLane::SqlResultOnly,
+            vec![
+                ObservedExecutionLane::SqlResult,
+                ObservedExecutionLane::CompatibilityFallback,
+            ],
+            "trace-test",
+            "run-test",
+            "scenario-test",
+            "select",
+            "unix",
+            "fallback_allowed",
+            "unix:fallback_allowed",
+            vec![sample_fallback()],
+            true,
+        );
+
+        assert!(!allowed.is_empty());
+        assert!(allowed.contains("group_by_fallback"));
+        assert!(evidence.validate_canonical_fallback_registry().is_empty());
+    }
+
+    #[test]
+    fn execution_lane_serialization_is_stable_and_unknown_values_fail() {
+        let evidence = lane_evidence(
+            ExecutionLane::PlannerRequired,
+            vec![
+                ObservedExecutionLane::Vdbe,
+                ObservedExecutionLane::Planner,
+                ObservedExecutionLane::SqlResult,
+            ],
+        );
+        let first = serde_json::to_string(&evidence).expect("serialize evidence");
+        let decoded: ExecutionLaneEvidence =
+            serde_json::from_str(&first).expect("deserialize evidence");
+        let second = serde_json::to_string(&decoded).expect("reserialize evidence");
+        assert_eq!(first, second);
+        assert!(decoded.validate().is_empty());
+
+        let unknown_required = first.replace("planner_required", "unknown_required");
+        assert!(serde_json::from_str::<ExecutionLaneEvidence>(&unknown_required).is_err());
+        let unknown_observed = first.replace("\"planner\"", "\"unknown_observed\"");
+        assert!(serde_json::from_str::<ExecutionLaneEvidence>(&unknown_observed).is_err());
+        let unknown_field = first.replacen('{', "{\"unknown\":true,", 1);
+        assert!(serde_json::from_str::<ExecutionLaneEvidence>(&unknown_field).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn execution_lane_property_recomputes_requirement(
+            required_index in 0_usize..6,
+            observed_bits in 0_u8..64,
+            fallback_capture_complete in any::<bool>(),
+        ) {
+            let requirements = [
+                ExecutionLane::SqlResultOnly,
+                ExecutionLane::PagerBackedRequired,
+                ExecutionLane::PlannerRequired,
+                ExecutionLane::VdbeRequired,
+                ExecutionLane::MvccRequired,
+                ExecutionLane::RecoveryRequired,
+            ];
+            let observations = [
+                ObservedExecutionLane::SqlResult,
+                ObservedExecutionLane::PagerBacked,
+                ObservedExecutionLane::Planner,
+                ObservedExecutionLane::Vdbe,
+                ObservedExecutionLane::Mvcc,
+                ObservedExecutionLane::Recovery,
+            ];
+            let observed = observations
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, lane)| ((observed_bits & (1 << index)) != 0).then_some(lane))
+                .collect::<Vec<_>>();
+            let evidence = ExecutionLaneEvidence::from_observations(
+                requirements[required_index],
+                observed,
+                "trace-property",
+                "run-property",
+                "scenario-property",
+                "test",
+                "unix",
+                "parity_cert_strict",
+                "unix:parity_cert_strict",
+                Vec::new(),
+                fallback_capture_complete,
+            );
+            prop_assert_eq!(
+                evidence.requirement_satisfied,
+                fallback_capture_complete && (observed_bits & (1 << required_index)) != 0
+            );
+            let errors = evidence.validate();
+            if observed_bits == 0 {
+                prop_assert!(
+                    errors.iter().any(|error| error.contains("observed_lanes is empty")),
+                    "{evidence:?} errors={errors:?}"
+                );
+            } else {
+                prop_assert!(errors.is_empty(), "{evidence:?} errors={errors:?}");
+            }
+        }
+    }
+
     // ── Builder ─────────────────────────────────────────────────────
 
     #[test]
@@ -1001,10 +1866,44 @@ mod tests {
     }
 
     #[test]
+    fn builder_rejects_missing_execution_lane_evidence() {
+        let error = FailureBundleBuilder::new()
+            .bundle_id("fb-run001-missing-lane")
+            .created_at("2026-02-13T06:00:00Z")
+            .run_id("bd-test-20260213-1234")
+            .scenario(sample_scenario())
+            .failure(sample_failure())
+            .reproducibility(sample_repro())
+            .environment(sample_env())
+            .build()
+            .expect_err("missing execution-lane evidence must fail closed");
+        assert_eq!(error, "execution_lane_evidence is required");
+    }
+
+    #[test]
+    fn builder_rejects_corrupted_execution_lane_evidence() {
+        let mut evidence = sample_lane("bd-test-20260213-1234", "MVCC-3");
+        evidence.requirement_satisfied = false;
+        let error = FailureBundleBuilder::new()
+            .bundle_id("fb-run001-corrupt-lane")
+            .created_at("2026-02-13T06:00:00Z")
+            .run_id("bd-test-20260213-1234")
+            .execution_lane_evidence(evidence)
+            .scenario(sample_scenario())
+            .failure(sample_failure())
+            .reproducibility(sample_repro())
+            .environment(sample_env())
+            .build()
+            .expect_err("corrupted execution-lane evidence must fail closed");
+        assert!(error.contains("execution_lane.requirement_satisfied is inconsistent"));
+    }
+
+    #[test]
     fn builder_rejects_missing_bundle_id() {
         let result = FailureBundleBuilder::new()
             .created_at("2026-02-13T06:00:00Z")
             .run_id("run1")
+            .execution_lane_evidence(sample_lane("run1", "MVCC-3"))
             .scenario(sample_scenario())
             .failure(sample_failure())
             .reproducibility(sample_repro())
@@ -1019,6 +1918,7 @@ mod tests {
             .bundle_id("fb-1")
             .created_at("2026-02-13T06:00:00Z")
             .run_id("run1")
+            .execution_lane_evidence(sample_lane("run1", "MVCC-3"))
             .failure(sample_failure())
             .reproducibility(sample_repro())
             .environment(sample_env())
@@ -1035,6 +1935,7 @@ mod tests {
             .bundle_id("fb-1")
             .created_at("2026-02-13T06:00:00Z")
             .run_id("run1")
+            .execution_lane_evidence(sample_lane("run1", "MVCC-3"))
             .scenario(sample_scenario())
             .reproducibility(sample_repro())
             .environment(sample_env())
@@ -1051,6 +1952,7 @@ mod tests {
             .bundle_id("fb-1")
             .created_at("2026-02-13T06:00:00Z")
             .run_id("run1")
+            .execution_lane_evidence(sample_lane("run1", "MVCC-3"))
             .scenario(sample_scenario())
             .failure(sample_failure())
             .reproducibility(sample_repro())
@@ -1067,6 +1969,7 @@ mod tests {
             .bundle_id("fb-1")
             .created_at("2026-02-13T06:00:00Z")
             .run_id("run1")
+            .execution_lane_evidence(sample_lane("run1", "MVCC-3"))
             .scenario(sample_scenario())
             .failure(sample_failure())
             .reproducibility(ReproducibilityInfo {
@@ -1403,6 +2306,7 @@ mod tests {
             .bundle_id("fb-run001-2")
             .created_at("2026-02-13T06:01:00Z")
             .run_id("bd-test-20260213-1234")
+            .execution_lane_evidence(sample_lane("bd-test-20260213-1234", "SQL-5"))
             .scenario(ScenarioInfo {
                 scenario_id: "SQL-5".to_owned(),
                 bead_id: "bd-sql".to_owned(),
@@ -1441,6 +2345,7 @@ mod tests {
             .bundle_id("fb-run001-3")
             .created_at("2026-02-13T06:02:00Z")
             .run_id("bd-test-20260213-1234")
+            .execution_lane_evidence(sample_lane("bd-test-20260213-1234", "MVCC-3"))
             .scenario(ScenarioInfo {
                 scenario_id: "MVCC-3".to_owned(),
                 bead_id: "bd-test".to_owned(),

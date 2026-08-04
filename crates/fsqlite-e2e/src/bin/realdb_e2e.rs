@@ -8020,6 +8020,7 @@ mod tests {
             backend_kind: "unix".to_owned(),
             backend_mode: "parity_cert_strict".to_owned(),
             backend_identity: "unix:parity_cert_strict".to_owned(),
+            execution_lane_evidence: None,
         });
         engine_report.correctness.notes = Some(
             "mode=concurrent (MVCC); single-threaded sequential execution; backend_identity=unix:parity_cert_strict"
