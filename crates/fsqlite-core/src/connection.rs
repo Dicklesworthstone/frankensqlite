@@ -13674,18 +13674,27 @@ impl Connection {
         callback: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
         let registry_generation = self.function_registry_generation();
+        let result =
+            self.invoke_live_vtab_callback_allowing_registry_change(callback_name, callback);
+        if self.function_registry_generation() != registry_generation {
+            return Err(FrankenError::SchemaChanged);
+        }
+        result
+    }
+
+    fn invoke_live_vtab_callback_allowing_registry_change<R>(
+        &self,
+        callback_name: &str,
+        callback: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         let _callback_guard = self.enter_live_vtab_callback(callback_name)?;
-        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
             Ok(result) => result,
             Err(payload) => Err(FrankenError::Internal(format!(
                 "virtual-table callback {callback_name} panicked: {}",
                 live_vtab_panic_message(payload.as_ref()),
             ))),
-        };
-        if self.function_registry_generation() != registry_generation {
-            return Err(FrankenError::SchemaChanged);
         }
-        result
     }
 
     fn invoke_taken_live_vtab_instance<R>(
@@ -31691,16 +31700,25 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> Result<InsertTargetLayout> {
-        let schema = self.schema.borrow();
-        let table = schema
-            .iter()
-            .find(|tbl| tbl.name.eq_ignore_ascii_case(&insert.table.name))
-            .ok_or_else(|| {
-                FrankenError::Internal(format!("table not found: {}", insert.table.name))
-            })?;
+        let targets_shadowed_main = self.targets_shadowed_main(&insert.table);
+        let visible_schema = self.schema.borrow();
+        let shadowed_schema = self.shadowed_main_tables.borrow();
+        let table = if targets_shadowed_main {
+            shadowed_schema.get(&insert.table.name.to_ascii_lowercase())
+        } else {
+            visible_schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
+        }
+        .ok_or_else(|| FrankenError::Internal(format!("table not found: {}", insert.table.name)))?;
         Self::validate_insert_target_columns(table, &insert.table.name, &insert.columns)?;
 
         let table_columns: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+        let default_sqls = table
+            .columns
+            .iter()
+            .map(|column| column.default_value.clone())
+            .collect();
         let rowid_alias_col_idx = table.columns.iter().position(|column| column.is_ipk);
 
         if insert.columns.is_empty() {
@@ -31709,6 +31727,7 @@ impl Connection {
                 explicit_rowid_source: rowid_alias_col_idx,
                 rowid_alias_col_idx,
                 table_columns,
+                default_sqls,
                 targets,
             });
         }
@@ -31735,6 +31754,7 @@ impl Connection {
             targets,
             rowid_alias_col_idx,
             explicit_rowid_source,
+            default_sqls,
         })
     }
 
@@ -37472,12 +37492,11 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let layout = self.resolve_insert_target_layout(insert)?;
-        let default_sqls = self.collect_insert_default_sqls(&insert.table.name)?;
         let table_column_count = layout.table_columns.len();
-        if default_sqls.len() != table_column_count {
+        if layout.default_sqls.len() != table_column_count {
             return Err(FrankenError::Internal(format!(
                 "INSERT trigger snapshot: default row width {} does not match table width {table_column_count}",
-                default_sqls.len()
+                layout.default_sqls.len()
             )));
         }
         match &insert.source {
@@ -37502,7 +37521,9 @@ impl Connection {
                     let source_values = self
                         .evaluate_insert_source_row(&canonical_exprs, params)
                         .await?;
-                    let default_row = self.evaluate_default_row_from_sqls(&default_sqls).await?;
+                    let default_row = self
+                        .evaluate_default_row_from_sqls(&layout.default_sqls)
+                        .await?;
                     mapped.push(self.map_insert_source_row_to_table_row(
                         &default_row,
                         &layout.targets,
@@ -37520,7 +37541,9 @@ impl Connection {
                     .await?;
                 let mut mapped = Vec::with_capacity(source_rows.len());
                 for (row_idx, row) in source_rows.iter().enumerate() {
-                    let default_row = self.evaluate_default_row_from_sqls(&default_sqls).await?;
+                    let default_row = self
+                        .evaluate_default_row_from_sqls(&layout.default_sqls)
+                        .await?;
                     mapped.push(self.map_insert_source_row_to_table_row(
                         &default_row,
                         &layout.targets,
@@ -37533,7 +37556,8 @@ impl Connection {
                 Ok(mapped)
             }
             fsqlite_ast::InsertSource::DefaultValues => Ok(vec![
-                self.evaluate_default_row_from_sqls(&default_sqls).await?,
+                self.evaluate_default_row_from_sqls(&layout.default_sqls)
+                    .await?,
             ]),
         }
     }
@@ -39521,13 +39545,19 @@ impl Connection {
         }
 
         let table_name = &update.table.name.name;
-        let schema = self.schema.borrow();
-        let table = schema
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(table_name))
-            .ok_or_else(|| FrankenError::NoSuchTable {
-                name: table_name.clone(),
-            })?;
+        let targets_shadowed_main = self.targets_shadowed_main(&update.table.name);
+        let visible_schema = self.schema.borrow();
+        let shadowed_schema = self.shadowed_main_tables.borrow();
+        let table = if targets_shadowed_main {
+            shadowed_schema.get(&table_name.to_ascii_lowercase())
+        } else {
+            visible_schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+        }
+        .ok_or_else(|| FrankenError::NoSuchTable {
+            name: table_name.clone(),
+        })?;
         let column_names: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
         let table_label = update
             .table
@@ -39535,7 +39565,8 @@ impl Connection {
             .as_deref()
             .unwrap_or(table_name)
             .to_owned();
-        drop(schema);
+        drop(visible_schema);
+        drop(shadowed_schema);
 
         let col_map = column_names
             .iter()
@@ -63502,8 +63533,8 @@ impl Connection {
         // snapshot. `column_info` is user code and may replace its own module
         // registration reentrantly; re-reading the map afterward would combine
         // the old factory's column shape with the replacement's instance.
-        let factory_columns =
-            self.invoke_live_vtab_callback("xColumnInfo", || {
+        let factory_columns = self
+            .invoke_live_vtab_callback_allowing_registry_change("xColumnInfo", || {
                 Ok(factory.column_info(&factory_arg_refs))
             })?
             .into_iter()
@@ -116376,6 +116407,7 @@ struct InsertSelectReplayOutcome {
 #[derive(Debug, Clone)]
 struct InsertTargetLayout {
     table_columns: Vec<String>,
+    default_sqls: Vec<Option<String>>,
     targets: Vec<InsertTarget>,
     rowid_alias_col_idx: Option<usize>,
     explicit_rowid_source: Option<usize>,
