@@ -74,8 +74,13 @@ impl SharedPrefetchStore {
     }
 }
 
+// This test adapter always wraps `MemPageStore`, whose page-operation futures
+// are deliberately immediate-ready and contain no suspension points. The
+// shared `RefCell` is needed so cloned cursors observe one backing store; its
+// borrow crosses the await below, but that await cannot yield.
 #[allow(clippy::manual_async_fn)]
 impl PageReader for SharedPrefetchStore {
+    #[allow(clippy::await_holding_refcell_ref)]
     #[allow(clippy::useless_let_if_seq)]
     fn read_page<'a>(
         &'a self,
@@ -128,8 +133,11 @@ impl PageReader for SharedPrefetchStore {
     }
 }
 
+// As above, each mutable borrow crosses only an immediate-ready
+// `MemPageStore` future, so none of these await points can yield.
 #[allow(clippy::manual_async_fn)]
 impl PageWriter for SharedPrefetchStore {
+    #[allow(clippy::await_holding_refcell_ref)]
     fn write_page<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -142,6 +150,7 @@ impl PageWriter for SharedPrefetchStore {
         }
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     fn allocate_page<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -152,6 +161,7 @@ impl PageWriter for SharedPrefetchStore {
         }
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     fn free_page<'a>(
         &'a mut self,
         cx: &'a Cx,
