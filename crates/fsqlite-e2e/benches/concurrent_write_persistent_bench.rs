@@ -169,10 +169,13 @@ fn insert_sql(table_id: usize) -> String {
 
 fn criterion_config() -> Criterion {
     let criterion = Criterion::default().configure_from_args();
-    persistent_phase_capture_dir().map_or(criterion, |capture_dir| {
-        // criterion 0.8 takes `&Path` here, not an owned `PathBuf`.
-        criterion.output_directory(&capture_dir.join("criterion_measurements"))
-    })
+    match persistent_phase_capture_dir() {
+        Some(capture_dir) => {
+            // criterion 0.8 takes `&Path` here, not an owned `PathBuf`.
+            criterion.output_directory(&capture_dir.join("criterion_measurements"))
+        }
+        None => criterion,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1287,20 +1290,17 @@ fn bench_persistent_16t(c: &mut Criterion) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PersistentPhaseCaptureProvenance, compiled_build_nonce_from, has_same_capture_identity,
-        require_lowercase_hex_64, sha256_file,
-    };
-    use std::io::Write;
-
     #[test]
     fn citation_nonce_requires_exact_lowercase_hex() {
         let valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert_eq!(compiled_build_nonce_from(Some(valid)).unwrap(), valid);
-        assert!(compiled_build_nonce_from(None).is_err());
-        assert!(compiled_build_nonce_from(Some("not-a-nonce")).is_err());
+        assert_eq!(
+            super::compiled_build_nonce_from(Some(valid)).unwrap(),
+            valid
+        );
+        assert!(super::compiled_build_nonce_from(None).is_err());
+        assert!(super::compiled_build_nonce_from(Some("not-a-nonce")).is_err());
         assert!(
-            require_lowercase_hex_64(
+            super::require_lowercase_hex_64(
                 "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
                 "test nonce",
             )
@@ -1310,10 +1310,12 @@ mod tests {
 
     #[test]
     fn running_binary_digest_is_sha256() {
+        use std::io::Write as _;
+
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"abc").unwrap();
         assert_eq!(
-            sha256_file(file.path()).unwrap(),
+            super::sha256_file(file.path()).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
@@ -1405,7 +1407,7 @@ mod tests {
 
     #[test]
     fn stale_capture_provenance_identity_is_rejected() {
-        let current = PersistentPhaseCaptureProvenance {
+        let current = super::PersistentPhaseCaptureProvenance {
             schema_version: "fsqlite-e2e.persistent_phase_capture_provenance.v2".to_owned(),
             benchmark: "concurrent_write_persistent_bench".to_owned(),
             output_dir_env: "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR".to_owned(),
@@ -1424,14 +1426,14 @@ mod tests {
             kernel_release: Some("kernel".to_owned()),
             criterion_emission_scope: "measurement".to_owned(),
         };
-        let decoded: PersistentPhaseCaptureProvenance =
+        let decoded: super::PersistentPhaseCaptureProvenance =
             serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
-        assert!(has_same_capture_identity(&decoded, &current));
+        assert!(super::has_same_capture_identity(&decoded, &current));
 
         let mut stale = decoded;
         stale.build_nonce =
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
-        assert!(!has_same_capture_identity(&stale, &current));
+        assert!(!super::has_same_capture_identity(&stale, &current));
     }
 }
 
