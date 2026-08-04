@@ -754,6 +754,58 @@ fn controlled_env(worker: &str) -> BTreeMap<String, String> {
     ])
 }
 
+const BUILD_SHAPING_ENV_EXACT: &[&str] = &[
+    "AR",
+    "CC",
+    "CFLAGS",
+    "CPP",
+    "CPPFLAGS",
+    "CXX",
+    "CXXFLAGS",
+    "HOST_CC",
+    "HOST_CFLAGS",
+    "HOST_CXX",
+    "HOST_CXXFLAGS",
+    "LDFLAGS",
+    "RANLIB",
+    "RUSTC",
+    "RUSTC_BOOTSTRAP",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTDOC",
+    "RUSTDOCFLAGS",
+    "RUSTFLAGS",
+    "RUSTUP_TOOLCHAIN",
+    "TARGET_CC",
+    "TARGET_CFLAGS",
+    "TARGET_CXX",
+    "TARGET_CXXFLAGS",
+];
+
+const NATIVE_TOOL_ENV_STEMS: &[&str] = &[
+    "AR", "CC", "CFLAGS", "CPP", "CPPFLAGS", "CXX", "CXXFLAGS", "LDFLAGS", "RANLIB",
+];
+
+fn is_target_qualified_native_env(key: &str) -> bool {
+    NATIVE_TOOL_ENV_STEMS.iter().any(|stem| {
+        key.strip_prefix(stem)
+            .is_some_and(|target| target.starts_with('_') && target.len() > 1)
+            || key
+                .strip_suffix(stem)
+                .is_some_and(|target| target.ends_with('_') && target.len() > 1)
+    })
+}
+
+fn is_build_shaping_env(key: &str) -> bool {
+    BUILD_SHAPING_ENV_EXACT.contains(&key)
+        || key == "CARGO_ENCODED_RUSTFLAGS"
+        || key == "CARGO_INCREMENTAL"
+        || key.starts_with("CARGO_BUILD_")
+        || key.starts_with("CARGO_PROFILE_")
+        || key.starts_with("CARGO_TARGET_")
+        || is_target_qualified_native_env(key)
+}
+
 fn spawn_stream_reader<R: Read + Send + 'static>(
     reader: R,
     kind: StreamKind,
@@ -1049,17 +1101,82 @@ fn collect_child_streams(
     }
 }
 
-fn strict_cargo(root: &Path, worker: &str, argv: &[String]) -> Result<StrictOutput, String> {
-    if argv.first().map(String::as_str) != Some("cargo") {
-        return Err("strict runner accepts direct Cargo argv only".to_owned());
+fn controlled_cargo_target_dir(root: &Path) -> PathBuf {
+    let root_digest = blake3::hash(root.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string();
+    root.parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .join(format!(".phase5-rch-target-{}", &root_digest[..16]))
+}
+
+fn validate_remote_target_mapping(stderr: &str, root: &Path, worker: &str) -> Result<(), String> {
+    const PREFIX: &str = "Rewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): ";
+    let mappings = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|entry| {
+            entry
+                .pointer("/fields/message")
+                .and_then(Value::as_str)
+                .and_then(|message| message.strip_prefix(PREFIX))
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let [mapping] = mappings.as_slice() else {
+        return Err("RCH stderr must contain exactly one structured target-dir rewrite".to_owned());
+    };
+    let (local, remote) = mapping
+        .split_once(" -> ")
+        .ok_or_else(|| "RCH target-dir rewrite is missing its remote path".to_owned())?;
+    let expected_local = controlled_cargo_target_dir(root);
+    if Path::new(local) != expected_local {
+        return Err("RCH target-dir rewrite does not bind the controlled local sibling".to_owned());
     }
-    let mut child = Command::new("rch")
+    let remote = Path::new(remote);
+    let expected_prefix = format!(".rch-target-{worker}-pool-");
+    if !remote.is_absolute()
+        || remote == expected_local
+        || !remote.starts_with(root)
+        || !remote
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&expected_prefix))
+    {
+        return Err(
+            "RCH target-dir rewrite does not bind an absolute worker-scoped pool".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn strict_rch_command(root: &Path, worker: &str, argv: &[String]) -> Command {
+    let cargo_target_dir = controlled_cargo_target_dir(root);
+    let mut command = Command::new("rch");
+    for key in BUILD_SHAPING_ENV_EXACT {
+        command.env_remove(key);
+    }
+    for (key, _) in env::vars_os() {
+        if key.to_str().is_some_and(is_build_shaping_env) {
+            command.env_remove(key);
+        }
+    }
+    command
         .args(["--no-self-healing", "exec", "--no-self-healing", "--"])
         .args(argv)
         .current_dir(root)
         .envs(controlled_env(worker))
+        .env("CARGO_TARGET_DIR", cargo_target_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn strict_cargo(root: &Path, worker: &str, argv: &[String]) -> Result<StrictOutput, String> {
+    if argv.first().map(String::as_str) != Some("cargo") {
+        return Err("strict runner accepts direct Cargo argv only".to_owned());
+    }
+    let mut child = strict_rch_command(root, worker, argv)
         .spawn()
         .map_err(|error| format!("could not invoke strict RCH: {error}"))?;
     let stdout_pipe = child
@@ -1151,6 +1268,7 @@ fn strict_cargo(root: &Path, worker: &str, argv: &[String]) -> Result<StrictOutp
             "strict RCH job {job_id} stderr does not bind worker `{worker}` and remote exit 0"
         ));
     }
+    validate_remote_target_mapping(stderr_text, root, worker)?;
     Ok(StrictOutput {
         status,
         stdout,
@@ -1628,14 +1746,6 @@ fn require_pristine_capture_checkout(root: &Path) -> Result<(), String> {
         )
     }
 }
-#[allow(dead_code)]
-fn rch_version(root: &Path) -> Result<String, String> {
-    text(&local(root, "rch", &["--version"])?)
-}
-#[allow(dead_code)]
-fn local_toolchain_identity(root: &Path) -> Result<String, String> {
-    text(&local(root, "rustc", &["--version", "--verbose"])?)
-}
 fn local(root: &Path, program: &str, args: &[&str]) -> Result<Output, String> {
     if program != "git" {
         return Err(format!("unapproved local program `{program}`"));
@@ -2102,9 +2212,100 @@ fn prepare_external_baseline_root(
 #[cfg(test)]
 mod tests {
     use super::{
-        PackKind, adopt_active_job, external_pack_source_names,
-        validate_persistent_citation_receipt,
+        BUILD_SHAPING_ENV_EXACT, PackKind, adopt_active_job, external_pack_source_names,
+        is_build_shaping_env, strict_rch_command, validate_persistent_citation_receipt,
+        validate_remote_target_mapping,
     };
+
+    #[test]
+    fn build_shaping_environment_is_removed_without_hiding_credentials() {
+        for key in [
+            "RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "RUSTUP_TOOLCHAIN",
+            "CARGO_BUILD_TARGET",
+            "CARGO_PROFILE_RELEASE_LTO",
+            "CARGO_INCREMENTAL",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CC",
+            "CFLAGS",
+            "CC_x86_64_unknown_linux_gnu",
+            "CFLAGS_x86_64-unknown-linux-gnu",
+            "CXX_x86_64_unknown_linux_gnu",
+            "AR_x86_64-unknown-linux-gnu",
+            "x86_64_unknown_linux_gnu_CC",
+            "x86_64-unknown-linux-gnu_CXXFLAGS",
+            "aarch64_unknown_linux_gnu_RANLIB",
+            "aarch64-unknown-linux-gnu_LDFLAGS",
+        ] {
+            assert!(is_build_shaping_env(key), "expected removal of {key}");
+        }
+        for key in [
+            "PATH",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "CARGO_REGISTRY_TOKEN",
+            "RCH_WORKER",
+            "PKG_CONFIG_PATH",
+            "CMAKE_GENERATOR",
+        ] {
+            assert!(!is_build_shaping_env(key), "must preserve access env {key}");
+        }
+        let root = std::path::Path::new("/clean/ancestor/source");
+        let argv = ["cargo", "check"].map(str::to_owned);
+        let command = strict_rch_command(root, "ovh-a", &argv);
+        for key in BUILD_SHAPING_ENV_EXACT {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(candidate, value)| candidate == *key && value.is_none()),
+                "command must explicitly remove {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_rch_command_overrides_hostile_relative_cargo_target_dir() {
+        let root = std::path::Path::new("/clean/ancestor/source");
+        let argv = ["cargo", "check"].map(str::to_owned);
+        let command = strict_rch_command(root, "ovh-a", &argv);
+        let target_dir = command
+            .get_envs()
+            .find(|(key, _)| *key == "CARGO_TARGET_DIR")
+            .and_then(|(_, value)| value)
+            .map(std::path::Path::new)
+            .expect("controlled CARGO_TARGET_DIR overlay");
+        assert!(target_dir.is_absolute());
+        assert!(!target_dir.starts_with(root));
+        assert_ne!(target_dir, std::path::Path::new("hostile/relative-target"));
+    }
+
+    #[test]
+    fn structured_remote_target_mapping_binds_controlled_sibling_and_worker_pool() {
+        let root = std::path::Path::new("/clean/ancestor/source");
+        let worker = "ovh-a";
+        let argv = ["cargo", "check"].map(str::to_owned);
+        let command = strict_rch_command(root, worker, &argv);
+        let local = command
+            .get_envs()
+            .find(|(key, _)| *key == "CARGO_TARGET_DIR")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str())
+            .expect("controlled CARGO_TARGET_DIR");
+        let message = format!(
+            "Rewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): {local} -> /clean/ancestor/source/.rch-target-ovh-a-pool-deadbeef"
+        );
+        let stderr = serde_json::json!({"fields": {"message": message}}).to_string();
+        validate_remote_target_mapping(&stderr, root, worker).expect("accept exact mapping");
+
+        let wrong_worker = stderr.replace(".rch-target-ovh-a-", ".rch-target-ovh-b-");
+        assert!(validate_remote_target_mapping(&wrong_worker, root, worker).is_err());
+        let wrong_local = stderr.replace(local, "/tmp/ambient-target");
+        assert!(validate_remote_target_mapping(&wrong_local, root, worker).is_err());
+    }
 
     #[test]
     fn daemon_adoption_preserves_live_u64_job_identity_above_f64_range() {
