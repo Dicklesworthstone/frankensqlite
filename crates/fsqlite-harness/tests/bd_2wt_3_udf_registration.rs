@@ -3601,12 +3601,13 @@ fn test_pattern_operator_scalar_honors_collation_and_schema_metadata() {
             1,
             "UPSERT codegen must attach an explicit application-function collation",
         );
-        let observations = observed.lock().unwrap();
-        assert!(
-            observations.len() >= 6 && observations.iter().all(|name| name == "UDF_PATTERN"),
-            "every application LIKE dispatch must receive UDF_PATTERN, got {observations:?}",
-        );
-        drop(observations);
+        {
+            let observations = observed.lock().unwrap();
+            assert!(
+                observations.len() >= 6 && observations.iter().all(|name| name == "UDF_PATTERN"),
+                "every application LIKE dispatch must receive UDF_PATTERN, got {observations:?}",
+            );
+        }
 
         let schema_conn = open_mem().await;
         schema_conn

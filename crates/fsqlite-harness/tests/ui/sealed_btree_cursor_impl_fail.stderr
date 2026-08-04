@@ -1,22 +1,13 @@
-error[E0046]: not all trait items implemented, missing: `payload_into`, `payload_prefix_into`
- --> tests/ui/sealed_btree_cursor_impl_fail.rs:7:1
-  |
-7 | impl BtreeCursorOps for ExternalCursor {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `payload_into`, `payload_prefix_into` in implementation
-  |
-  = help: implement the missing item: `fn payload_into(&self, _: &Cx, _: &mut Vec<u8>) -> Result<(), FrankenError> { todo!() }`
-  = help: implement the missing item: `fn payload_prefix_into(&self, _: &Cx, _: usize, _: &mut Vec<u8>) -> Result<(), FrankenError> { todo!() }`
-
 error[E0277]: the trait bound `ExternalCursor: traits::sealed::Sealed` is not satisfied
- --> tests/ui/sealed_btree_cursor_impl_fail.rs:7:25
+ --> tests/ui/sealed_btree_cursor_impl_fail.rs:9:25
   |
-7 | impl BtreeCursorOps for ExternalCursor {
+9 | impl BtreeCursorOps for ExternalCursor {
   |                         ^^^^^^^^^^^^^^ unsatisfied trait bound
   |
 help: the trait `traits::sealed::Sealed` is not implemented for `ExternalCursor`
- --> tests/ui/sealed_btree_cursor_impl_fail.rs:5:1
+ --> tests/ui/sealed_btree_cursor_impl_fail.rs:7:1
   |
-5 | struct ExternalCursor;
+7 | struct ExternalCursor;
   | ^^^^^^^^^^^^^^^^^^^^^
 help: the following other types implement trait `traits::sealed::Sealed`
  --> $WORKSPACE/crates/fsqlite-btree/src/traits.rs

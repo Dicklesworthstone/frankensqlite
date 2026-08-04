@@ -289,7 +289,7 @@ impl VfsFile for DummyFile {
         _buf: &'a mut [u8],
         _offset: u64,
     ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-        async { Ok(0) }
+        std::future::ready(Ok(0))
     }
     fn write<'a>(
         &'a self,
@@ -297,7 +297,7 @@ impl VfsFile for DummyFile {
         _buf: &'a [u8],
         _offset: u64,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async { Ok(()) }
+        std::future::ready(Ok(()))
     }
     fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
         Ok(())
@@ -709,25 +709,23 @@ impl VfsFile for RecordingFile {
         buf: &'a mut [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-        async move {
-            self.log.push(format!("read:{offset}:{}", buf.len()));
-            let bytes = self
-                .bytes
-                .lock()
-                .expect("recording file bytes mutex must not be poisoned");
-            let start = usize::try_from(offset).expect("offset must fit usize");
-            if start >= bytes.len() {
-                buf.fill(0);
-                return Ok(0);
-            }
-            let available = &bytes[start..];
-            let n = available.len().min(buf.len());
-            buf[..n].copy_from_slice(&available[..n]);
-            if n < buf.len() {
-                buf[n..].fill(0);
-            }
-            Ok(n)
+        self.log.push(format!("read:{offset}:{}", buf.len()));
+        let bytes = self
+            .bytes
+            .lock()
+            .expect("recording file bytes mutex must not be poisoned");
+        let start = usize::try_from(offset).expect("offset must fit usize");
+        if start >= bytes.len() {
+            buf.fill(0);
+            return std::future::ready(Ok(0));
         }
+        let available = &bytes[start..];
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        if n < buf.len() {
+            buf[n..].fill(0);
+        }
+        std::future::ready(Ok(n))
     }
 
     fn write<'a>(
@@ -736,23 +734,21 @@ impl VfsFile for RecordingFile {
         buf: &'a [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            self.log.push(format!("write:{offset}:{}", buf.len()));
-            if self.fail_write {
-                return Err(FrankenError::Unsupported);
-            }
-            let mut bytes = self
-                .bytes
-                .lock()
-                .expect("recording file bytes mutex must not be poisoned");
-            let start = usize::try_from(offset).expect("offset must fit usize");
-            let end = start + buf.len();
-            if end > bytes.len() {
-                bytes.resize(end, 0);
-            }
-            bytes[start..end].copy_from_slice(buf);
-            Ok(())
+        self.log.push(format!("write:{offset}:{}", buf.len()));
+        if self.fail_write {
+            return std::future::ready(Err(FrankenError::Unsupported));
         }
+        let mut bytes = self
+            .bytes
+            .lock()
+            .expect("recording file bytes mutex must not be poisoned");
+        let start = usize::try_from(offset).expect("offset must fit usize");
+        let end = start + buf.len();
+        if end > bytes.len() {
+            bytes.resize(end, 0);
+        }
+        bytes[start..end].copy_from_slice(buf);
+        std::future::ready(Ok(()))
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -1096,14 +1092,14 @@ fn test_sealed_trait_mock_in_defining_crate() {
     // are no longer dyn-compatible; assert the sealed-impl relationship
     // statically instead. `CheckpointPageWriter` boxes its futures and is still
     // usable as a trait object.
-    fn _assert_mvcc_pager<P: MvccPager<Txn = MockTransaction>>(_pager: &P) {}
-    fn _assert_btree_cursor_ops<C: BtreeCursorOps>(_cursor: &C) {}
+    fn assert_mvcc_pager<P: MvccPager<Txn = MockTransaction>>(_pager: &P) {}
+    fn assert_btree_cursor_ops<C: BtreeCursorOps>(_cursor: &C) {}
 
     let pager = MockMvccPager;
-    _assert_mvcc_pager(&pager);
+    assert_mvcc_pager(&pager);
 
     let cursor = MockBtreeCursor::new(vec![(1, b"x".to_vec())]);
-    _assert_btree_cursor_ops(&cursor);
+    assert_btree_cursor_ops(&cursor);
 
     let mut writer = MockCheckpointPageWriter;
     let _: &mut dyn CheckpointPageWriter = &mut writer;
@@ -1187,7 +1183,7 @@ fn test_e2e_full_layer_stack() {
             value: SqliteValue::Integer(7),
         });
         let function = registry
-            .find_scalar("stack_fn", -1)
+            .find_scalar("stack_fn", 0)
             .expect("function should be found");
         assert_eq!(
             function.invoke(&[]).expect("invoke should succeed"),
@@ -1236,7 +1232,7 @@ fn test_e2e_function_registry_in_vdbe() {
     });
 
     let function = registry
-        .find_scalar("double_like", -1)
+        .find_scalar("double_like", 1)
         .expect("function must be present");
     let result = function
         .invoke(&[SqliteValue::Integer(42)])

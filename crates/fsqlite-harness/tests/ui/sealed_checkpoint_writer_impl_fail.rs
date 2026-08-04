@@ -1,21 +1,26 @@
-use fsqlite_error::Result;
-use fsqlite_pager::CheckpointPageWriter;
+use fsqlite_error::FrankenError;
+use fsqlite_pager::{CheckpointPageWriter, traits::WalFuture};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 
 struct ExternalCheckpointWriter;
 
 impl CheckpointPageWriter for ExternalCheckpointWriter {
-    fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
-        unreachable!("compile-fail test should not execute")
+    fn write_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _page_no: PageNumber,
+        _data: &'a [u8],
+    ) -> WalFuture<'a, ()> {
+        Box::pin(std::future::ready(Err(FrankenError::Unsupported)))
     }
 
-    fn truncate(&mut self, _cx: &Cx, _n_pages: u32) -> Result<()> {
-        unreachable!("compile-fail test should not execute")
+    fn truncate<'a>(&'a mut self, _cx: &'a Cx, _n_pages: u32) -> WalFuture<'a, ()> {
+        Box::pin(std::future::ready(Err(FrankenError::Unsupported)))
     }
 
-    fn sync(&mut self, _cx: &Cx) -> Result<()> {
-        unreachable!("compile-fail test should not execute")
+    fn sync<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(std::future::ready(Err(FrankenError::Unsupported)))
     }
 }
 

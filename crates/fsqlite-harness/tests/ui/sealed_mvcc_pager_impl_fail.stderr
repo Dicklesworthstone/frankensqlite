@@ -1,62 +1,13 @@
 error[E0277]: the trait bound `ExternalPager: traits::sealed::Sealed` is not satisfied
-  --> tests/ui/sealed_mvcc_pager_impl_fail.rs:10:5
-   |
-10 |     fn begin(&self, _cx: &Cx, _mode: TransactionMode) -> Result<Self::Txn> {
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
-   |
-help: the trait `traits::sealed::Sealed` is not implemented for `ExternalPager`
-  --> tests/ui/sealed_mvcc_pager_impl_fail.rs:5:1
-   |
- 5 | struct ExternalPager;
-   | ^^^^^^^^^^^^^^^^^^^^
-   = help: the following other types implement trait `traits::sealed::Sealed`:
-             MemoryMockMvccPager
-             MemoryMockTransaction
-             MockCheckpointPageWriter
-             MockMvccPager
-             MockTransaction
-             SimplePager<V>
-             SimplePagerCheckpointWriter<V>
-             SimpleTransaction<V>
-             TransactionKind
-note: required by a bound in `MvccPager`
-  --> $WORKSPACE/crates/fsqlite-pager/src/traits.rs
-   |
-   | pub trait MvccPager: sealed::Sealed + Send + Sync {
-   |                      ^^^^^^^^^^^^^^ required by this bound in `MvccPager`
-   = note: `MvccPager` is a "sealed trait", because to implement it you also need to implement `fsqlite_pager::traits::sealed::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
-   = help: the following types implement the trait:
-             fsqlite_pager::SimplePager<V>
-             fsqlite_pager::SimpleTransaction<V>
-             fsqlite_pager::SimplePagerCheckpointWriter<V>
-             fsqlite_pager::MockMvccPager
-             fsqlite_pager::MockTransaction
-             fsqlite_pager::MemoryMockMvccPager
-             fsqlite_pager::MemoryMockTransaction
-             fsqlite_pager::TransactionKind
-             fsqlite_pager::MockCheckpointPageWriter
-
-error[E0046]: not all trait items implemented, missing: `journal_mode`, `is_readonly`, `set_journal_mode`, `set_wal_backend`
- --> tests/ui/sealed_mvcc_pager_impl_fail.rs:7:1
+ --> tests/ui/sealed_mvcc_pager_impl_fail.rs:9:20
   |
-7 | impl MvccPager for ExternalPager {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `journal_mode`, `is_readonly`, `set_journal_mode`, `set_wal_backend` in implementation
-  |
-  = help: implement the missing item: `fn journal_mode(&self) -> fsqlite_pager::JournalMode { todo!() }`
-  = help: implement the missing item: `fn is_readonly(&self) -> bool { todo!() }`
-  = help: implement the missing item: `fn set_journal_mode(&self, _: &Cx, _: fsqlite_pager::JournalMode) -> Result<fsqlite_pager::JournalMode, FrankenError> { todo!() }`
-  = help: implement the missing item: `fn set_wal_backend(&self, _: Box<(dyn WalBackend + 'static)>) -> Result<(), FrankenError> { todo!() }`
-
-error[E0277]: the trait bound `ExternalPager: traits::sealed::Sealed` is not satisfied
- --> tests/ui/sealed_mvcc_pager_impl_fail.rs:7:20
-  |
-7 | impl MvccPager for ExternalPager {
+9 | impl MvccPager for ExternalPager {
   |                    ^^^^^^^^^^^^^ unsatisfied trait bound
   |
 help: the trait `traits::sealed::Sealed` is not implemented for `ExternalPager`
- --> tests/ui/sealed_mvcc_pager_impl_fail.rs:5:1
+ --> tests/ui/sealed_mvcc_pager_impl_fail.rs:7:1
   |
-5 | struct ExternalPager;
+7 | struct ExternalPager;
   | ^^^^^^^^^^^^^^^^^^^^
   = help: the following other types implement trait `traits::sealed::Sealed`:
             MemoryMockMvccPager
