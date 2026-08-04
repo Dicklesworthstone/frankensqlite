@@ -103,8 +103,9 @@ Compatibility with existing SQLite databases is a core goal of the current runti
 This guarantee belongs to the connection pipeline, which records the read/write
 dependencies consumed by Page-SSI. The lower-level
 `fsqlite-mvcc::TransactionManager` API does not infer those dependency flags
-from ordinary page reads and writes and must not be used by itself as a
-serializable transaction layer ([#189](https://github.com/Dicklesworthstone/frankensqlite/issues/189)).
+from ordinary page reads and writes and can therefore admit classic write-skew
+if used by itself. It must not be treated as a serializable transaction layer
+([#189](https://github.com/Dicklesworthstone/frankensqlite/issues/189)).
 
 ### 6. Strong Types Over Runtime Checks
 
@@ -2725,6 +2726,14 @@ still serves as an authoritative reference.
   2. Values remain unique and increasing; applications must not depend on
   rowid contiguity
   ([#147](https://github.com/Dicklesworthstone/frankensqlite/issues/147)).
+- **Header PRAGMA integer handling diverges from SQLite at signed 32-bit
+  boundaries.** On file databases, negative `PRAGMA application_id` and
+  `user_version` values such as -1 or -5 read back differently after close and
+  reopen ([#263](https://github.com/Dicklesworthstone/frankensqlite/issues/263)).
+  Separately, `PRAGMA user_version` retains an out-of-range assignment such as
+  2147483648 where stock SQLite reads back 0
+  ([#264](https://github.com/Dicklesworthstone/frankensqlite/issues/264)). Use
+  non-negative values within signed 32-bit range for these header fields.
 - **FrankenSQLite-created FTS5 databases are not yet integrity-clean when
   reopened by stock SQLite.** Stock SQLite's `integrity_check` reports a
   malformed inverted index on the verified FrankenSQLite-created FTS5 fixture.

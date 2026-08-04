@@ -97,6 +97,11 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   heap-backed. Do not concurrently mix FrankenSQLite and stock SQLite WAL
   connections to the same database on Windows
   ([#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139)).
+- **WAL-adapter commits do not yet provide cross-process `PerCommit` durable
+  visibility.** The certificate/checkpoint publication path has a database-fsync
+  recovery fence before truncation, but the WAL-adapter path lacks that
+  per-commit cross-process fence
+  ([#187](https://github.com/Dicklesworthstone/frankensqlite/issues/187)).
 - **AUTOINCREMENT rowids may skip values after savepoint rollback in concurrent
   mode.** In the verified sequence, rolling back the second insert leaves a
   gap: FrankenSQLite commits rowids 1 and 3, whereas stock SQLite commits 1 and
@@ -117,9 +122,10 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   supported ([#148](https://github.com/Dicklesworthstone/frankensqlite/issues/148)).
 - **The low-level `fsqlite-mvcc::TransactionManager` API is not by itself an
   SSI dependency collector.** Normal page reads and writes through that direct
-  API do not populate the dangerous-structure flags, so callers must not treat
-  it as a standalone serializable transaction layer. The connection pipeline's
-  dependency tracking is the supported Page-SSI surface
+  API do not populate the dangerous-structure flags and can therefore admit
+  classic write-skew if callers treat it as a standalone serializable
+  transaction layer. The connection pipeline's dependency tracking is the
+  supported Page-SSI surface
   ([#189](https://github.com/Dicklesworthstone/frankensqlite/issues/189)).
 - **Default concurrent transactions defer committed-freelist reuse while an
   older local snapshot is active.** When a concurrent transaction is the sole
@@ -135,6 +141,14 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   header-consistent, or fixed-point compact image. Do not use post-`VACUUM`
   `PRAGMA freelist_count` as an authoritative free-page count in this release
   ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
+- **Header PRAGMA integer handling diverges from SQLite at signed 32-bit
+  boundaries.** On file databases, negative `PRAGMA application_id` and
+  `user_version` values such as -1 or -5 read back differently after close and
+  reopen ([#263](https://github.com/Dicklesworthstone/frankensqlite/issues/263)).
+  Separately, `PRAGMA user_version` retains an out-of-range assignment such as
+  2147483648 where stock SQLite reads back 0
+  ([#264](https://github.com/Dicklesworthstone/frankensqlite/issues/264)). Use
+  non-negative values within signed 32-bit range for these header fields.
 - **`PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not persisted.** The mode
   currently changes connection-local readback only and returns to `NONE` after
   reopen. FrankenSQLite does not yet write the pointer-map pages required to
