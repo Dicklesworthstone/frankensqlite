@@ -837,8 +837,11 @@ fn w8_wal_growth_then_truncate() {
 
 #[test]
 fn fsqlite_wal_write_and_read() {
+    // Take the process-wide E2E lock in the synchronous test frame. A
+    // std guard held inside the async block would live across every await
+    // below and become part of the suspended state machine.
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let scenario_id = "FW1";
 
         emit_log(

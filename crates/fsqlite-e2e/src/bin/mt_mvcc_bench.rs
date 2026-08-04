@@ -7276,7 +7276,7 @@ mod tests {
     fn one_row_prepare_retries_transient_error_and_counts_it() {
         let mut prepare_calls = 0usize;
         let deadline = OneRowWorkerRetryDeadline::new(Duration::from_secs(1));
-        let (prepared, retries) = prepare_fsqlite_one_row_with_retry(&(), 0, deadline, |_| {
+        let (prepared, retries) = prepare_fsqlite_one_row_with_retry(&(), 0, deadline, |&()| {
             prepare_calls += 1;
             if prepare_calls == 1 {
                 Err(fsqlite::FrankenError::BusyRecovery)
@@ -7298,7 +7298,7 @@ mod tests {
             .expect("test instant supports a two-second lookback");
         let deadline = OneRowWorkerRetryDeadline::with_started(started, Duration::from_secs(1));
         let mut prepare_calls = 0usize;
-        let error = prepare_fsqlite_one_row_with_retry(&(), 0, deadline, |_| {
+        let error = prepare_fsqlite_one_row_with_retry(&(), 0, deadline, |&()| {
             prepare_calls += 1;
             Err::<(), _>(fsqlite::FrankenError::BusyRecovery)
         })
