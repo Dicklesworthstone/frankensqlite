@@ -31,7 +31,6 @@ use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
 use serde::{Deserialize, Serialize};
 
 use fsqlite::Connection as FsqliteConnection;
-use fsqlite_e2e::HarnessSettings;
 use fsqlite_e2e::batch_runner::{BatchConfig, CellResult, CellVerdict, run_matrix};
 use fsqlite_e2e::benchmark::BenchmarkConfig;
 use fsqlite_e2e::concurrency_showcase::{ShowcaseConfig, run_concurrency_showcase};
@@ -39,6 +38,7 @@ use fsqlite_e2e::corruption_demo_sqlite::{run_sqlite_corruption_scenario, verify
 use fsqlite_e2e::corruption_scenarios::scenario_catalog;
 use fsqlite_e2e::fsqlite_recovery_demo::run_scenario as run_fsqlite_recovery_scenario;
 use fsqlite_e2e::report::EngineRunReport;
+use fsqlite_e2e::{HarnessSettings, block_on};
 
 use rusqlite::OpenFlags;
 
@@ -2340,11 +2340,10 @@ fn probe_fsqlite_open_fixture(path: &Path) -> Result<(), String> {
     }
 
     catch_unwind(AssertUnwindSafe(|| {
-        let conn = FsqliteConnection::open(db_copy.display().to_string())
+        let conn = block_on(FsqliteConnection::open(db_copy.display().to_string()))
             .map_err(|e| format!("open failed: {e}"))?;
-        let _ = conn
-            .query("SELECT 1;")
-            .map_err(|e| format!("probe query failed: {e}"))?;
+        let _ =
+            block_on(conn.query("SELECT 1;")).map_err(|e| format!("probe query failed: {e}"))?;
         Ok(())
     }))
     .map_err(|payload| format!("probe panic: {}", panic_payload_to_string(payload)))?
