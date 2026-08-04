@@ -10,8 +10,14 @@
 use fsqlite::Connection;
 
 const ROWS: &[(&str, &str)] = &[
-    ("firecrawl:url:https://ir.crowdstrike.com/", "2026-07-04T04:03:20Z"),
-    ("firecrawl:url:https://ir.crowdstrike.com/", "2026-07-04T04:06:22Z"),
+    (
+        "firecrawl:url:https://ir.crowdstrike.com/",
+        "2026-07-04T04:03:20Z",
+    ),
+    (
+        "firecrawl:url:https://ir.crowdstrike.com/",
+        "2026-07-04T04:06:22Z",
+    ),
     ("sec_edgar:cik:0000094049", "2026-07-10T22:11:39Z"),
     ("EVT", "2026-07-12T20:38:37Z"),
     ("SPFI", "2026-07-12T21:38:14Z"),
@@ -37,14 +43,38 @@ const ROWS: &[(&str, &str)] = &[
     ("NET", "2026-07-17T01:20:42Z"),
     ("HTFL", "2026-07-17T01:20:49Z"),
     ("GWW", "2026-07-17T03:19:59Z"),
-    ("sec_edgar:cik:0001929872", "2026-07-17T03:30:18.411986072+00:00"),
-    ("sec_edgar:cik:0001181114", "2026-07-17T03:30:18.412203934+00:00"),
-    ("sec_edgar:cik:0001787802", "2026-07-17T03:30:18.412221207+00:00"),
-    ("sec_edgar:cik:0001279505", "2026-07-17T03:30:18.412230885+00:00"),
-    ("sec_edgar:cik:0001182054", "2026-07-17T03:30:18.412240814+00:00"),
-    ("sec_edgar:cik:0001248040", "2026-07-17T03:30:18.412249660+00:00"),
-    ("sec_edgar:cik:0001515709", "2026-07-17T03:30:18.412257916+00:00"),
-    ("sec_edgar:cik:0001307654", "2026-07-17T03:30:18.412268566+00:00"),
+    (
+        "sec_edgar:cik:0001929872",
+        "2026-07-17T03:30:18.411986072+00:00",
+    ),
+    (
+        "sec_edgar:cik:0001181114",
+        "2026-07-17T03:30:18.412203934+00:00",
+    ),
+    (
+        "sec_edgar:cik:0001787802",
+        "2026-07-17T03:30:18.412221207+00:00",
+    ),
+    (
+        "sec_edgar:cik:0001279505",
+        "2026-07-17T03:30:18.412230885+00:00",
+    ),
+    (
+        "sec_edgar:cik:0001182054",
+        "2026-07-17T03:30:18.412240814+00:00",
+    ),
+    (
+        "sec_edgar:cik:0001248040",
+        "2026-07-17T03:30:18.412249660+00:00",
+    ),
+    (
+        "sec_edgar:cik:0001515709",
+        "2026-07-17T03:30:18.412257916+00:00",
+    ),
+    (
+        "sec_edgar:cik:0001307654",
+        "2026-07-17T03:30:18.412268566+00:00",
+    ),
     ("sec_edgar:cik:0000320193", "2026-07-18T04:38:32Z"),
     ("sec_edgar:cik:0000320193", "2026-07-18T04:38:41Z"),
     ("000106798326000008", "2026-05-15T19:31:00Z"),
@@ -55,7 +85,10 @@ const ROWS: &[(&str, &str)] = &[
     ("WSO", "2026-07-18T05:51:18Z"),
     ("ROK", "2026-07-18T06:09:55Z"),
     ("DOV", "2026-07-18T06:24:44Z"),
-    ("google_trends:keyword:Stepan", "2026-07-23T21:53:07.782820912Z"),
+    (
+        "google_trends:keyword:Stepan",
+        "2026-07-23T21:53:07.782820912Z",
+    ),
     ("sec_edgar:cik:0001046179", "2026-07-24T07:14:09Z"),
     ("api_ninjas:ticker:AZTA", "2026-07-26T02:44:23Z"),
 ];
@@ -71,7 +104,11 @@ fn check_output(rows: &[Vec<String>]) -> String {
 fn vacuum_into_candidate_passes_own_integrity_check_with_desc_composite_index() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = dir.path().join("src.sqlite").to_string_lossy().into_owned();
-    let cand = dir.path().join("cand.sqlite").to_string_lossy().into_owned();
+    let cand = dir
+        .path()
+        .join("cand.sqlite")
+        .to_string_lossy()
+        .into_owned();
 
     let conn = Connection::open(&src).expect("open source");
     conn.execute(
@@ -96,7 +133,12 @@ fn vacuum_into_candidate_passes_own_integrity_check_with_desc_composite_index() 
         .query("PRAGMA integrity_check")
         .expect("source integrity_check runs")
         .iter()
-        .map(|row| row.values().iter().map(|v| format!("{v:?}")).collect::<Vec<_>>())
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     assert!(
         check_output(&source_verdict).contains("ok"),
@@ -117,7 +159,12 @@ fn vacuum_into_candidate_passes_own_integrity_check_with_desc_composite_index() 
         .query("PRAGMA integrity_check")
         .expect("candidate integrity_check runs")
         .iter()
-        .map(|row| row.values().iter().map(|v| format!("{v:?}")).collect::<Vec<_>>())
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
 
     assert!(
