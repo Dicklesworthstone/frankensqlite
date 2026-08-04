@@ -234,7 +234,7 @@ fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let upper = values.len() / 2;
     if values.len() % 2 == 0 {
-        (values[upper - 1] + values[upper]) / 2.0
+        f64::midpoint(values[upper - 1], values[upper])
     } else {
         values[upper]
     }
