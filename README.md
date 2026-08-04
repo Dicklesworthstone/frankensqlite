@@ -497,7 +497,7 @@ Each cursor maintains a stack of `(page_number, cell_index)` pairs representing 
 
 ### Freelist Management
 
-Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. Default file-backed concurrent transactions do not reuse committed free pages at or below the current database size, even when no reader is active; snapshot-safe versioned reclamation is not yet implemented ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)), so steady-state churn may grow the file. `VACUUM` rebuilds the database and can reclaim space, but the current insertion-based builder can retain pages freed during its own construction or leave trailing pages; v0.2.0 does not promise a zero-freelist, fixed-point compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
+Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. In default file-backed concurrent transactions, when the transaction is the sole active local transaction and its snapshot is current, allocation reuses committed free pages at or below the current database size. With an older active local snapshot, reuse remains deferred, so sustained overlap can still grow `page_count` and the freelist pending epoch/versioned-freelist reclamation ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)). `VACUUM` rebuilds the database and can reclaim space, but the current insertion-based builder can retain pages freed during its own construction or leave trailing pages, and page 1 of the rebuilt image may report a zero `freelist_count` that disagrees with the freelist actually present. The result is a valid, integrity-checkable database; v0.2.0 does not promise a zero-freelist, header-consistent, or fixed-point compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
 
 `PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not supported as durable settings in v0.2.0. The mode currently changes connection-local readback only and returns to `NONE` after reopen; FrankenSQLite does not yet write the pointer-map pages required to enable either mode safely ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)).
 
@@ -2714,6 +2714,11 @@ still serves as an authoritative reference.
   heap-backed. Do not concurrently mix FrankenSQLite and stock SQLite WAL
   connections to the same database on Windows
   ([#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139)).
+- **WAL-adapter commits do not yet provide cross-process `PerCommit` durable
+  visibility.** The certificate/checkpoint publication path has a database-fsync
+  recovery fence before truncation, but the WAL-adapter path lacks that
+  per-commit cross-process fence
+  ([#187](https://github.com/Dicklesworthstone/frankensqlite/issues/187)).
 - **AUTOINCREMENT rowids may skip values after savepoint rollback in concurrent
   mode.** In the verified sequence, rolling back the second insert leaves a
   gap: FrankenSQLite commits rowids 1 and 3, whereas stock SQLite commits 1 and
@@ -2737,6 +2742,23 @@ still serves as an authoritative reference.
   objects, and `sqlite_temp_master` is not recognized. Do not use these catalog
   spellings for TEMP-schema introspection in v0.2.0
   ([#238](https://github.com/Dicklesworthstone/frankensqlite/issues/238)).
+- **STRICT tables reject some losslessly convertible values.** Column type
+  checking matches the input storage class exactly except for INTEGER-to-REAL
+  conversion. An `INTEGER` column refuses the text `'42'` and the exact-integer
+  real `1.0`, a `REAL` column refuses the text `'1.5'`, and a `TEXT` column
+  refuses integer and real inputs where stock SQLite converts and stores the
+  value. Supply values in the declared storage class, or use a non-STRICT table
+  ([#162](https://github.com/Dicklesworthstone/frankensqlite/issues/162),
+  [#163](https://github.com/Dicklesworthstone/frankensqlite/issues/163),
+  [#164](https://github.com/Dicklesworthstone/frankensqlite/issues/164),
+  [#272](https://github.com/Dicklesworthstone/frankensqlite/issues/272)).
+- **`UPDATE` accepts assignments to generated columns.** Assigning to a
+  `GENERATED ALWAYS AS` column in an `UPDATE` returns success instead of
+  erroring as stock SQLite does; for a STORED column the persisted computed
+  value is unchanged, and the VIRTUAL case also reports success. `INSERT`
+  rejects the same assignment correctly, so only `UPDATE` is affected
+  ([#165](https://github.com/Dicklesworthstone/frankensqlite/issues/165),
+  [#166](https://github.com/Dicklesworthstone/frankensqlite/issues/166)).
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.

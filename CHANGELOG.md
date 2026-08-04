@@ -111,14 +111,20 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   it as a standalone serializable transaction layer. The connection pipeline's
   dependency tracking is the supported Page-SSI surface
   ([#189](https://github.com/Dicklesworthstone/frankensqlite/issues/189)).
-- **Default concurrent transactions do not yet reclaim committed freelist
-  pages below the current database size.** Reuse needs snapshot-safe retirement
-  evidence; until that exists, steady-state create/drop or delete/reinsert churn
-  can grow both `page_count` and the freelist
-  ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)).
+- **Default concurrent transactions defer committed-freelist reuse while an
+  older local snapshot is active.** When a concurrent transaction is the sole
+  active local transaction and its snapshot is current, it reuses committed
+  free pages at or below the current database size. Sustained overlap can still
+  grow `page_count` and the freelist pending epoch/versioned-freelist
+  reclamation ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)).
   The current insertion-based `VACUUM` rebuild can itself retain freed or
-  trailing pages, so v0.2.0 does not promise a zero-freelist or fixed-point
-  compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
+  trailing pages, and the rebuilt image's page-1 header may report
+  `freelist_trunk` and `freelist_count` as zero while the committed image still
+  holds a nonzero freelist. The output remains a valid database that passes
+  integrity validation, but v0.2.0 does not promise a zero-freelist,
+  header-consistent, or fixed-point compact image. Do not use post-`VACUUM`
+  `PRAGMA freelist_count` as an authoritative free-page count in this release
+  ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
 - **`PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not persisted.** The mode
   currently changes connection-local readback only and returns to `NONE` after
   reopen. FrankenSQLite does not yet write the pointer-map pages required to
@@ -150,6 +156,23 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   There is no `interrupt()` or progress-handler equivalent, so applications
   that require a hard kill deadline must currently use process isolation
   ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
+- **STRICT tables reject some losslessly convertible values.** Column type
+  checking matches the input storage class exactly except for INTEGER-to-REAL
+  conversion. An `INTEGER` column refuses the text `'42'` and the exact-integer
+  real `1.0`, a `REAL` column refuses the text `'1.5'`, and a `TEXT` column
+  refuses integer and real inputs where stock SQLite converts and stores the
+  value. Supply values in the declared storage class, or use a non-STRICT table
+  ([#162](https://github.com/Dicklesworthstone/frankensqlite/issues/162),
+  [#163](https://github.com/Dicklesworthstone/frankensqlite/issues/163),
+  [#164](https://github.com/Dicklesworthstone/frankensqlite/issues/164),
+  [#272](https://github.com/Dicklesworthstone/frankensqlite/issues/272)).
+- **`UPDATE` accepts assignments to generated columns.** Assigning to a
+  `GENERATED ALWAYS AS` column in an `UPDATE` returns success instead of
+  erroring as stock SQLite does; for a STORED column the persisted computed
+  value is unchanged, and the VIRTUAL case also reports success. `INSERT`
+  rejects the same assignment correctly, so only `UPDATE` is affected
+  ([#165](https://github.com/Dicklesworthstone/frankensqlite/issues/165),
+  [#166](https://github.com/Dicklesworthstone/frankensqlite/issues/166)).
 
 ### Added
 
