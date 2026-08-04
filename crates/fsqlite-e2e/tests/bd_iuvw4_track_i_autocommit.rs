@@ -64,11 +64,11 @@ fn rows_per_sec(rows: i64, elapsed: Duration) -> f64 {
 
 #[test]
 fn bd_iuvw4_track_i_retained_autocommit_reduces_flush_overhead() {
-    asupersync::test_utils::run_test(|| async {
-        let _guard = TRACK_I_E2E_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = TRACK_I_E2E_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
 
+    asupersync::test_utils::run_test(|| async {
         let temp = tempdir().expect("tempdir");
         let fsqlite_db = temp.path().join("track_i_retained_autocommit.db");
 
@@ -129,11 +129,11 @@ fn bd_iuvw4_track_i_retained_autocommit_reduces_flush_overhead() {
 
 #[test]
 fn bd_iuvw4_track_i_read_after_write_returns_correct_data() {
-    asupersync::test_utils::run_test(|| async {
-        let _guard = TRACK_I_E2E_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = TRACK_I_E2E_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
 
+    asupersync::test_utils::run_test(|| async {
         let temp = tempdir().expect("tempdir");
         let fsqlite_db = temp.path().join("track_i_read_after_write.db");
 
@@ -198,11 +198,11 @@ fn bd_iuvw4_track_i_read_after_write_returns_correct_data() {
 
 #[test]
 fn bd_iuvw4_track_i_connection_close_flushes_pending_writes() {
-    asupersync::test_utils::run_test(|| async {
-        let _guard = TRACK_I_E2E_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = TRACK_I_E2E_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
 
+    asupersync::test_utils::run_test(|| async {
         let temp = tempdir().expect("tempdir");
         let fsqlite_db = temp.path().join("track_i_close_flush.db");
 
@@ -252,11 +252,11 @@ fn bd_iuvw4_track_i_connection_close_flushes_pending_writes() {
 
 #[test]
 fn bd_iuvw4_track_i_autocommit_10k_throughput_with_oracle() {
-    asupersync::test_utils::run_test(|| async {
-        let _guard = TRACK_I_E2E_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = TRACK_I_E2E_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
 
+    asupersync::test_utils::run_test(|| async {
         let temp = tempdir().expect("tempdir");
         let fsqlite_db = temp.path().join("track_i_10k_fsqlite.db");
         let sqlite_db = temp.path().join("track_i_10k_sqlite.db");
@@ -337,11 +337,11 @@ fn bd_iuvw4_track_i_autocommit_10k_throughput_with_oracle() {
 
 #[test]
 fn bd_iuvw4_track_i_interleaved_read_write_correctness() {
-    asupersync::test_utils::run_test(|| async {
-        let _guard = TRACK_I_E2E_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = TRACK_I_E2E_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
 
+    asupersync::test_utils::run_test(|| async {
         let temp = tempdir().expect("tempdir");
         let fsqlite_db = temp.path().join("track_i_interleaved.db");
 
