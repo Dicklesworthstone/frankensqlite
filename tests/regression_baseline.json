@@ -4,7 +4,7 @@
   "passed": 5319,
   "failed": 0,
   "ignored": 0,
-  "baseline_commit": "ee508e3faf28",
+  "baseline_commit": "ee508e3faf285554f65a9f45c1f1637e7d979425",
   "ignored_tests": [
     {
       "source_path": "crates/fsqlite-btree/src/cell.rs",
@@ -522,6 +522,18 @@
     },
     {
       "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
+      "test_name": "historical_parallel_wal_segment_design_inventory",
+      "reason": "historical future-design inventory; no release receipt is required",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "None; this is a historical architecture inventory and cannot satisfy release acceptance or prove throughput or durable-segment independence.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
       "test_name": "scaling_report",
       "reason": "manual benchmark - run with --ignored",
       "cfg_condition": null,
@@ -534,18 +546,6 @@
     },
     {
       "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
-      "test_name": "test_16t_throughput_regression_gate",
-      "reason": "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1",
-      "cfg_condition": null,
-      "kind": "placeholder",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Replace the panic placeholder with a truthful gate backed by a same-pack persistent 16-thread release-perf artifact containing phase attribution, comparator, provenance, and passing threshold.",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
       "test_name": "test_64_thread_no_deadlock",
       "reason": "manual contention stress test",
       "cfg_condition": null,
@@ -553,18 +553,6 @@
       "policy": "run_for_release",
       "evidence": {
         "requirement": "Exact opt-in test completes before its hard deadline with every worker making progress, zero unexpected errors, and an immutable release-commit receipt.",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
-      "test_name": "test_8t_throughput_regression_gate",
-      "reason": "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1",
-      "cfg_condition": null,
-      "kind": "placeholder",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Replace the panic placeholder with a truthful gate backed by a same-pack persistent 8-thread release-perf artifact containing comparator, provenance, and passing threshold.",
         "receipt": null
       }
     },
@@ -589,30 +577,6 @@
       "policy": "run_for_release",
       "evidence": {
         "requirement": "Exact opt-in smoke test exits 0 before its hard deadline with the required successful large-row operations and zero unexpected failures; it must not be accepted as overlap evidence.",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
-      "test_name": "historical_parallel_wal_segment_design_inventory",
-      "reason": "historical future-design diagnostic: v0.2 has lane-local preparation plus one ordered WAL backend append; it does not promise independent lane-owned durable artifacts",
-      "cfg_condition": null,
-      "kind": "diagnostic",
-      "policy": "exempt",
-      "evidence": {
-        "requirement": "None; this is a historical architecture inventory and cannot satisfy release acceptance or prove throughput or durable-segment independence.",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
-      "test_name": "test_scaling_curve",
-      "reason": "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1",
-      "cfg_condition": null,
-      "kind": "placeholder",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Replace the panic placeholder with a truthful canonical persistent scaling gate whose same-pack artifact records release commit, comparator, workload, host, toolchain, RUSTFLAGS, repetitions, and thresholds.",
         "receipt": null
       }
     },
@@ -667,8 +631,8 @@
     {
       "source_path": "crates/fsqlite-e2e/tests/bd_db300_3_8_10_commit_path_proof_pack.rs",
       "test_name": "p4_non_regression_throughput",
-      "reason": "production performance gate; replay with --profile release-perf",
-      "cfg_condition": "debug_assertions",
+      "reason": "production performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack p4_non_regression_throughput -- --exact --ignored --nocapture --test-threads=1",
+      "cfg_condition": null,
       "kind": "performance",
       "policy": "run_for_release",
       "evidence": {
@@ -715,8 +679,8 @@
     {
       "source_path": "crates/fsqlite-e2e/tests/bd_wsw3p_concurrent_write_showcase.rs",
       "test_name": "t4_fsqlite_outperforms_csqlite_at_4_threads",
-      "reason": "production performance gate; replay with cargo test --profile release-perf -p fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --nocapture --test-threads=1",
-      "cfg_condition": "debug_assertions",
+      "reason": "production performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-e2e --test bd_wsw3p_concurrent_write_showcase t4_fsqlite_outperforms_csqlite_at_4_threads -- --exact --ignored --nocapture --test-threads=1",
+      "cfg_condition": null,
       "kind": "performance",
       "policy": "run_for_release",
       "evidence": {
@@ -780,7 +744,7 @@
       "kind": "release_gate",
       "policy": "run_for_release",
       "evidence": {
-        "requirement": "Canonical matrix completes under release-perf and content-addressed bundles record release commit, toolchain, host, RUSTFLAGS, every required cell, correctness checks, and comparator results.",
+        "requirement": "Canonical full matrix completes under release-perf with weakening environment overrides refused; content-addressed bundles record release commit, toolchain, host, RUSTFLAGS, every required cell, correctness checks, and commit-keyed C1 and persistent honesty-gate results. For v0.2.0 only, retain the full JSONL as the immutable bootstrap baseline for the next release and make no historical complete-matrix comparison claim.",
         "receipt": null
       }
     },
@@ -1255,8 +1219,8 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/core_types.rs",
       "test_name": "tests::test_txn_slot_alloc_release_latency_budget",
-      "reason": "production latency gate; replay with --profile release-perf",
-      "cfg_condition": "all(debug_assertions,test)",
+      "reason": "production latency gate; replay with cargo test --locked --profile release-perf --package fsqlite-mvcc --lib core_types::tests::test_txn_slot_alloc_release_latency_budget -- --exact --ignored --nocapture --test-threads=1",
+      "cfg_condition": "test",
       "kind": "performance",
       "policy": "run_for_release",
       "evidence": {
@@ -1387,8 +1351,8 @@
     {
       "source_path": "crates/fsqlite-pager/src/page_cache.rs",
       "test_name": "tests::test_sharded_cache_throughput_vs_single",
-      "reason": "production performance gate; replay with --profile release-perf",
-      "cfg_condition": "all(debug_assertions,test)",
+      "reason": "production performance gate; replay with cargo test --locked --profile release-perf --package fsqlite-pager --lib page_cache::tests::test_sharded_cache_throughput_vs_single -- --exact --ignored --nocapture --test-threads=1",
+      "cfg_condition": "test",
       "kind": "performance",
       "policy": "run_for_release",
       "evidence": {
