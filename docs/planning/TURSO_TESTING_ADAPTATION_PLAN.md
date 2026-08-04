@@ -756,7 +756,10 @@ Validation is differential until the cross-phase promotion gate:
   an unrelated bead permanently unclosable. The completion record must name
   the baseline and candidate SHAs, preserve both command results, prove that
   the candidate adds no diagnostic in the failing gate, and link the owning
-  debt bead. A failure in a touched surface or any new diagnostic is blocking.
+  debt bead. If the baseline cannot reach that gate because of a separate
+  compile failure, cold strict runs for every touched scope supply the
+  non-regression proof and the baseline failure remains part of the record. A
+  failure in a touched surface or any new diagnostic is blocking.
 - Baseline exceptions are temporary accounting, not waivers. Bead `.17` cannot
   promote a lane or close the program-wide CI gate until the repository-wide
   commands pass without an exception on the promotion candidate.
