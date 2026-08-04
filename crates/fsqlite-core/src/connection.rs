@@ -3578,8 +3578,12 @@ where
         Ok(()) => Ok(()),
         Err((err, adapter)) => {
             let adapter = adapter.into_inner();
-            let wal = adapter.into_inner();
-            let _ = wal.close(cx);
+            // GH #187: consuming the adapter fails closed while staged,
+            // unpublished frames remain. This is a cleanup path for an error
+            // already in flight, so skip the close rather than mask `err`.
+            if let Ok(wal) = adapter.into_inner() {
+                let _ = wal.close(cx);
+            }
             Err(err)
         }
     }
@@ -3608,8 +3612,10 @@ where
     match pager.set_wal_backend_owned(adapter) {
         Ok(()) => Ok(()),
         Err((err, adapter)) => {
-            let wal = adapter.into_inner();
-            let _ = wal.close(cx);
+            // GH #187: see above — fail closed without masking `err`.
+            if let Ok(wal) = adapter.into_inner() {
+                let _ = wal.close(cx);
+            }
             Err(err)
         }
     }
