@@ -1,3 +1,8 @@
+#![allow(
+    clippy::await_holding_lock,
+    reason = "the process-global VDBE metrics switches require each entire async test to remain serialized"
+)]
+
 //! V2 superinstruction fusion + ceremony reduction regression tests.
 //!
 //! Verifies correctness after V2.1 (FusedAppendInsert), V2.2
