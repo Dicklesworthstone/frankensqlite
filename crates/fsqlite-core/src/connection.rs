@@ -173939,6 +173939,94 @@ mod autocommit_txn_tests {
     }
 
     #[test]
+    fn file_backed_create_table_then_desc_index_has_clean_mvcc_and_pager_handoffs() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("sequential_ddl_handoffs.db");
+            let conn = Connection::open(db_path.to_str().unwrap()).await.unwrap();
+
+            let assert_quiescent = |phase: &str| {
+                assert!(
+                    conn.active_txn.borrow().is_none(),
+                    "{phase}: active pager transaction leaked"
+                );
+                assert!(
+                    !conn.has_concurrent_session(),
+                    "{phase}: concurrent session leaked"
+                );
+                assert_eq!(
+                    conn.concurrent_writer_count(),
+                    0,
+                    "{phase}: concurrent registry entry leaked"
+                );
+                assert_eq!(
+                    conn.concurrent_lock_table.total_lock_count(),
+                    0,
+                    "{phase}: shared MVCC page lock leaked"
+                );
+                assert!(
+                    conn.concurrent_lock_table.holder(PageNumber::ONE).is_none(),
+                    "{phase}: sqlite_schema page lock leaked"
+                );
+                assert!(
+                    !conn.pager.published_snapshot().checkpoint_active,
+                    "{phase}: checkpoint remained active"
+                );
+            };
+
+            assert_quiescent("before CREATE TABLE");
+            conn.execute(
+                "CREATE TABLE source_handles(\
+                 provider_subject_id TEXT NOT NULL, \
+                 known_at TEXT NOT NULL)",
+            )
+            .await
+            .unwrap();
+            assert_quiescent("after CREATE TABLE");
+
+            let Statement::CreateIndex(create_index) = parse_single_statement(
+                "CREATE INDEX idx_source_handles_provider_subject_id \
+                 ON source_handles(provider_subject_id, known_at DESC)",
+            )
+            .unwrap() else {
+                panic!("expected CREATE INDEX statement");
+            };
+            let cx = conn.op_cx().unwrap();
+            let started = conn
+                .ensure_autocommit_txn_with_cx(&cx)
+                .await
+                .expect("second DDL schema refresh and pager admission must not be Busy");
+            assert!(started, "second DDL must start an autocommit transaction");
+            assert!(conn.active_txn.borrow().is_some());
+            assert!(conn.has_concurrent_session());
+            assert_eq!(conn.concurrent_writer_count(), 1);
+
+            conn.execute_create_index(&create_index)
+                .await
+                .expect("CREATE INDEX body and backfill must not be Busy");
+            assert!(conn.active_txn.borrow().is_some());
+            assert!(conn.has_concurrent_session());
+            assert_eq!(
+                conn.concurrent_lock_table.total_lock_count(),
+                0,
+                "CREATE INDEX body acquired or exposed a stale shared MVCC lock before commit"
+            );
+            assert!(
+                conn.concurrent_lock_table.holder(PageNumber::ONE).is_none(),
+                "CREATE INDEX body exposed a sqlite_schema page lock before commit"
+            );
+
+            conn.resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+                true, true, None, true, true, &cx,
+            )
+            .await
+            .expect("CREATE INDEX concurrent commit planning and finalization must not be Busy");
+            assert_quiescent("after CREATE INDEX commit");
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_autocommit_failed_create_unique_index_restores_schema_state() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
