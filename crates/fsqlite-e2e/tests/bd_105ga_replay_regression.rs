@@ -168,7 +168,6 @@ fn bd105ga_stream_replays_without_error_or_integrity_loss() {
             let mut errors: Vec<String> = Vec::new();
             for (i, (sql, params)) in statements.iter().enumerate() {
                 let keyword = sql
-                    .trim_start()
                     .split_whitespace()
                     .next()
                     .unwrap_or("")
