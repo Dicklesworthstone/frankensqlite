@@ -942,6 +942,7 @@ Epic: `bd-turso-test-adaptation-zu081`
 | 6 | `bd-turso-test-adaptation-zu081.15` | Allocator/syscall fault-gap decision |
 | 6 | `bd-turso-test-adaptation-zu081.16` | CLI/system/fixed-database gap audit |
 | cross-phase | `bd-turso-test-adaptation-zu081.17` | CI, coverage, and phase-promotion gates |
+| related quality debt | `bd-fsqlite-core-strict-clippy-debt-1u517` | Pre-existing `fsqlite-core` cold-worker strict-Clippy findings discovered during `.1` |
 
 The epic is P0 because it contains the current top triage pick. Cross-epic
 `bd-2lt76.1` is a child of `bd-2lt76`, not of this epic. The Turso epic
@@ -949,6 +950,11 @@ therefore has 20 children, and every child carries both a
 `## Acceptance` section in its description and the structured
 `acceptance_criteria` field, so tooling that reads the structured field sees
 the same criteria as human readers.
+
+The `fsqlite-core` lint-debt bead is related, not blocking, for ordinary
+implementation children because Section 8 requires differential
+non-regression evidence. It is related to `.17`, whose promotion acceptance
+still requires an actually green repository-wide gate.
 
 The plan-to-bead coverage ledger is:
 
