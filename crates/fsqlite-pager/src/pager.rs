@@ -20185,12 +20185,33 @@ where
                     // state and cannot be safely reused from the live global freelist
                     // without versioned freelist metadata. Pages above db_size are
                     // different: they only exist because an earlier transaction
-                    // allocated EOF pages and then rolled back, so reusing them cannot
-                    // violate snapshot visibility and avoids page-count holes.
-                    if let Some(idx) = inner
-                        .freelist
-                        .iter()
-                        .rposition(|page| page.get() > inner.db_size)
+                    // allocated EOF pages and then rolled back, so reusing them does
+                    // not violate committed-snapshot visibility and avoids
+                    // page-count holes.
+                    //
+                    // Both reuse arms below share one safety gate: this
+                    // transaction must be the pager's ONLY live transaction
+                    // (`active_transactions == 1`) with a current snapshot
+                    // (`published_visible_commit_seq == inner.commit_seq`).
+                    // While another local transaction pins an older view, the
+                    // pager cannot refresh durable metadata, so a page in the
+                    // local `> db_size` pool may meanwhile have been claimed
+                    // and committed by a PEER connection growing the same
+                    // file — handing it out again would alias the peer's
+                    // committed page (pinned by test_concurrent_rollback_
+                    // quarantines_peer_claimed_eof_page_until_refresh). When
+                    // the gate holds, begin-time refresh has replaced the
+                    // freelist from durable state, and any race with a peer
+                    // allocating the same page after our snapshot resolves at
+                    // commit through WAL first-committer-wins conflict
+                    // detection, exactly as for EOF growth.
+                    let sole_current_snapshot = inner.active_transactions == 1
+                        && self.published_visible_commit_seq.get() == inner.commit_seq;
+                    if sole_current_snapshot
+                        && let Some(idx) = inner
+                            .freelist
+                            .iter()
+                            .rposition(|page| page.get() > inner.db_size)
                     {
                         let page = inner.freelist.remove(idx);
                         self.allocated_from_freelist.push(page);
@@ -20198,41 +20219,22 @@ where
                     }
 
                     // GH#302 bounded snapshot-safe reclamation: committed
-                    // freelist pages at or below db_size ARE reusable when it
-                    // is provable that no live local snapshot can still
-                    // observe them as tree content. The conservative proof
-                    // used here is:
-                    //
-                    //   1. this transaction is the ONLY active transaction on
-                    //      this pager (`active_transactions == 1`), so the
-                    //      only local snapshot that exists is our own; and
-                    //   2. our snapshot is current (`published_visible_
-                    //      commit_seq == inner.commit_seq`), so every page on
-                    //      the committed freelist is already free *in our own
-                    //      snapshot* — it cannot be live content of any tree
-                    //      we can read.
-                    //
-                    // Under those two conditions reuse is exactly as safe as
-                    // the non-concurrent pop below. Cross-process hazards are
-                    // covered by existing machinery, not by this gate:
-                    // a racing external writer that pops the same committed
-                    // free page produces a page-level write-write conflict and
-                    // aborts second-committer (see test_journal_commit_detects_
-                    // cross_connection_committed_freelist_reuse_alias), and
-                    // external readers at an older mark keep reading the
-                    // pre-reuse frame through WAL/journal versioning, the same
-                    // way they survive any ordinary in-place page rewrite.
-                    //
-                    // Transactions that begin AFTER we pop see the page as
-                    // free in their committed snapshot; freelist-page content
-                    // is never interpreted except through the committed trunk
-                    // chain, which is itself versioned at commit publication.
+                    // freelist pages at or below db_size ARE reusable under
+                    // the same gate — with only our own (current) snapshot
+                    // live, every page on the committed freelist is already
+                    // free *in our own snapshot* and cannot be live content
+                    // of any tree we can read, so the pop is exactly as safe
+                    // as the non-concurrent arm below. External readers at an
+                    // older mark keep reading the pre-reuse frame through
+                    // WAL/journal versioning, the same way they survive any
+                    // ordinary in-place page rewrite, and a racing external
+                    // writer popping the same committed free page aborts
+                    // second-committer (test_journal_commit_detects_cross_
+                    // connection_committed_freelist_reuse_alias).
                     //
                     // Without this arm, default (concurrent) transactions
                     // never reused committed free pages and every churn
                     // workload grew the file at EOF without bound.
-                    let sole_current_snapshot = inner.active_transactions == 1
-                        && self.published_visible_commit_seq.get() == inner.commit_seq;
                     if sole_current_snapshot && let Some(page) = inner.freelist.pop() {
                         self.allocated_from_freelist.push(page);
                         return Ok(page);
@@ -29620,6 +29622,31 @@ mod tests {
         persisted_parallel_wal_commit: SharedPersistedParallelWalCommit,
         fail_append_before_write: bool,
         fail_sync_after_append: bool,
+        /// Read snapshot pinned at the most recent `begin_transaction`, used
+        /// by the WAL commit path's cross-connection conflict detection. Kept
+        /// per-backend (per pager handle) like the real adapter's pinned
+        /// snapshot.
+        pinned_snapshot: StdMutex<Option<traits::WalPublicationSnapshot>>,
+    }
+
+    /// Derive a publication snapshot from the shared mock frame log: commit
+    /// frames are those carrying a nonzero `db_size_if_commit`, matching how
+    /// every mock-based test encodes commits.
+    fn mock_wal_publication_snapshot(
+        frames: &[(u32, Vec<u8>, u32)],
+    ) -> traits::WalPublicationSnapshot {
+        let commit_count = frames.iter().filter(|frame| frame.2 > 0).count() as u64;
+        traits::WalPublicationSnapshot {
+            publication_seq: commit_count,
+            generation: fsqlite_wal::WalGenerationIdentity {
+                checkpoint_seq: 0,
+                salts: fsqlite_wal::checksum::WalSalts { salt1: 0, salt2: 0 },
+            },
+            last_commit_frame: frames.iter().rposition(|frame| frame.2 > 0),
+            commit_count,
+            latest_frame_entries: frames.len(),
+            index_is_partial: false,
+        }
     }
 
     impl MockWalBackend {
@@ -29642,6 +29669,7 @@ mod tests {
                     persisted_parallel_wal_commit,
                     fail_append_before_write: false,
                     fail_sync_after_append: false,
+                    pinned_snapshot: StdMutex::new(None),
                 },
                 frames,
                 begin_calls,
@@ -29674,6 +29702,7 @@ mod tests {
                     persisted_parallel_wal_commit,
                     fail_append_before_write: false,
                     fail_sync_after_append: false,
+                    pinned_snapshot: StdMutex::new(None),
                 },
                 frames,
                 begin_calls,
@@ -29700,6 +29729,7 @@ mod tests {
                     persisted_parallel_wal_commit,
                     fail_append_before_write: false,
                     fail_sync_after_append: false,
+                    pinned_snapshot: StdMutex::new(None),
                 },
                 begin_calls,
                 batch_calls,
@@ -29731,6 +29761,7 @@ mod tests {
                     persisted_parallel_wal_commit,
                     fail_append_before_write: false,
                     fail_sync_after_append: false,
+                    pinned_snapshot: StdMutex::new(None),
                 },
                 frames,
                 begin_calls,
@@ -29758,6 +29789,7 @@ mod tests {
                     persisted_parallel_wal_commit,
                     fail_append_before_write: false,
                     fail_sync_after_append: true,
+                    pinned_snapshot: StdMutex::new(None),
                 },
                 frames,
                 sync_calls,
@@ -29785,6 +29817,7 @@ mod tests {
                     persisted_parallel_wal_commit,
                     fail_append_before_write: true,
                     fail_sync_after_append: false,
+                    pinned_snapshot: StdMutex::new(None),
                 },
                 frames,
                 sync_calls,
@@ -30842,7 +30875,44 @@ mod tests {
             Box::pin(async move {
                 let mut begin_calls = self.begin_calls.lock().unwrap();
                 *begin_calls += 1;
+                drop(begin_calls);
+                // Pin the read snapshot for cross-connection conflict
+                // detection, mirroring the real adapter: the commit path
+                // compares each batch against the snapshot pinned when its
+                // transaction began.
+                let snapshot = mock_wal_publication_snapshot(&self.frames.lock().unwrap());
+                *self.pinned_snapshot.lock().unwrap() = Some(snapshot);
                 Ok(())
+            })
+        }
+
+        fn pinned_read_snapshot(&self) -> Option<traits::WalPublicationSnapshot> {
+            *self.pinned_snapshot.lock().unwrap()
+        }
+
+        fn conflicting_pages_since_snapshot<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            snapshot: TransactionConflictSnapshot,
+            page_numbers: &'a [u32],
+            _page_baselines: &'a [TransactionConflictPageBaseline],
+        ) -> WalFuture<'a, Vec<u32>> {
+            Box::pin(async move {
+                let frames = self.frames.lock().unwrap();
+                let start = snapshot
+                    .last_commit_frame
+                    .map_or(0, |frame| frame.saturating_add(1));
+                if start >= frames.len() {
+                    return Ok(Vec::new());
+                }
+                let mut conflicts = page_numbers
+                    .iter()
+                    .copied()
+                    .filter(|page| frames[start..].iter().any(|frame| frame.0 == *page))
+                    .collect::<Vec<_>>();
+                conflicts.sort_unstable();
+                conflicts.dedup();
+                Ok(conflicts)
             })
         }
 
