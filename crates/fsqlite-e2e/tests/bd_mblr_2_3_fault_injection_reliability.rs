@@ -277,6 +277,9 @@ impl<F: VfsFile> VfsFile for TargetedFaultFile<F> {
         self.inner.file_identity()
     }
 
+    // The explicit future shape is intentional: these fault tests exercise
+    // cancellation and drop ordering across the delegated read.
+    #[allow(clippy::manual_async_fn)]
     fn read<'a>(
         &'a self,
         cx: &'a Cx,
@@ -1128,6 +1131,9 @@ impl<F: VfsFile> VfsFile for VacuumFaultFile<F> {
         self.inner.read(cx, buf, offset)
     }
 
+    // Preserve this explicit future shape because the keeper validates
+    // cancellation and drop ordering during publication recovery.
+    #[allow(clippy::manual_async_fn)]
     fn write<'a>(
         &'a self,
         cx: &'a Cx,

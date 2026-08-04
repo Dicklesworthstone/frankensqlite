@@ -57,19 +57,25 @@ fn median(values: &mut [f64]) -> f64 {
 
 fn self_provenance() {
     let exe = std::env::current_exe().ok();
-    let (sha, len) = exe.as_ref().map_or(("unavailable".to_owned(), 0), |path| {
-        std::fs::read(path).map_or(("unreadable".to_owned(), 0), |bytes| {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(&bytes);
-            let digest = hasher.finalize();
-            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-            (hex, bytes.len())
-        })
-    });
+    let (sha, len) = exe.as_ref().map_or_else(
+        || ("unavailable".to_owned(), 0),
+        |path| {
+            std::fs::read(path).map_or_else(
+                |_| ("unreadable".to_owned(), 0),
+                |bytes| {
+                    let mut hasher = sha2::Sha256::new();
+                    hasher.update(&bytes);
+                    let digest = hasher.finalize();
+                    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                    (hex, bytes.len())
+                },
+            )
+        },
+    );
     println!(
         "provenance: elf_sha256={sha} bytes={len} path={} profile=DIAGNOSTIC-ONLY",
         exe.as_deref()
-            .map_or("?".into(), |p| p.display().to_string())
+            .map_or_else(|| "?".into(), |p| p.display().to_string())
     );
 }
 
