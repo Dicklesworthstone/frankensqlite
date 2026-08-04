@@ -30368,8 +30368,7 @@ impl InsertSelectReplayEmitter<'_> {
                 .set_statement_change_count(self.statement_changes);
             self.connection.record_table_program_error_state(
                 self.statement_changes,
-                (self.statement_changes > 0)
-                    .then(|| self.connection.current_last_insert_rowid()),
+                (self.statement_changes > 0).then(|| self.connection.current_last_insert_rowid()),
             );
         } else if self.connection.internal_statement_savepoint_depth.get() > 0 {
             self.connection.restore_change_tracking_state(
@@ -30468,44 +30467,41 @@ impl Connection {
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         let mut execute_rows = async || -> Result<InsertSelectReplayOutcome> {
-            self.with_statement_fk_validation_scope(
-                preserve_constraint_failure_rows,
-                async || {
-                    let _fk_parent_validation_cache =
-                        self.enter_fk_parent_validation_cache_scope(&insert.table.name);
-                    let prepared = if collect_returning {
-                        None
-                    } else {
-                        Some(self.prepare_after_background_status(&insert_sql).await?)
-                    };
-                    let returning_statement = if collect_returning {
-                        Some(parse_single_statement(&insert_sql)?)
-                    } else {
-                        None
-                    };
-                    let mut emitter = InsertSelectReplayEmitter {
-                        connection: self,
-                        source_column_count,
-                        prepared,
-                        returning_statement,
-                        statement_changes: 0,
-                        returning_rows: Vec::new(),
-                        produced_rows: 0,
-                        error_state_recorded: false,
-                        preserve_constraint_failure_rows,
-                        previous_total_changes,
-                        previous_last_insert_rowid,
-                    };
+            self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+                let _fk_parent_validation_cache =
+                    self.enter_fk_parent_validation_cache_scope(&insert.table.name);
+                let prepared = if collect_returning {
+                    None
+                } else {
+                    Some(self.prepare_after_background_status(&insert_sql).await?)
+                };
+                let returning_statement = if collect_returning {
+                    Some(parse_single_statement(&insert_sql)?)
+                } else {
+                    None
+                };
+                let mut emitter = InsertSelectReplayEmitter {
+                    connection: self,
+                    source_column_count,
+                    prepared,
+                    returning_statement,
+                    statement_changes: 0,
+                    returning_rows: Vec::new(),
+                    produced_rows: 0,
+                    error_state_recorded: false,
+                    preserve_constraint_failure_rows,
+                    previous_total_changes,
+                    previous_last_insert_rowid,
+                };
 
-                    if let Err(error) = producer(&mut emitter).await {
-                        if !emitter.error_state_recorded {
-                            emitter.record_error_state(&error);
-                        }
-                        return Err(error);
+                if let Err(error) = producer(&mut emitter).await {
+                    if !emitter.error_state_recorded {
+                        emitter.record_error_state(&error);
                     }
-                    Ok(emitter.into_outcome())
+                    return Err(error);
                 }
-            )
+                Ok(emitter.into_outcome())
+            })
             .await
         };
 
@@ -36705,6 +36701,188 @@ impl Connection {
         );
         self.execute_statement(&Statement::Select(select), params)
             .await
+    }
+
+    /// Freeze stable row locators for a multi-row UPDATE before its first
+    /// mutation. Rowid tables use an unshadowed hidden rowid alias (or INTEGER
+    /// PRIMARY KEY); WITHOUT ROWID tables use the complete declared primary key.
+    async fn materialize_update_replay_locators(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<(Vec<String>, Vec<Vec<SqliteValue>>)>> {
+        let table_name = &update.table.name.name;
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.clone(),
+            })?;
+
+        let locator_columns = if table.without_rowid {
+            let indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
+            indices
+                .into_iter()
+                .filter_map(|index| table.columns.get(index).map(|column| column.name.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            let shadowed = table
+                .columns
+                .iter()
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect::<HashSet<_>>();
+            if let Some(hidden_rowid) = ["rowid", "_rowid_", "oid"]
+                .into_iter()
+                .find(|candidate| !shadowed.contains(*candidate))
+            {
+                vec![hidden_rowid.to_owned()]
+            } else if let Some(ipk_column) = table.columns.iter().find(|column| column.is_ipk) {
+                vec![ipk_column.name.clone()]
+            } else {
+                return Ok(None);
+            }
+        };
+        drop(schema);
+
+        if locator_columns.is_empty() {
+            return Ok(None);
+        }
+        let projections = locator_columns
+            .iter()
+            .map(|column| ResultColumn::Expr {
+                expr: Self::build_limit_scope_projection_expr(&update.table, column),
+                alias: None,
+            })
+            .collect();
+        let select = Self::build_single_table_select(
+            &update.table,
+            projections,
+            update.where_clause.as_ref(),
+            &[],
+            None,
+        );
+        let locator_rows = self
+            .execute_statement(&Statement::Select(select), params)
+            .await?
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        Ok(Some((locator_columns, locator_rows)))
+    }
+
+    fn build_update_replay_locator_filter(
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        locator_columns: &[String],
+        locator_values: &[SqliteValue],
+    ) -> Result<Expr> {
+        if locator_columns.len() != locator_values.len() || locator_columns.is_empty() {
+            return Err(FrankenError::Internal(format!(
+                "UPDATE row replay locator arity mismatch: columns={}, values={}",
+                locator_columns.len(),
+                locator_values.len()
+            )));
+        }
+
+        let mut predicates = locator_columns
+            .iter()
+            .zip(locator_values)
+            .map(|(column, value)| Expr::BinaryOp {
+                left: Box::new(Self::build_limit_scope_projection_expr(table_ref, column)),
+                op: BinaryOp::Eq,
+                right: Box::new(value_to_literal_expr(value.clone())),
+                span: Span::ZERO,
+            });
+        let first = predicates.next().ok_or_else(|| {
+            FrankenError::Internal("UPDATE row replay locator cannot be empty".to_owned())
+        })?;
+        Ok(predicates.fold(first, |left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOp::And,
+            right: Box::new(right),
+            span: Span::ZERO,
+        }))
+    }
+
+    async fn execute_update_row_by_row(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+        locator_columns: &[String],
+        locator_rows: &[Vec<SqliteValue>],
+    ) -> Result<Vec<Row>> {
+        let preserve_constraint_failure_rows =
+            update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+        let previous_total_changes = self.total_changes.get();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
+
+        self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+            let mut statement_changes = 0usize;
+            let mut returning_rows = Vec::new();
+            for (row_index, locator_values) in locator_rows.iter().enumerate() {
+                let mut row_update = update.clone();
+                row_update.where_clause = Some(Self::build_update_replay_locator_filter(
+                    &row_update.table,
+                    locator_columns,
+                    locator_values,
+                )?);
+                row_update.order_by.clear();
+                row_update.limit = None;
+
+                match self
+                    .execute_statement_impl_after_background_status(
+                        &Statement::Update(row_update),
+                        params,
+                        None,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(rows) => {
+                        statement_changes =
+                            statement_changes.saturating_add(self.last_changes.get());
+                        returning_rows.extend(rows);
+                    }
+                    Err(error) => {
+                        let preserve_rows = matches!(error, FrankenError::RaiseFail(_))
+                            || (preserve_constraint_failure_rows
+                                && error_is_constraint_violation(&error));
+                        if preserve_rows {
+                            self.set_statement_change_count(statement_changes);
+                            self.record_table_program_error_state(
+                                statement_changes,
+                                (statement_changes > 0).then(|| self.current_last_insert_rowid()),
+                            );
+                        } else if self.internal_statement_savepoint_depth.get() > 0 {
+                            self.restore_change_tracking_state(
+                                0,
+                                previous_total_changes,
+                                previous_last_insert_rowid,
+                            );
+                        } else {
+                            self.set_statement_change_count(statement_changes);
+                            self.record_table_program_error_state(
+                                statement_changes,
+                                (statement_changes > 0).then(|| self.current_last_insert_rowid()),
+                            );
+                        }
+                        tracing::debug!(
+                            target: "fsqlite.statement",
+                            table = %update.table.name.name,
+                            row_index,
+                            locator_columns = ?locator_columns,
+                            locator_values = ?locator_values,
+                            error = %error,
+                            "row-replayed UPDATE failed"
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+            self.set_statement_change_count(statement_changes);
+            Ok(returning_rows)
+        })
+        .await
     }
 
     /// Pre-evaluate and inline scalar subqueries in `expr` that reference
@@ -49201,8 +49379,7 @@ impl Connection {
             Ok(_) => true,
             Err(error) => {
                 matches!(error, FrankenError::RaiseFail(_))
-                    || (preserve_constraint_failure_rows
-                        && error_is_constraint_violation(error))
+                    || (preserve_constraint_failure_rows && error_is_constraint_violation(error))
             }
         };
         if !validate_retained_rows {
@@ -71430,6 +71607,7 @@ impl Connection {
         execution_cx: &Cx,
         invalidate_memdb_count_shortcuts_on_success: bool,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
+        self.last_replace_victims.borrow_mut().clear();
         let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
             .then(|| {
                 let span = tracing::span!(
@@ -71466,7 +71644,7 @@ impl Connection {
         // `OP_OpenWrite` still gates reuse by cursor id, root page, and backend
         // kind, so mixed DML shapes replace incompatible retained cursors.
         let allow_retained_cursor_reuse = invalidate_memdb_count_shortcuts_on_success;
-        let ((result, txn_back), engine_back) = execute_table_program_with_db(
+        let ((result, txn_back), mut engine_back) = execute_table_program_with_db(
             program,
             params,
             &func_reg,
@@ -71499,6 +71677,10 @@ impl Connection {
         let memdb_count_shortcuts_safe_after_exec = engine_back
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
+        let replace_victims = engine_back
+            .as_mut()
+            .map(VdbeEngine::take_replace_victims)
+            .unwrap_or_default();
         // Park the engine for reuse by the next statement.
         *self.cached_vdbe_engine.borrow_mut() = engine_back;
         // Always restore the transaction handle, even on error.
@@ -71507,6 +71689,7 @@ impl Connection {
         }
         match result {
             Ok((rows, changes, last_insert_rowid)) => {
+                *self.last_replace_victims.borrow_mut() = replace_victims;
                 self.clear_table_program_error_state();
                 if track_last_insert_rowid {
                     if let Some(last_insert_rowid) = last_insert_rowid {
