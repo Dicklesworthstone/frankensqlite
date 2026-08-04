@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use fsqlite_harness::parity_taxonomy::PARITY_TAXONOMY_CONTRACT_PATH;
+
 /// Parsed feature entry from the taxonomy TOML.
 #[derive(Debug)]
 struct Feature {
@@ -27,8 +29,9 @@ struct Exclusion {
 
 fn load_taxonomy() -> (Vec<Feature>, Vec<Exclusion>, toml::Value) {
     // CARGO_MANIFEST_DIR points to crates/fsqlite-harness.
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/contracts/parity_taxonomy.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(PARITY_TAXONOMY_CONTRACT_PATH);
     let content = fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "Failed to read parity_taxonomy.toml at {}: {e}",

@@ -1,3 +1,9 @@
+[inert_contract_pointer]
+schema_version = "fsqlite.inert_contract_pointer.v1"
+canonical_path = "docs/contracts/corpus_manifest.toml"
+canonical_sha256 = "1be2a6be550dbca036f108cd066c1ee93fe44a38ccfd1cdd661c66d25e20d755"
+disposition = "historical_payload_inert; docs/contracts path is the sole authority"
+legacy_payload = '''
 # Corpus Manifest v1.0.0
 #
 # Bead: bd-2yqp6.3.1
@@ -375,3 +381,4 @@ trace_id_template = "trace-bd-2yqp6.3.1-pragma-and-error-paths-{seed}"
 replay_command = "SHARD_ID=pragma-and-error-paths SEED=3522 bash scripts/verify_bd_2yqp6_3_1_corpus_manifest.sh"
 entry_ids = ["C1-018", "C1-019", "C1-020", "C1-021", "C1-022"]
 bundle_hash = "59765af1c2ef2f8607b99c1ce36012d8fb00b7df728a59d20e0e7ad0e094e37b"
+'''

@@ -12,7 +12,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// Default canonical fixture-root manifest path relative to workspace root.
-pub const DEFAULT_FIXTURE_ROOT_MANIFEST_PATH: &str = "docs/contracts/corpus_manifest.toml";
+pub const DEFAULT_FIXTURE_ROOT_MANIFEST_PATH: &str =
+    crate::canonical_parity_contract::CORPUS_MANIFEST_PATH;
 /// Expected schema version for `[fixture_roots]`.
 pub const FIXTURE_ROOT_SCHEMA_VERSION: &str = "1.0.0";
 /// Deterministic directory-hash algorithm used by canonical fixture roots.

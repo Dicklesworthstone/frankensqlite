@@ -30,6 +30,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Canonical parity-taxonomy contract path relative to the workspace root.
+pub const PARITY_TAXONOMY_CONTRACT_PATH: &str =
+    crate::canonical_parity_contract::PARITY_TAXONOMY_PATH;
+
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.1.1";

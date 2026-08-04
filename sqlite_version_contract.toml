@@ -1,3 +1,9 @@
+[inert_contract_pointer]
+schema_version = "fsqlite.inert_contract_pointer.v1"
+canonical_path = "docs/contracts/sqlite_version_contract.toml"
+canonical_sha256 = "50613ab0a488ac0a125f09bd5cc10ed34fb5b0668cd69aee85589cfdb2974d0b"
+disposition = "historical_payload_inert; docs/contracts path is the sole authority"
+legacy_payload = '''
 # SQLite Version Contract v1.0.0
 #
 # Bead: bd-2yqp6.1.3
@@ -22,3 +28,4 @@ surface_matrix = "supported_surface_matrix.toml"
 feature_ledger = "feature_universe_ledger.toml"
 parity_report_module = "crates/fsqlite-harness/src/differential_v2.rs"
 readme = "README.md"
+'''
