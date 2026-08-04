@@ -73,8 +73,8 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   anchors are current; it does not prove that every unsupported runtime path
   has been inventoried
   ([#136](https://github.com/Dicklesworthstone/frankensqlite/issues/136)).
-- **Read-only opens are not fully mutation-free in v0.2.0.** A database that
-  FrankenSQLite has opened before joins its existing namespace without
+- **Read-only opens are not fully mutation-free in v0.2.0.** On Unix, a database
+  that FrankenSQLite has opened before joins its existing namespace without
   rewriting the `-fsqlite-ns-gate` or `-fsqlite-ns-use` sidecar. First contact
   with a stock SQLite database instead creates both sidecars and therefore
   requires a writable parent directory. Windows opens also create the
@@ -86,8 +86,8 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140)). The
   namespace-sidecar rewrite reported in
   [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294) is fixed
-  and verified for explicit read-only opens of a database FrankenSQLite has
-  opened before: regression coverage snapshots every directory entry and
+  and verified on Unix for explicit read-only opens of a database FrankenSQLite
+  has opened before: regression coverage snapshots every directory entry and
   modification time across an open plus a WAL-backed query and requires full
   byte equality. The default-open and first-contact paths are not covered by
   that proof, and the first-contact case remains tracked in #140.
