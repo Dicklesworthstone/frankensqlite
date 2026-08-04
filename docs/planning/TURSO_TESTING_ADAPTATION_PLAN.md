@@ -1,6 +1,6 @@
 # Selective Turso Testing Adaptation Plan
 
-Status: proposed (rev 3 — dependency boundaries hardened 2026-08-03)
+Status: proposed (rev 4 — bead traceability and verification contracts hardened 2026-08-03)
 
 Research date: 2026-08-03
 
@@ -610,6 +610,36 @@ Exit gate:
 - Existing bundles remain readable or receive a direct schema migration with
   no compatibility shim.
 
+### Phase 2A: Stateful deterministic operation plans
+
+Deliverables:
+
+- A typed stateful interaction-plan layer extending the existing
+  `fsqlite-e2e::workload` and `fsqlite-e2e::oplog` ownership.
+- Independent model preconditions, expected transitions, and postconditions
+  for bounded supported-core DDL, DML, transactions, savepoints, rollback,
+  close/reopen, and integrity checks.
+- Strict public-path differential execution using the Phase-1 adapter and the
+  Phase-2 SQL reducer, canonical failure bundle, replay, and corpus promotion.
+- Unit/property, integration, and fixed-seed E2E coverage for model
+  transitions, deterministic generation, error classification, lane evidence,
+  reduction, clean-process replay, cancellation, and exhausted budgets.
+
+Exit gate:
+
+- Committed rows do not disappear without a modeled delete; rollback and
+  savepoint rollback have no unmodeled effects; table/index/uniqueness/foreign
+  key state agrees where supported; and reopen preserves committed state while
+  discarding uncommitted state.
+- Same seed/profile/schema produces byte-identical plan, SQL, trace, and stable
+  artifact metadata from a clean process.
+- A deliberately reducible state mismatch preserves its exact result/error/
+  model-state signature and required lane through minimization and public
+  replay.
+- No parallel runner, operation-log format, model coupled to production
+  internals, seed scheme, corpus, minimizer, replay path, or failure bundle is
+  introduced.
+
 ### Phase 3: SQL-level concurrency oracle and deterministic replay
 
 Deliverables:
@@ -831,13 +861,15 @@ Reject or defer when:
    contract-authority consolidation.
 2. Narrow typed differential generator.
 3. Structured SQL reducer integration.
-4. SQL-level serializability histories plus the production-`Connection`
+4. Stateful deterministic operation plans over the existing workload/oplog,
+   differential, reduction, and replay ownership.
+5. SQL-level serializability histories plus the production-`Connection`
    LabRuntime bridge.
-5. History/schedule reduction, then real-file/multiprocess schedules.
-6. SQLancer trial.
-7. Coverage-ledger and CI promotion decision (recommended after the SQLancer
+6. History/schedule reduction, then real-file/multiprocess schedules.
+7. SQLancer trial.
+8. Coverage-ledger and CI promotion decision (recommended after the SQLancer
    trial but not blocked by it — the tracker edge is non-blocking).
-8. Optional SQLRight, declarative DSL, Antithesis, and syscall-fault decisions.
+9. Optional SQLRight, declarative DSL, Antithesis, and syscall-fault decisions.
 
 This order maximizes independent correctness signal early while containing
 dependency, CI, and maintenance costs.
@@ -849,6 +881,9 @@ The program is complete when:
 - every Turso testing area has an evidence-backed adopt/defer/reject record;
 - adopted work is integrated into existing FrankenSQLite harness ownership;
 - generated cases are scope-aware, deterministic, minimized, and replayable;
+- stateful operation plans use an independent model, exercise rollback/reopen
+  invariants, and flow through the canonical operation-log, differential,
+  reduction, bundle, replay, and corpus ownership;
 - SQL-level concurrent histories are checked against serializability/SSI;
 - pager/MVCC/recovery claims include execution-lane evidence;
 - every scope-defining contract consumer resolves the canonical
@@ -874,6 +909,7 @@ Epic: `bd-turso-test-adaptation-zu081`
 | 1 | `bd-turso-test-adaptation-zu081.4` | Contract-derived profiles and coverage |
 | 1 | `bd-turso-test-adaptation-zu081.5` | Differential, corpus, and replay adapters |
 | 2 | `bd-turso-test-adaptation-zu081.6` | SQL AST/schema/value reduction |
+| 2A | `bd-turso-test-adaptation-zu081.20` | Stateful deterministic operation-plan/model campaign |
 | 3 | `bd-turso-test-adaptation-zu081.7` | SSI/serializability history oracle |
 | 3 prerequisite | `bd-2lt76.1` | Production `Connection`/LabRuntime scheduling bridge |
 | 3 | `bd-turso-test-adaptation-zu081.8` | LabRuntime/DPOR history integration |
@@ -890,10 +926,31 @@ Epic: `bd-turso-test-adaptation-zu081`
 
 The epic is P0 because it contains the current top triage pick. Cross-epic
 `bd-2lt76.1` is a child of `bd-2lt76`, not of this epic. The Turso epic
-therefore has 19 children, and every child carries both a
+therefore has 20 children, and every child carries both a
 `## Acceptance` section in its description and the structured
 `acceptance_criteria` field, so tooling that reads the structured field sees
 the same criteria as human readers.
+
+The plan-to-bead coverage ledger is:
+
+| Plan requirement | Primary owner | Required supporting boundary |
+|---|---|---|
+| §3.1 baseline and existing-owner inventory | `.1` | Current repository discovery and pinned Turso inventory |
+| §3.2 execution-lane evidence | `.2` | Existing parity-cert/fallback machinery and `.1` baseline |
+| §5.1 typed SQL generation | `.3`, `.4` | `.18` canonical contract authority |
+| §5.2 SQL reduction and canonical replay | `.6` | `.5` public differential/corpus/bundle adapter |
+| §5.3 stateful deterministic simulation | `.20` | `.3`-`.6` typed SQL, profile, adapter, and reducer chain |
+| §5.4 typed histories and SSI oracle | `.7` | `.1`, `.2` |
+| §5.4 production deterministic scheduling | `.8` | `.7` and cross-epic `bd-2lt76.1`; `bd-28z4i.5` is related |
+| §5.4 history/schedule reduction | `.19` | `.7`, `.8` |
+| §5.5 multiprocess crash/recovery | `.9` | `.19`, extended through `swarm_multiprocess.rs` |
+| §5.6 SQLancer provider and trial | `.10`, `.11` | `.18` contracts, `.2` lane evidence, `.6` canonical reduction |
+| §5.6 SQLRight decision | `.12` | `.11` equal-budget baseline |
+| §5.7 declarative case-format pilot | `.13` | `.18` contracts, `.2` lanes, existing SLT/JSON baseline |
+| §6 provenance and licensing | `.1` | Every importing/adapting child consumes the intake record |
+| §7-§9 phase gates, CI, coverage, artifacts | `.17` | `.5`, `.6`, `.8`, `.19`, `.9`, `.20`; adopted optional lanes only |
+| §11-§13 risk controls and stop/go decisions | Owning child plus `.17` | Epic closure requires all 20 child decisions |
+| §12 excluded/product-specific families | `.1`, `.16` | Explicit reject/defer records, never dormant code |
 
 The complete blocking-edge set (`task <- blockers`), kept exactly in sync
 with the tracker:
@@ -901,23 +958,28 @@ with the tracker:
 ```text
 .2  <- .1            .3  <- .1            .18 <- .1
 .4  <- .3, .18       .5  <- .2, .3, .4    .6  <- .5
+.20 <- .6
 .7  <- .1, .2        bd-2lt76.1 <- bd-2jpu6.5
 .8  <- .2, .7, bd-2lt76.1                 .19 <- .7, .8
-.9  <- .19           .10 <- .1, .2        .11 <- .6, .10
-.12 <- .11           .13 <- .1, .2        .14 <- .7, .9
-.15 <- .1, .9        .16 <- .1            .17 <- .5, .6, .8, .19
+.9  <- .19           .10 <- .1, .2, .18   .11 <- .6, .10
+.12 <- .11           .13 <- .1, .2, .18   .14 <- .7, .9
+.15 <- .1, .9        .16 <- .1
+.17 <- .5, .6, .8, .9, .19, .20
 ```
 
 Reading order of the spine: `.1 -> .18 -> .4` is the contract gate; the SQL
 generator/reducer chain is `.3 -> .4 -> .5 -> .6`; the concurrency chain joins
 `.7` with cross-epic bridge `bd-2lt76.1` at `.8`, then continues through
-`.19 -> .9`; the external-oracle chain is `.10 -> .11 -> .12`.
+`.19 -> .9`; the stateful-model campaign is `.6 -> .20`; the external-oracle
+chain is `.18 -> .10 -> .11 -> .12`.
 
-`.17` (CI, coverage, and promotion gates) deliberately does **not** block on
+`.17` (CI, coverage, and promotion gates) hard-blocks on all retained native
+campaign inputs, including `.9` multiprocess/recovery and `.20` stateful
+operation plans. It deliberately does **not** block on
 the external or optional lanes: its edges to `.10`, `.11`, `.12`, `.13`,
 `.14`, `.15`, and `.16` are non-blocking `related` links, so a deferred or
 rejected external tool can never stall CI promotion of the native lanes. Only
-adopted lanes gate CI; epic-level closure (all 19 children) is what enforces
+adopted lanes gate CI; epic-level closure (all 20 children) is what enforces
 that every Turso testing area ends with an adopt/defer/reject record.
 
 The LabRuntime integration (`.8`) hard-blocks on narrow bridge `bd-2lt76.1`
@@ -925,6 +987,6 @@ and retains a non-blocking `related` edge to `bd-28z4i.5`. This makes production
 determinism real without duplicating or waiting for unrelated DPOR scope.
 Observation-only histories are `.7` inputs, not `.8` completion evidence.
 Optional beads `.13` through `.16` hang off Phase 0 governance
-(`.13 <- .1, .2`; `.16 <- .1`) or the concurrency campaigns whose results they
+(`.13 <- .1, .2, .18`; `.16 <- .1`) or the concurrency campaigns whose results they
 assess (`.14 <- .7, .9`; `.15 <- .1, .9`); none of them blocks the core
 delivery spine.
