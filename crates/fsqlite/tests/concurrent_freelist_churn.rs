@@ -70,6 +70,10 @@ fn default_churn_page_count_plateaus_after_warmup() {
             verdict[0].values().first(),
             Some(SqliteValue::Text(s)) if s.as_ref() == "ok"
         );
-        assert!(ok, "integrity_check must return ok, got {:?}", verdict[0].values());
+        assert!(
+            ok,
+            "integrity_check must return ok, got {:?}",
+            verdict[0].values()
+        );
     });
 }
