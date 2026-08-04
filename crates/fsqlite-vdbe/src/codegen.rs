@@ -199,10 +199,6 @@ const OE_REPLACE: u16 = 5;
 /// This intentionally lives above the low 4 OE_* bits because this engine
 /// encodes conflict handling directly in `p5`, unlike SQLite's native layout.
 const OPFLAG_ISUPDATE: u16 = 0x10;
-/// Marks a WITHOUT ROWID table-row `IdxDelete` as an implicit REPLACE
-/// deletion whose exact OLD row must be reported to the connection layer for
-/// inbound foreign-key action enforcement.
-const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
 
 /// Convert AST `ConflictAction` to p5 OE_* flag value.
 fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
@@ -23129,14 +23125,7 @@ fn emit_without_rowid_row_insert(
             // REPLACE: delete the conflicting row's secondary index entries and
             // the old table row, then fall through to insert the new row.
             emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
-            b.emit_op(
-                Opcode::IdxDelete,
-                table_cursor,
-                0,
-                0,
-                P4::Table(table.name.clone()),
-                OPFLAG_REPLACE_VICTIM,
-            );
+            b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
         }
         b.resolve_label(do_insert);
         // Any conflicting row has been removed, so insert cannot conflict.
