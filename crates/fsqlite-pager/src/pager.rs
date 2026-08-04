@@ -22876,7 +22876,7 @@ mod tests {
     use fsqlite_vfs::{NamespaceOpenIntent, PendingNamespaceOpen, UnixVfs};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    use std::sync::{Arc, Mutex, Weak};
 
     static FAULT_HOOK_TEST_GUARD: crate::fault_hooks::FaultInjectionSessionLock =
         crate::fault_hooks::FaultInjectionSessionLock::new();
