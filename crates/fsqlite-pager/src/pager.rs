@@ -42651,7 +42651,7 @@ mod tests {
             // means the loser's rollback cannot shrink the extent or overwrite
             // the winner's bytes.
             {
-                let winner = pager_a.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                let mut winner = pager_a.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
                 assert_eq!(
                     winner.snapshot_db_size(),
                     contested_page.get(),
