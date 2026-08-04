@@ -17,6 +17,13 @@
 //! Run: `cargo test -p fsqlite --features fts5 --test fts5_update_idx_shadow_repro -- --nocapture`
 
 #![cfg(feature = "fts5")]
+// Every test here drives full-stack engine operations through a non-`Send`
+// `Connection`, which produces large futures held across awaits. `Box::pin` at
+// each site would add an allocation to the exact paths these regressions
+// measure without changing what they prove, so the lints are allowed at crate
+// level — the same rationale, and the same pair of lints, as
+// `fsqlite-e2e/tests/am152_allocator_race_repro.rs`.
+#![allow(clippy::future_not_send, clippy::large_futures)]
 
 use fsqlite::Connection;
 use rusqlite::Connection as StockConnection;
