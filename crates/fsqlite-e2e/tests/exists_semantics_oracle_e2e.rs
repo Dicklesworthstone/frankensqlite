@@ -201,7 +201,6 @@ fn not_exists_single_level_set_difference() {
 }
 
 #[test]
-#[ignore = "bd-zvk68: triple-nested correlation (relational division) — inner NOT EXISTS not bound to the middle row"]
 fn relational_division_double_not_exists() {
     asupersync::test_utils::run_test(|| async {
         let (f, r) = setup(&[
