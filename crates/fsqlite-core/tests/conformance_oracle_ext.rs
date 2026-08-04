@@ -35100,8 +35100,7 @@ fn test_conformance_atomic_trigger_interleaving_and_returning_s76n() {
 
     fconn.execute("DELETE FROM atomic_audit").unwrap();
     rconn.execute_batch("DELETE FROM atomic_audit").unwrap();
-    let update_sql =
-        "UPDATE atomic_rows SET value = value + 1 WHERE id <= 3 RETURNING id, value";
+    let update_sql = "UPDATE atomic_rows SET value = value + 1 WHERE id <= 3 RETURNING id, value";
     let frank_update = query_fsqlite_strings(&fconn, update_sql).unwrap();
     let oracle_update = query_rusqlite_strings(&rconn, update_sql).unwrap();
     eprintln!(
@@ -35336,7 +35335,8 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
     apply_fsqlite_statements(&fconn, &action_setup);
     apply_rusqlite_statements(&rconn, &action_setup);
 
-    let cascade_returning = "INSERT OR REPLACE INTO p_cascade VALUES (10, 'AAA'), (20, 'BBB') RETURNING id, symbol";
+    let cascade_returning =
+        "INSERT OR REPLACE INTO p_cascade VALUES (10, 'AAA'), (20, 'BBB') RETURNING id, symbol";
     let frank_returning = query_fsqlite_strings(&fconn, cascade_returning).unwrap();
     let oracle_returning = query_rusqlite_strings(&rconn, cascade_returning).unwrap();
     eprintln!(
