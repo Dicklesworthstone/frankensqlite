@@ -376,7 +376,7 @@ impl FrankenDb {
         };
         let sql = sql.to_owned();
         future_to_promise(async move {
-            FrankenDb::execute_admitted(guard, sql)
+            Self::execute_admitted(guard, sql)
                 .await
                 .map(|changes| JsValue::from_f64(changes as f64))
         })
@@ -391,7 +391,7 @@ impl FrankenDb {
         };
         let sql = sql.to_owned();
         future_to_promise(async move {
-            FrankenDb::execute_batch_admitted(guard, sql)
+            Self::execute_batch_admitted(guard, sql)
                 .await
                 .map(|()| JsValue::UNDEFINED)
         })
@@ -411,7 +411,7 @@ impl FrankenDb {
             // after this exported method returns, so a getter may safely free
             // its wasm-bindgen wrapper.
             let params = parse_js_params(params)?;
-            FrankenDb::execute_with_params_admitted(guard, sql, params)
+            Self::execute_with_params_admitted(guard, sql, params)
                 .await
                 .map(|changes| JsValue::from_f64(changes as f64))
         })
@@ -424,7 +424,7 @@ impl FrankenDb {
             Err(error) => return Promise::reject(&error),
         };
         let sql = sql.to_owned();
-        future_to_promise(FrankenDb::query_admitted(guard, sql))
+        future_to_promise(Self::query_admitted(guard, sql))
     }
 
     #[wasm_bindgen(js_name = queryWithParams)]
@@ -436,7 +436,7 @@ impl FrankenDb {
         let sql = sql.to_owned();
         future_to_promise(async move {
             let params = parse_js_params(params)?;
-            FrankenDb::query_with_params_admitted(guard, sql, params).await
+            Self::query_with_params_admitted(guard, sql, params).await
         })
     }
 
@@ -448,7 +448,7 @@ impl FrankenDb {
             Err(error) => return Promise::reject(&error),
         };
         let sql = format!("PRAGMA {pragma}");
-        future_to_promise(FrankenDb::query_admitted(guard, sql))
+        future_to_promise(Self::query_admitted(guard, sql))
     }
 
     #[cfg(feature = "prepared-statements")]
@@ -459,11 +459,9 @@ impl FrankenDb {
             Err(error) => return Promise::reject(&error),
         };
         let sql = sql.to_owned();
-        future_to_promise(async move {
-            FrankenDb::prepare_admitted(guard, sql)
-                .await
-                .map(JsValue::from)
-        })
+        future_to_promise(
+            async move { Self::prepare_admitted(guard, sql).await.map(JsValue::from) },
+        )
     }
 
     #[cfg(feature = "diagnostics")]
@@ -475,7 +473,7 @@ impl FrankenDb {
         };
         let sql = sql.to_owned();
         future_to_promise(async move {
-            FrankenDb::explain_admitted(guard, sql)
+            Self::explain_admitted(guard, sql)
                 .await
                 .map(|explanation| JsValue::from_str(&explanation))
         })
@@ -489,7 +487,7 @@ impl FrankenDb {
             Err(error) => return Promise::reject(&error),
         };
         future_to_promise(async move {
-            FrankenDb::export_admitted(guard)
+            Self::export_admitted(guard)
                 .await
                 .map(|bytes| Uint8Array::from(bytes.as_slice()).into())
         })
@@ -910,7 +908,7 @@ impl FrankenPreparedStatement {
         };
         let sql = self.sql.clone();
         future_to_promise(async move {
-            FrankenPreparedStatement::execute_admitted(guard, sql)
+            Self::execute_admitted(guard, sql)
                 .await
                 .map(|changes| JsValue::from_f64(changes as f64))
         })
@@ -927,7 +925,7 @@ impl FrankenPreparedStatement {
         let sql = self.sql.clone();
         future_to_promise(async move {
             let params = parse_js_params(params)?;
-            FrankenPreparedStatement::execute_with_params_admitted(guard, sql, params)
+            Self::execute_with_params_admitted(guard, sql, params)
                 .await
                 .map(|changes| JsValue::from_f64(changes as f64))
         })
@@ -940,7 +938,7 @@ impl FrankenPreparedStatement {
             Err(error) => return Promise::reject(&error),
         };
         let sql = self.sql.clone();
-        future_to_promise(FrankenPreparedStatement::query_admitted(guard, sql))
+        future_to_promise(Self::query_admitted(guard, sql))
     }
 
     #[wasm_bindgen(js_name = queryWithParams)]
@@ -954,7 +952,7 @@ impl FrankenPreparedStatement {
         let sql = self.sql.clone();
         future_to_promise(async move {
             let params = parse_js_params(params)?;
-            FrankenPreparedStatement::query_with_params_admitted(guard, sql, params).await
+            Self::query_with_params_admitted(guard, sql, params).await
         })
     }
 
@@ -967,7 +965,7 @@ impl FrankenPreparedStatement {
         };
         let sql = self.sql.clone();
         future_to_promise(async move {
-            FrankenPreparedStatement::explain_admitted(guard, sql)
+            Self::explain_admitted(guard, sql)
                 .await
                 .map(|explanation| JsValue::from_str(&explanation))
         })
