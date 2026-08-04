@@ -56,9 +56,8 @@ async fn query_count(conn: &fsqlite::Connection, sql: &str) -> i64 {
 
 #[test]
 fn bd_db300_6_1_1_same_statement_repeat_captures_reuse() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("reuse_capture.db");
 
@@ -122,9 +121,8 @@ fn bd_db300_6_1_1_same_statement_repeat_captures_reuse() {
 
 #[test]
 fn bd_db300_6_1_1_interleaved_statements_measure_distance() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("interleaved_distance.db");
 
@@ -176,9 +174,8 @@ fn bd_db300_6_1_1_interleaved_statements_measure_distance() {
 
 #[test]
 fn bd_db300_6_1_1_no_reuse_yields_zero_metrics() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("no_reuse.db");
 
@@ -215,9 +212,8 @@ fn bd_db300_6_1_1_no_reuse_yields_zero_metrics() {
 
 #[test]
 fn bd_db300_6_1_1_max_reuse_distance_tracked() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("max_distance.db");
 
@@ -265,9 +261,8 @@ fn bd_db300_6_1_1_max_reuse_distance_tracked() {
 
 #[test]
 fn bd_db300_6_1_1_profile_reset_clears_metrics() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("reset_clears.db");
 

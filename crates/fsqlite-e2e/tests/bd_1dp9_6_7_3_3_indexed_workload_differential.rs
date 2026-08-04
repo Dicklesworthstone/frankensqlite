@@ -195,9 +195,8 @@ async fn seed_data(exec: impl AsyncFn(String)) {
 
 #[test]
 fn i1_equality_lookup() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
         seed_data(async |sql: String| {
@@ -247,9 +246,8 @@ fn i1_equality_lookup() {
 
 #[test]
 fn i2_range_scan() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
         seed_data(async |sql: String| {
@@ -287,9 +285,8 @@ fn i2_range_scan() {
 
 #[test]
 fn i3_duplicate_heavy() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let c = setup_csqlite();
         c.execute_batch(
             "CREATE TABLE dupes (id INTEGER PRIMARY KEY, grp TEXT NOT NULL, val INTEGER);
@@ -336,9 +333,8 @@ fn i3_duplicate_heavy() {
 
 #[test]
 fn i4_covering_index() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
         seed_data(async |sql: String| {
@@ -376,9 +372,8 @@ fn i4_covering_index() {
 
 #[test]
 fn i5_multi_column_index() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
         seed_data(async |sql: String| {
@@ -419,9 +414,8 @@ fn i5_multi_column_index() {
 
 #[test]
 fn i6_unique_constraint() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
         seed_data(async |sql: String| {
@@ -466,9 +460,8 @@ fn i6_unique_constraint() {
 
 #[test]
 fn i7_order_by_indexed() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
         seed_data(async |sql: String| {
@@ -506,9 +499,8 @@ fn i7_order_by_indexed() {
 
 #[test]
 fn i8_mixed_dml_with_index() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
         seed_data(async |sql: String| {
@@ -575,9 +567,8 @@ fn i8_mixed_dml_with_index() {
 
 #[test]
 fn i9_null_handling() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let schema = "
         CREATE TABLE nullable (id INTEGER PRIMARY KEY, key TEXT, val INTEGER);
         CREATE INDEX idx_key ON nullable(key);
@@ -625,9 +616,8 @@ fn i9_null_handling() {
 
 #[test]
 fn i10_large_dataset() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
         let schema = "
         CREATE TABLE large (id INTEGER PRIMARY KEY, bucket INTEGER NOT NULL, payload TEXT);
         CREATE INDEX idx_bucket ON large(bucket);

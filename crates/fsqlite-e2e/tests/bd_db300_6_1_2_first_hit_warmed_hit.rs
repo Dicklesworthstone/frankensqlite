@@ -60,9 +60,8 @@ async fn query_count(conn: &fsqlite::Connection, sql: &str) -> i64 {
 
 #[test]
 fn bd_db300_6_1_2_first_statement_is_first_hit() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("first_hit.db");
 
@@ -121,9 +120,8 @@ fn bd_db300_6_1_2_first_statement_is_first_hit() {
 
 #[test]
 fn bd_db300_6_1_2_repeated_statement_is_warmed_hit() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("warmed_hit.db");
 
@@ -172,9 +170,8 @@ fn bd_db300_6_1_2_repeated_statement_is_warmed_hit() {
 
 #[test]
 fn bd_db300_6_1_2_first_hit_has_compile_overhead() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("compile_overhead.db");
 
@@ -221,9 +218,8 @@ fn bd_db300_6_1_2_first_hit_has_compile_overhead() {
 
 #[test]
 fn bd_db300_6_1_2_warmed_hit_faster_than_first_hit() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("warmed_faster.db");
 
@@ -295,9 +291,8 @@ fn bd_db300_6_1_2_warmed_hit_faster_than_first_hit() {
 
 #[test]
 fn bd_db300_6_1_2_profile_reset_clears_hit_metrics() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("reset_clears.db");
 
@@ -361,9 +356,8 @@ fn bd_db300_6_1_2_profile_reset_clears_hit_metrics() {
 
 #[test]
 fn bd_db300_6_1_2_compile_cache_consistency() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("cache_consistency.db");
 

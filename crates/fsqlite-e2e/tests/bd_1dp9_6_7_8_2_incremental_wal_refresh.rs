@@ -59,9 +59,8 @@ async fn query_count(conn: &fsqlite::Connection, sql: &str) -> i64 {
 
 #[test]
 fn bd_1dp9_6_7_8_2_steady_state_authoritative_lookup() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("authoritative_lookup.db");
 
@@ -105,9 +104,8 @@ fn bd_1dp9_6_7_8_2_steady_state_authoritative_lookup() {
 
 #[test]
 fn bd_1dp9_6_7_8_2_incremental_refresh_scales_with_new_frames() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("incremental_refresh.db");
 
@@ -167,9 +165,8 @@ fn bd_1dp9_6_7_8_2_incremental_refresh_scales_with_new_frames() {
 
 #[test]
 fn bd_1dp9_6_7_8_2_generation_reset_invalidates_index() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("generation_reset.db");
         let fsqlite_path = db_path.clone();
@@ -266,9 +263,8 @@ fn bd_1dp9_6_7_8_2_generation_reset_invalidates_index() {
 
 #[test]
 fn bd_1dp9_6_7_8_2_cross_connection_visibility_with_refresh() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("cross_conn_visibility.db");
 
@@ -318,9 +314,8 @@ fn bd_1dp9_6_7_8_2_cross_connection_visibility_with_refresh() {
 
 #[test]
 fn bd_1dp9_6_7_8_2_many_pages_authoritative_index_performance() {
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     asupersync::test_utils::run_test(|| async {
-        let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-
         let temp = tempdir().expect("tempdir");
         let fsqlite_db = temp.path().join("many_pages_fsqlite.db");
         let sqlite_db = temp.path().join("many_pages_sqlite.db");
