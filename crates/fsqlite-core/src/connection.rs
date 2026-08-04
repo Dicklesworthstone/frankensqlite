@@ -167249,6 +167249,15 @@ mod tests {
             conn.execute("PRAGMA synchronous=0;").await.unwrap();
             let rows = conn.query("PRAGMA synchronous;").await.unwrap();
             assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+            // GH #274: EXTRA was the only named level without readback
+            // coverage; 3 is its integer code. Both spellings must read back
+            // as Integer(3).
+            conn.execute("PRAGMA synchronous=EXTRA;").await.unwrap();
+            let rows = conn.query("PRAGMA synchronous;").await.unwrap();
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(3));
+            conn.execute("PRAGMA synchronous=3;").await.unwrap();
+            let rows = conn.query("PRAGMA synchronous;").await.unwrap();
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(3));
         });
     }
 
