@@ -42414,11 +42414,26 @@ mod tests {
             let path = PathBuf::from("/wal_stale_db_size_after_growth.db");
             let cx = Cx::new();
 
+            // Every participating pager must share one WAL frame log. Without an
+            // installed backend `set_journal_mode(Wal)` returns `Unsupported`
+            // (see the `has_wal_backend` gate in `set_journal_mode`), so the
+            // test would die in setup and never reach the commit behavior it
+            // claims to cover. Each `set_journal_mode` result is asserted so a
+            // future silent fallback to a rollback mode cannot pass unnoticed.
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+
             let existing_page = {
                 let seed = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
                     .await
                     .unwrap();
-                seed.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                let (seed_backend, _, _) =
+                    MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+                seed.set_wal_backend(Box::new(seed_backend)).unwrap();
+                assert_eq!(
+                    seed.set_journal_mode(&cx, JournalMode::Wal).await.unwrap(),
+                    JournalMode::Wal,
+                    "seed pager must actually enter WAL mode"
+                );
                 let mut txn = seed.begin(&cx, TransactionMode::Immediate).await.unwrap();
                 let page = txn.allocate_page(&cx).await.unwrap();
                 txn.write_page(&cx, page, &sample_page(0x22)).await.unwrap();
@@ -42429,9 +42444,29 @@ mod tests {
             let pager_a = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
+            let (backend_a, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+            pager_a.set_wal_backend(Box::new(backend_a)).unwrap();
+            assert_eq!(
+                pager_a
+                    .set_journal_mode(&cx, JournalMode::Wal)
+                    .await
+                    .unwrap(),
+                JournalMode::Wal,
+                "writer A must actually enter WAL mode"
+            );
             let pager_b = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
+            let (backend_b, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+            pager_b.set_wal_backend(Box::new(backend_b)).unwrap();
+            assert_eq!(
+                pager_b
+                    .set_journal_mode(&cx, JournalMode::Wal)
+                    .await
+                    .unwrap(),
+                JournalMode::Wal,
+                "writer B must actually enter WAL mode"
+            );
             let mut txn_a = pager_a
                 .begin(&cx, TransactionMode::Concurrent)
                 .await
@@ -42464,11 +42499,25 @@ mod tests {
             let verify = SimplePager::open(vfs, &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
+            let (verify_backend, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+            verify.set_wal_backend(Box::new(verify_backend)).unwrap();
+            assert_eq!(
+                verify
+                    .set_journal_mode(&cx, JournalMode::Wal)
+                    .await
+                    .unwrap(),
+                JournalMode::Wal,
+                "the verifying reader must read through the same WAL"
+            );
             let txn = verify.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
             assert_eq!(
                 txn.snapshot_db_size(),
                 grown_page.get(),
                 "the WAL commit marker must preserve the peer-grown extent"
+            );
+            assert!(
+                txn.snapshot_db_size() > existing_page.get(),
+                "B's stale snapshot size must not shrink the database below A's growth"
             );
             assert_eq!(
                 txn.get_page(&cx, grown_page).await.unwrap().as_ref(),
@@ -42494,23 +42543,56 @@ mod tests {
             let path = PathBuf::from("/wal_rollback_eof_quarantine.db");
             let cx = Cx::new();
 
-            {
+            // Every participating pager shares one WAL frame log; without an
+            // installed backend `set_journal_mode(Wal)` returns `Unsupported`
+            // and this test dies in setup before exercising EOF aliasing at all.
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+
+            let seeded_page = {
                 let seed = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
                     .await
                     .unwrap();
-                seed.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                let (seed_backend, _, _) =
+                    MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+                seed.set_wal_backend(Box::new(seed_backend)).unwrap();
+                assert_eq!(
+                    seed.set_journal_mode(&cx, JournalMode::Wal).await.unwrap(),
+                    JournalMode::Wal,
+                    "seed pager must actually enter WAL mode"
+                );
                 let mut txn = seed.begin(&cx, TransactionMode::Immediate).await.unwrap();
                 let page = txn.allocate_page(&cx).await.unwrap();
                 txn.write_page(&cx, page, &sample_page(0x22)).await.unwrap();
                 txn.commit(&cx).await.unwrap();
-            }
+                page
+            };
 
             let pager_a = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
+            let (backend_a, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+            pager_a.set_wal_backend(Box::new(backend_a)).unwrap();
+            assert_eq!(
+                pager_a
+                    .set_journal_mode(&cx, JournalMode::Wal)
+                    .await
+                    .unwrap(),
+                JournalMode::Wal,
+                "writer A must actually enter WAL mode"
+            );
             let pager_b = SimplePager::open(vfs, &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
+            let (backend_b, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+            pager_b.set_wal_backend(Box::new(backend_b)).unwrap();
+            assert_eq!(
+                pager_b
+                    .set_journal_mode(&cx, JournalMode::Wal)
+                    .await
+                    .unwrap(),
+                JournalMode::Wal,
+                "writer B must actually enter WAL mode"
+            );
             let mut reader_b = pager_b.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
             let mut txn_a = pager_a
                 .begin(&cx, TransactionMode::Concurrent)
@@ -42522,6 +42604,11 @@ mod tests {
                 .unwrap();
 
             let contested_page = txn_a.allocate_page(&cx).await.unwrap();
+            assert_eq!(
+                contested_page.get(),
+                seeded_page.get() + 1,
+                "premise: A must allocate the page just past the seeded extent"
+            );
             assert_eq!(
                 txn_b.allocate_page(&cx).await.unwrap(),
                 contested_page,
@@ -42540,8 +42627,43 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect_err("the second writer of the same EOF page must lose");
-            assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+            // The payload must name the contested EOF page: `fsqlite_executor`'s
+            // `parse_conflicting_pages` reads this comma-separated list to drive
+            // retry decisions, so an empty or mis-scoped payload is a silent
+            // downgrade even though the error variant looks correct.
+            let FrankenError::BusySnapshot { conflicting_pages } = &error else {
+                panic!(
+                    "the second writer of the same EOF page must lose with BusySnapshot: {error:?}"
+                );
+            };
+            let named: Vec<u32> = conflicting_pages
+                .split(',')
+                .filter_map(|raw| raw.trim().parse::<u32>().ok())
+                .collect();
+            assert!(
+                named.contains(&contested_page.get()),
+                "BusySnapshot payload {conflicting_pages:?} must name the contested EOF page {}",
+                contested_page.get()
+            );
             txn_b.rollback(&cx).await.unwrap();
+
+            // A's committed image must survive B's loss: first-committer-wins
+            // means the loser's rollback cannot shrink the extent or overwrite
+            // the winner's bytes.
+            {
+                let winner = pager_a.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert_eq!(
+                    winner.snapshot_db_size(),
+                    contested_page.get(),
+                    "the winner's growth must remain durable after the loser rolls back"
+                );
+                assert_eq!(
+                    winner.get_page(&cx, contested_page).await.unwrap().as_ref(),
+                    &sample_page(0xAA)[..],
+                    "the loser's rollback must not overwrite the winner's page"
+                );
+                winner.commit(&cx).await.unwrap();
+            }
 
             let mut retry_b = pager_b
                 .begin(&cx, TransactionMode::Concurrent)
