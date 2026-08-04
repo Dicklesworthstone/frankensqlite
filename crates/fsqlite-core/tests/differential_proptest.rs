@@ -1,4 +1,13 @@
-//! frankensqlite#86 — property-based differential testing harness.
+//! frankensqlite#86 — superseded property-based differential scaffold.
+//!
+//! This integration target is intentionally inert. The independent, typed,
+//! schema-aware generator now belongs to
+//! `fsqlite_harness::typed_sql_generator` under
+//! `bd-turso-test-adaptation-zu081.3`. That replacement records deterministic
+//! seed lineage and never treats arbitrary paired engine errors as agreement.
+//! The file remains in place because repository policy forbids deleting files
+//! without explicit user permission.
+#![cfg(any())]
 //!
 //! Builds on the existing `oracle_compare` pattern (see
 //! `conformance_oracle_*.rs`) by generating random valid SELECT
