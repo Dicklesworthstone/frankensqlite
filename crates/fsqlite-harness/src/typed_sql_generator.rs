@@ -1181,8 +1181,8 @@ impl GenerationSession {
     }
 
     pub fn propose_next(&mut self) -> Result<StatementProposal, GenerationError> {
-        let ordinal = self.counters.accepted;
-        let construct = self.bootstrap_construct(ordinal)?;
+        let construct =
+            self.bootstrap_construct(self.counters.accepted, self.counters.proposals)?;
         self.propose_construct(construct)
     }
 
@@ -1204,7 +1204,7 @@ impl GenerationSession {
             ));
         }
 
-        let ordinal = self.counters.accepted;
+        let ordinal = self.counters.proposals;
         let seed_path = format!("statement/{ordinal}/{construct:?}").to_ascii_lowercase();
         let derived_seed = derive_seed(self.config.root_seed, &seed_path);
         let mut rng = StableRng::new(derived_seed);
@@ -1340,21 +1340,27 @@ impl GenerationSession {
         Ok(generated)
     }
 
-    fn bootstrap_construct(&self, ordinal: u32) -> Result<Construct, GenerationError> {
+    fn bootstrap_construct(
+        &self,
+        accepted_ordinal: u32,
+        proposal_ordinal: u32,
+    ) -> Result<Construct, GenerationError> {
         let mandatory = [
             Construct::CreateTable,
-            Construct::Insert,
             Construct::CreateTable,
-            Construct::Insert,
             Construct::CreateIndex,
+            Construct::Insert,
+            Construct::Insert,
             Construct::Transaction,
             Construct::Update,
             Construct::Transaction,
         ];
-        if let Some(construct) = mandatory.get(usize::try_from(ordinal).unwrap_or(usize::MAX)) {
+        if let Some(construct) =
+            mandatory.get(usize::try_from(accepted_ordinal).unwrap_or(usize::MAX))
+        {
             return Ok(*construct);
         }
-        let seed_path = format!("statement/{ordinal}/weighted_construct");
+        let seed_path = format!("statement/{proposal_ordinal}/weighted_construct");
         let seed = derive_seed(self.config.root_seed, &seed_path);
         choose_weighted(&self.config.profile.weights, seed)
     }
@@ -1402,8 +1408,9 @@ impl GenerationSession {
     }
 
     fn generate_create_table(&self) -> Result<Statement, GenerationError> {
-        let ordinal = self.schema.tables.len();
-        let table = ident(format!("t{ordinal}"))?;
+        let schema_ordinal = self.schema.tables.len();
+        let proposal_ordinal = self.counters.proposals;
+        let table = ident(format!("t{schema_ordinal}_p{proposal_ordinal}"))?;
         Ok(Statement::CreateTable {
             table,
             columns: vec![
@@ -1432,7 +1439,11 @@ impl GenerationSession {
     fn generate_create_index(&self) -> Result<Statement, GenerationError> {
         let table = self.first_table()?;
         Ok(Statement::CreateIndex {
-            index: ident(format!("idx_{}_score", table.name.as_str()))?,
+            index: ident(format!(
+                "idx_{}_score_p{}",
+                table.name.as_str(),
+                self.counters.proposals
+            ))?,
             table: table.name.clone(),
             columns: vec![ident("score")?],
             unique: false,
@@ -1686,18 +1697,18 @@ impl GenerationSession {
                 ),
             ));
         }
-        let (rows, value_bytes) = statement_resources(statement);
+        let (rows, _, maximum_value_bytes) = statement_resources(statement);
         if self.schema.total_rows().saturating_add(rows) > self.config.budget.max_rows {
             return Err(GenerationError::budget_exhausted(
                 "max_rows",
                 "statement would exceed the row budget",
             ));
         }
-        if value_bytes > u64::from(self.config.budget.max_value_bytes) {
+        if maximum_value_bytes > u64::from(self.config.budget.max_value_bytes) {
             return Err(GenerationError::budget_exhausted(
                 "max_value_bytes",
                 format!(
-                    "statement value payload {value_bytes} exceeds {}",
+                    "statement value size {maximum_value_bytes} exceeds {}",
                     self.config.budget.max_value_bytes
                 ),
             ));
@@ -1715,7 +1726,7 @@ impl GenerationSession {
     }
 
     fn update_resource_counters(&mut self, statement: &Statement) {
-        let (rows, value_bytes) = statement_resources(statement);
+        let (_, value_bytes, _) = statement_resources(statement);
         self.counters.rows = self.schema.total_rows();
         self.counters.value_bytes = self.counters.value_bytes.saturating_add(value_bytes);
         self.counters.execution_steps = self
@@ -1723,9 +1734,6 @@ impl GenerationSession {
             .execution_steps
             .saturating_add(statement_cost(statement));
         self.counters.maximum_ast_depth = self.counters.maximum_ast_depth.max(statement.depth());
-        if rows == 0 {
-            self.counters.rows = self.schema.total_rows();
-        }
     }
 
     fn apply_accepted_statement(&mut self, statement: &Statement) -> Result<(), GenerationError> {
@@ -1812,29 +1820,54 @@ impl GenerationSession {
                         "accepted INSERT has an empty or mismatched row shape",
                     ));
                 }
+                let mut unique_columns = BTreeSet::new();
+                if columns.iter().any(|name| {
+                    !unique_columns.insert(name)
+                        || !table_state
+                            .columns
+                            .iter()
+                            .any(|column| column.name == *name)
+                }) {
+                    return Err(GenerationError::impossible_schema(
+                        "insert.columns",
+                        "accepted INSERT references an unknown or duplicate column",
+                    ));
+                }
                 table_state.estimated_rows = table_state
                     .estimated_rows
                     .saturating_add(u32::try_from(rows.len()).unwrap_or(u32::MAX));
             }
             Statement::Delete { table, .. } => {
-                let table_state = self
-                    .schema
-                    .tables
-                    .iter_mut()
-                    .find(|entry| entry.name == *table)
-                    .ok_or_else(|| {
-                        GenerationError::impossible_schema(
-                            "delete.table",
-                            "accepted DELETE references an unknown table",
-                        )
-                    })?;
-                table_state.estimated_rows = table_state.estimated_rows.saturating_sub(1);
-            }
-            Statement::Update { table, .. } => {
                 if self.schema.table(table).is_none() {
                     return Err(GenerationError::impossible_schema(
+                        "delete.table",
+                        "accepted DELETE references an unknown table",
+                    ));
+                }
+                // Predicate cardinality is unknown until the execution adapter
+                // reports it. Retaining the conservative row estimate avoids
+                // manufacturing primary-key reuse after a no-op DELETE.
+            }
+            Statement::Update {
+                table, assignments, ..
+            } => {
+                let table_state = self.schema.table(table).ok_or_else(|| {
+                    GenerationError::impossible_schema(
                         "update.table",
                         "accepted UPDATE references an unknown table",
+                    )
+                })?;
+                if assignments.is_empty()
+                    || assignments.iter().any(|(name, _)| {
+                        !table_state
+                            .columns
+                            .iter()
+                            .any(|column| column.name == *name)
+                    })
+                {
+                    return Err(GenerationError::impossible_schema(
+                        "update.assignments",
+                        "accepted UPDATE references an unknown or empty assignment list",
                     ));
                 }
             }
@@ -1973,21 +2006,28 @@ fn simple_id_select(table: Identifier) -> Result<Select, GenerationError> {
     })
 }
 
-fn statement_resources(statement: &Statement) -> (u32, u64) {
+fn statement_resources(statement: &Statement) -> (u32, u64, u64) {
     match statement {
         Statement::Insert { rows, .. } => {
             let row_count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
             let bytes = rows.iter().flatten().fold(0_u64, |total, value| {
                 total.saturating_add(u64::try_from(value.encoded_len()).unwrap_or(u64::MAX))
             });
-            (row_count, bytes)
+            let maximum = rows
+                .iter()
+                .flatten()
+                .map(SqlValue::encoded_len)
+                .max()
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0);
+            (row_count, bytes, maximum)
         }
-        _ => (0, 0),
+        _ => (0, 0, 0),
     }
 }
 
 fn statement_cost(statement: &Statement) -> u64 {
-    let (rows, _) = statement_resources(statement);
+    let (rows, _, _) = statement_resources(statement);
     1_u64
         .saturating_add(u64::from(statement.depth()))
         .saturating_add(u64::from(rows))
@@ -2054,6 +2094,8 @@ mod tests {
     use fsqlite_parser::Parser;
     use proptest::prelude::*;
 
+    use crate::differential_v2::{CsqliteExecutor, FsqliteExecutor, SqlExecutor, StmtOutcome};
+
     use super::*;
 
     const TEST_SEED: u64 = 0xD1FF_E2E0_2026_0804;
@@ -2068,6 +2110,28 @@ mod tests {
 
     fn bootstrap_case() -> GeneratedCase {
         generate_case(GeneratorConfig::bootstrap(TEST_SEED, 20)).expect("generate bootstrap case")
+    }
+
+    fn compare_paired_statement_outcome(
+        fsqlite: &FsqliteExecutor,
+        sqlite: &CsqliteExecutor,
+        sql: &str,
+    ) -> Result<(), String> {
+        match (fsqlite.run_stmt(sql), sqlite.run_stmt(sql)) {
+            (StmtOutcome::Rows(fsqlite_rows), StmtOutcome::Rows(sqlite_rows))
+                if fsqlite_rows == sqlite_rows =>
+            {
+                Ok(())
+            }
+            (StmtOutcome::Execute(fsqlite_count), StmtOutcome::Execute(sqlite_count))
+                if fsqlite_count == sqlite_count =>
+            {
+                Ok(())
+            }
+            (fsqlite_outcome, sqlite_outcome) => Err(format!(
+                "SQL {sql:?}: FrankenSQLite={fsqlite_outcome:?}, C SQLite={sqlite_outcome:?}"
+            )),
+        }
     }
 
     #[test]
@@ -2171,15 +2235,236 @@ mod tests {
     }
 
     #[test]
-    fn rejected_proposal_does_not_mutate_schema() {
+    fn every_operator_affinity_join_compound_and_value_variant_prints() {
+        let table = ident("all_variants").unwrap();
+        let affinities = [
+            ColumnAffinity::Integer,
+            ColumnAffinity::Real,
+            ColumnAffinity::Text,
+            ColumnAffinity::Blob,
+            ColumnAffinity::Numeric,
+        ];
+        let create = Statement::CreateTable {
+            table: table.clone(),
+            columns: affinities
+                .into_iter()
+                .enumerate()
+                .map(|(index, affinity)| ColumnSpec {
+                    name: ident(format!("c{index}")).unwrap(),
+                    affinity,
+                    primary_key: index == 0,
+                    not_null: index == 1,
+                })
+                .collect(),
+        };
+        assert_fsqlite_parses(&create.to_sql());
+
+        let values = [
+            SqlValue::Null,
+            SqlValue::Integer(i64::MIN),
+            SqlValue::Real(RealLiteral::new("1.25").unwrap()),
+            SqlValue::Text("quote'boundary".to_owned()),
+            SqlValue::Blob(vec![0, 127, 255]),
+        ];
+        assert_fsqlite_parses(
+            &Statement::Select {
+                select: Select {
+                    distinct: true,
+                    projection: values
+                        .into_iter()
+                        .map(|value| SelectItem {
+                            expr: Expr::literal(value),
+                            alias: None,
+                        })
+                        .collect(),
+                    from: None,
+                    joins: Vec::new(),
+                    predicate: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    compound: None,
+                    order_by: Vec::new(),
+                    limit: None,
+                },
+            }
+            .to_sql(),
+        );
+
+        for op in [UnaryOp::Negate, UnaryOp::Not, UnaryOp::BitNot] {
+            let sql = projection_sql(Expr::Unary {
+                op,
+                expr: Box::new(Expr::literal(SqlValue::Integer(1))),
+            });
+            assert_fsqlite_parses(&sql);
+        }
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Subtract,
+            BinaryOp::Multiply,
+            BinaryOp::Divide,
+            BinaryOp::Equal,
+            BinaryOp::NotEqual,
+            BinaryOp::Less,
+            BinaryOp::LessEqual,
+            BinaryOp::Greater,
+            BinaryOp::GreaterEqual,
+            BinaryOp::And,
+            BinaryOp::Or,
+            BinaryOp::Concat,
+        ] {
+            let sql = projection_sql(Expr::Binary {
+                left: Box::new(Expr::literal(SqlValue::Integer(4))),
+                op,
+                right: Box::new(Expr::literal(SqlValue::Integer(2))),
+            });
+            assert_fsqlite_parses(&sql);
+        }
+        for function in [
+            AggregateFunction::Count,
+            AggregateFunction::Sum,
+            AggregateFunction::Min,
+            AggregateFunction::Max,
+            AggregateFunction::Avg,
+        ] {
+            let sql = projection_sql(Expr::Aggregate {
+                function,
+                expr: Some(Box::new(Expr::literal(SqlValue::Integer(1)))),
+                distinct: true,
+            });
+            assert_fsqlite_parses(&sql);
+        }
+        for negated in [false, true] {
+            assert_fsqlite_parses(&projection_sql(Expr::IsNull {
+                expr: Box::new(Expr::literal(SqlValue::Null)),
+                negated,
+            }));
+            assert_fsqlite_parses(&projection_sql(Expr::InSubquery {
+                expr: Box::new(Expr::literal(SqlValue::Integer(1))),
+                subquery: Box::new(simple_id_select(table.clone()).unwrap()),
+                negated,
+            }));
+        }
+
+        for kind in [JoinKind::Inner, JoinKind::Left] {
+            let select = Select {
+                distinct: false,
+                projection: vec![SelectItem {
+                    expr: Expr::column(Some(ident("lhs").unwrap()), ident("c0").unwrap()),
+                    alias: None,
+                }],
+                from: Some(FromItem {
+                    table: table.clone(),
+                    alias: Some(ident("lhs").unwrap()),
+                }),
+                joins: vec![Join {
+                    kind,
+                    table: table.clone(),
+                    alias: Some(ident("rhs").unwrap()),
+                    on: equal_expr(
+                        Expr::column(Some(ident("lhs").unwrap()), ident("c0").unwrap()),
+                        Expr::column(Some(ident("rhs").unwrap()), ident("c0").unwrap()),
+                    ),
+                }],
+                predicate: None,
+                group_by: Vec::new(),
+                having: None,
+                compound: None,
+                order_by: Vec::new(),
+                limit: None,
+            };
+            assert_fsqlite_parses(&Statement::Select { select }.to_sql());
+        }
+
+        for operator in [
+            CompoundOperator::Union,
+            CompoundOperator::UnionAll,
+            CompoundOperator::Intersect,
+            CompoundOperator::Except,
+        ] {
+            let mut select = simple_id_select(table.clone()).unwrap();
+            select.compound = Some(CompoundSelect {
+                operator,
+                right: Box::new(simple_id_select(table.clone()).unwrap()),
+            });
+            assert_fsqlite_parses(&Statement::Select { select }.to_sql());
+        }
+        for direction in [OrderDirection::Asc, OrderDirection::Desc] {
+            let mut select = simple_id_select(table.clone()).unwrap();
+            select.order_by.push(OrderTerm {
+                expr: Expr::column(None, ident("c0").unwrap()),
+                direction,
+            });
+            assert_fsqlite_parses(&Statement::Select { select }.to_sql());
+        }
+        for statement in [
+            TransactionStatement::Begin,
+            TransactionStatement::Commit,
+            TransactionStatement::Rollback,
+        ] {
+            assert_fsqlite_parses(&Statement::Transaction { statement }.to_sql());
+        }
+    }
+
+    fn projection_sql(expr: Expr) -> String {
+        Statement::Select {
+            select: Select {
+                distinct: false,
+                projection: vec![SelectItem { expr, alias: None }],
+                from: None,
+                joins: Vec::new(),
+                predicate: None,
+                group_by: Vec::new(),
+                having: None,
+                compound: None,
+                order_by: Vec::new(),
+                limit: None,
+            },
+        }
+        .to_sql()
+    }
+
+    #[test]
+    fn rejected_proposal_advances_seed_lineage_without_mutating_schema() {
         let mut session = GenerationSession::new(GeneratorConfig::bootstrap(TEST_SEED, 1)).unwrap();
         let before = session.schema().clone();
-        let proposal = session.propose_construct(Construct::CreateTable).unwrap();
+        let rejected = session.propose_next().unwrap();
         session
-            .reject(proposal.proposal_id, "oracle rejected")
+            .reject(rejected.proposal_id, "oracle rejected")
             .unwrap();
         assert_eq!(session.schema(), &before);
         assert_eq!(session.counters().rejected, 1);
+
+        let retry = session.propose_next().unwrap();
+        assert_eq!(rejected.statement.construct, Construct::CreateTable);
+        assert_eq!(retry.statement.construct, Construct::CreateTable);
+        assert_eq!(rejected.statement.ordinal, 0);
+        assert_eq!(retry.statement.ordinal, 1);
+        assert_ne!(rejected.statement.seed_path, retry.statement.seed_path);
+        assert_ne!(
+            rejected.statement.derived_seed,
+            retry.statement.derived_seed
+        );
+        assert_ne!(rejected.proposal_id, retry.proposal_id);
+        assert_ne!(rejected.statement.sql, retry.statement.sql);
+        session.accept(retry.proposal_id).unwrap();
+        assert_eq!(session.schema().tables.len(), 1);
+    }
+
+    #[test]
+    fn accepted_no_op_delete_does_not_reuse_generated_primary_key() {
+        let mut session = GenerationSession::new(GeneratorConfig::bootstrap(TEST_SEED, 4)).unwrap();
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+
+        for construct in [Construct::CreateTable, Construct::Insert, Construct::Delete] {
+            let proposal = session.propose_construct(construct).unwrap();
+            sqlite.execute_batch(&proposal.statement.sql).unwrap();
+            session.accept(proposal.proposal_id).unwrap();
+        }
+
+        assert_eq!(session.schema().tables[0].estimated_rows, 1);
+        let second_insert = session.propose_construct(Construct::Insert).unwrap();
+        sqlite.execute_batch(&second_insert.statement.sql).unwrap();
+        assert!(second_insert.statement.sql.contains("VALUES (2,"));
     }
 
     #[test]
@@ -2202,10 +2487,10 @@ mod tests {
 
     #[test]
     fn stable_seed_vectors_and_weight_boundaries() {
-        assert_eq!(derive_seed(0, "statement/0"), 11_322_831_585_961_020_688);
+        assert_eq!(derive_seed(0, "statement/0"), 16_214_625_229_517_900_363);
         assert_eq!(
             derive_seed(TEST_SEED, "statement/7"),
-            10_892_558_890_197_216_815
+            15_012_522_081_494_179_931
         );
         let choices = [
             ConstructWeight {
@@ -2232,14 +2517,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_bootstrap_case_parses_and_executes_on_sqlite() {
+    fn generated_bootstrap_case_executes_on_both_engines() {
         let generated = bootstrap_case();
-        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        let fsqlite = FsqliteExecutor::open_in_memory().unwrap();
+        let sqlite = CsqliteExecutor::open_in_memory().unwrap();
         for statement in &generated.statements {
             assert_fsqlite_parses(&statement.sql);
-            sqlite
-                .execute_batch(&statement.sql)
-                .unwrap_or_else(|error| panic!("C SQLite rejected {:?}: {error}", statement.sql));
+            compare_paired_statement_outcome(&fsqlite, &sqlite, &statement.sql)
+                .unwrap_or_else(|error| panic!("paired engine mismatch: {error}"));
         }
         assert_eq!(generated.counters.accepted, 20);
         assert_eq!(generated.statements.len(), 20);
@@ -2295,7 +2580,7 @@ mod tests {
             "max_ast_depth"
         );
 
-        let mut rows = GeneratorConfig::bootstrap(TEST_SEED, 4);
+        let mut rows = GeneratorConfig::bootstrap(TEST_SEED, 5);
         rows.budget.max_rows = 1;
         assert_eq!(generate_case(rows).unwrap_err().constraint, "max_rows");
 
@@ -2367,6 +2652,39 @@ mod tests {
         let child = std::fs::read(&child_artifact).unwrap();
         let parent = bootstrap_case().to_canonical_json().unwrap();
         assert_eq!(child, parent.as_bytes());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn generated_cases_execute_and_compare_on_fresh_paired_engines(
+            root_seed in any::<u64>(),
+            requested_statements in 8_u32..=16,
+        ) {
+            let generated = generate_case(GeneratorConfig::bootstrap(
+                root_seed,
+                requested_statements,
+            ))
+            .expect("bounded typed case must generate");
+            let fsqlite = FsqliteExecutor::open_in_memory()
+                .expect("open fresh FrankenSQLite executor");
+            let sqlite = CsqliteExecutor::open_in_memory()
+                .expect("open fresh C SQLite executor");
+
+            for statement in &generated.statements {
+                if let Err(error) =
+                    compare_paired_statement_outcome(&fsqlite, &sqlite, &statement.sql)
+                {
+                    prop_assert!(
+                        false,
+                        "paired statement mismatch for seed {}: {}",
+                        root_seed,
+                        error
+                    );
+                }
+            }
+        }
     }
 
     proptest! {
