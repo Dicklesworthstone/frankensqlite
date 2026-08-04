@@ -31,6 +31,7 @@ pub const TURSO_INVENTORY_SCENARIO_ID: &str = "TURSO-TEST-INVENTORY-V1";
 
 /// Parsed machine-readable intake and overlap contract.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestInventoryContract {
     pub meta: ContractMeta,
     pub source: UpstreamSource,
@@ -46,6 +47,7 @@ pub struct TestInventoryContract {
 
 /// Contract identity and clean-room policy.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractMeta {
     pub schema_version: String,
     pub bead_id: String,
@@ -58,6 +60,7 @@ pub struct ContractMeta {
 
 /// Pinned upstream repository identity.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamSource {
     pub repository: String,
     pub commit: String,
@@ -74,6 +77,7 @@ pub struct UpstreamSource {
 
 /// Historical comparison point and its reproduction command.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BaselineReference {
     pub metric: String,
     pub reference_value: usize,
@@ -83,6 +87,7 @@ pub struct BaselineReference {
 
 /// Reviewed explanation for a baseline value that intentionally changed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BaselineDeltaExplanation {
     pub metric: String,
     pub observed_value: usize,
@@ -130,8 +135,22 @@ pub enum ExecutionLane {
     RecoveryRequired,
 }
 
+impl ExecutionLane {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SqlResultOnly => "sql_result_only",
+            Self::PagerBackedRequired => "pager_backed_required",
+            Self::PlannerRequired => "planner_required",
+            Self::VdbeRequired => "vdbe_required",
+            Self::MvccRequired => "mvcc_required",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
 /// Complete ownership and decision record for one Turso top-level entry.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortfolioEntry {
     pub source_path: String,
     pub source_kind: SourceKind,
@@ -153,6 +172,7 @@ pub struct PortfolioEntry {
 
 /// Canonical path authority and handoff for one divergent root duplicate.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractAuthority {
     pub logical_name: String,
     pub canonical_path: String,
@@ -170,6 +190,7 @@ pub struct ContractAuthority {
 
 /// A root-shaped path reference classified for the canonicalization handoff.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RootReference {
     pub path: String,
     pub anchor: String,
@@ -221,10 +242,10 @@ impl GitSnapshot {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("git_ls_tree_non_utf8: {error}"))?;
         let tracked_path_set = tracked_paths.iter().cloned().collect();
-        let dirty_paths = parse_dirty_paths(&git_text(
+        let dirty_paths = parse_dirty_paths(&git_bytes(
             workspace_root,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )?);
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?)?;
 
         Ok(Self {
             workspace_root: workspace_root.to_path_buf(),
@@ -283,6 +304,12 @@ impl GitSnapshot {
 
 fn git_bytes(workspace_root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
+        // RCH and containerized CI may materialize a clean checkout under a
+        // different uid. Trust only the exact workspace supplied to this run;
+        // do not mutate the user's global safe.directory configuration.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "safe.directory")
+        .env("GIT_CONFIG_VALUE_0", workspace_root)
         .arg("-C")
         .arg(workspace_root)
         .args(args)
@@ -303,16 +330,45 @@ fn git_text(workspace_root: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|error| format!("git_output_non_utf8 args={args:?} error={error}"))
 }
 
-fn parse_dirty_paths(status: &str) -> BTreeSet<String> {
-    status
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| {
-            path.rsplit_once(" -> ")
-                .map_or(path, |(_, destination)| destination)
-                .to_owned()
-        })
-        .collect()
+fn parse_dirty_paths(status: &[u8]) -> Result<BTreeSet<String>, String> {
+    let mut fields = status
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+    let mut paths = BTreeSet::new();
+    let mut index = 0_usize;
+    while let Some(entry) = fields.next() {
+        let (Some(status_code), Some(path_bytes)) = (entry.get(..2), entry.get(3..)) else {
+            return Err(format!(
+                "git_status_record_malformed index={index} record={}",
+                String::from_utf8_lossy(entry)
+            ));
+        };
+        if entry.get(2) != Some(&b' ') || path_bytes.is_empty() {
+            return Err(format!(
+                "git_status_record_malformed index={index} record={}",
+                String::from_utf8_lossy(entry)
+            ));
+        }
+        let path = std::str::from_utf8(path_bytes)
+            .map_err(|error| format!("git_status_path_non_utf8 index={index} error={error}"))?;
+        paths.insert(path.to_owned());
+
+        if status_code
+            .iter()
+            .any(|status| matches!(*status, b'R' | b'C'))
+        {
+            index += 1;
+            let source = fields.next().ok_or_else(|| {
+                format!("git_status_rename_source_missing index={index} destination={path}")
+            })?;
+            let source = std::str::from_utf8(source).map_err(|error| {
+                format!("git_status_rename_source_non_utf8 index={index} error={error}")
+            })?;
+            paths.insert(source.to_owned());
+        }
+        index += 1;
+    }
+    Ok(paths)
 }
 
 /// Load the canonical TOML contract.
@@ -489,6 +545,16 @@ fn validate_baselines(
     contract: &TestInventoryContract,
     diagnostics: &mut Vec<InventoryDiagnostic>,
 ) {
+    const REQUIRED: [&str; 8] = [
+        "e2e_rusqlite_files",
+        "e2e_top_level_integration_files",
+        "fuzz_corpus_files",
+        "fuzz_targets",
+        "harness_literal_beads_path_files",
+        "harness_top_level_integration_files",
+        "harness_tracker_shaped_files",
+        "slt_files",
+    ];
     let mut metrics = BTreeSet::new();
     for baseline in &contract.baseline {
         if !metrics.insert(baseline.metric.as_str()) {
@@ -508,6 +574,13 @@ fn validate_baselines(
             &format!("baseline.{}.delta_policy", baseline.metric),
             &baseline.delta_policy,
         );
+    }
+    if metrics != REQUIRED.into_iter().collect() {
+        diagnostics.push(InventoryDiagnostic::new(
+            "baseline_metric_set_incomplete",
+            "baseline",
+            format!("expected={REQUIRED:?} observed={metrics:?}"),
+        ));
     }
 
     let mut explanations = BTreeSet::new();
@@ -903,6 +976,16 @@ pub fn validate_upstream_tree(
     upstream: &UpstreamTree,
 ) -> Vec<InventoryDiagnostic> {
     let mut diagnostics = Vec::new();
+    if upstream.sha != contract.source.commit {
+        diagnostics.push(InventoryDiagnostic::new(
+            "upstream_commit_mismatch",
+            contract.source.repository.clone(),
+            format!(
+                "expected={} observed={}",
+                contract.source.commit, upstream.sha
+            ),
+        ));
+    }
     if upstream.truncated {
         diagnostics.push(InventoryDiagnostic::new(
             "upstream_tree_truncated",
@@ -1071,6 +1154,10 @@ impl TestClass {
 }
 
 /// Per-file inventory row derived from the tracked `HEAD` snapshot.
+///
+/// The boolean fields are independent, stable JSON/CSV columns. Grouping them
+/// behind another type would make the machine-readable report schemas diverge.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TestFileRecord {
     pub path: String,
@@ -1459,11 +1546,29 @@ fn observe_baselines(
                 "observed value matches the reference but an explanation remains",
             ));
         }
+        let observed_i64 = i64::try_from(observed_value).map_err(|error| {
+            format!(
+                "baseline_observed_value_out_of_range metric={} value={observed_value} error={error}",
+                baseline.metric
+            )
+        })?;
+        let reference_i64 = i64::try_from(baseline.reference_value).map_err(|error| {
+            format!(
+                "baseline_reference_value_out_of_range metric={} value={} error={error}",
+                baseline.metric, baseline.reference_value
+            )
+        })?;
+        let delta = observed_i64.checked_sub(reference_i64).ok_or_else(|| {
+            format!(
+                "baseline_delta_out_of_range metric={} observed={observed_value} reference={}",
+                baseline.metric, baseline.reference_value
+            )
+        })?;
         result.push(BaselineObservation {
             metric: baseline.metric.clone(),
             reference_value: baseline.reference_value,
             observed_value,
-            delta: observed_value as i64 - baseline.reference_value as i64,
+            delta,
             reference_command: baseline.reference_command.clone(),
             explanation: explanation.map(|entry| entry.rationale.clone()),
         });
@@ -1650,7 +1755,7 @@ pub fn render_test_inventory_markdown(report: &TestInventoryReport) -> String {
         let lanes = entry
             .execution_lanes
             .iter()
-            .map(|lane| format!("{lane:?}").to_ascii_lowercase())
+            .map(|lane| lane.label())
             .collect::<Vec<_>>()
             .join(", ");
         writeln!(
@@ -1801,5 +1906,43 @@ fn csv_cell(value: &str) -> String {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{csv_cell, parse_dirty_paths};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn dirty_paths_include_both_rename_sides_and_untracked_files() {
+        let paths = parse_dirty_paths(
+            b" M crates/demo/src/lib.rs\0R  new/name.rs\0old/name.rs\0?? scratch/input.sql\0",
+        )
+        .expect("parse NUL-delimited porcelain status");
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "crates/demo/src/lib.rs".to_owned(),
+                "new/name.rs".to_owned(),
+                "old/name.rs".to_owned(),
+                "scratch/input.sql".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn dirty_paths_reject_missing_rename_source() {
+        let error = parse_dirty_paths(b"R  new/name.rs\0")
+            .expect_err("rename without its source path must fail closed");
+        assert!(error.starts_with("git_status_rename_source_missing"));
+    }
+
+    #[test]
+    fn csv_cells_quote_commas_quotes_and_newlines() {
+        assert_eq!(csv_cell("plain/path.rs"), "plain/path.rs");
+        assert_eq!(csv_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_cell("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_cell("a\nb"), "\"a\nb\"");
     }
 }

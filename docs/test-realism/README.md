@@ -1,73 +1,63 @@
-# Test Realism Taxonomy Inventory
+# Test Realism and Adaptation Inventory
 
-## Overview
+The canonical inventory is generated from the repository's tracked `HEAD`
+object set. This makes counts reproducible in a shared worktree: untracked files
+and another agent's uncommitted edits cannot silently change the baseline, while
+the report still records whether the worktree was dirty.
 
-This directory contains the test realism classification for FrankenSQLite's test suite.
+The scanner classifies tracked test and corpus files as unit, integration,
+corpus, fuzz, end-to-end, or tracker-metadata coverage. File-backed execution is
+reported as an orthogonal flag rather than a competing class. It also records
+in-memory, mock, property-test, `rusqlite`, tracker-shaped, and literal
+`.beads/issues.jsonl` usage, plus exact-content duplicate groups.
 
-## Realism Tiers
+Do not maintain numeric totals in this README. The generated report is the
+authority because test files and direct `#[test]` counts change frequently.
 
-Tests are classified into the following tiers (from lowest to highest realism):
+## Reports
 
-| Tier | Description | Count |
-|------|-------------|-------|
-| **unit** | Pure unit tests, no I/O or backend | 26,537 |
-| **mocked** | Uses mock/fake/stub patterns | 76 |
-| **in-memory** | Uses MemDatabase/MemoryVfs backends | 681 |
-| **file-backed** | Uses tempfile for file I/O | 232 |
-| **e2e** | End-to-end integration tests | 3,585 |
+One validated report model produces all three views under
+`target/test-inventory/`:
 
-**Total: 31,111 tests**
+| Artifact | Purpose |
+|---|---|
+| `test_inventory.json` | Complete machine-readable provenance, counts, decisions, ownership, diagnostics, and reproduction metadata |
+| `summary.md` | Human-readable baseline reconciliation and Turso decision matrix |
+| `test_inventory.csv` | Per-file classification and realism flags for analysis tools |
 
-## Mock Usage
-
-- Tests using mocks: 968 / 31,111 (3.1%)
-- Property-based tests: 2,023
-
-## Files
-
-- `test_inventory.csv` - Machine-readable inventory with columns:
-  - `crate`: Crate name
-  - `file`: Source file path
-  - `test_count`: Number of `#[test]` functions
-  - `realism_tier`: Classification (unit/mocked/in-memory/file-backed/e2e)
-  - `uses_mock`: Whether file contains mock/fake/stub patterns
-  - `uses_memory`: Whether file uses in-memory backends
-  - `uses_file`: Whether file uses tempfile
-  - `is_proptest`: Whether file contains property-based tests
-
-- `summary.md` - Human-readable summary statistics
+The JSON and Markdown views include the reviewed Turso testing portfolio pinned
+by `docs/contracts/turso_test_adaptation_inventory.toml`. The `audit` command
+validates a non-truncated GitHub Git-tree response for that exact commit without
+loading or copying upstream source content.
 
 ## Commands
 
 ```bash
-# Generate/update inventory
-./scripts/test_inventory.sh
+# Offline: validate the contract against tracked HEAD and generate all reports.
+./scripts/test_inventory.sh full
 
-# View summary only
+# Online: additionally fetch and validate pinned Turso Git-tree metadata.
+./scripts/test_inventory.sh audit
+
+# Print the most recently generated Markdown report.
 ./scripts/test_inventory.sh summary
 
-# Analyze single crate
+# Filter the generated CSV to one crate.
 ./scripts/test_inventory.sh crate fsqlite-core
 ```
 
-## Interpretation
+`TURSO_TREE_JSON=/path/to/tree.json` makes `audit` use a previously captured
+GitHub tree response. `FSQLITE_TEST_INVENTORY_BIN=/path/to/test_inventory` uses
+a prebuilt runner, which is useful in remote-build and clean-checkout CI jobs.
 
-### Healthy Patterns
-- High unit test count indicates good coverage of edge cases
-- E2E tests exercising real storage stack
-- Property-based tests for invariant verification
+## Drift Policy
 
-### Areas for Improvement
-- Files classified as "mocked" should be reviewed for opportunities to use real backends
-- Critical path code should have corresponding E2E tests
-- In-memory tests are acceptable but file-backed tests provide higher confidence
+Historical values in the contract are comparison baselines, not frozen targets.
+Every changed value needs a reviewed, metric-specific explanation. Unknown test
+layouts, unknown Turso families, missing provenance, stale owner paths or beads,
+unknown feature IDs, and incomplete contract-authority handoffs fail the audit.
 
-## Updating
-
-Re-run `./scripts/test_inventory.sh` and copy results to this directory:
-
-```bash
-./scripts/test_inventory.sh
-cp target/test-inventory/test_inventory.csv docs/test-realism/
-cp target/test-inventory/summary.md docs/test-realism/
-```
+The baseline deliberately distinguishes files containing the broad
+`issues.jsonl` marker from files containing the literal
+`.beads/issues.jsonl` path. It also explains the tracked-`HEAD` differences from
+the original exploratory counts that included an ignored E2E scratch file.

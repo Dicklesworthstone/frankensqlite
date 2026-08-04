@@ -74,6 +74,21 @@ reference_command = "find conformance -type f -name '*.slt' | wc -l"
 delta_policy = "Every new SLT file must remain owned by the canonical corpus and fixture-root contracts."
 
 [[baseline_delta_explanation]]
+metric = "harness_top_level_integration_files"
+observed_value = 237
+rationale = "The canonical inventory integration target crates/fsqlite-harness/tests/bd_turso_test_adaptation_zu081_1_inventory.rs was added after the 2026-08-03 research count. It is tracked and therefore raises the top-level harness count from 236 to 237."
+
+[[baseline_delta_explanation]]
+metric = "harness_tracker_shaped_files"
+observed_value = 69
+rationale = "The canonical inventory integration target validates tracker-shaped classification with a controlled issues.jsonl fixture. It is tracked and therefore raises the research count from 68 to 69."
+
+[[baseline_delta_explanation]]
+metric = "harness_literal_beads_path_files"
+observed_value = 65
+rationale = "The canonical inventory integration target validates the literal .beads/issues.jsonl distinction with a controlled fixture. It is tracked and therefore raises the research count from 64 to 65."
+
+[[baseline_delta_explanation]]
 metric = "e2e_top_level_integration_files"
 observed_value = 268
 rationale = "The 2026-08-03 find-based count included ignored scratch file crates/fsqlite-e2e/tests/zz_scratch_mw_race.rs. The canonical inventory uses tracked Git objects and therefore reports 268."

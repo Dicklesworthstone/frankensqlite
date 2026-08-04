@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -196,6 +197,26 @@ fn run() -> Result<ExitCode, String> {
         .get(&AdoptionDecision::Reject)
         .copied()
         .unwrap_or_default();
+    let test_class_files = report
+        .summary
+        .classes
+        .iter()
+        .map(|summary| (summary.class, summary.file_count))
+        .collect::<BTreeMap<_, _>>();
+    let test_class_files = serde_json::to_string(&test_class_files)
+        .map_err(|error| format!("test_class_summary_serialize_failed: {error}"))?;
+    let duplicate_owner_refs =
+        report
+            .portfolio
+            .iter()
+            .fold(BTreeMap::<&str, usize>::new(), |mut totals, entry| {
+                for owner in &entry.duplicate_owners {
+                    *totals.entry(owner).or_default() += 1;
+                }
+                totals
+            });
+    let duplicate_owner_refs = serde_json::to_string(&duplicate_owner_refs)
+        .map_err(|error| format!("duplicate_owner_summary_serialize_failed: {error}"))?;
     tracing::info!(
         run_id = %report.run.run_id,
         trace_id = %report.run.trace_id,
@@ -207,10 +228,13 @@ fn run() -> Result<ExitCode, String> {
         adopted,
         deferred,
         rejected,
+        test_class_files = %test_class_files,
+        duplicate_groups = report.summary.duplicate_groups,
+        duplicate_owner_refs = %duplicate_owner_refs,
         "test inventory completed"
     );
     println!(
-        "INFO test_inventory_complete run_id={} trace_id={} scenario_id={} source_revision={} dirty={} upstream_verified={} files={} tests={} adopt={} defer={} reject={} json={} markdown={} csv={}",
+        "INFO test_inventory_complete run_id={} trace_id={} scenario_id={} source_revision={} dirty={} upstream_verified={} files={} tests={} adopt={} defer={} reject={} test_class_files={} duplicate_groups={} duplicate_owner_refs={} json={} markdown={} csv={}",
         report.run.run_id,
         report.run.trace_id,
         report.run.scenario_id,
@@ -222,6 +246,9 @@ fn run() -> Result<ExitCode, String> {
         adopted,
         deferred,
         rejected,
+        test_class_files,
+        report.summary.duplicate_groups,
+        duplicate_owner_refs,
         output_json.display(),
         output_markdown.display(),
         output_csv.display()

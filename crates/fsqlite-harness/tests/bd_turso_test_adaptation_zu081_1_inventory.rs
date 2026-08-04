@@ -105,6 +105,26 @@ fn canonical_contract_is_self_contained_and_valid() {
         "canonical contract diagnostics: {diagnostics:#?}"
     );
     assert_eq!(contract.meta.bead_id, BEAD_ID);
+    assert_eq!(
+        contract.source.repository,
+        "https://github.com/tursodatabase/turso"
+    );
+    assert_eq!(
+        contract.source.commit,
+        "19d1952c62b17012cba6392e14581b48db05ec1e"
+    );
+    assert_eq!(
+        contract.source.testing_tree_sha,
+        "12f3e77fd1951c6258f1e8e23a648aeaf32b051a"
+    );
+    assert_eq!(contract.source.testing_entry_count, 373);
+    assert_eq!(contract.source.license_path, "LICENSE.md");
+    assert_eq!(
+        contract.source.license_blob_sha,
+        "9573cadaf0b69893bf64bb595f06c4be150366e3"
+    );
+    assert_eq!(contract.source.license_spdx, "MIT");
+    assert_eq!(contract.source.license_class, "permissive");
     assert_eq!(contract.portfolio.len(), 17);
     assert_eq!(
         contract
@@ -120,7 +140,7 @@ fn canonical_contract_is_self_contained_and_valid() {
             .iter()
             .filter(|entry| entry.decision == AdoptionDecision::Adopt)
             .count(),
-        8
+        9
     );
     assert_eq!(contract.contract_authority.len(), 5);
     assert!(
@@ -145,6 +165,11 @@ fn pinned_tree_metadata_matches_every_reviewed_portfolio_entry() {
 #[test]
 fn pinned_tree_validation_fails_closed_for_unknown_truncated_and_missing_license_inputs() {
     let contract = load_contract();
+
+    let mut wrong_revision = synthetic_upstream_tree();
+    wrong_revision.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+    let diagnostics = validate_upstream_tree(&contract, &wrong_revision);
+    assert!(diagnostic_codes(&diagnostics).contains(&"upstream_commit_mismatch"));
 
     let mut unknown = synthetic_upstream_tree();
     unknown.tree.push(UpstreamTreeEntry {
@@ -185,6 +210,29 @@ fn provenance_schema_rejects_missing_revision_license_and_classification() {
 }
 
 #[test]
+fn provenance_schema_rejects_unknown_and_missing_fields() {
+    let raw = fs::read_to_string(contract_path()).expect("read canonical contract");
+    let mutated = raw.replacen(
+        "[meta]\n",
+        "[meta]\nunknown_contract_field = \"must fail closed\"\n",
+        1,
+    );
+    let temp = TempDir::new().expect("create unknown-field fixture");
+    let path = temp.path().join("contract.toml");
+    fs::write(&path, mutated).expect("write unknown-field fixture");
+    let error = load_test_inventory_contract(&path)
+        .expect_err("unknown intake fields must fail deserialization");
+    assert!(error.contains("unknown field `unknown_contract_field`"));
+
+    let missing_path = raw.replacen("source_path = \"testing/README.md\"\n", "", 1);
+    let path = temp.path().join("missing-source-path.toml");
+    fs::write(&path, missing_path).expect("write missing-path fixture");
+    let error = load_test_inventory_contract(&path)
+        .expect_err("a missing upstream source path must fail deserialization");
+    assert!(error.contains("missing field `source_path`"));
+}
+
+#[test]
 fn ownership_and_handoff_validation_reject_stale_or_incomplete_records() {
     let root = workspace_root();
     let snapshot = GitSnapshot::capture(&root).expect("capture tracked HEAD");
@@ -204,6 +252,11 @@ fn ownership_and_handoff_validation_reject_stale_or_incomplete_records() {
     assert!(codes.contains(&"stale_owner_path"));
     assert!(codes.contains(&"stale_owner_bead"));
     assert!(codes.contains(&"unknown_surface_id"));
+
+    let mut incomplete_baseline = load_contract();
+    incomplete_baseline.baseline.pop();
+    let diagnostics = validate_test_inventory_contract(&incomplete_baseline, &snapshot);
+    assert!(diagnostic_codes(&diagnostics).contains(&"baseline_metric_set_incomplete"));
 
     let mut incomplete_handoff = load_contract();
     incomplete_handoff.contract_authority.pop();
@@ -310,10 +363,11 @@ fn report_json_markdown_and_csv_reconcile_from_one_model() {
     assert_eq!(decoded, report);
 
     let markdown = render_test_inventory_markdown(&report);
-    assert!(markdown.contains("harness_tracker_shaped_files` | 68 | 68 | +0"));
-    assert!(markdown.contains("harness_literal_beads_path_files` | 64 | 64 | +0"));
+    assert!(markdown.contains("harness_top_level_integration_files` | 236 | 237 | +1"));
+    assert!(markdown.contains("harness_tracker_shaped_files` | 68 | 69 | +1"));
+    assert!(markdown.contains("harness_literal_beads_path_files` | 64 | 65 | +1"));
     assert!(markdown.contains("testing/differential-oracle"));
-    assert!(markdown.contains("Decision totals: adopt=8, defer=7, reject=2."));
+    assert!(markdown.contains("Decision totals: adopt=9, defer=6, reject=2."));
     assert!(markdown.contains("Contract Authority Handoff"));
 
     let csv = render_test_inventory_csv(&report);
