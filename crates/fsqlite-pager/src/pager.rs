@@ -20196,6 +20196,47 @@ where
                         self.allocated_from_freelist.push(page);
                         return Ok(page);
                     }
+
+                    // GH#302 bounded snapshot-safe reclamation: committed
+                    // freelist pages at or below db_size ARE reusable when it
+                    // is provable that no live local snapshot can still
+                    // observe them as tree content. The conservative proof
+                    // used here is:
+                    //
+                    //   1. this transaction is the ONLY active transaction on
+                    //      this pager (`active_transactions == 1`), so the
+                    //      only local snapshot that exists is our own; and
+                    //   2. our snapshot is current (`published_visible_
+                    //      commit_seq == inner.commit_seq`), so every page on
+                    //      the committed freelist is already free *in our own
+                    //      snapshot* — it cannot be live content of any tree
+                    //      we can read.
+                    //
+                    // Under those two conditions reuse is exactly as safe as
+                    // the non-concurrent pop below. Cross-process hazards are
+                    // covered by existing machinery, not by this gate:
+                    // a racing external writer that pops the same committed
+                    // free page produces a page-level write-write conflict and
+                    // aborts second-committer (see test_journal_commit_detects_
+                    // cross_connection_committed_freelist_reuse_alias), and
+                    // external readers at an older mark keep reading the
+                    // pre-reuse frame through WAL/journal versioning, the same
+                    // way they survive any ordinary in-place page rewrite.
+                    //
+                    // Transactions that begin AFTER we pop see the page as
+                    // free in their committed snapshot; freelist-page content
+                    // is never interpreted except through the committed trunk
+                    // chain, which is itself versioned at commit publication.
+                    //
+                    // Without this arm, default (concurrent) transactions
+                    // never reused committed free pages and every churn
+                    // workload grew the file at EOF without bound.
+                    let sole_current_snapshot = inner.active_transactions == 1
+                        && self.published_visible_commit_seq.get() == inner.commit_seq;
+                    if sole_current_snapshot && let Some(page) = inner.freelist.pop() {
+                        self.allocated_from_freelist.push(page);
+                        return Ok(page);
+                    }
                 } else if let Some(page) = inner.freelist.pop() {
                     self.allocated_from_freelist.push(page);
                     return Ok(page);
@@ -41719,6 +41760,15 @@ mod tests {
     #[test]
     fn test_concurrent_allocate_ignores_global_freelist_pages() {
         asupersync::test_utils::run_test(|| async {
+            // GH#302 changed the concurrent allocator: committed freelist
+            // pages ARE reused when this transaction is the pager's only
+            // live transaction AND its snapshot is current (see
+            // test_concurrent_allocate_reuses_committed_freelist_when_sole_
+            // current_snapshot). This keeper now pins the stale-snapshot
+            // half of that gate: a page freed AFTER this transaction
+            // captured its snapshot is still live tree content in this
+            // transaction's own view and must NOT be reused, even though no
+            // other transaction is active by allocation time.
             let (pager, _) = test_pager().await;
             let cx = Cx::new();
             let ps = PageSize::DEFAULT.as_usize();
@@ -41730,11 +41780,14 @@ mod tests {
             seed.write_page(&cx, p3, &vec![0x22; ps]).await.unwrap();
             seed.commit(&cx).await.unwrap();
 
-            let mut free_txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            // The concurrent transaction captures its snapshot BEFORE the
+            // free commits, so p2 is live content in its snapshot.
+            let mut concurrent = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+
+            let mut free_txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
             free_txn.free_page(&cx, p2).await.unwrap();
             free_txn.commit(&cx).await.unwrap();
 
-            let mut concurrent = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
             let allocated = concurrent.allocate_page(&cx).await.unwrap();
             assert_eq!(
                 allocated.get(),
@@ -42321,6 +42374,136 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrent_allocate_reuses_committed_freelist_when_sole_current_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            // GH#302: default (concurrent) transactions must reuse committed
+            // freelist pages at/below db_size when this transaction is the
+            // only active one and its snapshot is current. Otherwise churn
+            // workloads grow the file at EOF without bound while a large
+            // committed freelist sits unused.
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/gh302_concurrent_freelist_reuse.db");
+            let cx = Cx::new();
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            // Seed: grow the database, then durably free four pages.
+            let mut pages = Vec::new();
+            {
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                for fill in 0x21..0x29u8 {
+                    let p = txn.allocate_page(&cx).await.unwrap();
+                    txn.write_page(&cx, p, &sample_page(fill)).await.unwrap();
+                    pages.push(p);
+                }
+                txn.commit(&cx).await.unwrap();
+            }
+            let freed: Vec<PageNumber> = pages[..4].to_vec();
+            {
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                for &p in &freed {
+                    txn.free_page(&cx, p).await.unwrap();
+                }
+                txn.commit(&cx).await.unwrap();
+            }
+            let committed_size_after_free = pager.committed_snapshot().db_size;
+
+            // Churn: a sole concurrent transaction with a current snapshot
+            // must satisfy new allocations from the committed freelist, not
+            // at EOF.
+            {
+                let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                for round in 0..4u8 {
+                    let p = txn.allocate_page(&cx).await.unwrap();
+                    assert!(
+                        freed.contains(&p),
+                        "case=gh302_sole_concurrent_txn_reuses_committed_free_page \
+                         round={round} allocated={} freed={:?}",
+                        p.get(),
+                        freed.iter().map(|p| p.get()).collect::<Vec<_>>()
+                    );
+                    txn.write_page(&cx, p, &sample_page(0x90 + round))
+                        .await
+                        .unwrap();
+                }
+                txn.commit(&cx).await.unwrap();
+            }
+            assert_eq!(
+                pager.committed_snapshot().db_size,
+                committed_size_after_free,
+                "case=gh302_reuse_does_not_grow_the_database"
+            );
+            assert_eq!(
+                pager.committed_snapshot().freelist_count,
+                0,
+                "case=gh302_reused_pages_leave_the_committed_freelist"
+            );
+
+            // Reused pages carry the new content.
+            let mut txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            for (round, &p) in freed.iter().enumerate() {
+                let got = txn.get_page(&cx, p).await.unwrap();
+                assert_eq!(
+                    got.as_ref(),
+                    &sample_page(0x90 + u8::try_from(round).unwrap())[..],
+                    "case=gh302_reused_page_holds_new_content page={}",
+                    p.get()
+                );
+            }
+            txn.commit(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_concurrent_allocate_skips_committed_freelist_while_older_snapshot_active() {
+        asupersync::test_utils::run_test(|| async {
+            // GH#302 safety gate: while ANOTHER local transaction holds a
+            // snapshot, committed freelist pages at/below db_size stay
+            // snapshot-pinned and a concurrent writer must allocate at EOF
+            // instead of reusing them.
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/gh302_concurrent_freelist_pinned.db");
+            let cx = Cx::new();
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let mut pages = Vec::new();
+            {
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                for fill in 0x41..0x45u8 {
+                    let p = txn.allocate_page(&cx).await.unwrap();
+                    txn.write_page(&cx, p, &sample_page(fill)).await.unwrap();
+                    pages.push(p);
+                }
+                txn.commit(&cx).await.unwrap();
+            }
+            {
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                txn.free_page(&cx, pages[0]).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+            }
+            let committed_size = pager.committed_snapshot().db_size;
+
+            // Hold a reader snapshot open, then allocate concurrently.
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            {
+                let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                let p = txn.allocate_page(&cx).await.unwrap();
+                assert!(
+                    p.get() > committed_size,
+                    "case=gh302_active_reader_pins_committed_freelist allocated={} \
+                     committed_size={committed_size}",
+                    p.get()
+                );
+                txn.rollback(&cx).await.unwrap();
+            }
+            reader.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_journal_commit_preserves_peer_growth_for_disjoint_writer() {
         asupersync::test_utils::run_test(|| async {
             // Both pagers capture the same two-page image. Writer A grows the
@@ -42651,7 +42834,7 @@ mod tests {
             // means the loser's rollback cannot shrink the extent or overwrite
             // the winner's bytes.
             {
-                let winner = pager_a.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                let mut winner = pager_a.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
                 assert_eq!(
                     winner.snapshot_db_size(),
                     contested_page.get(),
