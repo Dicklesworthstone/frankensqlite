@@ -55844,6 +55844,32 @@ impl Connection {
             return Ok(Vec::new());
         }
 
+        // The v0.2 runtime is UTF-8-only. SQLite normally permits an encoding
+        // choice before the first schema object is created, but silently
+        // accepting a UTF-16 choice here would promise a format that the
+        // bootstrap admission gate below cannot decode. Reject every supported
+        // SQLite UTF-16 spelling before any connection or pager state changes.
+        if pragma_name == "encoding"
+            && pragma.value.as_ref().is_some_and(|value| {
+                let expr = match value {
+                    PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
+                };
+                let requested = match expr {
+                    Expr::Literal(Literal::String(text), _) => Some(text.to_ascii_lowercase()),
+                    Expr::Column(column, _) if column.table.is_none() => {
+                        Some(column.column.to_ascii_lowercase())
+                    }
+                    _ => None,
+                };
+                matches!(
+                    requested.as_deref(),
+                    Some("utf-16" | "utf-16le" | "utf-16be")
+                )
+            })
+        {
+            return Err(FrankenError::Unsupported);
+        }
+
         let mut pragma_out = {
             let mut state = self.pragma_state.borrow_mut();
             fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)?
@@ -73528,6 +73554,14 @@ impl Connection {
             }
 
             let header = parse_database_header_checked(page1_bytes)?;
+            // Admission belongs on the already-bound reload transaction: its
+            // page 1 reflects the installed WAL snapshot, and the check still
+            // precedes every schema or row-image mutation below. Opening a
+            // second standalone read transaction here would bypass the
+            // publication bind required by schema-only live-WAL bootstrap.
+            if !header.text_encoding.is_runtime_supported() {
+                return Err(FrankenError::Unsupported);
+            }
             let page_size = header.page_size;
             let reserved_per_page = header.reserved_per_page;
             let schema_cookie = if page1_bytes.len() >= 44 {
@@ -121183,7 +121217,7 @@ mod tests {
         ImplicitAutoindexSlot, InProcessPageLockTable, IoPollStrategy, LiveVtabRegistryUndo,
         MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope, Row,
         RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
-        arm_trigger_stack_probe, bind_placeholders_in_select_for_fallback,
+        arm_trigger_stack_probe, attached_schema_key, bind_placeholders_in_select_for_fallback,
         build_canonical_hash_join_key, canonical_hash_join_value, canonicalize_select_placeholders,
         cmp_values_with_comparison_affinity, implicit_autoindex_layout, init_global_runtime,
         is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
@@ -149341,6 +149375,90 @@ mod tests {
     }
 
     #[test]
+    fn test_utf16_database_admission_fails_closed_and_preserves_main_image() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            for encoding in ["UTF-16le", "UTF-16be"] {
+                let db_path = dir.path().join(format!("{encoding}.db"));
+                let db_str = db_path.to_string_lossy().into_owned();
+                {
+                    let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                    sqlite
+                        .execute_batch(&format!(
+                            r#"PRAGMA encoding = '{encoding}';
+                               CREATE TABLE "café"(id INTEGER PRIMARY KEY, value TEXT);
+                               INSERT INTO "café" VALUES (1, 'Καλημέρα');"#
+                        ))
+                        .unwrap();
+                }
+                let original = std::fs::read(&db_path).unwrap();
+                let header_encoding =
+                    u32::from_be_bytes(original[56..60].try_into().expect("encoding bytes"));
+                let expected_encoding = if encoding == "UTF-16le" { 2 } else { 3 };
+                assert_eq!(header_encoding, expected_encoding);
+
+                let err = Connection::open(&db_str)
+                    .await
+                    .expect_err("ordinary open must reject UTF-16");
+                assert!(matches!(err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+
+                let err = Connection::open_existing(&db_str)
+                    .await
+                    .expect_err("existing-only open must reject UTF-16");
+                assert!(matches!(err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+
+                let err = Connection::open_schema_only(&db_str)
+                    .await
+                    .expect_err("schema-only open must reject UTF-16");
+                assert!(matches!(err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+
+                let err = Connection::import_bytes(&original)
+                    .await
+                    .expect_err("in-memory import must reject UTF-16");
+                assert!(matches!(err, FrankenError::Unsupported));
+
+                let parent = Connection::open(":memory:").await.unwrap();
+                let attach_path = db_str.replace('\'', "''");
+                let attach_err = parent
+                    .execute(&format!(
+                        "ATTACH DATABASE '{attach_path}' AS unsupported_utf16;"
+                    ))
+                    .await
+                    .expect_err("ATTACH must reject a UTF-16 database");
+                assert!(matches!(attach_err, FrankenError::Unsupported));
+                assert!(
+                    parent
+                        .attached_schemas
+                        .borrow()
+                        .find("unsupported_utf16")
+                        .is_none(),
+                    "failed UTF-16 ATTACH must not publish the schema name"
+                );
+                assert!(
+                    !parent
+                        .attached_connections
+                        .borrow()
+                        .contains_key(&attached_schema_key("unsupported_utf16")),
+                    "failed UTF-16 ATTACH must not retain the child connection"
+                );
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+
+                let retry_err = Connection::open(&db_str)
+                    .await
+                    .expect_err("rejected bootstrap must release its namespace lease");
+                // This second same-path admission reaches the encoding gate
+                // again only if the first rejected Connection dropped every
+                // namespace/bootstrap lease instead of wedging the path.
+                assert!(matches!(retry_err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+            }
+        });
+    }
+
+    #[test]
     fn test_import_bytes_rejects_empty_database_image() {
         asupersync::test_utils::run_test(|| async {
             let err = Connection::import_bytes(&[]).await.unwrap_err();
@@ -166161,6 +166279,73 @@ mod tests {
     }
 
     #[test]
+    fn test_pragma_utf16_setters_fail_closed_without_mutating_database_state() {
+        asupersync::test_utils::run_test(|| async {
+            for schema_initialized in [false, true] {
+                let conn = Connection::open(":memory:").await.unwrap();
+                if schema_initialized {
+                    conn.execute(
+                        "CREATE TABLE encoding_guard_t(\
+                             id INTEGER PRIMARY KEY,\
+                             note TEXT DEFAULT 'café'\
+                         );",
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                let before_image = conn.export_bytes().await.unwrap();
+                let before_schema = conn
+                    .query("SELECT type, name, sql FROM sqlite_schema ORDER BY type, name;")
+                    .await
+                    .unwrap();
+                let before_attached_schemas = conn.attached_schemas.borrow().count();
+                let before_attached_connections = conn.attached_connections.borrow().len();
+
+                for requested in ["UTF-16", "UTF-16le", "UTF-16be"] {
+                    for sql in [
+                        format!("PRAGMA encoding = '{requested}';"),
+                        format!("PRAGMA encoding('{requested}');"),
+                    ] {
+                        let err = conn
+                            .execute(&sql)
+                            .await
+                            .expect_err("UTF-16 encoding setter must fail closed");
+                        assert!(
+                            matches!(err, FrankenError::Unsupported),
+                            "unexpected {requested} setter error for {sql}: {err:?}"
+                        );
+                    }
+
+                    let rows = conn.query("PRAGMA encoding;").await.unwrap();
+                    assert_eq!(
+                        rows[0].values()[0],
+                        SqliteValue::Text("UTF-8".into()),
+                        "rejected {requested} setter must retain UTF-8"
+                    );
+                    assert_eq!(conn.export_bytes().await.unwrap(), before_image);
+                    assert_eq!(
+                        conn.query(
+                            "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name;"
+                        )
+                        .await
+                        .unwrap(),
+                        before_schema
+                    );
+                    assert_eq!(
+                        conn.attached_schemas.borrow().count(),
+                        before_attached_schemas
+                    );
+                    assert_eq!(
+                        conn.attached_connections.borrow().len(),
+                        before_attached_connections
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn test_pragma_extended_connection_knobs_return_rows() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -180835,6 +181020,86 @@ fts5(title, body, content=docs, content_rowid=id)'
                 .expect("schema-only connection should still query through pager-backed cursors");
             assert_eq!(rows.len(), 1);
             assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+        });
+    }
+
+    #[test]
+    fn test_utf16_live_wal_admission_uses_authoritative_page1_and_preserves_main_image() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            fn create_live_wal_fixture(
+                dir: &std::path::Path,
+                stem: &str,
+            ) -> (rusqlite::Connection, std::path::PathBuf, Vec<u8>) {
+                let db_path = dir.join(format!("utf16_live_wal_{stem}.db"));
+                let db_str = db_path.to_str().unwrap();
+                let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                sqlite
+                    .execute_batch("PRAGMA encoding = 'UTF-16le';")
+                    .unwrap();
+                let journal_mode: String = sqlite
+                    .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+                sqlite
+                    .execute_batch(
+                        r#"PRAGMA wal_autocheckpoint=0;
+                           CREATE TABLE "café"(id INTEGER PRIMARY KEY, value TEXT);
+                           INSERT INTO "café" VALUES (1, 'Καλημέρα');"#,
+                    )
+                    .unwrap();
+                assert!(wal_path.exists(), "keeper requires a live WAL sidecar");
+
+                let original = std::fs::read(&db_path).unwrap();
+                let main_file_encoding = original.get(56..60).map(|bytes| {
+                    u32::from_be_bytes(bytes.try_into().expect("four-byte encoding field"))
+                });
+                assert!(
+                    !matches!(main_file_encoding, Some(2 | 3)),
+                    "UTF-16 must be visible only through the live WAL, not the stale main-file page 1"
+                );
+                (sqlite, db_path, original)
+            }
+
+            enum OpenKind {
+                Ordinary,
+                Existing,
+                SchemaOnly,
+            }
+
+            for (kind, stem, rejection) in [
+                (
+                    OpenKind::Ordinary,
+                    "ordinary",
+                    "ordinary open must reject WAL-visible UTF-16",
+                ),
+                (
+                    OpenKind::Existing,
+                    "existing",
+                    "existing-only open must reject WAL-visible UTF-16",
+                ),
+                (
+                    OpenKind::SchemaOnly,
+                    "schema_only",
+                    "schema-only open must reject WAL-visible UTF-16",
+                ),
+            ] {
+                // Each admission mode gets a fresh database so an earlier
+                // rejected open cannot checkpoint, refresh, or otherwise
+                // prime the pager/WAL state observed by a later mode.
+                let (sqlite, db_path, original) = create_live_wal_fixture(dir.path(), stem);
+                let db_str = db_path.to_str().unwrap();
+                let err = match kind {
+                    OpenKind::Ordinary => Connection::open(db_str).await,
+                    OpenKind::Existing => Connection::open_existing(db_str).await,
+                    OpenKind::SchemaOnly => Connection::open_schema_only(db_str).await,
+                }
+                .expect_err(rejection);
+                assert!(matches!(err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                drop(sqlite);
+            }
         });
     }
 
