@@ -35848,10 +35848,11 @@ fn test_conformance_main_qualified_dml_ignores_temp_shadow_gh144() {
         let fconn = Connection::open(":memory:").await.unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
         let setup = [
+            "PRAGMA foreign_keys=ON",
             "CREATE TABLE main.t(id INTEGER PRIMARY KEY, value TEXT)",
             "INSERT INTO main.t VALUES (1, 'one'), (2, 'two'), (3, 'three')",
-            "CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, value TEXT)",
-            "INSERT INTO temp.t VALUES (9, 'temp')",
+            "CREATE TEMP TABLE t(rowid TEXT, _rowid_ TEXT, oid TEXT, temp_id INTEGER PRIMARY KEY, temp_value TEXT)",
+            "INSERT INTO temp.t(temp_id, temp_value) VALUES (9, 'temp')",
         ];
         apply_fsqlite_statements(&fconn, &setup).await;
         apply_rusqlite_statements(&rconn, &setup);
@@ -35860,9 +35861,12 @@ fn test_conformance_main_qualified_dml_ignores_temp_shadow_gh144() {
             "INSERT INTO main.t VALUES (4, 'four')",
             "UPDATE main.t SET value = 'ONE' WHERE id = 1",
             "DELETE FROM main.t WHERE id = 2",
-            "INSERT INTO temp.t VALUES (10, 'temporary')",
-            "UPDATE temp.t SET value = 'TEMP' WHERE id = 9",
-            "DELETE FROM temp.t WHERE id = 10",
+            "INSERT INTO temp.t(temp_id, temp_value) VALUES (10, 'temporary')",
+            "UPDATE temp.t SET temp_value = 'TEMP' WHERE temp_id = 9",
+            "DELETE FROM temp.t WHERE temp_id = 10",
+            "INSERT INTO t(temp_id, temp_value) VALUES (11, 'unqualified')",
+            "UPDATE t SET temp_value = 'UNQUALIFIED' WHERE temp_id = 11",
+            "DELETE FROM t WHERE temp_id = 11",
         ];
         apply_fsqlite_statements(&fconn, &mutations).await;
         apply_rusqlite_statements(&rconn, &mutations);
@@ -35871,6 +35875,9 @@ fn test_conformance_main_qualified_dml_ignores_temp_shadow_gh144() {
             "INSERT INTO main.t VALUES (5, 'five')",
             "UPDATE main.t SET value = 'FOUR' WHERE id = 4",
             "DELETE FROM main.t WHERE id = 3",
+            "INSERT INTO temp.t(temp_id, temp_value) VALUES (12, 'prepared')",
+            "UPDATE temp.t SET temp_value = 'PREPARED' WHERE temp_id = 12",
+            "DELETE FROM temp.t WHERE temp_id = 12",
         ];
         for sql in prepared_mutations {
             let statement = fconn.prepare(sql).await.expect("prepare FrankenSQLite DML");
@@ -35887,7 +35894,7 @@ fn test_conformance_main_qualified_dml_ignores_temp_shadow_gh144() {
             &rconn,
             &[
                 "SELECT id, value FROM main.t ORDER BY id",
-                "SELECT id, value FROM temp.t ORDER BY id",
+                "SELECT temp_id, temp_value FROM temp.t ORDER BY temp_id",
             ],
         )
         .await;

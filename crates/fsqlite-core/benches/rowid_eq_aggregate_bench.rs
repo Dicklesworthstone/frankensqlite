@@ -295,7 +295,7 @@ fn median_f64(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let upper = values.len() / 2;
     if values.len() % 2 == 0 {
-        (values[upper - 1] + values[upper]) / 2.0
+        f64::midpoint(values[upper - 1], values[upper])
     } else {
         values[upper]
     }
@@ -451,7 +451,7 @@ fn report_case(label: &str, null: &PairedStats, claim: &PairedStats) {
         },
         null_radius,
         margin,
-        1.0 + 2.0 * null_radius
+        2.0_f64.mul_add(null_radius, 1.0)
     );
 }
 

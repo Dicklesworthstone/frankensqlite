@@ -498,6 +498,8 @@ Each cursor maintains a stack of `(page_number, cell_index)` pairs representing 
 
 Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. Default file-backed concurrent transactions do not reuse committed free pages at or below the current database size, even when no reader is active; snapshot-safe versioned reclamation is not yet implemented ([#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302)), so steady-state churn may grow the file. `VACUUM` rebuilds the database and can reclaim space, but the current insertion-based builder can retain pages freed during its own construction or leave trailing pages; v0.2.0 does not promise a zero-freelist, fixed-point compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
 
+`PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not supported as durable settings in v0.2.0. The mode currently changes connection-local readback only and returns to `NONE` after reopen; FrankenSQLite does not yet write the pointer-map pages required to enable either mode safely ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)).
+
 ---
 
 ## The SQL Parser
@@ -902,7 +904,7 @@ Every trait method that touches I/O, acquires locks, or could block accepts `&Cx
 
 Cx threads three capabilities through the entire call chain:
 
-- **Cancellation:** Pollable connection operations carry the caller's context, and long queries check its cancellation token at VDBE instruction boundaries (every N opcodes) and return `SQLITE_INTERRUPT` when they observe cancellation. The worker-backed `AsyncConnection` wrapper is narrower: cancellation after dispatch stops the caller's wait but does not interrupt the in-flight worker operation, and dropping the wrapper joins that worker ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
+- **Cancellation:** Pollable connection operations carry the caller's context, and long queries check its cancellation token at VDBE instruction boundaries (every N opcodes) and return `SQLITE_INTERRUPT` when they observe cancellation. The worker-backed `AsyncConnection` wrapper is narrower: cancellation after dispatch stops the caller's wait but does not interrupt the in-flight worker operation. Dropping the wrapper signals shutdown and detaches rather than joining, so `Drop` does not block; the worker finishes its terminal cleanup after the operation completes. Applications that require a hard kill deadline must use process isolation ([#306](https://github.com/Dicklesworthstone/frankensqlite/issues/306)).
 - **Deadline propagation:** Timeout budgets flow through the entire call chain. A 5-second query deadline decrements as it passes through the parser, planner, and executor.
 - **Capability narrowing:** Callers can restrict what callees are allowed to do. A read-only connection's Cx prevents write operations at the capability level.
 
@@ -1332,7 +1334,11 @@ interpreting or writing their text.
 
 ## Pointer Map and Auto-Vacuum
 
-SQLite's auto-vacuum mode returns freed pages to the operating system instead of adding them to the freelist. This requires a **pointer map** — a reverse lookup from any page to its parent — so the engine can relocate pages and update parent pointers during vacuum.
+SQLite's auto-vacuum modes use a **pointer map** — a reverse lookup from a page
+to its parent — so relocated pages can have their parent pointers updated. When
+auto-vacuum is enabled, the first pointer-map page is page 2. In FULL mode,
+freeing a page can relocate the final page and truncate the file; INCREMENTAL
+mode retains reclaimable pages until `PRAGMA incremental_vacuum` is run.
 
 **Entry format (5 bytes per page):**
 
@@ -1341,11 +1347,15 @@ SQLite's auto-vacuum mode returns freed pages to the operating system instead of
 | 0 | Type code: 1 = root page, 2 = freelist page, 3 = first overflow page, 4 = subsequent overflow page, 5 = non-root B-tree page |
 | 1-4 | Parent page number (u32 big-endian). Meaning varies by type: for B-tree pages, it's the parent in the tree; for overflow pages, it's the page containing the cell that overflows. |
 
-The first pointer map page is always page 2. Each page holds `usable_size / 5` entries (819 entries for 4096-byte pages). Pointer map pages recur at regular intervals: pages 2, 822, 1642, ... (group size = entries_per_page + 1 = 820).
+Each pointer-map page holds `usable_size / 5` entries (819 entries for
+4096-byte pages). Pointer-map pages recur at regular intervals: pages 2, 822,
+1642, ... (group size = entries_per_page + 1 = 820).
 
-**How auto-vacuum works:** When a page is freed (e.g., by `DELETE`), the engine moves the last page in the file into the freed slot, updates the moved page's parent pointer using the pointer map, and truncates the file by one page. This keeps the database file compact without requiring a full `VACUUM` rebuild.
-
-FrankenSQLite replicates pointer map layout and auto-vacuum page relocation identically to C SQLite, ensuring databases with `auto_vacuum = FULL` or `auto_vacuum = INCREMENTAL` are fully interoperable.
+The format above describes SQLite's on-disk contract, not a current
+FrankenSQLite feature. FrankenSQLite v0.2.0 does not yet create or maintain
+pointer-map pages or relocate pages for auto-vacuum. Setting
+`auto_vacuum = FULL` or `auto_vacuum = INCREMENTAL` is currently
+connection-local and is not persisted in the database header ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)).
 
 ---
 
@@ -2672,6 +2682,13 @@ still serves as an authoritative reference.
   interpretation or durable rewriting. Convert such a database to UTF-8 with
   stock SQLite before opening it in FrankenSQLite. This restriction concerns
   SQLite TEXT encoding; arbitrary bytes stored as BLOB values are unaffected.
+- **Legacy SQLite double-quoted-string fallback is intentionally unsupported.**
+  FrankenSQLite always interprets double-quoted tokens as identifiers. An
+  unresolved `"token"` therefore returns an identifier-resolution error,
+  whereas legacy-enabled SQLite may treat it as the string literal `token`.
+  Use single-quoted SQL string literals. Ordinary double-quoted identifiers
+  remain supported
+  ([#148](https://github.com/Dicklesworthstone/frankensqlite/issues/148)).
 - **Read-only opens are not fully mutation-free in v0.2.0.** A database that
   FrankenSQLite has opened before joins its existing namespace without
   rewriting the `-fsqlite-ns-gate` or `-fsqlite-ns-use` sidecar. First contact
@@ -2685,8 +2702,40 @@ still serves as an authoritative reference.
   ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140)). The
   namespace-sidecar rewrite reported in
   [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294) is fixed
-  for previously opened databases; its remaining first-contact case is tracked
-  in #140.
+  and verified for explicit read-only opens of a database FrankenSQLite has
+  opened before: regression coverage snapshots every directory entry and
+  modification time across an open plus a WAL-backed query and requires full
+  byte equality. The default-open and first-contact paths are not covered by
+  that proof, and the first-contact case remains tracked in #140.
+- **Windows WAL lock interoperability does not yet extend to shared-memory
+  contents.** FrankenSQLite mirrors ordinary WAL lock slots onto stock
+  SQLite's real `-shm` lock bytes, but its shared-memory region contents remain
+  heap-backed. Do not concurrently mix FrankenSQLite and stock SQLite WAL
+  connections to the same database on Windows
+  ([#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139)).
+- **AUTOINCREMENT rowids may skip values after savepoint rollback in concurrent
+  mode.** In the verified sequence, rolling back the second insert leaves a
+  gap: FrankenSQLite commits rowids 1 and 3, whereas stock SQLite commits 1 and
+  2. Values remain unique and increasing; applications must not depend on
+  rowid contiguity
+  ([#147](https://github.com/Dicklesworthstone/frankensqlite/issues/147)).
+- **FrankenSQLite-created FTS5 databases are not yet integrity-clean when
+  reopened by stock SQLite.** Stock SQLite's `integrity_check` reports a
+  malformed inverted index on the verified FrankenSQLite-created FTS5 fixture.
+  The exact on-disk cause is still unresolved
+  ([#300](https://github.com/Dicklesworthstone/frankensqlite/issues/300)).
+- **Renaming the content table of an external-content FTS5 table can make the
+  database unavailable through FrankenSQLite after the renaming connection
+  closes.** The established connection can also return stale `MATCH` rows.
+  Rename the table back on that same connection before closing it. If it has
+  already closed, stock SQLite can rename the table back because the file
+  remains intact. Do not rename an external-content FTS5 content table in
+  v0.2.0 ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)).
+- **TEMP schema catalog queries are not partitioned correctly.** On current
+  main, `temp.sqlite_master` exposes main-schema objects while omitting TEMP
+  objects, and `sqlite_temp_master` is not recognized. Do not use these catalog
+  spellings for TEMP-schema introspection in v0.2.0
+  ([#238](https://github.com/Dicklesworthstone/frankensqlite/issues/238)).
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.

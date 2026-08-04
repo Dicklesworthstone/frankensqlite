@@ -136,7 +136,9 @@ pub enum ExecutionLane {
 }
 
 impl ExecutionLane {
-    const fn label(self) -> &'static str {
+    /// Stable serialized/test-facing identifier for this execution requirement.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::SqlResultOnly => "sql_result_only",
             Self::PagerBackedRequired => "pager_backed_required",

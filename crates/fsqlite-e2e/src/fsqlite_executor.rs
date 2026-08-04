@@ -10,7 +10,7 @@
 //! partitions in parallel for file-backed databases (and sequentially for
 //! `:memory:` paths, which are connection-local by definition).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Barrier;
@@ -21,7 +21,15 @@ use fsqlite_btree::instrumentation::{
     BtreeMetricsSnapshot, btree_metrics_enabled, btree_metrics_snapshot, reset_btree_metrics,
     set_btree_metrics_enabled,
 };
-use fsqlite_core::connection::{hot_path_profile_enabled, reset_hot_path_profile};
+use fsqlite_core::connection::{
+    FallbackDecisionRecord, FallbackDecisionSnapshot, HotPathProfileSnapshot,
+    hot_path_profile_enabled, hot_path_profile_snapshot, planner_dispatch_ns,
+    reset_hot_path_profile, set_hot_path_profile_enabled,
+};
+use fsqlite_harness::failure_bundle::{
+    ExecutionLaneEvidence, FallbackDecisionEvidence, ObservedExecutionLane,
+};
+use fsqlite_harness::test_inventory::ExecutionLane;
 use fsqlite_parser::parser::{parse_metrics_enabled, set_parse_metrics_enabled};
 use fsqlite_parser::{
     ParseMetricsSnapshot, SemanticMetricsSnapshot, TokenizeMetricsSnapshot, parse_metrics_snapshot,
@@ -123,6 +131,8 @@ struct WorkerStats {
     body_execution_time_ns: u64,
     commit_finalize_time_ns: u64,
     rollback_time_ns: u64,
+    fallback_decisions: Vec<FallbackDecisionRecord>,
+    fallback_capture_truncated: bool,
     error: Option<String>,
 }
 
@@ -163,9 +173,16 @@ impl WorkerStats {
             .commit_finalize_time_ns
             .saturating_add(other.commit_finalize_time_ns);
         self.rollback_time_ns = self.rollback_time_ns.saturating_add(other.rollback_time_ns);
+        self.fallback_decisions.extend(other.fallback_decisions);
+        self.fallback_capture_truncated |= other.fallback_capture_truncated;
         if self.error.is_none() {
             self.error = other.error;
         }
+    }
+
+    fn capture_fallback_decisions(&mut self, snapshot: FallbackDecisionSnapshot) {
+        self.fallback_decisions.extend(snapshot.decisions);
+        self.fallback_capture_truncated |= snapshot.truncated;
     }
 
     fn record_busy(&mut self, busy: &BusyDiagnostic, phase: BatchPhase, attempt: u32) {
@@ -245,6 +262,7 @@ struct BatchOutcome {
 #[derive(Debug)]
 struct HotPathMetricsCapture {
     enabled: bool,
+    prev_connection_hot_path_enabled: bool,
     prev_parse_metrics_enabled: bool,
     prev_vdbe_metrics_enabled: bool,
     prev_btree_metrics_enabled: bool,
@@ -255,6 +273,7 @@ struct HotPathMetricsCapture {
 
 impl HotPathMetricsCapture {
     fn new(enabled: bool) -> Self {
+        let prev_connection_hot_path_enabled = hot_path_profile_enabled();
         let prev_parse_metrics_enabled = parse_metrics_enabled();
         let prev_vdbe_metrics_enabled = vdbe_metrics_enabled();
         let prev_btree_metrics_enabled = btree_metrics_enabled();
@@ -265,6 +284,7 @@ impl HotPathMetricsCapture {
         };
         let mut capture = Self {
             enabled,
+            prev_connection_hot_path_enabled,
             prev_parse_metrics_enabled,
             prev_vdbe_metrics_enabled,
             prev_btree_metrics_enabled,
@@ -273,6 +293,7 @@ impl HotPathMetricsCapture {
             wal_before: wal_telemetry_snapshot(),
         };
         if enabled {
+            set_hot_path_profile_enabled(true);
             set_parse_metrics_enabled(true);
             set_vdbe_metrics_enabled(true);
             set_btree_metrics_enabled(true);
@@ -318,6 +339,11 @@ impl HotPathMetricsCapture {
             oplog,
         }))
     }
+
+    fn core_snapshot(&self) -> Option<(HotPathProfileSnapshot, [u64; 2])> {
+        self.enabled
+            .then(|| (hot_path_profile_snapshot(), planner_dispatch_ns()))
+    }
 }
 
 impl Drop for HotPathMetricsCapture {
@@ -326,6 +352,7 @@ impl Drop for HotPathMetricsCapture {
         set_vdbe_metrics_enabled(self.prev_vdbe_metrics_enabled);
         set_btree_metrics_enabled(self.prev_btree_metrics_enabled);
         set_commit_phase_timing_enabled(self.prev_commit_phase_timing_enabled);
+        set_hot_path_profile_enabled(self.prev_connection_hot_path_enabled);
     }
 }
 
@@ -542,6 +569,22 @@ fn wal_delta(after: &WalTelemetrySnapshot, before: &WalTelemetrySnapshot) -> Wal
             .group_commit
             .commit_latency_us_total
             .saturating_sub(before.group_commit.commit_latency_us_total),
+        recovery_frames_total: after
+            .recovery
+            .recovery_frames_total
+            .saturating_sub(before.recovery.recovery_frames_total),
+        recovery_corruption_detected_total: after
+            .recovery
+            .corruption_detected_total
+            .saturating_sub(before.recovery.corruption_detected_total),
+        recovery_frames_repaired_total: after
+            .recovery
+            .frames_repaired_total
+            .saturating_sub(before.recovery.frames_repaired_total),
+        recovery_ops_total: after
+            .recovery
+            .recovery_ops_total
+            .saturating_sub(before.recovery.recovery_ops_total),
         commit_path: WalCommitPathProfile {
             prepare_us_total,
             consolidator_lock_wait_us_total,
@@ -811,6 +854,116 @@ fn build_hot_path_profile(inputs: HotPathProfileInputs<'_>) -> FsqliteHotPathPro
     }
 }
 
+fn fallback_decision_evidence(stats: &WorkerStats) -> Vec<FallbackDecisionEvidence> {
+    let mut aggregated = BTreeMap::new();
+    for decision in &stats.fallback_decisions {
+        let key = (
+            decision.statement_kind.clone(),
+            decision.fallback_boundary.clone(),
+            decision.decision_reason.clone(),
+            decision.decision_outcome.clone(),
+            decision.source_touchpoint.clone(),
+            decision.first_failure_diagnostic.clone(),
+        );
+        let occurrences = aggregated.entry(key).or_insert(0_u64);
+        *occurrences = occurrences.saturating_add(decision.occurrences);
+    }
+    aggregated
+        .into_iter()
+        .map(
+            |(
+                (
+                    statement_kind,
+                    fallback_boundary,
+                    decision_reason,
+                    decision_outcome,
+                    source_touchpoint,
+                    first_failure_diagnostic,
+                ),
+                occurrences,
+            )| FallbackDecisionEvidence {
+                statement_kind,
+                fallback_boundary,
+                decision_reason,
+                decision_outcome,
+                source_touchpoint,
+                first_failure_diagnostic,
+                occurrences,
+            },
+        )
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_execution_lane_evidence(
+    required_lane: ExecutionLane,
+    oplog: &OpLog,
+    storage: &StorageWiringReport,
+    profile: Option<&FsqliteHotPathProfile>,
+    core_profile: Option<&HotPathProfileSnapshot>,
+    planner_dispatch: Option<[u64; 2]>,
+    stats: &WorkerStats,
+    sql_result_observed: bool,
+    concurrent_mode: bool,
+) -> ExecutionLaneEvidence {
+    let mut observed = Vec::new();
+    if sql_result_observed {
+        observed.push(ObservedExecutionLane::SqlResult);
+    }
+    if profile.is_some_and(|value| {
+        storage.backend_kind != "memory"
+            && (value.vfs.read_ops > 0
+                || value.vfs.write_ops > 0
+                || value.btree.is_some_and(|btree| {
+                    btree.seek_total > 0 || btree.insert_total > 0 || btree.delete_total > 0
+                }))
+    }) {
+        observed.push(ObservedExecutionLane::PagerBacked);
+    }
+    if core_profile.is_some_and(|value| value.parser.compiled_cache_misses > 0)
+        && planner_dispatch.is_some_and(|timings| timings.into_iter().any(|value| value > 0))
+    {
+        observed.push(ObservedExecutionLane::Planner);
+    }
+    if profile.is_some_and(|value| {
+        value.vdbe.actual_statements_total > 0 && value.vdbe.actual_opcodes_executed_total > 0
+    }) {
+        observed.push(ObservedExecutionLane::Vdbe);
+    }
+    if concurrent_mode
+        && core_profile.is_some_and(|value| value.concurrent_commit_plan_attempts > 0)
+    {
+        observed.push(ObservedExecutionLane::Mvcc);
+    }
+    if profile.is_some_and(|value| value.wal.recovery_ops_total > 0) {
+        observed.push(ObservedExecutionLane::Recovery);
+    }
+    let fallback_decisions = fallback_decision_evidence(stats);
+    if !fallback_decisions.is_empty() {
+        observed.push(ObservedExecutionLane::CompatibilityFallback);
+    }
+
+    let run_id = oplog.header.fixture_id.clone();
+    let scenario_id = oplog
+        .header
+        .preset
+        .clone()
+        .unwrap_or_else(|| run_id.clone());
+    ExecutionLaneEvidence::from_observations(
+        required_lane,
+        observed,
+        format!("{:016x}", oplog.header.seed),
+        run_id,
+        scenario_id,
+        "oplog",
+        &storage.backend_kind,
+        &storage.backend_mode,
+        &storage.backend_identity,
+        fallback_decisions,
+        !stats.fallback_capture_truncated,
+    )
+}
+
 /// Run an OpLog against FrankenSQLite.
 ///
 /// Runs setup SQL once, then replays worker partitions:
@@ -827,7 +980,19 @@ pub fn run_oplog_fsqlite(
     oplog: &OpLog,
     config: &FsqliteExecConfig,
 ) -> E2eResult<EngineRunReport> {
-    let mut metrics_capture = HotPathMetricsCapture::new(config.collect_hot_path_profile);
+    run_oplog_fsqlite_with_lane_requirement(db_path, oplog, config, ExecutionLane::SqlResultOnly)
+}
+
+/// Run an OpLog and fail closed when the declared execution lane is not proven.
+pub fn run_oplog_fsqlite_with_lane_requirement(
+    db_path: &Path,
+    oplog: &OpLog,
+    config: &FsqliteExecConfig,
+    required_lane: ExecutionLane,
+) -> E2eResult<EngineRunReport> {
+    let capture_lane_metrics =
+        config.collect_hot_path_profile || required_lane != ExecutionLane::SqlResultOnly;
+    let mut metrics_capture = HotPathMetricsCapture::new(capture_lane_metrics);
     let worker_count = oplog.header.concurrency.worker_count;
     if worker_count == 0 {
         return Err(E2eError::Io(std::io::Error::new(
@@ -857,20 +1022,54 @@ pub fn run_oplog_fsqlite(
     } else {
         let conn = open_connection(db_path)?;
         storage_wiring = Some(configure_connection(&conn, db_path, config)?);
+        conn.reset_fallback_decision_evidence();
         execute_setup(&conn, &setup_records)?;
         reset_conflict_stats(&conn)?;
         metrics_capture.reset();
         let started = Instant::now();
-        let stats = replay_sequential(&conn, &per_worker, config);
+        let mut stats = replay_sequential(&conn, &per_worker, config);
+        stats.capture_fallback_decisions(conn.fallback_decision_snapshot());
         wall = started.elapsed();
         conflict_diagnostics = query_conflict_stats_note(&conn)?;
         stats
     };
     let retry_breakdown = retry_breakdown_from_stats(&stats);
-    let hot_path_profile = metrics_capture.snapshot(oplog).map(|mut profile| {
+    let captured_profile = metrics_capture.snapshot(oplog).map(|mut profile| {
         profile.runtime_retry = retry_breakdown.clone();
         profile
     });
+    let core_capture = metrics_capture.core_snapshot();
+    let execution_lane_evidence = storage_wiring.as_ref().map(|storage| {
+        build_execution_lane_evidence(
+            required_lane,
+            oplog,
+            storage,
+            captured_profile.as_ref(),
+            core_capture.as_ref().map(|(profile, _)| profile),
+            core_capture.as_ref().map(|(_, planner)| *planner),
+            &stats,
+            stats.ops_ok > 0 || stats.ops_err > 0 || stats.error.is_some(),
+            config.concurrent_mode,
+        )
+    });
+    let lane_error = execution_lane_evidence.as_ref().and_then(|evidence| {
+        evidence.emit_diagnostic();
+        let validation_errors = evidence.validate();
+        if !validation_errors.is_empty() {
+            Some(format!(
+                "invalid execution-lane evidence: {}",
+                validation_errors.join("; ")
+            ))
+        } else if evidence.requirement_satisfied {
+            None
+        } else {
+            evidence.first_failure_diagnostic.clone()
+        }
+    });
+    if let (Some(storage), Some(evidence)) = (storage_wiring.as_mut(), execution_lane_evidence) {
+        storage.execution_lane_evidence = Some(evidence);
+    }
+    let hot_path_profile = captured_profile;
 
     let integrity_check_ok = if config.run_integrity_check && db_path != Path::new(":memory:") {
         // Best-effort verification: validate the resulting DB file with
@@ -889,7 +1088,7 @@ pub fn run_oplog_fsqlite(
         ops_err: stats.ops_err,
         retries: stats.retries,
         aborts: stats.aborts,
-        first_error: stats.error.clone(),
+        first_error: lane_error.or_else(|| stats.error.clone()),
         retry_diagnostics,
         conflict_diagnostics,
         concurrent_mode: config.concurrent_mode,
@@ -1082,6 +1281,7 @@ fn configure_connection(
         backend_identity: format!("{backend_kind}:{backend_mode}"),
         backend_kind,
         backend_mode,
+        execution_lane_evidence: None,
     })
 }
 
@@ -1143,6 +1343,7 @@ fn replay_parallel(
     // Setup SQL must run once before worker replay so schema/seed data exists.
     let setup_conn = open_connection(db_path)?;
     *storage_wiring = Some(configure_connection(&setup_conn, db_path, config)?);
+    setup_conn.reset_fallback_decision_evidence();
     execute_setup(&setup_conn, setup_records)?;
     reset_conflict_stats(&setup_conn)?;
 
@@ -1191,6 +1392,7 @@ fn replay_parallel(
     for stats in worker_stats {
         total.merge_from(stats);
     }
+    total.capture_fallback_decisions(setup_conn.fallback_decision_snapshot());
 
     let conflict_diagnostics = query_conflict_stats_note(&setup_conn)?;
     Ok((total, conflict_diagnostics, wall))
@@ -1265,7 +1467,10 @@ fn run_worker_parallel(
     config_barrier.wait();
     start_barrier.wait();
 
-    run_records_with_retry(&conn, worker_id, records, config)
+    conn.reset_fallback_decision_evidence();
+    let mut stats = run_records_with_retry(&conn, worker_id, records, config);
+    stats.capture_fallback_decisions(conn.fallback_decision_snapshot());
+    stats
 }
 
 /// Assemble an [`EngineRunReport`] from execution statistics.
@@ -2752,6 +2957,9 @@ fn duration_to_u64_ns(d: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
     use crate::oplog::{
         ConcurrencyModel, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec,
         commutative_inserts_disjoint_keys_expected_rows, preset_commutative_inserts_disjoint_keys,
@@ -2760,6 +2968,59 @@ mod tests {
         hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
         set_hot_path_profile_enabled,
     };
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CapturedLaneDiagnostic {
+        level: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct LaneDiagnosticLayer(Arc<Mutex<Vec<CapturedLaneDiagnostic>>>);
+
+    #[derive(Default)]
+    struct LaneDiagnosticVisitor {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for LaneDiagnosticVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields.insert(
+                field.name().to_owned(),
+                format!("{value:?}").trim_matches('"').to_owned(),
+            );
+        }
+    }
+
+    impl<S> Layer<S> for LaneDiagnosticLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "fsqlite.execution_lane" {
+                return;
+            }
+            let mut visitor = LaneDiagnosticVisitor::default();
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(CapturedLaneDiagnostic {
+                    level: event.metadata().level().to_string(),
+                    fields: visitor.fields,
+                });
+        }
+    }
 
     fn hot_path_test_guard() -> std::sync::MutexGuard<'static, ()> {
         crate::perf_runner::HOT_PATH_TEST_LOCK
@@ -2824,6 +3085,64 @@ mod tests {
         }
     }
 
+    fn execution_lane_test_oplog(statement: &str) -> OpLog {
+        OpLog {
+            header: OpLogHeader {
+                fixture_id: "execution-lane-public-path".to_owned(),
+                seed: 0xE1A0,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 1,
+                    transaction_size: 2,
+                    commit_order_policy: "deterministic".to_owned(),
+                },
+                preset: Some("execution-lane-public-path".to_owned()),
+            },
+            records: vec![
+                OpRecord {
+                    op_id: 0,
+                    worker: 0,
+                    kind: OpKind::Begin,
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 1,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement:
+                            "CREATE TABLE lane_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL);"
+                                .to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 2,
+                    worker: 0,
+                    kind: OpKind::Insert {
+                        table: "lane_probe".to_owned(),
+                        key: 1,
+                        values: vec![("value".to_owned(), "lane-value".to_owned())],
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                },
+                OpRecord {
+                    op_id: 3,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: statement.to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 4,
+                    worker: 0,
+                    kind: OpKind::Commit,
+                    expected: None,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn run_oplog_fsqlite_basic_serial() {
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 1, 1, 10);
@@ -2834,6 +3153,404 @@ mod tests {
         assert!(report.error.is_none(), "error={:?}", report.error);
         assert!(report.ops_total > 0, "should have executed operations");
         assert!(report.runtime_phase_timing.is_some());
+        let lane = report
+            .storage_wiring
+            .as_ref()
+            .and_then(|storage| storage.execution_lane_evidence.as_ref())
+            .expect("every FrankenSQLite executor report must carry lane evidence");
+        assert_eq!(lane.required_lane, ExecutionLane::SqlResultOnly);
+        assert!(lane.requirement_satisfied);
+        assert!(lane.validate().is_empty(), "{lane:?}");
+    }
+
+    #[test]
+    fn public_executor_proves_pager_planner_vdbe_and_mvcc_lanes() {
+        let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("execution-lanes.db");
+        let oplog =
+            execution_lane_test_oplog("SELECT value FROM lane_probe WHERE id = 1 ORDER BY value;");
+        let config = FsqliteExecConfig {
+            max_busy_retries: 2,
+            busy_backoff: Duration::from_millis(1),
+            busy_backoff_max: Duration::from_millis(1),
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite_with_lane_requirement(
+            &db_path,
+            &oplog,
+            &config,
+            ExecutionLane::MvccRequired,
+        )
+        .unwrap();
+        let lane = report
+            .storage_wiring
+            .as_ref()
+            .and_then(|storage| storage.execution_lane_evidence.as_ref())
+            .expect("lane evidence");
+
+        assert!(report.error.is_none(), "{report:?}");
+        assert!(lane.requirement_satisfied, "{lane:?}");
+        for observed in [
+            ObservedExecutionLane::SqlResult,
+            ObservedExecutionLane::PagerBacked,
+            ObservedExecutionLane::Planner,
+            ObservedExecutionLane::Vdbe,
+            ObservedExecutionLane::Mvcc,
+        ] {
+            assert!(lane.observed_lanes.contains(&observed), "{lane:?}");
+        }
+        assert!(lane.validate().is_empty(), "{lane:?}");
+    }
+
+    #[test]
+    fn lane_diagnostics_are_bounded_counted_and_correlated() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(LaneDiagnosticLayer(Arc::clone(&captured)));
+        let success = ExecutionLaneEvidence::from_observations(
+            ExecutionLane::SqlResultOnly,
+            vec![
+                ObservedExecutionLane::SqlResult,
+                ObservedExecutionLane::Planner,
+                ObservedExecutionLane::Vdbe,
+                ObservedExecutionLane::CompatibilityFallback,
+            ],
+            "trace-success",
+            "run-success",
+            "scenario-success",
+            "select",
+            "unix",
+            "fallback_allowed",
+            "unix:fallback_allowed",
+            vec![FallbackDecisionEvidence {
+                statement_kind: "select".to_owned(),
+                fallback_boundary: "conn.select.with_clause_materialization".to_owned(),
+                decision_reason: "with_clause_materialization".to_owned(),
+                decision_outcome: "allowed_compatibility_fallback".to_owned(),
+                source_touchpoint: "execute_statement_dispatch".to_owned(),
+                first_failure_diagnostic: "statement_kind=select; fallback_boundary=conn.select.with_clause_materialization; source_touchpoint=execute_statement_dispatch; decision_reason=with_clause_materialization".to_owned(),
+                occurrences: 1,
+            }],
+            true,
+        );
+        let mismatch = ExecutionLaneEvidence::from_observations(
+            ExecutionLane::PagerBackedRequired,
+            vec![
+                ObservedExecutionLane::SqlResult,
+                ObservedExecutionLane::CompatibilityFallback,
+            ],
+            "trace-failure",
+            "run-failure",
+            "scenario-failure",
+            "select",
+            "unix",
+            "parity_cert_strict",
+            "unix:parity_cert_strict",
+            vec![FallbackDecisionEvidence {
+                statement_kind: "select".to_owned(),
+                fallback_boundary: "conn.select.with_clause_materialization".to_owned(),
+                decision_reason: "with_clause_materialization".to_owned(),
+                decision_outcome: "denied".to_owned(),
+                source_touchpoint: "execute_statement_dispatch".to_owned(),
+                first_failure_diagnostic: "statement_kind=select; fallback_boundary=conn.select.with_clause_materialization; source_touchpoint=execute_statement_dispatch; decision_reason=with_clause_materialization".to_owned(),
+                occurrences: 1,
+            }],
+            true,
+        );
+
+        assert!(success.validate().is_empty(), "{success:?}");
+        assert!(mismatch.validate().is_empty(), "{mismatch:?}");
+        tracing::subscriber::with_default(subscriber, || {
+            success.emit_diagnostic();
+            mismatch.emit_diagnostic();
+        });
+
+        let captured = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(captured.len(), 2, "one bounded event per run");
+        assert_eq!(captured[0].level, "INFO");
+        assert_eq!(
+            captured[0].fields.get("run_id").map(String::as_str),
+            Some("run-success")
+        );
+        assert_eq!(
+            captured[0].fields.get("trace_id").map(String::as_str),
+            Some("trace-success")
+        );
+        assert_eq!(
+            captured[0].fields.get("scenario_id").map(String::as_str),
+            Some("scenario-success")
+        );
+        assert_eq!(
+            captured[0]
+                .fields
+                .get("observed_lane_count")
+                .map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            captured[0].fields.get("planner_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            captured[0].fields.get("recovery_count").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            captured[0]
+                .fields
+                .get("fallback_boundary")
+                .map(String::as_str),
+            Some("conn.select.with_clause_materialization")
+        );
+        assert_eq!(
+            captured[0]
+                .fields
+                .get("fallback_outcome")
+                .map(String::as_str),
+            Some("allowed_compatibility_fallback")
+        );
+        assert_eq!(captured[1].level, "ERROR");
+        for field in [
+            "run_id",
+            "trace_id",
+            "scenario_id",
+            "statement_kind",
+            "required_lane",
+            "observed_lanes",
+            "backend_identity",
+            "backend_mode",
+            "fallback_boundary",
+            "fallback_reason",
+            "fallback_outcome",
+            "fallback_capture_complete",
+            "first_failure_diag",
+        ] {
+            assert!(
+                captured[1].fields.contains_key(field),
+                "missing field {field}"
+            );
+        }
+        assert_eq!(
+            captured[1]
+                .fields
+                .get("compatibility_fallback_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            captured[1]
+                .fields
+                .get("fallback_decision_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            captured[1]
+                .fields
+                .get("fallback_unique_decision_count")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn pager_required_rejects_forced_compatibility_fallback_with_reason() {
+        let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("execution-lane-fallback.db");
+        let oplog = execution_lane_test_oplog(
+            "WITH selected AS (SELECT value FROM lane_probe) SELECT value FROM selected;",
+        );
+        let config = FsqliteExecConfig {
+            max_busy_retries: 2,
+            busy_backoff: Duration::from_millis(1),
+            busy_backoff_max: Duration::from_millis(1),
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite_with_lane_requirement(
+            &db_path,
+            &oplog,
+            &config,
+            ExecutionLane::PagerBackedRequired,
+        )
+        .unwrap();
+        let lane = report
+            .storage_wiring
+            .as_ref()
+            .and_then(|storage| storage.execution_lane_evidence.as_ref())
+            .expect("lane evidence");
+
+        assert!(!lane.requirement_satisfied, "{lane:?}");
+        assert!(
+            lane.observed_lanes
+                .contains(&ObservedExecutionLane::CompatibilityFallback),
+            "{lane:?}"
+        );
+        assert!(
+            lane.fallback_decisions.iter().any(|decision| {
+                decision.decision_reason == "with_clause_materialization"
+                    && decision.decision_outcome == "denied"
+                    && decision.source_touchpoint
+                        == "execute_statement_dispatch:select:with_clause_materialization"
+                    && decision.occurrences == 1
+            }),
+            "{lane:?}"
+        );
+        assert!(lane.fallback_capture_complete, "{lane:?}");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("execution_lane_mismatch")),
+            "{report:?}"
+        );
+        assert!(lane.validate().is_empty(), "{lane:?}");
+    }
+
+    #[test]
+    fn pager_required_rejects_allowed_compatibility_fallback_from_core_evidence() {
+        let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("execution-lane-allowed-fallback.db");
+        let oplog = execution_lane_test_oplog(
+            "WITH selected AS (SELECT value FROM lane_probe) SELECT value FROM selected;",
+        );
+        let config = FsqliteExecConfig {
+            pragmas: vec!["PRAGMA fsqlite.parity_cert=OFF;".to_owned()],
+            max_busy_retries: 2,
+            busy_backoff: Duration::from_millis(1),
+            busy_backoff_max: Duration::from_millis(1),
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite_with_lane_requirement(
+            &db_path,
+            &oplog,
+            &config,
+            ExecutionLane::PagerBackedRequired,
+        )
+        .unwrap();
+        let storage = report.storage_wiring.as_ref().expect("storage wiring");
+        let lane = storage
+            .execution_lane_evidence
+            .as_ref()
+            .expect("lane evidence");
+
+        assert_eq!(storage.backend_mode, "fallback_allowed", "{report:?}");
+        assert!(!lane.requirement_satisfied, "{lane:?}");
+        assert!(lane.fallback_capture_complete, "{lane:?}");
+        assert_eq!(lane.fallback_decisions.len(), 1, "{lane:?}");
+        let fallback = &lane.fallback_decisions[0];
+        assert_eq!(fallback.statement_kind, "select");
+        assert_eq!(
+            fallback.fallback_boundary,
+            "conn.select.with_clause_materialization"
+        );
+        assert_eq!(fallback.decision_reason, "with_clause_materialization");
+        assert_eq!(fallback.decision_outcome, "allowed_compatibility_fallback");
+        assert_eq!(
+            fallback.source_touchpoint,
+            "execute_statement_dispatch:select:with_clause_materialization"
+        );
+        assert_eq!(fallback.occurrences, 1);
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("execution_lane_mismatch")),
+            "{report:?}"
+        );
+        assert!(lane.validate().is_empty(), "{lane:?}");
+    }
+
+    #[test]
+    fn public_native_recovery_produces_recovery_lane_evidence() {
+        let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
+        use fsqlite_types::ecs::ManifestSegment;
+        use fsqlite_wal::GLOBAL_WAL_RECOVERY_METRICS;
+        use fsqlite_wal::recovery_compaction::{NativeRecovery, RootManifest};
+
+        GLOBAL_WAL_RECOVERY_METRICS.reset();
+        let before = wal_telemetry_snapshot();
+        let mut recovery = NativeRecovery::new();
+        recovery.load_root_manifest(RootManifest {
+            ecs_epoch: 1,
+            latest_checkpoint: None,
+            manifest: ManifestSegment::new(Vec::new()),
+        });
+        recovery.replay_markers(&[], |_| unreachable!("empty marker stream"));
+        let summary = recovery.finalize(1);
+        assert!(summary.violations.is_empty());
+        let after = wal_telemetry_snapshot();
+        let profile = FsqliteHotPathProfile {
+            collection_mode: "runtime_counters".to_owned(),
+            parser: ParserHotPathProfile::default(),
+            vdbe: VdbeHotPathProfile::default(),
+            vfs: VfsHotPathProfile::default(),
+            wal: wal_delta(&after, &before),
+            decoded_values: HotPathValueHistogram::default(),
+            workload_input_types: HotPathValueHistogram::default(),
+            result_rows: ResultRowHotPathProfile::default(),
+            allocator_pressure: None,
+            btree: None,
+            runtime_retry: HotPathRetryBreakdown::default(),
+            statement_hotspots: Vec::new(),
+        };
+        GLOBAL_WAL_RECOVERY_METRICS.reset();
+        let oplog = execution_lane_test_oplog("SELECT value FROM lane_probe;");
+        let storage = StorageWiringReport {
+            backend_kind: "unix".to_owned(),
+            backend_mode: "parity_cert_strict".to_owned(),
+            backend_identity: "unix:parity_cert_strict".to_owned(),
+            execution_lane_evidence: None,
+        };
+
+        let evidence = build_execution_lane_evidence(
+            ExecutionLane::RecoveryRequired,
+            &oplog,
+            &storage,
+            Some(&profile),
+            None,
+            None,
+            &WorkerStats::default(),
+            false,
+            true,
+        );
+        assert!(evidence.requirement_satisfied, "{evidence:?}");
+        assert!(
+            evidence
+                .observed_lanes
+                .contains(&ObservedExecutionLane::Recovery),
+            "{evidence:?}"
+        );
+        assert!(
+            !evidence
+                .observed_lanes
+                .contains(&ObservedExecutionLane::SqlResult),
+            "synthetic recovery must not claim unobserved SQL execution: {evidence:?}"
+        );
+        assert_eq!(profile.wal.recovery_ops_total, 1);
+        assert!(evidence.validate().is_empty(), "{evidence:?}");
     }
 
     #[test]

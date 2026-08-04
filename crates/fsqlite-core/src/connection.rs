@@ -9820,6 +9820,75 @@ type CustomAggregateArities = HashMap<(String, i32), FunctionArity>;
 /// identity.
 const TEMP_MEMDB_ROOT_START: i32 = i32::MAX - 1;
 
+const MAX_FALLBACK_DECISION_EVIDENCE: usize = 64;
+
+/// One distinct fallback routing decision captured by a [`Connection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackDecisionRecord {
+    pub statement_kind: String,
+    pub fallback_boundary: String,
+    pub decision_reason: String,
+    pub decision_outcome: String,
+    pub source_touchpoint: String,
+    pub first_failure_diagnostic: String,
+    pub occurrences: u64,
+}
+
+impl FallbackDecisionRecord {
+    fn has_same_identity(&self, other: &Self) -> bool {
+        self.statement_kind == other.statement_kind
+            && self.fallback_boundary == other.fallback_boundary
+            && self.decision_reason == other.decision_reason
+            && self.decision_outcome == other.decision_outcome
+            && self.source_touchpoint == other.source_touchpoint
+            && self.first_failure_diagnostic == other.first_failure_diagnostic
+    }
+}
+
+/// Bounded snapshot of fallback routing decisions observed by a connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FallbackDecisionSnapshot {
+    pub decisions: Vec<FallbackDecisionRecord>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Default)]
+struct FallbackDecisionCapture {
+    decisions: Vec<FallbackDecisionRecord>,
+    truncated: bool,
+}
+
+impl FallbackDecisionCapture {
+    fn record(&mut self, mut decision: FallbackDecisionRecord) {
+        if let Some(existing) = self
+            .decisions
+            .iter_mut()
+            .find(|existing| existing.has_same_identity(&decision))
+        {
+            existing.occurrences = existing.occurrences.saturating_add(1);
+            return;
+        }
+        if self.decisions.len() >= MAX_FALLBACK_DECISION_EVIDENCE {
+            self.truncated = true;
+            return;
+        }
+        decision.occurrences = 1;
+        self.decisions.push(decision);
+    }
+
+    fn snapshot(&self) -> FallbackDecisionSnapshot {
+        FallbackDecisionSnapshot {
+            decisions: self.decisions.clone(),
+            truncated: self.truncated,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.decisions.clear();
+        self.truncated = false;
+    }
+}
+
 pub struct Connection {
     path: String,
     /// In-memory execution image shared with the VDBE engine.
@@ -10480,6 +10549,9 @@ pub struct Connection {
     /// certifying runs to fail fast on unsupported fallback paths without
     /// changing default developer ergonomics.
     reject_mem_fallback_strict: RefCell<bool>,
+    /// Bounded structured evidence emitted from the authoritative fallback
+    /// decision point. This remains active even when tracing is disabled.
+    fallback_decision_capture: RefCell<FallbackDecisionCapture>,
     // ── Virtual table module registry (bd-196x4) ────────────────────────────
     /// Registered virtual-table module factories, keyed by module name
     /// (uppercased).  Used by `CREATE VIRTUAL TABLE ... USING module(args)`.
@@ -11753,6 +11825,7 @@ impl Connection {
             defer_fts5_hydration,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
+            fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
             dropped_vtab_instances: RefCell::new(HashMap::new()),
@@ -12216,6 +12289,7 @@ impl Connection {
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
+            fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
             // Virtual table module registry (bd-196x4)
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
@@ -15333,6 +15407,18 @@ impl Connection {
         *self.reject_mem_fallback_strict.borrow_mut() = strict;
     }
 
+    /// Return the bounded fallback-decision evidence observed since open or
+    /// the most recent reset.
+    #[must_use]
+    pub fn fallback_decision_snapshot(&self) -> FallbackDecisionSnapshot {
+        self.fallback_decision_capture.borrow().snapshot()
+    }
+
+    /// Clear all connection-local fallback-decision evidence.
+    pub fn reset_fallback_decision_evidence(&self) {
+        self.fallback_decision_capture.borrow_mut().reset();
+    }
+
     #[must_use]
     fn backend_mode_label(&self) -> &'static str {
         if *self.reject_mem_fallback.borrow() {
@@ -15521,6 +15607,17 @@ impl Connection {
         );
         let statement_fingerprint =
             Self::fallback_statement_fingerprint(statement_kind, decision_reason);
+        self.fallback_decision_capture
+            .borrow_mut()
+            .record(FallbackDecisionRecord {
+                statement_kind: statement_kind.to_owned(),
+                fallback_boundary: fallback_boundary.clone(),
+                decision_reason: decision_reason.to_owned(),
+                decision_outcome: decision_outcome.to_owned(),
+                source_touchpoint: source_touchpoint.clone(),
+                first_failure_diagnostic: first_failure_diag.clone(),
+                occurrences: 1,
+            });
         let backend_identity = self.backend_identity();
         let (run_id, scenario_id) = statement_reuse_log_context_from_env();
         if decision_outcome == "denied" {
@@ -36854,13 +36951,19 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<(Vec<String>, Vec<Vec<SqliteValue>>)>> {
         let table_name = &update.table.name.name;
-        let schema = self.schema.borrow();
-        let table = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(table_name))
-            .ok_or_else(|| FrankenError::NoSuchTable {
-                name: table_name.clone(),
-            })?;
+        let targets_shadowed_main = self.targets_shadowed_main(&update.table.name);
+        let visible_schema = self.schema.borrow();
+        let shadowed_schema = self.shadowed_main_tables.borrow();
+        let table = if targets_shadowed_main {
+            shadowed_schema.get(&table_name.to_ascii_lowercase())
+        } else {
+            visible_schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+        }
+        .ok_or_else(|| FrankenError::NoSuchTable {
+            name: table_name.clone(),
+        })?;
 
         let locator_columns = if table.without_rowid {
             let indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
@@ -36885,7 +36988,8 @@ impl Connection {
                 return Ok(None);
             }
         };
-        drop(schema);
+        drop(visible_schema);
+        drop(shadowed_schema);
 
         if locator_columns.is_empty() {
             return Ok(None);
@@ -121582,16 +121686,16 @@ mod tests {
     }
 
     struct MetadataReentrantWindowFunction {
-        name_calls: Arc<AtomicUsize>,
-        arity_calls: Arc<AtomicUsize>,
-        min_args_calls: Arc<AtomicUsize>,
-        max_args_calls: Arc<AtomicUsize>,
+        name_lookups: Arc<AtomicUsize>,
+        arity_queries: Arc<AtomicUsize>,
+        min_args_checks: Arc<AtomicUsize>,
+        max_args_reads: Arc<AtomicUsize>,
     }
 
     struct MetadataReentrantScalarFunction {
-        name_calls: Arc<AtomicUsize>,
-        arity_calls: Arc<AtomicUsize>,
-        deterministic_calls: Arc<AtomicUsize>,
+        name_lookups: Arc<AtomicUsize>,
+        arity_queries: Arc<AtomicUsize>,
+        determinism_checks: Arc<AtomicUsize>,
     }
 
     impl fsqlite_func::ScalarFunction for MetadataReentrantScalarFunction {
@@ -121600,8 +121704,7 @@ mod tests {
         }
 
         fn is_deterministic(&self) -> bool {
-            self.deterministic_calls
-                .fetch_add(1, AtomicOrdering::SeqCst);
+            self.determinism_checks.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_scalar_nested_deterministic",
@@ -121611,7 +121714,7 @@ mod tests {
         }
 
         fn num_args(&self) -> i32 {
-            self.arity_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.arity_queries.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_scalar_nested_arity",
@@ -121621,7 +121724,7 @@ mod tests {
         }
 
         fn name(&self) -> &str {
-            self.name_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.name_lookups.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_scalar_nested_name",
@@ -121699,7 +121802,7 @@ mod tests {
         }
 
         fn num_args(&self) -> i32 {
-            let callback_index = self.arity_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let callback_index = self.arity_queries.fetch_add(1, AtomicOrdering::SeqCst);
             let nested_name = if callback_index == 0 {
                 "metadata_nested_0"
             } else {
@@ -121714,7 +121817,7 @@ mod tests {
         }
 
         fn min_args(&self) -> i32 {
-            self.min_args_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.min_args_checks.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_nested_min_args",
@@ -121724,7 +121827,7 @@ mod tests {
         }
 
         fn max_args(&self) -> Option<i32> {
-            self.max_args_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.max_args_reads.fetch_add(1, AtomicOrdering::SeqCst);
             reentrant_vtab_connection().register_deterministic_scalar_function(
                 MetadataNestedScalarFunction {
                     function_name: "metadata_nested_max_args",
@@ -121734,7 +121837,7 @@ mod tests {
         }
 
         fn name(&self) -> &str {
-            self.name_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.name_lookups.fetch_add(1, AtomicOrdering::SeqCst);
             "metadata_reentrant_window"
         }
     }
@@ -122240,6 +122343,10 @@ mod tests {
             })
         }
 
+        #[allow(
+            clippy::collapsible_match,
+            reason = "the explicit VT_PERMUTE arm must remain a handled no-op when fewer than two usages exist"
+        )]
         fn best_index(&self, info: &mut VtabIndexInfo) -> Result<()> {
             match self.table_name.as_str() {
                 "VT_EXTEND" => info.constraint_usage.push(Default::default()),
@@ -145715,7 +145822,7 @@ mod tests {
 
             let view_index = fconn.view_index_of("view_metadata").unwrap();
             let schema_snapshot = fconn.schema.borrow().clone();
-            let mut resolver = super::CteResultMetadataResolver::new(&fconn, &schema_snapshot);
+            let resolver = super::CteResultMetadataResolver::new(&fconn, &schema_snapshot);
             let metadata = resolver.resolve_view(view_index);
             assert_eq!(
                 metadata.names,
@@ -157095,7 +157202,7 @@ mod tests {
             assert!(
                 native_scalar_lhs
                     .iter()
-                    .all(|row| row.values() == &[SqliteValue::Integer(1)])
+                    .all(|row| row.values() == [SqliteValue::Integer(1)])
             );
             let prepared_native_scalar_lhs = conn.prepare(native_scalar_lhs_sql).await.unwrap();
             let prepared_native_scalar_lhs_rows = prepared_native_scalar_lhs.query().await.unwrap();
@@ -157103,7 +157210,7 @@ mod tests {
             assert!(
                 prepared_native_scalar_lhs_rows
                     .iter()
-                    .all(|row| row.values() == &[SqliteValue::Integer(1)])
+                    .all(|row| row.values() == [SqliteValue::Integer(1)])
             );
 
             conn.execute("CREATE TABLE rhs_collation (v TEXT);")
@@ -157153,7 +157260,7 @@ mod tests {
             assert!(
                 scalar_inner_collation_rows
                     .iter()
-                    .all(|row| row.values() == &[SqliteValue::Integer(0)])
+                    .all(|row| row.values() == [SqliteValue::Integer(0)])
             );
             let prepared_scalar_inner_collation =
                 conn.prepare(scalar_inner_collation_sql).await.unwrap();
@@ -157163,7 +157270,7 @@ mod tests {
                     .await
                     .unwrap()
                     .iter()
-                    .all(|row| row.values() == &[SqliteValue::Integer(0)])
+                    .all(|row| row.values() == [SqliteValue::Integer(0)])
             );
 
             // Native complex-IN lowering retains the representative source row
@@ -158460,10 +158567,10 @@ mod tests {
             let max_args_calls = Arc::new(AtomicUsize::new(0));
 
             connection.register_window_function(MetadataReentrantWindowFunction {
-                name_calls: Arc::clone(&name_calls),
-                arity_calls: Arc::clone(&arity_calls),
-                min_args_calls: Arc::clone(&min_args_calls),
-                max_args_calls: Arc::clone(&max_args_calls),
+                name_lookups: Arc::clone(&name_calls),
+                arity_queries: Arc::clone(&arity_calls),
+                min_args_checks: Arc::clone(&min_args_calls),
+                max_args_reads: Arc::clone(&max_args_calls),
             });
 
             assert_eq!(
@@ -158533,9 +158640,9 @@ mod tests {
             let deterministic_calls = Arc::new(AtomicUsize::new(0));
 
             connection.register_deterministic_scalar_function(MetadataReentrantScalarFunction {
-                name_calls: Arc::clone(&name_calls),
-                arity_calls: Arc::clone(&arity_calls),
-                deterministic_calls: Arc::clone(&deterministic_calls),
+                name_lookups: Arc::clone(&name_calls),
+                arity_queries: Arc::clone(&arity_calls),
+                determinism_checks: Arc::clone(&deterministic_calls),
             });
 
             assert_eq!(name_calls.load(AtomicOrdering::SeqCst), 1);
@@ -168059,17 +168166,16 @@ mod tests {
             offset: u64,
         ) -> impl std::future::Future<Output = std::result::Result<usize, FrankenError>> + Send + 'a
         {
-            async move {
-                buf.fill(0);
-                if offset >= self.size {
-                    return Ok(0);
-                }
+            buf.fill(0);
+            let bytes = if offset >= self.size {
+                0
+            } else {
                 let remaining = self.size.saturating_sub(offset);
-                let bytes = usize::try_from(remaining)
+                usize::try_from(remaining)
                     .unwrap_or(usize::MAX)
-                    .min(buf.len());
-                Ok(bytes)
-            }
+                    .min(buf.len())
+            };
+            std::future::ready(Ok(bytes))
         }
 
         fn write<'a>(
@@ -168079,11 +168185,9 @@ mod tests {
             _offset: u64,
         ) -> impl std::future::Future<Output = std::result::Result<(), FrankenError>> + Send + 'a
         {
-            async move {
-                Err(FrankenError::internal(
-                    "write is unused in read-only WAL probe test",
-                ))
-            }
+            std::future::ready(Err(FrankenError::internal(
+                "write is unused in read-only WAL probe test",
+            )))
         }
 
         fn truncate(&mut self, _cx: &Cx, _size: u64) -> std::result::Result<(), FrankenError> {
@@ -184407,6 +184511,85 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_fallback_decision_snapshot_aggregates_and_resets() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.expect("open db");
+            for _ in 0..2 {
+                conn.log_fallback_decision_event(
+                    "select",
+                    "with_clause_materialization",
+                    "execute_statement_dispatch",
+                );
+            }
+
+            let snapshot = conn.fallback_decision_snapshot();
+            assert!(!snapshot.truncated);
+            assert_eq!(snapshot.decisions.len(), 1);
+            assert_eq!(
+                snapshot.decisions[0],
+                FallbackDecisionRecord {
+                    statement_kind: "select".to_owned(),
+                    fallback_boundary: "conn.select.with_clause_materialization".to_owned(),
+                    decision_reason: "with_clause_materialization".to_owned(),
+                    decision_outcome: "allowed_compatibility_fallback".to_owned(),
+                    source_touchpoint:
+                        "execute_statement_dispatch:select:with_clause_materialization".to_owned(),
+                    first_failure_diagnostic: "statement_kind=select; \
+                        fallback_boundary=conn.select.with_clause_materialization; \
+                        source_touchpoint=execute_statement_dispatch:select:with_clause_materialization; \
+                        decision_reason=with_clause_materialization"
+                        .to_owned(),
+                    occurrences: 2,
+                }
+            );
+
+            conn.reset_fallback_decision_evidence();
+            assert_eq!(
+                conn.fallback_decision_snapshot(),
+                FallbackDecisionSnapshot::default()
+            );
+        });
+    }
+
+    #[test]
+    fn test_fallback_decision_capture_is_bounded_and_counts_known_keys_after_truncation() {
+        let mut capture = FallbackDecisionCapture::default();
+        for index in 0..=MAX_FALLBACK_DECISION_EVIDENCE {
+            let decision_reason = format!("reason-{index}");
+            capture.record(FallbackDecisionRecord {
+                statement_kind: "select".to_owned(),
+                fallback_boundary: format!("conn.select.{decision_reason}"),
+                decision_reason,
+                decision_outcome: "allowed_compatibility_fallback".to_owned(),
+                source_touchpoint: format!("test:select:reason-{index}"),
+                first_failure_diagnostic: format!("reason-{index}"),
+                occurrences: u64::MAX,
+            });
+        }
+
+        let truncated = capture.snapshot();
+        assert!(truncated.truncated);
+        assert_eq!(truncated.decisions.len(), MAX_FALLBACK_DECISION_EVIDENCE);
+        assert!(
+            truncated
+                .decisions
+                .iter()
+                .all(|decision| decision.occurrences == 1)
+        );
+
+        capture.record(FallbackDecisionRecord {
+            statement_kind: "select".to_owned(),
+            fallback_boundary: "conn.select.reason-0".to_owned(),
+            decision_reason: "reason-0".to_owned(),
+            decision_outcome: "allowed_compatibility_fallback".to_owned(),
+            source_touchpoint: "test:select:reason-0".to_owned(),
+            first_failure_diagnostic: "reason-0".to_owned(),
+            occurrences: 1,
+        });
+        assert_eq!(capture.snapshot().decisions[0].occurrences, 2);
+    }
+
+    #[test]
     fn test_select_routes_through_pager_with_autocommit() {
         asupersync::test_utils::run_test(|| async {
             // A simple table-backed SELECT with autocommit should work via the
@@ -187086,12 +187269,14 @@ mod pager_routing_tests {
                 )
             }
 
+            type WorkerOutcome = (Vec<i64>, Vec<(i64, i64, u32, String)>);
+
             let thread_results = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for worker_idx in 0_i64..4 {
                     let db = db.clone();
                     handles.push(scope.spawn(move || {
-                    let mut worker_outcome: Option<(Vec<i64>, Vec<(i64, i64, u32, String)>)> = None;
+                    let mut worker_outcome: Option<WorkerOutcome> = None;
                     asupersync::test_utils::run_test(|| async {
                     let conn = open_connection_with_transient_retry(&db).await;
                     conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();

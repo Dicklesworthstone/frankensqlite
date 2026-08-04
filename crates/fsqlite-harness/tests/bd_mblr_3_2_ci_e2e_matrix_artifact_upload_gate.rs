@@ -15,8 +15,8 @@ use fsqlite_harness::ci_gate_matrix::{
 };
 use fsqlite_harness::e2e_logging_init::{E2eLoggingConfig, LogOutputFormat, RunContext};
 use fsqlite_harness::failure_bundle::{
-    BUNDLE_SCHEMA_VERSION, EnvironmentInfo, FailureBundle, FailureInfo, FailureType,
-    FirstDivergence, ReproducibilityInfo, ScenarioInfo,
+    BUNDLE_SCHEMA_VERSION, EnvironmentInfo, ExecutionLaneEvidence, FailureBundle, FailureInfo,
+    FailureType, FirstDivergence, ReproducibilityInfo, ScenarioInfo,
 };
 
 const BEAD_ID: &str = "bd-mblr.3.2";
@@ -67,6 +67,12 @@ fn make_failure_bundle(scenario_id: &str, failure_type: FailureType, seed: u64) 
         bundle_id: format!("{BEAD_ID}-bundle-{scenario_id}"),
         created_at: "2026-02-21T12:00:00Z".to_owned(),
         run_id: format!("{BEAD_ID}-run-{seed}"),
+        execution_lane_evidence: ExecutionLaneEvidence::semantic_only(
+            "trace-artifact-upload",
+            format!("{BEAD_ID}-run-{seed}"),
+            scenario_id,
+            "artifact_upload_gate",
+        ),
         scenario: ScenarioInfo {
             scenario_id: scenario_id.to_owned(),
             bead_id: BEAD_ID.to_owned(),
