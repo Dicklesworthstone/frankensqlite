@@ -867,6 +867,7 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
         let namespace_gate = suffixed_path(&path, "-fsqlite-ns-gate");
         let namespace_use = suffixed_path(&path, "-fsqlite-ns-use");
         let wal = suffixed_path(&path, "-wal");
+        let wal_certificate = suffixed_path(&path, "-wal-cert");
         let shm = suffixed_path(&path, "-shm");
         assert!(
             namespace_gate.exists(),
@@ -879,6 +880,10 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
         assert!(
             wal.exists(),
             "fixture must retain a WAL companion for readback"
+        );
+        assert!(
+            wal_certificate.exists(),
+            "fixture must retain the WAL certificate paired with the WAL"
         );
         let sentinel_modified = UNIX_EPOCH + Duration::from_secs(946_684_800);
         File::options()
@@ -899,6 +904,10 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
                 .expect("namespace use file name")
                 .to_owned(),
             wal.file_name().expect("WAL file name").to_owned(),
+            wal_certificate
+                .file_name()
+                .expect("WAL certificate file name")
+                .to_owned(),
         ]);
         if shm.exists() {
             expected_names.insert(shm.file_name().expect("SHM file name").to_owned());
@@ -909,7 +918,7 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
             expected_names,
-            "GH #294 steady-state fixture must contain exactly main, WAL, namespace, and any native filesystem-backed SHM artifacts before the read-only open"
+            "GH #294 steady-state fixture must contain exactly main, WAL, WAL-certificate, namespace, and any native filesystem-backed SHM artifacts before the read-only open"
         );
 
         let readonly = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
