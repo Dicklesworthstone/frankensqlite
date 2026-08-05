@@ -1546,15 +1546,15 @@ impl FastPageArray {
     /// Remove and return a page entry.
     fn take(&mut self, page_no: PageNumber) -> Option<CachedPageEntry> {
         let idx = Self::pgno_to_idx(page_no);
-        if let Some(slot) = self.pages.get_mut(idx) {
-            if let Some(entry) = slot.take() {
-                self.count = self.count.saturating_sub(1);
-                if self.count == 0 {
-                    self.next_eviction_scan_start = 0;
-                }
-                self.evictions = self.evictions.saturating_add(1);
-                return Some(entry);
+        if let Some(slot) = self.pages.get_mut(idx)
+            && let Some(entry) = slot.take()
+        {
+            self.count = self.count.saturating_sub(1);
+            if self.count == 0 {
+                self.next_eviction_scan_start = 0;
             }
+            self.evictions = self.evictions.saturating_add(1);
+            return Some(entry);
         }
         None
     }
@@ -2978,10 +2978,10 @@ impl ShardedPageCache {
     }
 
     fn resident_pages(&self) -> Vec<PageNumber> {
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                return fast.lock().resident_pages();
-            }
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            return fast.lock().resident_pages();
         }
 
         let mut residents = self.flat_slots.resident_pages();
@@ -3002,10 +3002,10 @@ impl ShardedPageCache {
     /// prefer `metrics_snapshot()` which aggregates all counters atomically.
     pub fn len(&self) -> usize {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                return fast.lock().len();
-            }
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            return fast.lock().len();
         }
         // Flat slots (bd-eorms) + overflow shards
         self.flat_slots.len() + self.shards.iter().map(|s| s.lock().len()).sum::<usize>()
@@ -3014,10 +3014,10 @@ impl ShardedPageCache {
     /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                return fast.lock().len() == 0;
-            }
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            return fast.lock().len() == 0;
         }
         self.flat_slots.len() == 0 && self.shards.iter().all(|s| s.lock().pages.is_empty())
     }
@@ -3026,10 +3026,10 @@ impl ShardedPageCache {
     #[inline]
     pub fn contains(&self, page_no: PageNumber) -> bool {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                return fast.lock().contains(page_no);
-            }
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            return fast.lock().contains(page_no);
         }
         // Flat slots first (lock-free probe), then overflow shard
         if self.flat_slots.contains(page_no) {
@@ -3049,14 +3049,14 @@ impl ShardedPageCache {
     #[inline]
     pub fn get(&self, page_no: PageNumber) -> Option<Vec<u8>> {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let result = fast.lock().get(page_no).map(|s| s.to_vec());
-                if result.is_some() {
-                    self.record_eviction_access(page_no);
-                }
-                return result;
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let result = fast.lock().get(page_no).map(|s| s.to_vec());
+            if result.is_some() {
+                self.record_eviction_access(page_no);
             }
+            return result;
         }
         // Flat slots (bd-eorms) — lock-free probe, per-slot Mutex on hit
         if let Some(data) = self.flat_slots.get_copy(page_no) {
@@ -3081,14 +3081,14 @@ impl ShardedPageCache {
     #[inline]
     pub fn with_page<R>(&self, page_no: PageNumber, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let result = fast.lock().get(page_no).map(f);
-                if result.is_some() {
-                    self.record_eviction_access(page_no);
-                }
-                return result;
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let result = fast.lock().get(page_no).map(f);
+            if result.is_some() {
+                self.record_eviction_access(page_no);
             }
+            return result;
         }
         // Flat slots (bd-eorms) — find_slot is lock-free; data Mutex on hit only
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
@@ -3123,14 +3123,14 @@ impl ShardedPageCache {
         f: impl FnOnce(&mut [u8]) -> R,
     ) -> Option<R> {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let result = fast.lock().get_mut(page_no).map(f);
-                if result.is_some() {
-                    self.record_eviction_access(page_no);
-                }
-                return result;
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let result = fast.lock().get_mut(page_no).map(f);
+            if result.is_some() {
+                self.record_eviction_access(page_no);
             }
+            return result;
         }
         // Flat slots (bd-eorms)
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
@@ -3257,25 +3257,25 @@ impl ShardedPageCache {
         f: impl FnOnce(&mut [u8]) -> R,
     ) -> Result<R> {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let mut arr = fast.lock();
-                let mut buf = self.pool.acquire()?;
-                buf.as_mut_slice().fill(0);
-                let result = f(buf.as_mut_slice());
-                let admitted_new = arr.insert(page_no, buf);
-                if let Some(Some(entry)) = arr.pages.get_mut(FastPageArray::pgno_to_idx(page_no)) {
-                    entry.mark_dirty();
-                    entry.record_access();
-                }
-                drop(arr);
-                if admitted_new {
-                    self.record_eviction_admit(page_no);
-                } else {
-                    self.record_eviction_access(page_no);
-                }
-                return Ok(result);
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let mut arr = fast.lock();
+            let mut buf = self.pool.acquire()?;
+            buf.as_mut_slice().fill(0);
+            let result = f(buf.as_mut_slice());
+            let admitted_new = arr.insert(page_no, buf);
+            if let Some(Some(entry)) = arr.pages.get_mut(FastPageArray::pgno_to_idx(page_no)) {
+                entry.mark_dirty();
+                entry.record_access();
             }
+            drop(arr);
+            if admitted_new {
+                self.record_eviction_admit(page_no);
+            } else {
+                self.record_eviction_access(page_no);
+            }
+            return Ok(result);
         }
 
         // Allocate and zero the buffer, call f, then insert into flat slots.
@@ -3305,21 +3305,21 @@ impl ShardedPageCache {
         post_install: impl FnOnce(),
     ) {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let admitted_new = fast.lock().insert(page_no, buf);
-                // `FastPageArray::insert` constructs a clean entry. Do not
-                // reacquire the array lock to mark by page number: a newer
-                // dirty replacement may have won between those two critical
-                // sections, and cleaning it would silently lose dirty state.
-                post_install();
-                if admitted_new {
-                    self.record_eviction_admit(page_no);
-                } else {
-                    self.record_eviction_access(page_no);
-                }
-                return;
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let admitted_new = fast.lock().insert(page_no, buf);
+            // `FastPageArray::insert` constructs a clean entry. Do not
+            // reacquire the array lock to mark by page number: a newer
+            // dirty replacement may have won between those two critical
+            // sections, and cleaning it would silently lose dirty state.
+            post_install();
+            if admitted_new {
+                self.record_eviction_admit(page_no);
+            } else {
+                self.record_eviction_access(page_no);
             }
+            return;
         }
         // Flat slots first; overflow to shard.
         let admitted_new = self.insert_tiered(page_no, buf, false);
@@ -3337,15 +3337,15 @@ impl ShardedPageCache {
     /// Evict a specific page from the cache.
     pub fn evict(&self, page_no: PageNumber) -> bool {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let removed = fast.lock().remove(page_no);
-                if removed {
-                    self.remove_overflow_duplicate(page_no);
-                    self.forget_eviction_page(page_no);
-                }
-                return removed;
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let removed = fast.lock().remove(page_no);
+            if removed {
+                self.remove_overflow_duplicate(page_no);
+                self.forget_eviction_page(page_no);
             }
+            return removed;
         }
         // Try flat slots first, then overflow shard.
         if self.flat_slots.remove(page_no) {
@@ -3543,16 +3543,16 @@ impl ShardedPageCache {
         }
 
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let removed = fast.lock().remove_any();
-                if let Some(page_no) = removed {
-                    self.remove_overflow_duplicate(page_no);
-                    self.forget_eviction_page(page_no);
-                    return true;
-                }
-                return false;
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let removed = fast.lock().remove_any();
+            if let Some(page_no) = removed {
+                self.remove_overflow_duplicate(page_no);
+                self.forget_eviction_page(page_no);
+                return true;
             }
+            return false;
         }
         // Flat slots first (bd-eorms)
         if let Some(page_no) = self.flat_slots.remove_any_page() {
@@ -3643,18 +3643,18 @@ impl ShardedPageCache {
     /// 2026-04-23 hotspot capture (bd-m4s2c).
     #[must_use]
     pub fn metrics_lightweight_snapshot(&self) -> PageCacheLightweightSnapshot {
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let arr = fast.lock();
-                return PageCacheLightweightSnapshot {
-                    hits: arr.hits,
-                    misses: arr.misses,
-                    admits: arr.admits,
-                    evictions: arr.evictions,
-                    cached_pages: arr.len(),
-                    pool_capacity: self.pool.capacity(),
-                };
-            }
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let arr = fast.lock();
+            return PageCacheLightweightSnapshot {
+                hits: arr.hits,
+                misses: arr.misses,
+                admits: arr.admits,
+                evictions: arr.evictions,
+                cached_pages: arr.len(),
+                pool_capacity: self.pool.capacity(),
+            };
         }
         let mut total_hits = self.flat_slots.hits.load(Ordering::Relaxed);
         let mut total_misses = self.flat_slots.misses.load(Ordering::Relaxed);
@@ -3683,49 +3683,49 @@ impl ShardedPageCache {
     #[must_use]
     pub fn metrics_snapshot(&self) -> PageCacheMetricsSnapshot {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let arr = fast.lock();
-                let dirty_pages = arr
-                    .pages
-                    .iter()
-                    .filter(|slot| slot.as_ref().is_some_and(CachedPageEntry::is_dirty))
-                    .count();
-                let queue_snapshot = {
-                    let tracker = self.eviction_policy.lock();
-                    if matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_)) {
-                        let residents = arr.resident_pages();
-                        tracker.queue_snapshot(&residents)
-                    } else {
-                        None
-                    }
-                };
-                let (t1_size, t2_size, b1_size, p_target) = if let Some(snapshot) = queue_snapshot {
-                    (
-                        snapshot.small_len,
-                        snapshot.main_len,
-                        snapshot.ghost_len,
-                        snapshot.small_capacity,
-                    )
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let arr = fast.lock();
+            let dirty_pages = arr
+                .pages
+                .iter()
+                .filter(|slot| slot.as_ref().is_some_and(CachedPageEntry::is_dirty))
+                .count();
+            let queue_snapshot = {
+                let tracker = self.eviction_policy.lock();
+                if matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_)) {
+                    let residents = arr.resident_pages();
+                    tracker.queue_snapshot(&residents)
                 } else {
-                    (arr.len(), 0, 0, arr.len())
-                };
-                return PageCacheMetricsSnapshot {
-                    hits: arr.hits,
-                    misses: arr.misses,
-                    admits: arr.admits,
-                    evictions: arr.evictions,
-                    cached_pages: arr.len(),
-                    pool_capacity: self.pool.capacity(),
-                    dirty_ratio_pct: percent_ratio_u64(dirty_pages, arr.len()),
-                    t1_size,
-                    t2_size,
-                    b1_size,
-                    b2_size: 0,
-                    p_target,
-                    mvcc_multi_version_pages: 0,
-                };
-            }
+                    None
+                }
+            };
+            let (t1_size, t2_size, b1_size, p_target) = if let Some(snapshot) = queue_snapshot {
+                (
+                    snapshot.small_len,
+                    snapshot.main_len,
+                    snapshot.ghost_len,
+                    snapshot.small_capacity,
+                )
+            } else {
+                (arr.len(), 0, 0, arr.len())
+            };
+            return PageCacheMetricsSnapshot {
+                hits: arr.hits,
+                misses: arr.misses,
+                admits: arr.admits,
+                evictions: arr.evictions,
+                cached_pages: arr.len(),
+                pool_capacity: self.pool.capacity(),
+                dirty_ratio_pct: percent_ratio_u64(dirty_pages, arr.len()),
+                t1_size,
+                t2_size,
+                b1_size,
+                b2_size: 0,
+                p_target,
+                mvcc_multi_version_pages: 0,
+            };
         }
 
         // Flat slots metrics (bd-eorms)
@@ -3858,11 +3858,11 @@ impl ShardedPageCache {
     /// Reset cache counters while preserving resident pages.
     pub fn reset_metrics(&self) {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                fast.lock().reset_metrics();
-                return;
-            }
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            fast.lock().reset_metrics();
+            return;
         }
         self.flat_slots.reset_metrics();
         for shard in self.shards.iter() {
@@ -3929,14 +3929,14 @@ impl ShardedPageCache {
     #[inline]
     pub fn get_copy(&self, page_no: PageNumber) -> Option<Vec<u8>> {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let result = fast.lock().get(page_no).map(|data| data.to_vec());
-                if result.is_some() {
-                    self.record_eviction_access(page_no);
-                }
-                return result;
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let result = fast.lock().get(page_no).map(|data| data.to_vec());
+            if result.is_some() {
+                self.record_eviction_access(page_no);
             }
+            return result;
         }
         // Flat slots (bd-eorms)
         if let Some(data) = self.flat_slots.get_copy(page_no) {
@@ -3960,14 +3960,14 @@ impl ShardedPageCache {
     /// invalidates it.
     pub fn get_shared(&self, page_no: PageNumber) -> Option<PageData> {
         // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let result = fast.lock().get_shared(page_no);
-                if result.is_some() {
-                    self.record_eviction_access(page_no);
-                }
-                return result;
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let result = fast.lock().get_shared(page_no);
+            if result.is_some() {
+                self.record_eviction_access(page_no);
             }
+            return result;
         }
         // Flat slots (bd-eorms)
         if let Some(data) = self.flat_slots.get_shared(page_no) {

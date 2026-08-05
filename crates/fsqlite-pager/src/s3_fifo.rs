@@ -57,7 +57,7 @@ impl S3FifoConfig {
 
         let scaled_capacity = capacity.saturating_mul(DEFAULT_SMALL_RATIO_NUM);
         let mut small_capacity = scaled_capacity / DEFAULT_SMALL_RATIO_DEN;
-        if scaled_capacity % DEFAULT_SMALL_RATIO_DEN != 0 {
+        if !scaled_capacity.is_multiple_of(DEFAULT_SMALL_RATIO_DEN) {
             small_capacity = small_capacity.saturating_add(1);
         }
         if small_capacity == 0 {
@@ -674,11 +674,11 @@ impl S3Fifo {
             let Some((page_id, epoch)) = self.ghost.pop_front() else {
                 break;
             };
-            if let Some(EntryState::Ghost(current_epoch)) = self.index.get(&page_id) {
-                if *current_epoch == epoch {
-                    self.index.remove(&page_id);
-                    events.push(S3FifoEvent::GhostTrimmed(page_id));
-                }
+            if let Some(EntryState::Ghost(current_epoch)) = self.index.get(&page_id)
+                && *current_epoch == epoch
+            {
+                self.index.remove(&page_id);
+                events.push(S3FifoEvent::GhostTrimmed(page_id));
             }
         }
     }
@@ -773,7 +773,7 @@ fn ceil_ratio(value: usize, numerator: usize, denominator: usize) -> usize {
     assert!(denominator > 0, "denominator must be > 0");
     let scaled = value.saturating_mul(numerator);
     let mut out = scaled / denominator;
-    if scaled % denominator != 0 {
+    if !scaled.is_multiple_of(denominator) {
         out = out.saturating_add(1);
     }
     out

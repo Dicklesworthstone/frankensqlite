@@ -114,7 +114,7 @@ impl ThompsonPartitioner {
     pub fn tick(&self) -> bool {
         let prev = self.access_count.fetch_add(1, Ordering::Relaxed);
         let count = prev.wrapping_add(1);
-        if count % RESAMPLE_INTERVAL == 0 {
+        if count.is_multiple_of(RESAMPLE_INTERVAL) {
             self.resample();
             true
         } else {

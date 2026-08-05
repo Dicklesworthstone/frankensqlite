@@ -400,7 +400,8 @@ const fn flush_busy_retry_spin_loops(attempt: u32) -> u32 {
 }
 
 const fn flush_busy_retry_should_yield(attempt: u32) -> bool {
-    attempt >= FLUSH_BUSY_HANDOFF_YIELD_EVERY && attempt % FLUSH_BUSY_HANDOFF_YIELD_EVERY == 0
+    attempt >= FLUSH_BUSY_HANDOFF_YIELD_EVERY
+        && attempt.is_multiple_of(FLUSH_BUSY_HANDOFF_YIELD_EVERY)
 }
 
 const fn flush_busy_retry_wait(attempt: u32) -> FlushBusyRetryWait {
@@ -1444,10 +1445,10 @@ struct GroupCommitEpochConsumer {
 
 impl Drop for GroupCommitEpochConsumer {
     fn drop(&mut self) {
-        if self.tracked {
-            if let Some(queue) = self.queue.upgrade() {
-                queue.release_epoch_consumer(self.epoch);
-            }
+        if self.tracked
+            && let Some(queue) = self.queue.upgrade()
+        {
+            queue.release_epoch_consumer(self.epoch);
         }
     }
 }
@@ -7780,10 +7781,10 @@ impl<F: VfsFile> PagerInner<F> {
     ) -> Result<Vec<u8>> {
         // In WAL mode, check the WAL for the latest version of the page first.
         // bd-db300.3.8.7: try shared-lock path when the backend supports pinned reads.
-        if self.journal_mode == JournalMode::Wal {
-            if let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no).await? {
-                return Ok(data);
-            }
+        if self.journal_mode == JournalMode::Wal
+            && let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no).await?
+        {
+            return Ok(data);
         }
 
         // Reads of yet-unallocated pages should observe zero-filled content.
@@ -7853,10 +7854,10 @@ impl<F: VfsFile> PagerInner<F> {
         page_no: PageNumber,
     ) -> Result<Vec<u8>> {
         // bd-db300.3.8.7: try shared-lock path first for WAL reads.
-        if self.journal_mode == JournalMode::Wal {
-            if let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no).await? {
-                return Ok(data);
-            }
+        if self.journal_mode == JournalMode::Wal
+            && let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no).await?
+        {
+            return Ok(data);
         }
 
         let page_size = self.page_size.as_usize();
@@ -8905,10 +8906,10 @@ async fn prepare_group_commit_batch_for_lane(
         return Ok(None);
     }
 
-    if let Some(limit) = control.max_parallel_commit_bytes {
-        if group_commit_batch_staged_bytes(batch) > limit {
-            return Ok(None);
-        }
+    if let Some(limit) = control.max_parallel_commit_bytes
+        && group_commit_batch_staged_bytes(batch) > limit
+    {
+        return Ok(None);
     }
 
     let frame_refs = group_commit_batch_frame_refs(batch);
@@ -10909,7 +10910,7 @@ impl DatabaseImageReceipt {
 
 fn exact_database_page_count(file_size: u64, page_size: PageSize) -> Result<u32> {
     let page_size_bytes = u64::from(page_size.get());
-    if file_size == 0 || file_size % page_size_bytes != 0 {
+    if file_size == 0 || !file_size.is_multiple_of(page_size_bytes) {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
                 "database image length {file_size} is not a positive multiple of page size {page_size_bytes}"
@@ -19936,16 +19937,15 @@ where
             }
 
             // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
-            if self.journal_mode == JournalMode::Wal {
-                if let Some(data) =
+            if self.journal_mode == JournalMode::Wal
+                && let Some(data) =
                     read_page_from_wal_backend(&self.wal_backend, cx, page_no).await?
-                {
-                    let page = PageData::from_vec(data);
-                    self.txn_read_cache
-                        .borrow_mut()
-                        .insert(page_no, page.clone());
-                    return Ok(page);
-                }
+            {
+                let page = PageData::from_vec(data);
+                self.txn_read_cache
+                    .borrow_mut()
+                    .insert(page_no, page.clone());
+                return Ok(page);
             }
 
             let inner = self
@@ -20054,13 +20054,13 @@ where
             // longer single-owner, replace that map entry directly. Routing through
             // `insert_staged_page` would hash and insert the same key again even
             // though `write_pages_sorted` is already correct.
-            if let Some(existing) = self.write_set.get_mut(&page_no) {
-                if existing.try_overwrite_page_data_in_place(&data) {
-                    self.writes_observed = true;
-                    self.remove_freed_page_if_present(page_no);
-                    STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-                    return Ok(());
-                }
+            if let Some(existing) = self.write_set.get_mut(&page_no)
+                && existing.try_overwrite_page_data_in_place(&data)
+            {
+                self.writes_observed = true;
+                self.remove_freed_page_if_present(page_no);
+                STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                return Ok(());
             }
 
             let staged = StagedPage::from_page_data_with_cache_recovery(
@@ -20625,8 +20625,8 @@ where
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
-                if freelist_dirty {
-                    if let Err(e) = serialize_freelist_to_write_set(
+                if freelist_dirty
+                    && let Err(e) = serialize_freelist_to_write_set(
                         cx,
                         &mut inner,
                         &self.cache,
@@ -20639,16 +20639,15 @@ where
                         wal_attempt.as_ref().map(|attempt| &attempt.phase_a_undo),
                     )
                     .await
-                    {
-                        if wal_attempt.is_some() {
-                            drop(inner);
-                            self.restore_not_committed_wal_attempt()?;
-                        } else {
-                            self.restore_pending_freed_pages(pending_freed);
-                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-                        }
-                        return Err(e);
+                {
+                    if wal_attempt.is_some() {
+                        drop(inner);
+                        self.restore_not_committed_wal_attempt()?;
+                    } else {
+                        self.restore_pending_freed_pages(pending_freed);
+                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                     }
+                    return Err(e);
                 }
 
                 // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
@@ -21301,8 +21300,8 @@ where
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
-                if freelist_dirty {
-                    if let Err(e) = serialize_freelist_to_write_set(
+                if freelist_dirty
+                    && let Err(e) = serialize_freelist_to_write_set(
                         cx,
                         &mut inner,
                         &self.cache,
@@ -21315,16 +21314,15 @@ where
                         wal_attempt.as_ref().map(|attempt| &attempt.phase_a_undo),
                     )
                     .await
-                    {
-                        if wal_attempt.is_some() {
-                            drop(inner);
-                            self.restore_not_committed_wal_attempt()?;
-                        } else {
-                            self.restore_pending_freed_pages(pending_freed);
-                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-                        }
-                        return Err(e);
+                {
+                    if wal_attempt.is_some() {
+                        drop(inner);
+                        self.restore_not_committed_wal_attempt()?;
+                    } else {
+                        self.restore_pending_freed_pages(pending_freed);
+                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                     }
+                    return Err(e);
                 }
 
                 // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not

@@ -133,11 +133,11 @@ impl DerefMut for PageBuf {
 
 impl Drop for PageBuf {
     fn drop(&mut self) {
-        if let Some(backing) = self.backing.take() {
-            if let Some(ref pool) = self.pool {
-                pool.return_buf(backing, self.offset);
-            }
-            // Otherwise the backing Vec drops and frees normally.
+        // With no pool attached, the backing Vec drops and frees normally.
+        if let Some(backing) = self.backing.take()
+            && let Some(ref pool) = self.pool
+        {
+            pool.return_buf(backing, self.offset);
         }
     }
 }

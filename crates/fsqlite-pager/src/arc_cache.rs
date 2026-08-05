@@ -1632,10 +1632,10 @@ impl ArcCache {
     fn release_inflight_slot(&self, key: CacheKey, slot: &Arc<InflightLoad>) {
         {
             let mut inflight = self.inflight.lock();
-            if let Some(existing) = inflight.get(&key) {
-                if Arc::ptr_eq(existing, slot) {
-                    inflight.remove(&key);
-                }
+            if let Some(existing) = inflight.get(&key)
+                && Arc::ptr_eq(existing, slot)
+            {
+                inflight.remove(&key);
             }
         }
         {
@@ -1807,10 +1807,10 @@ impl ArcEvictionModel {
             }
         } else {
             let total_dir = l1_len + self.t2.len() + self.b2.len();
-            if total_dir >= self.capacity.saturating_mul(2) {
-                if let Some(ghost) = self.b2.pop_front() {
-                    self.directory.remove(&ghost);
-                }
+            if total_dir >= self.capacity.saturating_mul(2)
+                && let Some(ghost) = self.b2.pop_front()
+            {
+                self.directory.remove(&ghost);
             }
             if self.t1.len() + self.t2.len() >= self.capacity {
                 self.replace(page, matches!(lookup, CacheLookup::GhostHitB2));
