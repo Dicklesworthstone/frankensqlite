@@ -7,6 +7,7 @@
 //! filesystem writes stay outside the duration returned to Criterion.
 
 use std::env;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
 use std::io::{Read, Write};
@@ -100,11 +101,20 @@ fn sha256_file(path: &Path) -> (String, u64) {
         }
         hasher.update(&buffer[..read]);
     }
-    (format!("{:x}", hasher.finalize()), byte_len)
+    (lower_hex(hasher.finalize()), byte_len)
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    lower_hex(Sha256::digest(bytes))
+}
+
+fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 fn write_new_json(path: &Path, record: &Value) {
