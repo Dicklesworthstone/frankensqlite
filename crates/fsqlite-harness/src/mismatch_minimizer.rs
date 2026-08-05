@@ -427,8 +427,8 @@ impl TypedReductionResult {
 }
 
 /// Candidate verifier used by the structured reducer.
-pub type TypedReproducibilityTest =
-    dyn Fn(&[GeneratedStatement]) -> Result<TypedReductionObservation, String>;
+pub type TypedReproducibilityTest<'a> =
+    dyn Fn(&[GeneratedStatement]) -> Result<TypedReductionObservation, String> + 'a;
 
 #[derive(Debug, Clone)]
 struct TypedReductionCandidate {
@@ -442,7 +442,7 @@ struct TypedReductionCandidate {
 pub fn minimize_typed_statements(
     statements: &[GeneratedStatement],
     config: &TypedReductionConfig,
-    test_fn: &TypedReproducibilityTest,
+    test_fn: &TypedReproducibilityTest<'_>,
 ) -> Result<TypedReductionResult, String> {
     if statements.is_empty() {
         return Err("structured reduction requires at least one statement".to_owned());
