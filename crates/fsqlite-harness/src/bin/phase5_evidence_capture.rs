@@ -3256,4 +3256,127 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn capture_cargo_profile_binding_rejects_swapped_profiles() {
+        assert!(
+            validate_cargo_profile_binding(
+                "scorecard",
+                PersistentProfile::Release,
+                Some("release"),
+                Some("z"),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_cargo_profile_binding(
+                "pack manifest",
+                PersistentProfile::ReleasePerf,
+                Some("release-perf"),
+                Some("3"),
+            )
+            .is_ok()
+        );
+
+        // Swapped whole pairs, and single-field swaps in either direction.
+        for (profile, cargo_profile, opt_level) in [
+            (PersistentProfile::Release, "release-perf", "3"),
+            (PersistentProfile::ReleasePerf, "release", "z"),
+            (PersistentProfile::Release, "release", "3"),
+            (PersistentProfile::ReleasePerf, "release-perf", "z"),
+            (PersistentProfile::Release, "release-perf", "z"),
+            (PersistentProfile::ReleasePerf, "release", "3"),
+        ] {
+            assert!(
+                validate_cargo_profile_binding(
+                    "scorecard",
+                    profile,
+                    Some(cargo_profile),
+                    Some(opt_level),
+                )
+                .is_err(),
+                "{cargo_profile}/{opt_level} must not satisfy the {} binding",
+                profile.manifest_name()
+            );
+        }
+
+        // Omitting or blanking the binding is never a silent exemption.
+        for (cargo_profile, opt_level) in [
+            (None, None),
+            (Some("release"), None),
+            (None, Some("z")),
+            (Some(""), Some("")),
+        ] {
+            assert!(
+                validate_cargo_profile_binding(
+                    "pack manifest",
+                    PersistentProfile::Release,
+                    cargo_profile,
+                    opt_level,
+                )
+                .is_err(),
+                "absent or empty cargo profile binding must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_persistent_profiles_reject_equal_build_nonces() {
+        let workload = || PersistentWorkload {
+            benchmark: "persistent_concurrent_write_{1,8,16}t".to_owned(),
+            rows_per_thread: 1000,
+            synchronous: "NORMAL".to_owned(),
+            threads: vec![1, 8, 16],
+            criterion: PersistentCriterion {
+                sample_size: 10,
+                warmup_secs: 1,
+                measurement_secs: 1,
+                export_root: "{phase}/criterion_measurements".to_owned(),
+                headline_source:
+                    "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json".to_owned(),
+            },
+        };
+        let identity = |nonce: &str, worker: &str, host: &str| PersistentCitationIdentity {
+            actual_worker: worker.to_owned(),
+            actual_host: host.to_owned(),
+            nonce: nonce.to_owned(),
+            workload: workload(),
+        };
+        let release_nonce = "c".repeat(64);
+        let release_perf_nonce = "d".repeat(64);
+
+        assert!(
+            validate_persistent_profile_pairing(
+                &identity(&release_nonce, "ovh-a", "worker.example.test"),
+                &identity(&release_perf_nonce, "ovh-a", "worker.example.test"),
+            )
+            .is_ok()
+        );
+
+        let replayed = validate_persistent_profile_pairing(
+            &identity(&release_nonce, "ovh-a", "worker.example.test"),
+            &identity(&release_nonce, "ovh-a", "worker.example.test"),
+        )
+        .expect_err("equal build nonces must not pair");
+        assert!(
+            replayed.contains("distinct build nonces"),
+            "equal-nonce rejection must name the nonce contract; got `{replayed}`"
+        );
+
+        // A fresh nonce cannot buy admission for a cross-worker or cross-host pair.
+        assert!(
+            validate_persistent_profile_pairing(
+                &identity(&release_nonce, "ovh-a", "worker.example.test"),
+                &identity(&release_perf_nonce, "ovh-b", "worker.example.test"),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_persistent_profile_pairing(
+                &identity(&release_nonce, "ovh-a", "worker.example.test"),
+                &identity(&release_perf_nonce, "ovh-a", "other.example.test"),
+            )
+            .is_err()
+        );
+    }
 }

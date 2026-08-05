@@ -8099,8 +8099,8 @@ fn test_regression_guard_persistent_profiles_reject_equal_build_nonces() {
             warmup_secs: 1,
             measurement_secs: 1,
             export_root: "{phase}/criterion_measurements".to_owned(),
-            headline_source:
-                "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json".to_owned(),
+            headline_source: "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json"
+                .to_owned(),
         },
     };
     let identity = |nonce: &str, worker: &str, host: &str| PersistentCitationIdentity {
