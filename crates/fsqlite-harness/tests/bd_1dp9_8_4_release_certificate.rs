@@ -4,6 +4,9 @@
 //! invariant catalog, drift monitors, confidence gates, adversarial search,
 //! and CI artifacts into a machine-verifiable release certificate.
 
+use std::fs;
+use std::process::Command;
+
 use fsqlite_harness::adversarial_search::run_campaign;
 use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
 use fsqlite_harness::drift_monitor::ParityDriftMonitor;
@@ -33,6 +36,103 @@ fn full_pipeline_produces_valid_certificate() {
     assert_eq!(
         cert.schema_version, CERTIFICATE_SCHEMA_VERSION,
         "bead_id={BEAD_ID} case=schema_version"
+    );
+}
+
+#[test]
+fn certificate_runner_rejects_evidence_outside_workspace_without_writing_outputs() {
+    let temp_dir = tempfile::tempdir().expect("temporary certificate directory");
+    let workspace_root = temp_dir.path().join("workspace");
+    let evidence_root = workspace_root.join("evidence");
+    let output_dir = workspace_root.join("output");
+    fs::create_dir_all(&evidence_root).expect("create evidence root");
+    let init = Command::new("git")
+        .args([
+            "init",
+            "--quiet",
+            workspace_root.to_str().expect("workspace UTF-8"),
+        ])
+        .status()
+        .expect("initialize workspace git repository");
+    assert!(init.success(), "initialize fixture repository");
+    fs::write(workspace_root.join("README"), "certificate fixture\n")
+        .expect("write tracked fixture");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(&workspace_root)
+            .args(args)
+            .output()
+            .expect("run fixture git command")
+    };
+    assert!(git(&["add", "README"]).status.success(), "stage fixture");
+    assert!(
+        git(&[
+            "-c",
+            "user.name=Certificate Test",
+            "-c",
+            "user.email=certificate@example.test",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture"
+        ])
+        .status
+        .success(),
+        "commit fixture"
+    );
+
+    let evidence = temp_dir.path().join("malformed-evidence.json");
+    fs::write(&evidence, "{}\n").expect("write out-of-workspace evidence");
+    let head_command = Command::new("git")
+        .arg("-C")
+        .arg(&workspace_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("query HEAD");
+    assert!(head_command.status.success(), "query fixture HEAD");
+    let head = String::from_utf8(head_command.stdout).expect("HEAD is UTF-8");
+    let output = Command::new(env!("CARGO_BIN_EXE_parity_verification_workflow_runner"))
+        .args([
+            "--workspace-root",
+            workspace_root.to_str().expect("workspace root UTF-8"),
+            "--certificate-evidence-json",
+            evidence.to_str().expect("evidence path UTF-8"),
+            "--certificate-evidence-root",
+            evidence_root.to_str().expect("evidence root UTF-8"),
+            "--candidate-git-sha",
+            head.trim(),
+            "--certificate-output-dir",
+            output_dir.to_str().expect("output directory UTF-8"),
+        ])
+        .output()
+        .expect("run certificate mode");
+
+    assert_eq!(output.status.code(), Some(2), "must fail closed");
+    let canonical_evidence = evidence.canonicalize().expect("canonical evidence");
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr UTF-8"),
+        format!(
+            "ERROR bead_id={BEAD_ID} parity_verification_workflow_runner failed: evidence_path_outside_workspace path={}\n",
+            canonical_evidence.display()
+        ),
+        "outside evidence rejection must be stable"
+    );
+    assert!(
+        git(&["status", "--porcelain=v1", "--untracked-files=no"])
+            .status
+            .success(),
+        "fixture git status command succeeds"
+    );
+    assert!(
+        git(&["status", "--porcelain=v1", "--untracked-files=no"])
+            .stdout
+            .is_empty(),
+        "runner must not dirty the tracked checkout"
+    );
+    assert!(
+        !output_dir.exists(),
+        "failure must not publish a final bundle"
     );
 }
 

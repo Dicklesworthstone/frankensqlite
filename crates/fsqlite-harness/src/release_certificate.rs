@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::adversarial_search::{
     AdversarialConfig, CampaignResult, CounterexampleSeverity, run_campaign,
@@ -413,13 +414,7 @@ pub struct CertificateInputs {
 
 /// Compute a SHA-256 hash of a string (for evidence chain).
 fn sha256_hex(data: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    // Deterministic hash for content integrity (not cryptographic).
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    let h = hasher.finish();
-    format!("{h:016x}{h:016x}{h:016x}{h:016x}", h = h)
+    crate::bytes_to_lower_hex(Sha256::digest(data.as_bytes()))
 }
 
 fn fallback_transparency_remediation_summary(
@@ -1111,6 +1106,29 @@ mod tests {
                 entry.source_bead,
             );
         }
+    }
+
+    #[test]
+    fn evidence_hash_is_real_sha256_known_vector() {
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn evidence_chain_uses_sha256_for_catalog_payload() {
+        let cert = default_cert();
+        let catalog = build_canonical_catalog();
+        let catalog_json = serde_json::to_string(&catalog.stats()).expect("catalog serializes");
+        let catalog_entry = cert
+            .evidence_chain
+            .iter()
+            .find(|entry| entry.source_bead == "bd-1dp9.8.1")
+            .expect("catalog evidence entry");
+
+        assert_eq!(catalog_entry.content_hash, sha256_hex(&catalog_json));
+        assert_eq!(catalog_entry.content_hash.len(), 64);
     }
 
     #[test]
