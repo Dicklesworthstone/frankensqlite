@@ -35,7 +35,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::parity_taxonomy::{FeatureCategory, FeatureUniverse, truncate_score};
+use crate::parity_taxonomy::{FeatureCategory, FeatureUniverse, ParityStatus, truncate_score};
 use crate::verification_contract_enforcement::{
     ContractEnforcementOutcome, enforce_gate_decision, evaluate_workspace_verification_contract,
 };
@@ -43,6 +43,13 @@ use crate::verification_contract_enforcement::{
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.1.3";
+
+/// Feasible statistical floor for finite-sample credible lower bounds.
+///
+/// Empirical declared-surface completeness is enforced separately at 100%.
+/// A finite Beta posterior with a positive beta parameter has a lower credible
+/// bound strictly below 1.0, even when every observation succeeds.
+pub const STATISTICAL_RELEASE_FLOOR: f64 = 0.70;
 
 // ---------------------------------------------------------------------------
 // Beta distribution
@@ -60,11 +67,17 @@ impl BetaParams {
     ///
     /// # Panics
     ///
-    /// Panics if `alpha` or `beta` are not positive.
+    /// Panics if `alpha` or `beta` are not finite and positive.
     #[must_use]
     pub fn new(alpha: f64, beta: f64) -> Self {
-        assert!(alpha > 0.0, "alpha must be positive, got {alpha}");
-        assert!(beta > 0.0, "beta must be positive, got {beta}");
+        assert!(
+            alpha.is_finite() && alpha > 0.0,
+            "alpha must be finite and positive, got {alpha}"
+        );
+        assert!(
+            beta.is_finite() && beta > 0.0,
+            "beta must be finite and positive, got {beta}"
+        );
         Self { alpha, beta }
     }
 
@@ -295,6 +308,16 @@ impl Default for PriorConfig {
 }
 
 impl PriorConfig {
+    /// Whether the prior and its credible-interval level are finite and valid.
+    #[must_use]
+    pub(crate) fn is_valid(self) -> bool {
+        self.alpha.is_finite()
+            && self.alpha > 0.0
+            && self.beta.is_finite()
+            && self.beta > 0.0
+            && is_strict_probability(self.confidence_level)
+    }
+
     /// Jeffreys prior: Beta(0.5, 0.5).
     #[must_use]
     pub fn jeffreys() -> Self {
@@ -383,8 +406,9 @@ pub struct ConformalBand {
 /// Machine-readable scorecard combining Bayesian estimation with conformal bounds.
 ///
 /// This is the primary output consumed by release-gating decisions. The
-/// `release_ready` field is `true` iff statistical gates pass and any configured
-/// verification-contract enforcement allows release.
+/// `release_ready` field is `true` only when every non-excluded feature is
+/// passing, the statistical gates pass, and any configured verification-contract
+/// enforcement allows release.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BayesianScorecard {
     /// Bead ID for traceability.
@@ -403,9 +427,9 @@ pub struct BayesianScorecard {
     pub category_posteriors: BTreeMap<String, CategoryPosterior>,
     /// Conformal band for the global score.
     pub conformal_band: ConformalBand,
-    /// Whether the score meets release criteria.
+    /// Whether empirical completeness and statistical release criteria are met.
     pub release_ready: bool,
-    /// Release threshold (lower bound must exceed this).
+    /// Release threshold (lower bound must meet or exceed this).
     pub release_threshold: f64,
     /// Total features analysed (non-excluded).
     pub effective_features: usize,
@@ -445,7 +469,7 @@ impl BayesianScorecard {
 pub struct ScoreEngineConfig {
     /// Prior hyperparameters.
     pub prior: PriorConfig,
-    /// Release threshold: global lower bound must exceed this.
+    /// Statistical release floor: the global lower bound must meet or exceed this.
     pub release_threshold: f64,
     /// Conformal coverage level.
     pub conformal_coverage: f64,
@@ -455,10 +479,20 @@ impl Default for ScoreEngineConfig {
     fn default() -> Self {
         Self {
             prior: PriorConfig::default(),
-            release_threshold: 1.0,
+            release_threshold: STATISTICAL_RELEASE_FLOOR,
             conformal_coverage: 0.95,
         }
     }
+}
+
+fn is_strict_probability(value: f64) -> bool {
+    value.is_finite() && value > 0.0 && value < 1.0
+}
+
+fn score_engine_config_is_valid(config: &ScoreEngineConfig) -> bool {
+    config.prior.is_valid()
+        && (STATISTICAL_RELEASE_FLOOR..=1.0).contains(&config.release_threshold)
+        && is_strict_probability(config.conformal_coverage)
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +509,17 @@ pub fn compute_bayesian_scorecard(
     universe: &FeatureUniverse,
     config: &ScoreEngineConfig,
 ) -> BayesianScorecard {
+    let config_is_valid = score_engine_config_is_valid(config);
+    let calculation_prior = if config.prior.is_valid() {
+        config.prior
+    } else {
+        PriorConfig::default()
+    };
+    let calculation_coverage = if is_strict_probability(config.conformal_coverage) {
+        config.conformal_coverage
+    } else {
+        ScoreEngineConfig::default().conformal_coverage
+    };
     let mut category_posteriors = BTreeMap::new();
     let mut total_effective = 0_usize;
     let mut category_residuals = Vec::new();
@@ -502,12 +547,12 @@ pub fn compute_bayesian_scorecard(
 
         total_effective += effective;
 
-        let alpha = config.prior.alpha + successes;
-        let beta = config.prior.beta + failures;
+        let alpha = calculation_prior.alpha + successes;
+        let beta = calculation_prior.beta + failures;
         let posterior = BetaParams::new(alpha, beta);
 
         let point_est = truncate_score(posterior.mean());
-        let (lo, hi) = posterior.credible_interval(config.prior.confidence_level);
+        let (lo, hi) = posterior.credible_interval(calculation_prior.confidence_level);
 
         // Compute frequentist pass rate for conformal calibration.
         let total_weight = successes + failures;
@@ -527,7 +572,7 @@ pub fn compute_bayesian_scorecard(
                 point_estimate: point_est,
                 lower_bound: truncate_score(lo),
                 upper_bound: truncate_score(hi.min(1.0)),
-                confidence_level: config.prior.confidence_level,
+                confidence_level: calculation_prior.confidence_level,
                 global_weight: cat.global_weight(),
                 effective_sample_size: effective,
                 weighted_successes: truncate_score(successes),
@@ -556,7 +601,7 @@ pub fn compute_bayesian_scorecard(
 
     // Conformal band: empirical quantile of category residuals.
     let conformal_half_width =
-        compute_conformal_half_width(&category_residuals, config.conformal_coverage);
+        compute_conformal_half_width(&category_residuals, calculation_coverage);
 
     let conformal_lower = (global_point - conformal_half_width).max(0.0);
     let conformal_upper = (global_point + conformal_half_width).min(1.0);
@@ -568,10 +613,18 @@ pub fn compute_bayesian_scorecard(
         upper: truncate_score(conformal_upper),
     };
 
-    // Release decision: the more conservative of the two lower bounds
-    // (credible interval and conformal) must exceed threshold.
+    // Release decision: every declared, non-excluded feature must pass, and
+    // the more conservative lower bound (credible interval or conformal) must
+    // meet or exceed the finite-sample threshold.
     let conservative_lower = truncate_score(global_lower.min(conformal_lower));
-    let release_ready = conservative_lower >= config.release_threshold;
+    let empirically_complete = total_effective > 0
+        && universe
+            .features
+            .values()
+            .filter(|feature| feature.status.score_contribution().is_some())
+            .all(|feature| feature.status == ParityStatus::Passing);
+    let release_ready =
+        empirically_complete && config_is_valid && conservative_lower >= config.release_threshold;
 
     BayesianScorecard {
         bead_id: BEAD_ID.to_owned(),

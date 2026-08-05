@@ -140,7 +140,7 @@ fn canonical_contract_is_self_contained_and_valid() {
             .iter()
             .filter(|entry| entry.decision == AdoptionDecision::Adopt)
             .count(),
-        9
+        8
     );
     assert_eq!(contract.contract_authority.len(), 5);
     assert!(
@@ -367,7 +367,7 @@ fn report_json_markdown_and_csv_reconcile_from_one_model() {
     assert!(markdown.contains("harness_tracker_shaped_files` | 68 | 69 | +1"));
     assert!(markdown.contains("harness_literal_beads_path_files` | 64 | 65 | +1"));
     assert!(markdown.contains("testing/differential-oracle"));
-    assert!(markdown.contains("Decision totals: adopt=9, defer=6, reject=2."));
+    assert!(markdown.contains("Decision totals: adopt=8, defer=7, reject=2."));
     assert!(markdown.contains("Contract Authority Handoff"));
 
     let csv = render_test_inventory_csv(&report);

@@ -12,7 +12,15 @@
 # degraded regimes originally identified on 2026-03-20.
 #
 # Usage:
-#   ./scripts/capture_persistent_phase_pack.sh [output_dir]
+#   FSQLITE_RELEASE_CARGO_PROFILE=release \\
+#     ./scripts/capture_persistent_phase_pack.sh [output_dir]
+#
+# `FSQLITE_RELEASE_CARGO_PROFILE` is `release-perf` by default for the
+# existing throughput-attribution workflow. A release candidate must capture
+# both accepted profiles into separate empty output directories with the same
+# frozen source commit; the receipt names the selected profile and its expected
+# Cargo optimization level so a size-optimized shipped artifact cannot be
+# mistaken for the throughput-oriented one.
 #
 # Citation-grade capture contract (fail closed):
 # - clean frozen source revision, 64-hex build nonce, and `cargo -vv` build log;
@@ -91,6 +99,7 @@ RENDER_ONLY="${RENDER_ONLY:-0}"
 SKIP_RUN="${SKIP_RUN:-0}"
 FSQLITE_USE_RCH="${FSQLITE_USE_RCH:-0}"
 RCH_BIN="${RCH_BIN:-rch}"
+CARGO_PROFILE="${FSQLITE_RELEASE_CARGO_PROFILE:-release-perf}"
 EQUIVALENCE_MARGIN_MAX_DROP=0.05
 EQUIVALENCE_LOWER_BOUND_MIN=0.95
 TAIL_COLLAPSE_P95_US="${TAIL_COLLAPSE_P95_US:-250000}"
@@ -139,6 +148,49 @@ require_positive_integer() {
     local value="$1"
     local label="$2"
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$label must be a positive integer"
+}
+
+require_supported_cargo_profile() {
+    case "$CARGO_PROFILE" in
+        release)
+            CARGO_PROFILE_OPT_LEVEL="z"
+            ;;
+        release-perf)
+            CARGO_PROFILE_OPT_LEVEL="3"
+            ;;
+        *)
+            die "FSQLITE_RELEASE_CARGO_PROFILE must be exactly release or release-perf, got: $CARGO_PROFILE"
+            ;;
+    esac
+}
+
+require_no_rustflags() {
+    [[ -z "${RUSTFLAGS:-}" ]] \
+        || die "RUSTFLAGS must be unset for the portable release evidence contract"
+    [[ -z "${CARGO_ENCODED_RUSTFLAGS:-}" ]] \
+        || die "CARGO_ENCODED_RUSTFLAGS must be unset for the portable release evidence contract"
+    [[ -z "${CARGO_BUILD_RUSTFLAGS:-}" ]] \
+        || die "CARGO_BUILD_RUSTFLAGS must be unset for the portable release evidence contract"
+}
+
+validate_profile_contract() {
+    python3 - "$PROJECT_ROOT/Cargo.toml" "$CARGO_PROFILE" "$CARGO_PROFILE_OPT_LEVEL" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+manifest_path, profile, expected_opt_level = sys.argv[1:]
+try:
+    manifest = tomllib.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    actual_opt_level = manifest["profile"][profile]["opt-level"]
+except (KeyError, OSError, tomllib.TOMLDecodeError) as error:
+    raise SystemExit(f"cannot validate Cargo profile contract for {profile!r}: {error}")
+
+if actual_opt_level != expected_opt_level:
+    raise SystemExit(
+        f"Cargo profile {profile!r} has opt-level {actual_opt_level!r}, expected {expected_opt_level!r}"
+    )
+PY
 }
 
 # Configurable because fleet quarantine is operational state. The release
@@ -310,6 +362,9 @@ validate_citation_contract() {
     [[ ! -d "$OUTPUT_DIR" || -z "$(find "$OUTPUT_DIR" -mindepth 1 -print -quit)" ]] \
         || die "citation output directory must be empty; refusing stale provenance or measurements"
     [[ "$FSQLITE_USE_RCH" == "1" ]] || die "FSQLITE_USE_RCH=1 is required for release capture"
+    require_supported_cargo_profile
+    validate_profile_contract
+    require_no_rustflags
     [[ "${RCH_REQUIRE_REMOTE:-}" == "1" ]] || die "RCH_REQUIRE_REMOTE=1 is required"
     [[ "${RCH_NO_SELF_HEALING:-}" == "1" ]] || die "RCH_NO_SELF_HEALING=1 is required"
     [[ -n "${RCH_WORKER:-}" ]] || die "RCH_WORKER must name the requested remote worker"
@@ -344,6 +399,36 @@ validate_citation_contract() {
 
 run_synthetic_contract_checks() {
     local RCH_WORKER="healthy-worker"
+    local expected_opt_level
+    local mismatched_profile
+    require_supported_cargo_profile
+    case "$CARGO_PROFILE" in
+        release)
+            expected_opt_level="z"
+            mismatched_profile="release-perf"
+            ;;
+        release-perf)
+            expected_opt_level="3"
+            mismatched_profile="release"
+            ;;
+        *)
+            die "synthetic validation reached an unsupported Cargo profile"
+            ;;
+    esac
+    [[ "$CARGO_PROFILE_OPT_LEVEL" == "$expected_opt_level" ]] \
+        || die "synthetic validation did not derive the selected profile opt-level"
+    if (CARGO_PROFILE=unsupported require_supported_cargo_profile); then
+        die "synthetic validation did not reject an unsupported Cargo profile"
+    fi
+    if (RUSTFLAGS="-C target-cpu=native" require_no_rustflags); then
+        die "synthetic validation did not reject host-tuned RUSTFLAGS"
+    fi
+    if (CARGO_ENCODED_RUSTFLAGS="-Ctarget-cpu=native" require_no_rustflags); then
+        die "synthetic validation did not reject encoded host-tuned Rust flags"
+    fi
+    if (CARGO_BUILD_RUSTFLAGS="-Ctarget-cpu=native" require_no_rustflags); then
+        die "synthetic validation did not reject configured host-tuned Rust flags"
+    fi
     # The timing contract is source-derived, so it is executable here as well as
     # in a real preflight. This is the only executable gate on the benchmark's
     # timed region: the bench declares `harness = false`, so its inline
@@ -379,7 +464,7 @@ run_synthetic_contract_checks() {
     # markers do not exist in real transcripts, and logs are corroboration only.
     local ours_id=29960766543102031
     local near_id=29960766543102030
-    local our_cmd="cargo bench -vv --locked --profile release-perf -p fsqlite-e2e --bench concurrent_write_persistent_bench --no-run"
+    local our_cmd="env FSQLITE_BENCH_BUILD_NONCE=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef FSQLITE_BENCH_PROFILE_NAME=${CARGO_PROFILE} cargo bench -vv --locked --profile ${CARGO_PROFILE} -p fsqlite-e2e --bench concurrent_write_persistent_bench --no-run"
     local their_cmd="cargo test -p fsqlite-harness --test phase5_regression_guard"
     local marker="concurrent_write_persistent_bench"
     local project="frankensqlite-df8c83ae"
@@ -421,6 +506,11 @@ run_synthetic_contract_checks() {
         || die "synthetic validation lost job-id precision above 2^53"
     [[ "$(printf '%s' "$reported" | python3 -c 'import json,sys; print(json.load(sys.stdin)["active_samples"])')" == "3" ]] \
         || die "synthetic validation miscounted retained active samples"
+    require_attested_cargo_profile "$reported" \
+        || die "synthetic validation rejected a well-formed profile-attested job"
+    if (CARGO_PROFILE="$mismatched_profile" require_attested_cargo_profile "$reported"); then
+        die "synthetic validation accepted a job with the wrong Cargo profile"
+    fi
     [[ "$(actual_host_from_status_trace healthy-worker <(active_snap "$ours"))" == "vmi123" ]] \
         || die "synthetic validation did not parse nested daemon host identity"
 
@@ -483,7 +573,7 @@ run_cargo() {
     if [[ "$FSQLITE_USE_RCH" == "1" ]]; then
         local env_args=(
             "FSQLITE_BENCH_BUILD_NONCE=${BUILD_NONCE}"
-            "FSQLITE_BENCH_PROFILE_NAME=release-perf"
+            "FSQLITE_BENCH_PROFILE_NAME=${CARGO_PROFILE}"
         )
         if [[ -n "${FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR:-}" ]]; then
             env_args+=("FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR=${FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR}")
@@ -491,7 +581,11 @@ run_cargo() {
         if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
             env_args+=("CARGO_TARGET_DIR=${CARGO_TARGET_DIR}")
         fi
-        "$RCH_BIN" exec -- env "${env_args[@]}" cargo "$@"
+        "$RCH_BIN" exec -- env \
+            -u RUSTFLAGS \
+            -u CARGO_ENCODED_RUSTFLAGS \
+            -u CARGO_BUILD_RUSTFLAGS \
+            "${env_args[@]}" cargo "$@"
     else
         cargo "$@"
     fi
@@ -724,6 +818,42 @@ print(
 PY
 }
 
+# The selected profile is meaningful only if the daemon-attested command used
+# it. The compile-time benchmark field independently binds the same value to
+# the running binary; requiring both prevents a receipt from relabeling a
+# release-perf binary as the shipped size-optimized release artifact (or the
+# reverse).
+require_attested_cargo_profile() {
+    local identity_json="$1"
+    python3 - "$CARGO_PROFILE" "$identity_json" <<'PY'
+import json
+import shlex
+import sys
+
+expected_profile, encoded_identity = sys.argv[1:]
+try:
+    identity = json.loads(encoded_identity)
+    command = identity["command"]
+    argv = shlex.split(command)
+except (KeyError, TypeError, ValueError) as error:
+    raise SystemExit(f"RCH job identity has no parseable command for Cargo-profile attestation: {error}")
+
+positions = [index for index, value in enumerate(argv) if value == "--profile"]
+if len(positions) != 1 or positions[0] + 1 >= len(argv):
+    raise SystemExit("RCH job command must carry exactly one complete --profile selector")
+if argv[positions[0] + 1] != expected_profile:
+    raise SystemExit(
+        f"RCH job command selected profile {argv[positions[0] + 1]!r}, expected {expected_profile!r}"
+    )
+
+expected_build_profile = f"FSQLITE_BENCH_PROFILE_NAME={expected_profile}"
+if expected_build_profile not in argv:
+    raise SystemExit(
+        f"RCH job command does not forward the compile-time profile attestation {expected_build_profile!r}"
+    )
+PY
+}
+
 actual_host_from_status_trace() {
     local worker="$1"
     local trace_path="$2"
@@ -780,6 +910,7 @@ run_cargo_with_scheduler_trace() {
     require_allowed_remote_worker "$worker"
     identity_json="$(verify_rch_job_identity \
         "$worker" "$RCH_JOB_COMMAND_MARKER" "$trace_path" "$completion_path")" || exit 2
+    require_attested_cargo_profile "$identity_json" || exit 2
     assert_worker_marker_agrees "$(worker_marker_from_rch_log "$log_path")" "$worker"
 
     if [[ -n "$ACTUAL_WORKER" && "$ACTUAL_WORKER" != "$worker" ]]; then
@@ -871,6 +1002,11 @@ write_citation_receipt() {
         --arg bead_id "$BEAD_ID" \
         --arg frozen_commit "$FROZEN_COMMIT" \
         --arg build_nonce "$BUILD_NONCE" \
+        --arg cargo_profile "$CARGO_PROFILE" \
+        --arg cargo_profile_opt_level "$CARGO_PROFILE_OPT_LEVEL" \
+        --arg rustflags "${RUSTFLAGS:-}" \
+        --arg cargo_encoded_rustflags "${CARGO_ENCODED_RUSTFLAGS:-}" \
+        --arg cargo_build_rustflags "${CARGO_BUILD_RUSTFLAGS:-}" \
         --arg requested_worker "$RCH_WORKER" \
         --arg actual_worker "$ACTUAL_WORKER" \
         --arg actual_host "$ACTUAL_HOST" \
@@ -906,7 +1042,14 @@ write_citation_receipt() {
             bead_id: $bead_id,
             source: { commit: $frozen_commit, clean: $source_clean },
             build: {
-                profile: "release-perf",
+                profile: $cargo_profile,
+                expected_opt_level: $cargo_profile_opt_level,
+                rustflags: {
+                    RUSTFLAGS: $rustflags,
+                    CARGO_ENCODED_RUSTFLAGS: $cargo_encoded_rustflags,
+                    CARGO_BUILD_RUSTFLAGS: $cargo_build_rustflags,
+                    policy: "all three values must be empty; remote cargo is invoked through env -u for each"
+                },
                 nonce: $build_nonce,
                 cargo_verbose_log: "provenance/cargo-build-vv.log",
                 cargo_verbose_log_sha256: $build_log_sha256,
@@ -972,11 +1115,15 @@ verify_run_artifacts() {
     [[ -s "$samples" ]] || die "${thread_count}t benchmark samples.jsonl is missing"
     jq -e \
         --arg expected_nonce "$BUILD_NONCE" \
+        --arg expected_profile "$CARGO_PROFILE" \
+        --arg expected_schema "fsqlite-e2e.persistent_phase_capture_provenance.v3" \
         --argjson expected_threads "$thread_count" \
         --argjson expected_rows "$EXPECTED_ROWS_PER_THREAD" \
-        '(.current_exe | type == "string" and length > 0) and
+        '.schema_version == $expected_schema and
+         (.current_exe | type == "string" and length > 0) and
          (.running_binary_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
          .build_nonce == $expected_nonce and
+         .cargo_profile == $expected_profile and
          .concurrency == $expected_threads and
          .rows_per_thread == $expected_rows and
          .synchronous == "NORMAL" and
@@ -1044,7 +1191,9 @@ write_environment_provenance() {
         echo "git_branch: $(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null || echo unknown)"
         echo "git_dirty_files: $(git -C "$PROJECT_ROOT" diff --name-only 2>/dev/null | wc -l || echo unknown)"
         echo "rust_version: $(rustc --version 2>/dev/null || echo unknown)"
-        echo "cargo_profile: release-perf"
+        echo "cargo_profile: ${CARGO_PROFILE}"
+        echo "cargo_profile_expected_opt_level: ${CARGO_PROFILE_OPT_LEVEL}"
+        echo "rustflags_policy: RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS, and CARGO_BUILD_RUSTFLAGS must all be empty"
         echo "cargo_runner: $(cargo_runner_label)"
         echo "cargo_target_dir: ${CARGO_TARGET_DIR:-unset}"
         echo "rch_bin: ${RCH_BIN}"
@@ -1075,9 +1224,9 @@ write_environment_provenance() {
 }
 
 ensure_bench_binary() {
-    echo "--- Building release-perf benchmark binary ($(cargo_runner_label)) ---"
+    echo "--- Building ${CARGO_PROFILE} benchmark binary ($(cargo_runner_label)) ---"
     run_cargo_with_scheduler_trace "$BUILD_VV_LOG" "$BUILD_STATUS_TRACE" \
-        bench -vv --locked --profile release-perf -p fsqlite-e2e \
+        bench -vv --locked --profile "$CARGO_PROFILE" -p fsqlite-e2e \
         --bench concurrent_write_persistent_bench --no-run
 }
 
@@ -1102,7 +1251,7 @@ run_persistent_bench() {
 
     FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR="$run_dir" \
         run_cargo_with_scheduler_trace "$run_dir/criterion_stdout.log" "$run_dir/rch_status.jsonl" \
-            bench --locked --profile release-perf -p fsqlite-e2e \
+            bench --locked --profile "$CARGO_PROFILE" -p fsqlite-e2e \
             --bench concurrent_write_persistent_bench \
             -- --sample-size "$CRITERION_SAMPLE_SIZE" \
             --warm-up-time "$CRITERION_WARMUP_SECS" \
@@ -1141,7 +1290,9 @@ render_reports() {
         "$TAIL_COLLAPSE_MAX_US" \
         "$PHASE_B_COLLAPSE_P99_US" \
         "$WAL_APPEND_COLLAPSE_P99_US" \
-        "$THREAD_COUNTS_CSV" <<'PY'
+        "$THREAD_COUNTS_CSV" \
+        "$CARGO_PROFILE" \
+        "$CARGO_PROFILE_OPT_LEVEL" <<'PY'
 import json
 import statistics
 import sys
@@ -1165,6 +1316,8 @@ for item in sys.argv[13].split(","):
     if not item:
         continue
     thread_labels.append(item if item.endswith("t") else f"{item}t")
+cargo_profile = sys.argv[14]
+cargo_profile_opt_level = sys.argv[15]
 
 
 def nested_get(mapping, *keys):
@@ -1652,6 +1805,8 @@ scorecard = {
     "bead_id": bead_id,
     "run_id": output_dir.name,
     "entrypoint": "scripts/capture_persistent_phase_pack.sh",
+    "cargo_profile": cargo_profile,
+    "cargo_profile_expected_opt_level": cargo_profile_opt_level,
     "pack_role": "honest_gate_phase_pack",
     "baseline_comparator": "sqlite3_same_pack",
     "shadow_lineage": "none",
@@ -1701,6 +1856,8 @@ manifest = {
     "bead_id": bead_id,
     "run_id": output_dir.name,
     "entrypoint": "scripts/capture_persistent_phase_pack.sh",
+    "cargo_profile": cargo_profile,
+    "cargo_profile_expected_opt_level": cargo_profile_opt_level,
     "scorecard_json": scorecard_path.name,
     "summary_md": summary_path.name,
     "citation_receipt_json": "provenance/citation_receipt.json",
@@ -1723,6 +1880,7 @@ summary_lines = [
     f"# {bead_id} Persistent Phase Pack",
     "",
     f"- run_id: `{output_dir.name}`",
+    f"- cargo_profile: `{cargo_profile}` (expected opt-level `{cargo_profile_opt_level}`)",
     "- baseline_comparator: same-pack `sqlite3` measurement-only Criterion estimates + phase-attribution samples",
     f"- critical_regimes: `{', '.join(regime['regime_id'] for regime in critical_regimes)}`",
     "- disclosure: `samples.jsonl` mixes warmup and measurement; use it only for phase and wake-reason truth. Headline throughput derives solely from copied Criterion `base/estimates.json`.",
@@ -1846,6 +2004,7 @@ export RCH_REQUIRE_REMOTE=1
 export RCH_NO_SELF_HEALING=1
 export RCH_BIN="\${RCH_BIN:-${RCH_BIN}}"
 export FSQLITE_RELEASE_WORKER_DENYLIST="\${FSQLITE_RELEASE_WORKER_DENYLIST:-${RELEASE_WORKER_DENYLIST}}"
+export FSQLITE_RELEASE_CARGO_PROFILE="\${FSQLITE_RELEASE_CARGO_PROFILE:-${CARGO_PROFILE}}"
 if [[ -n "\${CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}" ]]; then
     export CARGO_TARGET_DIR="\${CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
 fi
@@ -1864,6 +2023,7 @@ main() {
     echo "=== ${BEAD_ID}: Authoritative Persistent Phase-Attribution Pack ==="
     echo "Output: $OUTPUT_DIR"
     echo "Timestamp: $TIMESTAMP"
+    echo "Cargo profile: $CARGO_PROFILE (expected opt-level $CARGO_PROFILE_OPT_LEVEL)"
 
     if [[ "$SELF_TEST" == "1" ]]; then
         run_synthetic_contract_checks
@@ -1903,4 +2063,5 @@ main() {
     echo "Rerun: $RERUN_SH"
 }
 
+require_supported_cargo_profile
 main "$@"

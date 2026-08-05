@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const DIGEST_ALGORITHM: &str = "blake3-256";
 const SHA256_ALGORITHM: &str = "sha2-256";
 const RCH_RECEIPT_SCHEMA: &str = "fsqlite.phase5.rch_execution_receipt.v1";
@@ -28,7 +28,7 @@ const MANIFEST_NAME: &str = "manifest.json";
 const BASELINE: &str = "tests/regression_baseline.json";
 const GUARD_LOCATOR: &str = "crates/fsqlite-harness/tests/phase5_regression_guard.rs::phase5_regression_guard_full_workspace_against_baseline";
 const MAX_CAPTURE_WORKERS: usize = 2;
-const USAGE: &str = "usage: phase5_evidence_capture (--plan | --baseline-only --baseline-output-dir <absolute-external-dir> | --output <tests/artifacts/release-evidence/<commit>/manifest.json> --c1-pack-dir <absolute-external-dir> --persistent-pack-dir <absolute-external-dir>) [--tested-commit <40-hex>]";
+const USAGE: &str = "usage: phase5_evidence_capture (--plan | --baseline-only --baseline-output-dir <absolute-external-dir> | --output <tests/artifacts/release-evidence/<commit>/manifest.json> --c1-pack-dir <absolute-external-dir> --persistent-release-pack-dir <absolute-external-dir> --persistent-release-perf-pack-dir <absolute-external-dir>) [--tested-commit <40-hex>]";
 
 #[derive(Debug, Deserialize)]
 struct Baseline {
@@ -68,7 +68,17 @@ struct Manifest {
     workspace: RunEvidence,
     run_receipts: Vec<RunReceipt>,
     auxiliary_scorecards: Scorecards,
+    performance_regression_gate: PerformanceRegressionGate,
     evidence_pack: Vec<EvidenceLeaf>,
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceRegressionGate {
+    schema_version: &'static str,
+    status: &'static str,
+    release_authorized: bool,
+    blockers: [&'static str; 4],
+    rationale: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,7 +105,13 @@ struct EvidenceLeaf {
 #[derive(Debug, Serialize)]
 struct Scorecards {
     c1: ScorecardEvidence,
-    persistent: ScorecardEvidence,
+    persistent: PersistentProfileScorecards,
+}
+
+#[derive(Debug, Serialize)]
+struct PersistentProfileScorecards {
+    release: ScorecardEvidence,
+    release_perf: ScorecardEvidence,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,7 +215,8 @@ struct Options {
     output: Option<String>,
     tested_commit: Option<String>,
     c1_pack_dir: Option<PathBuf>,
-    persistent_pack_dir: Option<PathBuf>,
+    persistent_release_pack_dir: Option<PathBuf>,
+    persistent_release_perf_pack_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,9 +230,12 @@ struct ValidatedPackInputs {
     c1_scorecard: Vec<u8>,
     c1_manifest: Vec<u8>,
     c1_provenance: Vec<u8>,
-    persistent_scorecard: Vec<u8>,
-    persistent_manifest: Vec<u8>,
-    persistent_provenance: Vec<u8>,
+    persistent_release_scorecard: Vec<u8>,
+    persistent_release_manifest: Vec<u8>,
+    persistent_release_provenance: Vec<u8>,
+    persistent_release_perf_scorecard: Vec<u8>,
+    persistent_release_perf_manifest: Vec<u8>,
+    persistent_release_perf_provenance: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -285,16 +305,24 @@ fn run() -> Result<(), String> {
     let c1_pack_dir = options
         .c1_pack_dir
         .ok_or_else(|| format!("missing --c1-pack-dir; {USAGE}"))?;
-    let persistent_pack_dir = options
-        .persistent_pack_dir
-        .ok_or_else(|| format!("missing --persistent-pack-dir; {USAGE}"))?;
+    let persistent_release_pack_dir = options
+        .persistent_release_pack_dir
+        .ok_or_else(|| format!("missing --persistent-release-pack-dir; {USAGE}"))?;
+    let persistent_release_perf_pack_dir = options
+        .persistent_release_perf_pack_dir
+        .ok_or_else(|| format!("missing --persistent-release-perf-pack-dir; {USAGE}"))?;
     let namespace = expected_namespace(&tested_commit);
     if output != format!("{namespace}/{MANIFEST_NAME}") {
         return Err(format!("--output must be `{namespace}/{MANIFEST_NAME}`"));
     }
     require_pristine_capture_checkout(&root)?;
-    let pack_inputs =
-        validate_pack_inputs(&root, &tested_commit, &c1_pack_dir, &persistent_pack_dir)?;
+    let pack_inputs = validate_pack_inputs(
+        &root,
+        &tested_commit,
+        &c1_pack_dir,
+        &persistent_release_pack_dir,
+        &persistent_release_perf_pack_dir,
+    )?;
     let workers = required_workers()?;
     let primary_worker = workers
         .first()
@@ -307,10 +335,15 @@ fn run() -> Result<(), String> {
         &format!("{namespace}/performance/c1/c1_scorecard.json"),
         &pack_inputs.c1_scorecard,
     )?;
-    let persistent_scorecard = write_raw_new(
+    let persistent_release_scorecard = write_raw_new(
         &root,
-        &format!("{namespace}/performance/persistent/persistent_scorecard.json"),
-        &pack_inputs.persistent_scorecard,
+        &format!("{namespace}/performance/persistent/release/persistent_scorecard.json"),
+        &pack_inputs.persistent_release_scorecard,
+    )?;
+    let persistent_release_perf_scorecard = write_raw_new(
+        &root,
+        &format!("{namespace}/performance/persistent/release-perf/persistent_scorecard.json"),
+        &pack_inputs.persistent_release_perf_scorecard,
     )?;
     let census = pre_capture_untracked(&root, &tested_commit)?;
     let pre_capture_untracked = write_raw_new(
@@ -328,15 +361,27 @@ fn run() -> Result<(), String> {
         &format!("{namespace}/performance/c1/build_metadata.json"),
         &pack_inputs.c1_provenance,
     )?;
-    let persistent_manifest = write_raw_new(
+    let persistent_release_manifest = write_raw_new(
         &root,
-        &format!("{namespace}/performance/persistent/manifest.json"),
-        &pack_inputs.persistent_manifest,
+        &format!("{namespace}/performance/persistent/release/manifest.json"),
+        &pack_inputs.persistent_release_manifest,
     )?;
-    let persistent_provenance = write_raw_new(
+    let persistent_release_provenance = write_raw_new(
         &root,
-        &format!("{namespace}/performance/persistent/provenance/citation_receipt.json"),
-        &pack_inputs.persistent_provenance,
+        &format!("{namespace}/performance/persistent/release/provenance/citation_receipt.json"),
+        &pack_inputs.persistent_release_provenance,
+    )?;
+    let persistent_release_perf_manifest = write_raw_new(
+        &root,
+        &format!("{namespace}/performance/persistent/release-perf/manifest.json"),
+        &pack_inputs.persistent_release_perf_manifest,
+    )?;
+    let persistent_release_perf_provenance = write_raw_new(
+        &root,
+        &format!(
+            "{namespace}/performance/persistent/release-perf/provenance/citation_receipt.json"
+        ),
+        &pack_inputs.persistent_release_perf_provenance,
     )?;
 
     let tree = tested_tree_hash(&root, &tested_commit)?;
@@ -475,11 +520,25 @@ fn run() -> Result<(), String> {
                 pack_manifest: c1_manifest,
                 commit_provenance: c1_provenance,
             },
-            persistent: ScorecardEvidence {
-                scorecard: persistent_scorecard,
-                pack_manifest: persistent_manifest,
-                commit_provenance: persistent_provenance,
+            persistent: PersistentProfileScorecards {
+                release: ScorecardEvidence {
+                    scorecard: persistent_release_scorecard,
+                    pack_manifest: persistent_release_manifest,
+                    commit_provenance: persistent_release_provenance,
+                },
+                release_perf: ScorecardEvidence {
+                    scorecard: persistent_release_perf_scorecard,
+                    pack_manifest: persistent_release_perf_manifest,
+                    commit_provenance: persistent_release_perf_provenance,
+                },
             },
+        },
+        performance_regression_gate: PerformanceRegressionGate {
+            schema_version: "fsqlite.performance_release_admission.v1",
+            status: "blocked_no_immutable_historical_baseline",
+            release_authorized: false,
+            blockers: ["bd-dqdoe", "bd-uh1fv", "bd-zywqc.2", "bd-1dp9.6.4"],
+            rationale: "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.",
         },
         evidence_pack: Vec::new(),
     };
@@ -511,7 +570,8 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
     let mut output = None;
     let mut tested_commit = None;
     let mut c1_pack_dir = None;
-    let mut persistent_pack_dir = None;
+    let mut persistent_release_pack_dir = None;
+    let mut persistent_release_perf_pack_dir = None;
     let mut iter = arguments.iter().skip(1);
     while let Some(flag) = iter.next() {
         match flag.as_str() {
@@ -542,10 +602,17 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
                         format!("missing value after --c1-pack-dir; {USAGE}")
                     })?));
             }
-            "--persistent-pack-dir" if persistent_pack_dir.is_none() => {
-                persistent_pack_dir = Some(PathBuf::from(iter.next().ok_or_else(|| {
-                    format!("missing value after --persistent-pack-dir; {USAGE}")
-                })?));
+            "--persistent-release-pack-dir" if persistent_release_pack_dir.is_none() => {
+                persistent_release_pack_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        format!("missing value after --persistent-release-pack-dir; {USAGE}")
+                    })?));
+            }
+            "--persistent-release-perf-pack-dir" if persistent_release_perf_pack_dir.is_none() => {
+                persistent_release_perf_pack_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        format!("missing value after --persistent-release-perf-pack-dir; {USAGE}")
+                    })?));
             }
             _ => return Err(format!("unrecognized or duplicate `{flag}`; {USAGE}")),
         }
@@ -556,18 +623,21 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         && baseline_output_dir.is_some()
         && output.is_none()
         && c1_pack_dir.is_none()
-        && persistent_pack_dir.is_none();
+        && persistent_release_pack_dir.is_none()
+        && persistent_release_perf_pack_dir.is_none();
     let capture_shape = capture
         && !baseline_only
         && baseline_output_dir.is_none()
         && c1_pack_dir.is_some()
-        && persistent_pack_dir.is_some();
+        && persistent_release_pack_dir.is_some()
+        && persistent_release_perf_pack_dir.is_some();
     let plan_shape = plan
         && !baseline_only
         && baseline_output_dir.is_none()
         && output.is_none()
         && c1_pack_dir.is_none()
-        && persistent_pack_dir.is_none();
+        && persistent_release_pack_dir.is_none()
+        && persistent_release_perf_pack_dir.is_none();
     if modes != 1 || !(baseline_shape || capture_shape || plan_shape) {
         return Err(USAGE.to_owned());
     }
@@ -578,7 +648,8 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         output,
         tested_commit,
         c1_pack_dir,
-        persistent_pack_dir,
+        persistent_release_pack_dir,
+        persistent_release_perf_pack_dir,
     })
 }
 
@@ -712,7 +783,7 @@ fn plan_json(tested_commit: &str, runs: &[&IgnoredTest]) -> Result<Value, String
             "RCH_LOG_FORMAT=json"
         ],
         "worker_pool": {"maximum": MAX_CAPTURE_WORKERS, "receipt_order": "baseline locator order"},
-        "required_capture_inputs": ["--c1-pack-dir <absolute external dir>", "--persistent-pack-dir <absolute external dir>"],
+        "required_capture_inputs": ["--c1-pack-dir <absolute external dir>", "--persistent-release-pack-dir <absolute external dir>", "--persistent-release-perf-pack-dir <absolute external dir>"],
         "signing": "DSR detached signature is intentionally not produced by this runner"
     }))
 }
@@ -1837,15 +1908,40 @@ fn evidence_pack(
         manifest.auxiliary_scorecards.c1.scorecard.clone(),
         manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
         manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
-        manifest.auxiliary_scorecards.persistent.scorecard.clone(),
         manifest
             .auxiliary_scorecards
             .persistent
+            .release
+            .scorecard
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release
             .pack_manifest
             .clone(),
         manifest
             .auxiliary_scorecards
             .persistent
+            .release
+            .commit_provenance
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
+            .scorecard
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
+            .pack_manifest
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
             .commit_provenance
             .clone(),
     ];
@@ -1894,7 +1990,10 @@ fn prepare_evidence_namespace(namespace_path: &Path, namespace: &str) -> Result<
         "performance",
         "performance/c1",
         "performance/persistent",
-        "performance/persistent/provenance",
+        "performance/persistent/release",
+        "performance/persistent/release/provenance",
+        "performance/persistent/release-perf",
+        "performance/persistent/release-perf/provenance",
         "inputs",
         "transcripts",
         "runner",
@@ -2042,7 +2141,7 @@ fn pre_capture_untracked(root: &Path, commit: &str) -> Result<Vec<u8>, String> {
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
     let expected = format!(
-        "?? {EVIDENCE_ROOT}/{commit}/performance/c1/c1_scorecard.json\0?? {EVIDENCE_ROOT}/{commit}/performance/persistent/persistent_scorecard.json\0"
+        "?? {EVIDENCE_ROOT}/{commit}/performance/c1/c1_scorecard.json\0?? {EVIDENCE_ROOT}/{commit}/performance/persistent/release-perf/persistent_scorecard.json\0?? {EVIDENCE_ROOT}/{commit}/performance/persistent/release/persistent_scorecard.json\0"
     )
     .into_bytes();
     if output.stdout != expected {
@@ -2063,6 +2162,60 @@ fn pre_capture_untracked(root: &Path, commit: &str) -> Result<Vec<u8>, String> {
 enum PackKind {
     C1,
     Persistent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistentProfile {
+    Release,
+    ReleasePerf,
+}
+
+impl PersistentProfile {
+    fn receipt_name(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::ReleasePerf => "release-perf",
+        }
+    }
+
+    fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::ReleasePerf => "release-perf",
+        }
+    }
+
+    fn expected_opt_level(self) -> &'static str {
+        match self {
+            Self::Release => "z",
+            Self::ReleasePerf => "3",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PersistentCitationIdentity {
+    actual_worker: String,
+    actual_host: String,
+    workload: PersistentWorkload,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+struct PersistentWorkload {
+    benchmark: String,
+    rows_per_thread: u64,
+    synchronous: String,
+    threads: Vec<u64>,
+    criterion: PersistentCriterion,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+struct PersistentCriterion {
+    sample_size: u64,
+    warmup_secs: u64,
+    measurement_secs: u64,
+    export_root: String,
+    headline_source: String,
 }
 
 fn external_pack_source_names(kind: PackKind) -> [&'static str; 3] {
@@ -2128,19 +2281,52 @@ fn pack_kind_name(kind: PackKind) -> &'static str {
     }
 }
 
-fn validate_persistent_citation_receipt(bytes: &[u8], tested_commit: &str) -> Result<(), String> {
+fn validate_persistent_citation_receipt(
+    bytes: &[u8],
+    tested_commit: &str,
+    expected_profile: PersistentProfile,
+) -> Result<PersistentCitationIdentity, String> {
     const SCHEMA: &str = "fsqlite.release_persistent_phase_pack_citation_receipt.v2";
+    const RUSTFLAGS_POLICY: &str =
+        "all three values must be empty; remote cargo is invoked through env -u for each";
 
     #[derive(Deserialize)]
     struct Citation {
         schema_version: String,
         source: Source,
+        build: Build,
+        rch: Rch,
         rch_scheduler_isolation: SchedulerIsolation,
+        workload: PersistentWorkload,
     }
     #[derive(Deserialize)]
     struct Source {
         commit: String,
         clean: bool,
+    }
+    #[derive(Deserialize)]
+    struct Build {
+        profile: String,
+        expected_opt_level: String,
+        rustflags: Rustflags,
+        nonce: String,
+    }
+    #[derive(Deserialize)]
+    struct Rustflags {
+        #[allow(non_snake_case)]
+        RUSTFLAGS: String,
+        #[allow(non_snake_case)]
+        CARGO_ENCODED_RUSTFLAGS: String,
+        #[allow(non_snake_case)]
+        CARGO_BUILD_RUSTFLAGS: String,
+        policy: String,
+    }
+    #[derive(Deserialize)]
+    struct Rch {
+        actual_worker: String,
+        actual_host: String,
+        require_remote: bool,
+        no_self_healing: bool,
     }
     #[derive(Deserialize)]
     struct SchedulerIsolation {
@@ -2184,6 +2370,40 @@ fn validate_persistent_citation_receipt(bytes: &[u8], tested_commit: &str) -> Re
             "persistent citation receipt must use v2 and bind the clean tested commit".to_owned(),
         );
     }
+    if citation.build.profile != expected_profile.receipt_name()
+        || citation.build.expected_opt_level != expected_profile.expected_opt_level()
+        || citation.build.rustflags.RUSTFLAGS != ""
+        || citation.build.rustflags.CARGO_ENCODED_RUSTFLAGS != ""
+        || citation.build.rustflags.CARGO_BUILD_RUSTFLAGS != ""
+        || citation.build.rustflags.policy != RUSTFLAGS_POLICY
+        || !canonical_sha256(&citation.build.nonce)
+        || citation.rch.actual_worker.trim().is_empty()
+        || citation.rch.actual_host.trim().is_empty()
+        || !citation.rch.require_remote
+        || !citation.rch.no_self_healing
+    {
+        return Err(format!(
+            "persistent {} citation receipt must bind the portable {} profile, its opt level, empty Rust flags, canonical build nonce, and remote worker identity",
+            expected_profile.receipt_name(),
+            expected_profile.receipt_name(),
+        ));
+    }
+    if citation.workload.benchmark != "persistent_concurrent_write_{1,8,16}t"
+        || citation.workload.rows_per_thread != 1000
+        || citation.workload.synchronous != "NORMAL"
+        || citation.workload.threads.as_slice() != &[1, 8, 16]
+        || citation.workload.criterion.sample_size == 0
+        || citation.workload.criterion.warmup_secs == 0
+        || citation.workload.criterion.measurement_secs == 0
+        || citation.workload.criterion.export_root != "{phase}/criterion_measurements"
+        || citation.workload.criterion.headline_source
+            != "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json"
+    {
+        return Err(
+            "persistent citation receipt does not retain the fixed release workload contract"
+                .to_owned(),
+        );
+    }
     let isolation = citation.rch_scheduler_isolation;
     if isolation.build_status_trace != "provenance/rch_build_status.jsonl"
         || isolation.build_completion_snapshot != "provenance/rch_build_status_completion.json"
@@ -2214,14 +2434,19 @@ fn validate_persistent_citation_receipt(bytes: &[u8], tested_commit: &str) -> Re
             ));
         }
     }
-    Ok(())
+    Ok(PersistentCitationIdentity {
+        actual_worker: citation.rch.actual_worker,
+        actual_host: citation.rch.actual_host,
+        workload: citation.workload,
+    })
 }
 
 fn validate_pack_inputs(
     root: &Path,
     tested_commit: &str,
     c1_directory: &Path,
-    persistent_directory: &Path,
+    persistent_release_directory: &Path,
+    persistent_release_perf_directory: &Path,
 ) -> Result<ValidatedPackInputs, String> {
     const C1_SCORECARD_SCHEMA: &str = "bd-db300.c1_evidence_pack_scorecard.v1";
     const C1_MANIFEST_SCHEMA: &str = "bd-db300.c1_evidence_pack_manifest.v1";
@@ -2255,10 +2480,19 @@ fn validate_pack_inputs(
     let [c1_scorecard, c1_manifest, c1_provenance] =
         read_external_pack(root, c1_directory, PackKind::C1)?;
     let [
-        persistent_scorecard,
-        persistent_manifest,
-        persistent_provenance,
-    ] = read_external_pack(root, persistent_directory, PackKind::Persistent)?;
+        persistent_release_scorecard,
+        persistent_release_manifest,
+        persistent_release_provenance,
+    ] = read_external_pack(root, persistent_release_directory, PackKind::Persistent)?;
+    let [
+        persistent_release_perf_scorecard,
+        persistent_release_perf_manifest,
+        persistent_release_perf_provenance,
+    ] = read_external_pack(
+        root,
+        persistent_release_perf_directory,
+        PackKind::Persistent,
+    )?;
     let c1_score: Scorecard = serde_json::from_slice(&c1_scorecard)
         .map_err(|error| format!("invalid C1 scorecard: {error}"))?;
     let c1_pack: PackManifest = serde_json::from_slice(&c1_manifest)
@@ -2285,33 +2519,74 @@ fn validate_pack_inputs(
         );
     }
 
-    let persistent_score: Scorecard = serde_json::from_slice(&persistent_scorecard)
-        .map_err(|error| format!("invalid persistent scorecard: {error}"))?;
-    let persistent_pack: PackManifest = serde_json::from_slice(&persistent_manifest)
-        .map_err(|error| format!("invalid persistent pack manifest: {error}"))?;
-    if persistent_score.schema_version != PERSISTENT_SCORECARD_SCHEMA
-        || persistent_pack.schema_version != PERSISTENT_MANIFEST_SCHEMA
-        || persistent_score.run_id.trim().is_empty()
-        || persistent_score.run_id != persistent_pack.run_id
-        || persistent_score.honest_gate_summary.verdict != "pass"
-        || persistent_pack.citation_receipt_json.as_deref()
-            != Some("provenance/citation_receipt.json")
-        || persistent_pack.build_metadata_json.is_some()
-        || persistent_pack.build_metadata.is_some()
+    let validate_persistent_pack = |scorecard: &[u8],
+                                    manifest: &[u8],
+                                    provenance: &[u8],
+                                    profile: PersistentProfile|
+     -> Result<PersistentCitationIdentity, String> {
+        let score: Scorecard = serde_json::from_slice(scorecard).map_err(|error| {
+            format!(
+                "invalid persistent {} scorecard: {error}",
+                profile.manifest_name()
+            )
+        })?;
+        let pack: PackManifest = serde_json::from_slice(manifest).map_err(|error| {
+            format!(
+                "invalid persistent {} pack manifest: {error}",
+                profile.manifest_name()
+            )
+        })?;
+        if score.schema_version != PERSISTENT_SCORECARD_SCHEMA
+            || pack.schema_version != PERSISTENT_MANIFEST_SCHEMA
+            || score.run_id.trim().is_empty()
+            || score.run_id != pack.run_id
+            || score.honest_gate_summary.verdict != "pass"
+            || pack.citation_receipt_json.as_deref() != Some("provenance/citation_receipt.json")
+            || pack.build_metadata_json.is_some()
+            || pack.build_metadata.is_some()
+        {
+            return Err(format!(
+                "persistent {} evidence pack does not bind a passing run to the clean tested commit",
+                profile.manifest_name()
+            ));
+        }
+        validate_persistent_citation_receipt(provenance, tested_commit, profile)
+    };
+    let release_identity = validate_persistent_pack(
+        &persistent_release_scorecard,
+        &persistent_release_manifest,
+        &persistent_release_provenance,
+        PersistentProfile::Release,
+    )?;
+    let release_perf_identity = validate_persistent_pack(
+        &persistent_release_perf_scorecard,
+        &persistent_release_perf_manifest,
+        &persistent_release_perf_provenance,
+        PersistentProfile::ReleasePerf,
+    )?;
+    if release_identity.actual_worker != release_perf_identity.actual_worker
+        || release_identity.actual_host != release_perf_identity.actual_host
+        || release_identity.workload != release_perf_identity.workload
     {
         return Err(
-            "persistent evidence pack does not bind a passing run to the clean tested commit"
+            "persistent release and release-perf packs must retain the same worker, host, and workload contract"
                 .to_owned(),
         );
     }
-    validate_persistent_citation_receipt(&persistent_provenance, tested_commit)?;
+    // Each profile builds a distinct binary, so its fresh nonce is deliberately
+    // validated as a canonical 64-hex family member above rather than forced
+    // equal here. Equality would encourage replaying one build identity across
+    // the two independently profile-bound captures.
     Ok(ValidatedPackInputs {
         c1_scorecard,
         c1_manifest,
         c1_provenance,
-        persistent_scorecard,
-        persistent_manifest,
-        persistent_provenance,
+        persistent_release_scorecard,
+        persistent_release_manifest,
+        persistent_release_provenance,
+        persistent_release_perf_scorecard,
+        persistent_release_perf_manifest,
+        persistent_release_perf_provenance,
     })
 }
 
@@ -2403,13 +2678,43 @@ fn prepare_external_baseline_root(
 #[cfg(test)]
 mod tests {
     use super::{
-        AdoptedRchJob, BUILD_SHAPING_ENV_EXACT, PackKind, adopt_active_job,
+        AdoptedRchJob, BUILD_SHAPING_ENV_EXACT, PackKind, PersistentProfile, adopt_active_job,
         completed_status_matches, external_pack_source_names, is_build_shaping_env,
-        missing_adopted_job_error, parallel_map_ordered, parse_single_worker, parse_worker_pool,
-        pin_adopted_job, strict_rch_command, validate_persistent_citation_receipt,
-        validate_remote_target_mapping,
+        missing_adopted_job_error, parallel_map_ordered, parse_options, parse_single_worker,
+        parse_worker_pool, pin_adopted_job, strict_rch_command,
+        validate_persistent_citation_receipt, validate_remote_target_mapping,
     };
     use serde_json::Value;
+
+    #[test]
+    fn capture_options_require_distinct_release_and_release_perf_packs() {
+        let canonical = [
+            "phase5_evidence_capture",
+            "--output",
+            "tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/manifest.json",
+            "--c1-pack-dir",
+            "/tmp/c1",
+            "--persistent-release-pack-dir",
+            "/tmp/release",
+            "--persistent-release-perf-pack-dir",
+            "/tmp/release-perf",
+        ]
+        .map(str::to_owned);
+        assert!(parse_options(&canonical).is_ok());
+        assert!(parse_options(&canonical[..7]).is_err());
+
+        let legacy = [
+            "phase5_evidence_capture",
+            "--output",
+            "tests/artifacts/release-evidence/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/manifest.json",
+            "--c1-pack-dir",
+            "/tmp/c1",
+            "--persistent-pack-dir",
+            "/tmp/persistent",
+        ]
+        .map(str::to_owned);
+        assert!(parse_options(&legacy).is_err());
+    }
 
     #[test]
     fn worker_pool_parser_is_bounded_unique_and_canonical() {
@@ -2798,6 +3103,23 @@ mod tests {
         let mut citation = serde_json::json!({
             "schema_version": "fsqlite.release_persistent_phase_pack_citation_receipt.v2",
             "source": {"commit": commit, "clean": true},
+            "build": {
+                "profile": "release",
+                "expected_opt_level": "z",
+                "rustflags": {
+                    "RUSTFLAGS": "",
+                    "CARGO_ENCODED_RUSTFLAGS": "",
+                    "CARGO_BUILD_RUSTFLAGS": "",
+                    "policy": "all three values must be empty; remote cargo is invoked through env -u for each",
+                },
+                "nonce": "c".repeat(64),
+            },
+            "rch": {
+                "actual_worker": "ovh-a",
+                "actual_host": "worker.example.test",
+                "require_remote": true,
+                "no_self_healing": true,
+            },
             "rch_scheduler_isolation": {
                 "build_status_trace": "provenance/rch_build_status.jsonl",
                 "build_status_trace_sha256": digest,
@@ -2812,13 +3134,36 @@ mod tests {
                     "16t": trace("16t", "29960952048779269"),
                 },
             },
+            "workload": {
+                "benchmark": "persistent_concurrent_write_{1,8,16}t",
+                "rows_per_thread": 1000,
+                "synchronous": "NORMAL",
+                "threads": [1, 8, 16],
+                "criterion": {
+                    "sample_size": 10,
+                    "warmup_secs": 1,
+                    "measurement_secs": 1,
+                    "export_root": "{phase}/criterion_measurements",
+                    "headline_source": "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json",
+                },
+            },
         });
         assert!(
             validate_persistent_citation_receipt(
                 &serde_json::to_vec(&citation).expect("encode v2 citation"),
                 &commit,
+                PersistentProfile::Release,
             )
             .is_ok()
+        );
+
+        assert!(
+            validate_persistent_citation_receipt(
+                &serde_json::to_vec(&citation).expect("encode release citation"),
+                &commit,
+                PersistentProfile::ReleasePerf,
+            )
+            .is_err()
         );
 
         citation["schema_version"] =
@@ -2827,6 +3172,7 @@ mod tests {
             validate_persistent_citation_receipt(
                 &serde_json::to_vec(&citation).expect("encode v1 citation"),
                 &commit,
+                PersistentProfile::Release,
             )
             .is_err()
         );
@@ -2839,6 +3185,7 @@ mod tests {
             validate_persistent_citation_receipt(
                 &serde_json::to_vec(&citation).expect("encode numeric job id"),
                 &commit,
+                PersistentProfile::Release,
             )
             .is_err()
         );

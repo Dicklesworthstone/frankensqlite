@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::ci_gate_matrix::CiLane;
 use crate::confidence_gates::GateConfig;
 use crate::ratchet_policy::RatchetPolicy;
+use crate::score_engine::STATISTICAL_RELEASE_FLOOR;
 
 /// Owning Track G bead.
 pub const CERTIFICATION_POLICY_BEAD_ID: &str = "bd-2yqp6.7";
 /// Stable identifier for the strict certification profile.
-pub const CERTIFICATION_POLICY_ID: &str = "strict-conformant-release.v1";
+pub const CERTIFICATION_POLICY_ID: &str = "strict-conformant-release.v2";
 /// Schema version for machine-readable certification policy artifacts.
 pub const CERTIFICATION_POLICY_SCHEMA_VERSION: u32 = 1;
 /// Certification requires full declared-surface verification.
@@ -171,8 +172,9 @@ pub const REQUIRED_CERTIFICATION_LANES: [CiLane; 6] = [
 #[must_use]
 pub fn certification_gate_config() -> GateConfig {
     GateConfig {
-        release_threshold: 1.0,
+        release_threshold: STATISTICAL_RELEASE_FLOOR,
         category_min_verification_pct: CERTIFICATION_MIN_VERIFICATION_PCT,
+        waived_obligations_satisfy_gate: false,
         ..GateConfig::default()
     }
 }
@@ -191,28 +193,49 @@ pub fn evaluate_certification_ratchets(
 ) -> CertificationRatchetEvaluation {
     let mut regressed_ratchets = Vec::new();
 
-    if candidate.global_lower_bound < baseline.global_lower_bound {
+    if baseline.schema_version != CERTIFICATION_POLICY_SCHEMA_VERSION
+        || baseline.policy_id != CERTIFICATION_POLICY_ID
+    {
+        regressed_ratchets.push("baseline_identity".to_owned());
+    }
+
+    if !(0.0..=1.0).contains(&baseline.global_lower_bound)
+        || !(0.0..=1.0).contains(&candidate.global_lower_bound)
+        || candidate.global_lower_bound < baseline.global_lower_bound
+    {
         regressed_ratchets.push("global_lower_bound".to_owned());
     }
 
-    if baseline
-        .category_lower_bounds
-        .iter()
-        .any(|(category, approved)| {
-            candidate
-                .category_lower_bounds
-                .get(category)
-                .is_none_or(|current| current < approved)
-        })
+    if baseline.category_lower_bounds.is_empty()
+        || baseline
+            .category_lower_bounds
+            .keys()
+            .ne(candidate.category_lower_bounds.keys())
+        || baseline
+            .category_lower_bounds
+            .iter()
+            .any(|(category, approved)| {
+                !(0.0..=1.0).contains(approved)
+                    || candidate
+                        .category_lower_bounds
+                        .get(category)
+                        .is_none_or(|current| !(0.0..=1.0).contains(current) || current < approved)
+            })
     {
         regressed_ratchets.push("category_lower_bounds".to_owned());
     }
 
-    if candidate.required_suite_pass_rate_pct < baseline.required_suite_pass_rate_pct {
+    if !(0.0..=100.0).contains(&baseline.required_suite_pass_rate_pct)
+        || !(0.0..=100.0).contains(&candidate.required_suite_pass_rate_pct)
+        || candidate.required_suite_pass_rate_pct < baseline.required_suite_pass_rate_pct
+    {
         regressed_ratchets.push("required_suite_pass_rate".to_owned());
     }
 
-    if candidate.traceability_link_coverage_pct < baseline.traceability_link_coverage_pct {
+    if !(0.0..=100.0).contains(&baseline.traceability_link_coverage_pct)
+        || !(0.0..=100.0).contains(&candidate.traceability_link_coverage_pct)
+        || candidate.traceability_link_coverage_pct < baseline.traceability_link_coverage_pct
+    {
         regressed_ratchets.push("traceability_link_coverage".to_owned());
     }
 
@@ -350,8 +373,16 @@ mod tests {
         assert_eq!(policy.required_suite_pass_rate_pct, 100.0);
         assert_eq!(policy.max_high_severity_counterexamples, 0);
         assert_eq!(policy.max_evidence_age_hours, 24);
-        assert_eq!(policy.gate_config.release_threshold, 1.0);
+        assert_eq!(
+            policy.gate_config.release_threshold,
+            STATISTICAL_RELEASE_FLOOR
+        );
         assert_eq!(policy.gate_config.category_min_verification_pct, 100.0);
+        assert!(!policy.gate_config.waived_obligations_satisfy_gate);
+        assert_eq!(
+            policy.ratchet_policy.minimum_release_threshold,
+            STATISTICAL_RELEASE_FLOOR
+        );
         assert_eq!(policy.ratchet_policy.regression_tolerance, 0.0);
         assert_eq!(policy.ratchet_policy.category_regression_tolerance, 0.0);
         assert!(!policy.ratchet_policy.quarantine_enabled);

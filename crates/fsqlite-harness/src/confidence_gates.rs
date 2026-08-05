@@ -34,7 +34,7 @@ use crate::parity_invariant_catalog::{
     InvariantCatalog, InvariantId, ObligationStatus, ParityInvariant, ProofKind,
 };
 use crate::parity_taxonomy::{FeatureCategory, FeatureUniverse, truncate_score};
-use crate::score_engine::{BetaParams, PriorConfig};
+use crate::score_engine::{BetaParams, PriorConfig, STATISTICAL_RELEASE_FLOOR};
 use crate::verification_contract_enforcement::{
     ContractEnforcementOutcome, enforce_gate_decision, evaluate_workspace_verification_contract,
 };
@@ -57,10 +57,16 @@ pub struct GateConfig {
     pub prior: PriorConfig,
     /// Confidence level for credible intervals (e.g., 0.95).
     pub confidence_level: f64,
-    /// Release threshold: conservative lower bound must exceed this.
+    /// Statistical release floor: the conservative lower bound must meet or exceed this.
     pub release_threshold: f64,
     /// Per-category minimum verification percentage to pass the gate.
     pub category_min_verification_pct: f64,
+    /// Whether waived obligations count as satisfied evidence.
+    ///
+    /// Generic analysis may opt into waiver semantics. Strict release
+    /// certification disables this so every declared obligation must be
+    /// independently verified.
+    pub waived_obligations_satisfy_gate: bool,
     /// Cost multiplier for false-negative (missed mismatch) vs false-positive.
     /// Higher values prioritise catching mismatches over avoiding false alarms.
     pub loss_asymmetry_ratio: f64,
@@ -71,10 +77,33 @@ impl Default for GateConfig {
         Self {
             prior: PriorConfig::default(),
             confidence_level: 0.95,
-            release_threshold: 1.0,
+            release_threshold: STATISTICAL_RELEASE_FLOOR,
             category_min_verification_pct: 50.0,
+            waived_obligations_satisfy_gate: true,
             loss_asymmetry_ratio: 5.0,
         }
+    }
+}
+
+fn is_strict_probability(value: f64) -> bool {
+    value.is_finite() && value > 0.0 && value < 1.0
+}
+
+fn gate_config_is_valid(config: &GateConfig) -> bool {
+    config.prior.is_valid()
+        && is_strict_probability(config.confidence_level)
+        && (STATISTICAL_RELEASE_FLOOR..=1.0).contains(&config.release_threshold)
+        && config.category_min_verification_pct.is_finite()
+        && (0.0..=100.0).contains(&config.category_min_verification_pct)
+        && config.loss_asymmetry_ratio.is_finite()
+        && config.loss_asymmetry_ratio > 0.0
+}
+
+fn calculation_prior(config: &GateConfig) -> PriorConfig {
+    if config.prior.is_valid() {
+        config.prior
+    } else {
+        PriorConfig::default()
     }
 }
 
@@ -271,7 +300,7 @@ impl GateReport {
 // ---------------------------------------------------------------------------
 
 /// Evaluate the confidence gate for a single invariant.
-fn evaluate_invariant_gate(inv: &ParityInvariant) -> InvariantGateResult {
+fn evaluate_invariant_gate(inv: &ParityInvariant, config: &GateConfig) -> InvariantGateResult {
     let mut verified = 0_usize;
     let mut pending = 0_usize;
     let mut partial = 0_usize;
@@ -287,7 +316,12 @@ fn evaluate_invariant_gate(inv: &ParityInvariant) -> InvariantGateResult {
     }
 
     let total = inv.obligations.len();
-    let satisfied = verified + waived;
+    let satisfied = verified
+        + if config.waived_obligations_satisfy_gate {
+            waived
+        } else {
+            0
+        };
     #[allow(clippy::cast_precision_loss)]
     let verification_pct = if total > 0 {
         truncate_score((satisfied as f64 / total as f64) * 100.0)
@@ -297,7 +331,7 @@ fn evaluate_invariant_gate(inv: &ParityInvariant) -> InvariantGateResult {
 
     let decision = if total == 0 {
         GateDecision::Fail
-    } else if waived == total {
+    } else if config.waived_obligations_satisfy_gate && waived == total {
         GateDecision::Waived
     } else if satisfied == total {
         GateDecision::Pass
@@ -347,11 +381,17 @@ fn evaluate_category_gate(
     let successes = passing as f64;
     #[allow(clippy::cast_precision_loss)]
     let failures = (total - passing) as f64;
-    let alpha = config.prior.alpha + successes;
-    let beta = config.prior.beta + failures;
+    let prior = calculation_prior(config);
+    let confidence_level = if is_strict_probability(config.confidence_level) {
+        config.confidence_level
+    } else {
+        GateConfig::default().confidence_level
+    };
+    let alpha = prior.alpha + successes;
+    let beta = prior.beta + failures;
     let posterior = BetaParams::new(alpha, beta);
     let posterior_mean = truncate_score(posterior.mean());
-    let (lo, hi) = posterior.credible_interval(config.confidence_level);
+    let (lo, hi) = posterior.credible_interval(confidence_level);
 
     let decision = if total == 0 {
         GateDecision::Fail
@@ -384,10 +424,11 @@ fn evaluate_category_gate(
 /// report suitable for consumption by the release certificate generator (bd-1dp9.8.4).
 #[must_use]
 pub fn evaluate_gate(catalog: &InvariantCatalog, config: &GateConfig) -> GateReport {
+    let config_is_valid = gate_config_is_valid(config);
     // Evaluate each invariant
     let mut invariant_results = BTreeMap::new();
     for inv in catalog.invariants.values() {
-        let result = evaluate_invariant_gate(inv);
+        let result = evaluate_invariant_gate(inv, config);
         invariant_results.insert(inv.id.0.clone(), result);
     }
 
@@ -428,9 +469,11 @@ pub fn evaluate_gate(catalog: &InvariantCatalog, config: &GateConfig) -> GateRep
 
     // Global gate decision
     let all_categories_pass = category_results.values().all(|cr| cr.decision.is_pass());
-    let threshold_met = global_lower_bound >= config.release_threshold;
+    let threshold_met = config_is_valid && global_lower_bound >= config.release_threshold;
 
-    let global_decision = if all_categories_pass && threshold_met {
+    let global_decision = if !config_is_valid {
+        GateDecision::Fail
+    } else if all_categories_pass && threshold_met {
         GateDecision::Pass
     } else if passing_invariants > 0 {
         GateDecision::Conditional
@@ -582,10 +625,10 @@ pub fn compute_expected_loss_ranking(
     let mut entries = Vec::new();
 
     for inv in catalog.invariants.values() {
-        let gate_result = evaluate_invariant_gate(inv);
+        let gate_result = evaluate_invariant_gate(inv, config);
 
         // Posterior mismatch probability
-        let mismatch_prob = compute_mismatch_probability(inv, &gate_result, &config.prior);
+        let mismatch_prob = compute_mismatch_probability(inv, &gate_result, config);
 
         // Mismatch cost: category weight × asymmetry ratio
         let category_weight = inv.category.global_weight();
@@ -598,7 +641,13 @@ pub fn compute_expected_loss_ranking(
         let pending_proof_kinds: Vec<ProofKind> = inv
             .obligations
             .iter()
-            .filter(|o| o.status == ObligationStatus::Pending)
+            .filter(|o| {
+                matches!(
+                    o.status,
+                    ObligationStatus::Pending | ObligationStatus::Partial
+                ) || (!config.waived_obligations_satisfy_gate
+                    && o.status == ObligationStatus::Waived)
+            })
             .map(|o| o.kind)
             .collect();
 
@@ -645,22 +694,32 @@ pub fn compute_expected_loss_ranking(
 ///
 /// Uses a Beta-posterior model:
 /// - Each obligation contributes to the posterior as a Bernoulli observation
-/// - Verified/waived → success, Pending/Partial → failure
+/// - Verified obligations are successes
+/// - Pending/Partial obligations are failures
+/// - Waived obligations follow the configured gate policy
 /// - The mismatch probability is 1 - posterior_mean
 fn compute_mismatch_probability(
     inv: &ParityInvariant,
     gate_result: &InvariantGateResult,
-    prior: &PriorConfig,
+    config: &GateConfig,
 ) -> f64 {
     if inv.obligations.is_empty() {
         return 1.0; // no evidence → maximum uncertainty
     }
 
+    let waived_successes = if config.waived_obligations_satisfy_gate {
+        gate_result.waived_count
+    } else {
+        0
+    };
     #[allow(clippy::cast_precision_loss)]
-    let successes = (gate_result.verified_count + gate_result.waived_count) as f64;
+    let successes = (gate_result.verified_count + waived_successes) as f64;
     #[allow(clippy::cast_precision_loss)]
-    let failures = (gate_result.pending_count + gate_result.partial_count) as f64;
+    let failures =
+        (gate_result.pending_count + gate_result.partial_count + gate_result.waived_count
+            - waived_successes) as f64;
 
+    let prior = calculation_prior(config);
     let alpha = prior.alpha + successes;
     let beta = prior.beta + failures;
     let posterior = BetaParams::new(alpha, beta);
@@ -798,6 +857,17 @@ mod tests {
 
     fn default_config() -> GateConfig {
         GateConfig::default()
+    }
+
+    fn fully_verified_catalog() -> InvariantCatalog {
+        let mut catalog = build_canonical_catalog();
+        for invariant in catalog.invariants.values_mut() {
+            for obligation in &mut invariant.obligations {
+                obligation.status = ObligationStatus::Verified;
+                obligation.waiver_rationale = None;
+            }
+        }
+        catalog
     }
 
     fn synthetic_contract_outcome(
@@ -939,6 +1009,23 @@ mod tests {
         let deserialized = GateReport::from_json(&json).expect("deserialisation");
         assert_eq!(report.total_invariants, deserialized.total_invariants);
         assert_eq!(report.global_decision, deserialized.global_decision);
+    }
+
+    #[test]
+    fn gate_report_rejects_missing_waiver_policy_field() {
+        let report = evaluate_gate(&build_canonical_catalog(), &default_config());
+        let mut value = serde_json::to_value(report).expect("serialize gate report");
+        value
+            .get_mut("config")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("gate report config must be an object")
+            .remove("waived_obligations_satisfy_gate");
+        let json = serde_json::to_string(&value).expect("serialize modified gate report");
+
+        assert!(
+            GateReport::from_json(&json).is_err(),
+            "missing waiver policy must not inherit a permissive default"
+        );
     }
 
     #[test]
@@ -1227,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_threshold_passes_gate() {
+    fn threshold_below_canonical_floor_fails_closed() {
         let catalog = build_canonical_catalog();
         let config = GateConfig {
             release_threshold: 0.0,
@@ -1235,11 +1322,62 @@ mod tests {
             ..default_config()
         };
         let report = evaluate_gate(&catalog, &config);
-        // With zero thresholds, even partial verification should pass
-        assert!(
-            report.global_lower_bound >= 0.0,
-            "lower bound should be non-negative"
-        );
+        assert_ne!(report.global_decision, GateDecision::Pass);
+        assert!(!report.release_ready);
+    }
+
+    #[test]
+    fn invalid_uncertainty_configuration_fails_closed_without_panicking() {
+        let catalog = fully_verified_catalog();
+        let invalid_probabilities = [f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -1.0, 0.0, 1.0];
+
+        for confidence_level in invalid_probabilities {
+            let config = GateConfig {
+                confidence_level,
+                ..default_config()
+            };
+            let (report, ranking) = evaluate_full(&catalog, &build_canonical_universe(), &config);
+            assert_eq!(report.global_decision, GateDecision::Fail);
+            assert!(!report.release_ready);
+            assert!(report.global_lower_bound.is_finite());
+            assert!(ranking.total_expected_loss.is_finite());
+        }
+
+        let invalid_prior_parameters = [f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -1.0, 0.0];
+        for invalid in invalid_prior_parameters {
+            for invalid_alpha in [true, false] {
+                let mut prior = PriorConfig::default();
+                if invalid_alpha {
+                    prior.alpha = invalid;
+                } else {
+                    prior.beta = invalid;
+                }
+                let config = GateConfig {
+                    prior,
+                    ..default_config()
+                };
+                let (report, ranking) =
+                    evaluate_full(&catalog, &build_canonical_universe(), &config);
+                assert_eq!(report.global_decision, GateDecision::Fail);
+                assert!(!report.release_ready);
+                assert!(report.global_lower_bound.is_finite());
+                assert!(ranking.total_expected_loss.is_finite());
+            }
+        }
+
+        for confidence_level in invalid_probabilities {
+            let config = GateConfig {
+                prior: PriorConfig {
+                    confidence_level,
+                    ..PriorConfig::default()
+                },
+                ..default_config()
+            };
+            let report = evaluate_gate(&catalog, &config);
+            assert_eq!(report.global_decision, GateDecision::Fail);
+            assert!(!report.release_ready);
+            assert!(report.global_lower_bound.is_finite());
+        }
     }
 
     #[test]

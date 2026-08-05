@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,9 +7,23 @@ use std::process::ExitCode;
 use fsqlite_harness::parity_verification_workflow::{
     BEAD_ID, WorkflowInput, build_workflow_report, render_workflow_markdown,
 };
+use fsqlite_harness::release_certificate::{
+    StrictCertificateRunConfig, build_and_publish_strict_certificate,
+};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_OUTPUT_DIR: &str = "artifacts/parity-verification-workflow";
+const CERTIFICATE_ONLY_SELECTORS: &[&str] = &[
+    "--certificate-evidence-root",
+    "--certificate-evidence-json",
+    "--candidate-git-sha",
+    "--baseline-metadata-git-sha",
+    "--candidate-rch-project-id",
+    "--baseline-rch-project-id",
+    "--certificate-output-dir",
+    "--certificate-output-json",
+    "--certificate-output-human",
+];
 
 #[derive(Debug)]
 struct Config {
@@ -16,6 +31,123 @@ struct Config {
     input_json: PathBuf,
     output_json: PathBuf,
     output_human: PathBuf,
+}
+
+#[derive(Debug)]
+struct CertificateCliConfig {
+    run: StrictCertificateRunConfig,
+}
+
+impl CertificateCliConfig {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        Self::parse_with_default_workspace(args, default_workspace_root)
+    }
+
+    fn parse_with_default_workspace(
+        args: &[String],
+        default_workspace_root: impl FnOnce() -> PathBuf,
+    ) -> Result<Self, String> {
+        reject_duplicate_certificate_selectors(args)?;
+
+        let mut workspace_root = default_workspace_root();
+        let mut evidence_root = None;
+        let mut evidence_json = None;
+        let mut candidate_git_sha = None;
+        let mut baseline_metadata_git_sha = None;
+        let mut candidate_rch_project_id = None;
+        let mut baseline_rch_project_id = None;
+        let mut output_dir = None;
+
+        let mut index = 0_usize;
+        while let Some(arg) = args.get(index) {
+            match arg.as_str() {
+                "--workspace-root" => {
+                    index += 1;
+                    workspace_root = PathBuf::from(required_arg(args, index, "--workspace-root")?);
+                }
+                "--certificate-evidence-root" => {
+                    index += 1;
+                    evidence_root = Some(PathBuf::from(required_arg(
+                        args,
+                        index,
+                        "--certificate-evidence-root",
+                    )?));
+                }
+                "--certificate-evidence-json" => {
+                    index += 1;
+                    evidence_json = Some(PathBuf::from(required_arg(
+                        args,
+                        index,
+                        "--certificate-evidence-json",
+                    )?));
+                }
+                "--candidate-git-sha" => {
+                    index += 1;
+                    candidate_git_sha =
+                        Some(required_arg(args, index, "--candidate-git-sha")?.to_owned());
+                }
+                "--baseline-metadata-git-sha" => {
+                    index += 1;
+                    baseline_metadata_git_sha =
+                        Some(required_arg(args, index, "--baseline-metadata-git-sha")?.to_owned());
+                }
+                "--candidate-rch-project-id" => {
+                    index += 1;
+                    candidate_rch_project_id =
+                        Some(required_arg(args, index, "--candidate-rch-project-id")?.to_owned());
+                }
+                "--baseline-rch-project-id" => {
+                    index += 1;
+                    baseline_rch_project_id =
+                        Some(required_arg(args, index, "--baseline-rch-project-id")?.to_owned());
+                }
+                "--certificate-output-dir" => {
+                    index += 1;
+                    output_dir = Some(PathBuf::from(required_arg(
+                        args,
+                        index,
+                        "--certificate-output-dir",
+                    )?));
+                }
+                "--certificate-output-json" | "--certificate-output-human" => {
+                    return Err(format!(
+                        "{arg} is unsupported; strict certificate mode publishes one atomic four-file directory via --certificate-output-dir"
+                    ));
+                }
+                "-h" | "--help" => {
+                    print_help();
+                    return Err(String::new());
+                }
+                unknown => {
+                    return Err(format!(
+                        "certificate mode does not accept workflow argument: {unknown}"
+                    ));
+                }
+            }
+            index += 1;
+        }
+
+        let evidence_root =
+            evidence_root.ok_or_else(|| "--certificate-evidence-root is required".to_owned())?;
+        Ok(Self {
+            run: StrictCertificateRunConfig {
+                workspace_root: workspace_root.clone(),
+                evidence_root: resolve_path(&workspace_root, &evidence_root),
+                evidence_json: evidence_json
+                    .ok_or_else(|| "--certificate-evidence-json is required".to_owned())?,
+                candidate_git_sha: candidate_git_sha
+                    .ok_or_else(|| "--candidate-git-sha is required".to_owned())?,
+                baseline_metadata_git_sha: baseline_metadata_git_sha
+                    .ok_or_else(|| "--baseline-metadata-git-sha is required".to_owned())?,
+                candidate_rch_project_id: candidate_rch_project_id
+                    .ok_or_else(|| "--candidate-rch-project-id is required".to_owned())?,
+                baseline_rch_project_id: baseline_rch_project_id
+                    .ok_or_else(|| "--baseline-rch-project-id is required".to_owned())?,
+                output_dir: output_dir
+                    .ok_or_else(|| "--certificate-output-dir is required".to_owned())?,
+            },
+        })
+    }
 }
 
 impl Config {
@@ -89,6 +221,28 @@ OPTIONS:
     --output-json <PATH>      JSON workflow report path
     --output-human <PATH>     Markdown workflow navigator path
     -h, --help                Show this help
+
+STRICT CERTIFICATE MODE:
+    --certificate-evidence-root <PATH>
+                              Explicit trust root; must resolve to the candidate workspace root
+    --certificate-evidence-json <RELATIVE_PATH>
+                              Strict candidate evidence manifest below the evidence root
+    --candidate-git-sha <SHA> Exact lowercase 40-hex checked-out candidate
+    --baseline-metadata-git-sha <SHA>
+                              Exact commit containing the baseline and its historical receipts
+    --candidate-rch-project-id <ID>
+                              Exact RCH project identity for candidate and live-guard runs
+    --baseline-rch-project-id <ID>
+                              Exact RCH project identity for the historical baseline run
+    --certificate-output-dir <NEW_PATH>
+                              New atomic bundle directory containing exactly four files
+    Every strict-certificate selector, including --workspace-root, may be supplied at most once.
+
+REJECTED CERTIFICATE SELECTORS:
+    --certificate-output-json <PATH>
+                              Split output would bypass atomic bundle publication
+    --certificate-output-human <PATH>
+                              Split output would bypass atomic bundle publication
 ";
     println!("{help}");
 }
@@ -163,6 +317,17 @@ fn write_text(path: &Path, payload: &str) -> Result<(), String> {
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
+    if certificate_mode_requested(args) {
+        let config = CertificateCliConfig::parse(args)?;
+        let certificate = build_and_publish_strict_certificate(&config.run)?;
+        println!(
+            "INFO release_certificate_bundle_written candidate_git_sha={} output_dir={} verdict={}",
+            config.run.candidate_git_sha,
+            config.run.output_dir.display(),
+            certificate.verdict,
+        );
+        return Ok(0);
+    }
     let config = Config::parse(args)?;
     let mut input = read_input(&config)?;
     enrich_artifact_hashes(&config, &mut input)?;
@@ -186,6 +351,32 @@ fn run(args: &[String]) -> Result<i32, String> {
     Ok(i32::from(!report.workflow_complete))
 }
 
+fn is_certificate_mode_selector(argument: &str) -> bool {
+    CERTIFICATE_ONLY_SELECTORS.contains(&argument)
+}
+
+fn is_duplicate_guarded_certificate_selector(argument: &str) -> bool {
+    argument == "--workspace-root" || is_certificate_mode_selector(argument)
+}
+
+fn reject_duplicate_certificate_selectors(args: &[String]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for argument in args {
+        let selector = argument.as_str();
+        if is_duplicate_guarded_certificate_selector(selector) && !seen.insert(selector) {
+            return Err(format!(
+                "duplicate certificate selector: {selector} may be specified at most once"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn certificate_mode_requested(args: &[String]) -> bool {
+    args.iter()
+        .any(|argument| is_certificate_mode_selector(argument))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match run(&args) {
@@ -199,5 +390,98 @@ fn main() -> ExitCode {
             );
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_certificate_only_selector_activates_strict_mode() {
+        for selector in CERTIFICATE_ONLY_SELECTORS.iter().copied() {
+            assert!(certificate_mode_requested(&[selector.to_owned()]));
+        }
+        assert!(!certificate_mode_requested(&["--input-json".to_owned()]));
+    }
+
+    #[test]
+    fn duplicate_certificate_selectors_fail_before_workspace_resolution() {
+        for selector in
+            std::iter::once("--workspace-root").chain(CERTIFICATE_ONLY_SELECTORS.iter().copied())
+        {
+            let default_workspace_was_resolved = std::cell::Cell::new(false);
+            let error = CertificateCliConfig::parse_with_default_workspace(
+                &[
+                    selector.to_owned(),
+                    "first-value".to_owned(),
+                    selector.to_owned(),
+                    "second-value".to_owned(),
+                ],
+                || {
+                    default_workspace_was_resolved.set(true);
+                    PathBuf::from("unexpected-default-workspace")
+                },
+            )
+            .expect_err("a repeated certificate selector must be rejected");
+
+            assert_eq!(
+                error,
+                format!("duplicate certificate selector: {selector} may be specified at most once")
+            );
+            assert!(
+                !default_workspace_was_resolved.get(),
+                "duplicate {selector} resolved the default workspace before returning"
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_mode_rejects_split_output_flags() {
+        let error = CertificateCliConfig::parse(&[
+            "--certificate-output-json".to_owned(),
+            "certificate.json".to_owned(),
+        ])
+        .expect_err("split output would bypass atomic publication");
+        assert!(error.contains("unsupported"));
+    }
+
+    #[test]
+    fn certificate_mode_requires_and_preserves_chronology_and_project_proofs() {
+        let parsed = CertificateCliConfig::parse(&[
+            "--workspace-root".to_owned(),
+            ".".to_owned(),
+            "--certificate-evidence-root".to_owned(),
+            ".".to_owned(),
+            "--certificate-evidence-json".to_owned(),
+            "strict-input.json".to_owned(),
+            "--candidate-git-sha".to_owned(),
+            "a".repeat(40),
+            "--baseline-metadata-git-sha".to_owned(),
+            "b".repeat(40),
+            "--candidate-rch-project-id".to_owned(),
+            "candidate-project".to_owned(),
+            "--baseline-rch-project-id".to_owned(),
+            "baseline-project".to_owned(),
+            "--certificate-output-dir".to_owned(),
+            "certificate".to_owned(),
+        ])
+        .expect("complete strict invocation");
+        assert_eq!(parsed.run.baseline_metadata_git_sha, "b".repeat(40));
+        assert_eq!(parsed.run.candidate_rch_project_id, "candidate-project");
+        assert_eq!(parsed.run.baseline_rch_project_id, "baseline-project");
+
+        let error = CertificateCliConfig::parse(&[
+            "--certificate-evidence-root".to_owned(),
+            ".".to_owned(),
+            "--certificate-evidence-json".to_owned(),
+            "strict-input.json".to_owned(),
+            "--candidate-git-sha".to_owned(),
+            "a".repeat(40),
+            "--certificate-output-dir".to_owned(),
+            "certificate".to_owned(),
+        ])
+        .expect_err("missing chronology proof must fail");
+        assert_eq!(error, "--baseline-metadata-git-sha is required");
     }
 }

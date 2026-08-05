@@ -8,7 +8,7 @@ use fsqlite_harness::certification_policy::{
     CERTIFICATION_MAX_EVIDENCE_AGE_HOURS, CERTIFICATION_MIN_VERIFICATION_PCT,
     CERTIFICATION_POLICY_ID, CERTIFICATION_POLICY_SCHEMA_VERSION, CertificationRatchetBaseline,
     CertificationRatchetCandidate, REQUIRED_CERTIFICATION_LANES, canonical_certification_policy,
-    evaluate_certification_ratchets,
+    certification_gate_config, evaluate_certification_ratchets,
 };
 use fsqlite_harness::ci_gate_matrix::{
     ArtifactEntry, ArtifactKind, ArtifactManifest, FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION,
@@ -18,14 +18,15 @@ use fsqlite_harness::ci_gate_matrix::{
 use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
 use fsqlite_harness::drift_monitor::ParityDriftMonitor;
 use fsqlite_harness::parity_invariant_catalog::{
-    InvariantId, ObligationStatus, ProofKind, ProofSummaryEntry, ReleaseTraceabilityReport,
-    TraceabilityEntry, build_canonical_catalog,
+    InvariantCatalog, InvariantId, ObligationStatus, ProofKind, ProofSummaryEntry,
+    ReleaseTraceabilityReport, TraceabilityEntry, build_canonical_catalog,
 };
 use fsqlite_harness::parity_taxonomy::{FeatureId, build_canonical_universe};
 use fsqlite_harness::release_certificate::{
     CERTIFICATION_TRACEABILITY_SCHEMA_VERSION, CertificateConfig, CertificateInputs,
     CertificateVerdict, build_certificate,
 };
+use fsqlite_harness::score_engine::STATISTICAL_RELEASE_FLOOR;
 use fsqlite_harness::verification_contract_enforcement::{
     ContractEnforcementOutcome, EnforcementDisposition,
 };
@@ -199,17 +200,24 @@ fn synthetic_passing_campaign() -> CampaignResult {
     }
 }
 
+fn fully_verified_catalog() -> InvariantCatalog {
+    let mut catalog = build_canonical_catalog();
+    for invariant in catalog.invariants.values_mut() {
+        for obligation in &mut invariant.obligations {
+            obligation.status = ObligationStatus::Verified;
+            obligation.waiver_rationale = None;
+        }
+    }
+    catalog
+}
+
 fn strict_ready_inputs(
     contract: ContractEnforcementOutcome,
 ) -> (CertificateInputs, CertificateConfig) {
     let config = CertificateConfig::default();
-    let catalog = build_canonical_catalog();
+    let catalog = fully_verified_catalog();
     let universe = build_canonical_universe();
-    let (mut gate_report, ranking) = evaluate_full(&catalog, &universe, &config.gate_config);
-    gate_report.global_decision = GateDecision::Pass;
-    gate_report.release_ready = true;
-    gate_report.global_verification_pct = 100.0;
-    gate_report.passing_invariants = gate_report.total_invariants;
+    let (gate_report, ranking) = evaluate_full(&catalog, &universe, &config.gate_config);
 
     let ledger = build_evidence_ledger(&gate_report, &ranking);
     let drift_snapshot = ParityDriftMonitor::new(config.drift_config.clone()).snapshot();
@@ -245,6 +253,15 @@ fn canonical_policy_matches_track_g_requirements() {
         CERTIFICATION_MAX_EVIDENCE_AGE_HOURS
     );
     assert_eq!(policy.gate_config.category_min_verification_pct, 100.0);
+    assert!(!policy.gate_config.waived_obligations_satisfy_gate);
+    assert_eq!(
+        policy.gate_config.release_threshold,
+        STATISTICAL_RELEASE_FLOOR
+    );
+    assert_eq!(
+        policy.ratchet_policy.minimum_release_threshold,
+        STATISTICAL_RELEASE_FLOOR
+    );
     assert_eq!(policy.ratchet_policy.regression_tolerance, 0.0);
     assert!(!policy.ratchet_policy.quarantine_enabled);
     assert!(!policy.ratchet_policy.waivers_enabled);
@@ -258,6 +275,148 @@ fn canonical_policy_matches_track_g_requirements() {
             lane.as_str(),
         );
     }
+}
+
+#[test]
+fn genuinely_generated_all_verified_gate_can_pass_canonical_policy() {
+    let catalog = fully_verified_catalog();
+    let universe = build_canonical_universe();
+    let config = certification_gate_config();
+    let (report, _) = evaluate_full(&catalog, &universe, &config);
+
+    assert!((report.global_verification_pct - 100.0).abs() < f64::EPSILON);
+    assert_eq!(report.passing_invariants, report.total_invariants);
+    assert!(report.total_invariants > 0);
+    assert!(report.category_results.values().all(|category| {
+        category.decision == GateDecision::Pass
+            && (category.verification_pct - 100.0).abs() < f64::EPSILON
+            && category.passing_invariants == category.total_invariants
+    }));
+    assert!(
+        report.global_lower_bound < 1.0,
+        "bead_id={BEAD_ID} case=finite_beta_bound lower={}",
+        report.global_lower_bound,
+    );
+    assert!(
+        report.global_lower_bound >= config.release_threshold,
+        "bead_id={BEAD_ID} case=feasible_statistical_floor lower={} threshold={}",
+        report.global_lower_bound,
+        config.release_threshold,
+    );
+    assert_eq!(report.global_decision, GateDecision::Pass);
+    assert!(report.release_ready);
+}
+
+#[test]
+fn one_pending_obligation_blocks_even_when_statistical_floor_is_met() {
+    let mut catalog = fully_verified_catalog();
+    let changed_category = {
+        let invariant = catalog
+            .invariants
+            .values_mut()
+            .next()
+            .expect("canonical catalog must contain an invariant");
+        invariant
+            .obligations
+            .first_mut()
+            .expect("canonical invariant must contain an obligation")
+            .status = ObligationStatus::Pending;
+        invariant.category.display_name().to_owned()
+    };
+    let universe = build_canonical_universe();
+    let config = certification_gate_config();
+    let (report, _) = evaluate_full(&catalog, &universe, &config);
+
+    assert!(
+        report.global_lower_bound >= config.release_threshold,
+        "bead_id={BEAD_ID} case=statistical_floor_should_still_pass lower={} threshold={}",
+        report.global_lower_bound,
+        config.release_threshold,
+    );
+    assert!((report.global_verification_pct - 100.0).abs() >= f64::EPSILON);
+    let changed_result = report
+        .category_results
+        .get(&changed_category)
+        .expect("changed category must be represented in the gate report");
+    assert_ne!(changed_result.decision, GateDecision::Pass);
+    assert_ne!(report.global_decision, GateDecision::Pass);
+    assert!(!report.release_ready);
+}
+
+#[test]
+fn strict_confidence_threshold_cannot_be_downgraded() {
+    let catalog = fully_verified_catalog();
+    let universe = build_canonical_universe();
+
+    for release_threshold in [
+        0.0,
+        STATISTICAL_RELEASE_FLOOR - 0.000_001,
+        f64::NEG_INFINITY,
+    ] {
+        let mut config = certification_gate_config();
+        config.release_threshold = release_threshold;
+        let (report, _) = evaluate_full(&catalog, &universe, &config);
+
+        assert_ne!(report.global_decision, GateDecision::Pass);
+        assert!(!report.release_ready);
+    }
+}
+
+#[test]
+fn one_waived_obligation_blocks_strict_certification() {
+    let mut catalog = fully_verified_catalog();
+    let changed_invariant = {
+        let invariant = catalog
+            .invariants
+            .values_mut()
+            .next()
+            .expect("canonical catalog must contain an invariant");
+        let obligation = invariant
+            .obligations
+            .first_mut()
+            .expect("canonical invariant must contain an obligation");
+        obligation.status = ObligationStatus::Waived;
+        obligation.waiver_rationale = Some("strict certification must reject this".to_owned());
+        invariant.id.0.clone()
+    };
+    let universe = build_canonical_universe();
+    let config = certification_gate_config();
+    let (report, ranking) = evaluate_full(&catalog, &universe, &config);
+
+    let invariant = report
+        .invariant_results
+        .get(&changed_invariant)
+        .expect("changed invariant must be represented in the gate report");
+    assert_eq!(invariant.waived_count, 1);
+    assert_ne!(invariant.decision, GateDecision::Pass);
+    assert!(invariant.verification_pct < 100.0);
+    assert_ne!(report.global_decision, GateDecision::Pass);
+    assert!(!report.release_ready);
+    let ranked = ranking
+        .entries
+        .iter()
+        .find(|entry| entry.invariant_id.0 == changed_invariant)
+        .expect("changed invariant must be represented in the expected-loss ranking");
+    assert!(ranked.expected_loss > 0.0);
+    assert!(!ranked.pending_proof_kinds.is_empty());
+}
+
+#[test]
+fn all_waived_obligations_block_strict_certification() {
+    let mut catalog = fully_verified_catalog();
+    for invariant in catalog.invariants.values_mut() {
+        for obligation in &mut invariant.obligations {
+            obligation.status = ObligationStatus::Waived;
+            obligation.waiver_rationale = Some("strict certification must reject this".to_owned());
+        }
+    }
+    let universe = build_canonical_universe();
+    let (report, _) = evaluate_full(&catalog, &universe, &certification_gate_config());
+
+    assert_eq!(report.passing_invariants, 0);
+    assert!((report.global_verification_pct - 0.0).abs() < f64::EPSILON);
+    assert_eq!(report.global_decision, GateDecision::Fail);
+    assert!(!report.release_ready);
 }
 
 #[test]
@@ -353,6 +512,138 @@ fn certification_ratchet_blocks_required_suite_pass_rate_backslide() {
         evaluation.summary.contains("required_suite_pass_rate"),
         "bead_id={BEAD_ID} case=regression_summary_must_name_backslide summary={}",
         evaluation.summary,
+    );
+}
+
+#[test]
+fn certification_ratchets_reject_wrong_baseline_identity() {
+    let baseline = CertificationRatchetBaseline {
+        schema_version: CERTIFICATION_POLICY_SCHEMA_VERSION + 1,
+        policy_id: "different-policy.v1".to_owned(),
+        global_lower_bound: STATISTICAL_RELEASE_FLOOR,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), 0.5)]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+    let candidate = CertificationRatchetCandidate {
+        global_lower_bound: 1.0,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), 1.0)]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+
+    let evaluation = evaluate_certification_ratchets(&baseline, &candidate);
+
+    assert!(!evaluation.passed);
+    assert_eq!(
+        evaluation.regressed_ratchets,
+        vec!["baseline_identity".to_owned()]
+    );
+}
+
+#[test]
+fn certification_ratchets_reject_non_finite_candidate_metrics() {
+    let baseline = CertificationRatchetBaseline {
+        schema_version: CERTIFICATION_POLICY_SCHEMA_VERSION,
+        policy_id: CERTIFICATION_POLICY_ID.to_owned(),
+        global_lower_bound: STATISTICAL_RELEASE_FLOOR,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), 0.5)]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+    let candidate = CertificationRatchetCandidate {
+        global_lower_bound: f64::NAN,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), f64::INFINITY)]),
+        required_suite_pass_rate_pct: f64::NEG_INFINITY,
+        traceability_link_coverage_pct: f64::NAN,
+    };
+
+    let evaluation = evaluate_certification_ratchets(&baseline, &candidate);
+
+    assert!(!evaluation.passed);
+    assert_eq!(
+        evaluation.regressed_ratchets,
+        vec![
+            "global_lower_bound".to_owned(),
+            "category_lower_bounds".to_owned(),
+            "required_suite_pass_rate".to_owned(),
+            "traceability_link_coverage".to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn certification_ratchets_reject_non_finite_baseline_metrics() {
+    let baseline = CertificationRatchetBaseline {
+        schema_version: CERTIFICATION_POLICY_SCHEMA_VERSION,
+        policy_id: CERTIFICATION_POLICY_ID.to_owned(),
+        global_lower_bound: f64::NAN,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), f64::NEG_INFINITY)]),
+        required_suite_pass_rate_pct: f64::INFINITY,
+        traceability_link_coverage_pct: f64::NAN,
+    };
+    let candidate = CertificationRatchetCandidate {
+        global_lower_bound: 1.0,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), 1.0)]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+
+    let evaluation = evaluate_certification_ratchets(&baseline, &candidate);
+
+    assert!(!evaluation.passed);
+    assert_eq!(evaluation.regressed_ratchets.len(), 4);
+}
+
+#[test]
+fn certification_ratchets_reject_out_of_range_metrics() {
+    let baseline = CertificationRatchetBaseline {
+        schema_version: CERTIFICATION_POLICY_SCHEMA_VERSION,
+        policy_id: CERTIFICATION_POLICY_ID.to_owned(),
+        global_lower_bound: STATISTICAL_RELEASE_FLOOR,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), 0.5)]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+    let candidate = CertificationRatchetCandidate {
+        global_lower_bound: 1.1,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), -0.1)]),
+        required_suite_pass_rate_pct: 100.1,
+        traceability_link_coverage_pct: -0.1,
+    };
+
+    let evaluation = evaluate_certification_ratchets(&baseline, &candidate);
+
+    assert!(!evaluation.passed);
+    assert_eq!(evaluation.regressed_ratchets.len(), 4);
+}
+
+#[test]
+fn certification_ratchets_reject_extra_candidate_categories() {
+    let baseline = CertificationRatchetBaseline {
+        schema_version: CERTIFICATION_POLICY_SCHEMA_VERSION,
+        policy_id: CERTIFICATION_POLICY_ID.to_owned(),
+        global_lower_bound: STATISTICAL_RELEASE_FLOOR,
+        category_lower_bounds: BTreeMap::from([("Core SQL".to_owned(), 0.5)]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+    let candidate = CertificationRatchetCandidate {
+        global_lower_bound: 1.0,
+        category_lower_bounds: BTreeMap::from([
+            ("Core SQL".to_owned(), 1.0),
+            ("Injected".to_owned(), f64::NAN),
+        ]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+
+    let evaluation = evaluate_certification_ratchets(&baseline, &candidate);
+
+    assert!(!evaluation.passed);
+    assert_eq!(
+        evaluation.regressed_ratchets,
+        vec!["category_lower_bounds".to_owned()]
     );
 }
 
@@ -484,13 +775,9 @@ fn release_certificate_rejects_failed_verification_contract_from_manifest() {
 #[test]
 fn release_certificate_rejects_manifest_missing_verification_contract() {
     let config = CertificateConfig::default();
-    let catalog = build_canonical_catalog();
+    let catalog = fully_verified_catalog();
     let universe = build_canonical_universe();
-    let (mut gate_report, ranking) = evaluate_full(&catalog, &universe, &config.gate_config);
-    gate_report.global_decision = GateDecision::Pass;
-    gate_report.release_ready = true;
-    gate_report.global_verification_pct = 100.0;
-    gate_report.passing_invariants = gate_report.total_invariants;
+    let (gate_report, ranking) = evaluate_full(&catalog, &universe, &config.gate_config);
 
     let inputs = CertificateInputs {
         gate_report: gate_report.clone(),

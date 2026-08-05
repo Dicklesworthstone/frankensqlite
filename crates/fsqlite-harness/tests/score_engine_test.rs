@@ -18,8 +18,8 @@ use fsqlite_harness::parity_taxonomy::{
     ParityStatus, build_canonical_universe,
 };
 use fsqlite_harness::score_engine::{
-    BayesianScorecard, BetaParams, PriorConfig, ScoreEngineConfig, compute_bayesian_scorecard,
-    compute_bayesian_scorecard_with_contract,
+    BayesianScorecard, BetaParams, PriorConfig, STATISTICAL_RELEASE_FLOOR, ScoreEngineConfig,
+    compute_bayesian_scorecard, compute_bayesian_scorecard_with_contract,
 };
 
 const BEAD_ID: &str = "bd-1dp9.1.3";
@@ -155,6 +155,19 @@ fn lower_bound_below_point_estimate() {
 }
 
 #[test]
+fn finite_all_success_beta_lower_bound_is_strictly_below_one() {
+    for successes in [1.0, 4.0, 47.0, 126.0, 1_000_000.0] {
+        let posterior = BetaParams::new(successes + 1.0, 1.0);
+        let (lower, _) = posterior.credible_interval(0.95);
+
+        assert!(
+            lower < 1.0,
+            "[{BEAD_ID}] finite all-success Beta posterior unexpectedly reached certainty: successes={successes} lower={lower}",
+        );
+    }
+}
+
+#[test]
 fn upper_bound_above_point_estimate() {
     let universe = build_canonical_universe();
     let config = ScoreEngineConfig::default();
@@ -246,24 +259,46 @@ fn conformal_half_width_non_negative() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn release_gating_with_default_threshold() {
-    let universe = build_canonical_universe();
+fn default_release_gate_accepts_complete_surface_with_finite_evidence() {
+    let universe = build_uniform_universe(ParityStatus::Passing, 20);
     let config = ScoreEngineConfig::default();
     let scorecard = compute_bayesian_scorecard(&universe, &config);
 
-    // Under strict 100% release policy, canonical universe (~73% score)
-    // must not be release-ready at default settings.
+    assert!(
+        scorecard
+            .global_lower_bound
+            .min(scorecard.conformal_band.lower)
+            >= config.release_threshold,
+        "[{BEAD_ID}] all-passing finite evidence must meet the default statistical floor",
+    );
+    assert!(
+        scorecard.release_ready,
+        "[{BEAD_ID}] complete empirical surface and statistical floor should pass",
+    );
+}
+
+#[test]
+fn incomplete_surface_blocks_even_when_statistical_floor_is_met() {
+    let mut universe = build_uniform_universe(ParityStatus::Passing, 20);
+    universe
+        .features
+        .values_mut()
+        .next()
+        .expect("synthetic universe must contain a feature")
+        .status = ParityStatus::Partial;
+    let config = ScoreEngineConfig::default();
+    let scorecard = compute_bayesian_scorecard(&universe, &config);
+
+    assert!(
+        scorecard
+            .global_lower_bound
+            .min(scorecard.conformal_band.lower)
+            >= config.release_threshold,
+        "[{BEAD_ID}] keeper requires statistical evidence to remain above the floor",
+    );
     assert!(
         !scorecard.release_ready,
-        "[{BEAD_ID}] strict default threshold should block canonical universe; lower bound is {:.4}",
-        scorecard.global_lower_bound
-    );
-    eprintln!(
-        "bead_id={BEAD_ID} test=release_gating threshold={:.2} lower={:.4} conformal_lower={:.4} release_ready={}",
-        config.release_threshold,
-        scorecard.global_lower_bound,
-        scorecard.conformal_band.lower,
-        scorecard.release_ready
+        "[{BEAD_ID}] statistical confidence must not replace 100% empirical completion",
     );
 }
 
@@ -285,7 +320,7 @@ fn release_gating_high_threshold_fails() {
 }
 
 #[test]
-fn release_gating_low_threshold_passes() {
+fn low_statistical_threshold_does_not_bypass_empirical_completion() {
     let universe = build_canonical_universe();
     let config = ScoreEngineConfig {
         release_threshold: 0.50,
@@ -293,12 +328,88 @@ fn release_gating_low_threshold_passes() {
     };
     let scorecard = compute_bayesian_scorecard(&universe, &config);
 
-    // At 50% threshold, the canonical universe (~73%) should pass.
+    // The canonical universe is incomplete, so a permissive statistical floor
+    // must not make it release-ready.
     assert!(
-        scorecard.release_ready,
-        "[{BEAD_ID}] should be release-ready at 50% threshold, lower bound is {:.4}",
+        !scorecard.release_ready,
+        "[{BEAD_ID}] incomplete surface passed at a 50% statistical floor; lower bound is {:.4}",
         scorecard.global_lower_bound
     );
+}
+
+#[test]
+fn statistical_threshold_cannot_be_configured_below_canonical_floor() {
+    let universe = build_uniform_universe(ParityStatus::Passing, 20);
+    for release_threshold in [
+        0.0,
+        STATISTICAL_RELEASE_FLOOR - 0.000_001,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NAN,
+        1.000_001,
+    ] {
+        let config = ScoreEngineConfig {
+            release_threshold,
+            ..Default::default()
+        };
+        let scorecard = compute_bayesian_scorecard(&universe, &config);
+
+        assert!(
+            !scorecard.release_ready,
+            "[{BEAD_ID}] invalid release threshold passed: {release_threshold}",
+        );
+    }
+}
+
+#[test]
+fn invalid_uncertainty_configuration_fails_closed_without_panicking() {
+    let universe = build_uniform_universe(ParityStatus::Passing, 20);
+    let invalid_probabilities = [f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -1.0, 0.0, 1.0];
+
+    for confidence_level in invalid_probabilities {
+        let config = ScoreEngineConfig {
+            prior: PriorConfig {
+                confidence_level,
+                ..PriorConfig::default()
+            },
+            ..ScoreEngineConfig::default()
+        };
+        let scorecard = compute_bayesian_scorecard(&universe, &config);
+        assert!(!scorecard.release_ready);
+        assert!(scorecard.global_lower_bound.is_finite());
+        assert!(scorecard.conformal_band.lower.is_finite());
+    }
+
+    for conformal_coverage in invalid_probabilities {
+        let config = ScoreEngineConfig {
+            conformal_coverage,
+            ..ScoreEngineConfig::default()
+        };
+        let scorecard = compute_bayesian_scorecard(&universe, &config);
+        assert!(!scorecard.release_ready);
+        assert!(scorecard.global_lower_bound.is_finite());
+        assert!(scorecard.conformal_band.lower.is_finite());
+    }
+
+    let invalid_prior_parameters = [f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -1.0, 0.0];
+    for invalid in invalid_prior_parameters {
+        for invalid_alpha in [true, false] {
+            let mut prior = PriorConfig::default();
+            if invalid_alpha {
+                prior.alpha = invalid;
+            } else {
+                prior.beta = invalid;
+            }
+            let config = ScoreEngineConfig {
+                prior,
+                ..ScoreEngineConfig::default()
+            };
+            let scorecard = compute_bayesian_scorecard(&universe, &config);
+            assert!(!scorecard.release_ready);
+            assert!(scorecard.global_lower_bound.is_finite());
+            assert!(scorecard.conformal_band.lower.is_finite());
+        }
+    }
 }
 
 #[test]
@@ -312,11 +423,8 @@ fn release_gating_with_contract_blocks_when_evidence_missing() {
     )
     .expect("write issues.jsonl");
 
-    let universe = build_canonical_universe();
-    let config = ScoreEngineConfig {
-        release_threshold: 0.0,
-        ..Default::default()
-    };
+    let universe = build_uniform_universe(ParityStatus::Passing, 20);
+    let config = ScoreEngineConfig::default();
     let scorecard = compute_bayesian_scorecard_with_contract(temp_dir.path(), &universe, &config)
         .expect("compute scorecard with contract");
 
@@ -326,7 +434,7 @@ fn release_gating_with_contract_blocks_when_evidence_missing() {
         .expect("contract enforcement should be present");
     assert!(
         contract.base_gate_passed,
-        "[{BEAD_ID}] base statistical gate should pass at 0 threshold"
+        "[{BEAD_ID}] complete surface should pass the canonical statistical floor"
     );
     assert!(
         !contract.contract_passed,
@@ -349,11 +457,8 @@ fn release_gating_with_contract_allows_when_no_required_parity_beads() {
     )
     .expect("write issues.jsonl");
 
-    let universe = build_canonical_universe();
-    let config = ScoreEngineConfig {
-        release_threshold: 0.0,
-        ..Default::default()
-    };
+    let universe = build_uniform_universe(ParityStatus::Passing, 20);
+    let config = ScoreEngineConfig::default();
     let scorecard = compute_bayesian_scorecard_with_contract(temp_dir.path(), &universe, &config)
         .expect("compute scorecard with contract");
 
@@ -662,6 +767,6 @@ fn default_config_is_sensible() {
     assert!(config.prior.alpha > 0.0);
     assert!(config.prior.beta > 0.0);
     assert!(config.prior.confidence_level > 0.0 && config.prior.confidence_level < 1.0);
-    assert!((config.release_threshold - 1.0).abs() < f64::EPSILON);
+    assert!((config.release_threshold - STATISTICAL_RELEASE_FLOOR).abs() < f64::EPSILON);
     assert!(config.conformal_coverage > 0.0 && config.conformal_coverage < 1.0);
 }

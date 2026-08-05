@@ -20,7 +20,7 @@ const REGRESSION_BASELINE_PATH: &str = "tests/regression_baseline.json";
 const EVIDENCE_MANIFEST_ENV: &str = "FSQLITE_REGRESSION_GUARD_EVIDENCE_MANIFEST";
 const EVIDENCE_MANIFEST_BLAKE3_ENV: &str = "FSQLITE_REGRESSION_GUARD_EVIDENCE_MANIFEST_BLAKE3";
 const CLEAN_SNAPSHOT_KEEPER_ENV: &str = "FSQLITE_REGRESSION_GUARD_TEST_CLEAN_SNAPSHOT";
-const EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const EVIDENCE_SCHEMA_VERSION: u32 = 3;
 const EVIDENCE_PATH_PREFIX: &str = "tests/artifacts/release-evidence/";
 const EVIDENCE_DIGEST_ALGORITHM: &str = "blake3-256";
 const INVENTORY_SHA256_ALGORITHM: &str = "sha2-256";
@@ -2004,7 +2004,14 @@ struct ScorecardEvidence {
 #[serde(deny_unknown_fields)]
 struct AuxiliaryScorecards {
     c1: ScorecardEvidence,
-    persistent: ScorecardEvidence,
+    persistent: PersistentProfileScorecards,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PersistentProfileScorecards {
+    release: ScorecardEvidence,
+    release_perf: ScorecardEvidence,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -2086,7 +2093,18 @@ struct ReleaseEvidenceManifest {
     workspace: RunEvidenceV2,
     run_receipts: Vec<CurrentRunReceipt>,
     auxiliary_scorecards: AuxiliaryScorecards,
+    performance_regression_gate: PerformanceRegressionGate,
     evidence_pack: Vec<EvidenceLeaf>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PerformanceRegressionGate {
+    schema_version: String,
+    status: String,
+    release_authorized: bool,
+    blockers: Vec<String>,
+    rationale: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2286,7 +2304,7 @@ fn validate_scorecard_evidence_shape(
             format!("{root}/manifest.json"),
             format!("{root}/build_metadata.json"),
         ]
-    } else if kind == "persistent" {
+    } else if matches!(kind, "persistent/release" | "persistent/release-perf") {
         [
             format!("{root}/persistent_scorecard.json"),
             format!("{root}/manifest.json"),
@@ -2350,7 +2368,7 @@ fn validate_scorecard_evidence(
         .map_err(|error| format!("unable to parse {kind} pack manifest: {error}"))?;
     let (scorecard_schema, manifest_schema) = match kind {
         "c1" => (C1_SCORECARD_SCHEMA_VERSION, C1_MANIFEST_SCHEMA_VERSION),
-        "persistent" => (
+        "persistent/release" | "persistent/release-perf" => (
             PERSISTENT_SCORECARD_SCHEMA_VERSION,
             PERSISTENT_MANIFEST_SCHEMA_VERSION,
         ),
@@ -2370,7 +2388,7 @@ fn validate_scorecard_evidence(
         && (pack.build_metadata_json.as_deref() != Some("build_metadata.json")
             || pack.build_metadata.is_none()
             || pack.citation_receipt_json.is_some()))
-        || (kind == "persistent"
+        || (matches!(kind, "persistent/release" | "persistent/release-perf")
             && (pack.citation_receipt_json.as_deref() != Some("provenance/citation_receipt.json")
                 || pack.build_metadata_json.is_some()
                 || pack.build_metadata.is_some()))
@@ -2410,28 +2428,116 @@ fn validate_scorecard_evidence(
                 );
             }
         }
-        "persistent" => {
-            validate_persistent_citation_receipt_bytes(&provenance_bytes, tested_commit)?;
+        "persistent/release" => {
+            validate_persistent_citation_receipt_bytes(
+                &provenance_bytes,
+                tested_commit,
+                PersistentProfile::Release,
+            )?;
+        }
+        "persistent/release-perf" => {
+            validate_persistent_citation_receipt_bytes(
+                &provenance_bytes,
+                tested_commit,
+                PersistentProfile::ReleasePerf,
+            )?;
         }
         _ => return Err(format!("unknown auxiliary scorecard kind `{kind}`")),
     }
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistentProfile {
+    Release,
+    ReleasePerf,
+}
+
+impl PersistentProfile {
+    fn receipt_name(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::ReleasePerf => "release-perf",
+        }
+    }
+
+    fn expected_opt_level(self) -> &'static str {
+        match self {
+            Self::Release => "z",
+            Self::ReleasePerf => "3",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PersistentWorkload {
+    benchmark: String,
+    rows_per_thread: u64,
+    synchronous: String,
+    threads: Vec<u64>,
+    criterion: PersistentCriterion,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PersistentCriterion {
+    sample_size: u64,
+    warmup_secs: u64,
+    measurement_secs: u64,
+    export_root: String,
+    headline_source: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PersistentCitationIdentity {
+    actual_worker: String,
+    actual_host: String,
+    workload: PersistentWorkload,
+}
+
 fn validate_persistent_citation_receipt_bytes(
     bytes: &[u8],
     tested_commit: &str,
-) -> Result<(), String> {
+    expected_profile: PersistentProfile,
+) -> Result<PersistentCitationIdentity, String> {
+    const RUSTFLAGS_POLICY: &str =
+        "all three values must be empty; remote cargo is invoked through env -u for each";
     #[derive(Deserialize)]
     struct PersistentCitationReceipt {
         schema_version: String,
         source: PersistentSource,
+        build: PersistentBuild,
+        rch: PersistentRch,
         rch_scheduler_isolation: PersistentRchSchedulerIsolation,
+        workload: PersistentWorkload,
     }
     #[derive(Deserialize)]
     struct PersistentSource {
         commit: String,
         clean: bool,
+    }
+    #[derive(Deserialize)]
+    struct PersistentBuild {
+        profile: String,
+        expected_opt_level: String,
+        rustflags: PersistentRustflags,
+        nonce: String,
+    }
+    #[derive(Deserialize)]
+    struct PersistentRustflags {
+        #[allow(non_snake_case)]
+        RUSTFLAGS: String,
+        #[allow(non_snake_case)]
+        CARGO_ENCODED_RUSTFLAGS: String,
+        #[allow(non_snake_case)]
+        CARGO_BUILD_RUSTFLAGS: String,
+        policy: String,
+    }
+    #[derive(Deserialize)]
+    struct PersistentRch {
+        actual_worker: String,
+        actual_host: String,
+        require_remote: bool,
+        no_self_healing: bool,
     }
     #[derive(Deserialize)]
     struct PersistentRchSchedulerIsolation {
@@ -2474,6 +2580,40 @@ fn validate_persistent_citation_receipt_bytes(
             "persistent pack citation receipt does not bind the clean tested commit".to_owned(),
         );
     }
+    if provenance.build.profile != expected_profile.receipt_name()
+        || provenance.build.expected_opt_level != expected_profile.expected_opt_level()
+        || provenance.build.rustflags.RUSTFLAGS != ""
+        || provenance.build.rustflags.CARGO_ENCODED_RUSTFLAGS != ""
+        || provenance.build.rustflags.CARGO_BUILD_RUSTFLAGS != ""
+        || provenance.build.rustflags.policy != RUSTFLAGS_POLICY
+        || provenance.build.nonce.len() != 64
+        || !is_lowercase_hex(&provenance.build.nonce)
+        || provenance.rch.actual_worker.trim().is_empty()
+        || provenance.rch.actual_host.trim().is_empty()
+        || !provenance.rch.require_remote
+        || !provenance.rch.no_self_healing
+    {
+        return Err(format!(
+            "persistent {} citation receipt must bind its profile, opt level, empty Rust flags, canonical build nonce, and remote worker identity",
+            expected_profile.receipt_name(),
+        ));
+    }
+    if provenance.workload.benchmark != "persistent_concurrent_write_{1,8,16}t"
+        || provenance.workload.rows_per_thread != 1000
+        || provenance.workload.synchronous != "NORMAL"
+        || provenance.workload.threads.as_slice() != &[1, 8, 16]
+        || provenance.workload.criterion.sample_size == 0
+        || provenance.workload.criterion.warmup_secs == 0
+        || provenance.workload.criterion.measurement_secs == 0
+        || provenance.workload.criterion.export_root != "{phase}/criterion_measurements"
+        || provenance.workload.criterion.headline_source
+            != "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json"
+    {
+        return Err(
+            "persistent citation receipt does not retain the fixed release workload contract"
+                .to_owned(),
+        );
+    }
 
     let isolation = provenance.rch_scheduler_isolation;
     if isolation.build_status_trace != "provenance/rch_build_status.jsonl"
@@ -2510,6 +2650,74 @@ fn validate_persistent_citation_receipt_bytes(
                 "persistent pack citation receipt carries a malformed {phase} RCH phase binding"
             ));
         }
+    }
+    Ok(PersistentCitationIdentity {
+        actual_worker: provenance.rch.actual_worker,
+        actual_host: provenance.rch.actual_host,
+        workload: provenance.workload,
+    })
+}
+
+fn validate_persistent_profile_scorecards(
+    root: &Path,
+    profiles: &PersistentProfileScorecards,
+    tested_commit: &str,
+) -> Result<(), String> {
+    validate_scorecard_evidence(root, &profiles.release, "persistent/release", tested_commit)?;
+    validate_scorecard_evidence(
+        root,
+        &profiles.release_perf,
+        "persistent/release-perf",
+        tested_commit,
+    )?;
+    let release = validate_persistent_citation_receipt_bytes(
+        &read_evidence_leaf(
+            root,
+            &profiles.release.commit_provenance,
+            "persistent release citation receipt",
+        )?,
+        tested_commit,
+        PersistentProfile::Release,
+    )?;
+    let release_perf = validate_persistent_citation_receipt_bytes(
+        &read_evidence_leaf(
+            root,
+            &profiles.release_perf.commit_provenance,
+            "persistent release-perf citation receipt",
+        )?,
+        tested_commit,
+        PersistentProfile::ReleasePerf,
+    )?;
+    if release.actual_worker != release_perf.actual_worker
+        || release.actual_host != release_perf.actual_host
+        || release.workload != release_perf.workload
+    {
+        return Err(
+            "persistent release and release-perf receipts must use the same worker, host, and workload contract"
+                .to_owned(),
+        );
+    }
+    // Profile-specific builds need independent nonces. Each receipt already
+    // requires a canonical 64-hex nonce, while profile binding prevents one
+    // receipt from satisfying both leaves.
+    Ok(())
+}
+
+fn validate_performance_regression_gate(gate: &PerformanceRegressionGate) -> Result<(), String> {
+    const SCHEMA: &str = "fsqlite.performance_release_admission.v1";
+    const STATUS: &str = "blocked_no_immutable_historical_baseline";
+    const RATIONALE: &str = "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.";
+    const BLOCKERS: [&str; 4] = ["bd-dqdoe", "bd-uh1fv", "bd-zywqc.2", "bd-1dp9.6.4"];
+    if gate.schema_version != SCHEMA
+        || gate.status != STATUS
+        || gate.release_authorized
+        || !gate.blockers.iter().map(String::as_str).eq(BLOCKERS)
+        || gate.rationale != RATIONALE
+    {
+        return Err(
+            "performance regression admission must remain explicitly blocked until an immutable historical baseline and authoritative policy are implemented"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -2921,10 +3129,16 @@ fn validate_release_evidence_manifest(
         "c1",
     )?;
     validate_scorecard_evidence_shape(
-        &manifest.auxiliary_scorecards.persistent,
+        &manifest.auxiliary_scorecards.persistent.release,
         &manifest.tested_commit,
-        "persistent",
+        "persistent/release",
     )?;
+    validate_scorecard_evidence_shape(
+        &manifest.auxiliary_scorecards.persistent.release_perf,
+        &manifest.tested_commit,
+        "persistent/release-perf",
+    )?;
+    validate_performance_regression_gate(&manifest.performance_regression_gate)?;
     validate_command_evidence_shape(&manifest.workspace.execution, "workspace")?;
     validate_command_evidence_commit_paths(
         &manifest.workspace.execution,
@@ -3064,15 +3278,40 @@ fn validate_release_evidence_manifest(
         manifest.auxiliary_scorecards.c1.scorecard.clone(),
         manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
         manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
-        manifest.auxiliary_scorecards.persistent.scorecard.clone(),
         manifest
             .auxiliary_scorecards
             .persistent
+            .release
+            .scorecard
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release
             .pack_manifest
             .clone(),
         manifest
             .auxiliary_scorecards
             .persistent
+            .release
+            .commit_provenance
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
+            .scorecard
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
+            .pack_manifest
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
             .commit_provenance
             .clone(),
         manifest.workspace.execution.stdout.leaf.clone(),
@@ -3451,7 +3690,8 @@ fn validate_pre_capture_untracked_bytes(bytes: &[u8], tested_commit: &str) -> Re
     let prefix = format!("{EVIDENCE_PATH_PREFIX}{tested_commit}/performance");
     let expected = vec![
         format!("?? {prefix}/c1/c1_scorecard.json"),
-        format!("?? {prefix}/persistent/persistent_scorecard.json"),
+        format!("?? {prefix}/persistent/release-perf/persistent_scorecard.json"),
+        format!("?? {prefix}/persistent/release/persistent_scorecard.json"),
     ];
     if records.windows(2).any(|pair| pair[0] >= pair[1]) || records != expected {
         records.sort();
@@ -4575,15 +4815,40 @@ fn load_release_evidence_manifest_from_path(
             manifest.auxiliary_scorecards.c1.scorecard.clone(),
             manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
             manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
-            manifest.auxiliary_scorecards.persistent.scorecard.clone(),
             manifest
                 .auxiliary_scorecards
                 .persistent
+                .release
+                .scorecard
+                .clone(),
+            manifest
+                .auxiliary_scorecards
+                .persistent
+                .release
                 .pack_manifest
                 .clone(),
             manifest
                 .auxiliary_scorecards
                 .persistent
+                .release
+                .commit_provenance
+                .clone(),
+            manifest
+                .auxiliary_scorecards
+                .persistent
+                .release_perf
+                .scorecard
+                .clone(),
+            manifest
+                .auxiliary_scorecards
+                .persistent
+                .release_perf
+                .pack_manifest
+                .clone(),
+            manifest
+                .auxiliary_scorecards
+                .persistent
+                .release_perf
                 .commit_provenance
                 .clone(),
         ] {
@@ -4652,10 +4917,9 @@ fn load_release_evidence_manifest_from_path(
         "c1",
         &manifest.tested_commit,
     )?;
-    validate_scorecard_evidence(
+    validate_persistent_profile_scorecards(
         root,
         &manifest.auxiliary_scorecards.persistent,
-        "persistent",
         &manifest.tested_commit,
     )?;
     let mut evidence_paths =
@@ -5615,17 +5879,42 @@ fn sample_release_evidence() -> (RegressionBaseline, ReleaseEvidenceManifest) {
                     "{evidence_root}/performance/c1/build_metadata.json"
                 )),
             },
-            persistent: ScorecardEvidence {
-                scorecard: sample_leaf(&format!(
-                    "{evidence_root}/performance/persistent/persistent_scorecard.json"
-                )),
-                pack_manifest: sample_leaf(&format!(
-                    "{evidence_root}/performance/persistent/manifest.json"
-                )),
-                commit_provenance: sample_leaf(&format!(
-                    "{evidence_root}/performance/persistent/provenance/citation_receipt.json"
-                )),
+            persistent: PersistentProfileScorecards {
+                release: ScorecardEvidence {
+                    scorecard: sample_leaf(&format!(
+                        "{evidence_root}/performance/persistent/release/persistent_scorecard.json"
+                    )),
+                    pack_manifest: sample_leaf(&format!(
+                        "{evidence_root}/performance/persistent/release/manifest.json"
+                    )),
+                    commit_provenance: sample_leaf(&format!(
+                        "{evidence_root}/performance/persistent/release/provenance/citation_receipt.json"
+                    )),
+                },
+                release_perf: ScorecardEvidence {
+                    scorecard: sample_leaf(&format!(
+                        "{evidence_root}/performance/persistent/release-perf/persistent_scorecard.json"
+                    )),
+                    pack_manifest: sample_leaf(&format!(
+                        "{evidence_root}/performance/persistent/release-perf/manifest.json"
+                    )),
+                    commit_provenance: sample_leaf(&format!(
+                        "{evidence_root}/performance/persistent/release-perf/provenance/citation_receipt.json"
+                    )),
+                },
             },
+        },
+        performance_regression_gate: PerformanceRegressionGate {
+            schema_version: "fsqlite.performance_release_admission.v1".to_owned(),
+            status: "blocked_no_immutable_historical_baseline".to_owned(),
+            release_authorized: false,
+            blockers: vec![
+                "bd-dqdoe".to_owned(),
+                "bd-uh1fv".to_owned(),
+                "bd-zywqc.2".to_owned(),
+                "bd-1dp9.6.4".to_owned(),
+            ],
+            rationale: "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.".to_owned(),
         },
         evidence_pack: Vec::new(),
     };
@@ -5654,15 +5943,40 @@ fn sample_release_evidence() -> (RegressionBaseline, ReleaseEvidenceManifest) {
         manifest.auxiliary_scorecards.c1.scorecard.clone(),
         manifest.auxiliary_scorecards.c1.pack_manifest.clone(),
         manifest.auxiliary_scorecards.c1.commit_provenance.clone(),
-        manifest.auxiliary_scorecards.persistent.scorecard.clone(),
         manifest
             .auxiliary_scorecards
             .persistent
+            .release
+            .scorecard
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release
             .pack_manifest
             .clone(),
         manifest
             .auxiliary_scorecards
             .persistent
+            .release
+            .commit_provenance
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
+            .scorecard
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
+            .pack_manifest
+            .clone(),
+        manifest
+            .auxiliary_scorecards
+            .persistent
+            .release_perf
             .commit_provenance
             .clone(),
     ];
@@ -7500,6 +7814,23 @@ fn test_regression_guard_persistent_citation_requires_v2_job_receipts() {
     let mut citation = serde_json::json!({
         "schema_version": PERSISTENT_CITATION_SCHEMA_VERSION,
         "source": { "commit": tested_commit, "clean": true },
+        "build": {
+            "profile": "release",
+            "expected_opt_level": "z",
+            "rustflags": {
+                "RUSTFLAGS": "",
+                "CARGO_ENCODED_RUSTFLAGS": "",
+                "CARGO_BUILD_RUSTFLAGS": "",
+                "policy": "all three values must be empty; remote cargo is invoked through env -u for each",
+            },
+            "nonce": "c".repeat(64),
+        },
+        "rch": {
+            "actual_worker": "ovh-a",
+            "actual_host": "worker.example.test",
+            "require_remote": true,
+            "no_self_healing": true,
+        },
         "rch_scheduler_isolation": {
             "build_status_trace": "provenance/rch_build_status.jsonl",
             "build_status_trace_sha256": digest,
@@ -7514,15 +7845,61 @@ fn test_regression_guard_persistent_citation_requires_v2_job_receipts() {
                 "16t": phase_trace("16t", "29960952048779269"),
             },
         },
+        "workload": {
+            "benchmark": "persistent_concurrent_write_{1,8,16}t",
+            "rows_per_thread": 1000,
+            "synchronous": "NORMAL",
+            "threads": [1, 8, 16],
+            "criterion": {
+                "sample_size": 10,
+                "warmup_secs": 1,
+                "measurement_secs": 1,
+                "export_root": "{phase}/criterion_measurements",
+                "headline_source": "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json",
+            },
+        },
     });
     let encoded = serde_json::to_vec(&citation).expect("encode canonical v2 citation receipt");
-    assert!(validate_persistent_citation_receipt_bytes(&encoded, &tested_commit).is_ok());
+    assert!(
+        validate_persistent_citation_receipt_bytes(
+            &encoded,
+            &tested_commit,
+            PersistentProfile::Release,
+        )
+        .is_ok()
+    );
+
+    assert!(
+        validate_persistent_citation_receipt_bytes(
+            &encoded,
+            &tested_commit,
+            PersistentProfile::ReleasePerf,
+        )
+        .is_err()
+    );
+    citation["build"]["rustflags"]["RUSTFLAGS"] = serde_json::json!("-Ctarget-cpu=native");
+    assert!(
+        validate_persistent_citation_receipt_bytes(
+            &serde_json::to_vec(&citation).expect("encode nonportable citation receipt"),
+            &tested_commit,
+            PersistentProfile::Release,
+        )
+        .is_err()
+    );
+    citation["build"]["rustflags"]["RUSTFLAGS"] = serde_json::json!("");
 
     citation["schema_version"] = serde_json::Value::String(
         "fsqlite.release_persistent_phase_pack_citation_receipt.v1".to_owned(),
     );
     let legacy = serde_json::to_vec(&citation).expect("encode legacy citation receipt");
-    assert!(validate_persistent_citation_receipt_bytes(&legacy, &tested_commit).is_err());
+    assert!(
+        validate_persistent_citation_receipt_bytes(
+            &legacy,
+            &tested_commit,
+            PersistentProfile::Release,
+        )
+        .is_err()
+    );
 
     citation["schema_version"] =
         serde_json::Value::String(PERSISTENT_CITATION_SCHEMA_VERSION.to_owned());
@@ -7531,7 +7908,12 @@ fn test_regression_guard_persistent_citation_requires_v2_job_receipts() {
     let rounded_number =
         serde_json::to_vec(&citation).expect("encode non-string citation receipt job id");
     assert!(
-        validate_persistent_citation_receipt_bytes(&rounded_number, &tested_commit).is_err(),
+        validate_persistent_citation_receipt_bytes(
+            &rounded_number,
+            &tested_commit,
+            PersistentProfile::Release,
+        )
+        .is_err(),
         "numeric job ids above 2^53 must not deserialize as exact receipt identities"
     );
 }
@@ -7541,7 +7923,7 @@ fn test_regression_guard_pre_capture_untracked_census_fails_closed() {
     let tested_commit = "a".repeat(40);
     let prefix = format!("{EVIDENCE_PATH_PREFIX}{tested_commit}/performance");
     let authentic = format!(
-        "?? {prefix}/c1/c1_scorecard.json\0?? {prefix}/persistent/persistent_scorecard.json\0"
+        "?? {prefix}/c1/c1_scorecard.json\0?? {prefix}/persistent/release-perf/persistent_scorecard.json\0?? {prefix}/persistent/release/persistent_scorecard.json\0"
     );
     assert!(validate_pre_capture_untracked_bytes(authentic.as_bytes(), &tested_commit).is_ok());
 
@@ -7549,12 +7931,31 @@ fn test_regression_guard_pre_capture_untracked_census_fails_closed() {
         authentic.trim_end_matches('\0').as_bytes().to_vec(),
         format!("{authentic}?? README.md\0").into_bytes(),
         format!(
-            " M Cargo.lock\0?? {prefix}/c1/c1_scorecard.json\0?? {prefix}/persistent/persistent_scorecard.json\0"
+            " M Cargo.lock\0?? {prefix}/c1/c1_scorecard.json\0?? {prefix}/persistent/release-perf/persistent_scorecard.json\0?? {prefix}/persistent/release/persistent_scorecard.json\0"
         )
         .into_bytes(),
     ] {
         assert!(validate_pre_capture_untracked_bytes(&invalid, &tested_commit).is_err());
     }
+}
+
+#[test]
+fn test_regression_guard_marks_diagnostic_performance_gate_non_authorizing() {
+    let mut gate = PerformanceRegressionGate {
+        schema_version: "fsqlite.performance_release_admission.v1".to_owned(),
+        status: "blocked_no_immutable_historical_baseline".to_owned(),
+        release_authorized: false,
+        blockers: vec![
+            "bd-dqdoe".to_owned(),
+            "bd-uh1fv".to_owned(),
+            "bd-zywqc.2".to_owned(),
+            "bd-1dp9.6.4".to_owned(),
+        ],
+        rationale: "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.".to_owned(),
+    };
+    assert!(validate_performance_regression_gate(&gate).is_ok());
+    gate.release_authorized = true;
+    assert!(validate_performance_regression_gate(&gate).is_err());
 }
 
 #[test]

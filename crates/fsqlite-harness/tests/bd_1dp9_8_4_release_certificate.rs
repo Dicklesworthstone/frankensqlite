@@ -4,6 +4,8 @@
 //! invariant catalog, drift monitors, confidence gates, adversarial search,
 //! and CI artifacts into a machine-verifiable release certificate.
 
+use std::path::{Path, PathBuf};
+
 use fsqlite_harness::adversarial_search::run_campaign;
 use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
 use fsqlite_harness::drift_monitor::ParityDriftMonitor;
@@ -11,11 +13,38 @@ use fsqlite_harness::parity_invariant_catalog::build_canonical_catalog;
 use fsqlite_harness::parity_taxonomy::build_canonical_universe;
 use fsqlite_harness::release_certificate::{
     CERTIFICATE_SCHEMA_VERSION, CertificateConfig, CertificateInputs, CertificateVerdict,
-    RELEASE_CERT_BEAD_ID, ReleaseCertificate, build_certificate, generate_release_certificate,
+    RELEASE_CERT_BEAD_ID, ReleaseCertificate, StrictCertificateRunConfig,
+    build_and_publish_strict_certificate, build_certificate, generate_release_certificate,
     load_certificate, write_certificate,
 };
 
 const BEAD_ID: &str = "bd-1dp9.8.4";
+
+#[test]
+fn strict_adapter_rejects_noncanonical_candidate_before_publication() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output_dir = workspace_root.join(format!(
+        "artifacts/strict-certificate-invalid-sha-test-{}",
+        std::process::id()
+    ));
+    assert!(!output_dir.exists(), "test output path must start absent");
+    let error = build_and_publish_strict_certificate(&StrictCertificateRunConfig {
+        workspace_root: workspace_root.clone(),
+        evidence_root: workspace_root,
+        evidence_json: PathBuf::from("evidence-that-must-not-be-read.json"),
+        candidate_git_sha: "A".repeat(40),
+        baseline_metadata_git_sha: "b".repeat(40),
+        candidate_rch_project_id: "frankensqlite-candidate".to_owned(),
+        baseline_rch_project_id: "frankensqlite-baseline".to_owned(),
+        output_dir: output_dir.clone(),
+    })
+    .expect_err("mixed-case candidate identity must fail closed");
+    assert_eq!(error, "candidate_git_sha_must_be_lowercase_40_hex");
+    assert!(
+        !output_dir.exists(),
+        "candidate rejection must not create a partial output"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Full pipeline

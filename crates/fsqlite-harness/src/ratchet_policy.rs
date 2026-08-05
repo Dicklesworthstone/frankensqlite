@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::parity_taxonomy::truncate_score;
-use crate::score_engine::BayesianScorecard;
+use crate::score_engine::{BayesianScorecard, STATISTICAL_RELEASE_FLOOR};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
@@ -85,7 +85,7 @@ impl Default for RatchetPolicy {
             quarantine_enabled: true,
             quarantine_max_evaluations: 5,
             waivers_enabled: true,
-            minimum_release_threshold: 1.0,
+            minimum_release_threshold: STATISTICAL_RELEASE_FLOOR,
         }
     }
 }
@@ -100,7 +100,7 @@ impl RatchetPolicy {
             quarantine_enabled: false,
             quarantine_max_evaluations: 0,
             waivers_enabled: false,
-            minimum_release_threshold: 1.0,
+            minimum_release_threshold: STATISTICAL_RELEASE_FLOOR,
         }
     }
 
@@ -113,7 +113,7 @@ impl RatchetPolicy {
             quarantine_enabled: true,
             quarantine_max_evaluations: 10,
             waivers_enabled: true,
-            minimum_release_threshold: 1.0,
+            minimum_release_threshold: STATISTICAL_RELEASE_FLOOR,
         }
     }
 }
@@ -194,14 +194,28 @@ impl RatchetState {
     /// Create a fresh state seeded from a scorecard (first evaluation).
     #[must_use]
     pub fn from_scorecard(scorecard: &BayesianScorecard) -> Self {
+        let global_lower_bound = truncate_score(scorecard.global_lower_bound);
+        let global_point_estimate = truncate_score(scorecard.global_point_estimate);
         let mut category_marks = BTreeMap::new();
         for (name, posterior) in &scorecard.category_posteriors {
             category_marks.insert(name.clone(), truncate_score(posterior.lower_bound));
         }
+        let initial_verdict = if scorecard.release_ready
+            && (STATISTICAL_RELEASE_FLOOR..=1.0).contains(&global_lower_bound)
+            && (0.0..=1.0).contains(&global_point_estimate)
+            && !category_marks.is_empty()
+            && category_marks
+                .values()
+                .all(|value| (0.0..=1.0).contains(value))
+        {
+            RatchetVerdict::Allow
+        } else {
+            RatchetVerdict::Block
+        };
         Self {
             schema_version: RATCHET_SCHEMA_VERSION,
-            high_water_mark: truncate_score(scorecard.global_lower_bound),
-            high_water_point_estimate: truncate_score(scorecard.global_point_estimate),
+            high_water_mark: global_lower_bound,
+            high_water_point_estimate: global_point_estimate,
             category_high_water_marks: category_marks,
             evaluation_count: 1,
             quarantine_streak: 0,
@@ -209,9 +223,9 @@ impl RatchetState {
             active_waiver: None,
             recent_evaluations: vec![EvaluationRecord {
                 evaluation_id: 1,
-                global_lower_bound: truncate_score(scorecard.global_lower_bound),
-                global_point_estimate: truncate_score(scorecard.global_point_estimate),
-                decision: RatchetVerdict::Allow,
+                global_lower_bound,
+                global_point_estimate,
+                decision: initial_verdict,
                 bead_id: scorecard.bead_id.clone(),
             }],
         }
@@ -362,10 +376,37 @@ pub fn evaluate_ratchet(
 ) -> RatchetDecision {
     let candidate_lower = truncate_score(scorecard.global_lower_bound);
     let candidate_point = truncate_score(scorecard.global_point_estimate);
+    let candidate_conformal_lower = truncate_score(scorecard.conformal_band.lower);
     let previous_hwm = state.high_water_mark;
 
     let global_regression = truncate_score(previous_hwm - candidate_lower);
-    let meets_threshold = candidate_lower >= policy.minimum_release_threshold;
+    let metrics_are_valid = scorecard.release_ready
+        && !scorecard.category_posteriors.is_empty()
+        && (0.0..=1.0).contains(&candidate_lower)
+        && (0.0..=1.0).contains(&candidate_point)
+        && (0.0..=1.0).contains(&candidate_conformal_lower)
+        && (STATISTICAL_RELEASE_FLOOR..=1.0).contains(&scorecard.release_threshold)
+        && (0.0..=1.0).contains(&previous_hwm)
+        && (0.0..=1.0).contains(&state.high_water_point_estimate)
+        && (STATISTICAL_RELEASE_FLOOR..=1.0).contains(&policy.minimum_release_threshold)
+        && (0.0..=1.0).contains(&policy.regression_tolerance)
+        && (0.0..=1.0).contains(&policy.category_regression_tolerance)
+        && state
+            .category_high_water_marks
+            .values()
+            .all(|value| (0.0..=1.0).contains(value))
+        && state
+            .category_high_water_marks
+            .keys()
+            .all(|category| scorecard.category_posteriors.contains_key(category))
+        && scorecard
+            .category_posteriors
+            .values()
+            .all(|posterior| (0.0..=1.0).contains(&posterior.lower_bound));
+    let meets_threshold = metrics_are_valid
+        && candidate_lower >= policy.minimum_release_threshold
+        && candidate_lower >= scorecard.release_threshold
+        && candidate_conformal_lower >= scorecard.release_threshold;
 
     // Detect per-category regressions.
     let mut regressed_categories = Vec::new();
@@ -393,7 +434,11 @@ pub fn evaluate_ratchet(
     }
 
     // Determine verdict.
-    let verdict = if global_regression <= policy.regression_tolerance {
+    let verdict = if !meets_threshold {
+        // The release floor is a non-waivable defense-in-depth gate. Invalid
+        // floating-point inputs also arrive here and fail closed.
+        RatchetVerdict::Block
+    } else if global_regression <= policy.regression_tolerance && regressed_categories.is_empty() {
         // No regression (or within tolerance): allow and advance high-water mark.
         RatchetVerdict::Allow
     } else if let Some(waiver) = &state.active_waiver {
@@ -670,13 +715,17 @@ fn build_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parity_taxonomy::build_canonical_universe;
+    use crate::parity_taxonomy::{ParityStatus, build_canonical_universe};
     use crate::score_engine::{BayesianScorecard, ScoreEngineConfig, compute_bayesian_scorecard};
 
     const TOL: f64 = 1e-6;
 
     fn make_scorecard() -> BayesianScorecard {
-        let universe = build_canonical_universe();
+        let mut universe = build_canonical_universe();
+        for feature in universe.features.values_mut() {
+            feature.status = ParityStatus::Passing;
+            feature.exclusion = None;
+        }
         let config = ScoreEngineConfig::default();
         compute_bayesian_scorecard(&universe, &config)
     }
@@ -706,6 +755,17 @@ mod tests {
         assert!(state.active_waiver.is_none());
         assert_eq!(state.recent_evaluations.len(), 1);
         assert_eq!(state.recent_evaluations[0].decision, RatchetVerdict::Allow);
+    }
+
+    #[test]
+    fn test_ratchet_state_seed_below_release_floor_is_blocked() {
+        let mut scorecard = make_scorecard();
+        scorecard.global_lower_bound = STATISTICAL_RELEASE_FLOOR - 0.1;
+        scorecard.release_ready = false;
+
+        let state = RatchetState::from_scorecard(&scorecard);
+
+        assert_eq!(state.recent_evaluations[0].decision, RatchetVerdict::Block);
     }
 
     // --- Allow on equal or improved score ---
@@ -1015,6 +1075,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_category_regression_blocks_even_without_global_regression() {
+        let mut scorecard = make_scorecard();
+        let mut state = RatchetState::from_scorecard(&scorecard);
+        let category = scorecard
+            .category_posteriors
+            .keys()
+            .next()
+            .expect("scorecard must contain a category")
+            .clone();
+        scorecard
+            .category_posteriors
+            .get_mut(&category)
+            .expect("selected category must exist")
+            .lower_bound = 0.0;
+
+        let decision = evaluate_ratchet(&scorecard, &mut state, &RatchetPolicy::strict(), None);
+
+        assert_eq!(decision.verdict, RatchetVerdict::Block);
+        assert_eq!(decision.regressed_categories.len(), 1);
+        assert_eq!(decision.regressed_categories[0].category, category);
+    }
+
+    #[test]
+    fn test_missing_candidate_category_blocks_fail_closed() {
+        let mut scorecard = make_scorecard();
+        let mut state = RatchetState::from_scorecard(&scorecard);
+        let category = scorecard
+            .category_posteriors
+            .keys()
+            .next()
+            .expect("scorecard must contain a category")
+            .clone();
+        scorecard.category_posteriors.remove(&category);
+
+        let decision = evaluate_ratchet(&scorecard, &mut state, &RatchetPolicy::strict(), None);
+
+        assert_eq!(decision.verdict, RatchetVerdict::Block);
+        assert!(!decision.meets_release_threshold);
+    }
+
     // --- High-water mark monotonicity ---
 
     #[test]
@@ -1057,24 +1158,101 @@ mod tests {
     // --- Release threshold ---
 
     #[test]
-    fn test_meets_release_threshold_reported() {
-        let sc = make_scorecard();
-        let mut state = RatchetState::default();
+    fn test_release_threshold_blocks_below_and_allows_at_or_above_floor() {
+        for (candidate_lower, expected_verdict) in [
+            (STATISTICAL_RELEASE_FLOOR - 0.000_001, RatchetVerdict::Block),
+            (STATISTICAL_RELEASE_FLOOR, RatchetVerdict::Allow),
+            (STATISTICAL_RELEASE_FLOOR + 0.000_001, RatchetVerdict::Allow),
+        ] {
+            let mut scorecard = make_scorecard();
+            scorecard.global_lower_bound = candidate_lower;
+            let mut state = RatchetState::default();
+            let decision = evaluate_ratchet(&scorecard, &mut state, &RatchetPolicy::strict(), None);
 
-        // Use a threshold we know the current score doesn't meet.
+            assert_eq!(
+                decision.verdict, expected_verdict,
+                "candidate={candidate_lower}"
+            );
+            assert_eq!(
+                decision.meets_release_threshold,
+                candidate_lower >= STATISTICAL_RELEASE_FLOOR,
+                "candidate={candidate_lower}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_release_threshold_cannot_be_bypassed_by_waiver_or_quarantine() {
+        let mut scorecard = make_scorecard();
+        scorecard.global_lower_bound = STATISTICAL_RELEASE_FLOOR - 0.1;
+        let mut state = RatchetState::default();
+        grant_waiver(&mut state, "must not bypass the floor", 5, "test");
+        enter_quarantine(&mut state, "must not bypass the floor");
         let policy = RatchetPolicy {
-            minimum_release_threshold: 0.99,
-            ..Default::default()
+            waivers_enabled: true,
+            quarantine_enabled: true,
+            ..RatchetPolicy::strict()
+        };
+        let request = QuarantineRequest {
+            reason: "must not bypass the floor".to_owned(),
         };
 
-        let decision = evaluate_ratchet(&sc, &mut state, &policy, None);
-        // The verdict may still be Allow (ratchet doesn't block on threshold,
-        // only reports), but meets_release_threshold should be false if score < 0.99.
-        if sc.global_lower_bound < 0.99 {
-            assert!(
-                !decision.meets_release_threshold,
-                "should report below threshold"
-            );
+        let decision = evaluate_ratchet(&scorecard, &mut state, &policy, Some(&request));
+
+        assert_eq!(decision.verdict, RatchetVerdict::Block);
+        assert!(!decision.meets_release_threshold);
+    }
+
+    #[test]
+    fn test_release_threshold_cannot_be_configured_below_canonical_floor() {
+        let scorecard = make_scorecard();
+        let mut state = RatchetState::default();
+        let policy = RatchetPolicy {
+            minimum_release_threshold: 0.0,
+            ..RatchetPolicy::strict()
+        };
+
+        let decision = evaluate_ratchet(&scorecard, &mut state, &policy, None);
+
+        assert_eq!(decision.verdict, RatchetVerdict::Block);
+        assert!(!decision.meets_release_threshold);
+    }
+
+    #[test]
+    fn test_scorecard_release_block_cannot_be_bypassed_by_ratchet() {
+        let mut scorecard = make_scorecard();
+        scorecard.release_ready = false;
+        let mut state = RatchetState::default();
+
+        let decision = evaluate_ratchet(&scorecard, &mut state, &RatchetPolicy::strict(), None);
+
+        assert_eq!(decision.verdict, RatchetVerdict::Block);
+        assert!(!decision.meets_release_threshold);
+    }
+
+    #[test]
+    fn test_empty_category_scorecard_blocks_fail_closed() {
+        let mut scorecard = make_scorecard();
+        scorecard.category_posteriors.clear();
+        let mut state = RatchetState::default();
+
+        let decision = evaluate_ratchet(&scorecard, &mut state, &RatchetPolicy::strict(), None);
+
+        assert_eq!(decision.verdict, RatchetVerdict::Block);
+        assert!(!decision.meets_release_threshold);
+    }
+
+    #[test]
+    fn test_invalid_candidate_blocks_fail_closed() {
+        for candidate_lower in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut scorecard = make_scorecard();
+            scorecard.global_lower_bound = candidate_lower;
+            let mut state = RatchetState::default();
+
+            let decision = evaluate_ratchet(&scorecard, &mut state, &RatchetPolicy::strict(), None);
+
+            assert_eq!(decision.verdict, RatchetVerdict::Block);
+            assert!(!decision.meets_release_threshold);
         }
     }
 
@@ -1088,13 +1266,14 @@ mod tests {
         assert!(p.quarantine_enabled);
         assert_eq!(p.quarantine_max_evaluations, 5);
         assert!(p.waivers_enabled);
-        assert!((p.minimum_release_threshold - 1.0).abs() < TOL);
+        assert!((p.minimum_release_threshold - STATISTICAL_RELEASE_FLOOR).abs() < TOL);
     }
 
     #[test]
     fn test_strict_policy() {
         let p = RatchetPolicy::strict();
         assert!((p.regression_tolerance - 0.0).abs() < TOL);
+        assert!((p.minimum_release_threshold - STATISTICAL_RELEASE_FLOOR).abs() < TOL);
         assert!(!p.quarantine_enabled);
         assert!(!p.waivers_enabled);
     }
@@ -1103,6 +1282,7 @@ mod tests {
     fn test_relaxed_policy() {
         let p = RatchetPolicy::relaxed();
         assert!((p.regression_tolerance - 0.01).abs() < TOL);
+        assert!((p.minimum_release_threshold - STATISTICAL_RELEASE_FLOOR).abs() < TOL);
         assert!(p.quarantine_enabled);
         assert!(p.waivers_enabled);
     }

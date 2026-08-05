@@ -25,7 +25,8 @@
 //! Optional machine-readable capture:
 //! - Set `FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR=/path/to/dir`
 //! - Citation capture is opt-in: setting the directory also requires the
-//!   compile-time `FSQLITE_BENCH_BUILD_NONCE` identity. The benchmark writes
+//!   compile-time `FSQLITE_BENCH_BUILD_NONCE` and
+//!   `FSQLITE_BENCH_PROFILE_NAME` identities. The benchmark writes
 //!   `provenance.json` once, appends per-iteration
 //!   records to `samples.jsonl`, and refreshes paired SQLite-vs-FrankenSQLite
 //!   `component_comparison.{json,md}` artifacts without changing default
@@ -75,9 +76,10 @@ const PERSISTENT_BENCH_SYNCHRONOUS: &str = "NORMAL";
 const MAX_TXN_RETRIES: u32 = 100_000;
 const RETRY_BACKOFF: Duration = Duration::from_micros(100);
 const PERSISTENT_PHASE_CAPTURE_DIR_ENV: &str = "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR";
-const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V2: &str =
-    "fsqlite-e2e.persistent_phase_capture_provenance.v2";
+const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V3: &str =
+    "fsqlite-e2e.persistent_phase_capture_provenance.v3";
 const BENCH_BUILD_NONCE_ENV: &str = "FSQLITE_BENCH_BUILD_NONCE";
+const BENCH_BUILD_PROFILE_ENV: &str = "FSQLITE_BENCH_PROFILE_NAME";
 const PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3: &str =
     "fsqlite-e2e.persistent_phase_capture_sample.v3";
 const SQLITE_ENGINE_ID: &str = "sqlite3";
@@ -204,6 +206,7 @@ struct PersistentPhaseCaptureProvenance {
     current_dir: String,
     current_exe: String,
     build_nonce: String,
+    cargo_profile: String,
     running_binary_sha256: String,
     argv: Vec<String>,
     hostname: Option<String>,
@@ -380,6 +383,24 @@ fn compiled_build_nonce() -> std::io::Result<String> {
     compiled_build_nonce_from(option_env!("FSQLITE_BENCH_BUILD_NONCE"))
 }
 
+fn compiled_build_profile_from(value: Option<&str>) -> std::io::Result<String> {
+    match value {
+        Some(profile @ ("release" | "release-perf")) => Ok(profile.to_owned()),
+        Some(profile) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{BENCH_BUILD_PROFILE_ENV} must be release or release-perf, got {profile:?}"),
+        )),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{BENCH_BUILD_PROFILE_ENV} was absent while this benchmark was compiled"),
+        )),
+    }
+}
+
+fn compiled_build_profile() -> std::io::Result<String> {
+    compiled_build_profile_from(option_env!("FSQLITE_BENCH_PROFILE_NAME"))
+}
+
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -423,7 +444,7 @@ fn persistent_phase_capture_provenance(
 ) -> std::io::Result<PersistentPhaseCaptureProvenance> {
     let (current_exe, running_binary_sha256) = running_executable_identity()?;
     Ok(PersistentPhaseCaptureProvenance {
-        schema_version: PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V2.to_owned(),
+        schema_version: PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V3.to_owned(),
         benchmark: "concurrent_write_persistent_bench".to_owned(),
         output_dir_env: PERSISTENT_PHASE_CAPTURE_DIR_ENV.to_owned(),
         rows_per_thread: ROWS_PER_THREAD,
@@ -435,6 +456,7 @@ fn persistent_phase_capture_provenance(
             .unwrap_or_else(|_| ".".to_owned()),
         current_exe,
         build_nonce: compiled_build_nonce()?,
+        cargo_profile: compiled_build_profile()?,
         running_binary_sha256,
         argv: std::env::args_os()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -485,8 +507,9 @@ fn has_same_capture_identity(
     existing: &PersistentPhaseCaptureProvenance,
     current: &PersistentPhaseCaptureProvenance,
 ) -> bool {
-    existing.schema_version == PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V2
+    existing.schema_version == PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V3
         && existing.build_nonce == current.build_nonce
+        && existing.cargo_profile == current.cargo_profile
         && existing.concurrency == current.concurrency
         && existing.synchronous == current.synchronous
         && existing.current_exe == current.current_exe
@@ -1408,7 +1431,7 @@ mod tests {
     #[test]
     fn stale_capture_provenance_identity_is_rejected() {
         let current = super::PersistentPhaseCaptureProvenance {
-            schema_version: "fsqlite-e2e.persistent_phase_capture_provenance.v2".to_owned(),
+            schema_version: "fsqlite-e2e.persistent_phase_capture_provenance.v3".to_owned(),
             benchmark: "concurrent_write_persistent_bench".to_owned(),
             output_dir_env: "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR".to_owned(),
             rows_per_thread: 1000,
@@ -1419,6 +1442,7 @@ mod tests {
             current_exe: "/worker/project/target/bench".to_owned(),
             build_nonce: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_owned(),
+            cargo_profile: "release-perf".to_owned(),
             running_binary_sha256:
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned(),
             argv: Vec::new(),
@@ -1434,6 +1458,25 @@ mod tests {
         stale.build_nonce =
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
         assert!(!super::has_same_capture_identity(&stale, &current));
+
+        let mut stale_profile = current;
+        stale_profile.cargo_profile = "release".to_owned();
+        assert!(!super::has_same_capture_identity(&stale_profile, &decoded));
+    }
+
+    #[test]
+    fn build_profile_rejects_missing_or_unsupported_values() {
+        assert_eq!(
+            super::compiled_build_profile_from(Some("release")).expect("release is supported"),
+            "release"
+        );
+        assert_eq!(
+            super::compiled_build_profile_from(Some("release-perf"))
+                .expect("release-perf is supported"),
+            "release-perf"
+        );
+        assert!(super::compiled_build_profile_from(None).is_err());
+        assert!(super::compiled_build_profile_from(Some("debug")).is_err());
     }
 }
 

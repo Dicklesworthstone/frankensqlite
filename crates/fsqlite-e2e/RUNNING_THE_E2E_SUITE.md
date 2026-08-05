@@ -7,8 +7,9 @@ checks, concurrency benchmarks, and corruption/recovery demos.
 ## Prerequisites
 
 ```bash
-# Nightly Rust toolchain (required for workspace)
-rustup default nightly
+# Confirm rustup selected the exact dated nightly pinned by this checkout.
+# Run these commands from the repository; do not switch to a floating nightly.
+rustup show active-toolchain
 
 # Build the E2E binary (release recommended for benchmarks)
 cargo build -p fsqlite-e2e --bin realdb-e2e --release

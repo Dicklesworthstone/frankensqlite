@@ -1,20 +1,22 @@
 //! Contract tests for parity_release_threshold_policy.toml (bd-2yqp6.7.1).
 //!
-//! Enforces strict 100% release thresholds and deterministic policy signature
-//! verification for release-gating defaults.
+//! Enforces strict 100% empirical thresholds, a feasible finite-sample
+//! statistical floor, and deterministic policy-signature verification.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use fsqlite_harness::certification_policy::{CERTIFICATION_POLICY_ID, certification_gate_config};
 use fsqlite_harness::confidence_gates::GateConfig;
 use fsqlite_harness::ratchet_policy::RatchetPolicy;
-use fsqlite_harness::score_engine::ScoreEngineConfig;
+use fsqlite_harness::score_engine::{STATISTICAL_RELEASE_FLOOR, ScoreEngineConfig};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const BEAD_ID: &str = "bd-2yqp6.7.1";
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ThresholdPolicyDocument {
     meta: PolicyMeta,
     thresholds: ThresholdPolicy,
@@ -24,9 +26,11 @@ struct ThresholdPolicyDocument {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicyMeta {
     schema_version: String,
     policy_version: String,
+    certification_policy_id: String,
     bead_id: String,
     track_id: String,
     generated_at: String,
@@ -34,6 +38,7 @@ struct PolicyMeta {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ThresholdPolicy {
     declared_surface_parity_min: f64,
     required_suite_pass_rate_min: f64,
@@ -41,15 +46,18 @@ struct ThresholdPolicy {
     confidence_gate_release_threshold: f64,
     ratchet_minimum_release_threshold: f64,
     allow_threshold_downgrade: bool,
+    allow_waived_obligations: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EvidencePolicy {
     max_evidence_age_hours: u64,
     require_fresh_evidence_for_release: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicySignature {
     algorithm: String,
     canonical_payload: String,
@@ -57,6 +65,7 @@ struct PolicySignature {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicyReferences {
     parity_score_contract: String,
     supported_surface_matrix: String,
@@ -105,16 +114,28 @@ fn canonical_payload(policy: &ThresholdPolicyDocument) -> String {
     let thresholds = &policy.thresholds;
     let evidence = &policy.evidence;
     format!(
-        "policy_version={}|declared_surface_parity_min={:.6}|required_suite_pass_rate_min={:.6}|score_engine_release_threshold={:.6}|confidence_gate_release_threshold={:.6}|ratchet_minimum_release_threshold={:.6}|allow_threshold_downgrade={}|max_evidence_age_hours={}|require_fresh_evidence_for_release={}",
+        "schema_version={}|policy_version={}|certification_policy_id={}|bead_id={}|track_id={}|generated_at={}|policy_owner={}|declared_surface_parity_min={:.6}|required_suite_pass_rate_min={:.6}|score_engine_release_threshold={:.6}|confidence_gate_release_threshold={:.6}|ratchet_minimum_release_threshold={:.6}|allow_threshold_downgrade={}|allow_waived_obligations={}|max_evidence_age_hours={}|require_fresh_evidence_for_release={}|parity_score_contract={}|supported_surface_matrix={}|score_engine_module={}|confidence_gates_module={}|ratchet_policy_module={}",
+        policy.meta.schema_version,
         policy.meta.policy_version,
+        policy.meta.certification_policy_id,
+        policy.meta.bead_id,
+        policy.meta.track_id,
+        policy.meta.generated_at,
+        policy.meta.policy_owner,
         thresholds.declared_surface_parity_min,
         thresholds.required_suite_pass_rate_min,
         thresholds.score_engine_release_threshold,
         thresholds.confidence_gate_release_threshold,
         thresholds.ratchet_minimum_release_threshold,
         thresholds.allow_threshold_downgrade,
+        thresholds.allow_waived_obligations,
         evidence.max_evidence_age_hours,
-        evidence.require_fresh_evidence_for_release
+        evidence.require_fresh_evidence_for_release,
+        policy.references.parity_score_contract,
+        policy.references.supported_surface_matrix,
+        policy.references.score_engine_module,
+        policy.references.confidence_gates_module,
+        policy.references.ratchet_policy_module,
     )
 }
 
@@ -126,11 +147,12 @@ fn sha256_hex(input: &str) -> String {
 }
 
 #[test]
-fn policy_meta_and_thresholds_are_strict() {
+fn policy_meta_and_thresholds_separate_empirical_completion_from_uncertainty() {
     let policy = load_threshold_policy();
 
-    assert_eq!(policy.meta.schema_version, "1.0.0");
-    assert_eq!(policy.meta.policy_version, "strict-100.v1");
+    assert_eq!(policy.meta.schema_version, "2.0.0");
+    assert_eq!(policy.meta.policy_version, "strict-100.v2");
+    assert_eq!(policy.meta.certification_policy_id, CERTIFICATION_POLICY_ID);
     assert_eq!(policy.meta.bead_id, BEAD_ID);
     assert_eq!(policy.meta.track_id, "bd-2yqp6.7");
     assert!(!policy.meta.generated_at.trim().is_empty());
@@ -138,13 +160,35 @@ fn policy_meta_and_thresholds_are_strict() {
 
     assert!((policy.thresholds.declared_surface_parity_min - 1.0).abs() < f64::EPSILON);
     assert!((policy.thresholds.required_suite_pass_rate_min - 1.0).abs() < f64::EPSILON);
-    assert!((policy.thresholds.score_engine_release_threshold - 1.0).abs() < f64::EPSILON);
-    assert!((policy.thresholds.confidence_gate_release_threshold - 1.0).abs() < f64::EPSILON);
-    assert!((policy.thresholds.ratchet_minimum_release_threshold - 1.0).abs() < f64::EPSILON);
+    for threshold in [
+        policy.thresholds.score_engine_release_threshold,
+        policy.thresholds.confidence_gate_release_threshold,
+        policy.thresholds.ratchet_minimum_release_threshold,
+    ] {
+        assert!((threshold - STATISTICAL_RELEASE_FLOOR).abs() < f64::EPSILON);
+        assert!(
+            (f64::MIN_POSITIVE..1.0).contains(&threshold),
+            "finite-sample statistical floor must be feasible: {threshold}",
+        );
+    }
     assert!(!policy.thresholds.allow_threshold_downgrade);
+    assert!(!policy.thresholds.allow_waived_obligations);
 
     assert!(policy.evidence.max_evidence_age_hours > 0);
     assert!(policy.evidence.require_fresh_evidence_for_release);
+}
+
+#[test]
+fn root_and_documented_policy_copies_are_identical() {
+    let root = workspace_root();
+    let root_copy = read_text(&root.join("parity_release_threshold_policy.toml"));
+    let documented_copy = read_text(
+        &root
+            .join("docs/contracts")
+            .join("parity_release_threshold_policy.toml"),
+    );
+
+    assert_eq!(root_copy, documented_copy);
 }
 
 #[test]
@@ -163,6 +207,7 @@ fn defaults_match_policy_thresholds() {
 
     let score_default = ScoreEngineConfig::default().release_threshold;
     let gate_default = GateConfig::default().release_threshold;
+    let certification_gate = certification_gate_config();
     let ratchet_default = RatchetPolicy::default().minimum_release_threshold;
     let ratchet_strict = RatchetPolicy::strict().minimum_release_threshold;
     let ratchet_relaxed = RatchetPolicy::relaxed().minimum_release_threshold;
@@ -172,6 +217,10 @@ fn defaults_match_policy_thresholds() {
     );
     assert!(
         (gate_default - policy.thresholds.confidence_gate_release_threshold).abs() < f64::EPSILON
+    );
+    assert_eq!(
+        certification_gate.waived_obligations_satisfy_gate,
+        policy.thresholds.allow_waived_obligations,
     );
     assert!(
         (ratchet_default - policy.thresholds.ratchet_minimum_release_threshold).abs()
