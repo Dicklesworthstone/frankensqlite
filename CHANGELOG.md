@@ -73,9 +73,9 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   column and return false positives. Avoid column-qualified `MATCH`, or verify
   the selected column in application logic
   ([#249](https://github.com/Dicklesworthstone/frankensqlite/issues/249)).
-- **Bounded external snapshots are unavailable on macOS in v0.2.0.** The native
-  macOS VFS does not implement that capability; applications requiring bounded
-  external snapshots must not treat it as a portable v0.2.0 API
+- **HFDT bounded database-image validation is not shipped in v0.2.0.** Its
+  macOS support is therefore unavailable, and applications must not rely on
+  that downstream capability as a portable `fsqlite::Connection` API
   ([#307](https://github.com/Dicklesworthstone/frankensqlite/issues/307)).
 - **v0.2.0 makes no numeric performance claim.** The async storage migration
   invalidated the older benchmark matrices, and the current comprehensive and
