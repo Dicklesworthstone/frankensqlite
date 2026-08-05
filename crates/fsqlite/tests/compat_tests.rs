@@ -885,7 +885,7 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
             wal_certificate.exists(),
             "fixture must retain the WAL certificate paired with the WAL"
         );
-        let sentinel_modified = UNIX_EPOCH + Duration::from_secs(946_684_800);
+        let sentinel_modified = UNIX_EPOCH + Duration::from_hours(262_968);
         File::options()
             .write(true)
             .open(&namespace_use)
