@@ -5,7 +5,6 @@ description = "Conflict analytics and observability infrastructure for FrankenSQ
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 fsqlite-types = { workspace = true }

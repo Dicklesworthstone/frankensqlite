@@ -6,7 +6,6 @@ edition.workspace = true
 autobins = false
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 description = "End-to-end differential testing and benchmark harness for FrankenSQLite"
 
 [lints]

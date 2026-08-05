@@ -5,7 +5,6 @@ description = "Miscellaneous extensions: generate_series, carray, dbstat, dbpage
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 fsqlite-types = { workspace = true }

@@ -5,7 +5,6 @@ description = "Interactive SQL shell"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [[bin]]
 name = "fsqlite"

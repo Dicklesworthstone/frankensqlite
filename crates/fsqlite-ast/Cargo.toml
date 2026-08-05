@@ -5,7 +5,6 @@ description = "SQL abstract syntax tree node types"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 fsqlite-types = { workspace = true }

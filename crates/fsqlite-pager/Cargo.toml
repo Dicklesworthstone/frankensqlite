@@ -5,7 +5,6 @@ description = "Page cache and journal management"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [features]
 default = ["native"]

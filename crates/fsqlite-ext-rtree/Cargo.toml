@@ -5,7 +5,6 @@ description = "R-tree and geopoly spatial index extension"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 fsqlite-func = { workspace = true }

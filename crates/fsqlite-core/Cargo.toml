@@ -5,7 +5,6 @@ description = "Core engine: connection, prepare, schema, DDL/DML codegen"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [features]
 default = ["native", "linux-asupersync-uring"]

@@ -5,7 +5,6 @@ description = "Structured error types for FrankenSQLite"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }

@@ -39,7 +39,6 @@ edition = "2024"
 # and guarantees every published crate contains the complete rider text.
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankensqlite"
-rust-version = "1.85"
 readme = "README.md"
 keywords = ["sqlite", "database", "embedded", "sql", "pure-rust"]
 categories = ["database-implementations", "parser-implementations"]

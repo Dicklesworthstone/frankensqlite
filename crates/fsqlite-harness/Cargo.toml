@@ -6,7 +6,6 @@ description = "Conformance test runner and golden file comparison"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 asupersync.workspace = true

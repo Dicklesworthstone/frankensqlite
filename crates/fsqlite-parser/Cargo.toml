@@ -5,7 +5,6 @@ description = "Hand-written SQL parser with explicit-state Pratt and SELECT mach
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 fsqlite-types = { workspace = true }

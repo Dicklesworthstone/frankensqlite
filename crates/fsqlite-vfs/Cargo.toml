@@ -5,7 +5,6 @@ description = "Virtual filesystem abstraction layer"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [features]
 default = ["linux-asupersync-uring"]
