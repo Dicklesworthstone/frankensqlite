@@ -3597,6 +3597,34 @@ impl ShardedPageCache {
         self.take_clean_buffer_entry()
     }
 
+    /// Reproduce the pre-GH-326 snapshot-and-sort reclaim algorithm.
+    ///
+    /// This benchmark-only adapter is intentionally control-flow equivalent to
+    /// the production algorithm at `0696131c`, except that it retains the
+    /// victim page number so the harness can reinsert the exact page after
+    /// every measured reclaim. It is absent from default builds and must never
+    /// be used as a production capacity-recovery path.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn take_clean_buffer_entry_legacy_for_bench(&self) -> Option<(PageNumber, PageBuf)> {
+        if let Some(preferred) = self.preferred_reconstructed_victim()
+            && let Some(buffer) = self.take_clean_buffer_at(preferred)
+        {
+            return Some((preferred, buffer));
+        }
+
+        let mut candidates = self.page_snapshots();
+        candidates.sort_unstable_by_key(|snapshot| (snapshot.access_count, snapshot.page_no.get()));
+        candidates
+            .into_iter()
+            .filter(|snapshot| !snapshot.dirty)
+            .find_map(|snapshot| {
+                self.take_clean_buffer_at(snapshot.page_no)
+                    .map(|buffer| (snapshot.page_no, buffer))
+            })
+    }
+
     /// Count overflow residents for a benchmark fixture invariant.
     #[cfg(feature = "bench-internals")]
     #[doc(hidden)]

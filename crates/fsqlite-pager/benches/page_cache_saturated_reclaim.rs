@@ -1,9 +1,10 @@
 //! GH #326 saturated page-cache reclaim-cycle benchmark.
 //!
 //! The measured region contains only one or more `reclaim + exact-page
-//! reinsertion` cycles. Fixture construction, invariant checks, provenance,
-//! hashing, serialization, stdout, and filesystem writes stay outside the
-//! duration returned to Criterion.
+//! reinsertion` cycles using either the exact pre-GH-326 snapshot-and-sort
+//! algorithm or the candidate cursor algorithm. Fixture construction,
+//! invariant checks, provenance, hashing, serialization, stdout, and
+//! filesystem writes stay outside the duration returned to Criterion.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -151,8 +152,12 @@ fn bench_saturated_reclaim(criterion: &mut Criterion) {
                     let run_started = Instant::now();
                     let mut receipt = 0_u64;
                     for _ in 0..iters {
-                        let (page_no, buffer) = cache
-                            .take_clean_buffer_entry_for_bench()
+                        let reclaimed = if BENCH_ARM == "baseline" {
+                            cache.take_clean_buffer_entry_legacy_for_bench()
+                        } else {
+                            cache.take_clean_buffer_entry_for_bench()
+                        };
+                        let (page_no, buffer) = reclaimed
                             .expect("saturated clean cache must expose a reclaimable buffer");
                         receipt ^= u64::from(page_no.get());
                         cache.insert_buffer(page_no, buffer);
@@ -270,6 +275,11 @@ fn main() {
         BENCH_ARM == "baseline" || BENCH_ARM == "candidate",
         "FSQLITE_GH326_ARM must be baseline or candidate"
     );
+    let implementation = if BENCH_ARM == "baseline" {
+        "pre_gh326_snapshot_sort_reconstructed_at_0696131c"
+    } else {
+        "candidate_persistent_cursor_reclaim"
+    };
     let run_label = required_env("FSQLITE_GH326_RUN_LABEL");
     assert_lower_hex(ENGINE_REVISION, 40, "FSQLITE_GH326_ENGINE_REVISION");
     assert_lower_hex(HARNESS_SHA256, 64, "FSQLITE_GH326_HARNESS_SHA256");
@@ -304,6 +314,7 @@ fn main() {
         "benchmark": "page_cache_saturated_flat_reclaim",
         "measurement_scope": "flat_tier_saturated_clean_reclaim_plus_exact_page_reinsert",
         "arm": BENCH_ARM,
+        "implementation": implementation,
         "run_label": run_label,
         "engine_revision": ENGINE_REVISION,
         "harness_sha256": HARNESS_SHA256,
