@@ -466,7 +466,7 @@ async fn run_contract() {
     }
 }
 
-pub(crate) fn run_entrypoint() {
+pub fn run_entrypoint() {
     {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
