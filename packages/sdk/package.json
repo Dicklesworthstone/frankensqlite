@@ -2,6 +2,16 @@
   "name": "@frankensqlite/sdk",
   "version": "0.2.0",
   "description": "Async TypeScript SDK for FrankenSQLite browser bindings",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dicklesworthstone/frankensqlite.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://github.com/Dicklesworthstone/frankensqlite/tree/main/packages/sdk#readme",
+  "bugs": {
+    "url": "https://github.com/Dicklesworthstone/frankensqlite/issues"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -13,7 +23,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "peerDependencies": {
     "@frankensqlite/core": "^0.2.0"
@@ -24,6 +35,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepack": "npm run typecheck && npm run test && npm run build"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }
