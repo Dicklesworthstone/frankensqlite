@@ -284,7 +284,7 @@ fn sqlite_page_size_from_db_header(db_header: &[u8]) -> Result<u32> {
 }
 
 fn sqlite_wal_checksum_native_8byte_chunks(data: &[u8]) -> Result<(u32, u32)> {
-    if data.len() % 8 != 0 {
+    if !data.len().is_multiple_of(8) {
         return Err(FrankenError::WalCorrupt {
             detail: format!(
                 "sqlite wal checksum input must be 8-byte aligned, got {} bytes",
@@ -295,7 +295,7 @@ fn sqlite_wal_checksum_native_8byte_chunks(data: &[u8]) -> Result<(u32, u32)> {
 
     let mut s1 = 0_u32;
     let mut s2 = 0_u32;
-    for chunk in data.chunks_exact(8) {
+    for chunk in data.as_chunks::<8>().0 {
         let w1 = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let w2 = u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         s1 = s1.wrapping_add(w1).wrapping_add(s2);
@@ -1158,10 +1158,10 @@ impl Vfs for UnixVfs {
 
         // Use /dev/urandom for real randomness; fall back to deterministic
         // xorshift if unavailable (for hermetic test environments).
-        if let Ok(mut f) = File::open("/dev/urandom") {
-            if f.read_exact(buf).is_ok() {
-                return;
-            }
+        if let Ok(mut f) = File::open("/dev/urandom")
+            && f.read_exact(buf).is_ok()
+        {
+            return;
         }
 
         let seq = FALLBACK_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2049,16 +2049,16 @@ impl UnixFile {
             )
             .err();
 
-        if let Err(err) = self.compat_shm_release_dms_shared(cx) {
-            if first_error.is_none() {
-                first_error = Some(err);
-            }
+        if let Err(err) = self.compat_shm_release_dms_shared(cx)
+            && first_error.is_none()
+        {
+            first_error = Some(err);
         }
 
-        if let Err(err) = self.unlock(cx, LockLevel::None) {
-            if first_error.is_none() {
-                first_error = Some(err);
-            }
+        if let Err(err) = self.unlock(cx, LockLevel::None)
+            && first_error.is_none()
+        {
+            first_error = Some(err);
         }
 
         match first_error {

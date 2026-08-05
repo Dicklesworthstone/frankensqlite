@@ -4132,10 +4132,10 @@ impl Parser {
             TokenKind::KwCollate => Some(bp::COLLATE),
             TokenKind::KwIsnull | TokenKind::KwNotnull => Some(bp::EQUALITY.0),
             TokenKind::KwNot => {
-                if let Some(next) = self.tokens.get(self.pos + 1) {
-                    if matches!(next.kind, TokenKind::KwNull) {
-                        return Some(bp::EQUALITY.0);
-                    }
+                if let Some(next) = self.tokens.get(self.pos + 1)
+                    && matches!(next.kind, TokenKind::KwNull)
+                {
+                    return Some(bp::EQUALITY.0);
                 }
                 None
             }

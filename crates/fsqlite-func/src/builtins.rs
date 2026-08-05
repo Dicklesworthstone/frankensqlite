@@ -1619,11 +1619,11 @@ fn soundex(s: &str) -> [u8; 4] {
             break;
         }
         let current = code(c);
-        if let Some(digit) = current {
-            if current != last_code {
-                result[result_len] = digit;
-                result_len += 1;
-            }
+        if let Some(digit) = current
+            && current != last_code
+        {
+            result[result_len] = digit;
+            result_len += 1;
         }
         last_code = current;
     }

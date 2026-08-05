@@ -262,10 +262,11 @@ fn parse_timestring(s: &str) -> Option<f64> {
     // Try as a Julian Day Number (bare float).
     // Reject non-finite values (NaN/Inf) — sqlite3AtoF doesn't recognize them.
     let numeric = s.trim_matches(|c: char| c.is_ascii_whitespace());
-    if let Ok(jdn) = numeric.parse::<f64>() {
-        if jdn >= 0.0 && jdn.is_finite() {
-            return Some(jdn);
-        }
+    if let Ok(jdn) = numeric.parse::<f64>()
+        && jdn >= 0.0
+        && jdn.is_finite()
+    {
+        return Some(jdn);
     }
 
     // SQLite accepts trailing ASCII whitespace on ISO-8601 input, but not

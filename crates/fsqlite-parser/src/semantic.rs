@@ -365,12 +365,11 @@ impl Scope {
                 if cols.as_ref().is_none_or(|c| c.contains(&col_lower)) {
                     return ResolveResult::Resolved(key);
                 }
-                if let Some(table_name) = self.aliases.get(&key) {
-                    if let Some(table_def) = schema.find_table_by_lookup_key(table_name) {
-                        if table_def.is_rowid_alias(&col_lower) {
-                            return ResolveResult::Resolved(key);
-                        }
-                    }
+                if let Some(table_name) = self.aliases.get(&key)
+                    && let Some(table_def) = schema.find_table_by_lookup_key(table_name)
+                    && table_def.is_rowid_alias(&col_lower)
+                {
+                    return ResolveResult::Resolved(key);
                 }
                 return ResolveResult::ColumnNotFound;
             }
@@ -1138,12 +1137,12 @@ impl<'a> Resolver<'a> {
             // between the pre-existing tables and the newly joined table(s).
             let mut to_insert = Vec::new();
             for (alias, cols_opt) in &scope.columns {
-                if !pre_join_aliases.contains(alias) {
-                    if let Some(new_cols) = cols_opt {
-                        for col_name in new_cols {
-                            if pre_join_columns.iter().any(|cs| cs.contains(col_name)) {
-                                to_insert.push(col_name.clone());
-                            }
+                if !pre_join_aliases.contains(alias)
+                    && let Some(new_cols) = cols_opt
+                {
+                    for col_name in new_cols {
+                        if pre_join_columns.iter().any(|cs| cs.contains(col_name)) {
+                            to_insert.push(col_name.clone());
                         }
                     }
                 }
@@ -1531,21 +1530,20 @@ impl<'a> Resolver<'a> {
         // literal in [0.0, 1.0], matching C SQLite's exprProbability() contract.
         // Integer literals, out-of-range values, and non-literal expressions are
         // all rejected at prepare time.
-        if name.eq_ignore_ascii_case("likelihood") {
-            if let FunctionArgs::List(list) = args {
-                if list.len() == 2 {
-                    let is_valid_probability = matches!(
-                        &list[1],
-                        Expr::Literal(Literal::Float(p), _) if (0.0..=1.0).contains(p)
-                    );
-                    if !is_valid_probability {
-                        self.push_error(SemanticErrorKind::InvalidFunctionArgument {
-                            message:
-                                "second argument to likelihood() must be a constant between 0.0 and 1.0"
-                                    .to_owned(),
-                        });
-                    }
-                }
+        if name.eq_ignore_ascii_case("likelihood")
+            && let FunctionArgs::List(list) = args
+            && list.len() == 2
+        {
+            let is_valid_probability = matches!(
+                &list[1],
+                Expr::Literal(Literal::Float(p), _) if (0.0..=1.0).contains(p)
+            );
+            if !is_valid_probability {
+                self.push_error(SemanticErrorKind::InvalidFunctionArgument {
+                    message:
+                        "second argument to likelihood() must be a constant between 0.0 and 1.0"
+                            .to_owned(),
+                });
             }
         }
     }

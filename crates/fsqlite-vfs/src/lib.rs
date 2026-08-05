@@ -123,20 +123,20 @@ pub mod host_fs {
     }
 
     pub fn write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, bytes)?;
         Ok(())
     }
 
     pub fn copy_file(from: &Path, to: &Path) -> Result<u64> {
-        if let Some(parent) = to.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = to.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         Ok(std::fs::copy(from, to)?)
     }
@@ -154,10 +154,10 @@ pub mod host_fs {
     }
 
     pub fn append_line(path: &Path, line: &str) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)

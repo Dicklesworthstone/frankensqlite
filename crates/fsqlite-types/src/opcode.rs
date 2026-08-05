@@ -1495,13 +1495,13 @@ impl ProgramBuilder {
     pub fn finish(self) -> Result<VdbeProgram> {
         // Check for unresolved labels.
         for (i, state) in self.labels.iter().enumerate() {
-            if let LabelState::Unresolved(refs) = state {
-                if !refs.is_empty() {
-                    return Err(FrankenError::Internal(format!(
-                        "unresolved label {i} referenced by {} instruction(s)",
-                        refs.len()
-                    )));
-                }
+            if let LabelState::Unresolved(refs) = state
+                && !refs.is_empty()
+            {
+                return Err(FrankenError::Internal(format!(
+                    "unresolved label {i} referenced by {} instruction(s)",
+                    refs.len()
+                )));
             }
         }
 

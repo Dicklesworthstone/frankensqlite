@@ -714,7 +714,7 @@ impl<'a> Lexer<'a> {
             self.advance(); // skip closing '
 
             // Validate hex content
-            if hex_bytes.len() % 2 != 0 {
+            if !hex_bytes.len().is_multiple_of(2) {
                 return TokenKind::Error(format!(
                     "blob literal has odd number of hex digits at byte {}",
                     start
@@ -724,9 +724,9 @@ impl<'a> Lexer<'a> {
             // Work directly on raw bytes to avoid panics from
             // string-slicing multi-byte UTF-8 sequences.
             let mut bytes = Vec::with_capacity(hex_bytes.len() / 2);
-            for pair in hex_bytes.chunks_exact(2) {
-                let hi = hex_digit(pair[0]);
-                let lo = hex_digit(pair[1]);
+            for &[hi, lo] in hex_bytes.as_chunks::<2>().0 {
+                let hi = hex_digit(hi);
+                let lo = hex_digit(lo);
                 match (hi, lo) {
                     (Some(h), Some(l)) => bytes.push((h << 4) | l),
                     _ => {
@@ -821,17 +821,17 @@ impl<'a> Lexer<'a> {
 
         // Helper to check if the current position (+ offset) starts a valid exponent.
         let is_valid_exponent = |lexer: &Self, mut offset: usize| -> bool {
-            if let Some(c) = lexer.peek_at(offset) {
-                if c == b'e' || c == b'E' {
+            if let Some(c) = lexer.peek_at(offset)
+                && (c == b'e' || c == b'E')
+            {
+                offset += 1;
+                if let Some(s) = lexer.peek_at(offset)
+                    && (s == b'+' || s == b'-')
+                {
                     offset += 1;
-                    if let Some(s) = lexer.peek_at(offset) {
-                        if s == b'+' || s == b'-' {
-                            offset += 1;
-                        }
-                    }
-                    if let Some(d) = lexer.peek_at(offset) {
-                        return d.is_ascii_digit();
-                    }
+                }
+                if let Some(d) = lexer.peek_at(offset) {
+                    return d.is_ascii_digit();
                 }
             }
             false
@@ -874,26 +874,25 @@ impl<'a> Lexer<'a> {
 
         // SQLite strictness: a number cannot be immediately followed by an alphabetical character or underscore.
         // Doing so produces an "unrecognized token" error.
-        if let Some(c) = self.peek() {
-            if c.is_ascii_alphabetic()
+        if let Some(c) = self.peek()
+            && (c.is_ascii_alphabetic()
                 || c == b'_'
                 || (c == b'.'
                     && self
                         .peek_at(1)
-                        .is_some_and(|n| n.is_ascii_alphabetic() || n == b'_'))
-            {
-                let err_start = start;
-                while self.pos < self.src.len() {
-                    let ch = self.src[self.pos];
-                    if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'.' {
-                        self.advance();
-                    } else {
-                        break;
-                    }
+                        .is_some_and(|n| n.is_ascii_alphabetic() || n == b'_')))
+        {
+            let err_start = start;
+            while self.pos < self.src.len() {
+                let ch = self.src[self.pos];
+                if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'.' {
+                    self.advance();
+                } else {
+                    break;
                 }
-                let err_text = String::from_utf8_lossy(&self.src[err_start..self.pos]);
-                return TokenKind::Error(format!("unrecognized token: \"{err_text}\""));
             }
+            let err_text = String::from_utf8_lossy(&self.src[err_start..self.pos]);
+            return TokenKind::Error(format!("unrecognized token: \"{err_text}\""));
         }
 
         let text_raw = String::from_utf8_lossy(&self.src[start..self.pos]);

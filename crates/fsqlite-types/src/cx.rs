@@ -1036,13 +1036,13 @@ impl Future for LocalCancellation<'_> {
                 return Poll::Pending;
             }
 
-            if existing_position.is_none() {
-                if let Err(error) = waiters.entries.try_reserve(1) {
-                    drop(waiters);
-                    drop(dispatch);
-                    drop(prepared_waker);
-                    panic!("failed to reserve local-cancellation waiter storage: {error}");
-                }
+            if existing_position.is_none()
+                && let Err(error) = waiters.entries.try_reserve(1)
+            {
+                drop(waiters);
+                drop(dispatch);
+                drop(prepared_waker);
+                panic!("failed to reserve local-cancellation waiter storage: {error}");
             }
 
             let Some(new_waker) = prepared_waker.take() else {
@@ -3606,10 +3606,10 @@ mod tests {
             let closes = i32::try_from(line.matches('}').count()).unwrap_or(i32::MAX);
             brace_depth = brace_depth.saturating_add(opens).saturating_sub(closes);
 
-            if let Some(until) = skip_until_depth {
-                if brace_depth <= until {
-                    skip_until_depth = None;
-                }
+            if let Some(until) = skip_until_depth
+                && brace_depth <= until
+            {
+                skip_until_depth = None;
             }
         }
 

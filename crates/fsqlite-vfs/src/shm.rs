@@ -644,7 +644,7 @@ impl ShmRegion {
     }
 
     fn checked_aligned_u64_offset(&self, offset: usize, actual_len: usize) -> Result<Range<usize>> {
-        if offset % std::mem::align_of::<u64>() != 0 {
+        if !offset.is_multiple_of(std::mem::align_of::<u64>()) {
             return Err(FrankenError::OutOfRange {
                 what: "SHM atomic u64 access".to_owned(),
                 value: format!("unaligned offset={offset}"),

@@ -488,11 +488,9 @@ impl DatabaseNamespaceBinding {
             }
         };
 
-        if !use_is_shared {
-            if let Err(error) = downgrade_to_shared(&use_file) {
-                *lease = BindingLease::BootstrapExclusive { gate, use_file };
-                return Err(error);
-            }
+        if !use_is_shared && let Err(error) = downgrade_to_shared(&use_file) {
+            *lease = BindingLease::BootstrapExclusive { gate, use_file };
+            return Err(error);
         }
         if let Err(error) = release_gate_fn(&gate) {
             *lease = BindingLease::BootstrapUseShared { gate, use_file };

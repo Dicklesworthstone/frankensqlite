@@ -1178,7 +1178,7 @@ impl DatabaseHeader {
     #[allow(clippy::cast_possible_truncation)]
     pub const fn page_count_from_file_size(&self, file_size: u64) -> Option<u32> {
         let ps = self.page_size.get() as u64;
-        if file_size == 0 || file_size % ps != 0 {
+        if file_size == 0 || !file_size.is_multiple_of(ps) {
             return None;
         }
         let count = file_size / ps;

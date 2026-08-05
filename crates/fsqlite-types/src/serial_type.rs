@@ -969,10 +969,10 @@ mod tests {
             let written = write_varint(&mut buf, value);
             // If more than 1 byte, removing the first byte should NOT decode
             // to the same value (proves minimality).
-            if written > 1 {
-                if let Some((alt, _)) = read_varint(&buf[1..written]) {
-                    prop_assert_ne!(alt, value, "shorter encoding yields same value — not canonical");
-                }
+            if written > 1
+                && let Some((alt, _)) = read_varint(&buf[1..written])
+            {
+                prop_assert_ne!(alt, value, "shorter encoding yields same value — not canonical");
             }
         }
 
@@ -1016,7 +1016,7 @@ mod tests {
         fn prop_blob_serial_type(len in 0u64..=1_000_000) {
             let st = serial_type_for_blob(len);
             prop_assert!(st >= 12, "blob type {st} < 12");
-            prop_assert!(st % 2 == 0, "blob type {st} is odd");
+            prop_assert!(st.is_multiple_of(2), "blob type {st} is odd");
             prop_assert_eq!(classify_serial_type(st), SerialTypeClass::Blob);
             // Inverse: recover original length
             prop_assert_eq!(serial_type_len(st), Some(len));

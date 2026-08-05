@@ -403,10 +403,10 @@ impl<T> TrackedSender<T> {
             .take()
             .expect("TrackedSender: sender already consumed");
         let result = sender.send(value);
-        if result.is_ok() {
-            if let Some(ref mut ob) = self.obligation {
-                ob.commit();
-            }
+        if result.is_ok()
+            && let Some(ref mut ob) = self.obligation
+        {
+            ob.commit();
         }
         result
     }
