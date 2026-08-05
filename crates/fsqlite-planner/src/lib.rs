@@ -5132,7 +5132,13 @@ pub fn order_joins_with_hints_and_features(
     }
 
     if feature_flags.dpccp_join && n <= DPCCP_MAX_TABLES {
-        if let Some((order_indices, total_cost, plans_counted, branches_pruned)) = dpccp_order_joins(
+        if let Some(DpccpPlan {
+            order: order_indices,
+            access_paths,
+            total_cost,
+            plans_enumerated: plans_counted,
+            branches_pruned,
+        }) = dpccp_order_joins(
             tables,
             indexes,
             where_terms,
@@ -5145,30 +5151,10 @@ pub fn order_joins_with_hints_and_features(
                 .iter()
                 .map(|idx| tables[*idx].name.clone())
                 .collect::<Vec<_>>();
-            // DPccp currently costs one order-independent access path per
-            // relation. Keep the emitted paths under that same contract:
-            // admitting an outer-column probe only after selecting the order
-            // would make `total_cost` describe different paths than the plan
-            // carries. The default beam search below performs order-aware
-            // join-probe costing; DPccp fails closed until its state model is
-            // extended to cost paths by `(outer_set, candidate)`.
-            let access_paths = order_indices
-                .iter()
-                .map(|idx| {
-                    join_access_path(
-                        &tables[*idx],
-                        indexes,
-                        where_terms,
-                        needed_columns,
-                        JoinAccessPathContext {
-                            table_index_hints,
-                            cracking_hints: cracking_hints.as_deref(),
-                            available_outer_tables: &[],
-                            unqualified_terms_are_table_local: false,
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
+            // `access_paths` are the exact paths the search costed against their
+            // real outer prefixes, returned alongside the order that won. They
+            // are emitted verbatim rather than re-derived, so `total_cost` always
+            // describes the plan this function actually returns.
             let join_segments =
                 choose_join_segments(&join_order, tables, where_terms, None, feature_flags);
             let plan = QueryPlan {
@@ -5480,11 +5466,14 @@ fn dpccp_order_joins(
     table_index_hints: Option<&BTreeMap<String, IndexHint>>,
     cross_join_pairs: &[(String, String)],
     cracking_hints: Option<&CrackingHintStore>,
-) -> Option<(Vec<usize>, f64, u64, u64)> {
+) -> Option<DpccpPlan> {
     let n = tables.len();
     assert!(n <= DPCCP_MAX_TABLES);
 
-    let access_paths = tables
+    // Order-independent seeds. Used solely to derive a deterministic
+    // `visit_order`; the search costs every candidate against its real outer
+    // prefix and never reads these as a cost or bound.
+    let seed_paths = tables
         .iter()
         .map(|table| {
             join_access_path(
@@ -5504,71 +5493,183 @@ fn dpccp_order_joins(
 
     let mut visit_order = (0..n).collect::<Vec<_>>();
     visit_order.sort_by(|&lhs, &rhs| {
-        access_paths[lhs]
+        seed_paths[lhs]
             .estimated_rows
-            .partial_cmp(&access_paths[rhs].estimated_rows)
+            .partial_cmp(&seed_paths[rhs].estimated_rows)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                access_paths[lhs]
+                seed_paths[lhs]
                     .estimated_cost
-                    .partial_cmp(&access_paths[rhs].estimated_cost)
+                    .partial_cmp(&seed_paths[rhs].estimated_cost)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| lhs.cmp(&rhs))
     });
 
-    let mut state =
-        ExhaustiveJoinSearchState::new(tables, &access_paths, &visit_order, cross_join_pairs);
+    let mut state = ExhaustiveJoinSearchState::new(
+        tables,
+        &visit_order,
+        cross_join_pairs,
+        JoinCostingInputs {
+            indexes,
+            where_terms,
+            needed_columns,
+            table_index_hints,
+            cracking_hints,
+        },
+    );
     state.search();
 
     let order = state.best_order?;
+    let access_paths = state
+        .best_access_paths
+        .expect("best_order implies best_access_paths were captured together");
 
-    Some((
+    Some(DpccpPlan {
         order,
-        state.best_cost,
-        state.plans_enumerated,
-        state.branches_pruned,
-    ))
+        access_paths,
+        total_cost: state.best_cost,
+        plans_enumerated: state.plans_enumerated,
+        branches_pruned: state.branches_pruned,
+    })
 }
 
-struct ExhaustiveJoinSearchState<'a> {
+/// Winning exhaustive-search plan: the order, the access paths that were costed
+/// against their real outer prefixes to produce `total_cost`, and the search
+/// counters. Carried as a named struct so the order and the paths that justify
+/// its cost cannot drift apart at a call site.
+struct DpccpPlan {
+    order: Vec<usize>,
+    access_paths: Vec<AccessPath>,
+    total_cost: f64,
+    plans_enumerated: u64,
+    branches_pruned: u64,
+}
+
+/// Inputs `join_access_path` needs to cost a candidate. Grouped so the search
+/// state carries one borrow bundle instead of five parallel parameters.
+#[derive(Clone, Copy)]
+struct JoinCostingInputs<'a, 'w> {
+    indexes: &'a [IndexInfo],
+    where_terms: &'a [WhereTerm<'w>],
+    needed_columns: Option<&'a [String]>,
+    table_index_hints: Option<&'a BTreeMap<String, IndexHint>>,
+    cracking_hints: Option<&'a CrackingHintStore>,
+}
+
+struct ExhaustiveJoinSearchState<'a, 'w> {
     tables: &'a [TableStats],
-    access_paths: &'a [AccessPath],
+    /// Precomputed by the caller from order-independent seed paths. The seeds
+    /// themselves are deliberately *not* held here: a path costed with no outer
+    /// tables is only an upper bound on what the same relation costs once a
+    /// probe becomes admissible, so it must never be reachable as a cost or a
+    /// pruning bound from inside the search.
     visit_order: &'a [usize],
     cross_join_pairs: &'a [(String, String)],
+    indexes: &'a [IndexInfo],
+    where_terms: &'a [WhereTerm<'w>],
+    needed_columns: Option<&'a [String]>,
+    table_index_hints: Option<&'a BTreeMap<String, IndexHint>>,
+    cracking_hints: Option<&'a CrackingHintStore>,
+    /// Access paths keyed by `(outer_set, candidate)` as
+    /// `used_mask * tables.len() + candidate_idx`. `join_access_path` consults
+    /// `available_outer_tables` only for membership, so the path depends on the
+    /// outer *set* and not on the order that produced it. Keying by the mask is
+    /// therefore exact and costs each distinct pair once, which keeps the search
+    /// at O(2^n * n) costings instead of one per enumerated permutation.
+    path_cache: Vec<Option<AccessPath>>,
     best_order: Option<Vec<usize>>,
+    best_access_paths: Option<Vec<AccessPath>>,
     best_cost: f64,
     plans_enumerated: u64,
     branches_pruned: u64,
 }
 
-impl<'a> ExhaustiveJoinSearchState<'a> {
+impl<'a, 'w> ExhaustiveJoinSearchState<'a, 'w> {
     fn new(
         tables: &'a [TableStats],
-        access_paths: &'a [AccessPath],
         visit_order: &'a [usize],
         cross_join_pairs: &'a [(String, String)],
+        costing: JoinCostingInputs<'a, 'w>,
     ) -> Self {
+        let n = tables.len();
         Self {
             tables,
-            access_paths,
             visit_order,
             cross_join_pairs,
+            indexes: costing.indexes,
+            where_terms: costing.where_terms,
+            needed_columns: costing.needed_columns,
+            table_index_hints: costing.table_index_hints,
+            cracking_hints: costing.cracking_hints,
+            path_cache: vec![None; (1usize << n) * n],
             best_order: None,
+            best_access_paths: None,
             best_cost: f64::INFINITY,
             plans_enumerated: 0,
             branches_pruned: 0,
         }
     }
 
+    /// Slot index for the `(outer_set, candidate)` pair.
+    fn path_cache_slot(&self, used_mask: u64, candidate_idx: usize) -> usize {
+        (used_mask as usize) * self.tables.len() + candidate_idx
+    }
+
+    /// Ensure the `(outer_set, candidate)` pair is costed, returning only its
+    /// scalar cost and row estimate.
+    ///
+    /// Deliberately does **not** hand back an owned `AccessPath`: the caller
+    /// needs the scalars to run the branch-and-bound test, and a pruned branch
+    /// must not pay for cloning a path (two heap `String`s plus a probe) that is
+    /// then discarded. The clone happens once, only on the descending branch.
+    fn ensure_costed(
+        &mut self,
+        used_mask: u64,
+        candidate_idx: usize,
+        prefix_names: &[String],
+    ) -> (f64, f64) {
+        let slot = self.path_cache_slot(used_mask, candidate_idx);
+        if self.path_cache[slot].is_none() {
+            let access_path = join_access_path(
+                &self.tables[candidate_idx],
+                self.indexes,
+                self.where_terms,
+                self.needed_columns,
+                JoinAccessPathContext {
+                    table_index_hints: self.table_index_hints,
+                    cracking_hints: self.cracking_hints,
+                    available_outer_tables: prefix_names,
+                    unqualified_terms_are_table_local: false,
+                },
+            );
+            self.path_cache[slot] = Some(access_path);
+        }
+        let cached = self.path_cache[slot]
+            .as_ref()
+            .expect("slot was just populated");
+        (cached.estimated_cost, cached.estimated_rows)
+    }
+
     fn search(&mut self) {
         let mut current_order = Vec::with_capacity(self.tables.len());
-        self.search_dfs(&mut current_order, 0, 0.0, 1.0);
+        let mut current_paths = Vec::with_capacity(self.tables.len());
+        let mut prefix_names = Vec::with_capacity(self.tables.len());
+        self.search_dfs(
+            &mut current_order,
+            &mut current_paths,
+            &mut prefix_names,
+            0,
+            0.0,
+            1.0,
+        );
     }
 
     fn search_dfs(
         &mut self,
         current_order: &mut Vec<usize>,
+        current_paths: &mut Vec<AccessPath>,
+        prefix_names: &mut Vec<String>,
         used_mask: u64,
         current_cost: f64,
         current_rows: f64,
@@ -5577,6 +5678,10 @@ impl<'a> ExhaustiveJoinSearchState<'a> {
             if current_cost < self.best_cost {
                 self.best_cost = current_cost;
                 self.best_order = Some(current_order.clone());
+                // Capture the paths that produced this cost. Emitting these
+                // verbatim is what keeps `total_cost` describing the plan the
+                // caller actually carries.
+                self.best_access_paths = Some(current_paths.clone());
                 tracing::debug!(
                     target: "fsqlite.planner",
                     algorithm = "dpccp_exhaustive",
@@ -5593,32 +5698,33 @@ impl<'a> ExhaustiveJoinSearchState<'a> {
                 continue;
             }
 
-            let candidate = &self.tables[candidate_idx];
             if !cross_join_allowed_indices(
                 current_order,
-                &candidate.name,
+                &self.tables[candidate_idx].name,
                 self.tables,
                 self.cross_join_pairs,
             ) {
                 continue;
             }
 
-            let ap = &self.access_paths[candidate_idx];
+            // Cost this candidate against the tables already joined, so an
+            // equality probe onto an outer column is admitted exactly when that
+            // outer table is present in the prefix.
+            let (candidate_cost, candidate_rows) =
+                self.ensure_costed(used_mask, candidate_idx, prefix_names);
             let (new_cost, new_rows) = if current_order.is_empty() {
-                (ap.estimated_cost, ap.estimated_rows)
+                (candidate_cost, candidate_rows)
             } else {
-                let inner_cost = ap.estimated_cost * current_rows;
-                (current_cost + inner_cost, current_rows * ap.estimated_rows)
+                let inner_cost = candidate_cost * current_rows;
+                (current_cost + inner_cost, current_rows * candidate_rows)
             };
 
             self.plans_enumerated += 1;
             let should_prune = self.best_cost.is_finite() && new_cost >= self.best_cost;
 
-            let mut candidate_order = current_order
-                .iter()
-                .map(|idx| self.tables[*idx].name.as_str())
-                .collect::<Vec<_>>();
-            candidate_order.push(candidate.name.as_str());
+            // Borrowed view for tracing only: no `String` is cloned per visit.
+            let mut candidate_order = prefix_names.iter().map(String::as_str).collect::<Vec<_>>();
+            candidate_order.push(self.tables[candidate_idx].name.as_str());
 
             tracing::debug!(
                 target: "fsqlite.planner",
@@ -5640,13 +5746,25 @@ impl<'a> ExhaustiveJoinSearchState<'a> {
                 continue;
             }
 
+            // Only the descending branch materializes the path.
+            let slot = self.path_cache_slot(used_mask, candidate_idx);
+            let descend_path = self.path_cache[slot]
+                .as_ref()
+                .expect("candidate was costed above")
+                .clone();
             current_order.push(candidate_idx);
+            prefix_names.push(self.tables[candidate_idx].name.clone());
+            current_paths.push(descend_path);
             self.search_dfs(
                 current_order,
+                current_paths,
+                prefix_names,
                 used_mask | (1u64 << candidate_idx),
                 new_cost,
                 new_rows,
             );
+            current_paths.pop();
+            prefix_names.pop();
             current_order.pop();
         }
     }
@@ -13840,12 +13958,18 @@ mod tests {
         let indexes = vec![];
         let where_terms = vec![];
 
-        let (order, cost, plans, _pruned) =
-            dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
-                .expect("2-table exhaustive plan should exist");
+        let plan = dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
+            .expect("2-table exhaustive plan should exist");
+        let (order, paths, cost, plans) = (
+            plan.order,
+            plan.access_paths,
+            plan.total_cost,
+            plan.plans_enumerated,
+        );
         assert_eq!(order.len(), 2);
+        assert_eq!(paths.len(), order.len());
         assert!(cost > 0.0);
-        assert!(plans >= 2); // At least 2 seed + extensions.
+        assert!(plans >= 2); // At least two candidate extensions.
     }
 
     #[test]
@@ -13873,10 +13997,16 @@ mod tests {
         let indexes = vec![];
         let where_terms = vec![];
 
-        let (order, cost, plans, _pruned) =
-            dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
-                .expect("3-table exhaustive plan should exist");
+        let plan = dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
+            .expect("3-table exhaustive plan should exist");
+        let (order, paths, cost, plans) = (
+            plan.order,
+            plan.access_paths,
+            plan.total_cost,
+            plan.plans_enumerated,
+        );
         assert_eq!(order.len(), 3);
+        assert_eq!(paths.len(), order.len());
         assert!(cost > 0.0);
         assert!(plans > 3); // More than just seed.
         // Small table should be chosen first (lower cost).
@@ -13900,7 +14030,7 @@ mod tests {
             },
         ];
 
-        let (order, _cost, _plans, _pruned) = dpccp_order_joins(
+        let order = dpccp_order_joins(
             &tables,
             &[],
             &[],
@@ -13909,7 +14039,8 @@ mod tests {
             &[("t1".to_owned(), "t2".to_owned())],
             None,
         )
-        .expect("cross-join constrained exhaustive plan should exist");
+        .expect("cross-join constrained exhaustive plan should exist")
+        .order;
 
         assert_eq!(order, vec![0, 1], "CROSS JOIN should force t1 before t2");
     }
@@ -13974,11 +14105,236 @@ mod tests {
             },
         ];
 
-        let (_order, _cost, _plans, pruned) =
-            dpccp_order_joins(&tables, &[], &[], None, None, &[], None)
-                .expect("5-table exhaustive plan should exist");
+        let pruned = dpccp_order_joins(&tables, &[], &[], None, None, &[], None)
+            .expect("5-table exhaustive plan should exist")
+            .branches_pruned;
 
         assert!(pruned > 0, "expected branch-and-bound pruning to occur");
+    }
+
+    /// `orders.product_id = products.id` is only probeable once `products` is in
+    /// the outer prefix. DPccp must therefore admit `idx_orders_product` when it
+    /// orders `products` before `orders`, and must refuse the same probe when it
+    /// costs `orders` with nothing joined yet.
+    fn dpccp_probe_fixture() -> (Vec<TableStats>, Vec<IndexInfo>, Expr) {
+        let tables = vec![
+            TableStats {
+                name: "products".to_owned(),
+                n_pages: 180,
+                n_rows: 8_000,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "orders".to_owned(),
+                n_pages: 1_800,
+                n_rows: 220_000,
+                source: StatsSource::Heuristic,
+            },
+        ];
+        let indexes = vec![IndexInfo {
+            name: "idx_orders_product".to_owned(),
+            table: "orders".to_owned(),
+            columns: vec!["product_id".to_owned()],
+            unique: false,
+            n_pages: 280,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
+        }];
+        let join_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("orders", "product_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(
+                ColumnRef::qualified("products", "id"),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        (tables, indexes, join_expr)
+    }
+
+    #[test]
+    fn dpccp_admits_join_probe_only_with_referenced_table_in_outer_prefix() {
+        let (tables, indexes, join_expr) = dpccp_probe_fixture();
+        let where_terms = [WhereTerm {
+            expr: &join_expr,
+            column: Some(WhereColumn {
+                table: Some("orders".to_owned()),
+                column: "product_id".to_owned(),
+            }),
+            kind: WhereTermKind::Equality,
+        }];
+
+        // Costed with no outer tables, the probe references a table that is not
+        // yet available, so it must not be admitted.
+        let without_outer = join_access_path(
+            &tables[1],
+            &indexes,
+            &where_terms,
+            None,
+            JoinAccessPathContext {
+                table_index_hints: None,
+                cracking_hints: None,
+                available_outer_tables: &[],
+                unqualified_terms_are_table_local: false,
+            },
+        );
+        assert!(
+            without_outer.index.is_none(),
+            "no outer prefix must not admit an outer-column probe; got {:?}",
+            without_outer.index
+        );
+
+        // With `products` available, the same probe becomes admissible.
+        let outer = ["products".to_owned()];
+        let with_outer = join_access_path(
+            &tables[1],
+            &indexes,
+            &where_terms,
+            None,
+            JoinAccessPathContext {
+                table_index_hints: None,
+                cracking_hints: None,
+                available_outer_tables: &outer,
+                unqualified_terms_are_table_local: false,
+            },
+        );
+        assert_eq!(
+            with_outer.index.as_deref(),
+            Some("idx_orders_product"),
+            "an outer-column probe must be admitted once its table is in the prefix"
+        );
+        assert!(
+            with_outer.estimated_cost < without_outer.estimated_cost,
+            "the indexed probe must cost less than the full scan: {} vs {}",
+            with_outer.estimated_cost,
+            without_outer.estimated_cost
+        );
+    }
+
+    #[test]
+    fn dpccp_emitted_paths_correspond_to_returned_total_cost() {
+        let (tables, indexes, join_expr) = dpccp_probe_fixture();
+        let where_terms = [WhereTerm {
+            expr: &join_expr,
+            column: Some(WhereColumn {
+                table: Some("orders".to_owned()),
+                column: "product_id".to_owned(),
+            }),
+            kind: WhereTermKind::Equality,
+        }];
+
+        let plan = dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
+            .expect("2-table exhaustive plan should exist");
+        let (order, paths, cost) = (plan.order, plan.access_paths, plan.total_cost);
+
+        assert_eq!(
+            order.len(),
+            paths.len(),
+            "one emitted path per ordered table"
+        );
+        assert_eq!(
+            order,
+            vec![0, 1],
+            "the smaller products table must be the outer probe source"
+        );
+        assert_eq!(
+            paths[1].index.as_deref(),
+            Some("idx_orders_product"),
+            "the winning plan must emit the prefix-enabled orders probe"
+        );
+
+        // Recompute the nested-loop recurrence from the emitted paths alone. If
+        // the paths were re-derived under a different outer contract than the
+        // one that produced `cost`, this reconstruction diverges.
+        let mut expected_cost = 0.0_f64;
+        let mut cumulative_rows = 1.0_f64;
+        for (position, path) in paths.iter().enumerate() {
+            if position == 0 {
+                expected_cost = path.estimated_cost;
+                cumulative_rows = path.estimated_rows;
+            } else {
+                expected_cost += path.estimated_cost * cumulative_rows;
+                cumulative_rows *= path.estimated_rows;
+            }
+        }
+        assert!(
+            (expected_cost - cost).abs() <= f64::EPSILON * expected_cost.abs().max(1.0),
+            "total_cost {cost} must be reconstructible from the emitted paths ({expected_cost})"
+        );
+
+        // The emitted path for each table must match a fresh costing against the
+        // exact prefix that preceded it in the winning order.
+        let mut prefix: Vec<String> = Vec::new();
+        for (position, table_idx) in order.iter().enumerate() {
+            let recosted = join_access_path(
+                &tables[*table_idx],
+                &indexes,
+                &where_terms,
+                None,
+                JoinAccessPathContext {
+                    table_index_hints: None,
+                    cracking_hints: None,
+                    available_outer_tables: &prefix,
+                    unqualified_terms_are_table_local: false,
+                },
+            );
+            assert_eq!(
+                paths[position].index, recosted.index,
+                "emitted path {position} must match its prefix-bound costing"
+            );
+            assert!(
+                (paths[position].estimated_cost - recosted.estimated_cost).abs() <= f64::EPSILON,
+                "emitted cost {} must match prefix-bound cost {}",
+                paths[position].estimated_cost,
+                recosted.estimated_cost
+            );
+            prefix.push(tables[*table_idx].name.clone());
+        }
+    }
+
+    #[test]
+    fn dpccp_order_and_paths_are_deterministic_across_runs() {
+        let (tables, indexes, join_expr) = dpccp_probe_fixture();
+        let where_terms = [WhereTerm {
+            expr: &join_expr,
+            column: Some(WhereColumn {
+                table: Some("orders".to_owned()),
+                column: "product_id".to_owned(),
+            }),
+            kind: WhereTermKind::Equality,
+        }];
+
+        let first = dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
+            .expect("plan should exist");
+        let second = dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
+            .expect("plan should exist");
+
+        assert_eq!(
+            first.order, second.order,
+            "join order must be deterministic"
+        );
+        assert!(
+            (first.total_cost - second.total_cost).abs() <= f64::EPSILON,
+            "total cost must be deterministic"
+        );
+        let first_indexes = first
+            .access_paths
+            .iter()
+            .map(|p| p.index.clone())
+            .collect::<Vec<_>>();
+        let second_indexes = second
+            .access_paths
+            .iter()
+            .map(|p| p.index.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_indexes, second_indexes,
+            "emitted access paths must be deterministic"
+        );
     }
 
     #[test]
