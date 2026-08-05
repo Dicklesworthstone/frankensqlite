@@ -1,6 +1,6 @@
 # Selective Turso Testing Adaptation Plan
 
-Status: proposed (rev 4 — bead traceability and verification contracts hardened 2026-08-03)
+Status: active (rev 6 - external-generator feasibility decisions recorded 2026-08-05)
 
 Research date: 2026-08-03
 
@@ -26,8 +26,10 @@ The highest-value additions are:
    concurrent-writer campaigns. Turso's Elle history work is useful as a
    transport and workload reference, but its snapshot-isolation acceptance
    model is too weak for FrankenSQLite's SSI contract.
-3. A small external-oracle lane using SQLancer first, with SQLRight evaluated
-   separately, to add generator and oracle independence.
+3. External-oracle diversity remains desirable, but SQLancer is deferred until
+   FrankenSQLite has a production-honest JDBC/session boundary. SQLRight is
+   evaluated separately and is not promoted merely because SQLancer is
+   unavailable.
 4. Coverage accounting that joins generator capabilities to the existing
    supported-surface and feature ledgers.
 
@@ -235,8 +237,8 @@ lane was not observed.
 | `concurrent-simulator` (Whopper) | Operation histories, deterministic yield selection, multiprocess restarts, inline invariants, Elle export | Existing seeded concurrent workloads, crash tests, LabRuntime work, pending DPOR bead | Adapt history schema and oracle integration; coordinate with existing DPOR work | P0/P1 |
 | Elle integration | Independent anomaly analysis | No named Elle integration found | Pilot serializability checking; never use snapshot isolation as the acceptance model | P0 |
 | `sqltest` DSL | Readable cases, isolated DBs, setup reuse, comparison modes, capability annotations, snapshot support | JSON conformance fixtures, Rust integration tests, snapshots, target accounting | Run a bounded format pilot; do not port the Tokio runner | P1, gated |
-| SQLancer | Independent query synthesis and metamorphic/query-partitioning oracles | No integration found | Add a pinned, time-bounded external campaign after a provider spike | P1 |
-| SQLRight | Coverage-guided mutation plus NoREC/TLP/index oracles | No integration found; high toolchain cost | Separate feasibility and value gate after SQLancer | P2 |
+| SQLancer | Independent query synthesis and metamorphic/query-partitioning oracles | No integration found | Deferred: retain the pinned feasibility record and reopen only after the production-honest session-boundary gates in section 5.6 | P1 |
+| SQLRight | Coverage-guided mutation plus NoREC/TLP/index oracles | No integration found; high toolchain cost | Separate feasibility and value gate; SQLancer's deferral is not evidence to promote it | P2 |
 | Antithesis | Deterministic external fault exploration and multiverse debugging | Strong local deterministic/fault infrastructure; service access required | Optional feasibility spike only; local campaign must remain authoritative | P2 |
 | `unreliable-libc` | Faults below the VFS abstraction | FaultVfs already covers deterministic logical I/O faults | Unix-native VFS gap experiment, not a default lane | P2 |
 | Rust stress/Shuttle | Scheduling perturbation and long-running mixed workloads | asupersync LabRuntime is mandatory and better aligned | Mine workload shapes; reject Shuttle/Tokio runtime code | P1 ideas only |
@@ -440,7 +442,7 @@ merge CI.
 
 ### 5.6 External generator diversity
 
-SQLancer is the first external candidate because it provides an independent
+SQLancer was evaluated first because it provides an independent
 generator and well-known SQLite oracles (TLP, NoREC, PQS) without becoming a
 Rust runtime dependency. It is a Java tool whose SQLite support runs
 in-process over JDBC, so "add a provider" concretely means implementing a
@@ -448,7 +450,7 @@ SQLancer database-provider that reaches FrankenSQLite across a process or ABI
 boundary — candidate routes are driving the `fsqlite` CLI, a thin socket/pipe
 shim, or the optional `fsqlite-c-api` behind a SQLite-compatible JDBC driver
 configured to load a replacement native library. Selecting and de-risking that
-route is the point of the spike. The provider must:
+route was the point of the spike. Any future provider must:
 
 - invoke FrankenSQLite through a stable CLI or C API boundary;
 - pin the SQLancer revision and container/toolchain digest;
@@ -459,10 +461,146 @@ route is the point of the spike. The provider must:
 - distinguish unsupported input, harness error, timeout, crash, and semantic
   mismatch.
 
-SQLRight is evaluated later because AFL/LLVM instrumentation, Linux-only setup,
-patch maintenance, and corpus management are materially more expensive. It is
+#### SQLancer feasibility outcome (2026-08-05)
+
+Decision: **defer**. Do not merge a FrankenSQLite SQLancer provider or schedule
+the `.11` nightly trial yet.
+
+The spike audited SQLancer at
+`0f54adfa6864ba7b6b52518de277724cbf85e5a4` and Turso's pinned SQLancer
+subtree at `19d1952c62b17012cba6392e14581b48db05ec1e`. The relevant Turso source
+blobs are `cb6146f4f031b42b04b7921cba977dbba5459967` for
+`LimboProvider.java` and `2dfdb67d6a97b522babd01413876a912b25df01d`
+for `Dockerfile.sqlancer`.
+
+The provider route is not production-honest for FrankenSQLite today:
+
+- SQLancer's reusable SQLite query adapter is parameterized on
+  `SQLConnection` and executes through `java.sql.Connection`, `Statement`,
+  `PreparedStatement`, `ResultSet`, and JDBC metadata. FrankenSQLite has no
+  JDBC driver.
+- The `fsqlite` CLI can execute commands and batch input, but it does not
+  implement JDBC's persistent connection, prepared-statement, result-set, and
+  metadata contracts. A process-per-query adapter would also break transaction
+  and temporary-schema semantics.
+- `fsqlite-c-api` exports a useful but intentionally partial SQLite C surface.
+  Xerial's `sqlite-jdbc` native library is a JNI implementation, not a generic
+  loader for an alternate SQLite C library, so the FrankenSQLite C API cannot
+  simply be substituted for it.
+- A correct route therefore requires a maintained JDBC driver plus an IPC/JNI
+  session bridge, or an upstream SQLancer provider/query stack generalized
+  away from JDBC. Either route is a separate integration project, not a
+  bounded provider patch.
+
+The reviewed Turso lane is also not reproducible enough to adopt as-is:
+
+- its runner clones depth-one SQLancer `main` instead of checking out a commit;
+- its Dockerfile uses mutable `lukemathwalker/cargo-chef:latest-rust-1.88.0`
+  and `debian:bookworm-slim` tags, then installs unpinned apt and Bun content;
+- the provider accepts broad substrings including `not supported`,
+  `not implemented`, `Parse error`, and `UNIQUE constraint failed`, none tied
+  to FrankenSQLite feature/contract IDs;
+- the runner currently sets `ORACLES = ["NoREC"]`; PQS and TLP are commented
+  out despite the broader runner README;
+- the local host has Java 8 and no Maven, below the audited SQLancer Java 11
+  compiler target and the Turso runner's documented Java 17/Maven 3.9 setup.
+
+For provenance only, the mutable container tags resolved during the spike to
+manifest digests
+`sha256:de4b9af85fe34ec0d7b330e100dd9c8202f8b18bd089b150ea7bd3971535bd62`
+and
+`sha256:362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143`.
+Those observations do not repair the unpinned Dockerfile.
+
+No valid FrankenSQLite query, false-positive rate, unique coverage, or unique
+defect count is claimed: the required connection boundary is unavailable, so
+the fixed-seed smoke fails closed at admission rather than running against
+stock SQLite and mislabeling that as FrankenSQLite evidence. The setup cost is
+at least five maintained surfaces: JDBC/session transport, SQLancer provider
+and schema adaptation, contract-derived capability/error generation,
+container/toolchain pinning, and canonical failure-bundle/replay intake.
+
+Reopen `.11` only when all of the following hold:
+
+1. A supported FrankenSQLite JDBC binding or an upstream non-JDBC SQLancer
+   execution interface exists and preserves one connection across a run.
+2. The SQLancer commit, OCI manifests, JDK, Maven, Bun, and all provider inputs
+   are content-pinned.
+3. Expected errors are generated from canonical feature/contract IDs; broad
+   unsupported/error substrings are forbidden.
+4. A fixed-seed public-boundary smoke proves planner, VDBE, pager, and required
+   MVCC lane evidence and round-trips a canonical failure bundle locally.
+5. An equal-budget comparison against the native generator demonstrates unique
+   coverage or a unique confirmed defect class.
+
+SQLRight is evaluated separately because AFL/LLVM instrumentation, Linux-only
+setup, patch maintenance, and corpus management are materially more expensive. It is
 accepted only if a fixed-budget trial finds unique coverage or defects beyond
-the native generator and SQLancer.
+the native generator. SQLancer's deferred lane supplies no coverage baseline
+and therefore cannot be treated as either positive or negative evidence for
+SQLRight.
+
+#### SQLRight feasibility outcome (2026-08-05)
+
+Decision: **defer**. The execution boundary is plausible, but the experiment is
+not yet reproducible or comparable enough to justify importing the toolchain.
+
+The audit resolved Turso's abbreviated SQLRight pin `9457f03` to
+`9457f0311b70562a3423ee86ac7e2ebdaaa6664b`, an unverified 2022-10-28 commit
+from `PSU-Security-Universe/sqlright`. The upstream repository is MIT licensed,
+not archived, and had no newer pushed commit at the time of review. Turso pins
+the surrounding integration at
+`19d1952c62b17012cba6392e14581b48db05ec1e`; its `testing/sqlright` tree has
+23 entries and patches the upstream fork for a 2^21 AFL map, GCC 13 headers,
+and macOS build compatibility.
+
+Unlike SQLancer, SQLRight can plausibly exercise FrankenSQLite through the real
+`fsqlite` batch CLI because each generated input is a complete SQL program
+executed in one process. That preserves connection, transaction, and temporary
+schema state. It is still not an admitted campaign:
+
+- Turso's setup shallow-clones the current SQLRight default branch and then
+  checks out the abbreviated 2022 commit. It does not fetch the full pinned
+  object, so a future upstream branch move can make the checkout fail.
+- The Dockerfile uses mutable `ubuntu:22.04`, apt indexes, rustup `stable`, and
+  an unversioned `cargo install cargo-afl`; the build therefore cannot be
+  reproduced from the Turso and SQLRight Git hashes alone.
+- The target command and output contract are Turso-specific. FrankenSQLite
+  needs an audited adapter for its `fsqlite` batch flags, row rendering, error
+  classification, feature profile, and canonical failure-bundle intake.
+- Turso reports that efficient multi-core operation was not achieved. Its run
+  wrapper sets permissive AFL environment overrides, uses a one-second process
+  timeout while separately documenting a 30-second hang threshold, and keeps a
+  separate crash SQLite database rather than FrankenSQLite's canonical bundle
+  and replay ownership.
+- The host lacks `cargo-afl`, Bison, and Flex. More importantly, no equal-budget
+  coverage baseline exists: FrankenSQLite has five byte/structure libFuzzer
+  targets but no checked-in corpus or engine-level CLI/VDBE/pager/WAL fuzz
+  target. A SQLRight-only run could produce a bitmap, but not a defensible
+  unique-value comparison.
+
+No SQLRight coverage, crash, hang, valid-query, false-positive, or unique-defect
+count is claimed. The trial stops at admission rather than spending substantial
+build time on an incomparable result.
+
+Reopen the trial only when all of the following hold:
+
+1. The full SQLRight commit and every patch are content-pinned and fetched by
+   object ID rather than relying on a shallow mutable branch.
+2. OCI base manifests, apt snapshot, Rust toolchain, `cargo-afl`, Bison, Flex,
+   LLVM coverage tools, and runner image are pinned and recorded.
+3. A small public-boundary adapter proves one fixed seed through the real
+   `fsqlite` batch CLI, required planner/VDBE/pager lanes, canonical bundle
+   creation, and local replay without broad error suppression.
+4. A native baseline first supplies checked-in seed corpora plus at least one
+   engine-level target, with the same hardware, build SHA, CPU/wall budget,
+   seed material, and coverage metric used for SQLRight.
+5. Repeated equal-budget trials preserve queues, crashes, hangs, variance, and
+   count conservation, and show a confirmed unique defect or material unique
+   coverage beyond noise.
+
+No SQLRight, AFL, or patched compiler component becomes a normal workspace
+dependency while the decision is deferred.
 
 ### 5.7 Declarative case-format pilot
 
@@ -690,15 +828,16 @@ Exit gate:
   than guessed.
 - All failures replay from captured artifacts.
 
-### Phase 5: External oracle lane
+### Phase 5: External oracle decisions
 
 Deliverables:
 
-- SQLancer provider/container spike, then a time-bounded nightly campaign if
-  accepted.
-- Intake bridge from external logs to canonical failure bundles.
-- Unique-finding and coverage comparison against native campaigns.
-- Separate SQLRight feasibility report and go/no-go decision.
+- Pinned SQLancer provider/container feasibility record and a fail-closed
+  defer decision unless every section 5.6 re-entry condition is met.
+- A time-bounded nightly SQLancer campaign, intake bridge, and unique-finding
+  comparison only after an explicit future adoption decision.
+- A separate SQLRight feasibility report and go/no-go decision that cannot
+  inherit priority merely because SQLancer is unavailable.
 
 Exit gate:
 
@@ -729,7 +868,7 @@ Use three tiers:
 | Tier | Trigger | Budget | Contents |
 |---|---|---|---|
 | Presubmit | every relevant change | target under 10 minutes for this campaign | fixed seeds, generator contracts, reducer fixtures, small exhaustive histories |
-| Nightly | scheduled | bounded per lane, initially 30-60 minutes | expanded seeds, multiprocess schedules, SQLancer |
+| Nightly | scheduled | bounded per lane, initially 30-60 minutes | expanded seeds and multiprocess schedules; SQLancer only after its re-entry gates pass |
 | Campaign | manual/release | explicit operator budget | large DPOR, SQLRight, Antithesis, long fault and stress runs |
 
 Rules:
@@ -888,9 +1027,10 @@ Reject or defer when:
 5. SQL-level serializability histories plus the production-`Connection`
    LabRuntime bridge.
 6. History/schedule reduction, then real-file/multiprocess schedules.
-7. SQLancer trial.
-8. Coverage-ledger and CI promotion decision (recommended after the SQLancer
-   trial but not blocked by it — the tracker edge is non-blocking).
+7. Record the SQLancer defer decision; do not schedule its trial until every
+   documented re-entry gate passes.
+8. Coverage-ledger and CI promotion decision; it is not blocked by the deferred
+   SQLancer lane because the tracker edge is non-blocking.
 9. Optional SQLRight, declarative DSL, Antithesis, and syscall-fault decisions.
 
 This order maximizes independent correctness signal early while containing
@@ -937,8 +1077,8 @@ Epic: `bd-turso-test-adaptation-zu081`
 | 3 | `bd-turso-test-adaptation-zu081.8` | LabRuntime/DPOR history integration |
 | 3 | `bd-turso-test-adaptation-zu081.19` | History/schedule/worker/crash reduction |
 | 4 | `bd-turso-test-adaptation-zu081.9` | Real-file multiprocess crash/recovery |
-| 5 | `bd-turso-test-adaptation-zu081.10` | SQLancer provider spike |
-| 5 | `bd-turso-test-adaptation-zu081.11` | Bounded SQLancer nightly trial |
+| 5 | `bd-turso-test-adaptation-zu081.10` | SQLancer provider feasibility decision (deferred) |
+| 5 | `bd-turso-test-adaptation-zu081.11` | Bounded SQLancer nightly decision (not admitted) |
 | 5 | `bd-turso-test-adaptation-zu081.12` | SQLRight feasibility decision |
 | 6 | `bd-turso-test-adaptation-zu081.13` | Declarative case-format pilot |
 | 6 | `bd-turso-test-adaptation-zu081.14` | Antithesis feasibility decision |
@@ -973,7 +1113,7 @@ The plan-to-bead coverage ledger is:
 | §5.4 history/schedule reduction | `.19` | `.7`, `.8` |
 | §5.5 multiprocess crash/recovery | `.9` | `.19`, extended through `swarm_multiprocess.rs` |
 | §5.6 SQLancer provider and trial | `.10`, `.11` | `.18` contracts, `.2` lane evidence, `.6` canonical reduction |
-| §5.6 SQLRight decision | `.12` | `.11` equal-budget baseline |
+| §5.6 SQLRight decision | `.12` | Independent native-generator baseline; `.11` is related context only |
 | §5.7 declarative case-format pilot | `.13` | `.18` contracts, `.2` lanes, existing SLT/JSON baseline |
 | §6 provenance and licensing | `.1` | Every importing/adapting child consumes the intake record |
 | §7-§9 phase gates, CI, coverage, artifacts | `.17` | `.5`, `.6`, `.8`, `.19`, `.9`, `.20`; adopted optional lanes only |
@@ -990,7 +1130,7 @@ with the tracker:
 .7  <- .1, .2        bd-2lt76.1 <- bd-2jpu6.5
 .8  <- .2, .7, bd-2lt76.1                 .19 <- .7, .8
 .9  <- .19           .10 <- .1, .2, .18   .11 <- .6, .10
-.12 <- .11           .13 <- .1, .2, .18   .14 <- .7, .9
+.12 <- .6            .13 <- .1, .2, .18   .14 <- .7, .9
 .15 <- .1, .9        .16 <- .1
 .17 <- .5, .6, .8, .9, .19, .20
 ```
@@ -998,8 +1138,9 @@ with the tracker:
 Reading order of the spine: `.1 -> .18 -> .4` is the contract gate; the SQL
 generator/reducer chain is `.3 -> .4 -> .5 -> .6`; the concurrency chain joins
 `.7` with cross-epic bridge `bd-2lt76.1` at `.8`, then continues through
-`.19 -> .9`; the stateful-model campaign is `.6 -> .20`; the external-oracle
-chain is `.18 -> .10 -> .11 -> .12`.
+`.19 -> .9`; the stateful-model campaign is `.6 -> .20`; the SQLancer chain
+is `.18 -> .10 -> .11`, while `.12` independently evaluates SQLRight from the
+native `.6` baseline and keeps `.11` only as related context.
 
 `.17` (CI, coverage, and promotion gates) hard-blocks on all retained native
 campaign inputs, including `.9` multiprocess/recovery and `.20` stateful

@@ -1,24 +1,31 @@
-# Parity Release Threshold Policy v1.0.0
+# Parity Release Threshold Policy v2.0.0
 #
 # Bead: bd-2yqp6.7.1
-# Purpose: enforce strict 100% release thresholds for declared supported
-# surface parity and required-suite pass rate.
+# Purpose: enforce strict 100% empirical declared-surface parity and required-
+# suite pass rates alongside a feasible finite-sample statistical floor.
 
 [meta]
-schema_version = "1.0.0"
-policy_version = "strict-100.v1"
+schema_version = "2.0.0"
+policy_version = "strict-100.v2"
+certification_policy_id = "strict-conformant-release.v2"
 bead_id = "bd-2yqp6.7.1"
 track_id = "bd-2yqp6.7"
-generated_at = "2026-02-26"
+generated_at = "2026-08-05"
 policy_owner = "track-g-cert-owner"
 
 [thresholds]
+# Exact empirical completion requirements.
 declared_surface_parity_min = 1.0
 required_suite_pass_rate_min = 1.0
-score_engine_release_threshold = 1.0
-confidence_gate_release_threshold = 1.0
-ratchet_minimum_release_threshold = 1.0
+
+# Finite-sample credible-lower-bound requirements. These cannot be 1.0 for a
+# proper finite Beta posterior, even when every observation succeeds.
+score_engine_release_threshold = 0.70
+confidence_gate_release_threshold = 0.70
+ratchet_minimum_release_threshold = 0.70
+# Canonical certification rejects runtime configs that differ from these signed values.
 allow_threshold_downgrade = false
+allow_waived_obligations = false
 
 [evidence]
 max_evidence_age_hours = 24
@@ -26,8 +33,8 @@ require_fresh_evidence_for_release = true
 
 [signature]
 algorithm = "sha256"
-canonical_payload = "policy_version=strict-100.v1|declared_surface_parity_min=1.000000|required_suite_pass_rate_min=1.000000|score_engine_release_threshold=1.000000|confidence_gate_release_threshold=1.000000|ratchet_minimum_release_threshold=1.000000|allow_threshold_downgrade=false|max_evidence_age_hours=24|require_fresh_evidence_for_release=true"
-sha256 = "108b429bbc58b1c4d3b646044a1829db83b0d40ac366e9ae0f8638f3fd5c768f"
+canonical_payload = "schema_version=2.0.0|policy_version=strict-100.v2|certification_policy_id=strict-conformant-release.v2|bead_id=bd-2yqp6.7.1|track_id=bd-2yqp6.7|generated_at=2026-08-05|policy_owner=track-g-cert-owner|declared_surface_parity_min=1.000000|required_suite_pass_rate_min=1.000000|score_engine_release_threshold=0.700000|confidence_gate_release_threshold=0.700000|ratchet_minimum_release_threshold=0.700000|allow_threshold_downgrade=false|allow_waived_obligations=false|max_evidence_age_hours=24|require_fresh_evidence_for_release=true|parity_score_contract=parity_score_contract.toml|supported_surface_matrix=supported_surface_matrix.toml|score_engine_module=crates/fsqlite-harness/src/score_engine.rs|confidence_gates_module=crates/fsqlite-harness/src/confidence_gates.rs|ratchet_policy_module=crates/fsqlite-harness/src/ratchet_policy.rs"
+sha256 = "9c1dec86e5bb6f2c36d8fde84fc70758edea9ce7e248fc2c46190b3521d1e8ca"
 
 [references]
 parity_score_contract = "parity_score_contract.toml"

@@ -184,9 +184,10 @@ Initial baseline targets (to be refined after first measurement):
 ## Troubleshooting
 
 ### "LLVM instrumentation not supported"
-Ensure you are using a nightly toolchain:
+Run from the repository and confirm rustup selected the exact dated nightly in
+`rust-toolchain.toml`:
 ```bash
-rustup default nightly
+rustup show active-toolchain
 ```
 
 ### "No coverage data generated"
@@ -201,4 +202,3 @@ Use `--no-clean` after the first run:
 ```bash
 cargo llvm-cov --workspace --no-clean --summary-only
 ```
-

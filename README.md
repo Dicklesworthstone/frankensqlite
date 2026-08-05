@@ -2603,7 +2603,7 @@ FrankenSQLite's target combines SQLite file format compatibility, concurrent wri
 
 ### Prerequisites
 
-- [Rust nightly](https://rustup.rs/) (the `rust-toolchain.toml` handles this automatically)
+- [Rust nightly](https://rustup.rs/) (rustup automatically installs the exact dated version pinned in `rust-toolchain.toml`)
 
 ### Build
 
@@ -2886,9 +2886,9 @@ A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a sepa
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `error[E0554]: #![feature]` | Using stable Rust | Install nightly: `rustup default nightly` or let `rust-toolchain.toml` handle it |
+| `error[E0554]: #![feature]` | Using stable Rust | Run the command from this checkout so rustup honors the dated `rust-toolchain.toml` pin; `rustup show active-toolchain` should report that pinned toolchain |
 | `cargo clippy` warnings | Pedantic + nursery lints enabled | Fix the lint or add a targeted `#[allow]` with justification |
-| `edition 2024` errors | Outdated nightly | Run `rustup update nightly` |
+| `edition 2024` errors | Wrong or unavailable nightly | Install the exact dated toolchain recorded in `rust-toolchain.toml` (normally automatic); do not replace it with a floating nightly |
 | Submodule missing after clone | Forgot `--recursive` | Run `git submodule update --init --recursive` |
 | Tests fail on `fsqlite-types` | Possible float precision | Check platform; tests use exact float comparison for known values |
 | SQLITE_BUSY in concurrent tests | Expected MVCC conflict | Wrap writes in a retry loop; see the concurrent writers example above |
@@ -2905,7 +2905,7 @@ A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a sepa
 frankensqlite/
 ├── Cargo.toml                # Workspace: 27 members, shared deps, lint config
 ├── Cargo.lock                # Pinned dependency versions
-├── rust-toolchain.toml       # Nightly channel + rustfmt + clippy
+├── rust-toolchain.toml       # Pinned dated nightly + rustfmt + clippy
 ├── AGENTS.md                 # AI agent development guidelines
 ├── COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md  # Single source of truth (~9,500 lines)
 ├── MVCC_SPECIFICATION.md     # Standalone MVCC formal specification

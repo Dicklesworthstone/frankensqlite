@@ -248,17 +248,17 @@ source_kind = "directory"
 entry_count = 17
 blob_count = 14
 tree_count = 3
-decision = "adopt"
+decision = "defer"
 translation_class = "external_tool"
 owner_beads = ["bd-turso-test-adaptation-zu081.10", "bd-turso-test-adaptation-zu081.11"]
-owner_paths = ["crates/fsqlite-harness/src/differential_v2.rs", "crates/fsqlite-harness/src/corpus_ingest.rs"]
+owner_paths = ["docs/planning/TURSO_TESTING_ADAPTATION_PLAN.md", "docs/contracts/turso_test_adaptation_inventory.toml"]
 surface_ids = ["SURF-SQL-CORE-001", "SURF-SQL-COMPOUND-002", "SURF-CONFORMANCE-NATIVE-019"]
 execution_lanes = ["planner_required", "vdbe_required", "pager_backed_required"]
 duplicate_owners = ["fsqlite-harness differential and corpus adapters"]
-adaptations = "Build a pinned provider feasibility spike, then a bounded nightly trial only if Java/JDBC integration is production-honest."
-dedup_rationale = "SQLancer provides an independent oracle, but its runner and provider wiring must not fork FrankenSQLite's comparison, reduction, or corpus paths."
+adaptations = "Defer provider and nightly integration until FrankenSQLite has a supported JDBC/session boundary or SQLancer exposes a non-JDBC execution interface; retain the 2026-08-05 pinned feasibility record and fail-closed re-entry criteria in the plan."
+dedup_rationale = "SQLancer provides an independent oracle, but its SQLite query stack is hardwired to JDBC; building and maintaining a JDBC/IPC subsystem now would exceed the bounded spike and duplicate native generator, comparison, reduction, and corpus ownership without evidence of unique value."
 reviewer = "FrostyPike"
-update_policy = "Keep provider and upstream commits pinned and budget comparisons equal."
+update_policy = "Revisit only when a production-honest connection boundary exists; then pin every provider, toolchain, and container input and require an equal-budget unique-value comparison."
 
 [[portfolio]]
 source_path = "testing/sqlite_test_ext"
@@ -291,10 +291,10 @@ owner_paths = ["fuzz/fuzz_targets", "crates/fsqlite-harness/src/differential_v2.
 surface_ids = ["SURF-SQL-CORE-001", "SURF-CONFORMANCE-NATIVE-019"]
 execution_lanes = ["planner_required", "vdbe_required", "pager_backed_required"]
 duplicate_owners = ["five libFuzzer targets", "fsqlite-harness differential runner"]
-adaptations = "Run an equal-budget feasibility comparison only after the SQLancer baseline; adopt only if unique coverage or defects justify the native toolchain cost."
-dedup_rationale = "The current fuzz baseline has five targets and no corpus, but SQLRight carries substantial external build and patch cost."
+adaptations = "Defer until the full 2022 SQLRight commit, three Turso patches, container/toolchain inputs, a public fsqlite CLI adapter, and an equal-budget native engine-fuzz baseline are reproducible; then adopt only for confirmed unique signal."
+dedup_rationale = "The current fuzz baseline has five targets and no corpus or engine-level target, while Turso's experimental SQLRight lane depends on a patched old AFL fork, mutable build inputs, and separate crash storage; a run now would be expensive but incomparable."
 reviewer = "FrostyPike"
-update_policy = "Decision remains downstream of the bounded SQLancer trial."
+update_policy = "Reopen only after all five section 5.6 SQLRight re-entry gates pass; SQLancer's defer decision remains neither positive nor negative evidence."
 
 [[portfolio]]
 source_path = "testing/sqltest"

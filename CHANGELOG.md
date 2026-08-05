@@ -55,9 +55,11 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   version may therefore contain terms that current queries no longer produce.
   For each ordinary or external-content porter-tokenized FTS5 table, run
   `INSERT INTO table_name(table_name) VALUES('rebuild')` after upgrading. For a
-  contentless table, run
-  `INSERT INTO table_name(table_name) VALUES('delete-all')` and then reinsert
-  every document with its original rowid and indexed text, preferably in one
+  contentless table, do not use the `delete-all` control command: it is
+  unsupported in v0.2.0
+  ([#253](https://github.com/Dicklesworthstone/frankensqlite/issues/253)).
+  Recreate the table and re-ingest every document with its original rowid and
+  indexed text from the application-managed source, preferably in one
   transaction.
   No rebuild is required solely for `unicode61`, `ascii`, or `trigram`
   indexes. The 1,024-byte term limit now applies to every tokenizer, but an
@@ -66,6 +68,15 @@ semantic and crates.io predecessor, but it is not an ancestor of current
 
 ### Known limitations
 
+- **Column-qualified FTS5 `MATCH` is unsound.** A query intended to restrict
+  matching to one indexed column can also match terms present only in another
+  column and return false positives. Avoid column-qualified `MATCH`, or verify
+  the selected column in application logic
+  ([#249](https://github.com/Dicklesworthstone/frankensqlite/issues/249)).
+- **Bounded external snapshots are unavailable on macOS in v0.2.0.** The native
+  macOS VFS does not implement that capability; applications requiring bounded
+  external snapshots must not treat it as a portable v0.2.0 API
+  ([#307](https://github.com/Dicklesworthstone/frankensqlite/issues/307)).
 - **v0.2.0 makes no numeric performance claim.** The async storage migration
   invalidated the older benchmark matrices, and the current comprehensive and
   high-writer-count harnesses remain deliberately non-citable until their
