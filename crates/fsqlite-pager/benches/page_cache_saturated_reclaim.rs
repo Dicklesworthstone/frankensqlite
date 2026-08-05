@@ -7,6 +7,7 @@
 //! filesystem writes stay outside the duration returned to Criterion.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
@@ -16,6 +17,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use criterion::{BenchmarkId, Criterion};
+use fsqlite_pager::page_buf::PageBuf;
 use fsqlite_pager::page_cache::ShardedPageCache;
 use fsqlite_types::{PageNumber, PageSize};
 use serde_json::{Value, json};
@@ -23,10 +25,6 @@ use sha2::{Digest, Sha256};
 
 const RESIDENT_POINTS: [usize; 3] = [64, 1_024, 8_192];
 const SHARD_COUNT: usize = 4;
-const BENCH_ARM: &str = match option_env!("FSQLITE_GH326_ARM") {
-    Some(value) => value,
-    None => "unconfigured",
-};
 const ENGINE_REVISION: &str = match option_env!("FSQLITE_GH326_ENGINE_REVISION") {
     Some(value) => value,
     None => "unconfigured",
@@ -44,6 +42,35 @@ const PROFILE_NAME: &str = match option_env!("FSQLITE_BENCH_PROFILE_NAME") {
     None => "unconfigured",
 };
 const HARNESS_SOURCE: &[u8] = include_bytes!("page_cache_saturated_reclaim.rs");
+
+#[derive(Clone, Copy)]
+enum ReclaimArm {
+    Baseline,
+    Candidate,
+}
+
+impl ReclaimArm {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Candidate => "candidate",
+        }
+    }
+
+    fn reclaim(self, cache: &ShardedPageCache) -> Option<(PageNumber, PageBuf)> {
+        match self {
+            Self::Baseline => cache.take_clean_buffer_entry_legacy_for_bench(),
+            Self::Candidate => cache.take_clean_buffer_entry_for_bench(),
+        }
+    }
+}
+
+const RUN_SEQUENCE: [(&str, ReclaimArm); 4] = [
+    ("b1", ReclaimArm::Baseline),
+    ("t1", ReclaimArm::Candidate),
+    ("t2", ReclaimArm::Candidate),
+    ("b2", ReclaimArm::Baseline),
+];
 
 fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} must be set for a provenance-complete run"))
@@ -150,40 +177,39 @@ fn saturated_clean_flat_fixture(resident_count: usize) -> ShardedPageCache {
 }
 
 fn bench_saturated_reclaim(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group("page_cache_saturated_flat_reclaim");
-    for resident_count in RESIDENT_POINTS {
-        group.bench_with_input(
-            BenchmarkId::new("resident_pages", resident_count),
-            &resident_count,
-            move |bencher, &resident_count| {
-                bencher.iter_custom(|iters| {
-                    let cache = saturated_clean_flat_fixture(resident_count);
+    for (run_id, arm) in RUN_SEQUENCE {
+        let group_name = format!("page_cache_saturated_flat_reclaim_{run_id}_{}", arm.name());
+        let mut group = criterion.benchmark_group(group_name);
+        for resident_count in RESIDENT_POINTS {
+            group.bench_with_input(
+                BenchmarkId::new("resident_pages", resident_count),
+                &resident_count,
+                move |bencher, &resident_count| {
+                    bencher.iter_custom(|iters| {
+                        let cache = saturated_clean_flat_fixture(resident_count);
 
-                    let run_started = Instant::now();
-                    let mut receipt = 0_u64;
-                    for _ in 0..iters {
-                        let reclaimed = if BENCH_ARM == "baseline" {
-                            cache.take_clean_buffer_entry_legacy_for_bench()
-                        } else {
-                            cache.take_clean_buffer_entry_for_bench()
-                        };
-                        let (page_no, buffer) = reclaimed
-                            .expect("saturated clean cache must expose a reclaimable buffer");
-                        receipt ^= u64::from(page_no.get());
-                        cache.insert_buffer(page_no, buffer);
-                    }
-                    let run_wall = run_started.elapsed();
+                        let run_started = Instant::now();
+                        let mut receipt = 0_u64;
+                        for _ in 0..iters {
+                            let (page_no, buffer) = arm
+                                .reclaim(&cache)
+                                .expect("saturated clean cache must expose a reclaimable buffer");
+                            receipt ^= u64::from(page_no.get());
+                            cache.insert_buffer(page_no, buffer);
+                        }
+                        let run_wall = run_started.elapsed();
 
-                    assert_eq!(cache.len(), resident_count);
-                    assert_eq!(cache.pool().available(), 0);
-                    assert_eq!(cache.overflow_resident_count_for_bench(), 0);
-                    let _ = black_box(receipt);
-                    run_wall
-                });
-            },
-        );
+                        assert_eq!(cache.len(), resident_count);
+                        assert_eq!(cache.pool().available(), 0);
+                        assert_eq!(cache.overflow_resident_count_for_bench(), 0);
+                        let _ = black_box(receipt);
+                        run_wall
+                    });
+                },
+            );
+        }
+        group.finish();
     }
-    group.finish();
 }
 
 fn emit_official_samples(output_dir: &Path, receipt_path: &Path) {
@@ -216,9 +242,24 @@ fn emit_official_samples(output_dir: &Path, receipt_path: &Path) {
     sample_paths.sort();
     assert_eq!(
         sample_paths.len(),
-        RESIDENT_POINTS.len(),
-        "fresh Criterion output must contain one new/sample.json for each resident point"
+        RESIDENT_POINTS.len() * RUN_SEQUENCE.len(),
+        "fresh Criterion output must contain one new/sample.json for every run and resident point"
     );
+    for (run_id, arm) in RUN_SEQUENCE {
+        let group_name = format!("page_cache_saturated_flat_reclaim_{run_id}_{}", arm.name());
+        let group_sample_count = sample_paths
+            .iter()
+            .filter(|path| {
+                path.components()
+                    .any(|component| component.as_os_str() == OsStr::new(group_name.as_str()))
+            })
+            .count();
+        assert_eq!(
+            group_sample_count,
+            RESIDENT_POINTS.len(),
+            "{group_name} must contain one official sample for every resident point"
+        );
+    }
 
     let mut records = Vec::with_capacity(sample_paths.len());
     for entry_path in sample_paths {
@@ -281,15 +322,6 @@ fn main() {
         serde_json::to_string(&binary_identity).expect("serialize binary identity")
     );
 
-    assert!(
-        BENCH_ARM == "baseline" || BENCH_ARM == "candidate",
-        "FSQLITE_GH326_ARM must be baseline or candidate"
-    );
-    let implementation = if BENCH_ARM == "baseline" {
-        "pre_gh326_snapshot_sort_reconstructed_at_0696131c"
-    } else {
-        "candidate_persistent_cursor_reclaim"
-    };
     let run_label = required_env("FSQLITE_GH326_RUN_LABEL");
     assert_lower_hex(ENGINE_REVISION, 40, "FSQLITE_GH326_ENGINE_REVISION");
     assert_lower_hex(HARNESS_SHA256, 64, "FSQLITE_GH326_HARNESS_SHA256");
@@ -317,14 +349,27 @@ fn main() {
 
     let criterion_output = capture_dir.join("criterion");
     let official_sample_path = capture_dir.join("criterion_samples.jsonl");
+    let run_sequence = RUN_SEQUENCE
+        .iter()
+        .map(|(run_id, arm)| {
+            json!({
+                "run_id": run_id,
+                "arm": arm.name(),
+                "implementation": if matches!(*arm, ReclaimArm::Baseline) {
+                    "pre_gh326_snapshot_sort_reconstructed_at_0696131c"
+                } else {
+                    "candidate_persistent_cursor_reclaim"
+                }
+            })
+        })
+        .collect::<Vec<_>>();
 
     let provenance = json!({
         "schema_version": 1,
         "record_type": "benchmark_provenance",
-        "benchmark": "page_cache_saturated_flat_reclaim",
+        "benchmark": "page_cache_saturated_flat_reclaim_counterbalanced",
         "measurement_scope": "flat_tier_saturated_clean_reclaim_plus_exact_page_reinsert",
-        "arm": BENCH_ARM,
-        "implementation": implementation,
+        "run_sequence": run_sequence,
         "run_label": run_label,
         "engine_revision": ENGINE_REVISION,
         "harness_sha256": HARNESS_SHA256,
