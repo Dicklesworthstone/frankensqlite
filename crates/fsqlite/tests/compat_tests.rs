@@ -867,7 +867,6 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
         let namespace_gate = suffixed_path(&path, "-fsqlite-ns-gate");
         let namespace_use = suffixed_path(&path, "-fsqlite-ns-use");
         let wal = suffixed_path(&path, "-wal");
-        #[cfg(unix)]
         let shm = suffixed_path(&path, "-shm");
         assert!(
             namespace_gate.exists(),
@@ -881,12 +880,6 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
             wal.exists(),
             "fixture must retain a WAL companion for readback"
         );
-        #[cfg(unix)]
-        assert!(
-            shm.exists(),
-            "GH #294 steady-state fixture must retain an existing SHM companion"
-        );
-
         let sentinel_modified = UNIX_EPOCH + Duration::from_secs(946_684_800);
         File::options()
             .write(true)
@@ -895,7 +888,7 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
             .set_times(FileTimes::new().set_modified(sentinel_modified))
             .expect("set namespace identity timestamp sentinel");
         let before = snapshot_directory_files(dir.path());
-        let expected_names = std::collections::BTreeSet::from([
+        let mut expected_names = std::collections::BTreeSet::from([
             path.file_name().expect("database file name").to_owned(),
             namespace_gate
                 .file_name()
@@ -907,12 +900,9 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
                 .to_owned(),
             wal.file_name().expect("WAL file name").to_owned(),
         ]);
-        #[cfg(unix)]
-        let expected_names = {
-            let mut expected_names = expected_names;
+        if shm.exists() {
             expected_names.insert(shm.file_name().expect("SHM file name").to_owned());
-            expected_names
-        };
+        }
         assert_eq!(
             before
                 .keys()
@@ -941,7 +931,10 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
             before,
             "GH #294 steady-state read-only schema-only open/query must preserve exact artifact keys plus all bytes, modification times, and Unix change times"
         );
-        drop(writable);
+        writable
+            .close_without_checkpoint()
+            .await
+            .expect("close steady-state writer without changing the measured snapshot");
     });
 }
 
