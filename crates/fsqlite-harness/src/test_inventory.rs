@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
@@ -433,20 +433,19 @@ fn env_snapshot_value(name: &str) -> Result<Option<String>, String> {
 
 fn parse_env_path_list(name: &str, raw: &str) -> Result<Vec<String>, String> {
     let mut paths = Vec::new();
-    let separator = env_list_separator(raw);
     for (index, path) in raw
-        .split(separator)
+        .split(['\n', ';'])
         .filter(|path| !path.is_empty())
         .enumerate()
     {
         if path.contains('\r') {
             return Err(format!("git_env_path_contains_cr var={name} index={index}"));
         }
-        if Path::new(path).is_absolute()
-            || path == "."
-            || path == ".."
-            || path.starts_with("../")
-            || path.contains("/../")
+        let repository_path = Path::new(path);
+        if path.contains('\\')
+            || repository_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
         {
             return Err(format!(
                 "git_env_path_not_repository_relative var={name} index={index} path={path}"
@@ -460,7 +459,7 @@ fn parse_env_path_list(name: &str, raw: &str) -> Result<Vec<String>, String> {
 fn parse_env_bead_id_list(name: &str, raw: &str) -> Result<Vec<String>, String> {
     let mut ids = Vec::new();
     for (index, id) in raw
-        .split(env_list_separator(raw))
+        .split(['\n', ';'])
         .filter(|id| !id.is_empty())
         .enumerate()
     {
@@ -476,10 +475,6 @@ fn parse_env_bead_id_list(name: &str, raw: &str) -> Result<Vec<String>, String> 
         }
     }
     Ok(ids)
-}
-
-fn env_list_separator(raw: &str) -> char {
-    if raw.contains('\n') { '\n' } else { ';' }
 }
 
 fn parse_dirty_paths(status: &[u8]) -> Result<BTreeSet<String>, String> {
@@ -2133,8 +2128,34 @@ mod tests {
     }
 
     #[test]
-    fn env_path_list_rejects_absolute_parent_and_cr_paths() {
-        for raw in ["/tmp/file.rs", "../file.rs", "a/../file.rs", "ok\r.rs"] {
+    fn env_path_list_accepts_mixed_newline_and_semicolon_separators() {
+        let paths = parse_env_path_list(
+            "TEST_PATHS",
+            "crates/a.rs;crates/b.rs\ndocs/c.md;docs/d.md\n",
+        )
+        .expect("mixed supported separators are valid");
+        assert_eq!(
+            paths,
+            vec![
+                "crates/a.rs".to_owned(),
+                "crates/b.rs".to_owned(),
+                "docs/c.md".to_owned(),
+                "docs/d.md".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_path_list_rejects_absolute_relative_traversal_and_cr_paths() {
+        for raw in [
+            "/tmp/file.rs",
+            "./file.rs",
+            "../file.rs",
+            "a/../file.rs",
+            "..\\file.rs",
+            "a\\..\\file.rs",
+            "ok\r.rs",
+        ] {
             let error = parse_env_path_list("TEST_PATHS", raw)
                 .expect_err("invalid env path must fail closed");
             assert!(error.starts_with("git_env_path_"));
@@ -2143,14 +2164,17 @@ mod tests {
 
     #[test]
     fn env_bead_id_list_accepts_repository_issue_ids() {
-        let ids =
-            parse_env_bead_id_list("TEST_BEADS", "bd-turso-test-adaptation-zu081.10;bd-2lt76.1")
-                .expect("semicolon-separated bead IDs are valid");
+        let ids = parse_env_bead_id_list(
+            "TEST_BEADS",
+            "bd-turso-test-adaptation-zu081.10;bd-2lt76.1\nbd-uh1fv",
+        )
+        .expect("mixed supported separators are valid");
         assert_eq!(
             ids,
             vec![
                 "bd-turso-test-adaptation-zu081.10".to_owned(),
                 "bd-2lt76.1".to_owned(),
+                "bd-uh1fv".to_owned(),
             ]
         );
     }
