@@ -296,7 +296,9 @@ pub fn parse_offsets(payload: &str) -> Result<Vec<OffsetEntry>, OffsetsParseErro
     }
 
     let entries = values
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| OffsetEntry {
             column: chunk[0],
             term: chunk[1],

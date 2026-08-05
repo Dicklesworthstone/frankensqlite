@@ -524,25 +524,25 @@ pub fn resolve_parallel_wal_control_surface_from_env() -> ParallelWalControlSurf
             _ => control.mode,
         };
     }
-    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_LANES") {
-        if let Ok(value) = raw.trim().parse::<usize>() {
-            control.lane_count_override = Some(value.max(1));
-        }
+    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_LANES")
+        && let Ok(value) = raw.trim().parse::<usize>()
+    {
+        control.lane_count_override = Some(value.max(1));
     }
-    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_MAX_BATCH_BYTES") {
-        if let Ok(value) = raw.trim().parse::<u64>() {
-            control.max_parallel_commit_bytes = Some(value.max(1));
-        }
+    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_MAX_BATCH_BYTES")
+        && let Ok(value) = raw.trim().parse::<u64>()
+    {
+        control.max_parallel_commit_bytes = Some(value.max(1));
     }
-    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_MAX_FLUSH_DELAY_MS") {
-        if let Ok(value) = raw.trim().parse::<u64>() {
-            control.max_flush_delay_ms = Some(value);
-        }
+    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_MAX_FLUSH_DELAY_MS")
+        && let Ok(value) = raw.trim().parse::<u64>()
+    {
+        control.max_flush_delay_ms = Some(value);
     }
-    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_SHADOW_COMPARE_PER_MILLE") {
-        if let Ok(value) = raw.trim().parse::<u16>() {
-            control.shadow_compare_sampling_per_mille = Some(value);
-        }
+    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_SHADOW_COMPARE_PER_MILLE")
+        && let Ok(value) = raw.trim().parse::<u16>()
+    {
+        control.shadow_compare_sampling_per_mille = Some(value);
     }
 
     control
@@ -2614,10 +2614,10 @@ pub fn list_segments(db_path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if let Some(epoch_hex) = name_str.strip_prefix(&prefix) {
-            if let Ok(epoch) = u64::from_str_radix(epoch_hex, 16) {
-                segments.push((epoch, entry.path()));
-            }
+        if let Some(epoch_hex) = name_str.strip_prefix(&prefix)
+            && let Ok(epoch) = u64::from_str_radix(epoch_hex, 16)
+        {
+            segments.push((epoch, entry.path()));
         }
     }
     segments.sort_by_key(|(epoch, _)| *epoch);

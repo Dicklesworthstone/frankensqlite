@@ -1895,7 +1895,7 @@ mod tests {
 
         let gate_path = sidecar_path(&database, GATE_SUFFIX);
         let use_path = sidecar_path(&database, USE_SUFFIX);
-        let sentinel_modified = UNIX_EPOCH + Duration::from_secs(946_684_800);
+        let sentinel_modified = UNIX_EPOCH + Duration::from_hours(262_968);
         File::options()
             .write(true)
             .open(&use_path)

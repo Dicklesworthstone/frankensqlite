@@ -98,14 +98,14 @@ pub fn json_valid_blob(input: &[u8], flags: Option<u8>) -> i64 {
     let allow_jsonb_superficial = effective_flags & JSON_VALID_JSONB_SUPERFICIAL_FLAG != 0;
     let allow_jsonb_strict = effective_flags & JSON_VALID_JSONB_STRICT_FLAG != 0;
 
-    if allow_json || allow_json5 {
-        if let Ok(text) = std::str::from_utf8(input) {
-            if allow_json && parse_json_text(text).is_ok() {
-                return 1;
-            }
-            if allow_json5 && parse_json5_text(text).is_ok() {
-                return 1;
-            }
+    if (allow_json || allow_json5)
+        && let Ok(text) = std::str::from_utf8(input)
+    {
+        if allow_json && parse_json_text(text).is_ok() {
+            return 1;
+        }
+        if allow_json5 && parse_json5_text(text).is_ok() {
+            return 1;
         }
     }
 
@@ -456,7 +456,7 @@ pub fn json_array_with_subtypes(values: &[SqliteValue], subtypes: &[u32]) -> Res
 /// Build a JSON object from alternating key/value arguments, embedding
 /// JSON-subtyped values as parsed JSON rather than quoting them as strings.
 pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Result<String> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
             "json_object requires an even number of arguments",
         ));
@@ -488,7 +488,7 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
 ///
 /// Duplicate keys are overwritten by later entries.
 pub fn json_object(args: &[SqliteValue]) -> Result<String> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
             "json_object requires an even number of arguments",
         ));
@@ -2598,7 +2598,7 @@ pub struct JsonSetFunc;
 
 impl ScalarFunction for JsonSetFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",
@@ -2632,7 +2632,7 @@ impl ScalarFunction for JsonSetFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",
@@ -2679,7 +2679,7 @@ pub struct JsonbSetFunc;
 
 impl ScalarFunction for JsonbSetFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",
@@ -2720,7 +2720,7 @@ pub struct JsonInsertFunc;
 
 impl ScalarFunction for JsonInsertFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",
@@ -2754,7 +2754,7 @@ impl ScalarFunction for JsonInsertFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",
@@ -2801,7 +2801,7 @@ pub struct JsonbInsertFunc;
 
 impl ScalarFunction for JsonbInsertFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",
@@ -2842,7 +2842,7 @@ pub struct JsonReplaceFunc;
 
 impl ScalarFunction for JsonReplaceFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",
@@ -2876,7 +2876,7 @@ impl ScalarFunction for JsonReplaceFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",
@@ -2923,7 +2923,7 @@ pub struct JsonbReplaceFunc;
 
 impl ScalarFunction for JsonbReplaceFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(invalid_arity(
                 self.name(),
                 "an odd argument count >= 3 (json, path, value, ...)",

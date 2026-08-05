@@ -1396,10 +1396,10 @@ impl GroupCommitConsolidator {
         if self.pending_frame_count >= self.config.max_group_size {
             return true;
         }
-        if let Some(started) = self.filling_started {
-            if started.elapsed() >= self.config.max_group_delay {
-                return true;
-            }
+        if let Some(started) = self.filling_started
+            && started.elapsed() >= self.config.max_group_delay
+        {
+            return true;
         }
         false
     }

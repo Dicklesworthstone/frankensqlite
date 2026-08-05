@@ -3890,17 +3890,17 @@ impl Parser {
                 // SQLite accepts this one magnitude as the signed minimum.
                 // Preserve the normalized one-node literal AST and its actual
                 // retained height.
-                if let TokenKind::OversizedInt(s) = self.peek_kind() {
-                    if s == "9223372036854775808" {
-                        let num_span = self.advance_token().span;
-                        let span = token_span.merge(num_span);
-                        return self.finish_expr(
-                            Expr::Literal(Literal::Integer(i64::MIN), span),
-                            1,
-                            true,
-                            false,
-                        );
-                    }
+                if let TokenKind::OversizedInt(s) = self.peek_kind()
+                    && s == "9223372036854775808"
+                {
+                    let num_span = self.advance_token().span;
+                    let span = token_span.merge(num_span);
+                    return self.finish_expr(
+                        Expr::Literal(Literal::Integer(i64::MIN), span),
+                        1,
+                        true,
+                        false,
+                    );
                 }
                 let inner = self.parse_expr_bp(bp::UNARY)?;
                 let span = token_span.merge(inner.expr.span());

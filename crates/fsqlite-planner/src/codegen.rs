@@ -1581,10 +1581,10 @@ fn extract_column_eq_bind(where_clause: Option<&Expr>) -> Option<(String, i32)> 
 
 /// Extract a column name from an expression if it's a simple column reference.
 fn column_name(expr: &Expr) -> Option<String> {
-    if let Expr::Column(col_ref, _) = expr {
-        if !is_rowid_ref(col_ref) {
-            return Some(col_ref.column.to_string());
-        }
+    if let Expr::Column(col_ref, _) = expr
+        && !is_rowid_ref(col_ref)
+    {
+        return Some(col_ref.column.to_string());
     }
     None
 }

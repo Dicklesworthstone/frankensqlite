@@ -1371,11 +1371,12 @@ pub fn query_raptorq_repair_evidence(
             .collect::<Vec<_>>()
     };
 
-    if let Some(limit) = query.limit {
-        if limit > 0 && cards.len() > limit {
-            let keep_from = cards.len() - limit;
-            cards.drain(..keep_from);
-        }
+    if let Some(limit) = query.limit
+        && limit > 0
+        && cards.len() > limit
+    {
+        let keep_from = cards.len() - limit;
+        cards.drain(..keep_from);
     }
 
     cards
@@ -1908,15 +1909,15 @@ fn generate_wal_fec_repair_symbols_inner(
     let mut symbols = Vec::with_capacity(r_repair);
 
     for repair_index in 0..r_repair {
-        if let Some(cx) = cx {
-            if cx.checkpoint().is_err() {
-                return Ok(None);
-            }
+        if let Some(cx) = cx
+            && cx.checkpoint().is_err()
+        {
+            return Ok(None);
         }
-        if let Some(flag) = cancel_flag {
-            if flag.load(Ordering::SeqCst) {
-                return Ok(None);
-            }
+        if let Some(flag) = cancel_flag
+            && flag.load(Ordering::SeqCst)
+        {
+            return Ok(None);
         }
 
         let esi = meta
@@ -2157,10 +2158,10 @@ pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) ->
     use std::io::{Read, Seek, SeekFrom, Write};
 
     if !sidecar_path.exists() {
-        if let Some(parent) = sidecar_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = sidecar_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
         let header = WalFecPragmaHeader::new(value);
         // Use create_new (O_EXCL) to atomically create the file, avoiding a

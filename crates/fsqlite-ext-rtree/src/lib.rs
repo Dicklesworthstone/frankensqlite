@@ -84,7 +84,8 @@ impl MBoundingBox {
     ///
     /// `coords` must have an even length between 2 and 10 (1-5 dimensions).
     pub fn new(coords: Vec<f64>) -> Option<Self> {
-        if coords.len() % 2 != 0 || coords.is_empty() || coords.len() > MAX_DIMENSIONS * 2 {
+        if !coords.len().is_multiple_of(2) || coords.is_empty() || coords.len() > MAX_DIMENSIONS * 2
+        {
             return None;
         }
         Some(Self { coords })
@@ -428,7 +429,7 @@ fn parse_rtree_module_args(args: &[&str]) -> Result<ParsedRtreeModuleArgs> {
             "rtree requires an id column plus at least one min/max coordinate pair",
         ));
     }
-    if args.len() % 2 == 0 {
+    if args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
             "rtree requires an odd number of arguments: id plus min/max coordinate pairs",
         ));
@@ -757,10 +758,10 @@ impl VirtualTable for RtreeVirtualTable {
         let coordinate_values = match args.len().saturating_sub(2) {
             count if count == self.index.dimensions() * 2 => &args[2..],
             count if count == self.index.dimensions() * 2 + 1 => {
-                if let Some(id_value) = args[2].as_integer() {
-                    if id_value != new_rowid {
-                        return Err(FrankenError::PrimaryKeyViolation);
-                    }
+                if let Some(id_value) = args[2].as_integer()
+                    && id_value != new_rowid
+                {
+                    return Err(FrankenError::PrimaryKeyViolation);
                 }
                 &args[3..]
             }
@@ -1112,10 +1113,10 @@ pub fn geopoly_json(vertices: &[Point]) -> String {
         .map(|v| format!("[{},{}]", v.x, v.y))
         .collect();
     // Close the ring if needed.
-    if let (Some(first), Some(last)) = (vertices.first(), vertices.last()) {
-        if first != last {
-            parts.push(format!("[{},{}]", first.x, first.y));
-        }
+    if let (Some(first), Some(last)) = (vertices.first(), vertices.last())
+        && first != last
+    {
+        parts.push(format!("[{},{}]", first.x, first.y));
     }
     format!("[{}]", parts.join(","))
 }

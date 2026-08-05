@@ -157,7 +157,7 @@ impl WalChecksumTransform {
 
     /// Build the transform for aligned WAL checksum bytes.
     pub fn from_aligned_bytes(data: &[u8], big_endian_checksum_words: bool) -> Result<Self> {
-        if data.len() % 8 != 0 {
+        if !data.len().is_multiple_of(8) {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
                     "WAL checksum transform input must be 8-byte aligned, got {} bytes",
@@ -169,7 +169,8 @@ impl WalChecksumTransform {
         let (a11, a12, a21, a22) = Self::linear_coefficients_for_chunk_count(data.len() / 8);
         let mut c1 = 0_u32;
         let mut c2 = 0_u32;
-        for chunk in data.chunks_exact(8) {
+        let (chunks, _rest) = data.as_chunks::<8>();
+        for chunk in chunks {
             let x0 = decode_u32_words(&chunk[..4], big_endian_checksum_words);
             let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
             c1 = c1.wrapping_add(x0).wrapping_add(c2);
@@ -1542,7 +1543,7 @@ pub fn sqlite_wal_checksum(
     seed_s2: u32,
     big_endian_checksum_words: bool,
 ) -> Result<SqliteWalChecksum> {
-    if data.len() % 8 != 0 {
+    if !data.len().is_multiple_of(8) {
         return Err(FrankenError::WalCorrupt {
             detail: format!(
                 "WAL checksum input must be 8-byte aligned, got {} bytes",
@@ -1554,7 +1555,8 @@ pub fn sqlite_wal_checksum(
     let mut s1 = seed_s1;
     let mut s2 = seed_s2;
 
-    for chunk in data.chunks_exact(8) {
+    let (chunks, _rest) = data.as_chunks::<8>();
+    for chunk in chunks {
         let x0 = decode_u32_words(&chunk[..4], big_endian_checksum_words);
         let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
 

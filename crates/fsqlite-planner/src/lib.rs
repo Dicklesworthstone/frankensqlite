@@ -235,12 +235,12 @@ pub fn resolve_single_table_result_columns_with_options(
                 expr: Expr::Column(col_ref, _),
                 ..
             } => {
-                if let Some(qualifier) = &col_ref.table {
-                    if !qualifier_matches_table(qualifier, table_name, table_alias) {
-                        return Err(SingleTableProjectionError::UnknownTableQualifier {
-                            qualifier: qualifier.to_string(),
-                        });
-                    }
+                if let Some(qualifier) = &col_ref.table
+                    && !qualifier_matches_table(qualifier, table_name, table_alias)
+                {
+                    return Err(SingleTableProjectionError::UnknownTableQualifier {
+                        qualifier: qualifier.to_string(),
+                    });
                 }
                 if !(column_exists_ignore_case(table_columns, &col_ref.column)
                     || supports_hidden_rowid && is_rowid_alias_name(&col_ref.column))
@@ -367,10 +367,10 @@ fn resolve_single_term(
             let name = &col_ref.column;
             for aliases in all_aliases {
                 for (pos, alias_opt) in aliases.iter().enumerate() {
-                    if let Some(alias) = alias_opt {
-                        if alias.eq_ignore_ascii_case(name) {
-                            return Ok((pos, None));
-                        }
+                    if let Some(alias) = alias_opt
+                        && alias.eq_ignore_ascii_case(name)
+                    {
+                        return Ok((pos, None));
                     }
                 }
             }
@@ -1819,16 +1819,16 @@ fn best_access_path_internal(
         // small explicit lattice of same-bound comparisons and non-NULL
         // guarantees; unknown affinity, collation, or function semantics fail
         // closed.
-        if let Some(ref partial_pred) = idx.partial_where {
-            if !where_terms_imply_predicate(
+        if let Some(ref partial_pred) = idx.partial_where
+            && !where_terms_imply_predicate(
                 partial_index_terms,
                 partial_pred,
                 &idx.table,
                 unqualified_terms_are_table_local,
-            ) {
-                partial_indexes_pruned += 1;
-                continue;
-            }
+            )
+        {
+            partial_indexes_pruned += 1;
+            continue;
         }
 
         let mut skip_scan_candidate = None;
@@ -1995,11 +1995,11 @@ fn best_access_path_internal(
                 cost *= 0.01;
                 explicit_hint_applied = true;
             }
-        } else if let Some(adaptive_hint) = adaptive_preferred_index {
-            if idx.name.eq_ignore_ascii_case(adaptive_hint) {
-                cost *= ADAPTIVE_HINT_COST_BIAS;
-                adaptive_hint_applied = true;
-            }
+        } else if let Some(adaptive_hint) = adaptive_preferred_index
+            && idx.name.eq_ignore_ascii_case(adaptive_hint)
+        {
+            cost *= ADAPTIVE_HINT_COST_BIAS;
+            adaptive_hint_applied = true;
         }
 
         if cost < best.estimated_cost {
@@ -3099,16 +3099,15 @@ fn extract_range_probe_for_column(
                 upper: hi_bound,
             });
         }
-        if matches!(term.kind, WhereTermKind::Between) {
-            if let Expr::Between { low, high, not, .. } = term.expr {
-                if !not {
-                    return Some(AccessPathProbe::Range {
-                        column: col.column.clone(),
-                        lower: Some((Box::new(low.as_ref().clone()), true)),
-                        upper: Some((Box::new(high.as_ref().clone()), true)),
-                    });
-                }
-            }
+        if matches!(term.kind, WhereTermKind::Between)
+            && let Expr::Between { low, high, not, .. } = term.expr
+            && !not
+        {
+            return Some(AccessPathProbe::Range {
+                column: col.column.clone(),
+                lower: Some((Box::new(low.as_ref().clone()), true)),
+                upper: Some((Box::new(high.as_ref().clone()), true)),
+            });
         }
         if !matches!(term.kind, WhereTermKind::Range) {
             continue;
@@ -3561,24 +3560,22 @@ fn analyze_expression_index_usability(
             right,
             ..
         } = term.expr
+            && (expression_matches_index_key(left, first_expr, &index.table)
+                || expression_matches_index_key(right, first_expr, &index.table))
         {
-            if expression_matches_index_key(left, first_expr, &index.table)
-                || expression_matches_index_key(right, first_expr, &index.table)
-            {
-                return IndexUsability::Range {
-                    selectivity: DEFAULT_RANGE_SELECTIVITY,
-                };
-            }
+            return IndexUsability::Range {
+                selectivity: DEFAULT_RANGE_SELECTIVITY,
+            };
         }
         if let Expr::Between {
             expr: inner, not, ..
         } = term.expr
+            && !*not
+            && expression_matches_index_key(inner, first_expr, &index.table)
         {
-            if !*not && expression_matches_index_key(inner, first_expr, &index.table) {
-                return IndexUsability::Range {
-                    selectivity: DEFAULT_RANGE_SELECTIVITY,
-                };
-            }
+            return IndexUsability::Range {
+                selectivity: DEFAULT_RANGE_SELECTIVITY,
+            };
         }
     }
 

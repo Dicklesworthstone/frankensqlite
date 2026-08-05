@@ -1155,7 +1155,7 @@ impl Fts5TombstonePage {
         let key_size = if page[0] == 4 { 4 } else { 8 };
         let key_size_usize = usize::from(key_size);
         let payload_len = page.len() - 8;
-        if payload_len % key_size_usize != 0 {
+        if !payload_len.is_multiple_of(key_size_usize) {
             return Err(fts5_data_error("tombstone slot area is misaligned"));
         }
         let declared_entries = read_be_u32(&page[4..8]);
@@ -3748,11 +3748,11 @@ fn porter_stem(word: &str) -> String {
             s = base.to_owned();
             step1b_fixup(&mut s);
         }
-    } else if let Some(base) = s.strip_suffix("ing") {
-        if contains_vowel(base) {
-            s = base.to_owned();
-            step1b_fixup(&mut s);
-        }
+    } else if let Some(base) = s.strip_suffix("ing")
+        && contains_vowel(base)
+    {
+        s = base.to_owned();
+        step1b_fixup(&mut s);
     }
 
     // Step 1c: terminal y -> i if stem contains vowel
@@ -3820,11 +3820,11 @@ fn apply_step2(s: &mut String) {
     ];
 
     for (suffix, replacement) in replacements {
-        if let Some(base) = s.strip_suffix(suffix) {
-            if measure(base) > 0 {
-                *s = format!("{base}{replacement}");
-                return;
-            }
+        if let Some(base) = s.strip_suffix(suffix)
+            && measure(base) > 0
+        {
+            *s = format!("{base}{replacement}");
+            return;
         }
     }
 }
@@ -3841,11 +3841,11 @@ fn apply_step3(s: &mut String) {
     ];
 
     for (suffix, replacement) in replacements {
-        if let Some(base) = s.strip_suffix(suffix) {
-            if measure(base) > 0 {
-                *s = format!("{base}{replacement}");
-                return;
-            }
+        if let Some(base) = s.strip_suffix(suffix)
+            && measure(base) > 0
+        {
+            *s = format!("{base}{replacement}");
+            return;
         }
     }
 }
@@ -4939,10 +4939,10 @@ fn parse_primary(
         }
         Fts5QueryTokenKind::LParen => {
             let (expr, rest) = parse_or(&tokens[1..])?;
-            if let Some(close) = rest.first() {
-                if close.kind == Fts5QueryTokenKind::RParen {
-                    return Ok((expr, &rest[1..]));
-                }
+            if let Some(close) = rest.first()
+                && close.kind == Fts5QueryTokenKind::RParen
+            {
+                return Ok((expr, &rest[1..]));
             }
             Err(Fts5QueryError::UnbalancedParentheses)
         }

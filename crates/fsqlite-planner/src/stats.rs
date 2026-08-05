@@ -442,27 +442,27 @@ impl ColumnStats {
         }
 
         // Try sampling fallback.
-        if let Some(sample) = sample {
-            if !sample.is_empty() {
-                let matching = sample
-                    .iter()
-                    .filter(|sv| cmp_matches(sv, *op, value))
-                    .count();
-                let sel = (matching as f64 / sample.len() as f64).clamp(0.0, 1.0);
-                let span = tracing::debug_span!(
-                    target: "fsqlite.planner",
-                    "cost_estimate",
-                    table = tracing::field::Empty,
-                    estimated_rows = (sel * rows),
-                    actual_method = "sampling",
-                );
-                let _g = span.enter();
-                return CardinalityEstimate {
-                    estimated_rows: sel * rows,
-                    selectivity: sel,
-                    method: EstimationMethod::Sampling,
-                };
-            }
+        if let Some(sample) = sample
+            && !sample.is_empty()
+        {
+            let matching = sample
+                .iter()
+                .filter(|sv| cmp_matches(sv, *op, value))
+                .count();
+            let sel = (matching as f64 / sample.len() as f64).clamp(0.0, 1.0);
+            let span = tracing::debug_span!(
+                target: "fsqlite.planner",
+                "cost_estimate",
+                table = tracing::field::Empty,
+                estimated_rows = (sel * rows),
+                actual_method = "sampling",
+            );
+            let _g = span.enter();
+            return CardinalityEstimate {
+                estimated_rows: sel * rows,
+                selectivity: sel,
+                method: EstimationMethod::Sampling,
+            };
         }
 
         // NDV-based fallback for equality.

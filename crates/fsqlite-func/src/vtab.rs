@@ -1046,11 +1046,11 @@ mod tests {
 
             #[allow(clippy::cast_sign_loss)]
             let col_idx = col as usize;
-            if let Some((_, cols)) = self.rows.get(self.pos) {
-                if let Some(val) = cols.get(col_idx) {
-                    ctx.set_value(val.clone());
-                    return Ok(());
-                }
+            if let Some((_, cols)) = self.rows.get(self.pos)
+                && let Some(val) = cols.get(col_idx)
+            {
+                ctx.set_value(val.clone());
+                return Ok(());
             }
             ctx.set_value(SqliteValue::Null);
             Ok(())

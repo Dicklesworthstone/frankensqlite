@@ -558,7 +558,7 @@ impl DecisionLog {
         let mut sorted = calibrated;
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2) {
             f64::midpoint(sorted[n / 2 - 1], sorted[n / 2])
         } else {
             sorted[n / 2]

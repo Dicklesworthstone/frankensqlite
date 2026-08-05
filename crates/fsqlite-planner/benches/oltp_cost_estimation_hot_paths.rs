@@ -199,14 +199,14 @@ fn parse_iterations() -> u64 {
     let mut args = env::args().skip(1);
     let mut iterations = DEFAULT_ITERATIONS;
     while let Some(arg) = args.next() {
-        if arg == "--iterations" {
-            if let Some(value) = args.next() {
-                match value.parse() {
-                    Ok(parsed) => iterations = parsed,
-                    Err(_) => {
-                        eprintln!("invalid --iterations value: {value}");
-                        std::process::exit(2);
-                    }
+        if arg == "--iterations"
+            && let Some(value) = args.next()
+        {
+            match value.parse() {
+                Ok(parsed) => iterations = parsed,
+                Err(_) => {
+                    eprintln!("invalid --iterations value: {value}");
+                    std::process::exit(2);
                 }
             }
         }

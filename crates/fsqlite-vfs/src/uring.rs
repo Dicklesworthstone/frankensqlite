@@ -1853,7 +1853,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("shared_ring_100_reads.db");
             let mut seeded = vec![0_u8; READ_COUNT * READ_SIZE];
-            for (page_index, page) in seeded.chunks_exact_mut(READ_SIZE).enumerate() {
+            for (page_index, page) in seeded.as_chunks_mut::<READ_SIZE>().0.iter_mut().enumerate() {
                 page.fill(u8::try_from(page_index).expect("100 pages fit in u8"));
             }
             std::fs::write(&path, seeded).expect("synchronous seed write should succeed");

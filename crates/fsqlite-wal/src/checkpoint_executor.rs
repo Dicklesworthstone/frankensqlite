@@ -191,13 +191,13 @@ pub async fn execute_checkpoint<F: VfsFile>(
             // length is too small (tests with tiny pages), we skip the
             // capture silently — this is additive insurance, not a hard
             // invariant.
-            if page_data.len() >= crate::checksum::PAGE_CHECKSUM_RESERVED_BYTES {
-                if let Ok(checksum) = crate::checksum::read_page_checksum(page_data) {
-                    expected_checksums.push(ExpectedPageChecksum {
-                        page: *page_no,
-                        checksum,
-                    });
-                }
+            if page_data.len() >= crate::checksum::PAGE_CHECKSUM_RESERVED_BYTES
+                && let Ok(checksum) = crate::checksum::read_page_checksum(page_data)
+            {
+                expected_checksums.push(ExpectedPageChecksum {
+                    page: *page_no,
+                    checksum,
+                });
             }
 
             debug!(
@@ -212,11 +212,11 @@ pub async fn execute_checkpoint<F: VfsFile>(
 
         // If the checkpoint completed fully, truncate the database to the last
         // committed size.
-        if matches!(plan.progress, CheckpointProgress::Complete) {
-            if let Some(db_size) = last_db_size {
-                target.truncate_db(cx, db_size).await?;
-                target.sync_db(cx).await?;
-            }
+        if matches!(plan.progress, CheckpointProgress::Complete)
+            && let Some(db_size) = last_db_size
+        {
+            target.truncate_db(cx, db_size).await?;
+            target.sync_db(cx).await?;
         }
     }
 
