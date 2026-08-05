@@ -2747,6 +2747,20 @@ fn validate_persistent_profile_scorecards(
         tested_commit,
         PersistentProfile::ReleasePerf,
     )?;
+    validate_persistent_profile_pairing(&release, &release_perf)
+}
+
+/// Cross-profile pairing contract for the two persistent citation identities.
+///
+/// The release and release-perf captures must come from the same worker, host,
+/// and workload so their numbers are comparable, yet must carry distinct build
+/// nonces because each profile produces its own binary. Equal nonces mean one
+/// build identity was replayed under both profile labels, which would let a
+/// single `release-perf` binary masquerade as the portable `release` capture.
+fn validate_persistent_profile_pairing(
+    release: &PersistentCitationIdentity,
+    release_perf: &PersistentCitationIdentity,
+) -> Result<(), String> {
     if release.actual_worker != release_perf.actual_worker
         || release.actual_host != release_perf.actual_host
         || release.workload != release_perf.workload
@@ -2756,10 +2770,6 @@ fn validate_persistent_profile_scorecards(
                 .to_owned(),
         );
     }
-    // Profile-specific builds need independent nonces. Each receipt already
-    // requires a canonical 64-hex nonce; equality across the two leaves means a
-    // single build identity was replayed under both profile labels, so reject it
-    // here rather than treating the pair as two independent captures.
     if release.nonce == release_perf.nonce {
         return Err(format!(
             "persistent release and release-perf receipts must record distinct build nonces; both recorded `{}`",
@@ -7981,6 +7991,162 @@ fn test_regression_guard_persistent_citation_requires_v2_job_receipts() {
         )
         .is_err(),
         "numeric job ids above 2^53 must not deserialize as exact receipt identities"
+    );
+}
+
+#[test]
+fn test_regression_guard_cargo_profile_binding_rejects_swapped_profiles() {
+    // Canonical pairs are the only accepted shape.
+    assert!(
+        validate_cargo_profile_binding(
+            "scorecard",
+            PersistentProfile::Release,
+            Some("release"),
+            Some("z"),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_cargo_profile_binding(
+            "pack manifest",
+            PersistentProfile::ReleasePerf,
+            Some("release-perf"),
+            Some("3"),
+        )
+        .is_ok()
+    );
+
+    // A whole capture presented under the other profile's label.
+    for (profile, cargo_profile, opt_level) in [
+        (PersistentProfile::Release, "release-perf", "3"),
+        (PersistentProfile::ReleasePerf, "release", "z"),
+    ] {
+        assert!(
+            validate_cargo_profile_binding(
+                "scorecard",
+                profile,
+                Some(cargo_profile),
+                Some(opt_level),
+            )
+            .is_err(),
+            "a {cargo_profile}/{opt_level} pair must not satisfy the {} binding",
+            profile.receipt_name()
+        );
+    }
+
+    // Correct profile name carrying the other profile's opt level, and the
+    // reverse: an optimization-level swap alone must still fail closed.
+    for (profile, cargo_profile, opt_level) in [
+        (PersistentProfile::Release, "release", "3"),
+        (PersistentProfile::ReleasePerf, "release-perf", "z"),
+        (PersistentProfile::Release, "release-perf", "z"),
+        (PersistentProfile::ReleasePerf, "release", "3"),
+    ] {
+        assert!(
+            validate_cargo_profile_binding(
+                "pack manifest",
+                profile,
+                Some(cargo_profile),
+                Some(opt_level),
+            )
+            .is_err(),
+            "{cargo_profile}/{opt_level} must not satisfy the {} binding",
+            profile.receipt_name()
+        );
+    }
+
+    // Absent fields never pass: a pack that simply omits the binding is not
+    // silently exempt.
+    for (cargo_profile, opt_level) in [
+        (None, None),
+        (Some("release"), None),
+        (None, Some("z")),
+        (Some(""), Some("")),
+    ] {
+        assert!(
+            validate_cargo_profile_binding(
+                "scorecard",
+                PersistentProfile::Release,
+                cargo_profile,
+                opt_level,
+            )
+            .is_err(),
+            "absent or empty cargo profile binding must fail closed"
+        );
+    }
+
+    // The c1 pack is single-profile and deliberately exempt from the binding.
+    assert!(persistent_profile_for_kind("c1").is_none());
+    assert_eq!(
+        persistent_profile_for_kind("persistent/release"),
+        Some(PersistentProfile::Release)
+    );
+    assert_eq!(
+        persistent_profile_for_kind("persistent/release-perf"),
+        Some(PersistentProfile::ReleasePerf)
+    );
+}
+
+#[test]
+fn test_regression_guard_persistent_profiles_reject_equal_build_nonces() {
+    let workload = || PersistentWorkload {
+        benchmark: "persistent_concurrent_write_{1,8,16}t".to_owned(),
+        rows_per_thread: 1000,
+        synchronous: "NORMAL".to_owned(),
+        threads: vec![1, 8, 16],
+        criterion: PersistentCriterion {
+            sample_size: 10,
+            warmup_secs: 1,
+            measurement_secs: 1,
+            export_root: "{phase}/criterion_measurements".to_owned(),
+            headline_source:
+                "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json".to_owned(),
+        },
+    };
+    let identity = |nonce: &str, worker: &str, host: &str| PersistentCitationIdentity {
+        actual_worker: worker.to_owned(),
+        actual_host: host.to_owned(),
+        nonce: nonce.to_owned(),
+        workload: workload(),
+    };
+    let release_nonce = "c".repeat(64);
+    let release_perf_nonce = "d".repeat(64);
+
+    // Same worker/host/workload with distinct nonces is the authentic shape.
+    assert!(
+        validate_persistent_profile_pairing(
+            &identity(&release_nonce, "ovh-a", "worker.example.test"),
+            &identity(&release_perf_nonce, "ovh-a", "worker.example.test"),
+        )
+        .is_ok()
+    );
+
+    // One build identity replayed under both profile labels must fail closed.
+    let replayed = validate_persistent_profile_pairing(
+        &identity(&release_nonce, "ovh-a", "worker.example.test"),
+        &identity(&release_nonce, "ovh-a", "worker.example.test"),
+    )
+    .expect_err("equal build nonces must not pair");
+    assert!(
+        replayed.contains("distinct build nonces"),
+        "equal-nonce rejection must name the nonce contract; got `{replayed}`"
+    );
+
+    // The pre-existing worker/host/workload contract still fails first, so a
+    // distinct nonce cannot buy admission for a cross-worker pair.
+    assert!(
+        validate_persistent_profile_pairing(
+            &identity(&release_nonce, "ovh-a", "worker.example.test"),
+            &identity(&release_perf_nonce, "ovh-b", "worker.example.test"),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_persistent_profile_pairing(
+            &identity(&release_nonce, "ovh-a", "worker.example.test"),
+            &identity(&release_perf_nonce, "ovh-a", "other.example.test"),
+        )
+        .is_err()
     );
 }
 
