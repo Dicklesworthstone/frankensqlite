@@ -64,7 +64,328 @@ mod tests {
     use fsqlite_error::FrankenError;
     use fsqlite_parser::parse_first_statement_with_tail;
     use fsqlite_types::value::SqliteValue;
-    use std::sync::Arc;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const CONCURRENT_STRESS_CHILD_ENV: &str = "FSQLITE_CONCURRENT_STRESS_CHILD";
+    const CONCURRENT_STRESS_RECEIPT_ENV: &str = "FSQLITE_CONCURRENT_STRESS_RECEIPT";
+    const CONCURRENT_STRESS_RECEIPT_PREFIX: &str = "FSQLITE_CONCURRENT_STRESS_COMPLETE:";
+    const CONCURRENT_STRESS_TEST_NAME: &str = "tests::concurrent_writers_stress_conservation";
+    const CONCURRENT_STRESS_CHILD_TIMEOUT: Duration = Duration::from_secs(90);
+    const CONCURRENT_STRESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+    const CONCURRENT_STRESS_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
+    const CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT: u64 = 128;
+    const CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER: u64 = 2_560;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ConcurrentStressStartDecision {
+        Run,
+        Abort,
+    }
+
+    #[derive(Debug)]
+    enum ConcurrentStressStartup {
+        Ready { worker_id: usize },
+        Failed { worker_id: usize, error: String },
+    }
+
+    struct ConcurrentStressStartGate {
+        senders: Vec<mpsc::SyncSender<ConcurrentStressStartDecision>>,
+        armed: bool,
+    }
+
+    impl ConcurrentStressStartGate {
+        fn new(senders: Vec<mpsc::SyncSender<ConcurrentStressStartDecision>>) -> Self {
+            Self {
+                senders,
+                armed: true,
+            }
+        }
+
+        fn release(mut self) -> Result<(), String> {
+            let mut failures = Vec::new();
+            for (worker_id, sender) in self.senders.iter().enumerate() {
+                if sender.send(ConcurrentStressStartDecision::Run).is_err() {
+                    failures.push(worker_id);
+                }
+            }
+            if failures.is_empty() {
+                self.armed = false;
+                Ok(())
+            } else {
+                Err(format!(
+                    "workers disconnected before the run decision: {failures:?}"
+                ))
+            }
+        }
+    }
+
+    impl Drop for ConcurrentStressStartGate {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            for sender in &self.senders {
+                let _ = sender.try_send(ConcurrentStressStartDecision::Abort);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct ConcurrentStressRetryCounts {
+        busy: u64,
+        busy_recovery: u64,
+        busy_snapshot: u64,
+        database_locked: u64,
+        write_conflict: u64,
+        serialization_failure: u64,
+    }
+
+    impl ConcurrentStressRetryCounts {
+        fn record(&mut self, error: &FrankenError) -> bool {
+            match error {
+                FrankenError::Busy => self.busy += 1,
+                FrankenError::BusyRecovery => self.busy_recovery += 1,
+                FrankenError::BusySnapshot { .. } => self.busy_snapshot += 1,
+                FrankenError::DatabaseLocked { .. } => self.database_locked += 1,
+                FrankenError::WriteConflict { .. } => self.write_conflict += 1,
+                FrankenError::SerializationFailure { .. } => self.serialization_failure += 1,
+                _ => return false,
+            }
+            true
+        }
+
+        const fn total(self) -> u64 {
+            self.busy
+                + self.busy_recovery
+                + self.busy_snapshot
+                + self.database_locked
+                + self.write_conflict
+                + self.serialization_failure
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConcurrentStressWorkerOutcome {
+        worker_id: usize,
+        concurrent_mode_default: bool,
+        commits: u64,
+        attempts: u64,
+        max_attempts_for_commit: u64,
+        retries: ConcurrentStressRetryCounts,
+        elapsed: Duration,
+        failure: Option<String>,
+    }
+
+    impl ConcurrentStressWorkerOutcome {
+        fn pending(worker_id: usize) -> Self {
+            Self {
+                worker_id,
+                concurrent_mode_default: false,
+                commits: 0,
+                attempts: 0,
+                max_attempts_for_commit: 0,
+                retries: ConcurrentStressRetryCounts::default(),
+                elapsed: Duration::ZERO,
+                failure: Some("worker exited without recording an outcome".to_owned()),
+            }
+        }
+    }
+
+    fn supervise_concurrent_writer_stress() -> bool {
+        match (
+            std::env::var_os(CONCURRENT_STRESS_CHILD_ENV),
+            std::env::var_os(CONCURRENT_STRESS_RECEIPT_ENV),
+        ) {
+            (Some(child_token), Some(receipt_token)) if child_token == receipt_token => {
+                return false;
+            }
+            (None, None) => {}
+            _ => panic!("inconsistent inherited concurrent-stress supervision environment"),
+        }
+
+        let receipt_token = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock must be after the Unix epoch")
+                .as_nanos()
+        );
+        let expected_receipt = format!("{CONCURRENT_STRESS_RECEIPT_PREFIX}{receipt_token}");
+        let mut child =
+            Command::new(std::env::current_exe().expect("resolve current fsqlite test executable"))
+                .args([
+                    "--exact",
+                    CONCURRENT_STRESS_TEST_NAME,
+                    "--include-ignored",
+                    "--nocapture",
+                ])
+                .env(CONCURRENT_STRESS_CHILD_ENV, &receipt_token)
+                .env(CONCURRENT_STRESS_RECEIPT_ENV, &receipt_token)
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn supervised concurrent-writer stress child");
+        let child_stdout = child
+            .stdout
+            .take()
+            .expect("capture concurrent-writer stress child stdout");
+        let mut receipt_reader = Some(std::thread::spawn(move || {
+            let mut receipt_found = false;
+            for line in BufReader::new(child_stdout).lines() {
+                if line.expect("read concurrent-writer stress child stdout") == expected_receipt {
+                    receipt_found = true;
+                }
+            }
+            receipt_found
+        }));
+        let deadline = Instant::now() + CONCURRENT_STRESS_CHILD_TIMEOUT;
+
+        loop {
+            match child
+                .try_wait()
+                .expect("poll supervised concurrent-writer stress child")
+            {
+                Some(status) => {
+                    let receipt_found = receipt_reader
+                        .take()
+                        .expect("receipt reader must be present")
+                        .join()
+                        .expect("concurrent-writer stress receipt reader must not panic");
+                    assert!(
+                        status.success(),
+                        "supervised concurrent-writer stress child failed with {status}"
+                    );
+                    assert!(
+                        receipt_found,
+                        "supervised concurrent-writer stress child exited without its completion receipt"
+                    );
+                    return true;
+                }
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    child
+                        .wait()
+                        .expect("reap timed-out concurrent-writer stress child");
+                    receipt_reader
+                        .take()
+                        .expect("receipt reader must be present")
+                        .join()
+                        .expect("concurrent-writer stress receipt reader must not panic");
+                    panic!(
+                        "supervised concurrent-writer stress test exceeded {:?}",
+                        CONCURRENT_STRESS_CHILD_TIMEOUT
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+
+    fn concurrent_stress_attempt_budget_error(
+        attempts_for_commit: u64,
+        total_attempts: u64,
+        elapsed: Duration,
+    ) -> Option<String> {
+        if attempts_for_commit >= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT {
+            Some(format!(
+                "exhausted {CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT} attempts for one commit"
+            ))
+        } else if total_attempts >= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER {
+            Some(format!(
+                "exhausted {CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER} total attempts"
+            ))
+        } else if elapsed >= CONCURRENT_STRESS_WORKER_TIMEOUT {
+            Some(format!(
+                "exceeded worker deadline {:?}",
+                CONCURRENT_STRESS_WORKER_TIMEOUT
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn concurrent_stress_backoff(attempts_for_commit: u64) {
+        let exponent = attempts_for_commit.saturating_sub(1).min(5) as u32;
+        std::thread::sleep(Duration::from_millis(1_u64 << exponent));
+    }
+
+    async fn concurrent_stress_recover_precommit_transient(
+        conn: &mut Connection,
+        path: &str,
+        outcome: &mut ConcurrentStressWorkerOutcome,
+        attempts_for_commit: u64,
+        started_at: Instant,
+        phase: &str,
+        primary_error: &FrankenError,
+    ) -> Result<(), String> {
+        if !outcome.retries.record(primary_error) {
+            return Err(format!("unexpected {phase} error: {primary_error:?}"));
+        }
+
+        if let Err(cleanup_error) = conn.close_without_checkpoint_in_place().await {
+            let _ = outcome.retries.record(&cleanup_error);
+            conn.close_best_effort_in_place().await;
+            return Err(format!(
+                "connection cleanup after retryable {phase} error {primary_error:?} failed: \
+                 {cleanup_error:?}; best-effort teardown was attempted without retrying the \
+                 transaction"
+            ));
+        }
+
+        let mut reopen_attempts = 0_u64;
+        let mut last_open_error = None;
+        loop {
+            if reopen_attempts >= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT
+                || outcome.attempts >= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER
+                || started_at.elapsed() >= CONCURRENT_STRESS_WORKER_TIMEOUT
+            {
+                return Err(format!(
+                    "connection reopen after retryable {phase} error {primary_error:?} exhausted \
+                     its bounded retry budget after {reopen_attempts} attempts; last transient \
+                     error: {}",
+                    last_open_error.as_deref().unwrap_or("none")
+                ));
+            }
+
+            reopen_attempts += 1;
+            outcome.attempts += 1;
+            match Connection::open(path).await {
+                Ok(new_conn) if new_conn.is_concurrent_mode_default() => {
+                    *conn = new_conn;
+                    return Ok(());
+                }
+                Ok(mut new_conn) => {
+                    new_conn.close_best_effort_in_place().await;
+                    return Err(format!(
+                        "connection reopen after retryable {phase} error lost the \
+                         concurrent-writer default"
+                    ));
+                }
+                Err(error) if outcome.retries.record(&error) => {
+                    last_open_error = Some(format!("connection reopen: {error:?}"));
+                    concurrent_stress_backoff(reopen_attempts);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "connection reopen after retryable {phase} error failed: {error:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn concurrent_stress_panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            message
+        } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+            message
+        } else {
+            "non-string panic payload"
+        }
+    }
 
     fn row_values(row: &super::Row) -> Vec<SqliteValue> {
         row.values().to_vec()
@@ -2237,8 +2558,14 @@ mod tests {
     fn values_order_by() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
+            assert!(
+                conn.query("VALUES (3), (1), (2) ORDER BY 1;")
+                    .await
+                    .is_err(),
+                "bare VALUES cannot carry an ORDER BY clause in SQLite grammar"
+            );
             let rows = conn
-                .query("VALUES (3), (1), (2) ORDER BY 1;")
+                .query("SELECT * FROM (VALUES (3), (1), (2)) ORDER BY 1;")
                 .await
                 .unwrap();
             let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
@@ -2258,7 +2585,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let rows = conn
-                .query("VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 2;")
+                .query("SELECT * FROM (VALUES (3), (1), (2)) ORDER BY 1 DESC LIMIT 2;")
                 .await
                 .unwrap();
             let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
@@ -2270,8 +2597,14 @@ mod tests {
     fn values_limit_offset() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
+            assert!(
+                conn.query("VALUES (10), (20), (30), (40) LIMIT 2 OFFSET 1;")
+                    .await
+                    .is_err(),
+                "bare VALUES cannot carry a LIMIT clause in SQLite grammar"
+            );
             let rows = conn
-                .query("VALUES (10), (20), (30), (40) LIMIT 2 OFFSET 1;")
+                .query("SELECT * FROM (VALUES (10), (20), (30), (40)) ORDER BY 1 LIMIT 2 OFFSET 1;")
                 .await
                 .unwrap();
             let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
@@ -6529,236 +6862,621 @@ mod tests {
 
     /// Multi-threaded concurrent writer stress test.
     ///
-    /// 8 writer threads perform 1000 transfer operations each. Validates:
-    /// - Conservation invariant: total balance remains constant
-    /// - No data corruption under concurrent load
-    /// - Proper transaction isolation and conflict handling
+    /// Eight writer threads perform 20 committed transfer operations each.
+    /// The parent process enforces a hard deadline; the child process uses
+    /// bounded, typed retries and fail-closed startup coordination.
     #[test]
     fn concurrent_writers_stress_conservation() {
+        if supervise_concurrent_writer_stress() {
+            return;
+        }
+
+        use rand::prelude::*;
+        use std::thread;
+
+        const NUM_ACCOUNTS: i64 = 100;
+        const INITIAL_BALANCE: i64 = 1_000;
+        const EXPECTED_TOTAL: i64 = NUM_ACCOUNTS * INITIAL_BALANCE;
+        const NUM_WRITERS: usize = 8;
+        const OPS_PER_WRITER: u64 = 20;
+
+        let dir = tempfile::tempdir().expect("create concurrent-stress temp dir");
+        let db_path = dir.path().join("stress.db");
+        let db_path_string = db_path.to_string_lossy().into_owned();
+
         asupersync::test_utils::run_test(|| async {
-            use rand::prelude::*;
-            use std::sync::{Arc, Barrier};
-            use std::thread;
-
-            let dir = tempfile::tempdir().expect("create temp dir");
-            let db_path = dir.path().join("stress.db");
-            let db_path_str = db_path.to_str().unwrap();
-
-            // Number of accounts and initial balance.
-            const NUM_ACCOUNTS: i64 = 100;
-            const INITIAL_BALANCE: i64 = 1000;
-            const EXPECTED_TOTAL: i64 = NUM_ACCOUNTS * INITIAL_BALANCE;
-
-            // Test parameters: 8 writers, 20 ops each (reduced for test speed).
-            const NUM_WRITERS: usize = 8;
-            const OPS_PER_WRITER: u64 = 20;
-
-            // Setup: create table and initial accounts.
-            {
-                let conn = Connection::open(db_path_str)
-                    .await
-                    .expect("open db for setup");
-                conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);")
-                    .await
-                    .expect("create table");
-
-                for i in 0..NUM_ACCOUNTS {
-                    conn.execute(&format!(
-                        "INSERT INTO accounts VALUES ({}, {});",
-                        i, INITIAL_BALANCE
-                    ))
-                    .await
-                    .expect("insert account");
-                }
-
-                // Verify initial total.
-                let rows = conn
-                    .query("SELECT SUM(balance) FROM accounts;")
-                    .await
-                    .expect("sum query");
-                let total = match &row_values(&rows[0])[0] {
-                    SqliteValue::Integer(n) => *n,
-                    other => panic!("unexpected sum type: {:?}", other),
-                };
-                assert_eq!(total, EXPECTED_TOTAL, "initial balance mismatch");
+            let conn = Connection::open(&db_path_string)
+                .await
+                .expect("open concurrent-stress database for setup");
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "setup connection must preserve the concurrent-writer default"
+            );
+            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);")
+                .await
+                .expect("create accounts table");
+            for account_id in 0..NUM_ACCOUNTS {
+                conn.execute(&format!(
+                    "INSERT INTO accounts VALUES ({account_id}, {INITIAL_BALANCE});"
+                ))
+                .await
+                .expect("insert initial account");
             }
+            let rows = conn
+                .query("SELECT COUNT(*), SUM(balance) FROM accounts;")
+                .await
+                .expect("query initial account invariants");
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(NUM_ACCOUNTS));
+            assert_eq!(
+                row_values(&rows[0])[1],
+                SqliteValue::Integer(EXPECTED_TOTAL)
+            );
+            conn.close()
+                .await
+                .expect("close concurrent-stress setup connection");
+        });
 
-            // Synchronize all threads to start at the same time.
-            let barrier = Arc::new(Barrier::new(NUM_WRITERS));
+        let (startup_tx, startup_rx) = mpsc::channel::<ConcurrentStressStartup>();
+        let mut start_senders = Vec::with_capacity(NUM_WRITERS);
+        let mut handles = Vec::with_capacity(NUM_WRITERS);
 
-            // Track results from each thread: (commits, retries, errors).
-            let handles: Vec<_> = (0..NUM_WRITERS)
-                .map(|thread_id| {
-                    let path = db_path_str.to_owned();
-                    let barrier = Arc::clone(&barrier);
+        for worker_id in 0..NUM_WRITERS {
+            let path = db_path_string.clone();
+            let startup_tx = startup_tx.clone();
+            let (start_tx, start_rx) = mpsc::sync_channel(1);
+            start_senders.push(start_tx);
+            handles.push(thread::spawn(move || {
+                let mut outcome = ConcurrentStressWorkerOutcome::pending(worker_id);
+                let started_at = Instant::now();
+                asupersync::test_utils::run_test(|| async {
+                    let mut open_attempts = 0_u64;
+                    let mut last_open_error = None;
+                    let mut conn = loop {
+                        if open_attempts >= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT
+                            || outcome.attempts >= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER
+                            || started_at.elapsed() >= CONCURRENT_STRESS_STARTUP_TIMEOUT
+                        {
+                            let message = format!(
+                                "connection open exhausted its bounded retry budget after {open_attempts} attempts; last transient error: {}",
+                                last_open_error.as_deref().unwrap_or("none")
+                            );
+                            let _ = startup_tx.send(ConcurrentStressStartup::Failed {
+                                worker_id,
+                                error: message.clone(),
+                            });
+                            outcome.failure = Some(message);
+                            return;
+                        }
 
-                    thread::spawn(move || {
-                        let mut outcome = (0_u64, 0_u64, 0_u64);
-                        asupersync::test_utils::run_test(|| async {
-                            let conn = Connection::open(&path).await.expect("open db in thread");
-                            let mut rng = rand::rngs::StdRng::seed_from_u64(thread_id as u64);
+                        open_attempts += 1;
+                        outcome.attempts += 1;
+                        match Connection::open(&path).await {
+                            Ok(conn) => break conn,
+                            Err(error) if outcome.retries.record(&error) => {
+                                last_open_error = Some(format!("connection open: {error:?}"));
+                                concurrent_stress_backoff(open_attempts);
+                            }
+                            Err(error) => {
+                                let message = format!("connection open failed: {error:?}");
+                                let _ = startup_tx.send(ConcurrentStressStartup::Failed {
+                                    worker_id,
+                                    error: message.clone(),
+                                });
+                                outcome.failure = Some(message);
+                                return;
+                            }
+                        }
+                    };
+                    'worker: {
+                    outcome.concurrent_mode_default = conn.is_concurrent_mode_default();
+                    if !outcome.concurrent_mode_default {
+                        let message = "concurrent mode is not enabled by default".to_owned();
+                        let _ = startup_tx.send(ConcurrentStressStartup::Failed {
+                            worker_id,
+                            error: message.clone(),
+                        });
+                        outcome.failure = Some(message);
+                        break 'worker;
+                    }
+                    if startup_tx
+                        .send(ConcurrentStressStartup::Ready { worker_id })
+                        .is_err()
+                    {
+                        outcome.failure = Some("startup coordinator disconnected".to_owned());
+                        break 'worker;
+                    }
+                    match start_rx.recv() {
+                        Ok(ConcurrentStressStartDecision::Run) => {}
+                        Ok(ConcurrentStressStartDecision::Abort) => {
+                            outcome.failure = Some("startup coordinator aborted the run".to_owned());
+                            break 'worker;
+                        }
+                        Err(error) => {
+                            outcome.failure =
+                                Some(format!("startup decision channel disconnected: {error}"));
+                            break 'worker;
+                        }
+                    }
 
-                            let mut commits = 0_u64;
-                            let mut retries = 0_u64;
-                            let mut errors = 0_u64;
+                    outcome.failure = None;
+                    let mut attempts_for_commit = 0_u64;
+                    let mut last_transient_error: Option<String> = None;
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(worker_id as u64);
 
-                            // Wait for all threads to be ready.
-                            barrier.wait();
+                    'transfers: while outcome.commits < OPS_PER_WRITER {
+                        if let Some(budget_error) = concurrent_stress_attempt_budget_error(
+                            attempts_for_commit,
+                            outcome.attempts,
+                            started_at.elapsed(),
+                        ) {
+                            outcome.failure = Some(format!(
+                                "{budget_error}; last transient error: {}",
+                                last_transient_error.as_deref().unwrap_or("none")
+                            ));
+                            break;
+                        }
 
-                            while commits < OPS_PER_WRITER {
-                                // Pick random accounts for transfer.
-                                let from_id = rng.random_range(0..NUM_ACCOUNTS);
-                                let to_id = rng.random_range(0..NUM_ACCOUNTS);
-                                if from_id == to_id {
-                                    continue; // Skip self-transfer.
-                                }
-                                let amount = rng.random_range(1..=10_i64);
+                        outcome.attempts += 1;
+                        attempts_for_commit += 1;
+                        outcome.max_attempts_for_commit =
+                            outcome.max_attempts_for_commit.max(attempts_for_commit);
 
-                                // Start transaction (will be CONCURRENT by default).
-                                if conn.execute("BEGIN;").await.is_err() {
-                                    retries += 1;
-                                    continue;
-                                }
+                        let from_id = rng.random_range(0..NUM_ACCOUNTS);
+                        let to_id = rng.random_range(0..NUM_ACCOUNTS);
+                        if from_id == to_id {
+                            continue;
+                        }
+                        let amount = rng.random_range(1..=10_i64);
 
-                                // Read current balances.
-                                let from_balance = match conn
-                                    .query(&format!(
-                                        "SELECT balance FROM accounts WHERE id = {};",
-                                        from_id
-                                    ))
-                                    .await
-                                {
-                                    Ok(rows) if !rows.is_empty() => {
-                                        match &row_values(&rows[0])[0] {
-                                            SqliteValue::Integer(n) => *n,
-                                            _ => {
-                                                drop(conn.execute("ROLLBACK;").await);
-                                                errors += 1;
-                                                continue;
-                                            }
-                                        }
+                        if let Err(error) = conn.execute("BEGIN;").await {
+                            if outcome.retries.record(&error) {
+                                last_transient_error = Some(format!("BEGIN: {error:?}"));
+                                concurrent_stress_backoff(attempts_for_commit);
+                                continue;
+                            }
+                            outcome.failure =
+                                Some(format!("unexpected BEGIN error: {error:?}"));
+                            break;
+                        }
+
+                        let from_balance = match conn
+                            .query(&format!(
+                                "SELECT balance FROM accounts WHERE id = {from_id};"
+                            ))
+                            .await
+                        {
+                            Ok(rows) if rows.len() == 1 => match &row_values(&rows[0])[0] {
+                                SqliteValue::Integer(balance) => *balance,
+                                other => {
+                                    if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
+                                        outcome.failure = Some(format!(
+                                            "rollback after invalid balance type failed: {rollback_error:?}"
+                                        ));
+                                    } else {
+                                        outcome.failure = Some(format!(
+                                            "balance query returned invalid value: {other:?}"
+                                        ));
                                     }
-                                    _ => {
-                                        drop(conn.execute("ROLLBACK;").await);
-                                        errors += 1;
+                                    break 'transfers;
+                                }
+                            },
+                            Ok(rows) => {
+                                if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
+                                    outcome.failure = Some(format!(
+                                        "rollback after missing account failed: {rollback_error:?}"
+                                    ));
+                                } else {
+                                    outcome.failure = Some(format!(
+                                        "balance query returned {} rows for account {from_id}",
+                                        rows.len()
+                                    ));
+                                }
+                                break;
+                            }
+                            Err(error) => {
+                                let transient_error = format!("balance query: {error:?}");
+                                match concurrent_stress_recover_precommit_transient(
+                                    &mut conn,
+                                    &path,
+                                    &mut outcome,
+                                    attempts_for_commit,
+                                    started_at,
+                                    "balance query",
+                                    &error,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        last_transient_error = Some(transient_error);
+                                        concurrent_stress_backoff(attempts_for_commit);
                                         continue;
                                     }
-                                };
-
-                                // Skip if insufficient balance.
-                                if from_balance < amount {
-                                    drop(conn.execute("ROLLBACK;").await);
-                                    continue;
-                                }
-
-                                // Perform transfer: debit from, credit to.
-                                let debit_result = conn
-                                    .execute(&format!(
-                                        "UPDATE accounts SET balance = balance - {} WHERE id = {};",
-                                        amount, from_id
-                                    ))
-                                    .await;
-                                let credit_result = conn
-                                    .execute(&format!(
-                                        "UPDATE accounts SET balance = balance + {} WHERE id = {};",
-                                        amount, to_id
-                                    ))
-                                    .await;
-
-                                if debit_result.is_err() || credit_result.is_err() {
-                                    drop(conn.execute("ROLLBACK;").await);
-                                    retries += 1;
-                                    continue;
-                                }
-
-                                // Commit transaction.
-                                match conn.execute("COMMIT;").await {
-                                    Ok(_) => commits += 1,
-                                    Err(e) => {
-                                        // Check for BUSY/conflict errors.
-                                        drop(conn.execute("ROLLBACK;").await);
-                                        if format!("{:?}", e).contains("Busy")
-                                            || format!("{:?}", e).contains("busy")
-                                        {
-                                            retries += 1;
-                                        } else {
-                                            // Other error - still count as retry for this test.
-                                            retries += 1;
-                                        }
+                                    Err(recovery_error) => {
+                                        outcome.failure = Some(recovery_error);
+                                        break;
                                     }
                                 }
                             }
+                        };
 
-                            outcome = (commits, retries, errors);
-                        });
-                        outcome
-                    })
-                })
-                .collect();
+                        if from_balance < amount {
+                            if let Err(error) = conn.execute("ROLLBACK;").await {
+                                outcome.failure = Some(format!(
+                                    "rollback after insufficient balance failed: {error:?}"
+                                ));
+                                break;
+                            }
+                            continue;
+                        }
 
-            // Wait for all threads to complete and collect results.
-            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                        match conn
+                            .execute(&format!(
+                                "UPDATE accounts SET balance = balance - {amount} WHERE id = {from_id};"
+                            ))
+                            .await
+                        {
+                            Ok(1) => {}
+                            Ok(affected) => {
+                                if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
+                                    outcome.failure = Some(format!(
+                                        "rollback after debit affected {affected} rows failed: {rollback_error:?}"
+                                    ));
+                                } else {
+                                    outcome.failure = Some(format!(
+                                        "debit affected {affected} rows; expected 1"
+                                    ));
+                                }
+                                break;
+                            }
+                            Err(error) => {
+                                let transient_error = format!("debit: {error:?}");
+                                match concurrent_stress_recover_precommit_transient(
+                                    &mut conn,
+                                    &path,
+                                    &mut outcome,
+                                    attempts_for_commit,
+                                    started_at,
+                                    "debit",
+                                    &error,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        last_transient_error = Some(transient_error);
+                                        concurrent_stress_backoff(attempts_for_commit);
+                                        continue;
+                                    }
+                                    Err(recovery_error) => {
+                                        outcome.failure = Some(recovery_error);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
 
-            // Print thread results for diagnostics.
-            let mut total_commits = 0_u64;
-            let mut total_retries = 0_u64;
-            let mut total_errors = 0_u64;
-            for (i, (commits, retries, errors)) in results.iter().enumerate() {
-                eprintln!(
-                    "Thread {}: {} commits, {} retries, {} errors",
-                    i, commits, retries, errors
-                );
-                total_commits += commits;
-                total_retries += retries;
-                total_errors += errors;
+                        match conn
+                            .execute(&format!(
+                                "UPDATE accounts SET balance = balance + {amount} WHERE id = {to_id};"
+                            ))
+                            .await
+                        {
+                            Ok(1) => {}
+                            Ok(affected) => {
+                                if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
+                                    outcome.failure = Some(format!(
+                                        "rollback after credit affected {affected} rows failed: {rollback_error:?}"
+                                    ));
+                                } else {
+                                    outcome.failure = Some(format!(
+                                        "credit affected {affected} rows; expected 1"
+                                    ));
+                                }
+                                break;
+                            }
+                            Err(error) => {
+                                let transient_error = format!("credit: {error:?}");
+                                match concurrent_stress_recover_precommit_transient(
+                                    &mut conn,
+                                    &path,
+                                    &mut outcome,
+                                    attempts_for_commit,
+                                    started_at,
+                                    "credit",
+                                    &error,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        last_transient_error = Some(transient_error);
+                                        concurrent_stress_backoff(attempts_for_commit);
+                                        continue;
+                                    }
+                                    Err(recovery_error) => {
+                                        outcome.failure = Some(recovery_error);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        match conn.execute("COMMIT;").await {
+                            Ok(_) => {
+                                outcome.commits += 1;
+                                attempts_for_commit = 0;
+                                last_transient_error = None;
+                            }
+                            Err(error) => {
+                                if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
+                                    outcome.failure = Some(format!(
+                                        "rollback after commit error {error:?} failed: {rollback_error:?}"
+                                    ));
+                                    break;
+                                }
+                                if outcome.retries.record(&error) {
+                                    last_transient_error = Some(format!("commit: {error:?}"));
+                                    concurrent_stress_backoff(attempts_for_commit);
+                                    continue;
+                                }
+                                outcome.failure =
+                                    Some(format!("unexpected commit error: {error:?}"));
+                                break;
+                            }
+                        }
+                    }
+
+                    outcome.elapsed = started_at.elapsed();
+                    if outcome.failure.is_none()
+                        && outcome.elapsed > CONCURRENT_STRESS_WORKER_TIMEOUT
+                    {
+                        outcome.failure = Some(format!(
+                            "completed after worker deadline {:?}: {:?}",
+                            CONCURRENT_STRESS_WORKER_TIMEOUT, outcome.elapsed
+                        ));
+                    }
+                    }
+                    if let Err(error) = conn.close_without_checkpoint_in_place().await {
+                        let close_failure = format!("worker connection close failed: {error:?}");
+                        if let Some(failure) = &mut outcome.failure {
+                            failure.push_str("; ");
+                            failure.push_str(&close_failure);
+                        } else {
+                            outcome.failure = Some(close_failure);
+                        }
+                        conn.close_best_effort_in_place().await;
+                    }
+                });
+                outcome
+            }));
+        }
+        drop(startup_tx);
+
+        let mut ready = [false; NUM_WRITERS];
+        let mut ready_count = 0_usize;
+        let startup_deadline = Instant::now() + CONCURRENT_STRESS_STARTUP_TIMEOUT;
+        let mut startup_failure = None;
+        while ready_count < NUM_WRITERS {
+            let remaining = startup_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                startup_failure = Some(format!(
+                    "startup timed out with {ready_count}/{NUM_WRITERS} workers ready"
+                ));
+                break;
             }
-            eprintln!(
-                "Total: {} commits, {} retries, {} errors",
-                total_commits, total_retries, total_errors
-            );
-
-            // Verify conservation invariant: total balance should be unchanged.
-            let conn = Connection::open(db_path_str)
-                .await
-                .expect("reopen db for verification");
-            let rows = conn
-                .query("SELECT SUM(balance) FROM accounts;")
-                .await
-                .expect("final sum query");
-            let final_total = match &row_values(&rows[0])[0] {
-                SqliteValue::Integer(n) => *n,
-                other => panic!("unexpected final sum type: {:?}", other),
-            };
-            assert_eq!(
-                final_total, EXPECTED_TOTAL,
-                "Conservation invariant violated! Expected {}, got {}",
-                EXPECTED_TOTAL, final_total
-            );
-
-            // Verify no negative balances.
-            let rows = conn
-                .query("SELECT COUNT(*) FROM accounts WHERE balance < 0;")
-                .await
-                .expect("negative balance check");
-            let negative_count = match &row_values(&rows[0])[0] {
-                SqliteValue::Integer(n) => *n,
-                other => panic!("unexpected count type: {:?}", other),
-            };
-            assert_eq!(
-                negative_count, 0,
-                "Found {} accounts with negative balance",
-                negative_count
-            );
-
-            // Verify all threads completed their target commits.
-            for (i, (commits, _, _)) in results.iter().enumerate() {
-                assert_eq!(
-                    *commits, OPS_PER_WRITER,
-                    "Thread {} completed {} commits instead of {}",
-                    i, commits, OPS_PER_WRITER
-                );
+            match startup_rx.recv_timeout(remaining) {
+                Ok(ConcurrentStressStartup::Ready { worker_id }) => {
+                    if worker_id >= NUM_WRITERS {
+                        startup_failure =
+                            Some(format!("out-of-range startup worker id {worker_id}"));
+                        break;
+                    }
+                    if std::mem::replace(&mut ready[worker_id], true) {
+                        startup_failure =
+                            Some(format!("duplicate startup receipt from worker {worker_id}"));
+                        break;
+                    }
+                    ready_count += 1;
+                }
+                Ok(ConcurrentStressStartup::Failed { worker_id, error }) => {
+                    startup_failure = Some(format!("worker {worker_id} startup failed: {error}"));
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    startup_failure = Some(format!(
+                        "startup timed out with {ready_count}/{NUM_WRITERS} workers ready"
+                    ));
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    startup_failure = Some(format!(
+                        "startup channel closed with {ready_count}/{NUM_WRITERS} workers ready"
+                    ));
+                    break;
+                }
             }
+        }
+
+        let start_gate = ConcurrentStressStartGate::new(start_senders);
+        let startup_result = if let Some(error) = startup_failure {
+            drop(start_gate);
+            Err(error)
+        } else {
+            start_gate.release()
+        };
+
+        let mut results = Vec::with_capacity(NUM_WRITERS);
+        let mut panics = Vec::new();
+        for (worker_id, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(outcome) => results.push(outcome),
+                Err(payload) => panics.push(format!(
+                    "worker {worker_id} panicked: {}",
+                    concurrent_stress_panic_message(payload.as_ref())
+                )),
+            }
+        }
+        assert!(
+            panics.is_empty(),
+            "concurrent-stress worker panics: {panics:?}"
+        );
+        assert!(
+            startup_result.is_ok(),
+            "concurrent-stress startup failed: {}; outcomes: {results:#?}",
+            startup_result
+                .as_ref()
+                .expect_err("failed startup must carry a diagnostic")
+        );
+        assert_eq!(results.len(), NUM_WRITERS, "missing worker outcomes");
+        results.sort_by_key(|outcome| outcome.worker_id);
+
+        let mut total_commits = 0_u64;
+        let mut total_retries = 0_u64;
+        for (expected_worker_id, outcome) in results.iter().enumerate() {
+            eprintln!("concurrent stress worker outcome: {outcome:#?}");
+            assert_eq!(
+                outcome.worker_id, expected_worker_id,
+                "worker ids must be unique and contiguous"
+            );
+            assert!(
+                outcome.concurrent_mode_default,
+                "worker {} lost the concurrent-writer default",
+                outcome.worker_id
+            );
+            assert!(
+                outcome.failure.is_none(),
+                "worker {} failed: {:?}",
+                outcome.worker_id,
+                outcome.failure
+            );
+            assert_eq!(
+                outcome.commits, OPS_PER_WRITER,
+                "worker {} committed the wrong number of transfers",
+                outcome.worker_id
+            );
+            assert!(
+                outcome.attempts <= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER,
+                "worker {} exceeded its attempt budget",
+                outcome.worker_id
+            );
+            assert!(
+                outcome.max_attempts_for_commit <= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT,
+                "worker {} exceeded its per-commit attempt budget",
+                outcome.worker_id
+            );
+            assert!(
+                outcome.elapsed <= CONCURRENT_STRESS_WORKER_TIMEOUT,
+                "worker {} exceeded its elapsed-time budget",
+                outcome.worker_id
+            );
+            total_commits += outcome.commits;
+            total_retries += outcome.retries.total();
+        }
+        assert_eq!(
+            total_commits,
+            u64::try_from(NUM_WRITERS).expect("writer count fits u64") * OPS_PER_WRITER
+        );
+        eprintln!("concurrent stress total retries: {total_retries}");
+
+        let mut final_invariants = None;
+        let mut final_integrity = None;
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(&db_path_string)
+                .await
+                .expect("reopen concurrent-stress database for verification");
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "verification connection must preserve the concurrent-writer default"
+            );
+            let rows = conn
+                .query(
+                    "SELECT COUNT(*), SUM(balance),\
+                     SUM(CASE WHEN balance < 0 THEN 1 ELSE 0 END) FROM accounts;",
+                )
+                .await
+                .expect("query final account invariants");
+            final_invariants = Some(rows.iter().map(row_values).collect::<Vec<_>>());
+            let integrity = conn
+                .query("PRAGMA integrity_check;")
+                .await
+                .expect("run final integrity check");
+            final_integrity = Some(integrity.iter().map(row_values).collect::<Vec<_>>());
+            conn.close()
+                .await
+                .expect("close concurrent-stress verification connection");
         });
+        assert_eq!(
+            final_invariants,
+            Some(vec![vec![
+                SqliteValue::Integer(NUM_ACCOUNTS),
+                SqliteValue::Integer(EXPECTED_TOTAL),
+                SqliteValue::Integer(0),
+            ]]),
+            "final aggregate invariants must have exact INTEGER storage classes"
+        );
+        assert_eq!(
+            final_integrity,
+            Some(vec![vec![SqliteValue::Text("ok".into())]]),
+            "integrity_check must return exactly one TEXT ok row"
+        );
+
+        let receipt_token = std::env::var(CONCURRENT_STRESS_RECEIPT_ENV)
+            .expect("supervised child must inherit its receipt token");
+        println!("{CONCURRENT_STRESS_RECEIPT_PREFIX}{receipt_token}");
+    }
+
+    #[test]
+    fn concurrent_stress_start_gate_aborts_all_waiters_on_failure() {
+        let mut senders = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            senders.push(sender);
+            handles.push(std::thread::spawn(move || {
+                receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("abort decision must reach every startup waiter")
+            }));
+        }
+        drop(ConcurrentStressStartGate::new(senders));
+        for handle in handles {
+            assert_eq!(
+                handle.join().expect("startup waiter must be joined"),
+                ConcurrentStressStartDecision::Abort
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_stress_retry_budget_is_exact_and_finite() {
+        let mut attempts = 0_u64;
+        let mut retries = ConcurrentStressRetryCounts::default();
+        let exhaustion = loop {
+            if let Some(error) =
+                concurrent_stress_attempt_budget_error(attempts, attempts, Duration::ZERO)
+            {
+                break error;
+            }
+            attempts += 1;
+            assert!(retries.record(&FrankenError::Busy));
+        };
+        assert_eq!(attempts, CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT);
+        assert_eq!(retries.busy, CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT);
+        assert!(exhaustion.contains("attempts for one commit"));
+        assert!(retries.record(&FrankenError::BusyRecovery));
+        assert_eq!(retries.busy_recovery, 1);
+        assert!(
+            concurrent_stress_attempt_budget_error(
+                0,
+                CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER,
+                Duration::ZERO,
+            )
+            .expect("the total-attempt budget must be finite")
+            .contains("total attempts")
+        );
+        assert!(
+            concurrent_stress_attempt_budget_error(0, 0, CONCURRENT_STRESS_WORKER_TIMEOUT,)
+                .expect("the elapsed-time budget must be finite")
+                .contains("worker deadline")
+        );
     }
 
     /// Verify that concurrent readers see consistent snapshots.
