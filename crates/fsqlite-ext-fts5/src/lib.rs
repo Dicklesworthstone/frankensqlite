@@ -12523,6 +12523,97 @@ mod tests {
     }
 
     #[test]
+    fn test_contentless_lazy_append_discards_each_batch_resident_state() {
+        const HISTORICAL_ROWS: usize = 1_000_000;
+        const BATCH_WIDTH: usize = 3;
+        const BATCH_WIDTH_U64: u64 = 3;
+        const BATCH_COUNT: usize = 4;
+
+        fn assert_no_transient_state(table: &Fts5Table) {
+            assert!(
+                table.documents.is_empty(),
+                "lazy table must retain no documents"
+            );
+            assert!(
+                table.index.index.is_empty(),
+                "lazy table must retain no main terms"
+            );
+            assert!(
+                table
+                    .index
+                    .prefix_indexes
+                    .values()
+                    .all(|index| index.is_empty()),
+                "lazy table must retain no prefix terms"
+            );
+            assert!(
+                table.index.doc_ids.is_empty(),
+                "lazy table must retain no docids"
+            );
+            assert!(
+                table.index.doc_terms.is_empty(),
+                "lazy table must retain no document-to-term references"
+            );
+            assert!(
+                table.index.doc_lengths.as_ref().is_none_or(Vec::is_empty),
+                "lazy table must retain no document-length state"
+            );
+            assert!(
+                table.row_locales.is_empty(),
+                "lazy table must retain no locale state"
+            );
+            assert!(
+                table.shadow_rows.is_none(),
+                "lazy table must read historical state from the host, not retain shadow rows"
+            );
+        }
+
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "messages_fts", "body", "content=''"])
+                .unwrap();
+        table.mark_lazy_on_disk(HISTORICAL_ROWS);
+
+        assert!(table.is_lazy_on_disk());
+        assert_eq!(table.row_count(), HISTORICAL_ROWS);
+        assert_no_transient_state(&table);
+
+        for batch in 0..BATCH_COUNT {
+            let batch_start = 10_000_i64
+                + i64::try_from(batch * BATCH_WIDTH).expect("small test row offset fits i64");
+            let rowids: Vec<i64> = (0..BATCH_WIDTH)
+                .map(|offset| {
+                    batch_start + i64::try_from(offset).expect("small test row offset fits i64")
+                })
+                .collect();
+
+            for rowid in &rowids {
+                let values = vec![format!("batch-{batch} unique-term-{rowid}")];
+                table.insert_document(*rowid, &values);
+            }
+
+            assert!(table.is_lazy_on_disk());
+            assert_eq!(table.documents.len(), BATCH_WIDTH);
+            assert_eq!(table.index.total_docs(), BATCH_WIDTH_U64);
+            assert_eq!(table.index.doc_terms.len(), BATCH_WIDTH);
+            assert!(
+                !table.index.index.is_empty(),
+                "the current batch must materialize postings before persistence"
+            );
+
+            table.note_lazy_inserted_rows(&rowids);
+
+            assert!(table.is_lazy_on_disk());
+            assert_eq!(
+                table.row_count(),
+                HISTORICAL_ROWS + (batch + 1) * BATCH_WIDTH,
+                "only the persisted row-count metadata may grow across batches"
+            );
+            assert_no_transient_state(&table);
+        }
+    }
+
+    #[test]
     fn test_fts5_open_shadow_rows_rejects_inconsistent_stock_layout() {
         let cx = Cx::new();
         let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();

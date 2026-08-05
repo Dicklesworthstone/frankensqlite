@@ -842,7 +842,7 @@ fn open_with_flags_read_only_supports_datetime_builtin() {
 
 #[cfg(all(feature = "native", any(unix, windows)))]
 #[test]
-fn open_with_flags_read_only_query_preserves_every_database_artifact() {
+fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() {
     asupersync::test_utils::run_test(|| async {
         use std::fs::{File, FileTimes};
         use std::time::{Duration, UNIX_EPOCH};
@@ -864,11 +864,11 @@ fn open_with_flags_read_only_query_preserves_every_database_artifact() {
             )
             .await
             .expect("seed WAL-backed row");
-        drop(writable);
-
         let namespace_gate = suffixed_path(&path, "-fsqlite-ns-gate");
         let namespace_use = suffixed_path(&path, "-fsqlite-ns-use");
         let wal = suffixed_path(&path, "-wal");
+        #[cfg(unix)]
+        let shm = suffixed_path(&path, "-shm");
         assert!(
             namespace_gate.exists(),
             "writer must publish the namespace gate"
@@ -881,6 +881,11 @@ fn open_with_flags_read_only_query_preserves_every_database_artifact() {
             wal.exists(),
             "fixture must retain a WAL companion for readback"
         );
+        #[cfg(unix)]
+        assert!(
+            shm.exists(),
+            "GH #294 steady-state fixture must retain an existing SHM companion"
+        );
 
         let sentinel_modified = UNIX_EPOCH + Duration::from_secs(946_684_800);
         File::options()
@@ -890,6 +895,32 @@ fn open_with_flags_read_only_query_preserves_every_database_artifact() {
             .set_times(FileTimes::new().set_modified(sentinel_modified))
             .expect("set namespace identity timestamp sentinel");
         let before = snapshot_directory_files(dir.path());
+        let expected_names = std::collections::BTreeSet::from([
+            path.file_name().expect("database file name").to_owned(),
+            namespace_gate
+                .file_name()
+                .expect("namespace gate file name")
+                .to_owned(),
+            namespace_use
+                .file_name()
+                .expect("namespace use file name")
+                .to_owned(),
+            wal.file_name().expect("WAL file name").to_owned(),
+        ]);
+        #[cfg(unix)]
+        let expected_names = {
+            let mut expected_names = expected_names;
+            expected_names.insert(shm.file_name().expect("SHM file name").to_owned());
+            expected_names
+        };
+        assert_eq!(
+            before
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_names,
+            "GH #294 steady-state fixture must contain exactly main, WAL, namespace, and any native filesystem-backed SHM artifacts before the read-only open"
+        );
 
         let readonly = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .await
@@ -908,8 +939,9 @@ fn open_with_flags_read_only_query_preserves_every_database_artifact() {
         assert_eq!(
             snapshot_directory_files(dir.path()),
             before,
-            "read-only open/query must preserve the complete DB, namespace, WAL, and companion file set byte-for-byte without touching modification or change times"
+            "GH #294 steady-state read-only schema-only open/query must preserve exact artifact keys plus all bytes, modification times, and Unix change times"
         );
+        drop(writable);
     });
 }
 
@@ -962,7 +994,7 @@ fn open_with_flags_read_only_opens_stock_database_without_touching_it() {
 
 #[cfg(all(feature = "native", any(unix, windows)))]
 #[test]
-fn open_with_flags_rebinds_copied_or_corrupt_namespace_sidecars() {
+fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
         let source = dir.path().join("readonly_namespace_source.db");
@@ -1017,6 +1049,19 @@ fn open_with_flags_rebinds_copied_or_corrupt_namespace_sidecars() {
         let target_use_path = suffixed_path(&target, "-fsqlite-ns-use");
         std::fs::write(&target_use_path, b"corrupt copied namespace state")
             .expect("corrupt the quiescent machine-local namespace record");
+        let before_recovery = snapshot_directory_files(dir.path());
+        let namespace_use_name = target_use_path
+            .file_name()
+            .expect("namespace use file name")
+            .to_owned();
+        assert_eq!(
+            before_recovery
+                .get(&namespace_use_name)
+                .expect("snapshot corrupt namespace use artifact")
+                .bytes,
+            b"corrupt copied namespace state",
+            "GH #294 recovery fixture must begin with the intentional namespace corruption"
+        );
         let repaired = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .await
             .expect("corrupt quiescent namespace state must be repairable");
@@ -1029,6 +1074,54 @@ fn open_with_flags_rebinds_copied_or_corrupt_namespace_sidecars() {
             .close_without_checkpoint()
             .await
             .expect("close repaired read-only connection");
+
+        let after_recovery = snapshot_directory_files(dir.path());
+        assert_eq!(
+            after_recovery
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            before_recovery
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "GH #294 namespace recovery must not add or remove artifacts"
+        );
+        for (name, before_artifact) in &before_recovery {
+            if name != &namespace_use_name {
+                assert_eq!(
+                    after_recovery.get(name),
+                    Some(before_artifact),
+                    "GH #294 namespace recovery must leave {name:?} byte-for-byte and timestamp-identical"
+                );
+            }
+        }
+        assert_ne!(
+            after_recovery
+                .get(&namespace_use_name)
+                .expect("snapshot rebound namespace use artifact")
+                .bytes,
+            b"corrupt copied namespace state",
+            "GH #294 namespace recovery must replace the corrupt namespace identity"
+        );
+
+        let rebound = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .expect("rebound namespace identity must remain valid for a new read-only open");
+        let rebound_row = rebound
+            .query_row("SELECT value FROM copied_probe")
+            .await
+            .expect("query through the persisted rebound namespace identity");
+        assert_eq!(rebound_row.get(0), Some(&SqliteValue::Integer(17)));
+        rebound
+            .close_without_checkpoint()
+            .await
+            .expect("close read-only rebound namespace verification connection");
+        assert_eq!(
+            snapshot_directory_files(dir.path()),
+            after_recovery,
+            "GH #294 valid rebound verification must not mutate any artifact"
+        );
 
         assert_eq!(
             std::fs::read(&target).expect("re-read copied database bytes"),
