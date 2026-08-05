@@ -466,7 +466,7 @@ async fn run_contract() {
     }
 }
 
-fn run_entrypoint() {
+pub(crate) fn run_entrypoint() {
     {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
@@ -489,10 +489,6 @@ fn run_entrypoint() {
         .build()
         .expect("build minmax contract runtime");
     runtime.block_on(run_contract());
-}
-
-fn main() {
-    run_entrypoint();
 }
 
 #[cfg(test)]

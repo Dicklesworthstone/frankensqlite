@@ -56,7 +56,7 @@ tempfile = { workspace = true }
 
 [[bench]]
 name = "minmax_prefix_contract_bench"
-path = "tests/minmax_prefix_profile.rs"
+path = "benches/minmax_prefix_contract_bench.rs"
 harness = false
 
 [lints]
