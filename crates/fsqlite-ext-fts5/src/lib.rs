@@ -12555,7 +12555,11 @@ mod tests {
                 "lazy table must retain no document-to-term references"
             );
             assert!(
-                table.index.doc_lengths.as_ref().is_none_or(Vec::is_empty),
+                table
+                    .index
+                    .doc_lengths
+                    .as_ref()
+                    .is_none_or(|lengths| lengths.is_empty()),
                 "lazy table must retain no document-length state"
             );
             assert!(
