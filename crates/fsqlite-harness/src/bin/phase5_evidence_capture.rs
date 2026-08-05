@@ -867,6 +867,16 @@ fn append_chunks(receiver: &Receiver<StreamChunk>, stdout: &mut Vec<u8>, stderr:
     }
 }
 
+fn missing_adopted_job_error(worker: &str, stderr: &[u8]) -> String {
+    let detail = String::from_utf8_lossy(stderr);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        format!("RCH command was never observed as the sole active job on `{worker}`")
+    } else {
+        format!("RCH command was never observed as the sole active job on `{worker}`: {detail}")
+    }
+}
+
 fn rch_status(root: &Path) -> Result<Vec<u8>, String> {
     let output = Command::new("rch")
         .args([
@@ -1280,9 +1290,7 @@ fn strict_cargo(root: &Path, worker: &str, argv: &[String]) -> Result<StrictOutp
         .join()
         .map_err(|_| "RCH stderr reader panicked".to_owned())??;
     append_chunks(&receiver, &mut stdout, &mut stderr);
-    let adopted_job = adopted_job.ok_or_else(|| {
-        format!("RCH command was never observed as the sole active job on `{worker}`")
-    })?;
+    let adopted_job = adopted_job.ok_or_else(|| missing_adopted_job_error(worker, &stderr))?;
     let job_id = adopted_job.id.to_string();
     let active_status = active_status
         .ok_or_else(|| format!("RCH job {job_id} was never observed active on `{worker}`"))?;
@@ -2397,8 +2405,9 @@ mod tests {
     use super::{
         AdoptedRchJob, BUILD_SHAPING_ENV_EXACT, PackKind, adopt_active_job,
         completed_status_matches, external_pack_source_names, is_build_shaping_env,
-        parallel_map_ordered, parse_single_worker, parse_worker_pool, pin_adopted_job,
-        strict_rch_command, validate_persistent_citation_receipt, validate_remote_target_mapping,
+        missing_adopted_job_error, parallel_map_ordered, parse_single_worker, parse_worker_pool,
+        pin_adopted_job, strict_rch_command, validate_persistent_citation_receipt,
+        validate_remote_target_mapping,
     };
     use serde_json::Value;
 
@@ -2422,6 +2431,26 @@ mod tests {
         ] {
             assert!(parse_worker_pool(invalid).is_err(), "accepted `{invalid}`");
         }
+    }
+
+    #[test]
+    fn missing_adopted_job_error_retains_rch_failure_detail() {
+        assert_eq!(
+            missing_adopted_job_error("ovh-a", b""),
+            "RCH command was never observed as the sole active job on `ovh-a`"
+        );
+        assert_eq!(
+            missing_adopted_job_error("ovh-a", b"  \n\t"),
+            "RCH command was never observed as the sole active job on `ovh-a`"
+        );
+        assert_eq!(
+            missing_adopted_job_error("ovh-a", b"  RCH-E301: remote execution refused\n"),
+            "RCH command was never observed as the sole active job on `ovh-a`: RCH-E301: remote execution refused"
+        );
+        assert_eq!(
+            missing_adopted_job_error("ovh-a", b"\xff remote failure"),
+            "RCH command was never observed as the sole active job on `ovh-a`: \u{fffd} remote failure"
+        );
     }
 
     #[test]
