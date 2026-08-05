@@ -933,7 +933,10 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
             row.get(1),
             Some(&SqliteValue::Text("preserved".to_owned().into()))
         );
-        drop(readonly);
+        readonly
+            .close_without_checkpoint()
+            .await
+            .expect("close steady-state read-only connection without a checkpoint");
 
         assert_eq!(
             snapshot_directory_files(dir.path()),
