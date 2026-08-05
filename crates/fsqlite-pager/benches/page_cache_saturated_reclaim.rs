@@ -91,7 +91,7 @@ fn sha256_file(path: &Path) -> (String, u64) {
     let mut file = File::open(path).expect("open benchmark executable for identity hashing");
     let byte_len = file.metadata().expect("stat benchmark executable").len();
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1_024];
+    let mut buffer = [0_u8; 8 * 1_024];
     loop {
         let read = file
             .read(&mut buffer)
