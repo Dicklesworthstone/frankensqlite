@@ -92,13 +92,13 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   Do not use this release where the database directory is immutable or where a
   copied database must open directly from read-only media
   ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140)). The
-  namespace-sidecar rewrite reported in
+  explicit-read-only subcase reported in
   [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294) is fixed
-  and verified on Unix for explicit read-only opens of a database FrankenSQLite
-  has opened before: regression coverage snapshots every directory entry and
-  modification time across an open plus a WAL-backed query and requires full
-  byte equality. The default-open and first-contact paths are not covered by
-  that proof, and the first-contact case remains tracked in #140.
+  and verified on Unix for `OpenFlags::SQLITE_OPEN_READ_ONLY` opens of a database
+  FrankenSQLite has opened before: regression coverage snapshots every
+  directory entry and modification time across an open plus a WAL-backed query
+  and requires full byte equality. Broader default-open behavior remains under
+  #294; first-contact namespace mutation remains tracked in #140.
 - **Windows WAL lock interoperability does not yet extend to shared-memory
   contents.** FrankenSQLite mirrors ordinary WAL lock slots onto stock
   SQLite's real `-shm` lock bytes, but its shared-memory region contents remain
