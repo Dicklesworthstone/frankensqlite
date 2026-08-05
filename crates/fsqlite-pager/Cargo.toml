@@ -56,10 +56,10 @@ asupersync.workspace = true
 asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
-# Dev-only, and fsqlite-mvcc depends on fsqlite-pager — so pager must publish
-# FIRST. A `^0.2.0` pin would create a publish-order cycle; retain this bridge
-# range so the dev edge remains satisfiable before and after MVCC publishes.
-fsqlite-mvcc = { path = "../fsqlite-mvcc", version = ">=0.1.2, <0.3.0", default-features = false }
+# Dev-only, and fsqlite-mvcc depends on fsqlite-pager. Keep this local path
+# versionless so Cargo strips the dev edge when packaging and avoids a publish
+# cycle while pager tests still use the workspace MVCC source.
+fsqlite-mvcc = { path = "../fsqlite-mvcc", default-features = false }
 fsqlite-wal = { path = "../fsqlite-wal", version = "0.2.0", default-features = false }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
