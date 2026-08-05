@@ -863,7 +863,7 @@ fn observation_only_history(txns: &[CommittedTxn], seed: u64, label: &str) -> Tr
         }));
         operations.push((txn.commit_order, 3_u8, index, HistoryOperation::Commit));
     }
-    operations.sort_by(|left, right| (left.0, left.1, left.2).cmp(&(right.0, right.1, right.2)));
+    operations.sort_by_key(|operation| (operation.0, operation.1, operation.2));
     let events = operations
         .into_iter()
         .enumerate()

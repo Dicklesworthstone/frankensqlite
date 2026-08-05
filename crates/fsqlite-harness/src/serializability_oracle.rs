@@ -171,7 +171,7 @@ pub enum HistoryValue {
     Integer(i64),
     Text(String),
     Blob(Vec<u8>),
-    List(Vec<HistoryValue>),
+    List(Vec<Self>),
 }
 
 /// One observed history operation.
@@ -427,12 +427,12 @@ impl TransactionHistory {
                         ));
                     }
                 }
-                HistoryOperation::Restart { crash_id } => {
-                    if !crash_ids.contains(crash_id.as_str()) {
-                        errors.push(format!(
-                            "history.events[{index}] restarts unknown crash_id {crash_id}"
-                        ));
-                    }
+                HistoryOperation::Restart { crash_id }
+                    if !crash_ids.contains(crash_id.as_str()) =>
+                {
+                    errors.push(format!(
+                        "history.events[{index}] restarts unknown crash_id {crash_id}"
+                    ));
                 }
                 _ => {}
             }
@@ -1921,13 +1921,15 @@ mod tests {
         assert!(validate_serializability_failure_bundle(&corrupt).is_err());
     }
 
+    type TransactionProjection = (String, u64, u64, BTreeSet<String>, BTreeSet<String>);
+
     proptest! {
         #[test]
         fn graph_result_is_stable_under_input_order(transactions in prop::collection::vec(
             ("[a-z]{1,4}", 0_u64..20, 20_u64..40, prop::collection::btree_set("[a-c]", 0..3), prop::collection::btree_set("[a-c]", 0..3)),
             0..12,
         )) {
-            let make = |values: &[(String, u64, u64, BTreeSet<String>, BTreeSet<String>)]| {
+            let make = |values: &[TransactionProjection]| {
                 values.iter().enumerate().map(|(index, (name, start, commit, reads, writes))| CommittedTransaction {
                     transaction_id: format!("{name}-{index}"),
                     start_order: *start,
