@@ -889,7 +889,10 @@ impl StatefulOperation {
 
     fn to_op_kind(&self) -> Option<(OpKind, Option<ExpectedResult>)> {
         let projected = match self {
-            Self::CreateSchema => (
+            Self::CreateSchema
+            | Self::Savepoint { .. }
+            | Self::RollbackTo { .. }
+            | Self::Release { .. } => (
                 OpKind::Sql {
                     statement: self.to_sql_statement()?,
                 },
@@ -923,31 +926,7 @@ impl StatefulOperation {
             Self::Begin => (OpKind::Begin, None),
             Self::Commit => (OpKind::Commit, None),
             Self::Rollback => (OpKind::Rollback, None),
-            Self::Savepoint { .. } => (
-                OpKind::Sql {
-                    statement: self.to_sql_statement()?,
-                },
-                None,
-            ),
-            Self::RollbackTo { .. } => (
-                OpKind::Sql {
-                    statement: self.to_sql_statement()?,
-                },
-                None,
-            ),
-            Self::Release { .. } => (
-                OpKind::Sql {
-                    statement: self.to_sql_statement()?,
-                },
-                None,
-            ),
-            Self::SelectCount => (
-                OpKind::Sql {
-                    statement: self.to_sql_statement()?,
-                },
-                Some(ExpectedResult::RowCount(1)),
-            ),
-            Self::IntegrityCheck => (
+            Self::SelectCount | Self::IntegrityCheck => (
                 OpKind::Sql {
                     statement: self.to_sql_statement()?,
                 },
@@ -1017,14 +996,13 @@ pub enum StatefulCondition {
 impl StatefulCondition {
     fn verify(&self, model: &StatefulModel, step: &StatefulPlanStep) -> Result<(), String> {
         let satisfied = match self {
-            Self::SchemaExists => model.schema_created,
+            Self::SchemaExists | Self::IntegrityClean => model.schema_created,
             Self::RowExists { key } => model.rows.contains_key(key),
             Self::RowAbsent { key } => !model.rows.contains_key(key),
             Self::InTransaction => model.transaction_snapshot.is_some(),
             Self::NotInTransaction => model.transaction_snapshot.is_none(),
             Self::SavepointExists { name } => model.savepoints.contains_key(name),
             Self::RowCount { count } => model.rows.len() == *count,
-            Self::IntegrityClean => model.schema_created,
             Self::LaneObserved { lane } => step.required_lane == *lane,
         };
 
@@ -1213,7 +1191,7 @@ impl StatefulModel {
                     .rows
                     .get_mut(key)
                     .ok_or_else(|| format!("stateful_update_missing_key key={key}"))?;
-                *row = value.clone();
+                row.clone_from(value);
                 Ok(StatefulTransition::RowUpdated { key: *key })
             }
             StatefulOperation::Delete { key } => {
@@ -1564,7 +1542,9 @@ fn stateful_postconditions(
         StatefulOperation::Delete { key } => {
             conditions.push(StatefulCondition::RowAbsent { key: *key });
         }
-        StatefulOperation::Begin | StatefulOperation::Savepoint { .. } => {
+        StatefulOperation::Begin
+        | StatefulOperation::Savepoint { .. }
+        | StatefulOperation::Release { .. } => {
             conditions.push(StatefulCondition::InTransaction);
         }
         StatefulOperation::Commit
@@ -1575,9 +1555,6 @@ fn stateful_postconditions(
         StatefulOperation::RollbackTo { name } => {
             conditions.push(StatefulCondition::InTransaction);
             conditions.push(StatefulCondition::SavepointExists { name: name.clone() });
-        }
-        StatefulOperation::Release { .. } => {
-            conditions.push(StatefulCondition::InTransaction);
         }
         StatefulOperation::CreateSchema
         | StatefulOperation::SelectCount
