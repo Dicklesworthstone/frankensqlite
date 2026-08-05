@@ -2193,6 +2193,35 @@ impl PersistentProfile {
     }
 }
 
+/// Cross-profile pairing contract for the two persistent citation identities.
+///
+/// The release and release-perf captures must come from the same worker, host,
+/// and workload so their numbers are comparable, yet must carry distinct build
+/// nonces because each profile produces its own binary. Equal nonces mean one
+/// build identity was replayed under both profile labels, which would let a
+/// single `release-perf` binary masquerade as the portable `release` capture.
+fn validate_persistent_profile_pairing(
+    release: &PersistentCitationIdentity,
+    release_perf: &PersistentCitationIdentity,
+) -> Result<(), String> {
+    if release.actual_worker != release_perf.actual_worker
+        || release.actual_host != release_perf.actual_host
+        || release.workload != release_perf.workload
+    {
+        return Err(
+            "persistent release and release-perf packs must retain the same worker, host, and workload contract"
+                .to_owned(),
+        );
+    }
+    if release.nonce == release_perf.nonce {
+        return Err(format!(
+            "persistent release and release-perf packs must record distinct build nonces; both recorded `{}`",
+            release.nonce
+        ));
+    }
+    Ok(())
+}
+
 /// Exact dual-profile build binding shared by the persistent scorecard and its
 /// pack manifest. Both documents must name the same Cargo profile and the opt
 /// level that profile is defined to produce (`release` -> `z`, `release-perf`
@@ -2611,25 +2640,7 @@ fn validate_pack_inputs(
         &persistent_release_perf_provenance,
         PersistentProfile::ReleasePerf,
     )?;
-    if release_identity.actual_worker != release_perf_identity.actual_worker
-        || release_identity.actual_host != release_perf_identity.actual_host
-        || release_identity.workload != release_perf_identity.workload
-    {
-        return Err(
-            "persistent release and release-perf packs must retain the same worker, host, and workload contract"
-                .to_owned(),
-        );
-    }
-    // Each profile builds a distinct binary, so the two captures must carry
-    // distinct fresh nonces. Equal nonces mean one build identity was replayed
-    // across both profile-bound packs, which would let a single `release-perf`
-    // binary masquerade as the portable `release` capture as well.
-    if release_identity.nonce == release_perf_identity.nonce {
-        return Err(format!(
-            "persistent release and release-perf packs must record distinct build nonces; both recorded `{}`",
-            release_identity.nonce
-        ));
-    }
+    validate_persistent_profile_pairing(&release_identity, &release_perf_identity)?;
     Ok(ValidatedPackInputs {
         c1_scorecard,
         c1_manifest,
@@ -2731,11 +2742,13 @@ fn prepare_external_baseline_root(
 #[cfg(test)]
 mod tests {
     use super::{
-        AdoptedRchJob, BUILD_SHAPING_ENV_EXACT, PackKind, PersistentProfile, adopt_active_job,
+        AdoptedRchJob, BUILD_SHAPING_ENV_EXACT, PackKind, PersistentCitationIdentity,
+        PersistentCriterion, PersistentProfile, PersistentWorkload, adopt_active_job,
         completed_status_matches, external_pack_source_names, is_build_shaping_env,
         missing_adopted_job_error, parallel_map_ordered, parse_options, parse_single_worker,
-        parse_worker_pool, pin_adopted_job, strict_rch_command,
-        validate_persistent_citation_receipt, validate_remote_target_mapping,
+        parse_worker_pool, pin_adopted_job, strict_rch_command, validate_cargo_profile_binding,
+        validate_persistent_citation_receipt, validate_persistent_profile_pairing,
+        validate_remote_target_mapping,
     };
     use serde_json::Value;
 
