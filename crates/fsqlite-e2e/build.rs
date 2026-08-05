@@ -324,8 +324,8 @@ fn main() {
             println!("cargo:rerun-if-changed={path}");
         }
     }
-    if let Some(symbolic_ref) = git_stdout(&workspace_root, &["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(path) = git_stdout(
+    if let Some(symbolic_ref) = git_stdout(&workspace_root, &["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = git_stdout(
             &workspace_root,
             &[
                 "rev-parse",
@@ -333,9 +333,9 @@ fn main() {
                 "--git-path",
                 symbolic_ref.as_str(),
             ],
-        ) {
-            println!("cargo:rerun-if-changed={path}");
-        }
+        )
+    {
+        println!("cargo:rerun-if-changed={path}");
     }
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=FSQLITE_BENCH_BUILD_NONCE");
