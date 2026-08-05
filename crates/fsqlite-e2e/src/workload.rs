@@ -546,6 +546,7 @@ pub const STATEFUL_PLAN_SCHEMA_VERSION: &str = "stateful-operation-plan.v1";
 
 const STATEFUL_TABLE: &str = "stateful_kv";
 const STATEFUL_REQUIRED_LANE: &str = "pager_backed_required";
+const STATEFUL_OWNER_BEAD: &str = "bd-turso-test-adaptation-zu081.20";
 
 /// Configuration for the deterministic stateful operation-plan campaign.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -622,11 +623,24 @@ impl StatefulOperationPlan {
     /// Returns a diagnostic string when a step is internally inconsistent or an
     /// artifact was hand-edited into an invalid model state.
     pub fn validate(&self) -> Result<StatefulPlanAudit, String> {
+        self.validate_metadata_contract()?;
+
         let mut model = StatefulModel::default();
         let mut projected_record_count = 0_usize;
         let mut close_reopen_count = 0_usize;
 
-        for step in &self.steps {
+        for (expected_index, step) in self.steps.iter().enumerate() {
+            self.validate_step_contract(expected_index, step)?;
+            step.operation.validate_sql_contract()?;
+
+            let expected_preconditions =
+                stateful_preconditions(&model, &step.operation, &self.metadata.required_lane);
+            if step.preconditions != expected_preconditions {
+                return Err(format!(
+                    "stateful_step_preconditions_mismatch step_id={} expected={:?} actual={:?}",
+                    step.step_id, expected_preconditions, step.preconditions
+                ));
+            }
             for condition in &step.preconditions {
                 condition.verify(&model, step)?;
             }
@@ -639,6 +653,14 @@ impl StatefulOperationPlan {
                 ));
             }
 
+            let expected_postconditions =
+                stateful_postconditions(&model, &step.operation, &self.metadata.required_lane);
+            if step.postconditions != expected_postconditions {
+                return Err(format!(
+                    "stateful_step_postconditions_mismatch step_id={} expected={:?} actual={:?}",
+                    step.step_id, expected_postconditions, step.postconditions
+                ));
+            }
             for condition in &step.postconditions {
                 condition.verify(&model, step)?;
             }
@@ -658,6 +680,12 @@ impl StatefulOperationPlan {
                 self.final_model, final_model
             ));
         }
+        if close_reopen_count > 1 {
+            return Err(format!(
+                "stateful_close_reopen_count_mismatch expected_at_most=1 actual={close_reopen_count}"
+            ));
+        }
+        self.validate_profile_hash(close_reopen_count)?;
 
         Ok(StatefulPlanAudit {
             schema_version: STATEFUL_PLAN_SCHEMA_VERSION.to_owned(),
@@ -800,6 +828,108 @@ impl StatefulOperationPlan {
             metadata_hash: sha256_hex(metadata_json.as_bytes()),
         })
     }
+
+    fn validate_metadata_contract(&self) -> Result<(), String> {
+        if self.metadata.schema_version != STATEFUL_PLAN_SCHEMA_VERSION {
+            return Err(format!(
+                "stateful_schema_version_mismatch expected={STATEFUL_PLAN_SCHEMA_VERSION} actual={}",
+                self.metadata.schema_version
+            ));
+        }
+        if self.metadata.fixture_id.is_empty() {
+            return Err("stateful_fixture_id_empty".to_owned());
+        }
+        if self.metadata.required_lane.is_empty() {
+            return Err("stateful_required_lane_empty".to_owned());
+        }
+        if self.metadata.feature_ids.is_empty() {
+            return Err("stateful_feature_ids_empty".to_owned());
+        }
+        let mut seen_feature_ids = BTreeSet::new();
+        for feature_id in &self.metadata.feature_ids {
+            if feature_id.is_empty() {
+                return Err("stateful_feature_id_empty".to_owned());
+            }
+            if !seen_feature_ids.insert(feature_id) {
+                return Err(format!(
+                    "stateful_feature_id_duplicate feature_id={feature_id}"
+                ));
+            }
+        }
+        if self.metadata.owner_bead != STATEFUL_OWNER_BEAD {
+            return Err(format!(
+                "stateful_owner_bead_mismatch expected={STATEFUL_OWNER_BEAD} actual={}",
+                self.metadata.owner_bead
+            ));
+        }
+        if self.steps.len() > self.metadata.max_steps {
+            return Err(format!(
+                "stateful_step_bound_exceeded max_steps={} actual={}",
+                self.metadata.max_steps,
+                self.steps.len()
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_step_contract(
+        &self,
+        expected_index: usize,
+        step: &StatefulPlanStep,
+    ) -> Result<(), String> {
+        let expected_step_id = u64::try_from(expected_index)
+            .map_err(|error| format!("stateful_step_id_conversion_error {error}"))?;
+        if step.step_id != expected_step_id {
+            return Err(format!(
+                "stateful_step_id_mismatch expected={expected_step_id} actual={}",
+                step.step_id
+            ));
+        }
+        if step.required_lane != self.metadata.required_lane {
+            return Err(format!(
+                "stateful_step_lane_mismatch step_id={} expected={} actual={}",
+                step.step_id, self.metadata.required_lane, step.required_lane
+            ));
+        }
+        if step.feature_ids != self.metadata.feature_ids {
+            return Err(format!(
+                "stateful_step_feature_ids_mismatch step_id={}",
+                step.step_id
+            ));
+        }
+        let step_id = u16::try_from(step.step_id).map_err(|error| {
+            format!(
+                "stateful_step_seed_id_conversion_error step_id={} error={error}",
+                step.step_id
+            )
+        })?;
+        let expected_origin_seed = derive_worker_seed(self.metadata.seed, step_id);
+        if step.origin_seed != expected_origin_seed {
+            return Err(format!(
+                "stateful_origin_seed_mismatch step_id={} expected={} actual={}",
+                step.step_id, expected_origin_seed, step.origin_seed
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_profile_hash(&self, close_reopen_count: usize) -> Result<(), String> {
+        let expected_profile_hash = stateful_profile_hash(&StatefulPlanConfig {
+            fixture_id: self.metadata.fixture_id.clone(),
+            seed: self.metadata.seed,
+            max_steps: self.metadata.max_steps,
+            required_lane: self.metadata.required_lane.clone(),
+            feature_ids: self.metadata.feature_ids.clone(),
+            include_close_reopen: close_reopen_count == 1,
+        });
+        if self.metadata.profile_hash != expected_profile_hash {
+            return Err(format!(
+                "stateful_profile_hash_mismatch expected={expected_profile_hash} actual={}",
+                self.metadata.profile_hash
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One independently modeled stateful step.
@@ -877,9 +1007,9 @@ impl StatefulOperation {
             Self::Begin => "BEGIN".to_owned(),
             Self::Commit => "COMMIT".to_owned(),
             Self::Rollback => "ROLLBACK".to_owned(),
-            Self::Savepoint { name } => format!("SAVEPOINT {name}"),
-            Self::RollbackTo { name } => format!("ROLLBACK TO {name}"),
-            Self::Release { name } => format!("RELEASE {name}"),
+            Self::Savepoint { name } => format!("SAVEPOINT {}", stateful_sql_identifier(name)),
+            Self::RollbackTo { name } => format!("ROLLBACK TO {}", stateful_sql_identifier(name)),
+            Self::Release { name } => format!("RELEASE {}", stateful_sql_identifier(name)),
             Self::SelectCount => format!("SELECT COUNT(*) FROM {STATEFUL_TABLE}"),
             Self::IntegrityCheck => "PRAGMA integrity_check".to_owned(),
             Self::CloseReopen => return None,
@@ -936,6 +1066,24 @@ impl StatefulOperation {
         };
 
         Some(projected)
+    }
+
+    fn validate_sql_contract(&self) -> Result<(), String> {
+        match self {
+            Self::Savepoint { name } => stateful_validate_savepoint_name("savepoint", name),
+            Self::RollbackTo { name } => stateful_validate_savepoint_name("rollback_to", name),
+            Self::Release { name } => stateful_validate_savepoint_name("release", name),
+            Self::CreateSchema
+            | Self::Insert { .. }
+            | Self::Update { .. }
+            | Self::Delete { .. }
+            | Self::Begin
+            | Self::Commit
+            | Self::Rollback
+            | Self::SelectCount
+            | Self::IntegrityCheck
+            | Self::CloseReopen => Ok(()),
+        }
     }
 }
 
@@ -1318,7 +1466,7 @@ pub fn generate_stateful_operation_plan(
         required_lane: normalized.required_lane.clone(),
         feature_ids: normalized.feature_ids.clone(),
         profile_hash: stateful_profile_hash(&normalized),
-        owner_bead: "bd-turso-test-adaptation-zu081.20".to_owned(),
+        owner_bead: STATEFUL_OWNER_BEAD.to_owned(),
     };
 
     let mut model = StatefulModel::default();
@@ -1576,6 +1724,20 @@ fn stateful_sql_literal(value: &str) -> String {
         value.to_owned()
     } else {
         format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
+fn stateful_sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn stateful_validate_savepoint_name(operation: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        Err(format!(
+            "stateful_savepoint_name_empty operation={operation}"
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -2055,7 +2217,7 @@ mod tests {
             artifact
                 .workload
                 .iter()
-                .any(|sql| sql == "SAVEPOINT sp_stateful")
+                .any(|sql| sql == "SAVEPOINT \"sp_stateful\"")
         );
         assert!(artifact.trace.iter().any(|entry| {
             matches!(entry.operation, StatefulOperation::CloseReopen)
@@ -2117,6 +2279,97 @@ mod tests {
             .validate()
             .expect_err("tampered transition must fail closed");
         assert!(error.contains("stateful_step_transition_mismatch"));
+    }
+
+    #[test]
+    fn stateful_plan_validation_rejects_tampered_metadata() {
+        let mut plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        plan.metadata.schema_version = "stateful-operation-plan.v0".to_owned();
+        let error = plan
+            .validate()
+            .expect_err("tampered schema version must fail closed");
+        assert!(error.contains("stateful_schema_version_mismatch"));
+
+        let mut plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        plan.metadata.max_steps = plan.steps.len() - 1;
+        let error = plan
+            .validate()
+            .expect_err("tampered step bound must fail closed");
+        assert!(error.contains("stateful_step_bound_exceeded"));
+
+        let mut plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        plan.metadata.profile_hash = "tampered-profile".to_owned();
+        let error = plan
+            .validate()
+            .expect_err("tampered profile hash must fail closed");
+        assert!(error.contains("stateful_profile_hash_mismatch"));
+    }
+
+    #[test]
+    fn stateful_plan_validation_rejects_tampered_step_contract() {
+        let mut plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        plan.steps[1].step_id = 99;
+        let error = plan
+            .validate()
+            .expect_err("tampered step id must fail closed");
+        assert!(error.contains("stateful_step_id_mismatch"));
+
+        let mut plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        plan.steps[1].required_lane = "wrong_lane".to_owned();
+        let error = plan
+            .validate()
+            .expect_err("tampered step lane must fail closed");
+        assert!(error.contains("stateful_step_lane_mismatch"));
+
+        let mut plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        plan.steps[1].origin_seed = plan.steps[1].origin_seed.wrapping_add(1);
+        let error = plan
+            .validate()
+            .expect_err("tampered origin seed must fail closed");
+        assert!(error.contains("stateful_origin_seed_mismatch"));
+
+        let mut plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        plan.steps[1].preconditions.clear();
+        let error = plan
+            .validate()
+            .expect_err("tampered preconditions must fail closed");
+        assert!(error.contains("stateful_step_preconditions_mismatch"));
+    }
+
+    #[test]
+    fn stateful_savepoint_sql_quotes_public_identifiers() {
+        let savepoint_name = "sp\"x; DROP TABLE ignored";
+        assert_eq!(
+            StatefulOperation::Savepoint {
+                name: savepoint_name.to_owned(),
+            }
+            .to_sql_statement()
+            .as_deref(),
+            Some("SAVEPOINT \"sp\"\"x; DROP TABLE ignored\"")
+        );
+        assert_eq!(
+            StatefulOperation::RollbackTo {
+                name: savepoint_name.to_owned(),
+            }
+            .to_sql_statement()
+            .as_deref(),
+            Some("ROLLBACK TO \"sp\"\"x; DROP TABLE ignored\"")
+        );
+        assert_eq!(
+            StatefulOperation::Release {
+                name: savepoint_name.to_owned(),
+            }
+            .to_sql_statement()
+            .as_deref(),
+            Some("RELEASE \"sp\"\"x; DROP TABLE ignored\"")
+        );
     }
 
     #[test]

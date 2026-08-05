@@ -296,6 +296,11 @@ fn stateful_operation_plan_file_replay_is_reproducible() {
             oplog.header.preset.as_deref(),
             Some("stateful-operation-plan")
         );
+        let artifact = plan
+            .to_sql_artifact()
+            .expect("stateful SQL artifact should build");
+        assert_eq!(artifact.schema, fixed_seed_stateful_schema());
+        assert_eq!(artifact.workload, fixed_seed_stateful_workload());
 
         let state1 = execute_stateful_plan_and_hash(&plan).await;
         let state2 = execute_stateful_plan_and_hash(&plan).await;
@@ -445,6 +450,11 @@ async fn execute_stateful_plan_and_hash(plan: &StatefulOperationPlan) -> String 
     use sha2::{Digest, Sha256};
 
     assert_fixed_seed_stateful_plan(plan);
+    let artifact = plan
+        .to_sql_artifact()
+        .expect("stateful SQL artifact should build");
+    assert_eq!(artifact.schema, fixed_seed_stateful_schema());
+    assert_eq!(artifact.workload, fixed_seed_stateful_workload());
 
     let tempdir = tempfile::tempdir().expect("create temp dir");
     let db_path = tempdir.path().join("stateful.sqlite");
@@ -474,16 +484,16 @@ async fn execute_stateful_plan_and_hash(plan: &StatefulOperationPlan) -> String 
     )
     .await
     .expect("insert stateful key 2");
-    conn.execute("SAVEPOINT sp_stateful")
+    conn.execute("SAVEPOINT \"sp_stateful\"")
         .await
         .expect("create stateful savepoint");
     conn.execute("UPDATE stateful_kv SET val = 'stateful_2414e4b454e00465_20' WHERE id = 2")
         .await
         .expect("update stateful key 2");
-    conn.execute("ROLLBACK TO sp_stateful")
+    conn.execute("ROLLBACK TO \"sp_stateful\"")
         .await
         .expect("rollback to stateful savepoint");
-    conn.execute("RELEASE sp_stateful")
+    conn.execute("RELEASE \"sp_stateful\"")
         .await
         .expect("release stateful savepoint");
     conn.execute("COMMIT")
@@ -612,6 +622,43 @@ fn assert_fixed_seed_stateful_plan(plan: &StatefulOperationPlan) {
             (2, "stateful_01194905392d1538_2".to_owned()),
         ]
     );
+}
+
+fn fixed_seed_stateful_schema() -> Vec<String> {
+    vec![
+        "CREATE TABLE IF NOT EXISTS stateful_kv \
+         (id INTEGER PRIMARY KEY, val TEXT NOT NULL, num REAL DEFAULT 0)"
+            .to_owned(),
+    ]
+}
+
+fn fixed_seed_stateful_workload() -> Vec<String> {
+    vec![
+        "INSERT INTO stateful_kv (id, val, num) \
+         VALUES (1, 'stateful_008ca4829c968a9c_1', 1)"
+            .to_owned(),
+        "BEGIN".to_owned(),
+        "INSERT INTO stateful_kv (id, val, num) \
+         VALUES (2, 'stateful_01194905392d1538_2', 2)"
+            .to_owned(),
+        "SAVEPOINT \"sp_stateful\"".to_owned(),
+        "UPDATE stateful_kv SET val = 'stateful_2414e4b454e00465_20' WHERE id = 2".to_owned(),
+        "ROLLBACK TO \"sp_stateful\"".to_owned(),
+        "RELEASE \"sp_stateful\"".to_owned(),
+        "COMMIT".to_owned(),
+        "BEGIN".to_owned(),
+        "INSERT INTO stateful_kv (id, val, num) \
+         VALUES (3, 'stateful_0232920a725a2a70_3', 3)"
+            .to_owned(),
+        "ROLLBACK".to_owned(),
+        "INSERT INTO stateful_kv (id, val, num) \
+         VALUES (4, 'stateful_04652414e4b454e0_4', 4)"
+            .to_owned(),
+        "DELETE FROM stateful_kv WHERE id = 4".to_owned(),
+        "SELECT COUNT(*) FROM stateful_kv".to_owned(),
+        "PRAGMA integrity_check".to_owned(),
+        "SELECT COUNT(*) FROM stateful_kv".to_owned(),
+    ]
 }
 
 fn format_val(v: &str) -> String {
