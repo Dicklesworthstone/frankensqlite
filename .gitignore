@@ -397,3 +397,6 @@ claude-upgrade-progress.json
 .last-cleanup
 # RCH virtual FS workload workspaces (compile offload scratch)
 .rch-vfs-*/
+
+# Empty / scaffolding oracle stubs left ignored (not real e2e cases)
+crates/fsqlite-e2e/tests/*_ignored.rs
