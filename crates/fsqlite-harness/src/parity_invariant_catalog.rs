@@ -1213,7 +1213,7 @@ fn build_sql_grammar_invariants() -> Vec<ParityInvariant> {
     );
     b.add(
         "F-SQL-033",
-        "VACUUM compaction and VACUUM INTO backup copies produce SQLite-compatible database state.",
+        "VACUUM and VACUUM INTO produce integrity-clean rebuilt database images and preserve documented header metadata; v0.2.0 excludes exact zero-freelist, header-consistent, fixed-point compaction parity (GH #301).",
         &["WAL journal mode"],
         vec![
             unit_obligation(
@@ -1225,13 +1225,13 @@ fn build_sql_grammar_invariants() -> Vec<ParityInvariant> {
             unit_obligation(
                 "fsqlite-core",
                 "fsqlite_core::vacuum::tests::test_vacuum_rebuilds_file_backed_database_and_preserves_header_metadata",
-                "VACUUM rebuild preserves page size and header metadata while clearing freelist pages",
+                "VACUUM rebuild remains queryable and preserves page size and header metadata within the GH #301 limitation",
                 &["bd-1ge41"],
             ),
             unit_obligation(
                 "fsqlite-core",
                 "fsqlite_core::vacuum::tests::test_vacuum_into_writes_compacted_copy_with_preserved_page_size_and_pragmas",
-                "VACUUM INTO writes compact copies with preserved page size and header pragmas",
+                "VACUUM INTO writes integrity-clean copies with preserved page size and header pragmas within the GH #301 limitation",
                 &["bd-1ge41"],
             ),
         ],

@@ -9,11 +9,11 @@ use fsqlite_harness::maintenance_parity::{
 const BEAD_ID: &str = "bd-1dp9.4.3";
 
 #[test]
-fn assessment_produces_parity_verdict() {
+fn assessment_records_partial_vacuum_parity() {
     let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
     assert_eq!(
         report.verdict,
-        MaintenanceVerdict::Parity,
+        MaintenanceVerdict::Partial,
         "bead_id={BEAD_ID} case=verdict"
     );
     assert_eq!(
@@ -43,12 +43,16 @@ fn all_six_commands_tested() {
 }
 
 #[test]
-fn all_commands_at_parity() {
+fn five_commands_are_at_parity_and_vacuum_is_excluded() {
     let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
     assert_eq!(
         report.commands_at_parity.len(),
-        6,
+        5,
         "bead_id={BEAD_ID} case=cmd_parity"
+    );
+    assert!(
+        !report.commands_at_parity.iter().any(|cmd| cmd == "vacuum"),
+        "bead_id={BEAD_ID} case=vacuum_not_at_parity"
     );
 }
 
@@ -62,15 +66,28 @@ fn integrity_check_ok() {
 }
 
 #[test]
-fn parity_score_full() {
+fn parity_score_records_vacuum_limit() {
     let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
     assert!(
-        (report.parity_score - 1.0).abs() < f64::EPSILON,
+        (report.parity_score - 0.833_333).abs() < f64::EPSILON,
         "bead_id={BEAD_ID} case=score"
     );
     assert_eq!(
-        report.checks_at_parity, report.total_checks,
-        "bead_id={BEAD_ID} case=all_pass"
+        report.checks_at_parity, 10,
+        "bead_id={BEAD_ID} case=checks_at_parity"
+    );
+    assert_eq!(
+        report.total_checks, 12,
+        "bead_id={BEAD_ID} case=total_checks"
+    );
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .filter(|check| check.command == "vacuum" && !check.parity_achieved)
+            .count(),
+        2,
+        "bead_id={BEAD_ID} case=vacuum_partial_checks"
     );
 }
 
@@ -91,7 +108,7 @@ fn summary_is_informative() {
     let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
     assert!(!report.summary.is_empty(), "bead_id={BEAD_ID} case=summary");
     assert!(
-        report.summary.contains("PARITY"),
+        report.summary.contains("PARTIAL"),
         "bead_id={BEAD_ID} case=summary_verdict"
     );
 }

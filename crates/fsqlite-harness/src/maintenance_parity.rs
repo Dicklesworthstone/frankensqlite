@@ -98,7 +98,7 @@ impl fmt::Display for MaintenanceVerdict {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaintenanceParityConfig {
-    /// Minimum commands that must be tested.
+    /// Minimum commands that must reach parity for an overall parity verdict.
     pub min_commands_tested: usize,
     /// Whether integrity_check must return "ok".
     pub require_integrity_ok: bool,
@@ -188,22 +188,19 @@ pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> Maintenanc
 
     // VACUUM
     checks.push(MaintenanceCheck {
-        check_name: "vacuum_basic".to_owned(),
+        check_name: "vacuum_fixed_point_compaction".to_owned(),
         command: "vacuum".to_owned(),
-        parity_achieved: true,
-        detail:
-            "VACUUM rebuilds populated databases, clears freelist pages, and preserves header metadata"
-                .to_owned(),
+        parity_achieved: false,
+        detail: "VACUUM produces integrity-clean rebuilds, but GH #301 means the rebuilt image can retain freed or trailing pages and page-1 freelist metadata can disagree with the committed freelist; zero-freelist fixed-point compaction is not at parity"
+            .to_owned(),
     });
     checks.push(MaintenanceCheck {
-        check_name: "vacuum_into_backup_copy".to_owned(),
+        check_name: "vacuum_into_fixed_point_compaction".to_owned(),
         command: "vacuum".to_owned(),
-        parity_achieved: true,
-        detail:
-            "VACUUM INTO writes a compact backup copy with preserved page size, user_version, and application_id"
-                .to_owned(),
+        parity_achieved: false,
+        detail: "VACUUM INTO preserves page size, user_version, and application_id in an integrity-clean copy, but GH #301 excludes exact compact-image and freelist parity"
+            .to_owned(),
     });
-    commands_at_parity.push("vacuum".to_owned());
 
     // ANALYZE
     checks.push(MaintenanceCheck {
@@ -366,24 +363,34 @@ mod tests {
     }
 
     #[test]
-    fn assess_parity() {
+    fn assess_partial_vacuum_parity() {
         let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
-        assert_eq!(report.verdict, MaintenanceVerdict::Parity);
+        assert_eq!(report.verdict, MaintenanceVerdict::Partial);
     }
 
     #[test]
     fn assess_all_commands() {
         let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
         assert_eq!(report.commands_tested.len(), 6);
-        assert_eq!(report.commands_at_parity.len(), 6);
+        assert_eq!(report.commands_at_parity.len(), 5);
+        assert!(!report.commands_at_parity.iter().any(|cmd| cmd == "vacuum"));
     }
 
     #[test]
     #[allow(clippy::float_cmp)]
     fn assess_score() {
         let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
-        assert_eq!(report.parity_score, 1.0);
-        assert_eq!(report.checks_at_parity, report.total_checks);
+        assert_eq!(report.parity_score, 0.833_333);
+        assert_eq!(report.checks_at_parity, 10);
+        assert_eq!(report.total_checks, 12);
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .filter(|check| check.command == "vacuum" && !check.parity_achieved)
+                .count(),
+            2
+        );
     }
 
     #[test]
