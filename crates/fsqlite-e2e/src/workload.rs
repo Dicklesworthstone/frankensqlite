@@ -5,8 +5,13 @@
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::oplog::{ConcurrencyModel, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec};
+use crate::oplog::{
+    ConcurrencyModel, ExpectedResult, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec,
+};
 
 /// Policy governing how multi-worker transaction batches should be interpreted
 /// by an executor.
@@ -536,6 +541,1095 @@ fn derive_worker_seed(seed: u64, worker: u16) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Schema version for stateful operation-plan artifacts.
+pub const STATEFUL_PLAN_SCHEMA_VERSION: &str = "stateful-operation-plan.v1";
+
+const STATEFUL_TABLE: &str = "stateful_kv";
+const STATEFUL_REQUIRED_LANE: &str = "pager_backed_required";
+
+/// Configuration for the deterministic stateful operation-plan campaign.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulPlanConfig {
+    /// Artifact and fixture identifier.
+    pub fixture_id: String,
+    /// Base seed used for deterministic value generation.
+    pub seed: u64,
+    /// Upper bound for emitted model steps. Values below the campaign minimum
+    /// are normalized upward so generated plans remain semantically complete.
+    pub max_steps: usize,
+    /// Required execution lane attached to every step.
+    pub required_lane: String,
+    /// Canonical feature IDs covered by the generated plan.
+    pub feature_ids: Vec<String>,
+    /// Whether the plan includes the close/reopen boundary.
+    pub include_close_reopen: bool,
+}
+
+impl Default for StatefulPlanConfig {
+    fn default() -> Self {
+        Self {
+            fixture_id: "stateful-op-plan".to_owned(),
+            seed: 0x0054_5552_534F_0020,
+            max_steps: 18,
+            required_lane: STATEFUL_REQUIRED_LANE.to_owned(),
+            feature_ids: vec![
+                "SURF-SQL-CORE-001".to_owned(),
+                "SURF-TXN-MVCC-CONCURRENT-006".to_owned(),
+                "SURF-WAL-CRASH-RECOVERY-008".to_owned(),
+            ],
+            include_close_reopen: true,
+        }
+    }
+}
+
+/// Top-level metadata retained with a stateful operation plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulPlanMetadata {
+    /// Artifact schema version.
+    pub schema_version: String,
+    /// Fixture identifier.
+    pub fixture_id: String,
+    /// Base seed.
+    pub seed: u64,
+    /// Normalized step bound used by the generator.
+    pub max_steps: usize,
+    /// Required execution lane.
+    pub required_lane: String,
+    /// Feature IDs covered by this plan.
+    pub feature_ids: Vec<String>,
+    /// Stable hash of generation inputs.
+    pub profile_hash: String,
+    /// Owning bead for traceability.
+    pub owner_bead: String,
+}
+
+/// Deterministic stateful plan plus final independent model snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulOperationPlan {
+    /// Stable plan metadata.
+    pub metadata: StatefulPlanMetadata,
+    /// Ordered model steps.
+    pub steps: Vec<StatefulPlanStep>,
+    /// Final model state after all steps.
+    pub final_model: StatefulModelSnapshot,
+}
+
+impl StatefulOperationPlan {
+    /// Validate preconditions, transitions, postconditions, and final state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic string when a step is internally inconsistent or an
+    /// artifact was hand-edited into an invalid model state.
+    pub fn validate(&self) -> Result<StatefulPlanAudit, String> {
+        let mut model = StatefulModel::default();
+        let mut projected_record_count = 0_usize;
+        let mut close_reopen_count = 0_usize;
+
+        for step in &self.steps {
+            for condition in &step.preconditions {
+                condition.verify(&model, step)?;
+            }
+
+            let transition = model.apply(&step.operation)?;
+            if transition != step.expected_transition {
+                return Err(format!(
+                    "stateful_step_transition_mismatch step_id={} expected={:?} actual={:?}",
+                    step.step_id, step.expected_transition, transition
+                ));
+            }
+
+            for condition in &step.postconditions {
+                condition.verify(&model, step)?;
+            }
+
+            if step.operation.to_op_kind().is_some() {
+                projected_record_count += 1;
+            }
+            if matches!(step.operation, StatefulOperation::CloseReopen) {
+                close_reopen_count += 1;
+            }
+        }
+
+        let final_model = model.snapshot();
+        if final_model != self.final_model {
+            return Err(format!(
+                "stateful_final_model_mismatch expected={:?} actual={:?}",
+                self.final_model, final_model
+            ));
+        }
+
+        Ok(StatefulPlanAudit {
+            schema_version: STATEFUL_PLAN_SCHEMA_VERSION.to_owned(),
+            fixture_id: self.metadata.fixture_id.clone(),
+            step_count: self.steps.len(),
+            projected_record_count,
+            close_reopen_count,
+            final_model_hash: final_model
+                .stable_hash()
+                .map_err(|error| format!("stateful_final_model_hash_error {error}"))?,
+        })
+    }
+
+    /// Project executable steps into the existing OpLog format.
+    ///
+    /// The non-SQL close/reopen boundary remains in the stateful artifact and is
+    /// intentionally not encoded as fake SQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stateful plan fails model validation.
+    pub fn to_oplog(&self) -> Result<OpLog, String> {
+        self.validate()?;
+
+        let mut op_id = 0_u64;
+        let mut records = Vec::new();
+        for step in &self.steps {
+            if let Some((kind, expected)) = step.operation.to_op_kind() {
+                records.push(OpRecord {
+                    op_id,
+                    worker: 0,
+                    kind,
+                    expected,
+                });
+                op_id = op_id.saturating_add(1);
+            }
+        }
+
+        Ok(OpLog {
+            header: OpLogHeader {
+                fixture_id: self.metadata.fixture_id.clone(),
+                seed: self.metadata.seed,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 1,
+                    transaction_size: 1,
+                    commit_order_policy: "deterministic".to_owned(),
+                },
+                preset: Some("stateful-operation-plan".to_owned()),
+            },
+            records,
+        })
+    }
+
+    /// Serialize the plan using the stable serde field order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serde error if JSON serialization fails.
+    pub fn canonical_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Compute a stable hash over the canonical JSON artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serde error if JSON serialization fails.
+    pub fn stable_artifact_hash(&self) -> Result<String, serde_json::Error> {
+        self.canonical_json()
+            .map(|json| sha256_hex(json.as_bytes()))
+    }
+
+    /// Build stable SQL, trace, and metadata artifacts for public replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan is invalid or artifact serialization fails.
+    pub fn to_sql_artifact(&self) -> Result<StatefulSqlArtifact, String> {
+        let audit = self.validate()?;
+        let plan_hash = self
+            .stable_artifact_hash()
+            .map_err(|error| format!("stateful_plan_hash_error {error}"))?;
+        let final_model_hash = self
+            .final_model
+            .stable_hash()
+            .map_err(|error| format!("stateful_final_model_hash_error {error}"))?;
+        let mut schema = Vec::new();
+        let mut workload = Vec::new();
+        let mut trace = Vec::with_capacity(self.steps.len());
+
+        for step in &self.steps {
+            let executable_sql = step.operation.to_sql_statement();
+            if let Some(sql) = &executable_sql {
+                if matches!(step.operation, StatefulOperation::CreateSchema) {
+                    schema.push(sql.clone());
+                } else {
+                    workload.push(sql.clone());
+                }
+            }
+            trace.push(StatefulTraceEntry {
+                step_id: step.step_id,
+                origin_seed: step.origin_seed,
+                required_lane: step.required_lane.clone(),
+                feature_ids: step.feature_ids.clone(),
+                operation: step.operation.clone(),
+                expected_transition: step.expected_transition.clone(),
+                preconditions: step.preconditions.clone(),
+                postconditions: step.postconditions.clone(),
+                executable_sql,
+            });
+        }
+
+        let metadata = StatefulArtifactMetadata {
+            schema_version: self.metadata.schema_version.clone(),
+            fixture_id: self.metadata.fixture_id.clone(),
+            owner_bead: self.metadata.owner_bead.clone(),
+            seed: self.metadata.seed,
+            profile_hash: self.metadata.profile_hash.clone(),
+            required_lane: self.metadata.required_lane.clone(),
+            feature_ids: self.metadata.feature_ids.clone(),
+            plan_hash,
+            final_model_hash,
+            audit,
+            supported_statuses: StatefulExecutionStatus::fail_closed_statuses(),
+        };
+        let sql_text = stable_sql_text(&schema, &workload);
+        let trace_json = serde_json::to_string(&trace)
+            .map_err(|error| format!("stateful_trace_json_error {error}"))?;
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|error| format!("stateful_metadata_json_error {error}"))?;
+
+        Ok(StatefulSqlArtifact {
+            schema,
+            workload,
+            trace,
+            metadata,
+            sql_hash: sha256_hex(sql_text.as_bytes()),
+            trace_hash: sha256_hex(trace_json.as_bytes()),
+            metadata_hash: sha256_hex(metadata_json.as_bytes()),
+        })
+    }
+}
+
+/// One independently modeled stateful step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulPlanStep {
+    /// Deterministic step ID.
+    pub step_id: u64,
+    /// Conditions that must hold before the operation is applied.
+    pub preconditions: Vec<StatefulCondition>,
+    /// Operation payload.
+    pub operation: StatefulOperation,
+    /// Expected independent-model transition.
+    pub expected_transition: StatefulTransition,
+    /// Conditions that must hold after the transition.
+    pub postconditions: Vec<StatefulCondition>,
+    /// Required execution lane.
+    pub required_lane: String,
+    /// Feature IDs exercised by the step.
+    pub feature_ids: Vec<String>,
+    /// Per-step deterministic seed lineage.
+    pub origin_seed: u64,
+}
+
+/// Stateful operation vocabulary owned by the e2e workload model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatefulOperation {
+    /// Create the canonical table.
+    CreateSchema,
+    /// Insert a key/value row.
+    Insert { key: i64, value: String },
+    /// Update an existing key.
+    Update { key: i64, value: String },
+    /// Delete an existing key.
+    Delete { key: i64 },
+    /// Begin a transaction.
+    Begin,
+    /// Commit the active transaction.
+    Commit,
+    /// Roll back the active transaction.
+    Rollback,
+    /// Create a savepoint.
+    Savepoint { name: String },
+    /// Roll back to a savepoint.
+    RollbackTo { name: String },
+    /// Release a savepoint.
+    Release { name: String },
+    /// Observe the table row count.
+    SelectCount,
+    /// Run a supported integrity check.
+    IntegrityCheck,
+    /// Close and reopen the file-backed database boundary.
+    CloseReopen,
+}
+
+impl StatefulOperation {
+    /// Render this operation as SQL for public replay, when it has a SQL form.
+    #[must_use]
+    pub fn to_sql_statement(&self) -> Option<String> {
+        let statement = match self {
+            Self::CreateSchema => format!(
+                "CREATE TABLE IF NOT EXISTS {STATEFUL_TABLE} (\
+                 id INTEGER PRIMARY KEY, val TEXT NOT NULL, num REAL DEFAULT 0)"
+            ),
+            Self::Insert { key, value } => format!(
+                "INSERT INTO {STATEFUL_TABLE} (id, val, num) VALUES ({key}, {}, {key})",
+                stateful_sql_literal(value)
+            ),
+            Self::Update { key, value } => format!(
+                "UPDATE {STATEFUL_TABLE} SET val = {} WHERE id = {key}",
+                stateful_sql_literal(value)
+            ),
+            Self::Delete { key } => {
+                format!("DELETE FROM {STATEFUL_TABLE} WHERE id = {key}")
+            }
+            Self::Begin => "BEGIN".to_owned(),
+            Self::Commit => "COMMIT".to_owned(),
+            Self::Rollback => "ROLLBACK".to_owned(),
+            Self::Savepoint { name } => format!("SAVEPOINT {name}"),
+            Self::RollbackTo { name } => format!("ROLLBACK TO {name}"),
+            Self::Release { name } => format!("RELEASE {name}"),
+            Self::SelectCount => format!("SELECT COUNT(*) FROM {STATEFUL_TABLE}"),
+            Self::IntegrityCheck => "PRAGMA integrity_check".to_owned(),
+            Self::CloseReopen => return None,
+        };
+        Some(statement)
+    }
+
+    fn to_op_kind(&self) -> Option<(OpKind, Option<ExpectedResult>)> {
+        let projected = match self {
+            Self::CreateSchema => (
+                OpKind::Sql {
+                    statement: self.to_sql_statement()?,
+                },
+                None,
+            ),
+            Self::Insert { key, value } => (
+                OpKind::Insert {
+                    table: STATEFUL_TABLE.to_owned(),
+                    key: *key,
+                    values: vec![
+                        ("val".to_owned(), value.clone()),
+                        ("num".to_owned(), key.to_string()),
+                    ],
+                },
+                Some(ExpectedResult::AffectedRows(1)),
+            ),
+            Self::Update { key, value } => (
+                OpKind::Update {
+                    table: STATEFUL_TABLE.to_owned(),
+                    key: *key,
+                    values: vec![("val".to_owned(), value.clone())],
+                },
+                Some(ExpectedResult::AffectedRows(1)),
+            ),
+            Self::Delete { .. } => (
+                OpKind::Sql {
+                    statement: self.to_sql_statement()?,
+                },
+                Some(ExpectedResult::AffectedRows(1)),
+            ),
+            Self::Begin => (OpKind::Begin, None),
+            Self::Commit => (OpKind::Commit, None),
+            Self::Rollback => (OpKind::Rollback, None),
+            Self::Savepoint { .. } => (
+                OpKind::Sql {
+                    statement: self.to_sql_statement()?,
+                },
+                None,
+            ),
+            Self::RollbackTo { .. } => (
+                OpKind::Sql {
+                    statement: self.to_sql_statement()?,
+                },
+                None,
+            ),
+            Self::Release { .. } => (
+                OpKind::Sql {
+                    statement: self.to_sql_statement()?,
+                },
+                None,
+            ),
+            Self::SelectCount => (
+                OpKind::Sql {
+                    statement: self.to_sql_statement()?,
+                },
+                Some(ExpectedResult::RowCount(1)),
+            ),
+            Self::IntegrityCheck => (
+                OpKind::Sql {
+                    statement: self.to_sql_statement()?,
+                },
+                Some(ExpectedResult::RowCount(1)),
+            ),
+            Self::CloseReopen => return None,
+        };
+
+        Some(projected)
+    }
+}
+
+/// Expected independent-model transition for a step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatefulTransition {
+    /// Schema was created.
+    SchemaCreated,
+    /// Row was inserted.
+    RowInserted { key: i64 },
+    /// Row was updated.
+    RowUpdated { key: i64 },
+    /// Row was deleted.
+    RowDeleted { key: i64 },
+    /// Transaction began.
+    TransactionBegun,
+    /// Transaction committed.
+    TransactionCommitted,
+    /// Transaction rolled back.
+    TransactionRolledBack,
+    /// Savepoint was created.
+    SavepointCreated { name: String },
+    /// State was restored to a savepoint.
+    SavepointRolledBack { name: String },
+    /// Savepoint was released.
+    SavepointReleased { name: String },
+    /// Read-only observation occurred.
+    Observation { row_count: usize },
+    /// Integrity check completed.
+    IntegrityChecked,
+    /// Close/reopen preserved committed state.
+    CloseReopen { row_count: usize },
+}
+
+/// Preconditions and postconditions checked by the independent model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatefulCondition {
+    /// Schema exists.
+    SchemaExists,
+    /// Row exists.
+    RowExists { key: i64 },
+    /// Row is absent.
+    RowAbsent { key: i64 },
+    /// The model is in a transaction.
+    InTransaction,
+    /// The model is not in a transaction.
+    NotInTransaction,
+    /// Savepoint exists.
+    SavepointExists { name: String },
+    /// Current committed/logical row count matches.
+    RowCount { count: usize },
+    /// Integrity is clean according to the model.
+    IntegrityClean,
+    /// Step carries the expected required lane.
+    LaneObserved { lane: String },
+}
+
+impl StatefulCondition {
+    fn verify(&self, model: &StatefulModel, step: &StatefulPlanStep) -> Result<(), String> {
+        let satisfied = match self {
+            Self::SchemaExists => model.schema_created,
+            Self::RowExists { key } => model.rows.contains_key(key),
+            Self::RowAbsent { key } => !model.rows.contains_key(key),
+            Self::InTransaction => model.transaction_snapshot.is_some(),
+            Self::NotInTransaction => model.transaction_snapshot.is_none(),
+            Self::SavepointExists { name } => model.savepoints.contains_key(name),
+            Self::RowCount { count } => model.rows.len() == *count,
+            Self::IntegrityClean => model.schema_created,
+            Self::LaneObserved { lane } => step.required_lane == *lane,
+        };
+
+        if satisfied {
+            Ok(())
+        } else {
+            Err(format!(
+                "stateful_condition_failed step_id={} condition={self:?}",
+                step.step_id
+            ))
+        }
+    }
+}
+
+/// Stable model snapshot retained in plan artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulModelSnapshot {
+    /// Whether schema creation has occurred.
+    pub schema_created: bool,
+    /// Stable row state.
+    pub rows: Vec<(i64, String)>,
+    /// Whether a transaction is active.
+    pub in_transaction: bool,
+    /// Active savepoint names.
+    pub savepoints: Vec<String>,
+}
+
+impl StatefulModelSnapshot {
+    /// Compute a stable hash over the model snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serde error if JSON serialization fails.
+    pub fn stable_hash(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_vec(self).map(|bytes| sha256_hex(&bytes))
+    }
+}
+
+/// Validation summary for a stateful plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulPlanAudit {
+    /// Artifact schema version.
+    pub schema_version: String,
+    /// Fixture identifier.
+    pub fixture_id: String,
+    /// Number of stateful steps.
+    pub step_count: usize,
+    /// Number of steps projected into executable OpLog records.
+    pub projected_record_count: usize,
+    /// Number of close/reopen boundaries retained in the stateful artifact.
+    pub close_reopen_count: usize,
+    /// Stable hash of final independent model state.
+    pub final_model_hash: String,
+}
+
+/// Stable SQL, trace, and metadata projection for a stateful plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulSqlArtifact {
+    /// Schema statements run before the workload in public differential replay.
+    pub schema: Vec<String>,
+    /// Workload statements run after schema setup.
+    pub workload: Vec<String>,
+    /// Step-by-step stable trace, including non-SQL boundaries.
+    pub trace: Vec<StatefulTraceEntry>,
+    /// Stable metadata retained with the artifact.
+    pub metadata: StatefulArtifactMetadata,
+    /// Stable hash of schema/workload SQL text.
+    pub sql_hash: String,
+    /// Stable hash of the trace JSON.
+    pub trace_hash: String,
+    /// Stable hash of the metadata JSON.
+    pub metadata_hash: String,
+}
+
+/// Stable per-step trace entry for stateful replay artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulTraceEntry {
+    /// Step identifier.
+    pub step_id: u64,
+    /// Deterministic seed lineage for this step.
+    pub origin_seed: u64,
+    /// Required execution lane for the step.
+    pub required_lane: String,
+    /// Feature IDs exercised by the step.
+    pub feature_ids: Vec<String>,
+    /// Original model operation.
+    pub operation: StatefulOperation,
+    /// Expected independent-model transition.
+    pub expected_transition: StatefulTransition,
+    /// Preconditions checked before applying the operation.
+    pub preconditions: Vec<StatefulCondition>,
+    /// Postconditions checked after applying the operation.
+    pub postconditions: Vec<StatefulCondition>,
+    /// SQL emitted for public replay, absent for non-SQL boundaries.
+    pub executable_sql: Option<String>,
+}
+
+/// Stable metadata for a stateful SQL artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatefulArtifactMetadata {
+    /// Artifact schema version.
+    pub schema_version: String,
+    /// Fixture identifier.
+    pub fixture_id: String,
+    /// Owning bead for traceability.
+    pub owner_bead: String,
+    /// Base seed.
+    pub seed: u64,
+    /// Stable hash of the generation profile.
+    pub profile_hash: String,
+    /// Required execution lane.
+    pub required_lane: String,
+    /// Feature IDs covered by the artifact.
+    pub feature_ids: Vec<String>,
+    /// Stable hash of the full plan JSON.
+    pub plan_hash: String,
+    /// Stable hash of the final independent model state.
+    pub final_model_hash: String,
+    /// Validation audit for the plan.
+    pub audit: StatefulPlanAudit,
+    /// Distinct fail-closed execution statuses used by this lane.
+    pub supported_statuses: Vec<StatefulExecutionStatus>,
+}
+
+/// Distinct completion/fail-closed categories for stateful execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatefulExecutionStatus {
+    /// All required steps completed and validation passed.
+    Completed,
+    /// The plan is malformed or violates the independent model.
+    InvalidPlan,
+    /// The plan asked for a feature outside the explicit supported-core set.
+    UnsupportedFeature,
+    /// The configured execution budget expired.
+    Timeout,
+    /// The run was cancelled before a semantic verdict.
+    Cancelled,
+    /// The run exhausted its exploration budget before covering required work.
+    IncompleteExploration,
+}
+
+impl StatefulExecutionStatus {
+    /// All statuses that must remain distinct in stateful diagnostics.
+    #[must_use]
+    pub fn fail_closed_statuses() -> Vec<Self> {
+        vec![
+            Self::Completed,
+            Self::InvalidPlan,
+            Self::UnsupportedFeature,
+            Self::Timeout,
+            Self::Cancelled,
+            Self::IncompleteExploration,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StatefulModel {
+    schema_created: bool,
+    rows: BTreeMap<i64, String>,
+    transaction_snapshot: Option<BTreeMap<i64, String>>,
+    savepoints: BTreeMap<String, BTreeMap<i64, String>>,
+}
+
+impl StatefulModel {
+    fn apply(&mut self, operation: &StatefulOperation) -> Result<StatefulTransition, String> {
+        match operation {
+            StatefulOperation::CreateSchema => {
+                if self.transaction_snapshot.is_some() {
+                    return Err("stateful_create_schema_inside_transaction".to_owned());
+                }
+                self.schema_created = true;
+                Ok(StatefulTransition::SchemaCreated)
+            }
+            StatefulOperation::Insert { key, value } => {
+                self.require_schema()?;
+                if self.rows.contains_key(key) {
+                    return Err(format!("stateful_insert_duplicate_key key={key}"));
+                }
+                self.rows.insert(*key, value.clone());
+                Ok(StatefulTransition::RowInserted { key: *key })
+            }
+            StatefulOperation::Update { key, value } => {
+                self.require_schema()?;
+                let row = self
+                    .rows
+                    .get_mut(key)
+                    .ok_or_else(|| format!("stateful_update_missing_key key={key}"))?;
+                *row = value.clone();
+                Ok(StatefulTransition::RowUpdated { key: *key })
+            }
+            StatefulOperation::Delete { key } => {
+                self.require_schema()?;
+                if self.rows.remove(key).is_none() {
+                    return Err(format!("stateful_delete_missing_key key={key}"));
+                }
+                Ok(StatefulTransition::RowDeleted { key: *key })
+            }
+            StatefulOperation::Begin => {
+                self.require_schema()?;
+                if self.transaction_snapshot.is_some() {
+                    return Err("stateful_nested_begin".to_owned());
+                }
+                self.transaction_snapshot = Some(self.rows.clone());
+                Ok(StatefulTransition::TransactionBegun)
+            }
+            StatefulOperation::Commit => {
+                self.require_active_transaction()?;
+                self.transaction_snapshot = None;
+                self.savepoints.clear();
+                Ok(StatefulTransition::TransactionCommitted)
+            }
+            StatefulOperation::Rollback => {
+                let snapshot = self
+                    .transaction_snapshot
+                    .take()
+                    .ok_or_else(|| "stateful_rollback_without_transaction".to_owned())?;
+                self.rows = snapshot;
+                self.savepoints.clear();
+                Ok(StatefulTransition::TransactionRolledBack)
+            }
+            StatefulOperation::Savepoint { name } => {
+                self.require_active_transaction()?;
+                self.savepoints.insert(name.clone(), self.rows.clone());
+                Ok(StatefulTransition::SavepointCreated { name: name.clone() })
+            }
+            StatefulOperation::RollbackTo { name } => {
+                let snapshot = self
+                    .savepoints
+                    .get(name)
+                    .ok_or_else(|| format!("stateful_unknown_savepoint name={name}"))?
+                    .clone();
+                self.rows = snapshot;
+                Ok(StatefulTransition::SavepointRolledBack { name: name.clone() })
+            }
+            StatefulOperation::Release { name } => {
+                if self.savepoints.remove(name).is_none() {
+                    return Err(format!("stateful_release_unknown_savepoint name={name}"));
+                }
+                Ok(StatefulTransition::SavepointReleased { name: name.clone() })
+            }
+            StatefulOperation::SelectCount => {
+                self.require_schema()?;
+                Ok(StatefulTransition::Observation {
+                    row_count: self.rows.len(),
+                })
+            }
+            StatefulOperation::IntegrityCheck => {
+                self.require_schema()?;
+                Ok(StatefulTransition::IntegrityChecked)
+            }
+            StatefulOperation::CloseReopen => {
+                self.require_schema()?;
+                if self.transaction_snapshot.is_some() {
+                    return Err("stateful_close_reopen_inside_transaction".to_owned());
+                }
+                Ok(StatefulTransition::CloseReopen {
+                    row_count: self.rows.len(),
+                })
+            }
+        }
+    }
+
+    fn snapshot(&self) -> StatefulModelSnapshot {
+        StatefulModelSnapshot {
+            schema_created: self.schema_created,
+            rows: self
+                .rows
+                .iter()
+                .map(|(key, value)| (*key, value.clone()))
+                .collect(),
+            in_transaction: self.transaction_snapshot.is_some(),
+            savepoints: self.savepoints.keys().cloned().collect(),
+        }
+    }
+
+    fn require_schema(&self) -> Result<(), String> {
+        if self.schema_created {
+            Ok(())
+        } else {
+            Err("stateful_schema_missing".to_owned())
+        }
+    }
+
+    fn require_active_transaction(&self) -> Result<(), String> {
+        if self.transaction_snapshot.is_some() {
+            Ok(())
+        } else {
+            Err("stateful_transaction_missing".to_owned())
+        }
+    }
+}
+
+/// Generate a deterministic stateful operation plan.
+///
+/// # Errors
+///
+/// Returns an error only if the generated model would violate its own
+/// preconditions, which indicates a bug in the generator.
+pub fn generate_stateful_operation_plan(
+    cfg: StatefulPlanConfig,
+) -> Result<StatefulOperationPlan, String> {
+    let normalized_min = if cfg.include_close_reopen { 18 } else { 17 };
+    let max_steps = cfg.max_steps.max(normalized_min);
+    let mut normalized = cfg.clone();
+    normalized.max_steps = max_steps;
+
+    let metadata = StatefulPlanMetadata {
+        schema_version: STATEFUL_PLAN_SCHEMA_VERSION.to_owned(),
+        fixture_id: normalized.fixture_id.clone(),
+        seed: normalized.seed,
+        max_steps,
+        required_lane: normalized.required_lane.clone(),
+        feature_ids: normalized.feature_ids.clone(),
+        profile_hash: stateful_profile_hash(&normalized),
+        owner_bead: "bd-turso-test-adaptation-zu081.20".to_owned(),
+    };
+
+    let mut model = StatefulModel::default();
+    let mut steps = Vec::with_capacity(max_steps);
+    let mut seen_seeds = BTreeSet::new();
+
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::CreateSchema,
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Insert {
+            key: 1,
+            value: stateful_value(normalized.seed, 1),
+        },
+    )?;
+    push_stateful_step(&metadata, &mut model, &mut steps, StatefulOperation::Begin)?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Insert {
+            key: 2,
+            value: stateful_value(normalized.seed, 2),
+        },
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Savepoint {
+            name: "sp_stateful".to_owned(),
+        },
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Update {
+            key: 2,
+            value: stateful_value(normalized.seed, 20),
+        },
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::RollbackTo {
+            name: "sp_stateful".to_owned(),
+        },
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Release {
+            name: "sp_stateful".to_owned(),
+        },
+    )?;
+    push_stateful_step(&metadata, &mut model, &mut steps, StatefulOperation::Commit)?;
+    push_stateful_step(&metadata, &mut model, &mut steps, StatefulOperation::Begin)?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Insert {
+            key: 3,
+            value: stateful_value(normalized.seed, 3),
+        },
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Rollback,
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Insert {
+            key: 4,
+            value: stateful_value(normalized.seed, 4),
+        },
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::Delete { key: 4 },
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::SelectCount,
+    )?;
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::IntegrityCheck,
+    )?;
+    if normalized.include_close_reopen {
+        push_stateful_step(
+            &metadata,
+            &mut model,
+            &mut steps,
+            StatefulOperation::CloseReopen,
+        )?;
+    }
+    push_stateful_step(
+        &metadata,
+        &mut model,
+        &mut steps,
+        StatefulOperation::SelectCount,
+    )?;
+
+    for step in &steps {
+        if !seen_seeds.insert(step.origin_seed) {
+            return Err(format!(
+                "stateful_duplicate_origin_seed step_id={}",
+                step.step_id
+            ));
+        }
+    }
+
+    Ok(StatefulOperationPlan {
+        metadata,
+        steps,
+        final_model: model.snapshot(),
+    })
+}
+
+fn push_stateful_step(
+    metadata: &StatefulPlanMetadata,
+    model: &mut StatefulModel,
+    steps: &mut Vec<StatefulPlanStep>,
+    operation: StatefulOperation,
+) -> Result<(), String> {
+    let step_id = u64::try_from(steps.len()).unwrap_or(u64::MAX);
+    let preconditions = stateful_preconditions(model, &operation, &metadata.required_lane);
+    let transition = model.apply(&operation)?;
+    let postconditions = stateful_postconditions(model, &operation, &metadata.required_lane);
+    steps.push(StatefulPlanStep {
+        step_id,
+        preconditions,
+        operation,
+        expected_transition: transition,
+        postconditions,
+        required_lane: metadata.required_lane.clone(),
+        feature_ids: metadata.feature_ids.clone(),
+        origin_seed: derive_worker_seed(metadata.seed, u16::try_from(step_id).unwrap_or(u16::MAX)),
+    });
+    Ok(())
+}
+
+fn stateful_preconditions(
+    model: &StatefulModel,
+    operation: &StatefulOperation,
+    required_lane: &str,
+) -> Vec<StatefulCondition> {
+    let mut conditions = vec![StatefulCondition::LaneObserved {
+        lane: required_lane.to_owned(),
+    }];
+    match operation {
+        StatefulOperation::CreateSchema => conditions.push(StatefulCondition::NotInTransaction),
+        StatefulOperation::Insert { key, .. } => {
+            conditions.push(StatefulCondition::SchemaExists);
+            conditions.push(StatefulCondition::RowAbsent { key: *key });
+        }
+        StatefulOperation::Update { key, .. } | StatefulOperation::Delete { key } => {
+            conditions.push(StatefulCondition::SchemaExists);
+            conditions.push(StatefulCondition::RowExists { key: *key });
+        }
+        StatefulOperation::Begin | StatefulOperation::CloseReopen => {
+            conditions.push(StatefulCondition::SchemaExists);
+            conditions.push(StatefulCondition::NotInTransaction);
+        }
+        StatefulOperation::Commit | StatefulOperation::Rollback => {
+            conditions.push(StatefulCondition::InTransaction);
+        }
+        StatefulOperation::Savepoint { .. } => conditions.push(StatefulCondition::InTransaction),
+        StatefulOperation::RollbackTo { name } | StatefulOperation::Release { name } => {
+            conditions.push(StatefulCondition::InTransaction);
+            conditions.push(StatefulCondition::SavepointExists { name: name.clone() });
+        }
+        StatefulOperation::SelectCount | StatefulOperation::IntegrityCheck => {
+            conditions.push(StatefulCondition::SchemaExists);
+        }
+    }
+    conditions.push(StatefulCondition::RowCount {
+        count: model.rows.len(),
+    });
+    conditions
+}
+
+fn stateful_postconditions(
+    model: &StatefulModel,
+    operation: &StatefulOperation,
+    required_lane: &str,
+) -> Vec<StatefulCondition> {
+    let mut conditions = vec![
+        StatefulCondition::LaneObserved {
+            lane: required_lane.to_owned(),
+        },
+        StatefulCondition::SchemaExists,
+        StatefulCondition::RowCount {
+            count: model.rows.len(),
+        },
+    ];
+    match operation {
+        StatefulOperation::Insert { key, .. } | StatefulOperation::Update { key, .. } => {
+            conditions.push(StatefulCondition::RowExists { key: *key });
+        }
+        StatefulOperation::Delete { key } => {
+            conditions.push(StatefulCondition::RowAbsent { key: *key });
+        }
+        StatefulOperation::Begin | StatefulOperation::Savepoint { .. } => {
+            conditions.push(StatefulCondition::InTransaction);
+        }
+        StatefulOperation::Commit
+        | StatefulOperation::Rollback
+        | StatefulOperation::CloseReopen => {
+            conditions.push(StatefulCondition::NotInTransaction);
+        }
+        StatefulOperation::RollbackTo { name } => {
+            conditions.push(StatefulCondition::InTransaction);
+            conditions.push(StatefulCondition::SavepointExists { name: name.clone() });
+        }
+        StatefulOperation::Release { .. } => {
+            conditions.push(StatefulCondition::InTransaction);
+        }
+        StatefulOperation::CreateSchema
+        | StatefulOperation::SelectCount
+        | StatefulOperation::IntegrityCheck => {}
+    }
+    if matches!(operation, StatefulOperation::IntegrityCheck) {
+        conditions.push(StatefulCondition::IntegrityClean);
+    }
+    conditions
+}
+
+fn stateful_value(seed: u64, key: i64) -> String {
+    let rotation = u32::try_from(key.rem_euclid(32)).unwrap_or(0);
+    format!("stateful_{:016x}_{key}", seed.rotate_left(rotation))
+}
+
+fn stateful_sql_literal(value: &str) -> String {
+    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
+fn stable_sql_text(schema: &[String], workload: &[String]) -> String {
+    let mut text = String::new();
+    for statement in schema.iter().chain(workload) {
+        text.push_str(statement);
+        text.push('\n');
+    }
+    text
+}
+
+fn stateful_profile_hash(cfg: &StatefulPlanConfig) -> String {
+    let input = format!(
+        "{}:{}:{}:{}:{}:{}",
+        cfg.fixture_id,
+        cfg.seed,
+        cfg.max_steps,
+        cfg.required_lane,
+        cfg.include_close_reopen,
+        cfg.feature_ids.join(",")
+    );
+    sha256_hex(input.as_bytes())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    crate::bytes_to_lower_hex(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,5 +2034,123 @@ mod tests {
                 assert_eq!(values[1].0, "num", "second column should be 'num'");
             }
         }
+    }
+
+    #[test]
+    fn stateful_plan_validates_and_projects_to_oplog() {
+        let plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        let audit = plan
+            .validate()
+            .expect("default stateful plan should validate");
+        assert_eq!(audit.schema_version, STATEFUL_PLAN_SCHEMA_VERSION);
+        assert_eq!(audit.step_count, plan.steps.len());
+        assert_eq!(audit.close_reopen_count, 1);
+
+        let oplog = plan.to_oplog().expect("stateful plan should project");
+        assert_eq!(
+            oplog.header.preset.as_deref(),
+            Some("stateful-operation-plan")
+        );
+        assert_eq!(oplog.header.concurrency.worker_count, 1);
+        assert_eq!(oplog.records.len(), audit.projected_record_count);
+        assert!(oplog.records.len() < plan.steps.len());
+        assert!(
+            oplog
+                .records
+                .iter()
+                .any(|record| matches!(&record.kind, OpKind::Sql { statement } if statement.starts_with("SAVEPOINT ")))
+        );
+        assert!(
+            oplog
+                .records
+                .iter()
+                .any(|record| matches!(&record.kind, OpKind::Sql { statement } if statement == "PRAGMA integrity_check"))
+        );
+
+        let artifact = plan
+            .to_sql_artifact()
+            .expect("stateful SQL artifact should build");
+        assert_eq!(artifact.metadata.audit, audit);
+        assert_eq!(artifact.metadata.required_lane, STATEFUL_REQUIRED_LANE);
+        assert!(artifact.schema[0].starts_with("CREATE TABLE IF NOT EXISTS"));
+        assert!(
+            artifact
+                .workload
+                .iter()
+                .any(|sql| sql == "SAVEPOINT sp_stateful")
+        );
+        assert!(artifact.trace.iter().any(|entry| {
+            matches!(entry.operation, StatefulOperation::CloseReopen)
+                && entry.executable_sql.is_none()
+        }));
+        assert_eq!(
+            artifact.metadata.supported_statuses.len(),
+            artifact
+                .metadata
+                .supported_statuses
+                .iter()
+                .map(|status| format!("{status:?}"))
+                .collect::<BTreeSet<_>>()
+                .len()
+        );
+    }
+
+    #[test]
+    fn stateful_plan_artifact_hash_is_stable_for_same_seed() {
+        let cfg = StatefulPlanConfig {
+            fixture_id: "stable".to_owned(),
+            seed: 0x1234,
+            ..StatefulPlanConfig::default()
+        };
+        let first = generate_stateful_operation_plan(cfg.clone())
+            .expect("first stateful plan should generate")
+            .stable_artifact_hash()
+            .expect("hash first plan");
+        let second = generate_stateful_operation_plan(cfg)
+            .expect("second stateful plan should generate")
+            .stable_artifact_hash()
+            .expect("hash second plan");
+        assert_eq!(first, second);
+
+        let cfg = StatefulPlanConfig {
+            fixture_id: "stable".to_owned(),
+            seed: 0x1234,
+            ..StatefulPlanConfig::default()
+        };
+        let first_artifact = generate_stateful_operation_plan(cfg.clone())
+            .expect("first stateful plan should generate")
+            .to_sql_artifact()
+            .expect("first stateful artifact should build");
+        let second_artifact = generate_stateful_operation_plan(cfg)
+            .expect("second stateful plan should generate")
+            .to_sql_artifact()
+            .expect("second stateful artifact should build");
+        assert_eq!(first_artifact.sql_hash, second_artifact.sql_hash);
+        assert_eq!(first_artifact.trace_hash, second_artifact.trace_hash);
+        assert_eq!(first_artifact.metadata_hash, second_artifact.metadata_hash);
+    }
+
+    #[test]
+    fn stateful_plan_validation_rejects_tampered_transition() {
+        let mut plan = generate_stateful_operation_plan(StatefulPlanConfig::default())
+            .expect("default stateful plan should generate");
+        plan.steps[1].expected_transition = StatefulTransition::RowDeleted { key: 1 };
+        let error = plan
+            .validate()
+            .expect_err("tampered transition must fail closed");
+        assert!(error.contains("stateful_step_transition_mismatch"));
+    }
+
+    #[test]
+    fn stateful_plan_can_omit_close_reopen_boundary() {
+        let plan = generate_stateful_operation_plan(StatefulPlanConfig {
+            include_close_reopen: false,
+            ..StatefulPlanConfig::default()
+        })
+        .expect("stateful plan without reopen should generate");
+        let audit = plan.validate().expect("stateful plan should validate");
+        assert_eq!(audit.close_reopen_count, 0);
+        assert_eq!(plan.steps.len(), audit.projected_record_count);
     }
 }

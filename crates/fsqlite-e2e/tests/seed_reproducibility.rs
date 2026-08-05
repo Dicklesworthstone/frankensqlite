@@ -27,9 +27,17 @@
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::collections::BTreeSet;
 
 use fsqlite_e2e::oplog::{preset_commutative_inserts_disjoint_keys, preset_hot_page_contention};
+use fsqlite_e2e::workload::{
+    StatefulOperation, StatefulOperationPlan, StatefulPlanConfig, generate_stateful_operation_plan,
+};
 use fsqlite_e2e::{FRANKEN_SEED, derive_scenario_seed, derive_worker_seed};
+use fsqlite_harness::differential_v2::{
+    CsqliteExecutor, EngineIdentity, ExecutionEnvelope, FsqliteExecutor, NormalizedValue, Outcome,
+    SqlExecutor, minimize_mismatch_workload, run_differential,
+};
 
 const SCENARIO_HASHES: [u64; 5] = [
     0x0053_4348_u64,
@@ -268,6 +276,111 @@ fn database_state_commutative_inserts_seed_independent() {
     });
 }
 
+#[test]
+fn stateful_operation_plan_file_replay_is_reproducible() {
+    asupersync::test_utils::run_test(|| async {
+        let plan = generate_stateful_operation_plan(StatefulPlanConfig {
+            fixture_id: "stateful-db-repro".to_owned(),
+            seed: FRANKEN_SEED,
+            ..StatefulPlanConfig::default()
+        })
+        .expect("stateful plan should generate");
+
+        let audit = plan.validate().expect("stateful plan should validate");
+        assert_eq!(audit.close_reopen_count, 1);
+
+        let oplog = plan
+            .to_oplog()
+            .expect("stateful plan should project to OpLog");
+        assert_eq!(
+            oplog.header.preset.as_deref(),
+            Some("stateful-operation-plan")
+        );
+
+        let state1 = execute_stateful_plan_and_hash(&plan).await;
+        let state2 = execute_stateful_plan_and_hash(&plan).await;
+        assert_eq!(
+            state1, state2,
+            "stateful plan replay must be deterministic across clean temp files"
+        );
+    });
+}
+
+#[test]
+fn stateful_operation_plan_public_differential_matches_csqlite() {
+    let plan = generate_stateful_operation_plan(StatefulPlanConfig {
+        fixture_id: "stateful-public-differential".to_owned(),
+        seed: FRANKEN_SEED,
+        ..StatefulPlanConfig::default()
+    })
+    .expect("stateful plan should generate");
+    let artifact = plan
+        .to_sql_artifact()
+        .expect("stateful SQL artifact should build");
+    assert_eq!(
+        artifact.metadata.supported_statuses.len(),
+        distinct_status_count(&artifact.metadata.supported_statuses)
+    );
+
+    let envelope = stateful_artifact_envelope(&artifact.schema, &artifact.workload, FRANKEN_SEED);
+    let fsqlite = FsqliteExecutor::open_in_memory().expect("open FrankenSQLite executor");
+    let csqlite = CsqliteExecutor::open_in_memory().expect("open C SQLite executor");
+    let result = run_differential(&envelope, &fsqlite, &csqlite);
+
+    assert_eq!(result.outcome, Outcome::Pass, "{result:#?}");
+    assert!(result.logical_state_matched);
+    assert_eq!(result.statements_mismatched, 0);
+    assert_eq!(artifact.metadata.audit.close_reopen_count, 1);
+    assert!(artifact.trace.iter().any(|entry| {
+        matches!(entry.operation, StatefulOperation::CloseReopen) && entry.executable_sql.is_none()
+    }));
+}
+
+#[test]
+fn stateful_operation_plan_synthetic_mismatch_reduces_and_replays() {
+    let plan = generate_stateful_operation_plan(StatefulPlanConfig {
+        fixture_id: "stateful-reducer-replay".to_owned(),
+        seed: FRANKEN_SEED,
+        ..StatefulPlanConfig::default()
+    })
+    .expect("stateful plan should generate");
+    let artifact = plan
+        .to_sql_artifact()
+        .expect("stateful SQL artifact should build");
+    let envelope = stateful_artifact_envelope(&artifact.schema, &artifact.workload, FRANKEN_SEED);
+    let required_lane = artifact.metadata.required_lane.clone();
+
+    let reduction = minimize_mismatch_workload(
+        &envelope,
+        || Ok(SyntheticStatefulExecutor::subject()),
+        || Ok(SyntheticStatefulExecutor::reference()),
+    )
+    .expect("synthetic reducer should run")
+    .expect("synthetic mismatch should reproduce");
+
+    assert_eq!(reduction.minimized_result.outcome, Outcome::Divergence);
+    assert!(reduction.minimized_workload_len < reduction.original_workload_len);
+    assert_eq!(
+        reduction.minimized_envelope.workload,
+        vec!["SELECT COUNT(*) FROM stateful_kv".to_owned()]
+    );
+    let divergence = reduction
+        .minimized_result
+        .divergences
+        .first()
+        .expect("minimized result should retain first divergence");
+    assert_eq!(divergence.sql, "SELECT COUNT(*) FROM stateful_kv");
+    assert_eq!(required_lane, artifact.metadata.required_lane);
+
+    let replay = run_differential(
+        &reduction.minimized_envelope,
+        &SyntheticStatefulExecutor::subject(),
+        &SyntheticStatefulExecutor::reference(),
+    );
+    assert_eq!(replay.outcome, Outcome::Divergence);
+    assert_eq!(replay.divergences[0].sql, divergence.sql);
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /// Execute an OpLog on FrankenSQLite and return a hash of the final state.
@@ -328,11 +441,256 @@ async fn execute_oplog_and_hash(oplog: &fsqlite_e2e::oplog::OpLog) -> String {
     fsqlite_e2e::bytes_to_lower_hex(hasher.finalize())
 }
 
+async fn execute_stateful_plan_and_hash(plan: &StatefulOperationPlan) -> String {
+    use sha2::{Digest, Sha256};
+
+    assert_fixed_seed_stateful_plan(plan);
+
+    let tempdir = tempfile::tempdir().expect("create temp dir");
+    let db_path = tempdir.path().join("stateful.sqlite");
+    let db_path = db_path.to_str().expect("temp path is utf8").to_owned();
+    let conn = fsqlite::Connection::open(&db_path)
+        .await
+        .expect("open stateful connection");
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stateful_kv \
+         (id INTEGER PRIMARY KEY, val TEXT NOT NULL, num REAL DEFAULT 0)",
+    )
+    .await
+    .expect("create stateful schema");
+    conn.execute(
+        "INSERT INTO stateful_kv (id, val, num) \
+         VALUES (1, 'stateful_008ca4829c968a9c_1', 1)",
+    )
+    .await
+    .expect("insert stateful key 1");
+    conn.execute("BEGIN")
+        .await
+        .expect("begin stateful transaction");
+    conn.execute(
+        "INSERT INTO stateful_kv (id, val, num) \
+         VALUES (2, 'stateful_01194905392d1538_2', 2)",
+    )
+    .await
+    .expect("insert stateful key 2");
+    conn.execute("SAVEPOINT sp_stateful")
+        .await
+        .expect("create stateful savepoint");
+    conn.execute("UPDATE stateful_kv SET val = 'stateful_2414e4b454e00465_20' WHERE id = 2")
+        .await
+        .expect("update stateful key 2");
+    conn.execute("ROLLBACK TO sp_stateful")
+        .await
+        .expect("rollback to stateful savepoint");
+    conn.execute("RELEASE sp_stateful")
+        .await
+        .expect("release stateful savepoint");
+    conn.execute("COMMIT")
+        .await
+        .expect("commit stateful transaction");
+    conn.execute("BEGIN")
+        .await
+        .expect("begin rollback transaction");
+    conn.execute(
+        "INSERT INTO stateful_kv (id, val, num) \
+         VALUES (3, 'stateful_0232920a725a2a70_3', 3)",
+    )
+    .await
+    .expect("insert stateful key 3");
+    conn.execute("ROLLBACK")
+        .await
+        .expect("rollback stateful transaction");
+    conn.execute(
+        "INSERT INTO stateful_kv (id, val, num) \
+         VALUES (4, 'stateful_04652414e4b454e0_4', 4)",
+    )
+    .await
+    .expect("insert stateful key 4");
+    conn.execute("DELETE FROM stateful_kv WHERE id = 4")
+        .await
+        .expect("delete stateful key 4");
+
+    let rows = conn
+        .query("SELECT COUNT(*) FROM stateful_kv")
+        .await
+        .expect("stateful count query");
+    assert_eq!(rows.len(), 1);
+    let rows = conn
+        .query("PRAGMA integrity_check")
+        .await
+        .expect("stateful integrity_check");
+    assert_eq!(rows.len(), 1);
+
+    drop(conn);
+    let conn = fsqlite::Connection::open(&db_path)
+        .await
+        .expect("reopen stateful connection");
+    let rows = conn
+        .query("SELECT COUNT(*) FROM stateful_kv")
+        .await
+        .expect("post-reopen stateful count query");
+    assert_eq!(rows.len(), 1);
+
+    let rows = conn
+        .query("SELECT id, val FROM stateful_kv ORDER BY id")
+        .await
+        .expect("query final stateful rows");
+    assert_eq!(rows.len(), plan.final_model.rows.len());
+
+    let mut hasher = Sha256::new();
+    for row in &rows {
+        for val in row.values() {
+            hasher.update(format!("{val:?}").as_bytes());
+        }
+    }
+
+    fsqlite_e2e::bytes_to_lower_hex(hasher.finalize())
+}
+
+fn assert_fixed_seed_stateful_plan(plan: &StatefulOperationPlan) {
+    let operations = plan
+        .steps
+        .iter()
+        .map(|step| &step.operation)
+        .collect::<Vec<_>>();
+    assert_eq!(operations.len(), 18);
+    assert!(matches!(operations[0], StatefulOperation::CreateSchema));
+    assert!(matches!(
+        operations[1],
+        StatefulOperation::Insert { key: 1, value }
+            if value == "stateful_008ca4829c968a9c_1"
+    ));
+    assert!(matches!(operations[2], StatefulOperation::Begin));
+    assert!(matches!(
+        operations[3],
+        StatefulOperation::Insert { key: 2, value }
+            if value == "stateful_01194905392d1538_2"
+    ));
+    assert!(matches!(
+        operations[4],
+        StatefulOperation::Savepoint { name } if name == "sp_stateful"
+    ));
+    assert!(matches!(
+        operations[5],
+        StatefulOperation::Update { key: 2, value }
+            if value == "stateful_2414e4b454e00465_20"
+    ));
+    assert!(matches!(
+        operations[6],
+        StatefulOperation::RollbackTo { name } if name == "sp_stateful"
+    ));
+    assert!(matches!(
+        operations[7],
+        StatefulOperation::Release { name } if name == "sp_stateful"
+    ));
+    assert!(matches!(operations[8], StatefulOperation::Commit));
+    assert!(matches!(operations[9], StatefulOperation::Begin));
+    assert!(matches!(
+        operations[10],
+        StatefulOperation::Insert { key: 3, value }
+            if value == "stateful_0232920a725a2a70_3"
+    ));
+    assert!(matches!(operations[11], StatefulOperation::Rollback));
+    assert!(matches!(
+        operations[12],
+        StatefulOperation::Insert { key: 4, value }
+            if value == "stateful_04652414e4b454e0_4"
+    ));
+    assert!(matches!(
+        operations[13],
+        StatefulOperation::Delete { key: 4 }
+    ));
+    assert!(matches!(operations[14], StatefulOperation::SelectCount));
+    assert!(matches!(operations[15], StatefulOperation::IntegrityCheck));
+    assert!(matches!(operations[16], StatefulOperation::CloseReopen));
+    assert!(matches!(operations[17], StatefulOperation::SelectCount));
+    assert_eq!(
+        plan.final_model.rows,
+        vec![
+            (1, "stateful_008ca4829c968a9c_1".to_owned()),
+            (2, "stateful_01194905392d1538_2".to_owned()),
+        ]
+    );
+}
+
 fn format_val(v: &str) -> String {
     if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
         v.to_owned()
     } else {
         format!("'{}'", v.replace('\'', "''"))
+    }
+}
+
+fn stateful_artifact_envelope(
+    schema: &[String],
+    workload: &[String],
+    seed: u64,
+) -> ExecutionEnvelope {
+    ExecutionEnvelope::builder(seed)
+        .run_id("bd-turso-test-adaptation-zu081.20")
+        .scenario_id("stateful-operation-plan")
+        .schema(schema.iter().cloned())
+        .workload(workload.iter().cloned())
+        .build()
+}
+
+fn distinct_status_count(statuses: &[fsqlite_e2e::workload::StatefulExecutionStatus]) -> usize {
+    statuses
+        .iter()
+        .map(|status| format!("{status:?}"))
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+struct SyntheticStatefulExecutor {
+    identity: EngineIdentity,
+    count_value: i64,
+}
+
+impl SyntheticStatefulExecutor {
+    fn subject() -> Self {
+        Self {
+            identity: EngineIdentity::FrankenSqlite,
+            count_value: 2,
+        }
+    }
+
+    fn reference() -> Self {
+        Self {
+            identity: EngineIdentity::CSqliteOracle,
+            count_value: 99,
+        }
+    }
+}
+
+impl SqlExecutor for SyntheticStatefulExecutor {
+    fn execute(&self, sql: &str) -> Result<usize, String> {
+        if sql
+            .trim()
+            .eq_ignore_ascii_case("DELETE FROM stateful_kv WHERE id = 4")
+        {
+            Ok(1)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn query(&self, sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
+        if sql
+            .trim()
+            .eq_ignore_ascii_case("SELECT COUNT(*) FROM stateful_kv")
+        {
+            Ok(vec![vec![NormalizedValue::Integer(self.count_value)]])
+        } else if sql.trim().eq_ignore_ascii_case("PRAGMA integrity_check") {
+            Ok(vec![vec![NormalizedValue::Text("ok".to_owned())]])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn engine_identity(&self) -> EngineIdentity {
+        self.identity
     }
 }
 
