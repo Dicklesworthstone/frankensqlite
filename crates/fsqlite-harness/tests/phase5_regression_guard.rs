@@ -2342,6 +2342,8 @@ fn validate_scorecard_evidence(
         schema_version: String,
         run_id: String,
         honest_gate_summary: HonestGateSummary,
+        cargo_profile: Option<String>,
+        cargo_profile_expected_opt_level: Option<String>,
     }
     #[derive(Deserialize)]
     struct HonestGateSummary {
@@ -2354,6 +2356,8 @@ fn validate_scorecard_evidence(
         build_metadata_json: Option<String>,
         build_metadata: Option<serde_json::Value>,
         citation_receipt_json: Option<String>,
+        cargo_profile: Option<String>,
+        cargo_profile_expected_opt_level: Option<String>,
     }
     let scorecard_bytes =
         read_evidence_leaf(root, &evidence.scorecard, &format!("{kind} scorecard"))?;
@@ -2396,6 +2400,20 @@ fn validate_scorecard_evidence(
         return Err(format!(
             "{kind} pack manifest does not name its exact retained commit-provenance leaf"
         ));
+    }
+    if let Some(profile) = persistent_profile_for_kind(kind) {
+        validate_cargo_profile_binding(
+            "scorecard",
+            profile,
+            scorecard.cargo_profile.as_deref(),
+            scorecard.cargo_profile_expected_opt_level.as_deref(),
+        )?;
+        validate_cargo_profile_binding(
+            "pack manifest",
+            profile,
+            pack.cargo_profile.as_deref(),
+            pack.cargo_profile_expected_opt_level.as_deref(),
+        )?;
     }
     let provenance_bytes = read_evidence_leaf(
         root,
@@ -2469,6 +2487,42 @@ impl PersistentProfile {
     }
 }
 
+/// Map an auxiliary scorecard `kind` onto the profile whose Cargo binding it
+/// must carry. `c1` is a single-profile pack and is deliberately exempt.
+fn persistent_profile_for_kind(kind: &str) -> Option<PersistentProfile> {
+    match kind {
+        "persistent/release" => Some(PersistentProfile::Release),
+        "persistent/release-perf" => Some(PersistentProfile::ReleasePerf),
+        _ => None,
+    }
+}
+
+/// Exact dual-profile build binding shared by the persistent scorecard and its
+/// pack manifest. Both documents must name the same Cargo profile and the opt
+/// level that profile is defined to produce (`release` -> `z`, `release-perf`
+/// -> `3`). A swapped, absent, or mislabelled pair fails closed here so a
+/// release-perf capture can never be presented as the portable release pack.
+fn validate_cargo_profile_binding(
+    document: &str,
+    profile: PersistentProfile,
+    cargo_profile: Option<&str>,
+    cargo_profile_expected_opt_level: Option<&str>,
+) -> Result<(), String> {
+    if cargo_profile != Some(profile.receipt_name())
+        || cargo_profile_expected_opt_level != Some(profile.expected_opt_level())
+    {
+        return Err(format!(
+            "persistent {} {document} must bind cargo_profile={} and cargo_profile_expected_opt_level={}; found cargo_profile={:?} and cargo_profile_expected_opt_level={:?}",
+            profile.receipt_name(),
+            profile.receipt_name(),
+            profile.expected_opt_level(),
+            cargo_profile,
+            cargo_profile_expected_opt_level,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct PersistentWorkload {
     benchmark: String,
@@ -2491,6 +2545,10 @@ struct PersistentCriterion {
 struct PersistentCitationIdentity {
     actual_worker: String,
     actual_host: String,
+    /// Canonical 64-hex build nonce. Carried on the identity so the dual-profile
+    /// comparison can prove the two captures are independent builds rather than
+    /// one build replayed under two profile labels.
+    nonce: String,
     workload: PersistentWorkload,
 }
 
@@ -2654,6 +2712,7 @@ fn validate_persistent_citation_receipt_bytes(
     Ok(PersistentCitationIdentity {
         actual_worker: provenance.rch.actual_worker,
         actual_host: provenance.rch.actual_host,
+        nonce: provenance.build.nonce,
         workload: provenance.workload,
     })
 }
@@ -2698,8 +2757,15 @@ fn validate_persistent_profile_scorecards(
         );
     }
     // Profile-specific builds need independent nonces. Each receipt already
-    // requires a canonical 64-hex nonce, while profile binding prevents one
-    // receipt from satisfying both leaves.
+    // requires a canonical 64-hex nonce; equality across the two leaves means a
+    // single build identity was replayed under both profile labels, so reject it
+    // here rather than treating the pair as two independent captures.
+    if release.nonce == release_perf.nonce {
+        return Err(format!(
+            "persistent release and release-perf receipts must record distinct build nonces; both recorded `{}`",
+            release.nonce
+        ));
+    }
     Ok(())
 }
 
@@ -3696,7 +3762,7 @@ fn validate_pre_capture_untracked_bytes(bytes: &[u8], tested_commit: &str) -> Re
     if records.windows(2).any(|pair| pair[0] >= pair[1]) || records != expected {
         records.sort();
         return Err(format!(
-            "pre-capture Git status must be sorted and name only the two exact preexisting scorecards; found {records:?}"
+            "pre-capture Git status must be sorted and name only the three exact preexisting scorecards (c1, persistent/release, persistent/release-perf); found {records:?}"
         ));
     }
     Ok(())

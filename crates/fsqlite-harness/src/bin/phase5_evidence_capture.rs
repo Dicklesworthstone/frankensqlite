@@ -2146,7 +2146,7 @@ fn pre_capture_untracked(root: &Path, commit: &str) -> Result<Vec<u8>, String> {
     .into_bytes();
     if output.stdout != expected {
         return Err(format!(
-            "pre-capture status must contain exactly the sorted two scorecards; found {:?}",
+            "pre-capture status must contain exactly the sorted three scorecards (c1, persistent/release, persistent/release-perf); found {:?}",
             output
                 .stdout
                 .split(|byte| *byte == 0)
@@ -2193,10 +2193,40 @@ impl PersistentProfile {
     }
 }
 
+/// Exact dual-profile build binding shared by the persistent scorecard and its
+/// pack manifest. Both documents must name the same Cargo profile and the opt
+/// level that profile is defined to produce (`release` -> `z`, `release-perf`
+/// -> `3`). A swapped, absent, or mislabelled pair fails closed here so a
+/// release-perf capture can never be presented as the portable release pack.
+fn validate_cargo_profile_binding(
+    document: &str,
+    profile: PersistentProfile,
+    cargo_profile: Option<&str>,
+    cargo_profile_expected_opt_level: Option<&str>,
+) -> Result<(), String> {
+    if cargo_profile != Some(profile.manifest_name())
+        || cargo_profile_expected_opt_level != Some(profile.expected_opt_level())
+    {
+        return Err(format!(
+            "persistent {} {document} must bind cargo_profile={} and cargo_profile_expected_opt_level={}; found cargo_profile={:?} and cargo_profile_expected_opt_level={:?}",
+            profile.manifest_name(),
+            profile.manifest_name(),
+            profile.expected_opt_level(),
+            cargo_profile,
+            cargo_profile_expected_opt_level,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct PersistentCitationIdentity {
     actual_worker: String,
     actual_host: String,
+    /// Canonical 64-hex build nonce. Carried on the identity so the dual-profile
+    /// comparison can prove the two captures are independent builds rather than
+    /// one build replayed under two profile labels.
+    nonce: String,
     workload: PersistentWorkload,
 }
 
@@ -2437,6 +2467,7 @@ fn validate_persistent_citation_receipt(
     Ok(PersistentCitationIdentity {
         actual_worker: citation.rch.actual_worker,
         actual_host: citation.rch.actual_host,
+        nonce: citation.build.nonce,
         workload: citation.workload,
     })
 }
@@ -2457,6 +2488,8 @@ fn validate_pack_inputs(
         schema_version: String,
         run_id: String,
         honest_gate_summary: HonestGate,
+        cargo_profile: Option<String>,
+        cargo_profile_expected_opt_level: Option<String>,
     }
     #[derive(Deserialize)]
     struct HonestGate {
@@ -2469,6 +2502,8 @@ fn validate_pack_inputs(
         build_metadata_json: Option<String>,
         build_metadata: Option<Value>,
         citation_receipt_json: Option<String>,
+        cargo_profile: Option<String>,
+        cargo_profile_expected_opt_level: Option<String>,
     }
     #[derive(Deserialize)]
     struct C1Provenance {
@@ -2550,6 +2585,18 @@ fn validate_pack_inputs(
                 profile.manifest_name()
             ));
         }
+        validate_cargo_profile_binding(
+            "scorecard",
+            profile,
+            score.cargo_profile.as_deref(),
+            score.cargo_profile_expected_opt_level.as_deref(),
+        )?;
+        validate_cargo_profile_binding(
+            "pack manifest",
+            profile,
+            pack.cargo_profile.as_deref(),
+            pack.cargo_profile_expected_opt_level.as_deref(),
+        )?;
         validate_persistent_citation_receipt(provenance, tested_commit, profile)
     };
     let release_identity = validate_persistent_pack(
@@ -2573,10 +2620,16 @@ fn validate_pack_inputs(
                 .to_owned(),
         );
     }
-    // Each profile builds a distinct binary, so its fresh nonce is deliberately
-    // validated as a canonical 64-hex family member above rather than forced
-    // equal here. Equality would encourage replaying one build identity across
-    // the two independently profile-bound captures.
+    // Each profile builds a distinct binary, so the two captures must carry
+    // distinct fresh nonces. Equal nonces mean one build identity was replayed
+    // across both profile-bound packs, which would let a single `release-perf`
+    // binary masquerade as the portable `release` capture as well.
+    if release_identity.nonce == release_perf_identity.nonce {
+        return Err(format!(
+            "persistent release and release-perf packs must record distinct build nonces; both recorded `{}`",
+            release_identity.nonce
+        ));
+    }
     Ok(ValidatedPackInputs {
         c1_scorecard,
         c1_manifest,
