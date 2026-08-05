@@ -1602,6 +1602,46 @@ impl FastPageArray {
         None
     }
 
+    /// Remove and return the next clean buffer owned by `pool`.
+    ///
+    /// The cursor advances past every successful victim so a saturated
+    /// sequential scan does not repeatedly walk the sparse-array prefix.
+    fn take_any_clean_from_pool(&mut self, pool: &PageBufPool) -> Option<(PageNumber, PageBuf)> {
+        if self.count == 0 || self.pages.is_empty() {
+            self.next_eviction_scan_start = 0;
+            return None;
+        }
+
+        let len = self.pages.len();
+        let start = self.next_eviction_scan_start.min(len);
+        for idx in (start..len).chain(0..start) {
+            let reclaimable = self.pages[idx]
+                .as_ref()
+                .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(pool));
+            if !reclaimable {
+                continue;
+            }
+
+            let entry = self.pages[idx]
+                .take()
+                .expect("reclaimable fast-array entry must still be present");
+            self.count = self.count.saturating_sub(1);
+            self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+                0
+            } else {
+                idx + 1
+            };
+            self.evictions = self.evictions.saturating_add(1);
+            let raw_page_no = u32::try_from(idx + 1)
+                .expect("resident fast-array index must fit in a page number");
+            let page_no = PageNumber::new(raw_page_no)
+                .expect("resident fast-array index must be a valid page number");
+            return Some((page_no, entry.buf));
+        }
+
+        None
+    }
+
     /// Clear all pages.
     fn clear(&mut self) -> usize {
         let removed = self.count;
@@ -2301,6 +2341,31 @@ impl PageCacheShard {
         key
     }
 
+    /// Remove and return an arbitrary clean buffer owned by `pool`.
+    ///
+    /// `flat_slots` is checked while the shard lock is held, matching the
+    /// shard-to-flat lock order in `ShardedPageCache::insert_tiered`. A
+    /// duplicate therefore remains fail-closed instead of exposing a stale
+    /// overflow image.
+    fn take_any_clean_from_pool(
+        &mut self,
+        pool: &PageBufPool,
+        flat_slots: &FlatPageSlots,
+    ) -> Option<(PageNumber, PageBuf)> {
+        let page_no = self.pages.iter().find_map(|(&page_no, entry)| {
+            (!entry.is_dirty()
+                && entry.buf.returns_to_pool(pool)
+                && !flat_slots.contains_stable(page_no))
+            .then_some(page_no)
+        })?;
+        let entry = self
+            .pages
+            .remove(&page_no)
+            .expect("reclaimable overflow entry must still be present");
+        self.evictions = self.evictions.saturating_add(1);
+        Some((page_no, entry.buf))
+    }
+
     /// Clear all pages from this shard.
     fn clear(&mut self) -> usize {
         let removed = self.pages.len();
@@ -2442,6 +2507,8 @@ pub struct ShardedPageCache {
     shards_dirty: AtomicBool,
     shard_mask: usize,
     shard_shift: u32,
+    /// Per-cache round-robin start for clean overflow-buffer recovery.
+    overflow_clean_probe_cursor: AtomicUsize,
     /// Shared page buffer pool (lock-free allocation).
     pool: PageBufPool,
     /// Configured page size.
@@ -2456,6 +2523,14 @@ pub struct ShardedPageCache {
     eviction_policy_enabled: AtomicBool,
     /// Shared eviction-policy tracker used by [`Self::evict_any`].
     eviction_policy: Mutex<PageCacheEvictionTracker>,
+    /// Test-only receipt that distinguishes diagnostic snapshots from the
+    /// bounded saturated-buffer reclaim path.
+    #[cfg(test)]
+    diagnostic_snapshot_calls: AtomicU64,
+    /// Test-only receipt for the bounded-size eviction-policy reconstruction
+    /// that must also stay off the saturated-buffer reclaim path.
+    #[cfg(test)]
+    reconstructed_victim_scan_calls: AtomicU64,
     /// Per-page miss flights. The first task for a missing page owns the VFS
     /// read; later tasks await the same completion notification and retry the
     /// cache instead of amplifying disk I/O.
@@ -2598,12 +2673,17 @@ impl ShardedPageCache {
             shards_dirty: AtomicBool::new(false),
             shard_mask,
             shard_shift,
+            overflow_clean_probe_cursor: AtomicUsize::new(0),
             pool,
             page_size,
             fast_array: None,
             use_fast_path: AtomicBool::new(false),
             eviction_policy_enabled: AtomicBool::new(false),
             eviction_policy: Mutex::new(PageCacheEvictionTracker::default()),
+            #[cfg(test)]
+            diagnostic_snapshot_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            reconstructed_victim_scan_calls: AtomicU64::new(0),
             in_flight_reads: Mutex::new(HashMap::new()),
             #[cfg(feature = "evalue-eviction")]
             evalue_evictor: crate::evalue_eviction::EValueEvictor::new(),
@@ -3423,27 +3503,106 @@ impl ShardedPageCache {
         None
     }
 
+    /// Scan the flat tier from its persistent eviction cursor and atomically
+    /// reclaim the first eligible buffer.
+    fn take_clean_buffer_from_flat_slots(&self) -> Option<(PageNumber, PageBuf)> {
+        let start = self
+            .flat_slots
+            .eviction_cursor
+            .fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.flat_slots.slots.len() {
+            let idx = start.wrapping_add(offset) & self.flat_slots.mask;
+            let raw_page_no = self.flat_slots.slots[idx].pgno.load(Ordering::Relaxed);
+            if raw_page_no == SLOT_EMPTY || raw_page_no == SLOT_TOMBSTONE {
+                continue;
+            }
+            let Some(page_no) = PageNumber::new(raw_page_no) else {
+                continue;
+            };
+            if let Some(buffer) = self.take_clean_buffer_at(page_no) {
+                self.flat_slots
+                    .eviction_cursor
+                    .store(idx.wrapping_add(1), Ordering::Relaxed);
+                return Some((page_no, buffer));
+            }
+        }
+        None
+    }
+
+    /// Probe overflow shards in round-robin order and reclaim the first
+    /// eligible clean buffer without allocating a cache-wide snapshot.
+    fn take_clean_buffer_from_overflow(&self) -> Option<(PageNumber, PageBuf)> {
+        let start = self
+            .overflow_clean_probe_cursor
+            .fetch_add(1, Ordering::Relaxed)
+            & self.shard_mask;
+        for offset in 0..self.shards.len() {
+            let idx = start.wrapping_add(offset) & self.shard_mask;
+            let mut shard = self.shards[idx].lock();
+            let reclaimed = shard.take_any_clean_from_pool(&self.pool, &self.flat_slots);
+            drop(shard);
+            if let Some((page_no, buffer)) = reclaimed {
+                self.forget_eviction_page(page_no);
+                return Some((page_no, buffer));
+            }
+        }
+        None
+    }
+
     /// Atomically remove and return one clean buffer from this cache's pool.
     ///
     /// This is the write-admission counterpart to [`Self::evict_any`]. It is
     /// intentionally fail-closed for dirty entries: transaction staging must
     /// never recover capacity by discarding an unpublished or unflushed page.
     /// The path is only used after the shared [`PageBufPool`] reaches its
-    /// configured ceiling, so the diagnostic snapshot and deterministic
-    /// victim scan do not burden ordinary cache hits.
-    pub(crate) fn take_clean_buffer(&self) -> Option<PageBuf> {
-        if let Some(preferred) = self.preferred_reconstructed_victim()
-            && let Some(buffer) = self.take_clean_buffer_at(preferred)
+    /// configured ceiling. Tier-local cursors avoid restarting from the same
+    /// prefix and keep scans short when eligible residents are dense, without
+    /// rebuilding and sorting a cache-wide diagnostic snapshot for every
+    /// reclaimed buffer. Worst-case dirty, foreign-pool, duplicate, or sparse
+    /// scans remain linear in the tier's backing-table extent or resident-map
+    /// capacity. This capacity-recovery path also bypasses reconstructed
+    /// eviction-policy selection because that requires a full resident-page
+    /// walk; explicit [`Self::evict_any`] calls continue to honor the
+    /// configured policy.
+    fn take_clean_buffer_entry(&self) -> Option<(PageNumber, PageBuf)> {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
         {
-            return Some(buffer);
+            let reclaimed = fast.lock().take_any_clean_from_pool(&self.pool);
+            if let Some((page_no, buffer)) = reclaimed {
+                self.remove_overflow_duplicate(page_no);
+                self.forget_eviction_page(page_no);
+                return Some((page_no, buffer));
+            }
+            return None;
         }
 
-        let mut candidates = self.page_snapshots();
-        candidates.sort_unstable_by_key(|snapshot| (snapshot.access_count, snapshot.page_no.get()));
-        candidates
-            .into_iter()
-            .filter(|snapshot| !snapshot.dirty)
-            .find_map(|snapshot| self.take_clean_buffer_at(snapshot.page_no))
+        self.take_clean_buffer_from_flat_slots()
+            .or_else(|| self.take_clean_buffer_from_overflow())
+    }
+
+    pub(crate) fn take_clean_buffer(&self) -> Option<PageBuf> {
+        self.take_clean_buffer_entry().map(|(_, buffer)| buffer)
+    }
+
+    /// Return the saturated-cache victim together with its reusable buffer.
+    ///
+    /// This hidden adapter lets the GH #326 benchmark reinsert the exact same
+    /// page number after every reclaim so its resident set and probe topology
+    /// stay fixed. It is absent from default builds and is not a supported API.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn take_clean_buffer_entry_for_bench(&self) -> Option<(PageNumber, PageBuf)> {
+        self.take_clean_buffer_entry()
+    }
+
+    /// Count overflow residents for a benchmark fixture invariant.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn overflow_resident_count_for_bench(&self) -> usize {
+        self.shards.iter().map(|shard| shard.lock().len()).sum()
     }
 
     /// Evict one clean pool-backed cache page and return its buffer to the
@@ -3600,6 +3759,9 @@ impl ShardedPageCache {
             return None;
         }
 
+        #[cfg(test)]
+        self.reconstructed_victim_scan_calls
+            .fetch_add(1, Ordering::Relaxed);
         let residents = self.resident_pages();
         let tracker = self.eviction_policy.lock();
         tracker.choose_victim(&residents)
@@ -3807,6 +3969,10 @@ impl ShardedPageCache {
     /// Capture a read-only snapshot of the resident cache pages.
     #[must_use]
     pub fn page_snapshots(&self) -> Vec<PageCachePageSnapshot> {
+        #[cfg(test)]
+        self.diagnostic_snapshot_calls
+            .fetch_add(1, Ordering::Relaxed);
+
         let mut snapshots = Vec::new();
 
         if self.use_fast_path.load(Ordering::Relaxed) {
@@ -6265,6 +6431,123 @@ mod tests {
         assert_eq!(cache.pool().available(), 1);
         for raw_page_no in 1..=8 {
             assert!(cache.contains(PageNumber::new(raw_page_no).unwrap()));
+        }
+    }
+
+    #[test]
+    fn gh_326_saturated_clean_reclaim_never_builds_diagnostic_snapshot() {
+        fn reclaim_without_snapshot(cache: &ShardedPageCache, tier: &str) -> PageBuf {
+            let snapshots_before = cache.diagnostic_snapshot_calls.load(Ordering::Relaxed);
+            let reclaimed = cache
+                .take_clean_buffer()
+                .unwrap_or_else(|| panic!("{tier} must expose one reclaimable pooled buffer"));
+            assert_eq!(
+                cache.diagnostic_snapshot_calls.load(Ordering::Relaxed),
+                snapshots_before,
+                "{tier} reclaim must not build the O(cache) diagnostic snapshot"
+            );
+            assert!(
+                reclaimed.returns_to_pool(cache.pool()),
+                "{tier} reclaim must return a buffer owned by this cache pool"
+            );
+            reclaimed
+        }
+
+        let mut fast_cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 2, 1);
+        fast_cache.enable_fast_path();
+        fast_cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes[0] = 0xD1)
+            .unwrap();
+        let fast_clean_page = PageNumber::new(2).unwrap();
+        let fast_buffer = fast_cache.pool().acquire().unwrap();
+        fast_cache.insert_buffer(fast_clean_page, fast_buffer);
+        let _fast_reclaimed = reclaim_without_snapshot(&fast_cache, "fast-array");
+        assert!(
+            fast_cache.contains(PageNumber::ONE),
+            "fast-array reclaim must skip dirty pages"
+        );
+        assert!(!fast_cache.contains(fast_clean_page));
+
+        let flat_cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 1, 1);
+        let flat_buffer = flat_cache.pool().acquire().unwrap();
+        flat_cache.insert_buffer(PageNumber::ONE, flat_buffer);
+        let _flat_reclaimed = reclaim_without_snapshot(&flat_cache, "flat-slot");
+        assert!(!flat_cache.contains(PageNumber::ONE));
+
+        const STEADY_RESIDENTS: u32 = 64;
+        const STEADY_RECLAIMS: u32 = 4_096;
+        let steady_cache = ShardedPageCache::with_max_buffers_and_shards(
+            PageSize::DEFAULT,
+            usize::try_from(STEADY_RESIDENTS).unwrap(),
+            4,
+        );
+        for raw_page_no in 1..=STEADY_RESIDENTS {
+            let buffer = steady_cache.pool().acquire().unwrap();
+            steady_cache.insert_buffer(PageNumber::new(raw_page_no).unwrap(), buffer);
+        }
+        steady_cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(
+            usize::try_from(STEADY_RESIDENTS).unwrap(),
+        )));
+        assert_eq!(steady_cache.pool().available(), 0);
+        let snapshots_before = steady_cache
+            .diagnostic_snapshot_calls
+            .load(Ordering::Relaxed);
+        let reconstructed_scans_before = steady_cache
+            .reconstructed_victim_scan_calls
+            .load(Ordering::Relaxed);
+        for raw_page_no in (STEADY_RESIDENTS + 1)..=(STEADY_RESIDENTS + STEADY_RECLAIMS) {
+            let buffer = steady_cache
+                .take_clean_buffer()
+                .expect("steady saturated scan must keep reclaiming clean buffers");
+            steady_cache.insert_buffer(PageNumber::new(raw_page_no).unwrap(), buffer);
+        }
+        assert_eq!(
+            steady_cache
+                .diagnostic_snapshot_calls
+                .load(Ordering::Relaxed),
+            snapshots_before,
+            "repeated saturated reclaims must never rebuild diagnostic snapshots"
+        );
+        assert_eq!(
+            steady_cache
+                .reconstructed_victim_scan_calls
+                .load(Ordering::Relaxed),
+            reconstructed_scans_before,
+            "repeated saturated reclaims must never rebuild policy residents"
+        );
+        assert_eq!(
+            steady_cache.len(),
+            usize::try_from(STEADY_RESIDENTS).unwrap()
+        );
+        assert_eq!(steady_cache.pool().available(), 0);
+
+        let overflow_cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 1, 1);
+        let target_bucket = overflow_cache.flat_slots.hash_pgno(PageNumber::ONE.get());
+        let colliders = track_q_collision_pages(
+            &overflow_cache.flat_slots,
+            target_bucket,
+            MAX_PROBE_LENGTH + 1,
+        );
+        for page_no in colliders.iter().copied().take(MAX_PROBE_LENGTH) {
+            overflow_cache.insert_buffer(page_no, PageBuf::new(PageSize::DEFAULT));
+        }
+        let overflow_page = *colliders.last().unwrap();
+        let overflow_buffer = overflow_cache.pool().acquire().unwrap();
+        overflow_cache.insert_buffer(overflow_page, overflow_buffer);
+        assert!(!overflow_cache.flat_slots.contains(overflow_page));
+        assert!(
+            overflow_cache.shards[overflow_cache.shard_index(overflow_page)]
+                .lock()
+                .contains(overflow_page)
+        );
+
+        let _overflow_reclaimed = reclaim_without_snapshot(&overflow_cache, "overflow-shard");
+        assert!(!overflow_cache.contains(overflow_page));
+        for page_no in colliders.iter().copied().take(MAX_PROBE_LENGTH) {
+            assert!(
+                overflow_cache.contains(page_no),
+                "foreign flat-slot buffers must remain resident"
+            );
         }
     }
 

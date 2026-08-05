@@ -23,6 +23,8 @@ encryption = ["dep:argon2", "dep:chacha20poly1305"]
 # prefers the lowest-e page for eviction. Falls back to the existing policy
 # when disabled (compile-out).
 evalue-eviction = []
+# Hidden adapters used only by standalone Criterion targets.
+bench-internals = []
 
 [dependencies]
 foldhash = "0.2.0"
@@ -61,7 +63,14 @@ tempfile = { workspace = true }
 fsqlite-mvcc = { path = "../fsqlite-mvcc", default-features = false }
 fsqlite-wal = { path = "../fsqlite-wal", version = "0.2.0", default-features = false }
 serde_json = { workspace = true }
+criterion = { workspace = true }
+sha2 = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "page_cache_saturated_reclaim"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true
