@@ -2445,6 +2445,12 @@ impl GeneratedCase {
                 .saturating_add(statement_cost(&statement.ast));
             counters.maximum_ast_depth = counters.maximum_ast_depth.max(statement.ast.depth());
         }
+        if transaction_snapshot.is_some() || schema.transaction_open {
+            return Err(GenerationError::invalid_input(
+                "reduction.transaction",
+                "a reduced case must not end with an open transaction",
+            ));
+        }
         if !subject_seen {
             return Err(GenerationError::invalid_input(
                 "reduction.workload",
@@ -3658,6 +3664,74 @@ mod tests {
 
     fn bootstrap_case() -> GeneratedCase {
         generate_case(GeneratorConfig::bootstrap(TEST_SEED, 20)).expect("generate bootstrap case")
+    }
+
+    #[test]
+    fn reduced_case_recomputes_derived_state_and_retains_seed_trace() {
+        let original = bootstrap_case();
+        let mut statements = original.statements.clone();
+        let removable = statements
+            .iter()
+            .position(|statement| {
+                statement.role == StatementRole::Subject
+                    && matches!(statement.ast, Statement::Select { .. })
+            })
+            .expect("bootstrap profile must contain a subject SELECT");
+        statements.remove(removable);
+
+        let reduced = original
+            .rebuild_with_statements(statements)
+            .expect("rebuild a valid reduced case");
+        assert_eq!(reduced.trace, original.trace);
+        assert_eq!(reduced.trace_hash, original.trace_hash);
+        assert_ne!(reduced.sql_hash, original.sql_hash);
+        assert_eq!(reduced.schema_hash, original.schema_hash);
+        assert_eq!(
+            reduced.counters.accepted,
+            u32::try_from(reduced.statements.len()).unwrap()
+        );
+        assert!(
+            reduced
+                .statements
+                .iter()
+                .all(|statement| statement.sql == statement.ast.to_sql())
+        );
+    }
+
+    #[test]
+    fn reduced_case_rejects_missing_setup_and_unclosed_transactions() {
+        let original = bootstrap_case();
+        let insert = original
+            .statements
+            .iter()
+            .find(|statement| matches!(statement.ast, Statement::Insert { .. }))
+            .expect("bootstrap profile must contain an INSERT")
+            .clone();
+        assert_eq!(
+            original
+                .rebuild_with_statements(vec![insert])
+                .unwrap_err()
+                .constraint,
+            "insert.table"
+        );
+
+        let mut transaction = original
+            .statements
+            .iter()
+            .find(|statement| statement.role == StatementRole::Subject)
+            .expect("bootstrap profile must contain a subject statement")
+            .clone();
+        transaction.ast = Statement::Transaction {
+            statement: TransactionStatement::Begin,
+        };
+        transaction.sql = transaction.ast.to_sql();
+        assert_eq!(
+            original
+                .rebuild_with_statements(vec![transaction])
+                .unwrap_err()
+                .constraint,
+            "reduction.transaction"
+        );
     }
 
     fn compare_paired_statement_outcome(

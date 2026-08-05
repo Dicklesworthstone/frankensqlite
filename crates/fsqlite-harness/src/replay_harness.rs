@@ -38,8 +38,8 @@ use sha2::{Digest, Sha256};
 
 use crate::corpus_ingest::{CorpusBuilder, CorpusSource, TypedPromotionMetadata};
 use crate::differential_runner::{
-    TypedAdapterError, TypedAdapterErrorKind, TypedDifferentialCase, TypedDifferentialRun,
-    run_typed_differential_case, typed_case_to_corpus_entry,
+    StructuredTypedMinimization, TypedAdapterError, TypedAdapterErrorKind, TypedDifferentialCase,
+    TypedDifferentialRun, run_typed_differential_case, typed_case_to_corpus_entry,
 };
 use crate::differential_v2::{DifferentialResult, Outcome, SqlExecutor};
 use crate::failure_bundle::{ExecutionLaneEvidence, FailureBundle};
@@ -209,6 +209,7 @@ impl TypedDifferentialReplayArtifact {
                 if snapshotted != self.case {
                     return Err("typed replay case snapshot does not match artifact".to_owned());
                 }
+                validate_structured_reduction_bundle(self, bundle)?;
             }
             (None, Outcome::Divergence) => {
                 return Err("typed replay divergence requires a failure bundle".to_owned());
@@ -239,6 +240,64 @@ impl TypedDifferentialReplayArtifact {
         artifact.validate()?;
         Ok(artifact)
     }
+}
+
+fn validate_structured_reduction_bundle(
+    artifact: &TypedDifferentialReplayArtifact,
+    bundle: &FailureBundle,
+) -> Result<(), String> {
+    let keys = [
+        "original_typed_case_json",
+        "minimized_typed_case_json",
+        "typed_reduction_json",
+    ];
+    let has_tag = bundle
+        .triage_tags
+        .iter()
+        .any(|tag| tag == "structured-reduction");
+    let has_snapshot = keys
+        .iter()
+        .any(|key| bundle.state_snapshots.contains_key(*key));
+    if !has_tag && !has_snapshot {
+        return Ok(());
+    }
+    if !has_tag || bundle.scenario.bead_id != "bd-turso-test-adaptation-zu081.6" {
+        return Err("typed replay structured reduction marker is incomplete".to_owned());
+    }
+    let original_json = bundle
+        .state_snapshots
+        .get(keys[0])
+        .ok_or_else(|| "typed replay lacks original structured case snapshot".to_owned())?;
+    let minimized_json = bundle
+        .state_snapshots
+        .get(keys[1])
+        .ok_or_else(|| "typed replay lacks minimized structured case snapshot".to_owned())?;
+    let reduction_json = bundle
+        .state_snapshots
+        .get(keys[2])
+        .ok_or_else(|| "typed replay lacks structured reduction snapshot".to_owned())?;
+    let original = TypedDifferentialCase::from_json_strict(original_json)
+        .map_err(|error| format!("typed replay original structured case invalid: {error:?}"))?;
+    let minimized = TypedDifferentialCase::from_json_strict(minimized_json)
+        .map_err(|error| format!("typed replay minimized structured case invalid: {error:?}"))?;
+    let package =
+        StructuredTypedMinimization::from_json_strict(reduction_json).map_err(|error| {
+            format!("typed replay structured reduction snapshot invalid: {error:?}")
+        })?;
+    if minimized != artifact.case
+        || package.minimized_case != artifact.case
+        || package.original_case_hash != original.content_hash
+        || package.reduction.original_statements != original.generated.statements
+        || package.minimized_result_sha256 != artifact.expected_result_sha256
+        || package.repro_command != bundle.reproducibility.repro_command
+        || original.generated.root_seed != artifact.case.generated.root_seed
+        || original.profile_sha256 != artifact.case.profile_sha256
+        || original.run_id != artifact.case.run_id
+        || original.scenario_id != artifact.case.scenario_id
+    {
+        return Err("typed replay structured reduction provenance mismatch".to_owned());
+    }
+    Ok(())
 }
 
 /// Proof that replay observed the exact expected deterministic result.
@@ -313,6 +372,77 @@ pub fn promote_typed_divergence(
     minimal: &MinimalReproduction,
     reviewed_by: &str,
 ) -> Result<TypedCorpusPromotion, String> {
+    let reviewed_by = validate_typed_promotion_evidence(artifact, verification, reviewed_by)?;
+    if minimal.original_seed != artifact.case.generated.root_seed
+        || minimal.minimal_workload.is_empty()
+        || minimal.divergences.is_empty()
+        || minimal.signature.hash.trim().is_empty()
+    {
+        return Err("typed corpus promotion minimization evidence is incomplete".to_owned());
+    }
+
+    let mut entry = typed_case_to_corpus_entry(&artifact.case);
+    entry.id = format!("typed-regression-{}", minimal.signature.hash);
+    entry.statements = artifact
+        .case
+        .envelope
+        .schema
+        .iter()
+        .chain(minimal.minimal_workload.iter())
+        .cloned()
+        .collect();
+    entry.description = format!(
+        "reviewed typed differential regression {} from {}",
+        minimal.signature.hash, artifact.case.case_id
+    );
+    add_typed_promotion(
+        builder,
+        entry,
+        &minimal.signature.hash,
+        artifact,
+        &reviewed_by,
+    )
+}
+
+/// Promote a structured minimized typed divergence through the existing typed
+/// corpus format after exact public replay and explicit review.
+pub fn promote_structured_typed_divergence(
+    builder: &mut CorpusBuilder,
+    artifact: &TypedDifferentialReplayArtifact,
+    verification: &TypedReplayVerification,
+    package: &StructuredTypedMinimization,
+    reviewed_by: &str,
+) -> Result<TypedCorpusPromotion, String> {
+    let reviewed_by = validate_typed_promotion_evidence(artifact, verification, reviewed_by)?;
+    package
+        .validate()
+        .map_err(|error| format!("structured typed promotion package invalid: {error:?}"))?;
+    if artifact.case != package.minimized_case
+        || artifact.expected_result_sha256 != package.minimized_result_sha256
+        || package.mismatch_signature.trim().is_empty()
+    {
+        return Err("structured typed promotion provenance mismatch".to_owned());
+    }
+    let mut entry = typed_case_to_corpus_entry(&artifact.case);
+    entry.id = format!("typed-regression-{}", package.mismatch_signature);
+    entry.description = format!(
+        "reviewed structured typed differential regression {} from {}",
+        package.mismatch_signature, artifact.case.case_id
+    );
+    add_typed_promotion(
+        builder,
+        entry,
+        &package.mismatch_signature,
+        artifact,
+        &reviewed_by,
+    )
+}
+
+fn validate_typed_promotion_evidence(
+    artifact: &TypedDifferentialReplayArtifact,
+    verification: &TypedReplayVerification,
+    reviewed_by: &str,
+) -> Result<String, String> {
     artifact.validate()?;
     let observed = (
         verification.exact_match,
@@ -340,40 +470,28 @@ pub fn promote_typed_divergence(
     if reviewed_by.is_empty() || reviewed_by.contains('\n') || reviewed_by.contains('\r') {
         return Err("typed corpus promotion requires a single-line reviewer identity".to_owned());
     }
-    if minimal.original_seed != artifact.case.generated.root_seed
-        || minimal.minimal_workload.is_empty()
-        || minimal.divergences.is_empty()
-        || minimal.signature.hash.trim().is_empty()
-    {
-        return Err("typed corpus promotion minimization evidence is incomplete".to_owned());
-    }
+    Ok(reviewed_by.to_owned())
+}
 
-    let mut entry = typed_case_to_corpus_entry(&artifact.case);
-    entry.id = format!("typed-regression-{}", minimal.signature.hash);
-    entry.statements = artifact
-        .case
-        .envelope
-        .schema
-        .iter()
-        .chain(minimal.minimal_workload.iter())
-        .cloned()
-        .collect();
-    entry.description = format!(
-        "reviewed typed differential regression {} from {}",
-        minimal.signature.hash, artifact.case.case_id
-    );
+fn add_typed_promotion(
+    builder: &mut CorpusBuilder,
+    mut entry: crate::corpus_ingest::CorpusEntry,
+    mismatch_signature: &str,
+    artifact: &TypedDifferentialReplayArtifact,
+    reviewed_by: &str,
+) -> Result<TypedCorpusPromotion, String> {
     let CorpusSource::TypedGenerated { promotion, .. } = &mut entry.source else {
         return Err("typed corpus promotion produced a non-typed source".to_owned());
     };
     *promotion = Some(TypedPromotionMetadata {
-        mismatch_signature: minimal.signature.hash.clone(),
+        mismatch_signature: mismatch_signature.to_owned(),
         replay_artifact_sha256: artifact.content_hash.clone(),
         reviewed_by: reviewed_by.to_owned(),
     });
     let report = TypedCorpusPromotion {
         entry_id: entry.id.clone(),
         entry_content_sha256: entry.content_hash(),
-        mismatch_signature: minimal.signature.hash.clone(),
+        mismatch_signature: mismatch_signature.to_owned(),
         replay_artifact_sha256: artifact.content_hash.clone(),
         reviewed_by: reviewed_by.to_owned(),
     };

@@ -267,6 +267,7 @@ impl Default for MinimizerConfig {
 
 /// Deterministic budget and cancellation controls for structured reduction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypedReductionConfig {
     /// Maximum verifier calls after the required full-case verification.
     pub max_attempts: usize,
@@ -304,6 +305,7 @@ pub enum TypedReductionKind {
 
 /// Exact oracle identity that every accepted candidate must preserve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypedReductionObservation {
     pub mismatch_signature: String,
     pub required_lanes: Vec<ExecutionLane>,
@@ -339,6 +341,7 @@ impl TypedReductionStatus {
 
 /// One deterministic candidate decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypedReductionAttempt {
     pub ordinal: usize,
     pub kind: TypedReductionKind,
@@ -351,6 +354,7 @@ pub struct TypedReductionAttempt {
 
 /// Stable aggregate statistics for one reduction run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypedReductionStats {
     pub original_statements: usize,
     pub minimized_statements: usize,
@@ -363,8 +367,10 @@ pub struct TypedReductionStats {
 
 /// Canonical structured-reduction artifact retained by bundles and replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypedReductionResult {
     pub schema_version: String,
+    pub config: TypedReductionConfig,
     pub original_statements: Vec<GeneratedStatement>,
     pub minimized_statements: Vec<GeneratedStatement>,
     pub observation: TypedReductionObservation,
@@ -393,8 +399,19 @@ impl TypedReductionResult {
             return Err("typed reduction statement sets must be non-empty".to_owned());
         }
         self.observation.validate()?;
+        let lanes = self
+            .observation
+            .required_lanes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if lanes.len() != self.observation.required_lanes.len() {
+            return Err("typed reduction required lanes contain duplicates".to_owned());
+        }
         if self.stats.original_statements != self.original_statements.len()
             || self.stats.minimized_statements != self.minimized_statements.len()
+            || self.stats.original_bytes != statement_payload_bytes(&self.original_statements)
+            || self.stats.minimized_bytes != statement_payload_bytes(&self.minimized_statements)
             || self.stats.attempts != self.trace.len()
             || self.stats.accepted_candidates
                 != self.trace.iter().filter(|attempt| attempt.accepted).count()
@@ -406,6 +423,49 @@ impl TypedReductionResult {
                     .count()
         {
             return Err("typed reduction statistics do not match the payload".to_owned());
+        }
+        if self.trace.len() > self.config.max_attempts {
+            return Err("typed reduction trace exceeds its attempt budget".to_owned());
+        }
+        match self.status {
+            TypedReductionStatus::Complete => {}
+            TypedReductionStatus::BudgetExhausted
+                if self.trace.len() == self.config.max_attempts => {}
+            TypedReductionStatus::Cancelled
+                if self
+                    .config
+                    .cancel_after_attempts
+                    .is_some_and(|limit| self.trace.len() == limit) => {}
+            TypedReductionStatus::BudgetExhausted | TypedReductionStatus::Cancelled => {
+                return Err("typed reduction status contradicts its budget controls".to_owned());
+            }
+        }
+        let mut current_hash = statement_payload_hash(&self.original_statements);
+        for (ordinal, attempt) in self.trace.iter().enumerate() {
+            if attempt.ordinal != ordinal
+                || attempt.path.trim().is_empty()
+                || attempt.rationale.trim().is_empty()
+                || !is_sha256_hex_64(&attempt.before_sha256)
+                || !is_sha256_hex_64(&attempt.after_sha256)
+                || attempt.before_sha256 != current_hash
+                || attempt.before_sha256 == attempt.after_sha256
+            {
+                return Err("typed reduction trace is malformed or discontinuous".to_owned());
+            }
+            if attempt.accepted {
+                current_hash.clone_from(&attempt.after_sha256);
+            }
+        }
+        if current_hash != statement_payload_hash(&self.minimized_statements) {
+            return Err("typed reduction trace does not produce the minimized payload".to_owned());
+        }
+        let first_rejected = self
+            .trace
+            .iter()
+            .find(|attempt| !attempt.accepted)
+            .map(|attempt| attempt.rationale.as_str());
+        if first_rejected != self.first_rejected_invariant.as_deref() {
+            return Err("typed reduction first rejected invariant drifted".to_owned());
         }
         if self.content_hash != self.deterministic_hash() {
             return Err("typed reduction content hash mismatch".to_owned());
@@ -522,6 +582,7 @@ pub fn minimize_typed_statements(
     let accepted_candidates = trace.iter().filter(|attempt| attempt.accepted).count();
     let mut result = TypedReductionResult {
         schema_version: TYPED_REDUCTION_SCHEMA_VERSION.to_owned(),
+        config: config.clone(),
         original_statements: original,
         minimized_statements: current,
         observation,
@@ -962,7 +1023,7 @@ fn expression_reductions(expression: &Expr) -> Vec<(String, Expr)> {
                 candidates.push(("value".to_owned(), Expr::Value { value: reduced }));
             }
         }
-        Expr::Column { .. } => {}
+        Expr::Column { .. } | Expr::ScalarSubquery { .. } => {}
         Expr::Unary { op, expr } => {
             candidates.push(("unwrap".to_owned(), expr.as_ref().clone()));
             for (path, reduced) in expression_reductions(expr) {
@@ -1057,7 +1118,6 @@ fn expression_reductions(expression: &Expr) -> Vec<(String, Expr)> {
                 ));
             }
         }
-        Expr::ScalarSubquery { .. } => {}
     }
     candidates
 }
@@ -1251,7 +1311,7 @@ fn select_references_table(select: &Select, table: &Identifier) -> bool {
 
 fn expression_references_table(expression: &Expr, table: &Identifier) -> bool {
     match expression {
-        Expr::Value { .. } => false,
+        Expr::Value { .. } | Expr::Aggregate { expr: None, .. } => false,
         Expr::Column {
             table: expression_table,
             ..
@@ -1263,7 +1323,6 @@ fn expression_references_table(expression: &Expr, table: &Identifier) -> bool {
         | Expr::Aggregate {
             expr: Some(expr), ..
         } => expression_references_table(expr, table),
-        Expr::Aggregate { expr: None, .. } => false,
         Expr::Binary { left, right, .. } => {
             expression_references_table(left, table) || expression_references_table(right, table)
         }
@@ -1674,6 +1733,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn is_sha256_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1682,6 +1748,204 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::differential_v2::{NormalizedValue, StmtOutcome};
+    use crate::typed_sql_generator::{
+        BinaryOp, ColumnAffinity, ColumnSpec, FromItem, Join, JoinKind, OrderDirection, OrderTerm,
+        SelectItem,
+    };
+    use proptest::prelude::*;
+
+    fn identifier(value: &str) -> Identifier {
+        Identifier::new(value).expect("valid test identifier")
+    }
+
+    fn generated_statement(
+        ordinal: u32,
+        role: StatementRole,
+        ast: GeneratedAstStatement,
+    ) -> GeneratedStatement {
+        GeneratedStatement {
+            ordinal,
+            seed_path: format!("test/{ordinal}"),
+            derived_seed: u64::from(ordinal) + 1,
+            role,
+            construct: match &ast {
+                GeneratedAstStatement::CreateTable { .. } => {
+                    crate::typed_sql_generator::Construct::CreateTable
+                }
+                GeneratedAstStatement::CreateIndex { .. } => {
+                    crate::typed_sql_generator::Construct::CreateIndex
+                }
+                GeneratedAstStatement::Insert { .. } => {
+                    crate::typed_sql_generator::Construct::Insert
+                }
+                GeneratedAstStatement::Update { .. } => {
+                    crate::typed_sql_generator::Construct::Update
+                }
+                GeneratedAstStatement::Delete { .. } => {
+                    crate::typed_sql_generator::Construct::Delete
+                }
+                GeneratedAstStatement::Select { .. } => {
+                    crate::typed_sql_generator::Construct::Select
+                }
+                GeneratedAstStatement::Transaction { .. } => {
+                    crate::typed_sql_generator::Construct::Transaction
+                }
+            },
+            profile_feature_id: Some(format!("feature.{ordinal}")),
+            sql: ast.to_sql(),
+            ast,
+        }
+    }
+
+    fn structured_fixture() -> Vec<GeneratedStatement> {
+        let columns = vec![
+            ColumnSpec {
+                name: identifier("id"),
+                affinity: ColumnAffinity::Integer,
+                primary_key: true,
+                not_null: true,
+            },
+            ColumnSpec {
+                name: identifier("payload"),
+                affinity: ColumnAffinity::Text,
+                primary_key: false,
+                not_null: false,
+            },
+        ];
+        vec![
+            generated_statement(
+                0,
+                StatementRole::Setup,
+                GeneratedAstStatement::CreateTable {
+                    table: identifier("left_table"),
+                    columns: columns.clone(),
+                },
+            ),
+            generated_statement(
+                1,
+                StatementRole::Setup,
+                GeneratedAstStatement::CreateTable {
+                    table: identifier("right_table"),
+                    columns: columns.clone(),
+                },
+            ),
+            generated_statement(
+                2,
+                StatementRole::Setup,
+                GeneratedAstStatement::CreateIndex {
+                    index: identifier("left_index"),
+                    table: identifier("left_table"),
+                    columns: vec![identifier("id"), identifier("payload")],
+                    unique: false,
+                },
+            ),
+            generated_statement(
+                3,
+                StatementRole::Subject,
+                GeneratedAstStatement::Insert {
+                    table: identifier("left_table"),
+                    columns: vec![identifier("id"), identifier("payload")],
+                    rows: vec![
+                        vec![SqlValue::Integer(42), SqlValue::Text("abcdef".to_owned())],
+                        vec![SqlValue::Integer(84), SqlValue::Text("ghijkl".to_owned())],
+                    ],
+                },
+            ),
+            generated_statement(
+                4,
+                StatementRole::Subject,
+                GeneratedAstStatement::Transaction {
+                    statement: TransactionStatement::Begin,
+                },
+            ),
+            generated_statement(
+                5,
+                StatementRole::Subject,
+                GeneratedAstStatement::Select {
+                    select: Select {
+                        distinct: true,
+                        projection: vec![
+                            SelectItem {
+                                expr: Expr::Column {
+                                    table: Some(identifier("lhs")),
+                                    column: identifier("id"),
+                                },
+                                alias: None,
+                            },
+                            SelectItem {
+                                expr: Expr::Binary {
+                                    left: Box::new(Expr::Value {
+                                        value: SqlValue::Integer(42),
+                                    }),
+                                    op: BinaryOp::Add,
+                                    right: Box::new(Expr::Value {
+                                        value: SqlValue::Integer(7),
+                                    }),
+                                },
+                                alias: Some(identifier("answer")),
+                            },
+                        ],
+                        from: Some(FromItem {
+                            table: identifier("left_table"),
+                            alias: Some(identifier("lhs")),
+                        }),
+                        joins: vec![Join {
+                            kind: JoinKind::Inner,
+                            table: identifier("right_table"),
+                            alias: Some(identifier("rhs")),
+                            on: Expr::Binary {
+                                left: Box::new(Expr::Column {
+                                    table: Some(identifier("lhs")),
+                                    column: identifier("id"),
+                                }),
+                                op: BinaryOp::Equal,
+                                right: Box::new(Expr::Column {
+                                    table: Some(identifier("rhs")),
+                                    column: identifier("id"),
+                                }),
+                            },
+                        }],
+                        predicate: Some(Expr::Binary {
+                            left: Box::new(Expr::Column {
+                                table: Some(identifier("lhs")),
+                                column: identifier("id"),
+                            }),
+                            op: BinaryOp::Greater,
+                            right: Box::new(Expr::Value {
+                                value: SqlValue::Integer(1),
+                            }),
+                        }),
+                        group_by: Vec::new(),
+                        having: None,
+                        compound: None,
+                        order_by: vec![
+                            OrderTerm {
+                                expr: Expr::Column {
+                                    table: Some(identifier("lhs")),
+                                    column: identifier("id"),
+                                },
+                                direction: OrderDirection::Asc,
+                            },
+                            OrderTerm {
+                                expr: Expr::Value {
+                                    value: SqlValue::Integer(2),
+                                },
+                                direction: OrderDirection::Desc,
+                            },
+                        ],
+                        limit: Some(10),
+                    },
+                },
+            ),
+            generated_statement(
+                6,
+                StatementRole::Subject,
+                GeneratedAstStatement::Transaction {
+                    statement: TransactionStatement::Commit,
+                },
+            ),
+        ]
+    }
 
     fn make_divergence(index: usize, sql: &str) -> StatementDivergence {
         StatementDivergence {
@@ -1689,6 +1953,241 @@ mod tests {
             sql: sql.to_owned(),
             csqlite_outcome: StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(1)]]),
             fsqlite_outcome: StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(2)]]),
+        }
+    }
+
+    fn stable_observation() -> TypedReductionObservation {
+        TypedReductionObservation {
+            mismatch_signature: "mismatch-rows-1-vs-2".to_owned(),
+            required_lanes: vec![ExecutionLane::SqlResultOnly],
+        }
+    }
+
+    #[test]
+    fn typed_candidate_inventory_covers_every_sql_reducer_family() {
+        let candidates = typed_reduction_candidates(&structured_fixture());
+        let kinds = candidates
+            .iter()
+            .map(|candidate| candidate.kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            kinds,
+            BTreeSet::from([
+                TypedReductionKind::Statement,
+                TypedReductionKind::Transaction,
+                TypedReductionKind::Clause,
+                TypedReductionKind::Join,
+                TypedReductionKind::Projection,
+                TypedReductionKind::Predicate,
+                TypedReductionKind::OrderTerm,
+                TypedReductionKind::Index,
+                TypedReductionKind::Expression,
+                TypedReductionKind::SchemaTable,
+                TypedReductionKind::SchemaColumn,
+                TypedReductionKind::InsertRow,
+                TypedReductionKind::Value,
+            ])
+        );
+    }
+
+    #[test]
+    fn typed_reduction_is_deterministic_and_round_trips() {
+        let fixture = structured_fixture();
+        let verifier = |candidate: &[GeneratedStatement]| {
+            if candidate
+                .iter()
+                .any(|statement| matches!(statement.ast, GeneratedAstStatement::Select { .. }))
+            {
+                Ok(stable_observation())
+            } else {
+                Err("SELECT witness was removed".to_owned())
+            }
+        };
+        let first =
+            minimize_typed_statements(&fixture, &TypedReductionConfig::default(), &verifier)
+                .expect("reduce fixture");
+        let second =
+            minimize_typed_statements(&fixture, &TypedReductionConfig::default(), &verifier)
+                .expect("repeat reduction");
+        assert_eq!(first, second);
+        assert!(first.status.is_complete());
+        assert!(first.stats.minimized_statements < first.stats.original_statements);
+        assert!(first.stats.minimized_bytes < first.stats.original_bytes);
+        assert_eq!(
+            TypedReductionResult::from_json_strict(&first.to_json().unwrap()).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn typed_reduction_rejects_signature_lane_and_dependency_drift() {
+        let fixture = structured_fixture();
+        let verifier = |candidate: &[GeneratedStatement]| {
+            let has_left_table = candidate.iter().any(|statement| {
+                matches!(
+                    &statement.ast,
+                    GeneratedAstStatement::CreateTable { table, .. }
+                        if table.as_str() == "left_table"
+                )
+            });
+            if !has_left_table {
+                return Err("setup dependency missing: left_table".to_owned());
+            }
+            let has_42 = candidate
+                .iter()
+                .any(|statement| statement.sql.contains("42"));
+            let lane = if candidate
+                .iter()
+                .any(|statement| statement.sql.contains("LIMIT"))
+            {
+                ExecutionLane::SqlResultOnly
+            } else {
+                ExecutionLane::PlannerRequired
+            };
+            Ok(TypedReductionObservation {
+                mismatch_signature: if has_42 {
+                    "signature-42".to_owned()
+                } else {
+                    "signature-drift".to_owned()
+                },
+                required_lanes: vec![lane],
+            })
+        };
+        let result = minimize_typed_statements(
+            &fixture,
+            &TypedReductionConfig {
+                max_attempts: 200,
+                cancel_after_attempts: None,
+            },
+            &verifier,
+        )
+        .expect("reduction returns guarded result");
+        assert!(result.trace.iter().any(|attempt| {
+            !attempt.accepted && attempt.rationale.contains("signature drifted")
+        }));
+        assert!(result.trace.iter().any(|attempt| {
+            !attempt.accepted && attempt.rationale.contains("lane identity drifted")
+        }));
+        assert!(result.trace.iter().any(|attempt| {
+            !attempt.accepted && attempt.rationale.contains("setup dependency missing")
+        }));
+        assert_eq!(result.observation.mismatch_signature, "signature-42");
+        assert_eq!(
+            result.observation.required_lanes,
+            [ExecutionLane::SqlResultOnly]
+        );
+    }
+
+    #[test]
+    fn typed_reduction_budget_and_cancellation_return_valid_partial_results() {
+        let fixture = structured_fixture();
+        let verifier = |_candidate: &[GeneratedStatement]| Ok(stable_observation());
+        let exhausted = minimize_typed_statements(
+            &fixture,
+            &TypedReductionConfig {
+                max_attempts: 0,
+                cancel_after_attempts: None,
+            },
+            &verifier,
+        )
+        .expect("budget exhaustion returns partial result");
+        assert_eq!(exhausted.status, TypedReductionStatus::BudgetExhausted);
+        assert_eq!(exhausted.minimized_statements, fixture);
+        exhausted.validate().unwrap();
+
+        let cancelled = minimize_typed_statements(
+            &fixture,
+            &TypedReductionConfig {
+                max_attempts: usize::MAX,
+                cancel_after_attempts: Some(0),
+            },
+            &verifier,
+        )
+        .expect("cancellation returns partial result");
+        assert_eq!(cancelled.status, TypedReductionStatus::Cancelled);
+        assert_eq!(cancelled.minimized_statements, fixture);
+        cancelled.validate().unwrap();
+    }
+
+    #[test]
+    fn typed_reduction_rejects_empty_and_corrupt_artifacts() {
+        let verifier = |_candidate: &[GeneratedStatement]| Ok(stable_observation());
+        assert!(
+            minimize_typed_statements(&[], &TypedReductionConfig::default(), &verifier).is_err()
+        );
+        let fixture = structured_fixture();
+        let result = minimize_typed_statements(
+            &fixture,
+            &TypedReductionConfig {
+                max_attempts: 0,
+                cancel_after_attempts: None,
+            },
+            &verifier,
+        )
+        .unwrap();
+        let truncated = &result.to_json().unwrap()[..32];
+        assert!(TypedReductionResult::from_json_strict(truncated).is_err());
+        let mut corrupted = result;
+        corrupted.content_hash = "0".repeat(64);
+        assert!(corrupted.validate().is_err());
+
+        let mut malformed = minimize_typed_statements(
+            &fixture,
+            &TypedReductionConfig {
+                max_attempts: 1,
+                cancel_after_attempts: None,
+            },
+            &verifier,
+        )
+        .unwrap();
+        malformed.trace[0].ordinal = 99;
+        malformed.content_hash = malformed.deterministic_hash();
+        assert!(malformed.validate().is_err());
+
+        let mut unknown = serde_json::to_value(
+            minimize_typed_statements(
+                &fixture,
+                &TypedReductionConfig {
+                    max_attempts: 0,
+                    cancel_after_attempts: None,
+                },
+                &verifier,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(
+            TypedReductionResult::from_json_strict(&serde_json::to_string(&unknown).unwrap())
+                .is_err()
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn typed_reduction_is_stable_at_arbitrary_budget_boundaries(
+            max_attempts in 0_usize..=96,
+            cancel_after_attempts in proptest::option::of(0_usize..=96),
+        ) {
+            let fixture = structured_fixture();
+            let verifier = |_candidate: &[GeneratedStatement]| Ok(stable_observation());
+            let config = TypedReductionConfig {
+                max_attempts,
+                cancel_after_attempts,
+            };
+            let first = minimize_typed_statements(&fixture, &config, &verifier).unwrap();
+            let second = minimize_typed_statements(&fixture, &config, &verifier).unwrap();
+            prop_assert_eq!(&first, &second);
+            prop_assert!(first.stats.attempts <= max_attempts);
+            if let Some(cancel_after) = cancel_after_attempts {
+                prop_assert!(first.stats.attempts <= cancel_after);
+            }
+            prop_assert!(first.validate().is_ok());
         }
     }
 

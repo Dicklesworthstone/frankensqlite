@@ -1048,6 +1048,7 @@ where
 
 /// Replayable result of reducing one typed differential divergence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredTypedMinimization {
     pub schema_version: String,
     pub original_case_hash: String,
@@ -1282,8 +1283,11 @@ where
         minimized_statements = package.reduction.stats.minimized_statements,
         attempts = package.reduction.stats.attempts,
         accepted = package.reduction.stats.accepted_candidates,
+        max_attempts = package.reduction.config.max_attempts,
+        cancel_after_attempts = ?package.reduction.config.cancel_after_attempts,
         mismatch_signature = %package.mismatch_signature,
         required_lanes = %package.minimized_case.required_lanes.iter().map(|lane| lane.label()).collect::<Vec<_>>().join(","),
+        status = ?package.reduction.status,
         complete = package.reduction.status.is_complete(),
         "structured typed differential reduction completed"
     );
@@ -1332,7 +1336,7 @@ pub fn build_typed_reduction_failure_bundle(
     bundle
         .state_snapshots
         .insert("typed_reduction_json".to_owned(), reduction_json);
-    bundle.scenario.bead_id = "bd-turso-test-adaptation-zu081.6".to_owned();
+    "bd-turso-test-adaptation-zu081.6".clone_into(&mut bundle.scenario.bead_id);
     bundle.triage_tags.push("structured-reduction".to_owned());
     bundle.content_hash = bundle.deterministic_bundle_hash();
     let errors = bundle.validate();
@@ -1935,17 +1939,25 @@ fn is_sha256_hex_64(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
     use super::*;
     use crate::corpus_ingest::{CorpusBuilder, CorpusSource, Family};
     use crate::differential_v2::{CsqliteExecutor, FsqliteExecutor, NormalizedValue, StmtOutcome};
     use crate::replay_harness::{
-        TypedDifferentialReplayArtifact, promote_typed_divergence, replay_typed_differential,
+        TypedDifferentialReplayArtifact, promote_structured_typed_divergence,
+        promote_typed_divergence, replay_typed_differential,
     };
     use crate::typed_sql_generator::{
         GenerationBudget, GeneratorConfig, NamedGeneratorProfile, derive_named_profile,
         generate_case,
     };
     use proptest::prelude::*;
+
+    const STRUCTURED_REPLAY_CHILD_ENV: &str = "FSQLITE_STRUCTURED_REPLAY_CHILD";
+    const STRUCTURED_REPLAY_ORIGINAL_ENV: &str = "FSQLITE_STRUCTURED_REPLAY_ORIGINAL";
+    const STRUCTURED_REPLAY_MINIMIZED_ENV: &str = "FSQLITE_STRUCTURED_REPLAY_MINIMIZED";
 
     fn workspace_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2042,6 +2054,61 @@ mod tests {
         fn engine_identity(&self) -> crate::differential_v2::EngineIdentity {
             self.identity
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct UniformDivergenceExecutor {
+        identity: crate::differential_v2::EngineIdentity,
+        value: i64,
+    }
+
+    impl UniformDivergenceExecutor {
+        const fn fsqlite(value: i64) -> Self {
+            Self {
+                identity: crate::differential_v2::EngineIdentity::FrankenSqlite,
+                value,
+            }
+        }
+
+        const fn csqlite(value: i64) -> Self {
+            Self {
+                identity: crate::differential_v2::EngineIdentity::CSqliteOracle,
+                value,
+            }
+        }
+    }
+
+    impl SqlExecutor for UniformDivergenceExecutor {
+        fn execute(&self, _sql: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+
+        fn query(&self, _sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
+            Ok(vec![vec![NormalizedValue::Integer(self.value)]])
+        }
+
+        fn engine_identity(&self) -> crate::differential_v2::EngineIdentity {
+            self.identity
+        }
+    }
+
+    fn typed_provenance(
+        case: &TypedDifferentialCase,
+    ) -> (TypedEngineProvenance, TypedEngineProvenance) {
+        (
+            TypedEngineProvenance {
+                identity: "frankensqlite".to_owned(),
+                version: case.envelope.engines.fsqlite.clone(),
+                git_sha: "candidate-sha".to_owned(),
+                dirty: false,
+            },
+            TypedEngineProvenance {
+                identity: "csqlite-oracle".to_owned(),
+                version: case.envelope.engines.csqlite.clone(),
+                git_sha: "rusqlite-bundled".to_owned(),
+                dirty: false,
+            },
+        )
     }
 
     #[test]
@@ -2384,6 +2451,256 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn clean_process_structured_replay_child() {
+        if std::env::var_os(STRUCTURED_REPLAY_CHILD_ENV).is_none() {
+            return;
+        }
+        for variable in [
+            STRUCTURED_REPLAY_ORIGINAL_ENV,
+            STRUCTURED_REPLAY_MINIMIZED_ENV,
+        ] {
+            let path = std::env::var_os(variable).expect("child replay artifact path");
+            let json = std::fs::read_to_string(path).expect("read child replay artifact");
+            let artifact = TypedDifferentialReplayArtifact::from_json_strict(&json)
+                .expect("strict child replay artifact");
+            let (_, verification) = replay_typed_differential(
+                &artifact,
+                &UniformDivergenceExecutor::fsqlite(1),
+                &UniformDivergenceExecutor::csqlite(2),
+            )
+            .expect("clean-process exact public replay");
+            assert!(verification.exact_match);
+        }
+    }
+
+    #[test]
+    fn structured_typed_reduction_bundles_replays_and_promotes_clean_process() {
+        let case = typed_case(NamedGeneratorProfile::ReadOnly, 0x0057_5255_4354_2026);
+        let repro_command = "cargo test -p fsqlite-harness structured_typed_reduction";
+        let subject_factories = Arc::new(AtomicUsize::new(0));
+        let reference_factories = Arc::new(AtomicUsize::new(0));
+        let subject_count = Arc::clone(&subject_factories);
+        let reference_count = Arc::clone(&reference_factories);
+        let (package, minimized_run) = minimize_typed_divergence_structured(
+            &case,
+            &TypedReductionConfig {
+                max_attempts: 512,
+                cancel_after_attempts: None,
+            },
+            repro_command,
+            move || {
+                subject_count.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(UniformDivergenceExecutor::fsqlite(1))
+            },
+            move || {
+                reference_count.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(UniformDivergenceExecutor::csqlite(2))
+            },
+            semantic_lane_evidence,
+        )
+        .expect("structured public differential reduction");
+        let subject_factory_calls = subject_factories.load(AtomicOrdering::Relaxed);
+        let reference_factory_calls = reference_factories.load(AtomicOrdering::Relaxed);
+        assert_eq!(subject_factory_calls, reference_factory_calls);
+        assert!(
+            subject_factory_calls
+                >= package
+                    .reduction
+                    .stats
+                    .accepted_candidates
+                    .saturating_add(3)
+        );
+        assert!(subject_factory_calls <= package.reduction.stats.attempts.saturating_add(3));
+        assert!(
+            package.reduction.stats.minimized_bytes < package.reduction.stats.original_bytes,
+            "representative fixture must reduce materially"
+        );
+        assert_eq!(
+            package.minimized_case.required_lanes, case.required_lanes,
+            "required execution lanes must not drift"
+        );
+        let package_json = package.to_json().expect("structured package JSON");
+        let decoded_package = StructuredTypedMinimization::from_json_strict(&package_json)
+            .expect("strict structured package");
+        assert_eq!(decoded_package.content_hash, package.content_hash);
+        assert_eq!(
+            decoded_package.reduction.minimized_statements,
+            package.reduction.minimized_statements
+        );
+
+        let (subject, reference) = typed_provenance(&package.minimized_case);
+        let minimized_bundle = build_typed_reduction_failure_bundle(
+            &case,
+            &package,
+            &minimized_run,
+            "2026-08-05T00:00:00Z",
+            EnvironmentInfo::new("candidate-sha", "nightly", "test-platform"),
+            subject,
+            reference,
+        )
+        .expect("canonical structured failure bundle");
+        assert!(
+            minimized_bundle
+                .state_snapshots
+                .contains_key("original_typed_case_json")
+        );
+        assert!(
+            minimized_bundle
+                .state_snapshots
+                .contains_key("minimized_typed_case_json")
+        );
+        assert_eq!(
+            minimized_bundle
+                .typed_differential
+                .as_ref()
+                .expect("typed evidence")
+                .profile_sha256,
+            case.profile_sha256
+        );
+        let minimized_artifact = TypedDifferentialReplayArtifact::from_run(
+            package.minimized_case.clone(),
+            &minimized_run,
+            Some(minimized_bundle),
+        )
+        .expect("structured minimized replay artifact");
+        let (_, minimized_verification) = replay_typed_differential(
+            &minimized_artifact,
+            &UniformDivergenceExecutor::fsqlite(1),
+            &UniformDivergenceExecutor::csqlite(2),
+        )
+        .expect("minimized public replay");
+
+        let mut corpus = CorpusBuilder::new(case.generated.root_seed);
+        let promotion = promote_structured_typed_divergence(
+            &mut corpus,
+            &minimized_artifact,
+            &minimized_verification,
+            &package,
+            "reviewer@example.invalid",
+        )
+        .expect("reviewed structured corpus promotion");
+        assert_eq!(promotion.mismatch_signature, package.mismatch_signature);
+        let manifest = corpus.build();
+        assert!(matches!(
+            &manifest.entries[0].source,
+            CorpusSource::TypedGenerated {
+                promotion: Some(metadata),
+                ..
+            } if metadata.mismatch_signature == package.mismatch_signature
+        ));
+
+        let original_run = run_typed_differential_case(
+            &case,
+            semantic_lane_evidence(&case).expect("original lane evidence"),
+            &UniformDivergenceExecutor::fsqlite(1),
+            &UniformDivergenceExecutor::csqlite(2),
+        )
+        .expect("original differential run");
+        assert_eq!(
+            original_run.result.artifact_hashes.result_hash,
+            package.original_result_sha256
+        );
+        let (subject, reference) = typed_provenance(&case);
+        let original_bundle = build_typed_failure_bundle(
+            &case,
+            &original_run,
+            "2026-08-05T00:00:00Z",
+            repro_command,
+            EnvironmentInfo::new("candidate-sha", "nightly", "test-platform"),
+            subject,
+            reference,
+        )
+        .expect("original failure bundle");
+        let original_artifact =
+            TypedDifferentialReplayArtifact::from_run(case, &original_run, Some(original_bundle))
+                .expect("original replay artifact");
+
+        let mut corrupted = minimized_artifact.clone();
+        let bundle = corrupted
+            .failure_bundle
+            .as_mut()
+            .expect("structured bundle");
+        bundle
+            .state_snapshots
+            .get_mut("typed_reduction_json")
+            .expect("reduction snapshot")
+            .truncate(32);
+        bundle.content_hash = bundle.deterministic_bundle_hash();
+        corrupted.content_hash = corrupted.deterministic_hash();
+        assert!(
+            corrupted
+                .validate()
+                .unwrap_err()
+                .contains("structured reduction snapshot invalid")
+        );
+
+        let temp = tempfile::tempdir().expect("temporary replay directory");
+        assert!(
+            std::fs::write(
+                temp.path(),
+                original_artifact.to_json().expect("original artifact JSON")
+            )
+            .is_err(),
+            "artifact publication must surface write failures"
+        );
+        let original_path = temp.path().join("original.json");
+        let minimized_path = temp.path().join("minimized.json");
+        std::fs::write(
+            &original_path,
+            original_artifact.to_json().expect("original artifact JSON"),
+        )
+        .expect("write original artifact");
+        std::fs::write(
+            &minimized_path,
+            minimized_artifact
+                .to_json()
+                .expect("minimized artifact JSON"),
+        )
+        .expect("write minimized artifact");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("differential_runner::tests::clean_process_structured_replay_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(STRUCTURED_REPLAY_CHILD_ENV, "1")
+            .env(STRUCTURED_REPLAY_ORIGINAL_ENV, &original_path)
+            .env(STRUCTURED_REPLAY_MINIMIZED_ENV, &minimized_path)
+            .output()
+            .expect("spawn clean-process structured replay");
+        assert!(
+            output.status.success(),
+            "child replay failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn structured_typed_reduction_rejects_nondeterministic_witnesses() {
+        let case = typed_case(NamedGeneratorProfile::ReadOnly, 0x4E4F_4E44_4554);
+        let generation = Arc::new(AtomicUsize::new(0));
+        let subject_generation = Arc::clone(&generation);
+        let error = minimize_typed_divergence_structured(
+            &case,
+            &TypedReductionConfig {
+                max_attempts: 8,
+                cancel_after_attempts: None,
+            },
+            "cargo test -p fsqlite-harness nondeterministic_witnesses",
+            move || {
+                let value = subject_generation.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                Ok(UniformDivergenceExecutor::fsqlite(
+                    i64::try_from(value).unwrap(),
+                ))
+            },
+            || Ok(UniformDivergenceExecutor::csqlite(0)),
+            semantic_lane_evidence,
+        )
+        .expect_err("witness drift must fail closed");
+        assert_eq!(error.constraint, "typed_reduction.original_witness");
     }
 
     #[test]
