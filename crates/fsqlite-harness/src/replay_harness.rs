@@ -46,6 +46,10 @@ use crate::failure_bundle::{ExecutionLaneEvidence, FailureBundle};
 use crate::mismatch_minimizer::{
     MinimalReproduction, MinimizerConfig, ReproducibilityTest, Subsystem, minimize_workload,
 };
+use crate::serializability_oracle::{
+    OracleVerdict, SerializabilityReport, TransactionHistory, check_history,
+    validate_serializability_failure_bundle,
+};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
@@ -61,6 +65,8 @@ pub const REPLAY_MINIMIZATION_BEAD_ID: &str = "bd-mblr.2.3.2";
 pub const BISECT_REPLAY_MANIFEST_SCHEMA_VERSION: &str = "1.0.0";
 /// Schema identifier for typed differential replay artifacts.
 pub const TYPED_DIFFERENTIAL_REPLAY_SCHEMA_VERSION: &str = "fsqlite.typed-differential-replay.v1";
+/// Schema identifier for oracle-only serializability replay artifacts.
+pub const SERIALIZABILITY_REPLAY_SCHEMA_VERSION: &str = "fsqlite.serializability-replay.v1";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -77,6 +83,128 @@ fn is_sha256_hex_64(value: &str) -> bool {
 // ===========================================================================
 // Typed Differential Replay
 // ===========================================================================
+
+/// The current artifact replays the independent oracle over captured history.
+/// Scheduler re-execution is owned by the deterministic runtime integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerializabilityReplayScope {
+    OracleOnly,
+}
+
+/// Self-contained typed history, expected report, and canonical failure bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SerializabilityReplayArtifact {
+    pub schema_version: String,
+    pub replay_scope: SerializabilityReplayScope,
+    pub history: TransactionHistory,
+    pub expected_report: SerializabilityReport,
+    pub failure_bundle: Option<FailureBundle>,
+    pub content_hash: String,
+}
+
+impl SerializabilityReplayArtifact {
+    /// Capture an oracle replay artifact from one validated typed history.
+    pub fn from_history(
+        history: TransactionHistory,
+        failure_bundle: Option<FailureBundle>,
+    ) -> Result<Self, String> {
+        let expected_report = check_history(&history)?;
+        let mut artifact = Self {
+            schema_version: SERIALIZABILITY_REPLAY_SCHEMA_VERSION.to_owned(),
+            replay_scope: SerializabilityReplayScope::OracleOnly,
+            history,
+            expected_report,
+            failure_bundle,
+            content_hash: String::new(),
+        };
+        artifact.content_hash = artifact.deterministic_hash();
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    /// Hash replay-relevant content while excluding the hash field itself.
+    #[must_use]
+    pub fn deterministic_hash(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.content_hash.clear();
+        let bytes = serde_json::to_vec(&canonical)
+            .expect("serializability replay serialization must succeed");
+        sha256_hex(&bytes)
+    }
+
+    /// Validate schema, hashes, report identity, bundle links, and replay scope.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != SERIALIZABILITY_REPLAY_SCHEMA_VERSION {
+            return Err(format!(
+                "serializability replay schema mismatch: expected {SERIALIZABILITY_REPLAY_SCHEMA_VERSION}, got {}",
+                self.schema_version
+            ));
+        }
+        if self.replay_scope != SerializabilityReplayScope::OracleOnly {
+            return Err("unsupported serializability replay scope".to_owned());
+        }
+        self.expected_report.validate_against(&self.history)?;
+        let replayed = check_history(&self.history)?;
+        if replayed != self.expected_report {
+            return Err("serializability replay report mismatch".to_owned());
+        }
+        match (&self.failure_bundle, self.expected_report.verdict) {
+            (None, OracleVerdict::Serializable) => {}
+            (Some(bundle), OracleVerdict::Rejected | OracleVerdict::Inconclusive) => {
+                let (bundled_history, bundled_report) =
+                    validate_serializability_failure_bundle(bundle)?;
+                if bundled_history != self.history || bundled_report != self.expected_report {
+                    return Err("serializability replay bundle payload mismatch".to_owned());
+                }
+            }
+            (Some(_), OracleVerdict::Serializable) => {
+                return Err(
+                    "serializable history must not carry a serializability failure bundle"
+                        .to_owned(),
+                );
+            }
+            (None, OracleVerdict::Rejected | OracleVerdict::Inconclusive) => {
+                return Err(
+                    "rejected or inconclusive history requires a canonical failure bundle"
+                        .to_owned(),
+                );
+            }
+        }
+        if !is_sha256_hex_64(&self.content_hash) || self.content_hash != self.deterministic_hash() {
+            return Err("serializability replay content_hash mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Serialize a validated replay artifact.
+    pub fn to_json(&self) -> Result<String, String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+
+    /// Strictly decode and validate a replay artifact.
+    pub fn from_json_strict(json: &str) -> Result<Self, String> {
+        let artifact: Self = serde_json::from_str(json)
+            .map_err(|error| format!("serializability replay decode failed: {error}"))?;
+        artifact.validate()?;
+        Ok(artifact)
+    }
+}
+
+/// Re-run the independent oracle and require exact agreement with the artifact.
+pub fn replay_serializability_oracle(
+    artifact: &SerializabilityReplayArtifact,
+) -> Result<SerializabilityReport, String> {
+    artifact.validate()?;
+    let report = check_history(&artifact.history)?;
+    if report == artifact.expected_report {
+        Ok(report)
+    } else {
+        Err("serializability replay produced a different report".to_owned())
+    }
+}
 
 /// Self-contained typed case, expected result identity, lane evidence, and
 /// optional canonical failure bundle used by one-command replay.

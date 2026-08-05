@@ -8,7 +8,7 @@
 //! - Abort rate and throughput stay within target bounds for CI scale.
 #![recursion_limit = "512"]
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +19,13 @@ use rand::{RngExt, SeedableRng};
 use serde_json::json;
 
 use fsqlite_error::FrankenError;
+use fsqlite_harness::failure_bundle::{ExecutionLaneEvidence, ObservedExecutionLane};
+use fsqlite_harness::serializability_oracle::{
+    BeginMode, CommittedTransaction, DependencyEdge, HistoryEvent, HistoryOperation, HistoryValue,
+    HistoryWorkload, OracleVerdict, ScheduleProvenance, TRANSACTION_HISTORY_SCHEMA_VERSION,
+    TransactionHistory, build_serialization_graph, check_history,
+};
+use fsqlite_harness::test_inventory::ExecutionLane;
 use fsqlite_mvcc::{RetryAction, RetryController, RetryCostParams};
 use fsqlite_types::value::SqliteValue;
 
@@ -449,6 +456,18 @@ async fn run_ssi_workload(
             committed_txns.len()
         );
     }
+    let typed_history = observation_only_history(&committed_txns, seed, label);
+    let report = check_history(&typed_history).expect("validate public-path SSI history");
+    assert_eq!(
+        report.verdict,
+        OracleVerdict::Serializable,
+        "authoritative SSI oracle rejected {label}: {:?}",
+        report.minimal_witness
+    );
+    assert!(
+        !report.deterministic_replay_claim,
+        "OS-thread public-path history must remain observation-only"
+    );
 
     WorkloadSummary {
         committed,
@@ -767,109 +786,136 @@ async fn read_account_invariants(path: &Path) -> (i64, i64) {
 }
 
 fn detect_cycle(txns: &[CommittedTxn]) -> Option<Vec<usize>> {
-    let node_count = txns.len();
-    if node_count <= 1 {
-        return None;
-    }
-
-    let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); node_count];
-    let mut indegree = vec![0_usize; node_count];
-
-    for left_idx in 0..node_count {
-        for right_idx in (left_idx + 1)..node_count {
-            let left = &txns[left_idx];
-            let right = &txns[right_idx];
-
-            let mut add_edge = |from: usize, to: usize| {
-                if edges[from].insert(to) {
-                    indegree[to] += 1;
-                }
-            };
-
-            if intersects(&left.write_set, &right.write_set) {
-                if left.commit_order <= right.commit_order {
-                    add_edge(left_idx, right_idx);
-                } else {
-                    add_edge(right_idx, left_idx);
-                }
-            }
-
-            if intersects(&left.write_set, &right.read_set) {
-                orient_read_write_conflict(left, right, left_idx, right_idx, &mut add_edge);
-            }
-            if intersects(&right.write_set, &left.read_set) {
-                orient_read_write_conflict(right, left, right_idx, left_idx, &mut add_edge);
-            }
-        }
-    }
-
-    let mut queue = VecDeque::new();
-    for (idx, degree) in indegree.iter().enumerate() {
-        if *degree == 0 {
-            queue.push_back(idx);
-        }
-    }
-
-    let mut visited = 0_usize;
-    while let Some(node) = queue.pop_front() {
-        visited += 1;
-        for &next in &edges[node] {
-            indegree[next] -= 1;
-            if indegree[next] == 0 {
-                queue.push_back(next);
-            }
-        }
-    }
-
-    if visited == node_count {
-        return None;
-    }
-
-    // Extract one concrete cycle from the residual subgraph (nodes with
-    // positive indegree after Kahn elimination).
-    let mut state = vec![0_u8; node_count]; // 0=unseen, 1=visiting, 2=done
-    let mut stack = Vec::new();
-    for node in 0..node_count {
-        if indegree[node] == 0 || state[node] != 0 {
-            continue;
-        }
-        if let Some(cycle) = dfs_cycle(node, &edges, &indegree, &mut state, &mut stack) {
-            return Some(cycle);
-        }
-    }
-    Some(Vec::new())
+    let transactions = txns
+        .iter()
+        .enumerate()
+        .map(|(index, txn)| CommittedTransaction {
+            transaction_id: format!("txn-{index}"),
+            start_order: txn.start_order,
+            commit_order: txn.commit_order,
+            read_set: txn.read_set.iter().map(ToString::to_string).collect(),
+            write_set: txn.write_set.iter().map(ToString::to_string).collect(),
+            read_sources: BTreeMap::new(),
+        })
+        .collect::<Vec<_>>();
+    build_serialization_graph(&transactions)
+        .cycle
+        .map(|cycle| cycle_indices(&cycle))
 }
 
-fn dfs_cycle(
-    node: usize,
-    edges: &[BTreeSet<usize>],
-    indegree: &[usize],
-    state: &mut [u8],
-    stack: &mut Vec<usize>,
-) -> Option<Vec<usize>> {
-    state[node] = 1;
-    stack.push(node);
-    for &next in &edges[node] {
-        if indegree[next] == 0 {
-            continue;
-        }
-        if state[next] == 0 {
-            if let Some(cycle) = dfs_cycle(next, edges, indegree, state, stack) {
-                return Some(cycle);
-            }
-        } else if state[next] == 1 {
-            let start = stack
-                .iter()
-                .position(|&value| value == next)
-                .expect("cycle back-edge target should be in DFS stack");
-            let mut cycle = stack[start..].to_vec();
-            cycle.push(next);
-            return Some(cycle);
-        }
+fn observation_only_history(txns: &[CommittedTxn], seed: u64, label: &str) -> TransactionHistory {
+    let run_id = format!("bd-3plop.5-{label}-{seed:016x}");
+    let trace_id = format!("trace-{seed:016x}");
+    let scenario_id = format!("SSI-PUBLIC-PATH-{label}");
+    let lane_evidence = ExecutionLaneEvidence::from_observations(
+        ExecutionLane::MvccRequired,
+        vec![
+            ObservedExecutionLane::SqlResult,
+            ObservedExecutionLane::PagerBacked,
+            ObservedExecutionLane::Planner,
+            ObservedExecutionLane::Vdbe,
+            ObservedExecutionLane::Mvcc,
+        ],
+        &trace_id,
+        &run_id,
+        &scenario_id,
+        "BEGIN CONCURRENT",
+        "public_file",
+        "ssi_observed",
+        "public_file:ssi_observed",
+        Vec::new(),
+        true,
+    );
+    let mut operations = Vec::new();
+    for (index, txn) in txns.iter().enumerate() {
+        operations.push((
+            txn.start_order,
+            0_u8,
+            index,
+            HistoryOperation::Begin {
+                mode: BeginMode::Concurrent,
+            },
+        ));
+        operations.extend(txn.read_set.iter().map(|key| {
+            (
+                txn.start_order,
+                1_u8,
+                index,
+                HistoryOperation::Read {
+                    key: key.to_string(),
+                    value: HistoryValue::Null,
+                    version: Some(format!("snapshot-{}", txn.start_order)),
+                    source_transaction_id: None,
+                },
+            )
+        }));
+        operations.extend(txn.write_set.iter().map(|key| {
+            (
+                txn.start_order,
+                2_u8,
+                index,
+                HistoryOperation::Write {
+                    key: key.to_string(),
+                    value: HistoryValue::Null,
+                    page_number: None,
+                },
+            )
+        }));
+        operations.push((txn.commit_order, 3_u8, index, HistoryOperation::Commit));
     }
-    stack.pop();
-    state[node] = 2;
-    None
+    operations.sort_by(|left, right| (left.0, left.1, left.2).cmp(&(right.0, right.1, right.2)));
+    let events = operations
+        .into_iter()
+        .enumerate()
+        .map(
+            |(event_id, (logical_time, _, transaction_index, operation))| {
+                let transaction_id = format!("txn-{transaction_index}");
+                HistoryEvent {
+                    event_id: u64::try_from(event_id).expect("event count must fit u64"),
+                    logical_time,
+                    process_id: "public-path-process".to_owned(),
+                    connection_id: format!("connection-{transaction_index}"),
+                    transaction_id: Some(transaction_id),
+                    operation,
+                }
+            },
+        )
+        .collect();
+    let mut history = TransactionHistory {
+        schema_version: TRANSACTION_HISTORY_SCHEMA_VERSION.to_owned(),
+        run_id,
+        trace_id,
+        scenario_id,
+        seed,
+        engine_git_sha: option_env!("GIT_COMMIT_HASH")
+            .unwrap_or("unavailable-in-test-build")
+            .to_owned(),
+        engine_dirty: false,
+        workload: HistoryWorkload::Register,
+        schedule: ScheduleProvenance::observation_only(
+            "std::thread public fsqlite::Connection workload",
+        ),
+        execution_lane_evidence: vec![lane_evidence],
+        concurrent_mode_enabled: true,
+        reopen_concurrent_mode_enabled: None,
+        initial_state: BTreeMap::new(),
+        final_state: BTreeMap::new(),
+        final_state_sha256: String::new(),
+        events,
+    };
+    history.refresh_final_state_hash();
+    history
+}
+
+fn cycle_indices(cycle: &[DependencyEdge]) -> Vec<usize> {
+    let mut indices = cycle
+        .iter()
+        .filter_map(|edge| edge.from.strip_prefix("txn-")?.parse().ok())
+        .collect::<Vec<_>>();
+    if let Some(last) = cycle.last().and_then(|edge| edge.to.strip_prefix("txn-")) {
+        indices.push(last.parse().expect("canonical transaction index"));
+    }
+    indices
 }
 
 fn render_cycle_witness(txns: &[CommittedTxn], cycle: &[usize]) -> String {
@@ -887,30 +933,6 @@ fn render_cycle_witness(txns: &[CommittedTxn], cycle: &[usize]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" -> ")
-}
-
-fn orient_read_write_conflict(
-    writer: &CommittedTxn,
-    reader: &CommittedTxn,
-    writer_idx: usize,
-    reader_idx: usize,
-    add_edge: &mut impl FnMut(usize, usize),
-) {
-    if writer.commit_order <= reader.start_order {
-        // Writer committed before reader started: WR dependency writer -> reader.
-        add_edge(writer_idx, reader_idx);
-    } else if reader.commit_order <= writer.start_order {
-        // Reader finished before writer started: RW anti-dependency reader -> writer.
-        add_edge(reader_idx, writer_idx);
-    } else {
-        // Concurrent overlap: reader observed a snapshot while writer committed.
-        // Model this as anti-dependency reader -> writer.
-        add_edge(reader_idx, writer_idx);
-    }
-}
-
-fn intersects(left: &BTreeSet<i64>, right: &BTreeSet<i64>) -> bool {
-    left.iter().any(|item| right.contains(item))
 }
 
 #[test]

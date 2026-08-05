@@ -100,6 +100,7 @@ pub mod scheduler;
 pub mod score_engine;
 pub mod seed_taxonomy;
 pub mod semantic_gap_map;
+pub mod serializability_oracle;
 pub mod slo_governor;
 pub mod slo_governor_adapters;
 pub mod soak_executor;
