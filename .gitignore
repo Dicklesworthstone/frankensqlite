@@ -382,3 +382,18 @@ claude-upgrade-progress.json
 # remote-only validation is in progress. Keep these untracked; this exception
 # is temporary and is not part of the campaign commit.
 !crates/fsqlite/tests/zz_*.rs
+
+# === multi-repo ephemeral patterns 2026-08-05 ===
+# Root scratch SQLite left by local probes / doctor runs
+/state.db
+/state.db-shm
+/state.db-wal
+# One-off probe binary dropped at repo root
+/lint_probe
+# Beads local machine markers (never canonical tracker state)
+.beads/.local_version
+.beads/.migration-hint-ts
+# br / cleanup session markers
+.last-cleanup
+# RCH virtual FS workload workspaces (compile offload scratch)
+.rch-vfs-*/
